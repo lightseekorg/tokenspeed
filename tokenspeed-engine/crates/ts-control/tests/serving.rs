@@ -309,6 +309,10 @@ struct FakeDevice {
     landed: Arc<Mutex<Vec<Landing>>>,
     /// Control operations the device ran, in order.
     device_ops: Arc<Mutex<Vec<String>>>,
+    /// Results published after the control plane's all-rank agreement.
+    weight_commits: Arc<Mutex<Vec<bool>>>,
+    /// Inject a local loading failure while other ranks succeed.
+    fail_weight_update: bool,
     /// EPLB: this rank's EP rank, which skews the load it counts.
     ep_rank: usize,
     /// EPLB: the placement the experts sit in, as the routing tables say.
@@ -784,7 +788,12 @@ impl DataPlane for FakeDevice {
 
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         self.device_ops.lock().unwrap().push(op.tag().to_owned());
-        Ok((true, "applied".to_owned()))
+        Ok((!self.fail_weight_update, "applied".to_owned()))
+    }
+
+    fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError> {
+        self.weight_commits.lock().unwrap().push(success);
+        Ok(())
     }
 
     fn profile(&mut self, request: &ProfileReq) -> Result<(bool, String), DataPlaneError> {
@@ -1039,6 +1048,7 @@ struct Rank {
     storage_gate: Arc<Gate>,
     landed: Arc<Mutex<Vec<Landing>>>,
     device_ops: Arc<Mutex<Vec<String>>>,
+    weight_commits: Arc<Mutex<Vec<bool>>>,
     applied: Applied,
     epd_admitted: Arc<Mutex<Vec<String>>>,
     epd_released: Arc<Mutex<Vec<usize>>>,
@@ -1208,6 +1218,8 @@ struct Setup {
     cache_ack_polls: Option<fn(usize) -> usize>,
     /// The devices acknowledge no cache op until the test opens their gates.
     held_cache_acks: bool,
+    /// A rank whose device refuses a weight load.
+    weight_update_failure_rank: Option<usize>,
 }
 
 impl Layout {
@@ -1404,6 +1416,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         placeholder_stage: matches!(layout, Layout::Pp(_)) && rank + 1 < world,
         wire: setup.pd.as_ref().map(|pd| pd.wire.clone()),
         ep_rank: rank,
+        fail_weight_update: setup.weight_update_failure_rank == Some(rank),
         // The trivial initial placement: slot p holds expert p % 4.
         placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
         ..Default::default()
@@ -1480,6 +1493,7 @@ async fn start_ranks_with(
                 storage_gate,
                 landed: device.landed.clone(),
                 device_ops: device.device_ops.clone(),
+                weight_commits: device.weight_commits.clone(),
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
                 epd_released: device.epd_released.clone(),
@@ -1830,11 +1844,20 @@ async fn dropping_a_stream_aborts_the_request() {
                 *generated < 100,
                 "generated {generated} tokens after the abort"
             );
-            return;
+            // Cancellation produces no final output for the dropped stream,
+            // but the frontend must still learn that the engine is idle.
+            if engine
+                .client
+                .loads()
+                .iter()
+                .all(|load| load.num_running == 0 && load.num_waiting == 0)
+            {
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the aborted request was never released");
+    panic!("the aborted request was not released and reported idle");
 }
 
 /// Submit every request, then read each stream to its end.
@@ -3772,10 +3795,43 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
             *engine.ranks[rank].device_ops.lock().unwrap(),
             ["UpdateWeightFromDiskReqInput"]
         );
+        assert_eq!(*engine.ranks[rank].weight_commits.lock().unwrap(), [true]);
     }
     // Serving goes on.
     let chunks = run(&engine.client, request("r", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
+    for layout in [Layout::Dp(2), Layout::Tp(2), Layout::Pp(2)] {
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                weight_update_failure_rank: Some(1),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let load = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            model_path: "/checkpoint".to_owned(),
+            load_format: None,
+            weight_version: None,
+            flush_cache: true,
+        });
+        let replies = control(&engine, load).await;
+        assert_eq!(replies.len(), layout.sizes().2);
+        assert!(replies
+            .iter()
+            .all(|(tag, success)| { *tag == "UpdateWeightFromDiskReqOutput" && !success }));
+        for rank in &engine.ranks {
+            assert_eq!(*rank.weight_commits.lock().unwrap(), [false]);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

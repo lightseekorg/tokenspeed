@@ -2266,7 +2266,7 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
             captured, _ = layer(x)
         for exponent in (125, 121):
             before = native.clone()
-            with weight_update_session([model]):
+            with weight_update_session([model], require_complete=False, cpu_group=None):
                 model.load_weights(
                     [
                         (

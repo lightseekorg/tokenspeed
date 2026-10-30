@@ -2077,7 +2077,9 @@ def moe_plan(
     }
 
 
-def moe_process_weights(plan: dict, w: torch.nn.Module):
+def moe_process_weights(
+    plan: dict, w: torch.nn.Module, *, communication_initializer=None
+):
     """Process loaded MoE weights and prepare persistent communication storage.
 
     Args:
@@ -2086,6 +2088,9 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
             place to prepare solution-specific layouts and scales. DeepEP
             modules must declare hidden_size (the unquantized input width)
             and num_experts (the global expert count).
+        communication_initializer: Optional callback scheduler accepting a
+            zero-argument initializer. A managed allocator may defer it until
+            its weight region exits. None initializes immediately.
 
     Returns:
         The selected weight preprocessor's result, or None without one.
@@ -2106,7 +2111,8 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
         from tokenspeed_kernel.ops.communication.deep_ep import prepare_deepep_buffer
 
         hidden_size, num_experts = deepep_geometry
-        prepare_deepep_buffer(
+        initialize = functools.partial(
+            prepare_deepep_buffer,
             group=plan["process_group"],
             hidden_size=hidden_size,
             num_experts=num_experts,
@@ -2115,6 +2121,10 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
                 "deepep_low_latency_max_num_tokens_per_gpu"
             ],
         )
+        if communication_initializer is None:
+            initialize()
+        else:
+            communication_initializer(initialize)
     return result
 
 

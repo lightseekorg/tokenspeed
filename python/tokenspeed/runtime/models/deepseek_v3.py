@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import torch
@@ -141,6 +142,7 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = get_colorful_logger(__name__)
 
@@ -697,11 +699,16 @@ class DeepseekV3AttentionMLA(nn.Module):
             if self.o_proj_batch_invariant:
                 widths.append(hidden_size)
             for channels in widths:
-                prepare_shard_exchange(
-                    self.head_tp_group,
-                    channels,
-                    max_rows,
-                    torch.get_default_dtype(),
+                # Peer pointers and Lamport epochs belong to communication,
+                # not model weights. Discarding either breaks captured exchanges.
+                initialize_communication(
+                    partial(
+                        prepare_shard_exchange,
+                        self.head_tp_group,
+                        channels,
+                        max_rows,
+                        torch.get_default_dtype(),
+                    )
                 )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta

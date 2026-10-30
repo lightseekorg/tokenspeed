@@ -45,7 +45,7 @@ __device__ void Softmax(float* scores_vec) {
     max_score = scores_vec[i] > max_score ? scores_vec[i] : max_score;
   }
   __syncthreads();
-  max_score = BlockReduce(reduce_stroge).Reduce(max_score, ::cuda::maximum<float>{});
+  max_score = BlockReduce(reduce_stroge).Reduce(max_score, cub::Max{});
   if (threadIdx.x == 0) {
     shared_val = max_score;
   }

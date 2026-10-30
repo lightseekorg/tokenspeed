@@ -19,7 +19,9 @@
 # SOFTWARE.
 
 from abc import ABC
+from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 
@@ -29,6 +31,24 @@ try:
     _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
 except ImportError:
     pass
+
+
+_communication_initializers: ContextVar[list[Callable[[], None]] | None] = ContextVar(
+    "tokenspeed_communication_initializers", default=None
+)
+
+
+def initialize_communication(operation: Callable[[], None]) -> None:
+    """Allocate persistent communication storage after a managed region ends.
+
+    Deferring avoids nested CUDA MemPools: destroying an inner pool while a
+    managed outer pool is active aborts some supported Torch builds.
+    """
+    pending = _communication_initializers.get()
+    if pending is None:
+        operation()
+    else:
+        pending.append(operation)
 
 
 class TorchMemorySaverAdapter(ABC):
@@ -67,9 +87,23 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         # weights vs kv_cache regions can be paused/resumed independently.
         # enable_cpu_backup=True offloads (and restores) contents to CPU on
         # pause (weights); False discards them (kv_cache).
-        return _primary_memory_saver.region(
-            tag=tag or "default", enable_cpu_backup=enable_cpu_backup
-        )
+        @contextmanager
+        def active_region():
+            pending: list[Callable[[], None]] = []
+            token = _communication_initializers.set(pending)
+            try:
+                with _primary_memory_saver.region(
+                    tag=tag or "default", enable_cpu_backup=enable_cpu_backup
+                ):
+                    yield
+            finally:
+                _communication_initializers.reset(token)
+            # A failed model load never initializes communication. The original
+            # allocator region has fully exited before these callbacks run.
+            for operation in pending:
+                operation()
+
+        return active_region()
 
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         # Requires the library's preload hook mode, which configure_subprocess

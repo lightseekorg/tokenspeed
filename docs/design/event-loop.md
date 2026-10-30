@@ -579,7 +579,11 @@ thread in a collective the trainer drives or an SDK read; a DP peer that had
 not yet dequeued its copy would keep looping and wait for this rank in the
 per-round agreement, a deadlock. One operation completes per round, and the
 replica MIN-reduces its result before the loop publishes the L3 weight
-version or sends the reply. The same gate carries the online expert
+version or sends the reply. A weight load also commits that final result on
+all forward threads before replying. Under the discard policy, local loading
+success is pending: only the successful replica-wide commit marks parameters
+usable. Failure invalidates every rank, including ranks that loaded locally;
+KV wake and forwarding remain blocked until deployment restart. The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at
@@ -805,3 +809,13 @@ cleanup runs outside the callback.
   the same round, decided from rank-identical state (counts the ranks keep
   the same, agreed flags), never from a rank's own view; a rank-local error
   inside such a sequence goes into the agreement instead of out of the round.
+
+## Frontend load reports
+
+After the round's scheduler mutations and releases, the replica's frontend owner
+publishes its current request and cache load. Token outputs carry that snapshot;
+a changed snapshot is also sent in an empty output batch. Client cancellation
+can reap the final request without producing a final token, so reporting only
+nonempty outputs would leave routing and drain checks with a stale running
+count. An unchanged idle load is sent at most once per second as a heartbeat,
+so the frontend can distinguish an idle engine from a stale connection.

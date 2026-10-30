@@ -897,6 +897,10 @@ class HostDataPlane:
         )
         return bool(ok), str(message)
 
+    def commit_weight_update(self, success: bool) -> None:
+        """Publish a weight load only after the Rust rank agreement."""
+        self._device.commit_weight_update(success)
+
     def profile(self, payload: bytes) -> tuple[bool, str]:
         """Start or stop the profiler (a msgpack ``ProfileReq``)."""
         request = zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[
@@ -1404,13 +1408,23 @@ class HostBootstrap:
         self._device.shutdown_cache()
 
 
-def bootstrap(control_fd: int, pd_outbox) -> HostBootstrap | EncodeBootstrap:
+def bootstrap(
+    control_fd: int, pd_outbox, weight_update_commit_protocol: int = 0
+) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
     host's encode mode instead (``epd/encode_host.py``)."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
+    # Old host binaries call bootstrap with two arguments. Reject them before
+    # constructing a model or process group: they cannot publish the global
+    # decision that makes locally loaded weights usable again.
+    if server_args.enable_memory_saver and weight_update_commit_protocol < 1:
+        raise RuntimeError(
+            "Memory saver requires a ts-host binary with weight-update commit "
+            "protocol 1; rebuild tokenspeed-engine together with this runtime"
+        )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(

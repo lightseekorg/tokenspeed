@@ -480,7 +480,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1("bootstrap", (args.control_fd, outbox.clone()))?;
+                .call_method1("bootstrap", (args.control_fd, outbox.clone(), 1_u32))?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
             Ok((bootstrap.unbind(), outbox.unbind(), mode))
         })();

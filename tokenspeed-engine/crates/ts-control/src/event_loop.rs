@@ -203,6 +203,11 @@ pub trait DataPlane {
     /// and a message.
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError>;
 
+    /// Publish or invalidate a weight load after every rank agreed its
+    /// result and the new cache namespace. Local load success alone must
+    /// never permit a forward or a KV wake.
+    fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError>;
+
     /// Start or stop the profiler (`ProfileReq`). Returns the reply.
     fn profile(
         &mut self,
@@ -486,6 +491,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     forward_allowed: bool,
     /// Last load report on the output wire, including idle heartbeats.
     last_load_report: Option<Instant>,
+    /// Last load sent to the frontend, including rounds with no token output.
+    reported_load: Option<Load>,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -539,6 +546,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             dp_idle: true,
             forward_allowed: true,
             last_load_report: None,
+            reported_load: None,
         }
     }
 
@@ -664,12 +672,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
-        if self.owns_frontend()
-            && (!outputs.is_empty()
-                || self
-                    .last_load_report
-                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)))
-        {
+        if self.owns_frontend() {
             let sizes = self.scheduler.sizes();
             let load = Load {
                 num_running: self.outputs.num_running() as i64,
@@ -678,8 +681,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 kv_total_pages: self.config.kv_total_pages,
                 kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
             };
-            self.frontend.send(outputs, load);
-            self.last_load_report = Some(Instant::now());
+            // Silent aborts must refresh load immediately; periodic heartbeats
+            // also keep an idle engine's load snapshot fresh at its frontend.
+            if !outputs.is_empty()
+                || self.reported_load != Some(load)
+                || self
+                    .last_load_report
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+            {
+                self.frontend.send(outputs, load);
+                self.reported_load = Some(load);
+                self.last_load_report = Some(Instant::now());
+            }
         }
         // A deferred pause or release resolves once the scheduler drained.
         self.finish_drain()?;
@@ -1482,6 +1495,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     (agreed, message)
                 }
             }
+        };
+        let success = if control::is_weight_load(&op) {
+            // Namespace publication can fail after the load agreement. No
+            // rank commits usability until that final result also converged.
+            let agreed = self.converge(success)?;
+            self.data_plane.commit_weight_update(agreed)?;
+            agreed
+        } else {
+            success
         };
         tracing::info!(op = op.tag(), success, message, "weight operation done");
         self.controls
