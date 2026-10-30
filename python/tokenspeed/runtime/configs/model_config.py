@@ -58,13 +58,6 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 logger = get_colorful_logger(__name__)
 
-_DEEPSEEK_V4_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForCausalLMDSpark",
-        "DeepseekV4ForCausalLMNextN",
-    }
-)
 _QWEN4_EXP_ARCHITECTURES = frozenset(
     {
         "Qwen4ExpForConditionalGeneration",
@@ -151,40 +144,11 @@ def override_model_config(model_config, ext_yaml):
             logger.info(f"Override model config: {k!s}={new_v!r}")
 
 
-def is_deepseek_v4(config: PretrainedConfig) -> bool:
-    return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
-
-
 def is_qwen4_exp(config: PretrainedConfig) -> bool:
     return (
         getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
         or resolve_architecture(config) in _QWEN4_EXP_ARCHITECTURES
     )
-
-
-def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
-    return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
-
-
-def configure_deepseek_v4_attention(model_config, server_args: ServerArgs) -> None:
-    """Derive DeepSeek V4's MLA-like dimensions for runtime setup."""
-    del server_args  # the geometry follows the checkpoint alone
-
-    hf_config = model_config.hf_config
-    model_config.head_dim = hf_config.head_dim
-    model_config.attention_arch = AttentionArch.MLA
-    model_config.kv_lora_rank = hf_config.head_dim
-    model_config.qk_rope_head_dim = hf_config.qk_rope_head_dim
-    model_config.qk_nope_head_dim = hf_config.head_dim - hf_config.qk_rope_head_dim
-    model_config.v_head_dim = hf_config.head_dim
-    model_config.index_head_dim = getattr(hf_config, "index_head_dim", None)
-    model_config.scaling = 1 / math.sqrt(model_config.head_dim)
-    rope_scaling = getattr(hf_config, "rope_scaling", None)
-    if rope_scaling:
-        mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-        scaling_factor = rope_scaling["factor"]
-        mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-        model_config.scaling = model_config.scaling * mscale * mscale
 
 
 def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> None:
@@ -513,11 +477,6 @@ _ATTENTION_FAMILY_SPECS = (
         default_backend="deepseek_v41",
     ),
     _AttentionFamilySpec(
-        name="DeepSeek V4",
-        architectures=_DEEPSEEK_V4_ARCHITECTURES,
-        configure=configure_deepseek_v4_attention,
-    ),
-    _AttentionFamilySpec(
         name="GLM",
         architectures=_DSA_ARCHITECTURES,
         configure=configure_dsa_attention,
@@ -666,8 +625,6 @@ def _derive_num_attention_layers(
         return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
-    if is_deepseek_v4_nextn(hf_config):
-        num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
         num_attention_layers = num_hidden_layers * 2
     if any(arch in _CACHE_LAYER_VIEW_ARCHITECTURES for arch in architectures):
@@ -780,34 +737,16 @@ class ModelConfig:
         if (
             is_draft_worker
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
-            and resolve_architecture(self.hf_config)
-            in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
+            and resolve_architecture(self.hf_config) == "DeepseekV41ForCausalLMDSpark"
         ):
             if self.spec_block_size is None:
                 raise ValueError(
                     "DSPARK same-checkpoint decoding requires the checkpoint to "
                     "declare dspark_block_size."
                 )
-            dspark_window_size = int(
-                getattr(
-                    self.hf_text_config,
-                    "dspark_window_size",
-                    128,
-                )
-            )
-            if dspark_window_size <= 0:
-                raise ValueError(
-                    "DSPARK captured-context window size must be positive; "
-                    f"got {dspark_window_size}."
-                )
             # V4.1 keeps its windows in the SWA cache group, so a prefix hit
-            # already carries them; V4 rebuilds a drafter-private ring instead.
-            self.dspark_prefix_replay_tokens = (
-                0
-                if resolve_architecture(self.hf_config)
-                == "DeepseekV41ForCausalLMDSpark"
-                else dspark_window_size
-            )
+            # already carries them and nothing needs replaying.
+            self.dspark_prefix_replay_tokens = 0
             dspark_num_stages = count_dspark_stages(
                 model_path,
                 revision=revision,

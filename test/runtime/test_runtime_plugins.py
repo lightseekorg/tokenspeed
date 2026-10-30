@@ -530,7 +530,7 @@ def test_declared_draft_cache_family_must_match_a_custom_target() -> None:
         resolve("fixture_family", "fixture_family", draft_family_declared=True) is None
     )
     # An in-tree draft without a profile rides the target recipe's draft
-    # view (the deepseek_v4 NextN pattern).
+    # view (the in-tree NextN pattern).
     assert resolve("fixture_family", "mla", draft_family_declared=False) is None
     # A declared, different family is a layout contradiction.
     with pytest.raises(RuntimeError, match="declares cache family"):

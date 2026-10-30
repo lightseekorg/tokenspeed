@@ -86,8 +86,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
-DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
-DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
@@ -476,20 +474,6 @@ def _is_deepseek_v41_model(model_id: str | None) -> bool:
     )
 
 
-def _is_deepseek_v4_model(model_id: str | None) -> bool:
-    if not model_id or _is_deepseek_v41_model(model_id):
-        return False
-    normalized = model_id.lower().replace("_", "-")
-    if "deepseek-v4" in normalized or "deepseekv4" in normalized.replace("-", ""):
-        return True
-    config = _load_model_config(model_id)
-    architectures = config.get("architectures") or []
-    return (
-        config.get("model_type") == "deepseek_v4"
-        or "DeepseekV4ForCausalLM" in architectures
-    )
-
-
 def _is_glm_dsa_model(model_id: str | None) -> bool:
     if not model_id:
         return False
@@ -619,16 +603,6 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", "deepseek_v41"])
-
-    elif _is_deepseek_v4_model(model_id):
-        if (
-            "--reasoning-parser" not in engine_result
-            and "--reasoning-parser" not in gateway_result
-        ):
-            engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-            gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-        if "--tool-call-parser" not in gateway_result:
-            gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
 
     elif _is_glm_dsa_model(model_id):
         if (

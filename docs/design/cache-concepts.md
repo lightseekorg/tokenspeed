@@ -39,8 +39,8 @@ the group's nature switches on this value and nothing else:
   the request's whole life; prefix-closed and shared.
 * **`sliding_window`** (`kSlidingWindow`) — rows of token history of which
   only the trailing `sliding_window_tokens` stay resident; the rest slide out
-  (`ExpiredBlocksAt`). A trailing window of token rows (DeepSeek V4's SWA kv
-  and compressor tails) is this kind whatever a kernel calls its buffer.
+  (`ExpiredBlocksAt`). A trailing window of token rows (DeepSeek V4.1's SWA
+  kv and compressor tails) is this kind whatever a kernel calls its buffer.
 * **`state`** (`kState`) — recurrent/conv state whose block holds the state
   after some token count, whichever count a forward happened to end at. A
   state summarizes everything before it, so nothing in it ever slides out and
@@ -367,7 +367,7 @@ page span that paged-KV geometry math (row views, slot↔page arithmetic,
 scale-tile branching) reads. Both derive from the one plan, which is the
 single point of the prefix-page ↔ KV-page convention.
 Neither is a statement about per-group CacheBlock geometry: group spans live
-in the specs as `block_granularity`, and blocks narrower than P (V4's SWA
+in the specs as `block_granularity`, and blocks narrower than P (V4.1's SWA
 window) or spanning no tokens at all (recurrent state) are the norm, not the
 exception. A backend's
 `kernel_page_size` comes from the kernel registry or an explicit config
@@ -1334,7 +1334,7 @@ calculation, shared by pipeline stages, model construction, and PD topology.
 The model/cache construction boundary maps those execution windows to explicit
 `target_cache_windows` with `pp_stage_cache_windows`: both ends of every
 window scale by the model's attention instances per decoder layer
-(`ModelProfile.attention_instances_per_layer`; one for K3 and V4, which
+(`ModelProfile.attention_instances_per_layer`; one for K3 and V4.1, which
 declare no profile, two for LongCat's paired layer), so a block's cache layers
 stay with the stage that executes it. `CacheLayerOwnership` then adds the
 final stage's draft cache window. Cache ownership consumes cache-ID windows;
@@ -1368,7 +1368,7 @@ seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 The last answers whether speculative verify stages its scratch in the bound
 pool; a CUDA-graph memory probe arena then keeps the serving concurrency.
 `groups()` itself is a seam for the two families whose groups are not
-per-layer (Inkling appends conv columns; V4 declares each group
+per-layer (Inkling appends conv columns; V4.1 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
@@ -1545,8 +1545,8 @@ narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
 fabricates, and the pool takes one parent block per fabricated row, floored at
 what a single request needs — it binds before the memory profile has run, so
 it cannot size from a budget at all. Families whose per-group demand decides
-the pool — K3's state groups riding inside MLA planes, V4's
-SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
+the pool — K3's state groups riding inside MLA planes, V4.1's
+SWA and global KV groups, GLM-5.3-Flash — size from `parents_needed` and get
 the inverse for free from `_capacity_from_parents`, one monotonic binary
 search shared by all. `parents_needed` itself is not a Python formula: it
 hands the group specs, the layout's virtual packing and `scheduler_limits`
@@ -1615,11 +1615,9 @@ A recipe's group set never depends on the KVP size. Only groups whose every
 reader can attend to a shard may be sharded; a group some consumer must read
 whole stays replicated and is declared as its own group at every KVP size, so
 prefix matching, transfer, and zeroing -- all keyed by group -- see one
-topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache
-and compressor states replicated. Index-K is sharded in its own full-history
-group; its virtual IDs are independent of the compressed attention chain.
-Backend binding validates the KVP shard count for both compressed KV and
-Index-K; SWA and compressor-state groups must remain replicated.
+topology. DeepSeek V4.1 shards its global KV groups, whose pages carry both
+the compressed KV and the index-K rows, and keeps the SWA rows and compressor
+tails replicated.
 
 Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
 MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
@@ -1650,9 +1648,8 @@ opt-in to prepare full-head projection weights before execution.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
 KVP does not make unsupported kernels portable. Speculative decoding runs
 on sharded caches: `OrdinaryRecipe.groups()` shards a draft group like the
-target's, and the DeepSeek V4 and Kimi K3 recipes shard with their draft
-layers in the compressed-KV chains and the MLA history group respectively,
-each subject to its backend's `AttnConfig` gate. A verify window's queries
+target's, and the Kimi K3 recipe shards with its draft layers in the MLA
+history group, subject to its backend's `AttnConfig` gate. A verify window's queries
 end at different global positions, and the kernel's multi-query causal mask
 would subtract a query's global offset from a *local* length, so FlashMLA
 and CuTe MLA feed every query's global endpoint through the compact layout
@@ -2063,8 +2060,8 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   group and fails a live batch missing any of them. QSA's indexer claims
   its compressed/recent history groups separately; it does not instantiate
   attention leaves for them. State consumers (Mamba/KDA, PLE, Inkling conv)
-  index the dict by their own group ids, as does the V4 backend for the
-  several history groups one V4 layer reads at once (its pool view reports
+  index the dict by their own group ids, as does the V4.1 backend for the
+  several groups one V4.1 layer reads at once (its pool view reports
   no `PagedAttention` binding and no router leaf). Mamba's group set comes from
   its recurrent fields, so a PLE state group cannot arm its verify
   state. `cache_consumer_attn_kinds` remains the boot-time coverage
@@ -2091,14 +2088,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   each group's `block_granularity`. This ratio-one fill copies stable raw
   table views and clears holes/padding; it does not add another subdivision
   convention or derive its addresses through a dummy attention leaf.
-* The slot *arithmetic* itself lives in the mapping layer in exactly two
-  spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
-  is page-size invariant): the router's stacked window/span math
-  (`backends/paged/write_locations.py`, failing to slot 0 — the reserved dummy
-  page) and the token-shaped resolve
-  (`attention/page_table.py::group_slot_mapping_from_raw` +
-  `safe_page_ids`, failing closed to the `-1` skip sentinel for group
-  buffers with no dummy page).
+* The slot *arithmetic* itself lives in the mapping layer as one invariant
+  (`table[req, pos // P] * P + pos % P`, which is page-size invariant): the
+  router's stacked window/span math (`backends/paged/write_locations.py`,
+  failing to slot 0 — the reserved dummy page).
 
 ### Principle 6 — provenance discipline: fixed
 
@@ -2132,11 +2125,7 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 * Every backend's `kernel_page_size` is registry- or config-sourced
   (`kernel_page_sizes.py`); the registry LCM validator checks explicitly
   configured values, and a backend that resolves its own registry default
-  owns the divisibility check for it. The V4 milestone closed the last
-  P-derivation: compressed-chain rows, SWA rows, and layout byte shapes all
-  build from `DEEPSEEK_V4_PAGE_SIZE`, and V4 accepts any P that is a
-  positive multiple of it (e2e-verified against the `bt_v4` baseline;
-  GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
+  owns the divisibility check for it. ✓
 * Two arena scalars, two roles, both derived from the plan:
   `CacheArena.prefix_granularity` (identity grain; contract publication and
   plan checks) and `CacheArena.kv_page_size` (KV arena geometry, read by
