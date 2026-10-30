@@ -167,9 +167,12 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
 // and resumes at C; only a longer prompt repeating T's partial page could
 // match T, and it resumes at C instead, recomputing less than a page.
 // C lies below T, so a page-aligned T, a chain boundary a longer prompt
-// resumes from, is never covered. A request that resumed from a tail beyond
-// C keeps T: it extends an earlier prompt end in place, and the next request
-// likely extends T the same way. In practice C exists only with the
+// resumes from, is never covered. With aligned State checkpoints C is the
+// last segment entrance of any prompt longer than one segment instead, and
+// those groups neither publish nor match a state at a covered T, which is
+// never aligned. A request that resumed from a tail beyond C keeps T: it
+// extends an earlier prompt end in place, and the next request likely
+// extends T the same way. In practice C exists only with the
 // in-forward checkpoint (SchedulerConfig::state_checkpoint_in_forward);
 // otherwise only when another publication left a state at C: a junction cut
 // or a retraction there, or another request's prompt end or finish exactly

@@ -390,7 +390,8 @@ class ServerArgs:
     # checkpoints (and KV tails) a next turn that re-renders the end of the
     # previous prompt and its reply cannot resume at: a long prompt's end
     # inside the page whose start, its last prefix-page boundary before the
-    # replay tail, holds a cached state, and a fused finish past the prompt
+    # replay tail (with a declared checkpoint_granularity, its last segment
+    # entrance), holds a cached state, and a fused finish past the prompt
     # end (docs/design/scheduler.md section 1.2).
     drop_dead_state_checkpoints: bool = False
     # JSON on the CLI, normalized once to generic runtime options.
@@ -2665,8 +2666,11 @@ class ServerArgs:
             "prompt's last prefix-page boundary before its replay tail and the "
             "state at that boundary is cached (a resend or a longer prompt "
             "resumes there; prefill and fused servers), and a finish past the "
-            "prompt end (fused servers). A prompt that repeats a previous reply "
-            "verbatim resumes at an earlier checkpoint instead. Requires prefix "
+            "prompt end (fused servers). With a State group that declares "
+            "checkpoint_granularity, that boundary is the last segment entrance "
+            "of any prompt longer than one segment instead. A prompt that "
+            "repeats a previous reply verbatim resumes at an earlier checkpoint "
+            "instead. Requires prefix "
             "caching; a decode server ignores it. See docs/design/scheduler.md "
             "section 1.2.",
         )

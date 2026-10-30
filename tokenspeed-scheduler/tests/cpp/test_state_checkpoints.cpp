@@ -1428,6 +1428,67 @@ TEST_F(DropDeadCheckpointsFullOnlySuite, AModelWithoutStateGroupsKeepsItsTails) 
     EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{7}) << "resumes at the finish's tail";
 }
 
+// drop_dead_state_checkpoints beside aligned State checkpoints (a grain of
+// 4096 over 128-token pages). The pre-tail checkpoint is then the prompt's
+// last segment entrance 4096, which its single forward writes, and the State
+// groups publish and match states only on the grain: no prompt resumes at an
+// unaligned prompt end or finish, so every probe resumes where it does
+// without the flag. The flag skips the prompt end 4100, inside the page the
+// entrance starts, and a finish past the prompt end; the prompt end 4300 lies
+// further into its segment and keeps its tail. The aligned prompt end 8192 is
+// never covered: its state is published, and a longer prompt resumes there.
+class DropDeadCheckpointsAlignedSuite : public AlignedStateCheckpointSuite {
+protected:
+    void ResetWith(bool drop) {
+        config_ = MakeConfig();
+        config_.decode_input_tokens = 1;
+        config_.drop_dead_state_checkpoints = drop;
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    }
+};
+
+TEST_F(DropDeadCheckpointsAlignedSuite, NoAlignedCheckpointIsSkipped) {
+    struct Case {
+        std::int32_t prompt;
+        std::int32_t decodes;
+        std::size_t tails;
+        std::size_t tails_with_flag;
+        std::int32_t longer_resumes;
+    };
+    for (const Case& c : {Case{4100, 2, 2, 0, 4096}, Case{4100, 0, 1, 0, 4096}, Case{4300, 2, 2, 1, 4096},
+                          Case{4300, 0, 1, 1, 4096}, Case{8192, 2, 1, 0, 8192}, Case{8192, 0, 0, 0, 8192}}) {
+        for (const bool drop : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "prompt=" << c.prompt << " decodes=" << c.decodes << " drop=" << drop);
+            ResetWith(drop);
+            const std::vector<std::int32_t> tokens = MakeTokens(c.prompt);
+            Submit(RequestWithTokens("seed", tokens));
+            ASSERT_EQ(PlanAndStateRow("seed").size(), 3u) << "the forward writes the entrance 4096";
+            SendForwardDone("seed", {900});
+            for (std::int32_t step = 0; step < c.decodes; ++step) {
+                ExecutionPlan plan;
+                PlanAndStateRow("seed", &plan);
+                if (step == 0) {
+                    const bool publishes_tail = c.prompt % 128 != 0 && !(drop && c.prompt == 4100);
+                    EXPECT_EQ(plan.pages_to_copy.at("full").size(), publishes_tail ? 1u : 0u)
+                        << "the owner moves off a published partial page";
+                }
+                SendForwardDone("seed", {901 + step});
+            }
+            SendFinish("seed");
+            AckWriteBacks(PlanOnce());
+            EXPECT_EQ(scheduler_->TailEntries(), drop ? c.tails_with_flag : c.tails);
+
+            EXPECT_EQ(Probe("resent", tokens).prefix_tokens, 4096);
+            std::vector<std::int32_t> longer = tokens;
+            longer.insert(longer.end(), {600, 601, 602, 603});
+            EXPECT_EQ(Probe("longer", longer).prefix_tokens, c.longer_resumes);
+            std::vector<std::int32_t> continued = tokens;
+            continued.insert(continued.end(), {900, 901, 77});
+            EXPECT_EQ(Probe("continued", continued).prefix_tokens, c.longer_resumes);
+        }
+    }
+}
+
 // Mixed batches beside one decoding request, which takes one token of every
 // round's 8 and leaves 7 for the prefill.
 class StateCheckpointInForwardMixedSuite : public StateCheckpointInForwardSuite {
