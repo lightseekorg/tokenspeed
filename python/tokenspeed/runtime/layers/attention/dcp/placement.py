@@ -282,7 +282,8 @@ def prefix_chunk_segments(
     loop, request, first_column, shift, base = np.repeat(pairs, counts, axis=1)
     column = np.arange(loop.size, dtype=np.int64) + first_column
     column_row = column * granularity + shift
-    # A segment starts at its column's start or, the pair's first, later.
+    # A segment starts at its column's first row; only a pair's first
+    # segment can start later, at the pair's first row (base).
     row = np.maximum(column_row, base)
     # Segments tile the loops' rows: each ends where the next starts.
     rows = np.empty_like(row)

@@ -147,6 +147,17 @@ def test_expand_owner_segments_matches_the_per_row_layout(
         run(1037, generator, (0, 0))
 
 
+def test_expand_owner_segments_rejects_a_table_past_int32_indexing() -> None:
+    # Two entries past 2**31, where the kernel's int32 table offsets would
+    # wrap; meta tensors carry the shapes without allocating them.
+    segments = torch.empty((5, 2**31 // 5 + 1), dtype=torch.int32, device="meta")
+    rows = torch.empty(1, dtype=torch.int32, device="meta")
+    with pytest.raises(ValueError, match="int32"):
+        triton_expand_owner_segments(
+            segments, max_rows=64, gathered_index=rows, fetch=rows
+        )
+
+
 @pytest.mark.parametrize("extra_ranges", [0, 60])
 def test_zero_byte_ranges_strides_and_preserves_neighbors(
     device: str, extra_ranges: int

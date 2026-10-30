@@ -225,7 +225,7 @@ def triton_expand_owner_segments(
             ``fetch_row`` (its first row's entry of ``fetch``, or ``-1``
             when another rank owns it) and ``source_slot`` (this rank's
             physical slot of its first row; read only when ``fetch_row`` is
-            not ``-1``).
+            not ``-1``). At most ``2**31`` entries.
         max_rows: Bound of every segment's rows (the block granularity).
         gathered_index: Contiguous int32 output: each row's all-gather output
             row. Entries no segment covers keep their contents.
@@ -253,6 +253,11 @@ def triton_expand_owner_segments(
         raise ValueError("owner segment buffers disagree")
     if max_rows <= 0:
         raise ValueError(f"max_rows must be positive, got {max_rows}")
+    # The kernel reads field k of segment s at int32 offset k * segments + s,
+    # up to the table's last entry; no forward's history nears 2**31 / 5
+    # segments.
+    if segments.numel() > 2**31:
+        raise ValueError("owner segment table overflows int32 indexing")
     count = segments.shape[1]
     if count == 0:
         return
