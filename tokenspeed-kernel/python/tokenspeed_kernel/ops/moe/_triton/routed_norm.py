@@ -230,6 +230,20 @@ def _routed_sum_block(
 ROUTED_SUM_SINGLE_PASS_MAX_TOKENS = 4
 
 
+# CDNA4: one program per token holds a block of up to this many features in
+# registers without spilling (8 waves; a 16384 block spills).
+ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4 = 8192
+
+
+def _routed_sum_single_pass(num_tokens: int, block: int) -> bool:
+    """Whether one program per token reduces the routes instead of two launches."""
+    # MI350X at route width 4096 (Muse): the one-launch sum was never slower
+    # from 1 to 8192 tokens and roughly halves the time from 512 tokens.
+    if current_platform().is_cdna4 and block <= ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4:
+        return True
+    return num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS
+
+
 @register_kernel(
     "moe",
     "routed_input_scale_rmsnorm_sum",
@@ -293,7 +307,7 @@ def triton_routed_input_scale_rmsnorm_sum(
         eps,
         weight_offset,
         block,
-        num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS,
+        _routed_sum_single_pass(num_tokens, block),
         enable_pdl,
     )
     return output
@@ -479,7 +493,7 @@ def triton_routed_input_scale_rmsnorm_sum_gathered(
         eps,
         weight_offset,
         block,
-        num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS,
+        _routed_sum_single_pass(num_tokens, block),
         enable_pdl,
     )
     return output

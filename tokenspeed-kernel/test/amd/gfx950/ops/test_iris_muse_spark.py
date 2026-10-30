@@ -1382,7 +1382,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
         iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
     )
     from tokenspeed_kernel.ops.moe._triton.routed_norm import (
-        triton_routed_input_scale_rmsnorm_sum_gathered,
+        _launch_routed_input_scale_sum,
     )
     from utils import assert_no_triton_compile
 
@@ -1466,17 +1466,22 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             raw(1)
             if rows > 16:
                 local = state.all_reduce.producer.data[: rows * 4096].view(rows, 4096)
-                triton_routed_input_scale_rmsnorm_sum_gathered(
+                # The fused kernel keeps the two-launch routed sum's order; CDNA4
+                # dispatches the one-launch sum, within one BF16 ULP of it.
+                _launch_routed_input_scale_sum(
                     routes,
                     mapping,
-                    rows,
-                    8,
-                    weights,
-                    norm,
-                    1e-5,
-                    1.0,
-                    False,
-                    local,
+                    row_stride=routes.stride(0),
+                    route_weights=weights,
+                    norm_weight=norm,
+                    output=local,
+                    num_tokens=rows,
+                    topk=8,
+                    eps=1e-5,
+                    weight_offset=1.0,
+                    block=4096,
+                    single_pass=False,
+                    enable_pdl=False,
                 )
                 expected = state.reduction.run(
                     local,
