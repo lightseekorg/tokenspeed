@@ -30,24 +30,25 @@ while rotating independent input/output buffers, without an explicit L2 flush.
 For each shape, the number of groups is the L2 cache size divided by the size
 of one group, rounded up. Each timed graph uses every group the same number of
 times and has at least the originally configured number of profiling calls.
-These buffers are temporary and released after tuning. M uses powers-of-two
-buckets rounded down; N/K, the scale contract and profiling strategy remain in
-the cache key. Activation scales and output rows follow each M bucket.
+These buffers are temporary and released after tuning. M uses FlashInfer's
+hybrid buckets with upward mapping; N/K, the scale contract and profiling
+strategy remain in the cache key. Activation scales and output rows follow each
+M bucket.
 Entries from earlier profiling strategies are not reused.
 The normal startup cache save/load path persists the selected configurations.
+When a cache contains compatible winners for the current device, loading it
+precompiles those winners and the fixed fallback tiles before the first request.
+This adds startup time but avoids compiling an unseen winner during inference.
 FlashInfer's preparation phase compiles the valid dynamic-shape variants only
-when a tuning-cache miss needs profiling. Cache hits skip that phase and
-prepare the fixed fallback tiles and encountered winners during eager warmup.
+when a tuning-cache miss needs profiling.
 
 Outside the tuning context, calls use FlashInfer's cached choice. If the M bucket
 is missing, the default serving path searches cached buckets for the closest M
 with the same N/K, scale contract and device; ties use the smaller M. If no
 compatible entry exists, the previous fixed-tile rule applies. `--disable-autotune`
-skips new searches; an existing loaded cache can still be used. The first eager
-launch prepares all three fallback configurations. Loaded non-default winners
-must be warmed eagerly for their capture buckets; TokenSpeed's graph capture
-already runs each batch eagerly before capturing it. `prepare(device)` also
-prepares the three fallback configurations explicitly.
+skips new searches; an existing loaded cache can still be used. An eager launch
+prepares the three fallback configurations when needed. `prepare(device)` can
+also prepare them explicitly.
 The adapter passes the current PyTorch stream on every launch, so the same
 call path works in eager execution, auxiliary streams, and CUDA graphs.
 Input pointers and stream handles are never cached.

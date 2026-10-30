@@ -40,25 +40,25 @@ from flashinfer.autotuner import (
     autotuner_initializer_randn,
     is_in_profile_measurement,
 )
+from flashinfer.fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket_uncapped,
+)
 from tokenspeed_kernel.thirdparty.trtllm_blockwise._kernel import (
     Sm100BlockwiseGemmKernel,
 )
-from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import _prepare, _run
-
-
-def _token_bucket(tokens: int) -> int:
-    return 1 << (max(1, tokens).bit_length() - 1)
-
-
-def _token_buckets(tokens: int) -> tuple[int, ...]:
-    return tuple(1 << i for i in range(max(1, tokens).bit_length()))
+from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import (
+    _prepare,
+    _run,
+    prepare,
+)
 
 
 @lru_cache(maxsize=512)
 def _nearest_token_buckets(tokens: int) -> tuple[int, ...]:
     return tuple(
         sorted(
-            (1 << i for i in range(31)),
+            get_hybrid_num_tokens_buckets(1 << 30),
             key=lambda bucket: (abs(bucket - tokens), bucket),
         )
     )
@@ -76,7 +76,12 @@ class BlockwiseGemmRunner(TunableRunner):
         self._profile_base_repeat = 0
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
-                DynamicTensorSpec((0, 2, 4), (0, 0, 0), _token_buckets, _token_bucket),
+                DynamicTensorSpec(
+                    (0, 2, 4),
+                    (0, 0, 0),
+                    get_hybrid_num_tokens_buckets,
+                    map_to_hybrid_bucket_uncapped,
+                ),
             ),
             tensor_initializers=(
                 (0, autotuner_initializer_randn),
@@ -166,6 +171,24 @@ class BlockwiseGemmRunner(TunableRunner):
 _runner = BlockwiseGemmRunner()
 
 
+def prepare_cached_tactics(tuner):
+    """Prepare persisted tactics for the current device before serving."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    prefix = "('trtllm_cutedsl_fp8_blockscale', 'BlockwiseGemmRunner', "
+    suffix = f", {(*_CACHE_EXTRAS, device.index)!r})"
+    tactics = {
+        tactic
+        for key, (runner_name, tactic) in tuner._file_configs.items()
+        if key.startswith(prefix)
+        and key.endswith(suffix)
+        and runner_name == "BlockwiseGemmRunner"
+        and tactic != -1
+    }
+    if tactics:
+        prepare(device)
+        _prepare(device, sorted(tactics))
+
+
 def run(a, b, a_scales, b_scales, out):
     inputs = [a, b, a_scales, b_scales, out]
     tuner = AutoTuner.get()
@@ -227,7 +250,7 @@ def run(a, b, a_scales, b_scales, out):
                 # distance order using FlashInfer's normal validation. The
                 # current bucket was already checked above.
                 m = a.shape[0]
-                current_bucket = _token_bucket(m)
+                current_bucket = map_to_hybrid_bucket_uncapped(m)
                 for bucket in _nearest_token_buckets(m):
                     if bucket == current_bucket:
                         continue

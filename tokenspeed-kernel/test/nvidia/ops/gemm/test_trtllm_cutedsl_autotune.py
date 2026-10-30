@@ -136,11 +136,11 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
         return launcher._run(*args)
 
     monkeypatch.setattr(runner_module, "_run", record_tactic)
-    for m in (63, 64, 65):
+    for m in (32, 63, 64, 65):
         tensors = _inputs(m, 384, 256)
         _mm(tensors)
         assert selected[-1] == (
-            (False, (64, 128), (1, 1)) if m < 64 else (True, (128, 128), (2, 1))
+            (False, (64, 128), (1, 1)) if m <= 32 else (True, (128, 128), (2, 1))
         )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -211,3 +211,168 @@ def test_eager_warmup_covers_all_fallback_tiles(monkeypatch):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+
+
+@torch.inference_mode()
+def test_loaded_tactics_are_precompiled_and_match_hybrid_buckets(tmp_path, monkeypatch):
+    """Loaded tactics are ready for eager and graph execution, including misses."""
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    monkeypatch.setattr(launcher, "_compiled", {})
+    extras = (*runner_module._CACHE_EXTRAS, torch.cuda.current_device())
+    lower = (False, (64, 128), (1, 1))
+    upper = (True, (128, 128), (2, 1))
+    configs = {}
+    for bucket, tactic in ((256, lower), (512, lower), (768, upper), (8192, lower)):
+        shapes = ((bucket, 256), (384, 256), (bucket, 2), (3, 2), (bucket, 384))
+        key = str(
+            ("trtllm_cutedsl_fp8_blockscale", "BlockwiseGemmRunner", shapes, extras)
+        )
+        configs[key] = ["BlockwiseGemmRunner", tactic]
+        if bucket == 512:
+            key_512 = key
+    path = tmp_path / "hybrid-configs.json"
+    path.write_text(json.dumps(configs))
+    assert load_autotune_cache(str(path), None, 0)
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("Loaded FP8 tactics must be compiled before serving")
+
+    monkeypatch.setattr(launcher, "_compile", unexpected_compile)
+    selected = []
+    original_run = runner_module._run
+
+    def record_run(*args):
+        selected.append(args[-1])
+        return original_run(*args)
+
+    monkeypatch.setattr(runner_module, "_run", record_run)
+    for m, expected in ((300, lower), (700, upper), (800, upper), (8193, lower)):
+        inputs = _inputs(m, 384, 256)
+        actual = _mm(inputs)
+        assert selected[-1] == expected
+        torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+
+    # With the exact bucket missing, equidistant cached buckets prefer smaller M.
+    del tuner._file_configs[key_512]
+    inputs = _inputs(512, 384, 256)
+    actual = _mm(inputs)
+    assert selected[-1] == lower
+    torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+    inputs = _inputs(700, 384, 256)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = _mm(inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+    tuner.clear_cache()
+
+
+@torch.inference_mode()
+def test_nearest_tactic_from_in_memory_cache(monkeypatch):
+    """Nearest-M reuse also works before the tuning cache is saved."""
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    lower = (False, (64, 128), (1, 1))
+    upper = (True, (128, 128), (2, 1))
+    extras = (*runner_module._CACHE_EXTRAS, torch.cuda.current_device())
+    for m, tactic in ((64, lower), (256, upper)):
+        shapes = ((m, 256), (384, 256), (m, 2), (3, 2), (m, 384))
+        key = AutoTuner._get_cache_key(
+            "trtllm_cutedsl_fp8_blockscale",
+            runner_module._runner,
+            shapes,
+            runner_module._runner.tuning_config,
+            extras,
+        )
+        tuner.profiling_cache[key] = (tactic, None)
+
+    selected = []
+    original_run = runner_module._run
+
+    def record_run(*args):
+        selected.append(args[-1])
+        return original_run(*args)
+
+    monkeypatch.setattr(runner_module, "_run", record_run)
+    for m, n, expected in ((112, 384, lower), (800, 384, upper), (800, 512, -1)):
+        inputs = _inputs(m, n, 256)
+        actual = _mm(inputs)
+        assert selected[-1] == expected
+        torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+
+    from flashinfer.autotuner import autotune as flashinfer_autotune
+
+    with flashinfer_autotune(
+        tune_mode=False, skip_ops={"trtllm_cutedsl_fp8_blockscale"}
+    ):
+        _mm(_inputs(800, 384, 256))
+    assert selected[-1] == -1
+    tuner.clear_cache()
+
+
+@pytest.mark.parametrize("l2_ratio,expected_groups", [(1, 1), (5, 6), (12, 13)])
+@torch.inference_mode()
+def test_autotune_rotates_and_releases_profile_buffers(
+    monkeypatch, l2_ratio, expected_groups
+):
+    """Each timed graph visits every L2-sized group and releases it."""
+    import gc
+    import weakref
+    from collections import Counter, defaultdict
+
+    from flashinfer.autotuner import is_in_profile_measurement
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    monkeypatch.setattr(tuner, "repeat", 7)
+    inputs = _inputs(32, 384, 256)
+    group_bytes = sum(tensor.numel() * tensor.element_size() for tensor in inputs)
+    l2_bytes = l2_ratio * group_bytes + (expected_groups > l2_ratio)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: l2_bytes
+    )
+    original_repeat = tuner.repeat
+    original_addresses = {tensor.data_ptr() for tensor in inputs}
+    observed = defaultdict(list)
+    temporary_refs = []
+    original_run = runner_module._run
+
+    def record_profile(a, b, sa, sb, out, tactic):
+        tensors = (a, b, sa, sb, out)
+        if is_in_profile_measurement() and torch.cuda.is_current_stream_capturing():
+            observed[tactic].append(tuple(tensor.data_ptr() for tensor in tensors))
+            temporary_refs.extend(
+                weakref.ref(tensor)
+                for tensor in tensors
+                if tensor.data_ptr() not in original_addresses
+            )
+        return original_run(a, b, sa, sb, out, tactic)
+
+    monkeypatch.setattr(runner_module, "_run", record_profile)
+    with autotune(tune_mode=True, tuning_buckets=(32,), round_up=False):
+        actual = _mm(inputs)
+    assert tuner.repeat == original_repeat
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+    assert observed
+    calls_per_group = max(1, (original_repeat + expected_groups - 1) // expected_groups)
+    for addresses in observed.values():
+        assert len(addresses) == expected_groups * calls_per_group
+        assert all(
+            set(Counter(row[index] for row in addresses).values()) == {calls_per_group}
+            for index in range(5)
+        )
+    gc.collect()
+    assert temporary_refs and all(ref() is None for ref in temporary_refs)
+    tuner.clear_cache()
