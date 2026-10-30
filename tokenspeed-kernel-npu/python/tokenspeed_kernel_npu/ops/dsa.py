@@ -80,6 +80,8 @@ def _prefill_metadata(
     QuerySeq,
     Scan,
     Direct,
+    HistoryTable,
+    PatchSlots,
     batch,
     columns,
     table_stride,
@@ -90,11 +92,13 @@ def _prefill_metadata(
     degree,
     local_pages,
     send_rows,
+    history_pages,
     table_tiles,
     query_tiles,
     TOPK: tl.constexpr,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
+    PACKED_HISTORY: tl.constexpr,
 ):
     pid = tl.program_id(0)
     off = tl.arange(0, BLOCK)
@@ -126,6 +130,12 @@ def _prefill_metadata(
         page_owner = page_positive % degree
         page_local = (page_positive // degree + 1) * per_block + page_id % per_block
         page_mapped = tl.where(page_block > 0, page_owner * local_pages + page_local, 0)
+        if PACKED_HISTORY:
+            page_mapped = tl.load(
+                HistoryTable + page_req * columns + page_col,
+                page_col < columns,
+                other=0,
+            ).to(tl.int64)
         page_begin = tl.load(Cum + page_req).to(tl.int64)
         page_end = tl.load(Cum + page_req + 1).to(tl.int64)
         page_prefix = tl.load(Prefix + page_req).to(tl.int64)
@@ -133,7 +143,7 @@ def _prefill_metadata(
         tail_owner, tail_row, page_direct = _current_page(
             page_token, page_begin, page_end, page_prefix, total, degree, PAGE
         )
-        tail_page = degree * local_pages + (tail_owner * send_rows + tail_row) // PAGE
+        tail_page = history_pages + (tail_owner * send_rows + tail_row) // PAGE
         page_mapped = tl.where(page_direct, tail_page, page_mapped)
         tl.store(
             OutTable + page_compact * columns + page_col,
@@ -186,6 +196,7 @@ def _prefill_metadata(
     else:
         current_token = (pid - table_tiles - query_tiles - 1) * BLOCK + off
         current_direct = tl.full((BLOCK,), False, tl.int1)
+        patch_slot = tl.full((BLOCK,), -1, tl.int64)
         for current_req in range(batch):
             current_start = tl.load(Cum + current_req).to(tl.int64)
             current_end = tl.load(Cum + current_req + 1).to(tl.int64)
@@ -204,7 +215,24 @@ def _prefill_metadata(
                 & (current_token >= current_start)
                 & (current_token < current_end)
             )
+            if PACKED_HISTORY:
+                matches = (
+                    (current_token >= current_start)
+                    & (current_token < current_end)
+                    & (current_token < total)
+                )
+                position = current_prefix + current_token - current_start
+                page = tl.load(
+                    HistoryTable + current_req * columns + position // PAGE,
+                    matches,
+                    other=0,
+                ).to(tl.int64)
+                patch_slot = tl.where(
+                    matches & (page > 0), page * PAGE + position % PAGE, patch_slot
+                )
         tl.store(Direct + current_token, current_direct, current_token < total)
+        if PACKED_HISTORY:
+            tl.store(PatchSlots + current_token, patch_slot, current_token < total)
 
 
 def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
@@ -251,7 +279,15 @@ class AscendDSAKernels:
 
     @staticmethod
     def prepare_prefill(
-        kv_cache, index_cache, *, ranks, bootstrap_group, max_current_rows
+        kv_cache,
+        index_cache,
+        *,
+        ranks,
+        bootstrap_group,
+        max_current_rows,
+        max_history_rows=0,
+        history_null_rows=0,
+        workspace=None,
     ):
         return AscendDSAPrefill(
             kv_cache,
@@ -259,6 +295,9 @@ class AscendDSAKernels:
             ranks=ranks,
             bootstrap_group=bootstrap_group,
             max_current_rows=max_current_rows,
+            max_history_rows=max_history_rows,
+            history_null_rows=history_null_rows,
+            workspace=workspace,
         )
 
     @staticmethod
@@ -277,9 +316,26 @@ class AscendDSAKernels:
         page_size,
         topk,
         active_requests,
+        history_table=None,
+        patch_slots=None,
+        history_pages=None,
     ):
         """Plan final history/current addresses from existing device metadata."""
         batch, columns = table.shape
+        if history_table is not None and (
+            history_table.shape != table.shape
+            or history_table.dtype != torch.int32
+            or history_table.device != table.device
+            or not history_table.is_contiguous()
+            or patch_slots is None
+            or patch_slots.shape != (total,)
+            or patch_slots.dtype != torch.int64
+            or patch_slots.device != table.device
+            or not patch_slots.is_contiguous()
+            or history_pages is None
+            or history_pages < 1
+        ):
+            raise ValueError("Invalid compact Prefill page table or patch slots")
         mapped = torch.empty(
             (active_requests, columns), dtype=torch.int32, device=table.device
         )
@@ -301,6 +357,8 @@ class AscendDSAKernels:
             sequence,
             scan,
             direct,
+            history_table if history_table is not None else table,
+            patch_slots if patch_slots is not None else direct,
             batch,
             columns,
             table.stride(0),
@@ -311,11 +369,13 @@ class AscendDSAKernels:
             degree,
             local_pages,
             send_rows,
+            degree * local_pages if history_pages is None else history_pages,
             table_tiles,
             query_tiles,
             TOPK=topk,
             PAGE=page_size,
             BLOCK=block,
+            PACKED_HISTORY=history_table is not None,
         )
         return mapped, qcu, kcu, sequence, scan, direct
 
@@ -792,7 +852,16 @@ class AscendDSAPrefill:
     """
 
     def __init__(
-        self, kv_cache, index_cache, *, ranks, bootstrap_group, max_current_rows
+        self,
+        kv_cache,
+        index_cache,
+        *,
+        ranks,
+        bootstrap_group,
+        max_current_rows,
+        max_history_rows=0,
+        history_null_rows=0,
+        workspace=None,
     ):
         import torch.distributed as dist
 
@@ -842,6 +911,13 @@ class AscendDSAPrefill:
             ],
             "DsaCpPatch": [C.c_void_p] * 6 + [C.c_uint64] * 4 + [C.c_uint32] * 4,
         }
+        if max_history_rows:
+            signatures["DsaCpAllGatherV"] = (
+                [C.c_void_p] * 4 + [C.c_uint64] + [C.c_void_p] * 2
+            )
+            signatures["DsaCpPatchMapped"] = (
+                [C.c_void_p] * 7 + [C.c_uint64] * 5 + [C.c_uint32] * 4
+            )
         for name, arguments in signatures.items():
             function = getattr(self.lib, name)
             function.argtypes = arguments
@@ -866,34 +942,61 @@ class AscendDSAPrefill:
         self.send_capacity = (
             (max_current_rows + self.degree * 128 - 1) // (self.degree * 128)
         ) * 128
-        self.history_rows = self.local_rows * self.degree
+        if (
+            max_history_rows < 0
+            or history_null_rows < 0
+            or (max_history_rows and not 0 < history_null_rows < max_history_rows)
+        ):
+            raise ValueError("Invalid bounded Prefill history capacity")
+        self.history_rows = max_history_rows or self.local_rows * self.degree
+        self.history_null_rows = history_null_rows
+        self._bounded_history = max_history_rows > 0
         rows = self.history_rows + self.send_capacity * self.degree
         index_width = 128 if self._has_index else 0
-        self.storage = torch.empty(
-            rows * (576 + index_width), dtype=torch.bfloat16, device=self.device
+        sizes = (
+            rows * (576 + index_width),
+            self.send_capacity * (576 + index_width),
+            self.history_rows * (576 + index_width) if self._bounded_history else 0,
         )
+        if workspace is None:
+            workspace = tuple(
+                torch.empty(n, dtype=torch.bfloat16, device=self.device) for n in sizes
+            )
+        if len(workspace) != 3 or any(
+            value.dtype != torch.bfloat16
+            or value.device != self.device
+            or not value.is_contiguous()
+            or value.ndim != 1
+            or value.numel() != n
+            for value, n in zip(workspace, sizes, strict=True)
+        ):
+            raise ValueError("Prefill requires matching caller-owned workspace buffers")
+        self.storage, self.send_storage, history_send = workspace
         self.index = self.storage[: rows * index_width].view(rows, index_width)
         self.kv = self.storage[rows * index_width :].view(rows, 576)
-        self.send_storage = torch.empty(
-            self.send_capacity * (576 + index_width),
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
         self.send_index = self.send_storage[: self.send_capacity * index_width].view(
             self.send_capacity, index_width
         )
         self.send_kv = self.send_storage[self.send_capacity * index_width :].view(
             -1, 576
         )
+        self.history_send = history_send if self._bounded_history else None
+        if self._bounded_history:
+            self.index[:history_null_rows].zero_()
+            self.kv[:history_null_rows].zero_()
+        self._history_slots = None
+        self._history_counts = ()
+        self._history_arguments = []
+        self._patch_slots = None
         self.stream = torch.npu.Stream(device=self.device)
-        self.index_ready = torch.npu.Event()
-        self.kv_ready = torch.npu.Event()
-        self.consumed = torch.npu.Event()
-        self.source_ready = torch.npu.Event()
-        self.index_produced = torch.npu.Event()
-        self.kv_produced = torch.npu.Event()
-        self.index_current_ready = torch.npu.Event()
-        self.kv_current_ready = torch.npu.Event()
+        self.index_ready = torch.npu.Event(enable_timing=True)
+        self.kv_ready = torch.npu.Event(enable_timing=True)
+        self.consumed = torch.npu.Event(enable_timing=True)
+        self.source_ready = torch.npu.Event(enable_timing=True)
+        self.index_produced = torch.npu.Event(enable_timing=True)
+        self.kv_produced = torch.npu.Event(enable_timing=True)
+        self.index_current_ready = torch.npu.Event(enable_timing=True)
+        self.kv_current_ready = torch.npu.Event(enable_timing=True)
         self._current_rows = 0
         self._send_rows = 0
         self._started = {128: False, 576: False}
@@ -910,10 +1013,21 @@ class AscendDSAPrefill:
     @property
     def workspace_bytes(self):
         return (
-            self.storage.numel() + self.send_storage.numel()
+            self.storage.numel()
+            + self.send_storage.numel()
+            + (0 if self.history_send is None else self.history_send.numel())
         ) * self.storage.element_size()
 
-    def prefetch(self, layer_id, kv_cache, index_cache, *, has_history):
+    def prefetch(
+        self,
+        layer_id,
+        kv_cache,
+        index_cache,
+        *,
+        has_history,
+        history_slots=None,
+        history_counts=None,
+    ):
         """Enqueue both gathers directly into the prepared receive planes."""
         if self._closed or self.layer_id is not None:
             raise RuntimeError(
@@ -935,6 +1049,26 @@ class AscendDSAPrefill:
         self.layer_id = layer_id
         self._sources = (kv_cache, index_cache)
         self._started = {128: False, 576: False}
+        if self._bounded_history:
+            if (
+                history_slots is None
+                or history_counts is None
+                or len(history_counts) != self.degree
+            ):
+                raise ValueError("Bounded Prefill needs its batch page-gather plan")
+            if (
+                history_slots.dtype != torch.int64
+                or history_slots.device != self.device
+                or history_slots.numel() != history_counts[self.rank]
+                or min(history_counts) < 0
+                or sum(history_counts) + self.history_null_rows > self.history_rows
+            ):
+                raise ValueError(
+                    "Prefill page gather exceeds the prepared history capacity"
+                )
+        self._history_slots = history_slots
+        self._history_counts = () if history_counts is None else tuple(history_counts)
+        self._history_arguments = []
         self.source_ready.record(torch.npu.current_stream(self.device))
         with torch.npu.stream(self.stream):
             self.stream.wait_event(self.source_ready)
@@ -950,6 +1084,44 @@ class AscendDSAPrefill:
                 target.record_stream(self.stream)
                 if not has_history:
                     pass
+                elif self._bounded_history:
+                    # Cache views can include singleton head/page dimensions.
+                    width = 128 if source is index_cache else 576
+                    count = self._history_counts[self.rank]
+                    packed = self.history_send[: count * width].view(count, width)
+                    torch.index_select(
+                        source.view(-1, width), 0, self._history_slots, out=packed
+                    )
+                    self._history_slots.record_stream(self.stream)
+                    receive = target[
+                        self.history_null_rows : self.history_null_rows
+                        + sum(self._history_counts)
+                    ]
+                    if self.degree == 1:
+                        receive.copy_(packed)
+                    elif sum(self._history_counts):
+                        counts = (C.c_uint64 * self.degree)(
+                            *(n * width for n in self._history_counts)
+                        )
+                        offsets = (C.c_uint64 * self.degree)(
+                            *(
+                                sum(self._history_counts[:r]) * width
+                                for r in range(self.degree)
+                            )
+                        )
+                        self._history_arguments.append((counts, offsets))
+                        self._check(
+                            self.lib.DsaCpAllGatherV(
+                                self.comm,
+                                self.stream.npu_stream,
+                                self.history_send.data_ptr(),
+                                receive.data_ptr(),
+                                packed.numel(),
+                                counts,
+                                offsets,
+                            ),
+                            "bounded AICPU AllGatherV",
+                        )
                 elif self.degree == 1:
                     target.copy_(source.view_as(target))
                 else:
@@ -1032,8 +1204,23 @@ class AscendDSAPrefill:
             ready.record(self.stream)
         self._started[width] = True
 
-    def patch(self, layer_id, slots, direct, *, width, block_rows, virtual_blocks):
-        """Commit owner cache rows and stitch pages that cannot alias receives."""
+    def patch(
+        self,
+        layer_id,
+        slots,
+        direct,
+        *,
+        slots_workspace,
+        mapped_slots=None,
+        width,
+        block_rows,
+        virtual_blocks,
+    ):
+        """Commit rows using caller-owned, main-stream int64 slot scratch.
+
+        ``slots_workspace`` must hold at least ``slots.numel()`` entries and
+        remain alive until the compute stream consumes the native commit.
+        """
         if (
             layer_id != self.layer_id
             or self._sources is None
@@ -1049,12 +1236,29 @@ class AscendDSAPrefill:
             or not direct.is_contiguous()
             or direct.device != self.device
             or direct.numel() != slots.numel()
+            or slots_workspace.dtype != torch.int64
+            or slots_workspace.device != self.device
+            or not slots_workspace.is_contiguous()
+            or slots_workspace.numel() < slots.numel()
             or block_rows <= 0
             or self.local_rows % block_rows
         ):
             raise ValueError("DSA Prefill update has incompatible slots or layout")
+        if self._bounded_history and (
+            mapped_slots is None
+            or mapped_slots.dtype != torch.int64
+            or mapped_slots.device != self.device
+            or not mapped_slots.is_contiguous()
+            or mapped_slots.numel() != slots.numel()
+        ):
+            raise ValueError(
+                "Bounded Prefill commit needs matching compact write slots"
+            )
+        self._patch_slots = mapped_slots
         # The router publishes int32 slots; the native transport ABI reads int64.
-        slots = slots.to(torch.int64)
+        committed_slots = slots_workspace[: slots.numel()]
+        committed_slots.copy_(slots)
+        slots = committed_slots
         stream = torch.npu.current_stream(self.device)
         target, cache, ready = (
             (self.index, self._sources[1], self.index_current_ready)
@@ -1065,18 +1269,26 @@ class AscendDSAPrefill:
         stream.wait_event(ready)
         for tensor in (slots, direct, target, cache):
             tensor.record_stream(stream)
+        if mapped_slots is not None:
+            mapped_slots.record_stream(stream)
         self._check(
-            self.lib.DsaCpPatch(
+            (
+                self.lib.DsaCpPatchMapped
+                if self._bounded_history
+                else self.lib.DsaCpPatch
+            )(
                 stream.npu_stream,
                 target[self.history_rows :].data_ptr(),
                 slots.data_ptr(),
                 cache.data_ptr(),
                 target.data_ptr(),
                 direct.data_ptr(),
+                *([mapped_slots.data_ptr()] if self._bounded_history else []),
                 slots.numel(),
                 self.local_rows,
                 virtual_blocks,
                 self._send_rows,
+                *([self.history_rows] if self._bounded_history else []),
                 block_rows,
                 self.degree,
                 self.rank,

@@ -116,7 +116,7 @@ class FusedDSADecode:
         self.window_tokens = layer.index_local_tokens
         self.kernels = ascend_dsa_kernels()
         self.eps_q, self.eps_kv = eps_q, eps_kv
-        self.eps_index = 1e-6
+        self.eps_index = layer.indexer.k_norm.variance_epsilon
 
         def gathered(value):
             value = value.detach().contiguous()
@@ -291,7 +291,7 @@ class AscendDSAIndexer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
-        self.k_norm = RMSNorm(self.index_head_dim, eps=1e-6)
+        self.k_norm = RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.wk = ReplicatedLinear(
             hidden_size,
             self.index_head_dim,

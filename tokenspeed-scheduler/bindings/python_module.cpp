@@ -117,17 +117,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
                std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
                std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
-               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable) {
+               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable,
+               std::int32_t checkpoint_granularity) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    attn_kind,           sliding_window_tokens, replayable,  transfer_policy,
-                    shard_count,
+                    std::move(group_id), block_granularity,      total_pages, cache_blocks_per_lcm_block,
+                    attn_kind,           sliding_window_tokens,  replayable,  transfer_policy,
+                    shard_count,         checkpoint_granularity,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
-            nb::arg("replayable") = false)
+            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -136,12 +137,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
+        .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
