@@ -36,7 +36,7 @@
 
 namespace tokenspeed {
 
-std::vector<CacheCoordinator::HostPlacementPlan::Victim> CacheCoordinator::hostKvDuplicateCandidates() const {
+std::vector<CacheCoordinator::HostKvDuplicateCandidate> CacheCoordinator::hostKvDuplicateCandidates() const {
     std::int64_t lookback_tokens = 0;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         if (!GroupIsReplayable(i) && !GroupIsState(i) && !groups_[i].Matcher().IsPrefixClosed()) {
@@ -45,13 +45,7 @@ std::vector<CacheCoordinator::HostPlacementPlan::Victim> CacheCoordinator::hostK
                                               geometry_[i].BlockGranularity());
         }
     }
-    struct Candidate {
-        std::uint32_t group_id;
-        CacheBlockLocation location;
-        std::uint64_t device_epoch;
-        std::int32_t boundary_tokens;
-    };
-    std::vector<Candidate> candidates;
+    std::vector<HostKvDuplicateCandidate> candidates;
     const std::uint64_t scan_generation = ++host_duplicate_scan_generation_;
     _assert(scan_generation != 0, "Host duplicate scan generation overflow");
     std::vector<const BoundaryTree::Node*> ancestors;
@@ -117,37 +111,34 @@ std::vector<CacheCoordinator::HostPlacementPlan::Victim> CacheCoordinator::hostK
         if (window_needs_page) {
             continue;
         }
-        ForEachBoundaryKey(
-            CacheKey{.content_hash = *node->hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
-                if (!groups_[i].Matcher().IsPrefixClosed()) {
-                    return;
-                }
-                const PrefixCacheIndex& index = groups_[i].Index();
-                const CacheBlockRef host = index.Find(*host_pool_, key);
-                if (host && host.use_count() == 2) {
-                    const auto device_location = locationOf(pool_, i, key);
-                    _assert(device_location.has_value(), "complete Device prefix lost a KV entry");
-                    candidates.push_back(Candidate{groups_[i].Id(), host->Location(),
-                                                   index.MetadataFor(pool_, *device_location)->last_access_epoch,
-                                                   node->boundary_tokens});
-                }
-            });
+        ForEachBoundaryKey(CacheKey{.content_hash = *node->hash}, /*tail_tokens=*/0,
+                           [&](std::size_t i, const CacheKey& key) {
+                               if (!groups_[i].Matcher().IsPrefixClosed()) {
+                                   return;
+                               }
+                               const PrefixCacheIndex& index = groups_[i].Index();
+                               const CacheBlockRef host = index.Find(*host_pool_, key);
+                               if (host && host.use_count() == 2) {
+                                   const CacheBlockRef device = index.Find(pool_, key);
+                                   _assert(static_cast<bool>(device), "complete Device prefix lost a KV entry");
+                                   candidates.push_back(HostKvDuplicateCandidate{
+                                       .group_id = groups_[i].Id(),
+                                       .location = host->Location(),
+                                       .device_epoch = index.MetadataFor(pool_, device->Location())->last_access_epoch,
+                                       .boundary_tokens = node->boundary_tokens,
+                                       .device_in_use = device.use_count() != 2,
+                                   });
+                               }
+                           });
     }
     // Placement keeps this order for Device copies still held by a request.
     // Unheld copies can instead compete with Host State by access epoch.
-    std::ranges::sort(candidates, [](const Candidate& lhs, const Candidate& rhs) {
+    std::ranges::sort(candidates, [](const HostKvDuplicateCandidate& lhs, const HostKvDuplicateCandidate& rhs) {
         return std::tuple{~lhs.device_epoch, lhs.boundary_tokens, lhs.group_id, lhs.location.lcm_block_id,
                           lhs.location.slot_index} < std::tuple{~rhs.device_epoch, rhs.boundary_tokens, rhs.group_id,
                                                                 rhs.location.lcm_block_id, rhs.location.slot_index};
     });
-    std::vector<HostPlacementPlan::Victim> result;
-    result.reserve(candidates.size());
-    for (const Candidate& candidate : candidates) {
-        result.push_back(HostPlacementPlan::Victim{.group_id = candidate.group_id,
-                                                   .location = candidate.location,
-                                                   .reason = &HostEvictionStats::duplicate_kv});
-    }
-    return result;
+    return candidates;
 }
 
 CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
@@ -414,23 +405,17 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         if (!added_kv_duplicates && (candidates.empty() || candidates.top().victim_class == VictimClass::kHostOnly)) {
             const auto duplicates = hostKvDuplicateCandidates();
             for (std::size_t rank = 0; rank < duplicates.size(); ++rank) {
-                const HostPlacementPlan::Victim& duplicate = duplicates[rank];
-                const PrefixCacheIndex& index = groups_[duplicate.group_id].Index();
-                const std::optional<CacheKey> key = index.KeyOf(*host_pool_, duplicate.location);
-                _assert(key.has_value(), "duplicate Host KV lost its key");
-                const CacheBlockRef device = index.Find(pool_, *key);
-                _assert(static_cast<bool>(device), "duplicate Host KV lost its Device copy");
-                const bool compare_with_state = num_state_groups_ > 0 && device.use_count() == 2;
-                const BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
-                _assert(node != nullptr, "duplicate Host KV lost its boundary");
-                candidates.push(Candidate{
-                    .victim_class = compare_with_state ? VictimClass::kHostOnly : VictimClass::kDuplicateKv,
-                    .epoch_sort_key =
-                        compare_with_state ? index.MetadataFor(pool_, device->Location())->last_access_epoch : rank,
-                    .boundary_tokens = node->boundary_tokens,
-                    .first_entry_location = duplicate.location,
-                    .reason = duplicate.reason,
-                    .duplicate_kv_group = duplicate.group_id});
+                const HostKvDuplicateCandidate& duplicate = duplicates[rank];
+                // Collection and ranking run in one control-plane call: no
+                // owner or access epoch changes between the two.
+                const bool compare_with_state = num_state_groups_ > 0 && !duplicate.device_in_use;
+                candidates.push(
+                    Candidate{.victim_class = compare_with_state ? VictimClass::kHostOnly : VictimClass::kDuplicateKv,
+                              .epoch_sort_key = compare_with_state ? duplicate.device_epoch : rank,
+                              .boundary_tokens = duplicate.boundary_tokens,
+                              .first_entry_location = duplicate.location,
+                              .reason = &HostEvictionStats::duplicate_kv,
+                              .duplicate_kv_group = duplicate.group_id});
             }
             added_kv_duplicates = true;
         }

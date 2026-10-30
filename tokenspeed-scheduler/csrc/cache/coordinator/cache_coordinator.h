@@ -847,9 +847,17 @@ private:
         std::size_t num_placed{0};
         std::vector<Victim> victims;
     };
+    struct HostKvDuplicateCandidate {
+        std::uint32_t group_id{0};
+        CacheBlockLocation location;
+        std::uint64_t device_epoch{0};
+        std::int32_t boundary_tokens{0};
+        bool device_in_use{false};
+    };
     // Unpinned Host KV copies backed by a contiguous Device KV prefix,
-    // excluding pages a sliding group can force into a Host suffix.
-    std::vector<HostPlacementPlan::Victim> hostKvDuplicateCandidates() const;
+    // excluding pages a sliding group can force into a Host suffix. Keep the
+    // Device facts read during collection for this plan's ranking.
+    std::vector<HostKvDuplicateCandidate> hostKvDuplicateCandidates() const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,

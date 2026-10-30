@@ -145,6 +145,8 @@ chain once per scan and reuses that answer for other candidates sharing it.
 The memo and traversal buffers belong to the scan: the next scan rechecks
 store completions and new tree links. This changes traversal cost without
 changing candidate eligibility or eviction order.
+Collection also keeps each candidate's Device ownership and access epoch for
+ranking in the same call, avoiding a second set of key and tree lookups.
 
 The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
 empty parents come from the pool, active parents from the live requests' block

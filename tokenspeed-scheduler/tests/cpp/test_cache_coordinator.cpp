@@ -8801,6 +8801,27 @@ TEST_F(HostKvDuplicateReclaimTest, AnOlderUnheldDeviceKvCopyLeavesBeforeNewerHos
     EXPECT_EQ(coordinator_.HostEvictions().lru.blocks, 0u);
 }
 
+TEST_F(HostKvDuplicateReclaimTest, ADeviceHeldCopyKeepsPriorityAmongUnheldCopiesAndOlderState) {
+    const std::string older = CheckpointOnHost(100, {1, 2, 3}, /*device_keeps_checkpoint=*/false);
+    PublishKvCopiesAndHostOnlyCheckpoints();
+    const CacheKey held_key = Key(hashes_[2], 0);
+    const CacheBlockRef request_history = coordinator_.GroupPrefixIndex(0).Find(pool_, held_key);
+    ASSERT_TRUE(request_history);
+    HoldFreeCapacity(host_pool_, /*spare_parents=*/0);
+
+    const auto batch = Allocate(std::array<std::uint32_t, 1>{0});
+    ASSERT_EQ(batch.stats.allocated, 1u);
+    for (const std::string& hash : hashes_) {
+        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(hash, 0)), hash != held_key.content_hash);
+    }
+    for (const std::uint32_t group : state_group_ids_) {
+        EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(older, group)));
+    }
+    EXPECT_EQ(coordinator_.HostEvictions().duplicate_kv.blocks, 1u);
+    EXPECT_EQ(coordinator_.HostEvictions().lru.blocks, 0u);
+    ExpectHostCheckpoints();
+}
+
 TEST_F(HostKvDuplicateReclaimTest, OldStateCapacityCanBeReusedByKvInTheSharedPool) {
     const std::string old = CheckpointOnHost(100, {1, 2, 3}, /*device_keeps_checkpoint=*/false);
     PublishKvCopiesAndHostOnlyCheckpoints();
