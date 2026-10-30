@@ -20,7 +20,7 @@
 
 """GFX950 DeepSeek V4.1 CSA2 indexer.
 
-Scores page-planar MXFP4 index-K with the V4 ``mfma_scaled`` e2m1 tile.
+Scores page-planar MXFP4 index-K with an ``mfma_scaled`` e2m1 tile.
 The tokenspeed-kernel adapter owns query packing, bounded query tiling, and
 selection.
 """
@@ -29,22 +29,93 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.indexer import (
-    _BLOCK_N,
-    _CHUNK_N,
-    _HEADS_PER_MFMA,
-    _PACKED_DIM,
-    _PAGE_SIZE,
-    _SCALE_DIM,
-    _indexer_mfma_layouts,
-    _load_query_group,
-)
 
 __all__ = [
     "dsv41_index_logits_gfx950",
     "launch_gluon_dsv41_index_block_select_gfx950",
     "launch_gluon_dsv41_index_topk_select_gfx950",
 ]
+
+_HEAD_DIM = 128
+_PACKED_DIM = gl.constexpr(_HEAD_DIM // 2)
+_SCALE_DIM = gl.constexpr(_HEAD_DIM // 32)
+_PAGE_SIZE = 64
+_BLOCK_N = gl.constexpr(32)
+_HEADS_PER_MFMA = gl.constexpr(16)
+_CHUNK_N = 256
+
+
+@gluon.constexpr_function
+def _indexer_mfma_layouts(NUM_WARPS: gl.constexpr):
+    mfma = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 128],
+        transposed=True,
+        warps_per_cta=[1, NUM_WARPS],
+    )
+    dot_a = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=16)
+    dot_b = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=16)
+    a_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_a, [_HEADS_PER_MFMA, _SCALE_DIM])
+    b_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_b, [_BLOCK_N, _SCALE_DIM])
+    return mfma, dot_a, dot_b, a_scale, b_scale
+
+
+@gluon.jit
+def _load_query_group(
+    q,
+    q_scales,
+    weights,
+    token,
+    head_base: gl.constexpr,
+    stride_q_token,
+    stride_q_head,
+    stride_q_scale_token,
+    stride_q_scale_head,
+    stride_w_token,
+    stride_w_head,
+    mfma_layout: gl.constexpr,
+    dot_a_layout: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+):
+    heads = gl.arange(0, _HEADS_PER_MFMA, layout=gl.SliceLayout(1, dot_a_layout))[
+        :, None
+    ]
+    packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(0, dot_a_layout))[
+        None, :
+    ]
+    q_values = gl.amd.cdna4.buffer_load(
+        ptr=q,
+        offsets=(
+            token * stride_q_token + (head_base + heads) * stride_q_head + packed_dims
+        ).to(gl.int32),
+        cache=".cg",
+    )
+
+    scale_heads = gl.arange(
+        0, _HEADS_PER_MFMA, layout=gl.SliceLayout(1, a_scale_layout)
+    )[:, None]
+    scale_groups = gl.arange(0, _SCALE_DIM, layout=gl.SliceLayout(0, a_scale_layout))[
+        None, :
+    ]
+    scales = gl.amd.cdna4.buffer_load(
+        ptr=q_scales,
+        offsets=(
+            token * stride_q_scale_token
+            + (head_base + scale_heads) * stride_q_scale_head
+            + scale_groups
+        ).to(gl.int32),
+        cache=".cg",
+    )
+    weight_heads = gl.arange(0, _HEADS_PER_MFMA, layout=gl.SliceLayout(1, mfma_layout))
+    head_weights = gl.amd.cdna4.buffer_load(
+        ptr=weights,
+        offsets=(
+            token * stride_w_token + (head_base + weight_heads) * stride_w_head
+        ).to(gl.int32),
+        cache=".cg",
+    ).to(gl.float32)
+    return q_values, scales, head_weights
+
 
 _MFMA_HEADS = 32
 

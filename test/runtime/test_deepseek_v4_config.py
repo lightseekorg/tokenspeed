@@ -23,13 +23,6 @@ from tokenspeed_kernel.numerics.torch.residual import (
     torch_mhc_post,
     torch_mhc_pre,
 )
-from tokenspeed_kernel.ops.attention.dsv4.cuda import (
-    has_indexer_topk_prefill,
-    indexer_topk_prefill,
-)
-from tokenspeed_kernel.ops.attention.dsv4.triton import (
-    dsv4_compute_global_topk_indices_and_lens,
-)
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -1368,58 +1361,6 @@ class TestDeepseekV4Config:
         assert (server_args.speculative_draft_model_path) == ("external-draft")
         assert (server_args.speculative_num_steps) == (5)
         assert (server_args.speculative_num_draft_tokens) == (6)
-
-    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
-    def test_deepseek_v4_prefill_topk_cuda_op_matches_torch_topk(self):
-        if not has_indexer_topk_prefill():
-            pytest.skip("DeepSeek V4 prefill top-k op is unavailable")
-
-        torch.manual_seed(0)
-        lengths = torch.tensor([0, 3, 17, 33], device="cuda", dtype=torch.int32)
-        logits = torch.randn((lengths.numel(), 40), device="cuda", dtype=torch.float32)
-        row_starts = torch.zeros_like(lengths)
-        out = torch.full((lengths.numel(), 8), -1, device="cuda", dtype=torch.int32)
-
-        indexer_topk_prefill(logits, row_starts, lengths, out, out.shape[-1])
-        torch.cuda.synchronize()
-
-        for row, raw_len in enumerate(lengths.cpu().tolist()):
-            selected = min(raw_len, out.shape[-1])
-            actual = out[row, :selected].sort().values.cpu()
-            if selected == 0:
-                assert torch.equal(out[row], torch.full_like(out[row], -1))
-                continue
-            expected = (
-                torch.topk(
-                    logits[row, :raw_len],
-                    k=selected,
-                    dim=-1,
-                    sorted=False,
-                )
-                .indices.sort()
-                .values.cpu()
-                .to(torch.int32)
-            )
-            assert torch.equal(actual, expected)
-            assert torch.equal(
-                out[row, selected:],
-                torch.full_like(out[row, selected:], -1),
-            )
-
-    def test_deepseek_v4_global_topk_cpu_masks_invalid_req_before_indexing(self):
-        indices, lens = dsv4_compute_global_topk_indices_and_lens(
-            topk_indices=torch.tensor([[0, 4], [0, 1]], dtype=torch.int32),
-            token_to_req_indices=torch.tensor([0, 99], dtype=torch.int32),
-            block_table=torch.tensor([[10]], dtype=torch.int32),
-            block_size=4,
-            is_valid_token=torch.tensor([True, False]),
-        )
-
-        assert torch.equal(
-            indices,
-            torch.tensor([[40, -1], [-1, -1]], dtype=torch.int32),
-        )
-        assert torch.equal(lens, torch.tensor([2, 0], dtype=torch.int32))
 
     def test_hidden_compression_reference_preserves_expected_shapes(self):
         torch.manual_seed(0)
