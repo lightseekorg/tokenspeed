@@ -1815,15 +1815,13 @@ def _stream_balanced(
     acc,
     k_cache_ptr,
     v_cache_ptr,
-    pipeline,
     NUM_STAGES: gl.constexpr,
 ):
     """Stream a balanced split, software-pipelined NUM_STAGES deep as
-    _stream_split_pipelined when ``pipeline`` is set and the split spans at
-    least one iteration, else single-buffered in the first LDS buffer.
-
-    A deliberate copy of _stream_split_pipelined with the runtime
-    ``pipeline`` choice, so the split-grid kernel stays byte-identical."""
+    _stream_split_pipelined when the split spans at least one iteration,
+    else single-buffered in the first LDS buffer: balanced splits can be
+    shorter than one iteration, which the split grid's pipelined splits
+    never are."""
     cfg = program.cfg
     k_smem = gl.allocate_shared_memory(
         k_cache_ptr.dtype.element_ty,
@@ -1837,7 +1835,7 @@ def _stream_balanced(
     )
     iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
     short = program.split_end - program.split_start < iteration_tokens
-    if short | (pipeline == 0):
+    if short:
         return _stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem.index(0), v_smem.index(0)
         )
@@ -1916,7 +1914,6 @@ def gluon_mha_decode_balanced_gfx950(
     NUM_WARPS: gl.constexpr,
     IS_FP8: gl.constexpr,
     NUM_STAGES: gl.constexpr,
-    TARGET_PROGRAMS: gl.constexpr,
 ):
     """Full-attention split of one work item of a balanced schedule; the grid
     has one program per possible item, and the ones past the last item
@@ -1972,22 +1969,11 @@ def gluon_mha_decode_balanced_gfx950(
         splits,
         split_pages,
     )
-    if NUM_WARPS == 1:
-        # A one-wave work-group computes every page itself, and the
-        # pipeline's extra per-page instructions cost more than the latency
-        # they hide once two work-groups per CU stream the KV. Pipeline only
-        # while the items leave CUs with at most one work-group, or for
-        # splits of 32 pages or more, which spend longest waiting on loads.
-        long_split = program.split_end - program.split_start >= 32 * PAGE_SIZE
-        pipeline = (num_items * 2 <= TARGET_PROGRAMS) | long_split
-    else:
-        # Every multi-wave work-group pipelines.
-        pipeline = True
     if item < num_items:
         q = program.load_q()
         m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
         m_i, l_i, acc = _stream_balanced(
-            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, pipeline, NUM_STAGES
+            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
         # The row block's partials follow its first item, at its share of
         # the request's slots times row blocks.
@@ -2297,7 +2283,6 @@ def launch_gluon_mha_decode_balanced_gfx950(
         num_warps,
         is_fp8,
         _BALANCED_STAGES,
-        _BALANCED_TARGET_PROGRAMS,
         num_warps=num_warps,
         **sched_compile_options(),
     )

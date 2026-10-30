@@ -1350,9 +1350,8 @@ to `mha_decode_with_kvcache`, which then selects
   pages, share one XCD's L2. Splits are bounded by the live `cache_seqlens`
   and a request's last split runs to its end, so a schedule older than the
   lengths (a drafter's steps) still covers every key.
-- Page loads pipeline two deep. A one-wave work-group pipelines only while
-  the items leave each CU at most one work-group or its split spans 32 pages
-  or more; multi-wave work-groups always do.
+- Page loads pipeline two deep in every split of at least one pipeline
+  iteration.
 - The reduce finds a row's partials from its request's first slot and split
   count, stored next to each other, and loads them 16 bytes per lane in one
   tile of 16 or 64 splits. A row without keys merges to its sink alone.
