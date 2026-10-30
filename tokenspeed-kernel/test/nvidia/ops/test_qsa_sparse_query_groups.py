@@ -30,8 +30,12 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 
 def _require_blackwell() -> None:
-    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
-        pytest.skip("grouped QSA requires NVIDIA SM100 or SM103")
+    if current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+        ArchVersion(10, 7),
+    ):
+        pytest.skip("grouped QSA requires NVIDIA SM100, SM103, or SM107")
 
 
 @pytest.mark.parametrize(

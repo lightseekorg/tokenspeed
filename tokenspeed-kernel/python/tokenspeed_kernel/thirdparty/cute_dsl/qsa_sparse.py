@@ -29,6 +29,8 @@
 
 """Blackwell QSA attention with grouped query and KV operand reuse."""
 
+from functools import lru_cache
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -39,9 +41,9 @@ from tokenspeed_kernel.thirdparty.cute_dsl._qsa_sparse.common import (
     _SELECTED_WIDTH,
     _SMALL_MAX_CLUSTERS,
     _can_group_six_queries,
+    _head_tile_for_geometry,
     _num_splits,
     _scalar,
-    _select_head_tile,
     _select_launch_config,
     _sm_count,
     _to_tvm_meta,
@@ -91,7 +93,35 @@ def _query_head_tile(heads_per_kv: int, head_tile: int, bf16_kv: bool) -> int:
     # Native 48/72/96 tiles pack twelve real heads per query without padding.
     if head_tile in (48, 72, 96):
         return heads_per_kv
-    return _select_head_tile(heads_per_kv, bf16_kv, 1)
+    return _head_tile_for_geometry(heads_per_kv, bf16_kv, 1)
+
+
+@lru_cache(maxsize=None)
+def _is_sm107(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) == (10, 7)
+
+
+def _select_head_tile(
+    heads_per_kv: int,
+    bf16_kv: bool,
+    query_group: int,
+    *,
+    rows: int,
+    kv_heads: int,
+    sm_count: int,
+    device: int,
+) -> int:
+    """Select the launch tile, keeping query packing independent of grid policy."""
+    if (
+        not bf16_kv
+        and heads_per_kv == 12
+        and rows * kv_heads >= sm_count
+        and _is_sm107(device)
+    ):
+        # Cover twelve heads with one gather/conversion stream once the
+        # unsplit grid has at least one tile per SM. Smaller grids keep tile8.
+        return 16
+    return _head_tile_for_geometry(heads_per_kv * query_group, bf16_kv, query_group)
 
 
 def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, device):
@@ -99,7 +129,15 @@ def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, dev
     query_group = _query_group_size(
         rows, kv_heads, heads_per_kv, max_seqlen_q, bf16_kv, sm_count
     )
-    head_tile = _select_head_tile(heads_per_kv * query_group, bf16_kv, query_group)
+    head_tile = _select_head_tile(
+        heads_per_kv,
+        bf16_kv,
+        query_group,
+        rows=rows,
+        kv_heads=kv_heads,
+        sm_count=sm_count,
+        device=device,
+    )
     head_tiles_per_row = kv_heads * cute.ceil_div(heads_per_kv, head_tile)
     query_rows_per_cta, kv_splits, smem_slots, async_ready = _select_launch_config(
         rows,
