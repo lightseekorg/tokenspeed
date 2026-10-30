@@ -43,7 +43,9 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (  # noqa: E402
+    launch_gluon_mha_decode_balanced_gfx950,
     launch_gluon_mha_decode_gfx950,
+    launch_gluon_mha_decode_schedule_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (  # noqa: E402
     launch_gluon_mha_extend_gfx950,
@@ -319,6 +321,58 @@ def test_prefill_matches_reference_on_random_fp8(window_left, head_dim):
         sinks=None,
     )
     assert _rel_l2(out, expected) < RANDOM_INPUT_REL_L2
+
+
+@pytest.mark.parametrize("max_seqlen_q", [1, 8], ids=["decode", "verify"])
+def test_balanced_decode_matches_reference_on_random_fp8(max_seqlen_q):
+    """The balanced-schedule decode on an FP8 cache with sinks: 9 long
+    requests among 7 padding ones (one page each), as a padded graph batch
+    holds them."""
+    lengths = [(48 + 13 * i) * PAGE_SIZE + 5 * i for i in range(9)]
+    lengths += [max_seqlen_q] * 7
+    pages = [-(-length // PAGE_SIZE) for length in lengths]
+    k_cache = _random_fp8(sum(pages), PAGE_SIZE, KV_HEADS, 64, scale=1.0, seed=1)
+    v_cache = _random_fp8(sum(pages), PAGE_SIZE, KV_HEADS, 64, scale=1.0, seed=2)
+    q = _random_fp8(len(lengths) * max_seqlen_q, Q_HEADS, 64, scale=2.0, seed=3)
+    sinks = torch.randn(
+        Q_HEADS,
+        device="cuda",
+        generator=torch.Generator(device="cuda").manual_seed(4),
+    )
+    page_table = torch.zeros(len(lengths), max(pages), dtype=torch.int32, device="cuda")
+    physical = torch.randperm(sum(pages), generator=torch.Generator().manual_seed(5))
+    start = 0
+    for row, count in enumerate(pages):
+        page_table[row, :count] = physical[start : start + count].to(page_table)
+        start += count
+    cache_seqlens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    schedule = launch_gluon_mha_decode_schedule_gfx950(
+        q, k_cache, cache_seqlens, max_seqlen_q=max_seqlen_q, window_left=-1, out=None
+    )
+    out = launch_gluon_mha_decode_balanced_gfx950(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=1 << 20,
+        max_seqlen_q=max_seqlen_q,
+        sinks=sinks,
+        schedule=schedule,
+    )
+    for row, length in enumerate(lengths):
+        rows = slice(row * max_seqlen_q, (row + 1) * max_seqlen_q)
+        request_pages = page_table[row, : pages[row]].long()
+        expected, _ = torch_dense_attention(
+            q[rows],
+            k_cache[request_pages].flatten(0, 1)[:length],
+            v_cache[request_pages].flatten(0, 1)[:length],
+            scale=64**-0.5,
+            causal_offset=length - max_seqlen_q,
+            window_left=None,
+            sinks=sinks,
+        )
+        assert _rel_l2(out[rows], expected) < RANDOM_INPUT_REL_L2
 
 
 @pytest.mark.parametrize("scale", ["q_scale", "k_scale", "v_scale"])
