@@ -115,15 +115,30 @@ def test_block_verification_refuses_unvalidated_execution_modes(changes):
         _args(**kwargs)
 
 
-def test_block_verification_refuses_forced_acceptance():
-    with pytest.raises(
-        ValueError,
-        match="synthetic-acceptance-length requires --sampling-backend greedy",
-    ):
+def test_block_verification_accepts_synthetic_benchmark_acceptance():
+    args = _args(
+        speculative_algorithm="DSPARK",
+        enable_block_rejection=True,
+        synthetic_acceptance_length=3.36,
+    )
+    assert args.enable_block_rejection and args.enable_speculative_sampling
+    assert args.synthetic_acceptance_length == 3.36
+    assert args.sampling_backend == "flashinfer"
+
+
+def test_flashinfer_synthetic_acceptance_requires_block_verification():
+    # Plain draft-prob verify keeps synthetic acceptance on the greedy backend.
+    with pytest.raises(ValueError, match="flashinfer with --enable-block-rejection"):
+        _args(synthetic_acceptance_length=2.0)
+
+
+def test_block_verification_synthetic_acceptance_keeps_its_refusals():
+    with pytest.raises(ValueError, match="enable-output-logprobs"):
         _args(
             speculative_algorithm="DSPARK",
             enable_block_rejection=True,
             synthetic_acceptance_length=3.36,
+            enable_output_logprobs=True,
         )
 
 

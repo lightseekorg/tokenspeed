@@ -97,7 +97,6 @@ def test_verify_reads_decode_rows_own_coins():
     )
 
     config = SamplingBackendConfig(
-        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
@@ -182,7 +181,6 @@ def test_mixed_round_preserves_prefill_outputs():
     )
 
     config = SamplingBackendConfig(
-        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
@@ -265,7 +263,6 @@ def test_mixed_round_preserves_prefill_logprobs():
     from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
 
     config = SamplingBackendConfig(
-        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
@@ -370,7 +367,6 @@ def test_mixed_round_takes_fused_argmax_ids():
     from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
 
     config = SamplingBackendConfig(
-        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",

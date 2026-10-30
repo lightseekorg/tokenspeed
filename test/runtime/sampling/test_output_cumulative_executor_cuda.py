@@ -58,7 +58,6 @@ def _executor(*, enabled, drafter):
         SamplingBackendConfig(
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
-            enable_block_rejection=False,
             sampling_stream="per-request",
             logprob_order="torch",
             enable_output_logprobs=True,
