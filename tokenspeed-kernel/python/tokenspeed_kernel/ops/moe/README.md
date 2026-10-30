@@ -114,11 +114,11 @@ and fills the lookup table per expert instead of searching per tile.
 ### Fused SM90 gated FC1
 
 The private `optimized` mode fuses eligible block-FP8 SwiGLU calls with
-hidden size 512, intermediate size 1024, at most 256 input rows, and a positive
-`expected_m < 32`. Bias, LoRA, AWQ, min-latency mode, and a separate FC2 FP8
-quantization scale retain their existing paths. The supported paired tile has
-128 output channels per half and at most 32 token rows; other shapes retain the
-existing execution path.
+hidden size 512, intermediate size 1024, at most 256 input rows, and an
+`expected_m` value that is positive and less than 32. Bias, LoRA, AWQ,
+min-latency mode, and a separate FC2 FP8 quantization scale retain their
+existing paths. The supported paired tile has 128 output channels per half and
+at most 32 token rows; other shapes retain the existing execution path.
 
 A paired tile computes matching gate/up blocks and applies SwiGLU and 1x128
 FP8 quantization before writing its output. Both existing BF16 rounding points
