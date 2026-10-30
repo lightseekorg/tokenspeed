@@ -1177,12 +1177,19 @@ class ModelExecutor:
                 else ib.positions_buf[rows]
             )
             with active_forward(ctx):
-                self.model_runner.forward(
+                output = self.model_runner.forward(
                     ctx=ctx,
                     input_ids=ib.input_ids_buf[rows],
                     positions=positions,
                     **self._model_input_kwargs(num_tokens, ctx.bs, rows),
                 )
+            # Prefill sampling runs eagerly; its kernels follow each batch's
+            # sampling parameters. Mid-pipeline stages return no logits.
+            if (
+                isinstance(output, LogitsProcessorOutput)
+                and output.next_token_logits is not None
+            ):
+                self.sampling_backend.warmup_sample_kernels(output.next_token_logits)
             if self.drafter is not None:
                 self._autotune_draft_experts(num_tokens)
             if self.drafter is not None and not self.config.prefill_only:

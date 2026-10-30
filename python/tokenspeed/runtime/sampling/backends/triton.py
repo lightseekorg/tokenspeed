@@ -80,6 +80,8 @@ _COMPACT_GUMBEL_VOCAB_MAX = 32768
 _TOP_K_TOP_P_SMALL_BLOCK_SIZE = 1024
 _TOP_K_TOP_P_TUNED_VOCAB_MAX = 32768
 _TOP_K_TOP_P_PAD = 128
+# The top-k pads a step can pick: 64 when every finite top_k fits, else 128.
+_TOP_K_TOP_P_PADS = (64, _TOP_K_TOP_P_PAD)
 _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE = 1024
 _TOP_P_PARALLEL_SAMPLE_ATTEMPTS = 3
 _TOP_P_PARALLEL_VERIFY_ATTEMPTS = 4
@@ -370,8 +372,8 @@ class TritonSamplingBackend(SamplingBackend):
             for sp in sampling_params_list
             if int(sp.top_k) != _TOP_K_DISABLED
         ]
-        if finite_top_ks and max(finite_top_ks) <= 64:
-            return 64
+        if finite_top_ks and max(finite_top_ks) <= _TOP_K_TOP_P_PADS[0]:
+            return _TOP_K_TOP_P_PADS[0]
         return _TOP_K_TOP_P_PAD
 
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
@@ -473,11 +475,35 @@ class TritonSamplingBackend(SamplingBackend):
         # captures. Equivalence to argmax is pinned by
         # test_greedy_route_equivalence.py.
         offsets_pool = self._prepare_sampling_offsets(sampling_info)
-        bs = logits.shape[0]
         req_pool_indices = self._req_pool_indices_for_kernels(
-            sampling_info.req_pool_indices, bs
+            sampling_info.req_pool_indices, logits.shape[0]
         )
-        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
+        batch_next_token_ids = self._sample_rows(
+            logits,
+            req_pool_indices,
+            offsets_pool,
+            route=self._sample_route,
+            top_k_pad=self._top_k_top_p_pad,
+        )
+
+        sampled = batch_next_token_ids.to(torch.int32)
+        self.maybe_broadcast(sampled)
+
+        self._write_logprob_outputs(logits_output, logits, sampled)
+
+        return sampled, self._ones_buf[: logits.shape[0]]
+
+    def _sample_rows(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        route: int,
+        top_k_pad: int,
+    ) -> torch.Tensor:
+        """One Gumbel draw per logits row through ``route``."""
+        bs = logits.shape[0]
+        if route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
             if logits.shape[1] <= _COMPACT_GUMBEL_VOCAB_MAX:
                 batch_next_token_ids = gumbel_sample_from_pools_compact(
                     logits,
@@ -499,7 +525,7 @@ class TritonSamplingBackend(SamplingBackend):
                     self._gumbel_local_scores[:bs],
                     self._gumbel_out[:bs],
                 )
-        elif self._sample_route in (
+        elif route in (
             _SAMPLE_ROUTE_GUMBEL_TOP_K,
             _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
         ):
@@ -515,9 +541,9 @@ class TritonSamplingBackend(SamplingBackend):
                 self._topk_candidate_logits[:bs],
                 self._gumbel_out[:bs],
                 block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
-                top_k_pad=self._top_k_top_p_pad,
+                top_k_pad=top_k_pad,
             )
-        elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
+        elif route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
             batch_next_token_ids = gumbel_sample_top_p_parallel_from_pools(
                 logits,
                 req_pool_indices,
@@ -552,13 +578,41 @@ class TritonSamplingBackend(SamplingBackend):
                 offsets_pool,
                 self._gumbel_out[:bs],
             )
+        return batch_next_token_ids
 
-        sampled = batch_next_token_ids.to(torch.int32)
-        self.maybe_broadcast(sampled)
+    def warmup_sample_kernels(self, logits: torch.Tensor) -> None:
+        """Compile sample()'s kernels for every route and top-k pad.
 
-        self._write_logprob_outputs(logits_output, logits, sampled)
-
-        return sampled, self._ones_buf[: logits.shape[0]]
+        Eager prefill sampling picks its route and top-k pad from the
+        batch's sampling parameters, and graph capture only covers decode,
+        so a later request would otherwise compile them while serving. Runs
+        one row of ``logits`` (real logits, so the dtype and row stride
+        match serving) on the padding slot 0.
+        """
+        rows = logits[:1]
+        req_pool_indices = self._req_pool_indices_i32[:1].zero_()
+        assert self._sampling_offsets_pool is not None
+        for route in (
+            _SAMPLE_ROUTE_GUMBEL_GENERIC,
+            _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+            _SAMPLE_ROUTE_GUMBEL_TOP_P,
+        ):
+            self._sample_rows(
+                rows,
+                req_pool_indices,
+                self._sampling_offsets_pool,
+                route=route,
+                top_k_pad=_TOP_K_TOP_P_PAD,
+            )
+        for route in (_SAMPLE_ROUTE_GUMBEL_TOP_K, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P):
+            for top_k_pad in _TOP_K_TOP_P_PADS:
+                self._sample_rows(
+                    rows,
+                    req_pool_indices,
+                    self._sampling_offsets_pool,
+                    route=route,
+                    top_k_pad=top_k_pad,
+                )
 
     def _sample_verify_targets(
         self,

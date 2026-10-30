@@ -223,6 +223,11 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
     def reset_capture_state(self) -> None:
         self._counts[0].fill_(0)
 
+    def warmup_sample_kernels(self, logits: torch.Tensor) -> None:
+        # sample() here picks among its own full-logits kernels (penalties,
+        # min_p), not the parent's sample routes; they are not warmed yet.
+        pass
+
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         # The penalty history and bias beside the parent's scalars: a restored
         # request's penalties continue from the tokens it had produced.

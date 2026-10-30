@@ -559,6 +559,11 @@ class SamplingBackend(ABC):
         Called from prepare_step on flip. Stateful backends override."""
         raise NotImplementedError
 
+    def warmup_sample_kernels(self, logits: torch.Tensor) -> None:
+        """Compile the kernels sample() may pick per batch, on one row of
+        ``logits``, at startup. Backends whose sample() picks kernels per
+        batch override this. Default: no-op."""
+
     def reset_capture_state(self) -> None:
         """Clear any per-pool state that warm-up iterations may have dirtied
         before CUDA graph capture. Warm-up runs sample()/verify() against
