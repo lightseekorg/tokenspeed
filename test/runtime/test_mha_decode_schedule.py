@@ -225,11 +225,11 @@ def test_balanced_variant_needs_a_long_context_target():
     # little to share.
     assert backend.decode_kernel_variants(254) == (DECODE_VARIANT_BALANCED,)
     assert backend.decode_kernel_variants(255) == ()
-    assert backend.select_decode_kernel_variant([1000, 3, 1, 1]) == (
+    assert backend.prefer_decode_kernel_variant([1000, 3, 1, 1]) == (
         DECODE_VARIANT_BALANCED
     )
-    assert backend.select_decode_kernel_variant([1000] * 4) is None
-    assert backend.select_decode_kernel_variant([100, 3, 1, 1]) is None
+    assert backend.prefer_decode_kernel_variant([1000] * 4) is None
+    assert backend.prefer_decode_kernel_variant([100, 3, 1, 1]) is None
     assert _Step(width=8, context=8192).backend.decode_kernel_variants(4) == ()
     assert _Step(width=1, is_draft=True).backend.decode_kernel_variants(4) == ()
 

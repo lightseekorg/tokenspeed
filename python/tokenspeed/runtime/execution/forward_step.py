@@ -913,6 +913,8 @@ class ForwardStepRunner:
                 ForwardMode.DECODE,
                 block_tables=tables,
                 num_tokens=bs * self.max_tokens_per_req,
+                # Drafters run the default decode kernels.
+                decode_kernel_variant=None,
             )
             # Block drafters (DFLASH) re-run the unified refresh inside their
             # step loop with this round's tables; capture warm-ups run that
@@ -974,6 +976,7 @@ class ForwardStepRunner:
                 block_tables=block_tables,
                 for_graph_replay=use_graph,
                 num_tokens=padded_bs * self.max_tokens_per_req,
+                decode_kernel_variant=None,
             )
             # Block drafters re-run the same refresh inside their step loop;
             # hand them this round's tables (dies with the drafter-side
@@ -1039,6 +1042,7 @@ class ForwardStepRunner:
                 forward_mode=ForwardMode.DECODE,
                 num_extends=num_extends,
                 block_tables=kwargs.get("block_tables"),
+                decode_kernel_variant=None,
             )
             self.drafter.round_block_tables = kwargs.get("block_tables")
 

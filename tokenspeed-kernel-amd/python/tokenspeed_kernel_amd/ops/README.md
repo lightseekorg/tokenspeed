@@ -1331,17 +1331,13 @@ cache lengths.
 
 #### Balanced split schedule
 
-Under a captured graph the split count above comes from the padded batch and
-the model's context limit, so a batch of a few long requests among short or
-padding ones gives every request the same split count, and the long
-requests' work-groups run alone while CUs idle. `mha_decode_schedule_policy`
-(`supports_`/`prefers_gluon_mha_decode_balanced_gfx950`) decides on the host,
-from each request's page count, when a balanced schedule beats it; the caller
-then computes one per step with
-`mha_decode_schedule` (`gluon_mha_decode_schedule_gfx950`, one wave) and
-passes it to `mha_decode_with_kvcache`, which then selects
-`gluon_mha_decode_balanced_gfx950` and its reduce,
-`gluon_mha_decode_balanced_reduce_gfx950`.
+Under graphs the split count above follows the padded batch, so a few long
+requests among short ones leave CUs idle. `mha_decode_schedule_policy`
+(`supports_`/`limits_`/`prefers_gluon_mha_decode_balanced_gfx950`) decides on
+the host, from each request's page count, when a balanced schedule pays; the
+caller computes one per step with `mha_decode_schedule` and passes it to
+`mha_decode_with_kvcache`, which then selects
+`gluon_mha_decode_balanced_gfx950` and its reduce.
 
 - Full attention only. Every split covers the same number of pages, the
   fewest whose work items fit 512 (two per CU), at least 2 and at most 128

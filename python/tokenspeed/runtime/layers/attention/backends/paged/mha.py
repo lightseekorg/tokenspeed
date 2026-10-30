@@ -365,7 +365,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             return ()
         return (DECODE_VARIANT_BALANCED,)
 
-    def select_decode_kernel_variant(self, pages) -> str | None:
+    def prefer_decode_kernel_variant(self, pages) -> str | None:
         if not self.decode_kernel_variants(len(pages)):
             return None
         return DECODE_VARIANT_BALANCED if self._policy().prefers(pages) else None

@@ -801,7 +801,7 @@ class CacheGroupRouter(AttentionBackend):
             # spreads over intra-op threads, which costs milliseconds.
             blocks = np.count_nonzero(table[:actual_bs].numpy() >= 0, axis=1)
             # Padding requests replay at one page.
-            variant = leaf.select_decode_kernel_variant(
+            variant = leaf.prefer_decode_kernel_variant(
                 (blocks * pages_per_block).tolist() + [1] * (bs - actual_bs)
             )
             if variant is None or choice not in (None, variant):

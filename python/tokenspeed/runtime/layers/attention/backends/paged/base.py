@@ -393,7 +393,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         selection then."""
         return 0
 
-    def select_decode_kernel_variant(self, pages: Sequence[int]) -> str | None:
+    def prefer_decode_kernel_variant(self, pages: Sequence[int]) -> str | None:
         """This leaf's decode kernel variant for a step whose requests hold
         ``pages`` of its kernel pages each (an upper bound from the host
         tables; a padding request counts one), or None for the default."""

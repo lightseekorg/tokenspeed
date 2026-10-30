@@ -2153,16 +2153,6 @@ def gluon_mha_decode_balanced_reduce_gfx950(
     cdna4.buffer_store(output.to(out_ptr.dtype.element_ty), out_ptr, out_base + offs_d)
 
 
-def _balanced_row_blocks(
-    q: torch.Tensor, k_cache: torch.Tensor, max_seqlen_q: int
-) -> int:
-    num_kv_heads = k_cache.shape[2]
-    block_m, _ = _row_tile(max_seqlen_q, q.shape[1] // num_kv_heads)
-    return num_kv_heads * math.ceil(
-        max_seqlen_q * (q.shape[1] // num_kv_heads) / block_m
-    )
-
-
 def launch_gluon_mha_decode_schedule_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2203,7 +2193,7 @@ def launch_gluon_mha_decode_schedule_gfx950(
             cache_seqlens,
             out,
             num_requests,
-            _balanced_row_blocks(q, k_cache, max_seqlen_q),
+            _balanced_row_blocks_of(q.shape[1], k_cache.shape[2], max_seqlen_q),
             k_cache.shape[1],
             _BALANCED_TARGET_PROGRAMS,
             _BALANCED_MIN_SPLIT_PAGES,
@@ -2246,13 +2236,19 @@ def launch_gluon_mha_decode_balanced_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     *,
-    schedule: torch.Tensor | None = None,
+    schedule: torch.Tensor,
 ) -> torch.Tensor:
     """Full-attention paged decode split by a balanced schedule from
     launch_gluon_mha_decode_schedule_gfx950 (see Balanced Split Schedule);
-    arguments otherwise as launch_gluon_mha_decode_gfx950. ``max_seqlen_k``
-    does not size anything."""
-    del max_seqlen_k, logit_cap, return_lse
+    arguments otherwise as launch_gluon_mha_decode_gfx950."""
+    # The schedule sizes the splits from the lengths; max_seqlen_k (the
+    # split grid's sizing input) has nothing to size here.
+    del max_seqlen_k
+    if logit_cap != 0.0 or return_lse:
+        raise ValueError(
+            "gluon_mha_decode_balanced_gfx950 supports neither logit_cap nor "
+            f"return_lse, got logit_cap={logit_cap}, return_lse={return_lse}"
+        )
     reject_block_scales(
         "gluon_mha_decode_balanced_gfx950",
         q_scale=q_scale,
@@ -2261,11 +2257,6 @@ def launch_gluon_mha_decode_balanced_gfx950(
     )
     if window_left >= 0:
         raise ValueError("gluon_mha_decode_balanced_gfx950 serves full attention only")
-    if schedule is None:
-        raise ValueError(
-            "gluon_mha_decode_balanced_gfx950 reads a split schedule "
-            "(launch_gluon_mha_decode_schedule_gfx950)"
-        )
     num_requests = q.shape[0] // max_seqlen_q
     _check_schedule(schedule, num_requests)
     head_dim = q.shape[2]
