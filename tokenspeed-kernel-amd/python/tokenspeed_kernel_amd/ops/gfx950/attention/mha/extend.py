@@ -363,17 +363,12 @@ class ExtendProgram:
     def load_page_indices(self, start_n, last_page, count: gl.constexpr):
         """Physical pages of the count pages starting at token start_n.
 
-        Pages past last_page repeat it instead of being masked: a masked copy
-        compiles to a scalar branch around the buffer_load, and after it the
-        compiler cannot count the wave's outstanding loads, so it waits for
-        all of them (s_waitcnt vmcnt(0)), prefetched pages included. The
-        repeated page was just loaded and hits in L2. Every lane loads all
-        count entries, so selecting one needs no cross-lane traffic, and with
-        the page table read-only (tl.const) these are scalar loads (s_load).
-        Those are counted by lgkmcnt rather than vmcnt, so reading them does
-        not wait for the page copies. The compiler moves these scalar loads
-        down to their use, so each costs a scalar-cache round trip but never
-        waits for the copies.
+        Pages past last_page repeat it (an L2 hit): a masked copy becomes a
+        branch after which the compiler waits for every outstanding load
+        (s_waitcnt vmcnt(0)). Every lane loads all count entries of the
+        read-only (tl.const) table, so these are scalar loads (s_load), counted
+        by lgkmcnt and never waiting for the page copies. Each costs a
+        scalar-cache round trip at its use.
         """
         cfg = self.cfg
         layout: gl.constexpr = gl.BlockedLayout([count], [64], [cfg.NUM_WARPS], [0])
@@ -417,12 +412,8 @@ class ExtendProgram:
 
     @gluon.jit
     def issue_load_kv(self, physical_page, tile_offsets, k_smem, v_smem):
-        """Copy one page of K and V into LDS as one async group each.
-
-        A buffer descriptor must be in SGPRs. The page index already is: it
-        comes from a scalar load of the read-only page table (see
-        load_page_indices), so the descriptor needs no v_readfirstlane.
-        """
+        """Copy one page of K and V into LDS as one async group each. The page
+        index is already in an SGPR from its scalar load."""
         self.load_page_to_shared(self.k_cache_ptr, physical_page, tile_offsets, k_smem)
         async_copy.commit_group()
         self.load_page_to_shared(self.v_cache_ptr, physical_page, tile_offsets, v_smem)
@@ -634,16 +625,10 @@ def _stream_kv(
 ):
     """Attend this tile's rows to the keys in [kv_start, kv_end).
 
-    The K/V page loads are software-pipelined NUM_STAGES deep: page
-    p + NUM_STAGES - 1 is copied into the LDS buffer page p - 1 freed while
-    page p is consumed, so each wave keeps NUM_STAGES - 1 pages of loads
-    outstanding and the stream is not bound by one memory round trip per
-    page. Each loop iteration consumes NUM_STAGES pages, one per buffer.
-    Page indices are scalar loads, so reading them does not wait for the
-    prefetched copies; the compiler moves them down to their use, so each
-    costs a scalar-cache round trip (see load_page_indices). Single-buffered
-    (NUM_STAGES == 1, or a range with fewer pages than buffers), each page's
-    index is loaded just before its copies.
+    K/V page loads are pipelined NUM_STAGES deep: page p + NUM_STAGES - 1 is
+    copied into the buffer page p - 1 freed while page p is consumed. Each
+    iteration consumes NUM_STAGES pages, one per buffer. NUM_STAGES == 1, or a
+    range with fewer pages than buffers, is single-buffered.
     """
     cfg = program.cfg
     k_smem = gl.allocate_shared_memory(
@@ -1081,13 +1066,13 @@ _EXTEND_STAGES = 4
 # head dim 128 (128 KB) would leave one workgroup per CU and stays
 # single-buffered.
 _EXTEND_PIPELINE_MAX_LDS_BYTES = 64 * 1024
-# Resident workgroups per CU at head dim 64, from the gfx950 ISA of the
-# 4-wave, 128-row tile: two pipelined (LDS-bound). Single-buffered, the unsplit
-# kernel uses 167 VGPRs, so a SIMD's 512 hold three of its waves: three
-# workgroups. The split kernel's 169 round up past 512 / 3, leaving two, no
-# more than pipelined. On MI355X with 16 query / 2 KV heads over a 131k prefix,
-# unsplit grids of 640 and 768 workgroups ran 5% faster single-buffered, and
-# grids of 512 and 1024 7% faster pipelined.
+# Resident workgroups per CU at head dim 64 (4-wave, 128-row tile): two
+# pipelined (LDS-bound); single-buffered, three for the unsplit kernel and two
+# for the split kernel. VGPRs are allocated in groups of 8 (CDNA4 ISA 3.6.4):
+# the unsplit kernel's 167 round to 168, so three waves fit a SIMD's 512; the
+# split kernel's 169 round to 176. MI355X, 16 query / 2 KV heads over a 131k
+# prefix: unsplit grids of 640 and 768 workgroups ran 5% faster
+# single-buffered, 512 and 1024 7% faster pipelined.
 _EXTEND_PIPELINED_WORKGROUPS_PER_CU = 2
 _EXTEND_SINGLE_WORKGROUPS_PER_CU = 3
 

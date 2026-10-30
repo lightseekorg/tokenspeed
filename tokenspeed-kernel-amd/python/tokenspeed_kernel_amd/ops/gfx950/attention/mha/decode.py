@@ -363,15 +363,11 @@ class AttentionProgram:
     def load_page_indices(self, start_n, count: gl.constexpr):
         """Physical pages of the count pages starting at token start_n.
 
-        Pages past the split repeat its last page instead of being masked: a
-        masked copy compiles to a scalar branch around the buffer_load, and
-        after it the compiler cannot count the wave's outstanding loads, so
-        it waits for all of them (s_waitcnt vmcnt(0)), prefetched pages
-        included. The repeated page was just loaded and hits in L2. An empty
-        split reads the row's first entry; select_page replaces it with page
-        0 for a row without cached tokens. vmcnt retires a wave's loads in
-        issue order, so reading this result waits for every load issued
-        before it; the caller loads indices well before it reads them.
+        Pages past the split repeat its last page (an L2 hit): a masked copy
+        becomes a branch after which the compiler waits for every outstanding
+        load (s_waitcnt vmcnt(0)). An empty split reads the row's first entry;
+        select_page maps a row without cached tokens to page 0. vmcnt retires
+        in issue order, so the caller loads indices well before reading them.
         """
         cfg = self.cfg
         layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
@@ -380,21 +376,14 @@ class AttentionProgram:
             self.split_start < self.split_end, (self.split_end - 1) // cfg.PAGE_SIZE, 0
         )
         page_index = gl.minimum(start_n // cfg.PAGE_SIZE + offs, last_page)
-        # Each lane loads one entry (lane % count), so the address differs
-        # across lanes and this stays a vector load, retired in issue order
-        # with the page copies by the vmcnt waits the loop already makes. If
-        # every lane loaded every entry, the read-only (tl.const) table would
-        # compile to scalar loads (s_load). Those can return out of order, so
-        # the only usable wait for them is lgkmcnt(0) (CDNA4 ISA 4.4, 8.3). The
-        # compiler places it just before the copies that need the index, so
-        # each copy waits out a scalar-load round trip: 1-3% slower on long
-        # pipelined splits (MI355X).
-        # The page table is read-only (tl.const), so the compiler may also move
-        # an ordinary load of it down past the page copies issued after it,
-        # into the block that first reads it; reading it would then wait for
-        # those copies. A volatile load stays where it is issued. Volatile also
-        # makes the load skip the CU and L2 caches (sc0 sc1); loading two
-        # iterations ahead hides the extra latency.
+        # One entry per lane keeps this a vector load, retired in issue order
+        # with the copies by the loop's vmcnt waits. Uniform addresses into the
+        # tl.const table would compile to s_load, which can only be waited on
+        # with lgkmcnt(0) (CDNA4 ISA 4.4, 8.3), placed just before each copy:
+        # 1-3% slower on long pipelined splits (MI355X). Because the table is
+        # tl.const, the compiler may sink a plain load below the copies;
+        # volatile keeps it where it is issued, and its cache bypass (sc0 sc1)
+        # is hidden by loading two iterations ahead.
         return gl.load(
             self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index,
             volatile=True,
@@ -455,12 +444,9 @@ class AttentionProgram:
     @gluon.jit
     def issue_load_kv(self, physical_page, tile_offsets, k_smem, v_smem):
         """Copy one page of K and V into LDS as a single async group."""
-        # The page is in a VGPR because load_page_indices keeps it a vector
-        # load (see there). v_readfirstlane moves it into an SGPR at the copy.
-        # Left in a VGPR, the page could differ across lanes for all the
-        # compiler knows, and a buffer descriptor must be in SGPRs, so it would
-        # wrap each copy in a loop that issues it once per distinct lane value
-        # (readfirstlane, compare, exec mask).
+        # load_page_indices leaves the page in a VGPR. A buffer descriptor
+        # must be in SGPRs; without v_readfirstlane the compiler would wrap each
+        # copy in a loop over distinct lane values.
         physical_page = wave_uniform_i32(physical_page)
         self.load_page_to_shared(self.k_cache_ptr, physical_page, tile_offsets, k_smem)
         self.load_page_to_shared(self.v_cache_ptr, physical_page, tile_offsets, v_smem)
@@ -677,13 +663,10 @@ def _stream_split_pipelined(
     program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES: gl.constexpr
 ):
     cfg = program.cfg
-    # Software-pipelined K/V page loads, NUM_STAGES deep: page p + NUM_STAGES - 1
-    # is copied into the LDS buffer page p - 1 freed while page p is consumed,
-    # so a wave keeps NUM_STAGES - 1 pages of loads outstanding and a long split
-    # is not bound by one memory round trip per page. Each loop iteration
-    # consumes NUM_STAGES pages, one per buffer. Page indices are loaded two
-    # iterations before use: vmcnt retires in issue order, so reading an index
-    # loaded after the prefetched copies would wait for all of them.
+    # Page p + NUM_STAGES - 1 is copied into the buffer page p - 1 freed while
+    # page p is consumed, keeping NUM_STAGES - 1 pages in flight. Each iteration
+    # consumes NUM_STAGES pages, one per buffer, and loads the page indices for
+    # two iterations ahead.
     k_smem = gl.allocate_shared_memory(
         k_cache_ptr.dtype.element_ty,
         [NUM_STAGES, cfg.BLOCK_N, cfg.HEAD_DIM],

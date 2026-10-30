@@ -1292,39 +1292,27 @@ attention uses its own split kernels.
 
 #### Algorithm
 
-Each workgroup is a single wave that owns one KV head, up to 16 of its query
-heads and one split of the request's pages. K/V pages are copied into LDS with
-`buffer_load_dwordx4 ... lds`. When the grid already holds enough waves to
-cover the load latency, the split loop is single-buffered: it copies a page,
-waits for it (`s_waitcnt vmcnt`) and consumes it before copying the next.
+Each workgroup is one wave that owns one KV head, up to 16 of its query heads
+and one split of the request's pages. K/V pages are copied into LDS with
+`buffer_load_dwordx4 ... lds`. When the grid holds enough waves to hide load
+latency, the loop is single-buffered: copy a page, wait for it, consume it.
 
-When `select_kv_splits` returns its maximum of 64, even the most splits leave
-the grid below its occupancy target, so each wave streams a long split. Its
-page loads are then software-pipelined four deep: four LDS buffers, three pages
-prefetched while one is consumed, provided their copies fit the 6-bit vmcnt
-count (BF16 head dim 128 does not). Splits with fewer pages than buffers stay
-single-buffered. vmcnt retires a wave's loads in issue order, so page indices
-load two loop iterations before use; reading an index loaded after the
-prefetches would wait for all of them. The index loads are volatile: the page
-table is read-only (`tl.const`), so the compiler could otherwise move them
-below the prefetches. Volatile also makes them skip the CU and L2 caches
-(`sc0 sc1`); loading two iterations ahead hides the extra latency. Each lane
-loads a different entry, which keeps them vector loads: scalar loads of the
-read-only table can only be waited on with `lgkmcnt(0)`, which the compiler
-places just before the copies that need the index, so each copy waits for a
-scalar-load round trip. Prefetches
-past the split repeat its last page rather than masking the copy, since a
-masked copy becomes a scalar branch after which the compiler waits for every
-outstanding load (`s_waitcnt vmcnt(0)`); only the split's last page is masked.
-The loop waits for those prefetches before the epilogue, whose layout
-conversions reuse the page buffers' LDS. `v_readfirstlane` moves each page
-index into an SGPR, so each copy takes its 64-bit page address from a buffer
-descriptor based at that page, the KV head from the scalar offset, and reuses
-loop-invariant 32-bit lane offsets within the page.
+When `select_kv_splits` returns its 64-split maximum, even that leaves the grid
+below its occupancy target, so each wave streams a long split through a
+four-deep pipeline: three pages in flight while one is consumed, if their copies
+fit the 6-bit vmcnt count (BF16 head dim 128 does not). Splits with fewer pages
+than buffers stay single-buffered. vmcnt retires in issue order, so page indices
+are loaded two iterations ahead, one entry per lane: as vector loads they retire
+with the copies, whereas scalar loads of the read-only (`tl.const`) table could
+only be waited on with `lgkmcnt(0)`, placed just before each copy, which then
+waits for a scalar-load round trip. The index loads are volatile so the compiler
+keeps them ahead of the copies. `v_readfirstlane` moves each index into an SGPR
+for a buffer descriptor based at that page. Prefetches past the split repeat its
+last page, since a masked copy becomes a branch followed by `s_waitcnt
+vmcnt(0)`, and the loop waits for them before the epilogue reuses their LDS.
 
-Every split stores its partial output and LSE, with an LSE of -inf when it has
-no tokens, so the reduce merges stored partials without reading the cache
-lengths.
+Every split stores its partial and LSE (-inf when empty), so the reduce does
+not read cache lengths.
 
 ### gfx950 MHA cached extension
 
@@ -1350,23 +1338,14 @@ Each workgroup owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
 
-K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. The copies are
-software-pipelined four deep: four LDS buffers, three pages prefetched per wave
-while one is consumed, provided the buffers leave two workgroups per CU (head
-dim 64). Split launches always pipeline. Unsplit ones pipeline only if the lower
-occupancy adds no round of workgroups, since single-buffered they fit three per
-CU. Ranges with fewer pages than buffers stay single-buffered. Every lane
-reads the same entries of the read-only (`tl.const`) page table, so the page
-indices are scalar loads (`s_load`), counted by lgkmcnt rather than vmcnt, and
-reading them does not wait for the prefetched copies. The compiler moves these
-loads down to their use, so each costs a scalar-cache round trip. Prefetches
-past the range repeat its last page rather than masking the copy, which would
-become a scalar branch followed by `s_waitcnt vmcnt(0)`, and those pages are
-not consumed; only pages that cross the range end, a causal diagonal or a
-window edge are masked. Each page index is already in an SGPR from its scalar
-load, so each copy takes its 64-bit page address from a buffer descriptor based
-at that page, the KV head from the scalar offset, and reuses loop-invariant
-32-bit lane offsets within the page.
+K/V pages use the same four-deep LDS pipeline as decode when the buffers leave
+two workgroups per CU (head dim 64). Split launches always pipeline; unsplit
+ones only if that adds no round of workgroups, since single-buffered they fit
+three per CU. Ranges with fewer pages than buffers stay single-buffered. Every
+lane reads the same page-table entries, so the indices are scalar loads, already
+in SGPRs and counted by lgkmcnt, and never wait for the copies. Prefetches past
+the range repeat its last page; only pages crossing the range end, a causal
+diagonal or a window edge are masked.
 
 ### gfx950 MLA extend
 
