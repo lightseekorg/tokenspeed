@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -347,10 +348,18 @@ def _gqa_prologue_kernel(
         tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
 
 
+def _block_token_choices(block: int) -> tuple[int, int, int]:
+    """Tokens per program for up to 64 tokens, up to 256, and beyond.
+
+    At least four; 512 elements at decode sizes, 2048 past 256 tokens.
+    """
+    return tuple(max(4, elements // block) for elements in (512, 1024, 2048))
+
+
 def _block_tokens(num_tokens: int, block: int) -> int:
-    """Tokens per program: at least four; 512 elements at decode sizes, 2048 past 256 tokens."""
-    elements = 512 if num_tokens <= 64 else 1024 if num_tokens <= 256 else 2048
-    return max(4, elements // block)
+    """Tokens per program for a launch over num_tokens tokens."""
+    choice = 0 if num_tokens <= 64 else 1 if num_tokens <= 256 else 2
+    return _block_token_choices(block)[choice]
 
 
 @register_kernel(
@@ -415,11 +424,10 @@ def triton_gqa_prologue(
         mrope = None if rotary is None else rotary.mrope
         mrope_rows = positions.ndim == 2
         s0, s1, s2 = mrope.section if mrope_rows else (0, 0, 0)
-        block_t = _block_tokens(num_tokens, triton.next_power_of_2(head_dim))
+        block = triton.next_power_of_2(head_dim)
+        block_t = _block_tokens(num_tokens, block)
         scales = cache.scales if cache.format is KVCacheFormat.FP8_PER_TENSOR else None
-        _gqa_prologue_kernel[
-            (triton.cdiv(num_tokens, block_t), num_q_heads + num_kv_heads)
-        ](
+        args = (
             q,
             k,
             v,
@@ -453,6 +461,8 @@ def triton_gqa_prologue(
             half_rotary,
             0.0 if norm is None else norm.weight_offset,
             0.0 if norm is None else norm.eps,
+        )
+        options = dict(
             HAS_NORM=norm is not None,
             IS_NEOX=rotary is not None and rotary.style is RopeStyle.NEOX,
             MROPE_ROWS=mrope_rows,
@@ -462,13 +472,20 @@ def triton_gqa_prologue(
             S2=s2,
             RETURN_K=return_kv and not prepared,
             KV_SCALED=scales is not None,
-            BLOCK_T=block_t,
-            BLOCK=triton.next_power_of_2(head_dim),
+            BLOCK=block,
             HALF_BLOCK=max(triton.next_power_of_2(half_rotary), 1),
             ENABLE_PDL=enable_pdl,
             num_warps=4,
             **({"launch_pdl": True} if enable_pdl else {}),
         )
+        if is_warming_up():
+            # The token tile follows the batch's token count; compile every
+            # choice at startup rather than on a later batch's forward.
+            for tile in sorted(set(_block_token_choices(block))):
+                _gqa_prologue_kernel.warmup(*args, BLOCK_T=tile, grid=(1,), **options)
+        _gqa_prologue_kernel[
+            (triton.cdiv(num_tokens, block_t), num_q_heads + num_kv_heads)
+        ](*args, BLOCK_T=block_t, **options)
     return GQAPrologueOutput(
         q=q_out, k=k_out if return_kv else None, v=v if return_kv else None
     )

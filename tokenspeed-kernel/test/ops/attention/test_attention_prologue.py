@@ -592,6 +592,52 @@ def test_kv_scale_values_reuse_the_compiled_kernel():
             run(FP8TensorScales(k, v))
 
 
+@pytest.mark.parametrize("return_kv", [False, True])
+def test_startup_warmup_compiles_every_token_tile(return_kv):
+    """The token tile follows the token count; warming one count compiles all."""
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    hq, hkv, dim, total = 16, 2, 64, 1024
+    inputs = qkv(total, hq, hkv, dim, seed=23)
+    norm = head_norm(dim, 0.0, seed=24)
+    cos_sin = cos_sin_cache(dim)
+
+    def run(tokens):
+        # Rows are independent, so a shorter batch reproduces a prefix of the
+        # widest one, cache rows included.
+        rotary = Rotary(
+            cos_sin, torch.arange(tokens, device="cuda"), RopeStyle.NEOX, None
+        )
+        out = run_gqa(
+            "triton",
+            inputs[:tokens],
+            hq,
+            hkv,
+            dim,
+            norm=norm,
+            rotary=rotary,
+            fmt=KVCacheFormat.NATIVE,
+            return_kv=return_kv,
+            slots=torch.arange(tokens, device="cuda"),
+            total=total,
+        )
+        return [rows[:tokens] for rows in out]
+
+    full = run(total)
+
+    def check(tokens):
+        for got, want in zip(run(tokens), full):
+            assert bytes_equal(got, want[: got.shape[0]])
+
+    # Startup runs one token count; the launcher compiles the other tiles then.
+    with kernel_warmup(enabled=True):
+        check(500)
+    with assert_no_triton_compile(_gqa_prologue_kernel):
+        # Up to 64 tokens, up to 256, and beyond.
+        for tokens in (1, 7, 64, 65, 200, 256, 257, 1000):
+            check(tokens)
+
+
 def test_only_the_triton_solution_writes_a_scaled_cache():
     tokens, hq, hkv, dim, total = 4, 4, 2, 64, 16
     inputs = qkv(tokens, hq, hkv, dim, seed=19)
