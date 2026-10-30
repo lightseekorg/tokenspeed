@@ -17,6 +17,11 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+from tokenspeed.runtime.cache.host_storage import (  # noqa: E402
+    compute_host_group_packing,
+    validate_host_group_packing,
+)
+
 # Pure Python, no runtime dependencies: the knobs of an L2-only executor.
 from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
 
@@ -128,6 +133,8 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     storage = ModuleType("tokenspeed.runtime.cache.host_storage")
     storage.HostCacheStorage = Mock
     storage.compute_host_lcm_block_bytes = Mock(return_value=1)
+    storage.compute_host_group_packing = compute_host_group_packing
+    storage.validate_host_group_packing = validate_host_group_packing
     layout = ModuleType("tokenspeed.runtime.cache.transfer.layout")
     layout.combine_cache_transfer_layouts = lambda target, draft, group_ids=None: (
         target if draft is None else draft
@@ -912,8 +919,9 @@ class TestGroupAwareWireTest:
         draft_pool.cache_transfer_layout.return_value = draft_layout
         storage = SimpleNamespace(
             host_cache_block_bytes=(20, 24),
+            group_packing=(1, 1),
             host_field_offsets=((0,), (0, 12)),
-            host_lcm_block_bytes=192,
+            host_lcm_block_bytes=24,
             num_host_lcm_blocks=3,
             host_buffer="host",
         )
@@ -981,13 +989,14 @@ class TestGroupAwareWireTest:
 
         build_geometry.assert_called_once_with(
             rows=(
-                (1, 0, 8, 16, 24, 0, 8, 12),
-                (0, 1, 32, 64, 20, 0, 4, 20),
-                (1, 0, 48, 16, 24, 12, 8, 12),
+                (1, 0, 8, 16, 24, 0, 1, 12),
+                (0, 1, 32, 64, 20, 0, 1, 20),
+                (1, 0, 48, 16, 24, 12, 1, 12),
             ),
             layer_slices=((0, 1), (1, 0), (1, 1), (2, 1)),
             group_packing=(4, 8),
-            host_lcm_block_bytes=192,
+            host_group_packing=(1, 1),
+            host_lcm_block_bytes=24,
             num_host_lcm_blocks=3,
             num_device_lcm_blocks=11,
             num_device_buffers=2,
@@ -1008,6 +1017,7 @@ class TestGroupAwareWireTest:
         )
         storage = SimpleNamespace(
             host_cache_block_bytes=(16,),
+            group_packing=(1,),
             host_field_offsets=((0,),),
             host_lcm_block_bytes=64,
             num_host_lcm_blocks=2,
@@ -1368,6 +1378,7 @@ class TestHostMemoryShareTest:
         )
         storage = SimpleNamespace(
             host_cache_block_bytes=(host_lcm_block_bytes,),
+            group_packing=(1,),
             host_field_offsets=((0,),),
             host_lcm_block_bytes=host_lcm_block_bytes,
             num_host_lcm_blocks=0,

@@ -58,6 +58,9 @@ struct SchedulerConfig {
     std::int32_t debug_force_retraction_interval{0};
 
     std::vector<CacheGroupConfig> cache_groups{};
+    // Virtual children per compact Host parent, shared by L2 and snapshots.
+    // Required when either Host pool exists; no capacity is reserved by group.
+    std::vector<std::int32_t> host_group_packing{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }

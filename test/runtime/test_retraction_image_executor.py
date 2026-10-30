@@ -255,11 +255,28 @@ def _build(
     lanes = {name: Mock(name=f"{name}_lane") for name in lane_names}
     storages = iter(
         [
-            SimpleNamespace(host_buffer="l2-host"),
-            SimpleNamespace(host_buffer="pool-host"),
+            SimpleNamespace(
+                host_buffer="l2-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            ),
+            SimpleNamespace(
+                host_buffer="pool-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            ),
         ]
         if l2_tier
-        else [SimpleNamespace(host_buffer="pool-host")]
+        else [
+            SimpleNamespace(
+                host_buffer="pool-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            )
+        ]
     )
     geometries = iter(
         ["l2-geometry", "pool-geometry"] if l2_tier else ["pool-geometry"]
@@ -431,7 +448,13 @@ def test_sharded_group_keeps_each_ranks_rows_on_both_ends():
     contract = _contract(layout, [2])
     owners = {
         rank: BlockOwnerTranslation.for_host_pool(
-            layout, contract, num_host_lcm_blocks=3, rank=rank
+            layout,
+            contract,
+            num_host_lcm_blocks=3,
+            rank=rank,
+            host_group_packing=tuple(
+                group.cache_blocks_per_lcm_block for group in layout.groups
+            ),
         )
         for rank in (0, 1)
     }

@@ -38,8 +38,7 @@ namespace tokenspeed {
 // the empty parents, and the occupants still left in each parent an occupant
 // left. A planner removes and restores tentative victims and asks whether a
 // demand fits, so it can try a victim set before evicting anything. `groups`
-// gives each group's packing and shard count, with which the coordinator
-// registered it in every pool.
+// gives each group's cyclic owner count; the pool supplies its own packing.
 class ShadowOccupancy {
 public:
     ShadowOccupancy(const BlockPool& pool, std::span<const CacheGroup> groups)
@@ -67,7 +66,7 @@ public:
         std::vector<std::int64_t>& holes = holes_by_bucket_[group_id];
         const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
         if (occupied == 1) {
-            const std::int64_t per_bucket = allocator.CacheBlocksPerLcmBlock() / allocator.ShardCount();
+            const std::int64_t per_bucket = pool_.Packing(group_id) / allocator.ShardCount();
             for (std::int64_t& bucket_holes : holes) {
                 bucket_holes -= per_bucket;
             }
@@ -85,7 +84,7 @@ public:
         _assert(it != remaining_occupied_.end(), "a restored location has no shadow occupancy");
         std::int32_t& occupied = it->second;
         const GroupAllocator& allocator = groups_[group_id].Allocator();
-        const std::int32_t slots = allocator.CacheBlocksPerLcmBlock();
+        const std::int32_t slots = pool_.Packing(group_id);
         std::vector<std::int64_t>& holes = holes_by_bucket_[group_id];
         const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
         if (occupied == 0) {
@@ -115,7 +114,7 @@ public:
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             parents_needed += ParentsNeededForBuckets(need_by_bucket[i], holes_by_bucket_[i], dense_need[i],
-                                                      groups_[i].Allocator().CacheBlocksPerLcmBlock());
+                                                      pool_.Packing(static_cast<std::uint32_t>(i)));
         }
         return parents_needed <= empty_parent_count_;
     }

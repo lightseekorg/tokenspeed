@@ -196,10 +196,22 @@ def _worker(rank: int, rendezvous: str) -> None:
         layout = _layout()
         contract = _contract(layout)
         pool_owners = BlockOwnerTranslation.for_host_pool(
-            layout, contract, num_host_lcm_blocks=POOL_LCM_BLOCKS, rank=rank
+            layout,
+            contract,
+            num_host_lcm_blocks=POOL_LCM_BLOCKS,
+            rank=rank,
+            host_group_packing=tuple(
+                group.cache_blocks_per_lcm_block for group in layout.groups
+            ),
         )
         l2_owners = BlockOwnerTranslation.for_host_pool(
-            layout, contract, num_host_lcm_blocks=HOST_LCM_BLOCKS, rank=rank
+            layout,
+            contract,
+            num_host_lcm_blocks=HOST_LCM_BLOCKS,
+            rank=rank,
+            host_group_packing=tuple(
+                group.cache_blocks_per_lcm_block for group in layout.groups
+            ),
         )
         snapshot_op, restore_op = _adapted_ops()
 
@@ -263,7 +275,13 @@ def test_a_pair_of_different_owners_is_refused():
     """The scheduler's equal-residue invariant is asserted, not assumed."""
     layout = _layout()
     owners = BlockOwnerTranslation.for_host_pool(
-        layout, _contract(layout), num_host_lcm_blocks=POOL_LCM_BLOCKS, rank=0
+        layout,
+        _contract(layout),
+        num_host_lcm_blocks=POOL_LCM_BLOCKS,
+        rank=0,
+        host_group_packing=tuple(
+            group.cache_blocks_per_lcm_block for group in layout.groups
+        ),
     )
     with pytest.raises(ValueError, match="residue class"):
         owners.owned_positions([(0, 1, 2)])

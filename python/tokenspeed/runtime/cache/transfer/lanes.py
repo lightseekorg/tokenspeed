@@ -185,7 +185,7 @@ def build_transfer_geometry(
                     field.block_stride_bytes,
                     host_storage.host_cache_block_bytes[group_index],
                     host_storage.host_field_offsets[group_index][field_index],
-                    group.cache_blocks_per_lcm_block,
+                    host_storage.group_packing[group_index],
                     field.payload_bytes,
                 )
             )
@@ -202,6 +202,7 @@ def build_transfer_geometry(
         group_packing=tuple(
             group.cache_blocks_per_lcm_block for group in layout.groups
         ),
+        host_group_packing=host_storage.group_packing,
         host_lcm_block_bytes=host_storage.host_lcm_block_bytes,
         num_host_lcm_blocks=host_storage.num_host_lcm_blocks,
         num_device_lcm_blocks=layout.num_lcm_blocks,

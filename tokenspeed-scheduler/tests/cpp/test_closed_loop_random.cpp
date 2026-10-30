@@ -201,10 +201,10 @@ struct ClosedLoop {
             cfg.max_retracted_requests = 2;
             cfg.debug_force_retraction_interval = force_retraction_interval;
         }
-        schedulers.push_back(std::make_unique<Scheduler>(cfg));
+        schedulers.push_back(std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg)));
         if (mirrored) {
             heap_perturbation.resize(256 * (seed + 1));
-            schedulers.push_back(std::make_unique<Scheduler>(cfg));
+            schedulers.push_back(std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg)));
         }
         for (int i = 0; i < 3; ++i) {
             std::vector<std::int32_t> system;

@@ -385,6 +385,7 @@ def _device_request(**overrides):
     return _retraction_pool_request(
         SimpleNamespace(**knobs),
         contract,
+        host_group_packing=contract.virtual_packing,
         max_batch_size=4,
         max_context_len=4096,
         decode_input_tokens=1,

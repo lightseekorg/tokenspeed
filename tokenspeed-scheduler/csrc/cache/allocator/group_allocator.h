@@ -62,7 +62,9 @@ public:
     // Cyclic owners of this group's virtual blocks; 1 balances nothing.
     std::int32_t ShardCount() const noexcept { return shard_count_; }
 
-    std::int32_t ResolveCacheBlockId(CacheBlockLocation location) const {
+    // Bare locations occur in recorded Device eviction segments. A live
+    // reference carries its pool and must use the pool-aware overload below.
+    std::int32_t ResolveDeviceCacheBlockId(CacheBlockLocation location) const {
         _assert(location.lcm_block_id > 0, "LCM block id must be > 0");
         _assert(0 <= location.slot_index && location.slot_index < cache_blocks_per_lcm_block_,
                 "cache block slot is out of range");
@@ -72,11 +74,16 @@ public:
         _assert(page_id <= std::numeric_limits<std::int32_t>::max(), "kernel page id exceeds int32 range");
         return static_cast<std::int32_t>(page_id);
     }
+    std::int32_t ResolveCacheBlockId(const CacheBlock& block) const {
+        _assert(block.OwnerPool().BoundGroup(block.Location().lcm_block_id) == group_id_,
+                "block reference belongs to another cache group");
+        return block.OwnerPool().ResolveCacheBlockId(group_id_, block.Location());
+    }
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
         for (const CacheBlockRef& block_ref : table.Blocks()) {
-            ids.push_back(block_ref ? ResolveCacheBlockId(block_ref->Location()) : 0);
+            ids.push_back(block_ref ? ResolveCacheBlockId(*block_ref) : 0);
         }
         return ids;
     }

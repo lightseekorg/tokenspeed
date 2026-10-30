@@ -190,6 +190,8 @@ if cfg.role != ts.SchedulerConfig.Role.Fused:
 {tiers}
 if cfg.num_host_pages > 1:
     cfg.num_host_pages = 1024 // {kv_shard_count} + 1
+if cfg.num_host_pages > 1 or cfg.num_snapshot_pages > 1:
+    cfg.host_group_packing = [{kv_shard_count}]
 result = ts.Scheduler(cfg)
 "#
     );

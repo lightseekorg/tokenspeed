@@ -98,6 +98,21 @@ per-bucket free-slot counts and bucket indexes together on every occupancy
 transition. A parent with zero occupants is unbound, so its capacity belongs
 to the global empty-parent FIFO rather than any group.
 
+Packing is a property of each pool. Device packing satisfies attention-kernel
+strides; compact Host storage uses a parent large enough for the largest single
+group payload, then fits as many complete children of each group as that parent
+holds. Host L2 and the request-private snapshot pool use this compact geometry.
+The scheduler receives their virtual packing explicitly, including each group's
+shard count. A block reference's owner pool determines its exported block ID;
+the same location can encode different IDs on Device and Host. Placement,
+eviction's shadow fit and snapshot sizing all use the destination pool's
+packing. Cyclic owner counts stay the same across tiers, so transfers still
+keep the Device block's owner bucket. Every empty parent returns to the shared
+pool; no capacity is reserved for State or history.
+Mirrored ranks must agree on Host packing as well as parent counts. Startup
+compares both before allocating pinned memory and refuses incompatible local
+payload geometry rather than giving the same block ID different meanings.
+
 The pool knows which child slots are occupied, never who holds them. Whether a
 child is pinned by a request table, published by a prefix-cache entry, or held
 by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
@@ -388,6 +403,12 @@ grid cap, and optional layer flags. For an unflagged layer with no matching
 blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
+
+Mapped Host field copies use word accesses when both byte addresses and the
+payload size are 16-byte aligned. Other fields retain byte accesses, including
+packed children whose offsets lose that alignment. Masked copies preserve
+field padding, and per-layer readiness is published only after either copy
+has completed. The same geometry and completion protocol serve both cases.
 
 Every L2 copy is ordered after the prerequisite stream the caller names per
 submission: the stream whose completed work the copy must observe. Writeback
@@ -734,9 +755,10 @@ Its responsibilities:
   the tail's blocks below that window stay holes). The Host tier extends
   the Device under the **Host-suffix rule**
   (`CacheCoordinator::probeHostSuffix`): a hit at `T = p + t` takes the
-  Device's KV pages below a split `F` -- the Device's own KV coverage `L` in
+  Device's KV pages below a split `F` -- the Device's prefix-closed KV coverage `L` in
   full pages, or `p` when lower, lowered further to the page of the first
-  block a sliding group's window behind `T` needs and the Device lacks --
+  block a sliding group's window behind `T` needs and the Device lacks,
+  even when no Device window can resume on its own --
   the Host's KV pages `[F, p)`, the KV tail whole from one tier (the
   Device's only when `F == p`), and each State group's checkpoint at `T`
   from the Device when it holds it, else from the Host. So Device KV plus a
@@ -1012,12 +1034,56 @@ Its responsibilities:
   evicted for a dropped one. Each row's Host block is fitted and placed in its
   Device block's bucket, so under KV parallelism every rank copies only the
   rows it owns; a segment one bucket cannot fill is dropped whole, even when
-  another bucket has room. Host victims are whole as well, never in use, and
-  never take or sit right under a page an eviction write-back is still
+  another bucket has room. After dead and Device-covered segments, before
+  taking Host-only cache, placement reclaims
+  unpinned prefix-closed KV copies within a contiguous Device KV prefix,
+  independently of Host checkpoints. A Host-only checkpoint can still resume
+  on that Device prefix. Nonaligned KV tails stay whole, and sliding-window
+  lookback pages at checkpoint boundaries stay on the Host: a missing Device
+  window can lower the common tier split and require those closed-group pages
+  too. When State groups share the pool, KV still held on the Device has its
+  Host duplicate reclaimed first, newer Device copies first: the request keeps
+  that Device storage alive. Unheld Device KV can be demoted on the next
+  admission. Its duplicate competes with Host-only checkpoints by access epoch
+  (Device KV epoch versus Host State epoch), oldest first, with duplicates
+  winning ties. This lets unused State age out before newer KV is repeatedly
+  copied back. Models without State groups retain duplicate-first reclamation.
+  No group has a reserved capacity; every freed parent returns to the shared
+  pool and can serve either State or history demand.
+  The boundary tree maintains the nodes with settled closed-group duplicates
+  as entries arrive and leave. It also propagates complete Device-prefix
+  coverage when a page changes, including gaps opened or filled by restores.
+  A placement therefore visits duplicate nodes and their bounded sliding
+  lookback neighborhoods, rather than rescanning every cached prefix.
+  These candidates share the segment plan's shadow and restore pass, so an
+  unplaced segment or an unneeded duplicate evicts nothing. Their evictions
+  count as `HostEvictionStats::duplicate_kv`. Remaining Host victims are whole,
+  never in use, and never take or sit right under a page an eviction write-back is still
   bringing, which would otherwise arrive with nothing under it; dead entries
   (judged by the Host's checkpoint boundaries alone, unlike the collection
   below) go first, Host-only cache last. `AcquireHostSegments` documents the
   victim shapes, the ranking and the restore pass.
+  Host-only checkpoint recency follows its State entries, independently of
+  the KV entries at that boundary. A longer prefix hit can traverse those KV
+  entries while using only a deeper checkpoint; that traversal must not keep
+  the shallower, unused State young. KV-only victims retain KV access recency.
+  A history-block pin protects that block, independently of the State at the
+  same boundary. If it prevents a whole Host segment from leaving, the planner
+  may instead reclaim that boundary's unpinned State groups together. It leaves
+  every history block in place, still respects pending write-backs, and restores
+  the checkpoint when no placed segment needs its space. An actual State pin
+  still protects the whole checkpoint. This changes reclaim eligibility, not
+  allocation: State and history continue to share the same LCM pools.
+  A deeper Device checkpoint cannot restore State at a shorter boundary.
+  To prefer reclaiming a checkpoint along a proven continuation, the deeper
+  checkpoint must share that boundary's latest State access epoch: one epoch
+  belongs to one request's acquisitions and publications. This rule applies
+  to aligned boundaries and tails alike. An aligned ancestor or a tail's
+  shared preceding page alone does not prove State use by that request.
+  Without a shared State epoch or an exact Device duplicate, the checkpoint
+  keeps its Host-only LRU ranking. Preferring proven continuations retains
+  the recent frontier while making room for other sessions; it does not
+  make the deeper State a substitute for the earlier one.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at

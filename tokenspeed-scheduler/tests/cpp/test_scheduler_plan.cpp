@@ -222,7 +222,7 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
         }
     }
 
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(MakeRequestSpec("r_ccc", 2, 300));
     Submit(MakeRequestSpec("r_aaa", 2, 100));
     Submit(MakeRequestSpec("r_bbb", 2, 200));
@@ -295,7 +295,7 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock)
 TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFinish) {
     config_.device_allocator.total_pages = 5;
     config_.cache_groups.front().total_pages = config_.device_allocator.total_pages;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const RequestSpec spec{.request_id = "r1", .tokens = {1, 2, 3}};
     Submit(spec);
     PlanOnce();
@@ -738,7 +738,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     // with a negative usable count and assert before the config diagnostic.
     try {
         SetTestSnapshotPool(cfg);
-        Scheduler scheduler{cfg};
+        Scheduler scheduler{WithHostPackingFromDevice(cfg)};
         FAIL() << "a device cache without usable capacity was accepted";
     } catch (const std::invalid_argument& error) {
         EXPECT_NE(std::string{error.what()}.find("device cache"), std::string::npos) << error.what();

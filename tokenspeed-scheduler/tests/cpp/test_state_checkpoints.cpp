@@ -74,10 +74,10 @@ protected:
     }
 
     void Reset(bool host_cache, std::int32_t decode_width) {
-        config_ = MakeConfig();
+        config_ = WithHostPackingFromDevice(MakeConfig());
         config_.disable_l2_cache = !host_cache;
         config_.decode_input_tokens = decode_width;
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     }
 
     static RequestSpec RequestWithTokens(const std::string& id, std::vector<std::int32_t> tokens) {
@@ -1170,7 +1170,7 @@ TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTai
 TEST_F(StateRestoreClaimSuite, ARetractionAtAPageBoundaryRestoresUnderWriteBack) {
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 4});
     AckWriteBacks(PlanOnce());  // plan 1: the prefill
     SendForwardDone("r", {101});
@@ -2289,7 +2289,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         const bool write_back = policy == SchedulerConfig::HostWritePolicy::kWriteBack;
         Reset(host_cache, /*decode_width=*/1);
         config_.max_batch_size = 3;  // x, h and g in flight together
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
         std::vector<std::int32_t> o = MakeTokens(22, 3000);
         CompleteSession("o", o);
         const std::vector<std::int32_t> s1 = MakeTokens(22);
@@ -2356,7 +2356,7 @@ TEST_F(StateCheckpointPrefillHostSuite, ARestoredInputIsStillMarkedByItsOwnFinis
     role_ = Role::kFused;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.debug_force_retraction_interval = -7;  // the oldest Prefilling request, every seventh plan
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::vector<std::int32_t> s1 = MakeTokens(22);
     Submit(RequestWithTokens("s1", s1));
     ASSERT_EQ(RunPrefill("s1", 22).size(), 3u);  // plans 1-3
@@ -2987,7 +2987,7 @@ TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesW
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.enable_mixed_prefill_decode = true;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::vector<std::int32_t> s1 = MakeTokens(22);
     Submit(RequestWithTokens("s1", s1));
     RunPrefill("s1", 22);
@@ -3234,7 +3234,7 @@ TEST_F(StateCheckpointFusedHostSuite, ARestoresEvictionStoreRunsBeforeTheRestore
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.debug_force_retraction_interval = 5;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestWithTokens("r", MakeTokens(14)));
     std::optional<ExecutionPlan> image;
     std::optional<ExecutionPlan> restore;

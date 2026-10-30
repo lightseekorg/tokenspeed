@@ -1107,6 +1107,14 @@ Host pinned buffer (L2 / flat KV)
 Mooncake Store (L3)
 ```
 
+Host L2 and the retraction snapshot pool pack each group's payload independently
+of Device strides. A shared Host parent fits the largest single group payload;
+each group fits as many whole children in it as possible. Empty parents are
+available to every group, including recurrent State; no group has reserved
+capacity.
+Mirrored ranks must have the same Host packing; startup refuses local layouts
+that would give the same Host block ID different meanings across ranks.
+
 **Write policy.** `--kvstore-write-policy` chooses when pages of the GPU
 prefix cache are copied to Host L2:
 
@@ -1166,7 +1174,10 @@ fused role,
 [§3.3](../design/scheduler.md#33-fused--one-engine-everything-local).
 
 **Sizing.** `--kvstore-size` (gigabytes per rank) wins over
-`--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).
+`--kvstore-ratio` (a multiple of this rank's Device LCM block count, 2 by
+default). Host parents use compact payload geometry, so the ratio counts
+parents rather than allocated bytes. Use `--kvstore-size` to request a byte
+budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
