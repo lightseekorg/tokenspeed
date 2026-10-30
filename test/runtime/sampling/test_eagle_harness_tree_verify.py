@@ -59,6 +59,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 def _backend(bs: int, n: int, vocab: int) -> FlashInferSamplingBackend:
     return FlashInferSamplingBackend(
         SamplingBackendConfig(
+            enable_block_rejection=False,
             synthetic_acceptance_length=None,
             max_bs=bs,
             max_draft_tokens_per_req=n,

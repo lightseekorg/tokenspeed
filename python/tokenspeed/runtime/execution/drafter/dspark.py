@@ -17,8 +17,9 @@
 
 """Static DSpark drafter.
 
-This is the minimal static configuration: greedy sampling, vanilla Markov head,
-fixed verify window (verify-all). No confidence head / SPS-STS / ragged verify.
+Static Markov head and fixed verify window (verify-all). Greedy by default;
+explicit block rejection enables stochastic proposals through the shared sampler.
+No confidence head / SPS-STS / ragged verify.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -37,6 +40,7 @@ class DSpark(DFlash):
 
     sample_from_anchor = True
     spec_algorithm = "DSPARK"
+    supports_speculative_sampling = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -47,6 +51,10 @@ class DSpark(DFlash):
                 "(use a DSparkDraftModel checkpoint with markov_rank > 0)."
             )
 
+    def require_full_draft_logits(self) -> None:
+        """DSpark samples the target's shared head, not a draft-owned processor."""
+        self.logits_processor.require_full_vocab_logits()
+
     @nvtx_range("dspark_sample_block", color="purple")
     def _sample_block(
         self,
@@ -54,10 +62,14 @@ class DSpark(DFlash):
         block_ids: torch.Tensor,
         next_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Semi-autoregressive greedy proposal over the block positions."""
+        """Semi-autoregressive proposal using the configured shared draft sampler."""
         next_tokens[:, 0] = block_ids[:, 0]
         # Only the bias follows the previous token; the projection does not.
-        block_logits = self._block_base_logits(draft_hidden)
+        block_logits = (
+            self._block_base_logits(draft_hidden)
+            if self.draft_sampler is None
+            else None
+        )
         for k in range(1, self.spec_num_tokens):
             # The Markov head embeds the previous token, so it must be in range
             # before this step, not after the loop: the anchor comes from the
@@ -65,7 +77,24 @@ class DSpark(DFlash):
             # from a vocab-parallel argmax that can lose every shard. An
             # out-of-range id here indexes past the embedding table.
             bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
-            if block_logits is None:
+            if self.draft_sampler is not None:
+                # Full logits are necessary for the recorded proposal law.
+                # require_full_vocab gives this step private TP gather storage;
+                # successive Markov steps cannot alias a shared comm buffer.
+                metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.DECODE, query_shard=None
+                )
+                logits = self.logits_processor._get_logits(
+                    draft_hidden[:, k - 1, :],
+                    self.lm_head,
+                    metadata,
+                    embedding_bias=None,
+                    plan=None,
+                    require_full_vocab=True,
+                )
+                logits = logits + bias_fn(0, logits.shape[-1]).to(logits.dtype)
+                next_tokens[:, k].copy_(self.draft_sampler.propose(logits, step=k - 1))
+            elif block_logits is None:
                 self._greedy_argmax_vocab_parallel(
                     draft_hidden[:, k - 1, :],
                     out=next_tokens[:, k],

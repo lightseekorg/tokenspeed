@@ -68,6 +68,7 @@ def backend_pair(request):
         config = SamplingBackendConfig(
             synthetic_acceptance_length=None,
             enable_speculative_sampling=recorded_proposals,
+            enable_block_rejection=False,
             sampling_stream=stream,
             logprob_order=logprob_order,
             enable_output_logprobs=True,

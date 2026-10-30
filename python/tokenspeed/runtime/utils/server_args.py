@@ -598,6 +598,8 @@ class ServerArgs:
     # target distribution; this one trades a sampled proposal for a higher
     # acceptance rate under sampling temperatures.
     enable_speculative_sampling: bool = False
+    # Opt-in DSpark block verification; OFF preserves the existing verifier.
+    enable_block_rejection: bool = False
     # Recorded draft probabilities above this value mark a slot with no
     # proposal (fresh admission, PD landing): always reject. Sentinel rows
     # are written as threshold + 1, so it must lie within
@@ -1641,6 +1643,25 @@ class ServerArgs:
                 f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}"
             )
 
+        if self.enable_block_rejection:
+            if (
+                not self.enable_speculative_sampling
+                or self.speculative_algorithm != "DSPARK"
+                or self.sampling_backend != "flashinfer"
+                or self.dp_sampling
+                or self.mapping.has_attn_dp
+                or self.pipeline_parallel_size != 1
+                or self.disaggregation_mode != "null"
+            ):
+                raise ValueError(
+                    "--enable-block-rejection requires DSPARK, --enable-speculative-sampling, "
+                    "the flashinfer sampling backend, and aggregate TP without attention DP, "
+                    "DP sampling, or pipeline parallelism"
+                )
+            if self.synthetic_acceptance_length is not None:
+                raise ValueError(
+                    "block rejection correctness requires synthetic acceptance disabled"
+                )
         if self.enable_speculative_sampling:
             self._validate_speculative_sampling()
 
@@ -1733,7 +1754,9 @@ class ServerArgs:
                 "--enable-speculative-sampling needs speculative decoding: pass "
                 "--speculative-algorithm EAGLE3 or MTP"
             )
-        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
+        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS and not (
+            self.speculative_algorithm == "DSPARK" and self.enable_block_rejection
+        ):
             raise ValueError(
                 "--enable-speculative-sampling needs a chain drafter that samples "
                 "one token per step from its own distribution; "
@@ -3526,6 +3549,15 @@ class ServerArgs:
             "flashinfer backend; refused on the prefill role of "
             "a disaggregated deployment. Costs a per-request fp32 draft "
             "distribution buffer; see docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--enable-block-rejection",
+            action="store_true",
+            default=ServerArgs.enable_block_rejection,
+            help="Opt in to DSpark stochastic drafting and block rejection verification. "
+            "Requires --enable-speculative-sampling and --sampling-backend flashinfer. "
+            "Supports aggregate TP (including DCP), without DP or PP. "
+            "Synthetic acceptance is refused; greedy requests remain greedy.",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",

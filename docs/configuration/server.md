@@ -1353,3 +1353,27 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### DSpark block verification (experimental)
+
+`--enable-block-rejection --enable-speculative-sampling --sampling-backend flashinfer`
+opts DSpark into probabilistic Markov drafting and block verification. The feature
+is disabled by default; without it, the existing greedy DSpark path is unchanged.
+The initial support scope is aggregate TP, including DCP, without attention DP,
+DP sampling or pipeline parallelism. Other combinations fail at startup.
+
+Draft probabilities follow the request temperature; greedy requests retain
+one-hot proposals. Target filtering and grammar masks still apply before
+verification. The verifier uses clipped prefix likelihood ratios, selects the
+longest accepted prefix, and samples a prefix-scaled positive residual (or a
+target bonus token). It is not a single whole-block likelihood-ratio test.
+The output uses the existing accepted-length and state rollback contract.
+
+The existing per-request proposal RNG and verifier coin streams are reused.
+A stochastic output difference from greedy decoding is expected; validate the
+output distribution and accuracy, rather than requiring identical token IDs.
+Synthetic acceptance is deliberately rejected in this initial correctness path.
+A golden acceptance length is not a substitute for implementing or validating
+the algorithm. Full-vocabulary draft gathering, probability storage, and
+verification reductions all add work; measure their cost and natural acceptance
+length before drawing performance conclusions.

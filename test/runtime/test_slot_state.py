@@ -232,6 +232,7 @@ def _dsa(pool, *, is_draft: bool) -> DSABackend:
 def _sampling_backend(cls) -> SamplingBackend:
     """A sampling backend over the test pool geometry, on the CPU."""
     config = SamplingBackendConfig(
+        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=cls is not GreedySamplingBackend,
         sampling_stream="batch",

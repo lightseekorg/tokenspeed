@@ -52,6 +52,7 @@ class _BufferBackend(SamplingBackend):
 
 def _config(al, bs, width, device):
     return SamplingBackendConfig(
+        enable_block_rejection=False,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -70,6 +71,7 @@ def test_config_requires_explicit_synthetic_acceptance():
         SamplingBackendConfig()
     for length in (None, 2.6):
         config = SamplingBackendConfig(
+            enable_block_rejection=False,
             synthetic_acceptance_length=length,
             enable_speculative_sampling=False,
             sampling_stream="batch",

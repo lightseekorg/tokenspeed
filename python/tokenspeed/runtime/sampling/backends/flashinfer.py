@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling.block import block_speculative_sampling
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
 )
@@ -824,21 +825,38 @@ class FlashInferSamplingBackend(SamplingBackend):
                 if use_draft_prob
                 else None
             )
-            chain_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                uniform_samples=coins[:bs, :n],
-                uniform_samples_for_final_sampling=final_coins[:bs],
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=not dp_sampling,
-                use_draft_prob=use_draft_prob,
-                reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
-            )
+            if self.config.enable_block_rejection:
+                if draft_probs is None:
+                    raise RuntimeError(
+                        "block verification requires recorded draft probabilities"
+                    )
+                block_speculative_sampling(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    uniform_samples=coins[:bs, :n],
+                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                )
+            else:
+                chain_speculative_sampling_target_only(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    uniform_samples=coins[:bs, :n],
+                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                    threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                    deterministic=not dp_sampling,
+                    use_draft_prob=use_draft_prob,
+                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                )
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
                 canonical_greedy_verify(
                     logits=logits,

@@ -116,9 +116,9 @@ class BaseDrafter:
 
         Called once by ``ModelExecutor`` after construction. A no-op unless
         the executor allocated ``RuntimeStates.draft_probs``
-        (--enable-speculative-sampling); then the drafter must be a chain
-        drafter that proposes one token per step, and its proposals are
-        drawn from ``q`` and recorded there (``sample_draft_step``). Sampling
+        (--enable-speculative-sampling); then the drafter must record the conditional law of each proposal
+        in the shared pool. Chain drafters use ``sample_draft_step``; DSpark
+        records its sequential Markov-head draws through the same sampler. Sampling
         needs the whole distribution, so the draft model's logits processor
         is switched off its fused (TP-sharded) argmax here, before the first
         draft forward.
@@ -146,6 +146,10 @@ class BaseDrafter:
             vocab_map=self.draft_vocab_map(),
             device=self.runtime_states.draft_probs.device,
         )
+        self.require_full_draft_logits()
+
+    def require_full_draft_logits(self) -> None:
+        """Disable a proposal head argmax shortcut before stochastic drafting."""
         self.draft_model_runner.model.logits_processor.require_full_vocab_logits()
 
     def draft_vocab_map(self) -> torch.Tensor | None:
