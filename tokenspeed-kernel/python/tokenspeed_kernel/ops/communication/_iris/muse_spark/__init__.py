@@ -40,7 +40,7 @@ from tokenspeed_kernel.ops.communication._iris.all_gather import (
 )
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     ProducerAllReduce,
-    iris_cache_policy,
+    iris_arch_policy,
 )
 from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
@@ -149,6 +149,7 @@ class MuseIrisState:
         enable_lamport: bool,
         owned_route_max_rows: int,
     ):
+        self._arch = iris_arch_policy()
         self.all_reduce = all_reduce
         self.world_size = all_reduce.world_size
         self.enable_lamport = enable_lamport
@@ -318,6 +319,7 @@ class MuseIrisState:
             BLOCK=2048,
             NUM_WARPS=4,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
 
@@ -373,6 +375,7 @@ class MuseIrisState:
             NUM_WARPS=8,
             num_warps=8,
             enable_fp_fusion=False,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return outputs
 
@@ -411,6 +414,7 @@ class MuseIrisState:
             EXIT_BARRIER=True,
             PRODUCER_WRITES_THROUGH=False,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
 
@@ -469,6 +473,7 @@ class MuseIrisState:
             EXIT_BARRIER=True,
             PRODUCER_WRITES_THROUGH=False,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
 
@@ -528,6 +533,7 @@ class MuseIrisState:
             EPS=eps,
             WEIGHT_OFFSET=weight_offset,
             num_warps=8,
+            WAIT_STORES=self._arch.wait_stores,
         )
         local_rows = triton.cdiv(num_tokens, self.world_size)
         output = self.all_reduce.producer_pull.scratch[: local_rows * 4096].view(
@@ -548,6 +554,7 @@ class MuseIrisState:
             EXIT_BARRIER=True,
             PRODUCER_WRITES_THROUGH=True,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
 
@@ -598,6 +605,7 @@ class MuseIrisState:
             BLOCK=2048,
             NUM_WARPS=4,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
 
@@ -695,6 +703,7 @@ class MuseIrisState:
             BLOCK=2048,
             NUM_WARPS=4,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return result, output_ids, output_weights
 
@@ -795,6 +804,7 @@ class MuseIrisState:
                 EXIT_BARRIER=False,
                 PRODUCER_WRITES_THROUGH=False,
                 num_warps=4,
+                WAIT_VMEM=self._arch.wait_vmem,
             )
             out_stream = torch.empty_like(stream)
             pre_fp32 = torch.empty_like(stream)
@@ -821,6 +831,7 @@ class MuseIrisState:
                 ELEMENTS_PER_THREAD=8,
                 NUM_WARPS=16,
                 num_warps=16,
+                WAIT_VMEM=self._arch.wait_vmem,
             )
             return out_stream, pre_fp32, pre_bf16
         assert self.boundary_mailbox is not None
@@ -854,7 +865,7 @@ class MuseIrisState:
             ROTATE_PEERS=rows >= _MUSE_BOUNDARY_ROTATE_MIN_ROWS,
             ELEMENTS_PER_THREAD=8,
             NUM_WARPS=16,
-            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=16,
         )
         return out_stream, pre_fp32, pre_bf16
@@ -1001,7 +1012,7 @@ class MuseIrisState:
             PRE_EPS=pre_eps,
             PRE_WEIGHT_OFFSET=pre_weight_offset,
             HAS_PRE=pre_weight is not None,
-            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=16,
         )
         return out_stream, pre_bf16
@@ -1110,8 +1121,9 @@ class MuseIrisState:
                 EPS=eps,
                 MAX_ELEMENTS=self.reduction.lamport_max_numel,
                 PORTABLE_MATH=num_tokens > 16,
-                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+                PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 num_warps=1,
+                WAIT_STORES=self._arch.wait_stores,
             )
             return self.gather.output[: num_tokens * 4096].view(num_tokens, 4096)
         assert self.all_reduce.producer.data is not None
@@ -1231,7 +1243,8 @@ class MuseIrisState:
                 scale_stride_linear=scales.stride(0),
                 scale_stride_mblock=scales.stride(1),
                 max_elements=self.reduction.lamport_max_numel,
-                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+                PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+                WAIT_STORES=self._arch.wait_stores,
                 num_warps=1,
             )
             return packed, scales

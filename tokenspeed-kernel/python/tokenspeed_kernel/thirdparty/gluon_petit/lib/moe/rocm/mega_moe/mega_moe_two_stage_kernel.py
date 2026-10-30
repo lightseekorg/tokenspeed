@@ -1,12 +1,12 @@
 """Native three-launch MegaMoE: dispatch/stage one, stage two, and combine."""
 
-import triton.experimental.gluon as g
-import triton.language as tl
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
     _native_call,
     amdgcn_readfirstlane,
     amdgcn_s_waitcnt,
+    lds_load,
+    lds_store_masked,
 )
 from lib.moe.rocm.comm.barrier import (
     compiler_memory_barrier,
@@ -36,7 +36,9 @@ from lib.tal.tensor_ops import (
     store_words,
     wave_id,
 )
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import tl
 
 
 class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
@@ -124,13 +126,13 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
             BufferResource.kAtomicScopeAgent,
             leader,
         ).to(l.uint32)
-        l.store(
+        lds_store_masked(
             self.WorkId(shm) + l.full(tid.shape, 0, l.uint32, tid.type.layout),
             shard + local_work * self.kWorkShards,
-            mask=leader,
+            leader,
         )
         l.barrier()
-        return l.load(self.WorkId(shm))
+        return lds_load(self.WorkId(shm))
 
     @device_method
     def WaitForPayloadBlocks(self, workspace, work, tid):
@@ -199,7 +201,7 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
             shm, tiles, tid, wid, wtid, tokens, work.work_m
         )
         l.barrier()
-        quant_shm = shm.to(l.pointer_type(l.float32, 3))
+        quant_shm = shm.to(l.pointer_type(l.float32))
         self.ActivationQuantizer.StoreAccumulator(quant_shm, hidden, wid, wtid)
         l.barrier()
         route_in_slice, col_lane = tid // 32, tid % 32
@@ -632,10 +634,10 @@ def MegaMoEStage1(
     ).to(l.uint32)
     storage = l.allocate_shared_memory(
         l.uint32,
-        [((Kernel.kShmWords + 3) // 4) * 4],
+        [(Kernel.kShmWords + 3) // 4, 4],
         l.SwizzledSharedLayout(1, 1, 1, [0]),
     )
-    shm = l.full((), 0, l.uint64).to(l.pointer_type(l.uint32, 3))
+    shm = l.full((), 0, l.uint64).to(l.pointer_type(l.uint32))
     _stage1(
         Kernel,
         w13,
@@ -668,10 +670,10 @@ def MegaMoEStage2(w2, scales_w2, w2_bias, base, rank, Kernel: l.constexpr):
     ).to(l.uint32)
     storage = l.allocate_shared_memory(
         l.uint32,
-        [((Kernel.kShmWords + 3) // 4) * 4],
+        [(Kernel.kShmWords + 3) // 4, 4],
         l.SwizzledSharedLayout(1, 1, 1, [0]),
     )
-    shm = l.full((), 0, l.uint64).to(l.pointer_type(l.uint32, 3))
+    shm = l.full((), 0, l.uint64).to(l.pointer_type(l.uint32))
     _stage2(
         Kernel,
         w2,

@@ -249,6 +249,25 @@ the stop token under every schedule ([Scheduler
 dispatched as a rotating first decode publishes at the prompt end, where the
 prompt-end checkpoint it still holds in slot 0 is the canonical block.
 
+State groups may additionally restrict reusable checkpoints with
+`checkpoint_granularity`: intermediate prefill forwards end on its multiples,
+and only prefill-produced states at these positions are published or matched.
+The existing admission publishes retained checkpoints in stream order. A first
+decode admission can deliver the preceding prefill's checkpoint; decode-produced
+live states remain private, including at finish and retraction. Retraction
+still preserves the private state for the same request's restore. A forward may
+span several segments; the existing in-forward checkpoint mechanism saves the
+last segment entrance independently of the live endpoint.
+This is a numerical continuation constraint, not a block's token span. The
+grain is also part of the persistent cache identity and the P/D semantic
+contract, so a scan-final state cannot be loaded as an aligned entrance H.
+Unrestricted persistent namespaces remain unchanged. Live State
+blocks retain the same two-slot ownership; an interior checkpoint uses the
+existing separately allocated output block. Checkpoint keys always name the
+actual computed frontier; an unfinished tail is never relabeled as an earlier
+aligned H. Unrestricted State groups preserve the natural-checkpoint policy
+below.
+
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
@@ -1867,6 +1886,17 @@ including QSA's full-KV, compressed, and recent cache groups. Verify-state layer
 ownership and cache addresses come from the bound plan's layer window,
 including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
+Side-stream allocations retain their own workspace owner through execution,
+separate from scratch that main-stream operations can overwrite.
+Ascend native Prefill keeps receive, send, packed history, and commit slots in
+disjoint views of a backend-owned `WorkspacePool`, allocated on first Prefill
+use and reused thereafter. Cache binding carries only the bounded configuration;
+cache capacity planning does not reserve this runtime allocation. Without
+native pool options, the backend retains its ordinary collective path and
+creates no native transport.
+Native Prefill requires an explicit `chunk_prefill_kv_size`: its page limit is
+the scheduler's rounded batch budget, and exceeding it raises before transport.
+The null page and alignment are physical overhead, not additional batch capacity.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 

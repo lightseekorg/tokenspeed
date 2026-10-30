@@ -16,7 +16,11 @@ call the same implementation; the low-priority registration keeps explicit
 `solution="trtllm_cutedsl"` available for small M. Plugin priorities remain above
 both built-in backends.
 
-This is a dispatch policy, not autotuning. M is the actual GEMM row count, which
+Backend selection and tile tuning are separate. Once CuTe-DSL is selected,
+startup autotuning searches its tile, cluster and 2-CTA configurations and
+persists the winning choice per shape bucket in the shared autotune cache.
+See the [adapter contract](../../thirdparty/trtllm_blockwise/README.md) for
+search and fallback behavior. M is the actual GEMM row count, which
 can differ from serving concurrency after batching or tensor-parallel gathers.
 The PR #1639 comparison shapes use M=C for DEP16 and M=4C for TP4, so their
 cutovers are C=17 and C=5 respectively. In a powers-of-two concurrency sweep,
@@ -79,6 +83,14 @@ Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
 channel and dynamically quantize activations per token. This scale format is
 distinct from block scaling. Native FP8 matrix arithmetic uses FP32
 accumulators but need not match sequential FP32 arithmetic.
+
+## Startup tuning coverage
+
+During `ops.tuning.autotune`, FlashInfer MXFP8, per-tensor FP8, CUTLASS NVFP4,
+SM100/103 W4A16, and fused NVFP4 GEMMs cover the shared token budget, including
+larger observed inputs and the enclosing native bucket. Native mappers,
+constraints, and caches are preserved. Explicit buckets and disabled profiling
+retain their semantics; small-M BF16 keeps its existing bound.
 
 ## DeepSeek V4 grouped output projection
 

@@ -112,6 +112,69 @@ def first_group_page_count(op, request_id: str) -> int:
     return len([page for page in table[row] if page >= 0])
 
 
+class TestPrefillKvPageBudget:
+    @pytest.mark.parametrize("limit,expected", [(0, 3), (2, 2), (3, 3)])
+    def test_rounds_each_request_before_summing(self, limit, expected):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = limit
+        scheduler = Scheduler(cfg)
+        for index in range(3):
+            submit(scheduler, f"kv-{index}", list(range(index * 20, index * 20 + 9)))
+        batch = scheduler.next_execution_plan().forward[0]
+        assert batch.num_extends() == expected
+        assert batch.input_lengths == [9] * expected
+
+    def test_remaining_pages_can_shorten_the_next_request(self):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        submit(scheduler, "first", list(range(17)))
+        submit(scheduler, "second", list(range(100, 117)))
+        batch = scheduler.next_execution_plan().forward[0]
+        assert batch.request_ids == ["first", "second"]
+        assert batch.input_lengths == [17, 16]
+        assert (
+            sum(
+                (p + n + 15) // 16
+                for p, n in zip(batch.extend_prefix_lens, batch.input_lengths)
+            )
+            == 3
+        )
+
+    def test_continued_chunk_counts_its_history_again(self):
+        cfg = make_config(prefix_granularity=16, max_scheduled_tokens=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        submit(scheduler, "long", list(range(40)))
+        for prefix, new in [(0, 16), (16, 16), (32, 8)]:
+            batch = scheduler.next_execution_plan().forward[0]
+            assert batch.extend_prefix_lens == [prefix]
+            assert batch.input_lengths == [new]
+            assert (prefix + new + 15) // 16 <= cfg.max_kv_page_num
+
+    def test_shared_cached_prefix_is_counted_for_each_request(self):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        prefix = list(range(16))
+        submit(scheduler, "seed", prefix + [80])
+        scheduler.next_execution_plan()
+        advance_forward(scheduler, "seed", [90], finish=True)
+        for index in range(2):
+            submit(scheduler, f"shared-{index}", prefix + [100 + index])
+        batch = scheduler.next_execution_plan().forward[0]
+        assert batch.num_extends() == 1
+        assert batch.extend_prefix_lens == [16]
+        assert batch.input_lengths == [1]
+
+    def test_prompt_over_the_entire_budget_is_rejected(self):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        with pytest.raises(ValueError, match="max_kv_page_num"):
+            submit(scheduler, "too-long", list(range(49)))
+
+
 # ---------------------------------------------------------------------------
 # FSM: Submitted → Prefilling → Decoding → Finished
 # ---------------------------------------------------------------------------

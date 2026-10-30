@@ -23,7 +23,7 @@
 :func:`causal_conv1d_fn` (prefill) and :func:`causal_conv1d_update` (decode,
 chain verify and draft trees) select the depthwise causal conv in front of
 the Mamba / GDN recurrences, over a slot-indexed conv-window pool; the
-selected leaves are registered in ``conv/triton.py``.
+selected leaves are registered in ``conv/triton.py`` and ``conv/cute_dsl.py``.
 
 :func:`dflash2_grouped_conv` is independent of everything below it: a
 block-local grouped depthwise convolution for DFlash2's draft layers, with no
@@ -66,6 +66,7 @@ import torch
 from tokenspeed_kernel._triton import tl as _tl
 from tokenspeed_kernel._triton import triton as _triton_lang
 from tokenspeed_kernel.ops.attention.gdn.triton import CausalConv1dPrefillMetadata
+from tokenspeed_kernel.ops.conv import cute_dsl as _cute_dsl_solutions  # noqa: F401
 from tokenspeed_kernel.ops.conv.triton import (
     PAD_SLOT_ID,
     _inkling_ring_commit_kernel,
@@ -483,6 +484,16 @@ def causal_conv1d_fn(
         traits={
             "width": weight.shape[1],
             "state_layout": _state_layout(conv_states, weight),
+            "channels": x.shape[0],
+            "channel_contiguous": x.stride(0) == 1,
+            "token_stride": x.stride(1),
+            "weight_dtype": weight.dtype,
+            "bias_dtype": bias.dtype if bias is not None else None,
+            "state_dtype": conv_states.dtype,
+            "indexed_state": cache_indices is not None
+            and has_initial_state is not None,
+            "pad_slot_id": pad_slot_id,
+            "block_m": prefill_metadata.block_m,
         },
     )
     return kernel(

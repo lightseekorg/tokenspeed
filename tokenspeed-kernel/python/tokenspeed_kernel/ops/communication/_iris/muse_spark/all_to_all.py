@@ -28,7 +28,6 @@ for this rank's head features over all M rows, masking the last owner's tail.
 
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    _iris_drain_subgroup_vmem,
     _iris_peer_pointers,
     _iris_rendezvous,
 )
@@ -45,6 +44,7 @@ def iris_a2a_transpose_qkvg(
     FLAG_ROWS: gl.constexpr,
     BLOCK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """Exchange complete owned Q/K/V/gate rows for this rank's attention heads.
 
@@ -83,7 +83,7 @@ def iris_a2a_transpose_qkvg(
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The output projection may immediately overwrite this buffer. Every reader
     # must finish before any rank returns to that producer on the main stream.
-    _iris_drain_subgroup_vmem()
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -114,6 +114,7 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
     EPS: gl.constexpr,
     Q_SCALE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """Exchange owned QKVG rows and normalize/rotate the received Q and K heads.
 
@@ -206,7 +207,7 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
                 (copy_lanes >= KV_WIDTH) & (copy_lanes < (Q_WIDTH + KV_WIDTH)),
             )
     # All QKVG reads finish before the output projection reuses the producer buffer.
-    _iris_drain_subgroup_vmem()
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,

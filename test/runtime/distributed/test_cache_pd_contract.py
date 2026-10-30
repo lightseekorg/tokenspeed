@@ -234,6 +234,24 @@ def test_contract_wire_form_has_no_version_field() -> None:
     assert "version" not in contract_payload
 
 
+def test_contract_distinguishes_checkpoint_granularity() -> None:
+    ordinary = _layout()
+    aligned = replace(
+        ordinary,
+        group_specs=tuple(
+            (
+                replace(spec, checkpoint_granularity=4096)
+                if spec.attn_kind == "state"
+                else spec
+            )
+            for spec in ordinary.group_specs
+        ),
+    )
+    assert ordinary.to_wire_bytes() != aligned.to_wire_bytes()
+    payload = json.loads(aligned.to_wire_bytes())
+    assert payload["group_specs"][1]["checkpoint_granularity"] == 4096
+
+
 def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
     plane_bytes = 512
     lcm_block_bytes = 1024
