@@ -231,6 +231,14 @@ Operators can prepare compilation variants during ordinary execution with
 `ops.tuning.kernel_warmup(enabled=True)` and `is_warming_up()`. FlashInfer
 profiling uses a separate `autotune` context.
 
+Triton operators can register finite launch variants with
+`warmup.register_triton_warmup` for scalar alignment classes and bounded tile
+choices that vary with request shapes. `warmup.kernel_launcher` prepares these
+variants during ordinary startup execution, then launches the original call.
+Fixed-geometry cache management operations retain lazy compilation on first
+use; they need no synthetic startup writes, transfers, or waits. Per-request
+sizes must still be runtime arguments, even when their variants are warmed.
+
 ### JIT compilation while serving
 
 Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`) key the

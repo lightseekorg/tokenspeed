@@ -4046,6 +4046,133 @@ protected:
     std::vector<CacheBlockRef> held_;
 };
 
+// A cached Device state can outlive its Device window while pinned by a
+// request. The Host window remains useful to a later joint prefix match.
+class DeviceStateHostWindowPressureTest : public HostSlidingSuffixTest {
+protected:
+    void SetUp() override {
+        const auto publish = [&](const std::vector<std::int32_t>& tokens) {
+            std::vector<std::vector<std::int32_t>> pages;
+            for (int page = 0; page < 4; ++page)
+                pages.emplace_back(tokens.begin() + page * kP, tokens.begin() + (page + 1) * kP);
+            const auto hashes = ContentHashes(pages);
+            std::vector<BlockTable> tables(3);
+            EXPECT_TRUE(AdmitForTest(coordinator_, tables, 16));
+            CacheCompletedBlocksForTest(coordinator_, tables, hashes,
+                                        CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_), 0, 16,
+                                        CacheBoundaryKind::kEndpoint, false, true);
+            coordinator_.Free(tables);
+            return hashes;
+        };
+        const auto copy = [&](const CacheKey& key) {
+            auto block = host_.AcquireBlock(key.group_id);
+            coordinator_.CacheHostBlock(block, key, std::nullopt);
+        };
+        const auto evict = [&](const CacheKey& key) {
+            const auto location = CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, key.group_id, key);
+            ASSERT_TRUE(location);
+            ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, key.group_id, *location));
+        };
+        const auto older = publish(MakeTokens(16, 100));
+        older_checkpoint_ = older.back();
+        copy(Key(older_checkpoint_, 1));
+        evict(Key(older_checkpoint_, 1));
+        hashes_ = publish(tokens_);
+        for (const auto& hash : hashes_) copy(Key(hash, 0));
+        copy(Key(hashes_.back(), 2));
+        device_checkpoint_pin_ = coordinator_.GroupPrefixIndex(1).Find(device_, Key(hashes_.back(), 1));
+        ASSERT_TRUE(device_checkpoint_pin_);
+        evict(Key(hashes_.back(), 2));
+    }
+    std::string older_checkpoint_;
+    CacheBlockRef device_checkpoint_pin_{};
+};
+TEST_F(DeviceStateHostWindowPressureTest, HostWindowNeededByDeviceStateIsNotDead) {
+    auto before = coordinator_.ProbePromptPrefix(Prompt());
+    const auto before_hit = std::max(before.device.num_common_tokens, before.host.num_common_tokens);
+    ASSERT_EQ(before_hit, 16);
+    ASSERT_TRUE(coordinator_.GroupPrefixIndex(1).Contains(device_, Key(hashes_.back(), 1)));
+    ASSERT_FALSE(coordinator_.ContainsHostCachedBlock(Key(hashes_.back(), 1)));
+    HoldHostCapacity();
+    const std::array<std::uint32_t, 1> groups{1};
+    const std::array<std::int32_t, 1> buckets{0};
+    const std::array segments{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+    const auto allocated = coordinator_.AcquireHostSegments(groups, buckets, segments);
+    ASSERT_EQ(allocated.stats.allocated, 1u);
+    auto after = coordinator_.ProbePromptPrefix(Prompt());
+    const auto hit = std::max(after.device.num_common_tokens, after.host.num_common_tokens);
+    EXPECT_EQ(hit, 16);
+    EXPECT_TRUE(coordinator_.GroupPrefixIndex(1).Contains(device_, Key(hashes_.back(), 1)));
+    EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(hashes_.back(), 2)));
+    EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(older_checkpoint_, 1)));
+}
+
+TEST(JointStateHostPressureTest, StateAcrossTiersIsNotDeadHostState) {
+    BlockPool device(32, {4, 1, 1, 1});
+    BlockPool host(32, {4, 1, 1, 1});
+    auto coordinator = MakeCoordinator(
+        std::vector<CacheGroupSpec>{
+            {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
+            {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+            {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+            {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
+        4, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    const auto key = [](const std::string& hash, std::uint32_t group) {
+        return CacheKey{.group_id = group, .content_hash = hash};
+    };
+    const auto publish = [&](std::int32_t start) {
+        const auto tokens = MakeTokens(16, start);
+        std::vector<std::span<const std::int32_t>> pages;
+        for (int i = 0; i < 4; ++i) pages.emplace_back(tokens.data() + i * 4, 4);
+        const auto hashes = ComputePrefixHashes(pages, "");
+        std::vector<BlockTable> tables(4);
+        EXPECT_TRUE(AdmitForTest(coordinator, tables, 16));
+        CacheCompletedBlocksForTest(coordinator, tables, hashes,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), 0, 16,
+                                    CacheBoundaryKind::kEndpoint, false, true);
+        coordinator.Free(tables);
+        return hashes;
+    };
+    const auto copy = [&](const CacheKey& cache_key) {
+        auto block = host.AcquireBlock(cache_key.group_id);
+        coordinator.CacheHostBlock(block, cache_key, std::nullopt);
+    };
+    const auto evict = [&](const CacheKey& cache_key) {
+        const auto location = CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, cache_key.group_id, cache_key);
+        ASSERT_TRUE(location);
+        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, cache_key.group_id, *location));
+    };
+    const auto older = publish(100);
+    for (const auto group : {1u, 2u, 3u}) copy(key(older.back(), group));
+    evict(key(older.back(), 1));
+    const auto hashes = publish(1);
+    copy(key(hashes.back(), 2));
+    copy(key(hashes.back(), 3));
+    // A request pins one State group while its other groups are demoted to
+    // the Host. The same logical checkpoint remains complete across both tiers.
+    auto pin = coordinator.GroupPrefixIndex(1).Find(device, key(hashes.back(), 1));
+    ASSERT_TRUE(pin);
+    evict(key(hashes.back(), 2));
+    const auto tokens = MakeTokens(17);
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 16};
+    const auto before = coordinator.ProbePromptPrefix(prompt);
+    ASSERT_EQ(std::max(before.device.num_common_tokens, before.host.num_common_tokens), 16);
+    auto held = host.AcquireBlocks(0, host.NumFreeSlots(0));
+    for (auto& block : host.AcquireBlocks(1, host.NumEmptyLcmBlocks())) held.push_back(std::move(block));
+    const std::array<std::uint32_t, 1> groups{1};
+    const std::array<std::int32_t, 1> buckets{0};
+    const std::array segments{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+    const auto allocated = coordinator.AcquireHostSegments(groups, buckets, segments);
+    ASSERT_EQ(allocated.stats.allocated, 1u);
+    const auto after = coordinator.ProbePromptPrefix(prompt);
+    const auto hit = std::max(after.device.num_common_tokens, after.host.num_common_tokens);
+    EXPECT_EQ(hit, 16);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key(hashes.back(), 2)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key(hashes.back(), 3)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key(older.back(), 1)));
+}
+
 TEST_F(HostSlidingSuffixTest, FullDeviceKvResumesWithAHostWindowAndCheckpoint) {
     auto probe = coordinator_.ProbePromptPrefix(Prompt());
     EXPECT_EQ(probe.device_only_hit_tokens, 0);
@@ -9125,6 +9252,62 @@ TEST_F(HostSegmentPlanTest, AResumedHostTailIsSupersededByItsDeviceContinuation)
     EXPECT_EQ(coordinator_.ProbePromptPrefix({.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 26})
                   .device.num_common_tokens,
               26);
+}
+
+// The next prompt can share the aligned checkpoint and diverge before the
+// deeper Device frontier. Its KV remains usable while Host State ages by LRU.
+TEST_F(HostSegmentPlanTest, AnAlignedHostCheckpointSurvivesADeviceContinuationAndAnOlderVictim) {
+    const std::string older = CheckpointOnHost(100, {1, 2, 3}, false);
+    const std::string useful = CheckpointOnHost(1, {1, 2, 3}, false);
+    const std::vector<std::int32_t> tokens = MakeTokens(26);
+    const std::vector<std::string> input_hashes = hashes_;
+    {
+        std::vector<BlockTable> tables(4);
+        const auto admitted = AdmitForTest(
+            coordinator_, tables,
+            coordinator_.ProbePromptPrefix({.prefix_hashes = input_hashes, .tokens = tokens, .max_tokens = 16}),
+            GroupDemand{.extent = DenseGrowth{10}});
+        ASSERT_TRUE(admitted.has_value());
+        std::vector<std::vector<std::int32_t>> pages;
+        for (std::int32_t page = 0; page < 6; ++page) {
+            pages.emplace_back(tokens.begin() + page * kP, tokens.begin() + (page + 1) * kP);
+        }
+        hashes_ = ContentHashes(pages);
+        const TailPublication end{.tail_tokens = 2,
+                                  .hash = HashPrefixPage(token_span(tokens).subspan(24), hashes_.back())};
+        const RequestProgress progress{.completed_pages = CompletedPages{.prefix_hashes = hashes_,
+                                                                         .tail = end,
+                                                                         .publish_state = true,
+                                                                         .boundary_kind = CacheBoundaryKind::kEndpoint},
+                                       .num_computed_tokens = 26};
+        coordinator_.CacheCompletedBlocks(tables, progress, admitted->access_epoch);
+        coordinator_.Free(tables);
+    }
+    if (coordinator_.GroupPrefixIndex(1).Contains(pool_, Key(useful, 1))) {
+        EvictOnDevice(Key(useful, 1));
+    }
+    std::vector<std::int32_t> future(tokens.begin(), tokens.begin() + 16);
+    future.push_back(9999);
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = input_hashes, .tokens = future, .max_tokens = 16};
+    const auto before = coordinator_.ProbePromptPrefix(prompt);
+    ASSERT_EQ(std::max(before.device.num_common_tokens, before.host.num_common_tokens), 16);
+    ASSERT_FALSE(coordinator_.GroupPrefixIndex(1).Contains(pool_, Key(useful, 1)));
+    ASSERT_TRUE(coordinator_.ContainsHostCachedBlock(Key(useful, 1)));
+    HoldFreeCapacity(host_pool_, 0);
+    const std::array segments{HostSegmentRows{.first_row = 0, .past_end_row = 3}};
+    const auto allocation = coordinator_.AcquireHostSegments(state_group_ids_, zero_buckets_, segments);
+    ASSERT_EQ(allocation.stats.allocated, 3u);
+    const auto after = coordinator_.ProbePromptPrefix(prompt);
+    const auto hit_after = std::max(after.device.num_common_tokens, after.host.num_common_tokens);
+    const auto kv_after = std::max(after.device.kv_tokens, after.host.kv_tokens);
+    EXPECT_EQ(kv_after, 16);
+    EXPECT_EQ(hit_after, 16);
+    EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(older, 1)));
+    for (const auto group : state_group_ids_) {
+        EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(useful, group)));
+    }
+    EXPECT_EQ(coordinator_.HostEvictions().superseded.blocks, 0u);
+    EXPECT_EQ(coordinator_.HostEvictions().lru.blocks, 3u);
 }
 
 // The Device's KV with the Host's checkpoint is no duplicate (the Device

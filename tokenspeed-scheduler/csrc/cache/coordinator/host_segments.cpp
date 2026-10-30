@@ -213,12 +213,12 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         return newest;
     };
 
-    // An aligned ancestor or a tail's shared parent proves no State use by
-    // the deeper request. Only checkpoints acquired or published by the same
-    // request share a State access epoch. Require that evidence before giving
-    // a proven continuation priority over unrelated Host-only cache.
+    // Keep aligned checkpoints at their State LRU rank: a later prompt can
+    // diverge before the deeper frontier even within the same request cohort.
+    // A continued tail retains its existing priority so old input tails do
+    // not crowd out other sessions after the request has moved on.
     const auto device_continues_checkpoint = [&](const BoundaryTree::Node& checkpoint) {
-        if (checkpoint.latest_state_access_epoch == 0) {
+        if (checkpoint.tail_tokens == 0 || checkpoint.latest_state_access_epoch == 0) {
             return false;
         }
         const BoundaryTree::Node* root = checkpoint.tail_tokens > 0 ? checkpoint.parent : &checkpoint;
@@ -288,15 +288,15 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                             .first_entry_location = entries.front().location};
         const auto num_checkpoint_entries =
             std::ranges::count_if(entries, [&](const NodeEntry& entry) { return GroupIsState(entry.group_id); });
-        // Dead on the Host: a tail no probe enumerates any more; a
-        // checkpoint boundary missing some State group's checkpoint; with
-        // State groups, a node with no remaining Host checkpoint boundary
-        // at or under it. Only the Host's checkpoint boundaries count here:
-        // a Device checkpoint boundary under the node does not keep it out
-        // of this class, as it keeps it from CollectDeadEntries.
-        const bool dead = (node.tail_tokens > 0 && !tails_.Contains(*node.hash)) ||
-                          (num_checkpoint_entries > 0 && num_checkpoint_entries < num_state_groups_) ||
-                          (num_state_groups_ > 0 && num_remaining_checkpoint_boundaries(node) == 0);
+        // A Device checkpoint can still need this Host history, especially
+        // a window absent on the Device, or other State groups split across
+        // tiers. Incomplete Host State alone does not make these entries
+        // dead; they keep their ordinary eviction ranking.
+        const bool no_device_checkpoint = node.checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] == 0;
+        const bool dead =
+            (node.tail_tokens > 0 && !tails_.Contains(*node.hash)) ||
+            (no_device_checkpoint && ((num_checkpoint_entries > 0 && num_checkpoint_entries < num_state_groups_) ||
+                                      (num_state_groups_ > 0 && num_remaining_checkpoint_boundaries(node) == 0)));
         const BoundaryTree::Node* page = node.tail_tokens > 0 ? node.parent : &node;
         const std::int32_t num_deeper_device_checkpoint_boundaries =
             page == nullptr ? 0

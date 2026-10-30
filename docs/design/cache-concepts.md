@@ -1060,9 +1060,14 @@ Its responsibilities:
   count as `HostEvictionStats::duplicate_kv`. Remaining Host victims are whole,
   never in use, and never take or sit right under a page an eviction write-back is still
   bringing, which would otherwise arrive with nothing under it; dead entries
-  (judged by the Host's checkpoint boundaries alone, unlike the collection
-  below) go first, Host-only cache last. `AcquireHostSegments` documents the
-  victim shapes, the ranking and the restore pass.
+  go first, Host-only cache last. A Device checkpoint can depend on Host
+  history, such as a window missing on the Device: no Host checkpoint at that
+  boundary does not make those entries dead. Checkpoints on both tiers count
+  when deciding whether Host history is still needed. State groups at one
+  boundary may also be split across tiers; an incomplete Host portion is
+  still useful when the Device holds the other groups. These entries keep
+  their ordinary eviction rank. `AcquireHostSegments` documents the victim
+  shapes, the ranking and the restore pass.
   Host-only checkpoint recency follows its State entries, independently of
   the KV entries at that boundary. A longer prefix hit can traverse those KV
   entries while using only a deeper checkpoint; that traversal must not keep
@@ -1075,15 +1080,15 @@ Its responsibilities:
   still protects the whole checkpoint. This changes reclaim eligibility, not
   allocation: State and history continue to share the same LCM pools.
   A deeper Device checkpoint cannot restore State at a shorter boundary.
-  To prefer reclaiming a checkpoint along a proven continuation, the deeper
-  checkpoint must share that boundary's latest State access epoch: one epoch
-  belongs to one request's acquisitions and publications. This rule applies
-  to aligned boundaries and tails alike. An aligned ancestor or a tail's
-  shared preceding page alone does not prove State use by that request.
-  Without a shared State epoch or an exact Device duplicate, the checkpoint
-  keeps its Host-only LRU ranking. Preferring proven continuations retains
-  the recent frontier while making room for other sessions; it does not
-  make the deeper State a substitute for the earlier one.
+  Aligned Host checkpoints therefore retain their State LRU rank even when
+  a deeper Device checkpoint shares their State access epoch. These page
+  boundaries remain useful when a later prompt diverges before the deeper
+  frontier. An exact Device copy of the same boundary remains a duplicate.
+  For a nonaligned input checkpoint, a deeper Device checkpoint with the
+  same State access epoch retains the existing continuation priority: old
+  input tails must not crowd out other sessions after the request advances.
+  This is a retention choice, not a claim that deeper State restores the
+  shorter boundary; it does not reserve capacity for State.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at

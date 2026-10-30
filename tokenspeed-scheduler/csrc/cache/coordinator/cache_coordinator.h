@@ -524,12 +524,12 @@ public:
         // A segment plan took it as a duplicate of a boundary the Device
         // resumes.
         HostEvictionCounts duplicate;
-        // A segment plan took it as a checkpoint boundary a deeper Device one
-        // supersedes.
+        // A segment plan took a nonaligned input checkpoint whose request
+        // continued to a deeper Device checkpoint. Aligned checkpoints keep
+        // their State LRU rank.
         HostEvictionCounts superseded;
-        // A segment plan took it as a dead entry (judged by the Host's
-        // checkpoint boundaries alone, so a Device checkpoint boundary may
-        // still be under it), CollectDeadEntries evicted it, or a settled
+        // A segment plan took it as a dead entry (no checkpoint on either
+        // tier depends on it), CollectDeadEntries evicted it, or a settled
         // write-back cancelled it (a held member).
         HostEvictionCounts dead_entry;
         // The per-prior tail cap dropped its tail, entry by entry after the
@@ -602,14 +602,11 @@ public:
     // it. Chosen victims never contain a member in use. A pending write-back
     // of the parent page also blocks the victim: the page would otherwise
     // arrive with nothing under it. Victims go
-    // by class: dead entries (a checkpoint boundary missing a State group's
-    // checkpoint, a tail no probe enumerates, a page no Host checkpoint
-    // boundary depends on -- even one with a Device checkpoint boundary under
-    // it, which CollectDeadEntries, counting both tiers, would keep) first;
-    // then duplicates of a boundary the Device resumes and checkpoint
-    // boundaries a deeper Device checkpoint boundary on their chain
-    // supersedes (both aligned boundaries and tails need a shared State access epoch proving the
-    // continuation), the newest Device copy first; then Host-only cache, least
+    // by class: dead entries (a tail no probe enumerates, or incomplete State
+    // and history with no checkpoint on either tier depending on them) first;
+    // then exact Device duplicates and continued nonaligned input checkpoints
+    // (a shared State access epoch proves the continuation), newest Device
+    // copy first; then Host-only cache, least
     // recently used first. With State groups, an unheld Device KV copy's Host
     // duplicate joins that LRU rank at its Device access epoch, winning ties.
     // A held Device KV copy's duplicate stays ahead of Host-only State.
