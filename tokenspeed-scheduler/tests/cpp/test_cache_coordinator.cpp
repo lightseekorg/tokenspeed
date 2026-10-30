@@ -52,6 +52,41 @@
 namespace tokenspeed::test {
 namespace {
 
+TEST(CacheCoordinatorAdmissionBuckets, HostHitDestinationsPreserveSourceOwnership) {
+    for (const std::int32_t shards : {1, 2, 4}) {
+        SCOPED_TRACE(shards);
+        BlockPool device_pool(4, {8});
+        BlockPool host_pool(4, {8});
+        const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                              .cache_blocks_per_lcm_block = 8,
+                                              .block_granularity = 4,
+                                              .shard_count = shards}};
+        auto coordinator = MakeCoordinator(specs, 4, device_pool, false, &host_pool, nullptr, false, true);
+        const std::vector<std::string> hashes{"first", "second", "third", "fourth"};
+        std::vector<std::int32_t> source_buckets;
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            const std::int32_t bucket = static_cast<std::int32_t>((i + 1) % shards);
+            auto source = coordinator.AcquireHostBlock(0, bucket);
+            ASSERT_TRUE(source);
+            source_buckets.push_back(coordinator.Allocator(0).BucketOf(source->Location()));
+            coordinator.CacheHostBlock(source, CacheKey{.group_id = 0, .content_hash = hashes[i]}, std::nullopt);
+        }
+        std::vector<BlockTable> tables(1);
+        const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
+        auto admitted =
+            coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt, false);
+        ASSERT_TRUE(admitted);
+        EXPECT_EQ(admitted->host_prefix_tokens, 16);
+        ASSERT_EQ(admitted->load_pairs.size(), hashes.size());
+        for (std::size_t i = 0; i < admitted->load_pairs.size(); ++i) {
+            const auto& transfer = admitted->load_pairs[i];
+            EXPECT_EQ(coordinator.Allocator(0).BucketOf(transfer.source->Location()), source_buckets[i]);
+            EXPECT_EQ(coordinator.Allocator(0).BucketOf(transfer.destination->Location()), source_buckets[i]);
+        }
+        coordinator.Free(tables);
+    }
+}
+
 std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
     std::vector<std::int32_t> ids;
     ids.reserve(refs.size());

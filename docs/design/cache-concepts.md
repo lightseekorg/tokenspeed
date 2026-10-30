@@ -127,6 +127,11 @@ it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
 
+Replicated groups have one ownership bucket: every Host hit needs a Device
+destination in that bucket, without looking up or temporarily owning the Host
+block to count it. Sharded groups count destinations by their Host sources'
+ownership buckets.
+
 The prefix index remembers which entries an eviction traversal found pinned.
 Later admission attempts skip those entries until the last external block owner
 releases them. A one-shot ownership notification restores each entry to its

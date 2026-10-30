@@ -660,6 +660,12 @@ private:
                 : 0;
         const GroupAllocator& allocator = groups_[group_index].Allocator();
         const auto count_hit = [&](const CacheKey& key) {
+            // A replicated group has only bucket 0, independent of whether
+            // this source is already on Host or is an incoming L3 row.
+            if (allocator.ShardCount() == 1) {
+                ++need[0];
+                return;
+            }
             const CacheBlockRef host_block = groups_[group_index].Index().Find(*host_pool_, key);
             const std::int32_t bucket = host_block ? allocator.BucketOf(host_block->Location()) : 0;
             ++need[static_cast<std::size_t>(bucket)];
