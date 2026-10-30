@@ -177,6 +177,10 @@ class _AutotuneExecutor:
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
 
+    # autotune() sizes and runs its traversal through these.
+    _warmup_num_tokens = ModelExecutor._warmup_num_tokens
+    _warmup_forwards = ModelExecutor._warmup_forwards
+
     def _autotune_draft_experts(self, num_tokens):
         assert tuning_module.is_warming_up()
         self._events.append(("draft_experts", num_tokens))
@@ -390,6 +394,64 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
         ("group", None),
         ("save", None, group, 0),
     ]
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_the_rebound_pool_warmup_repeats_the_traversal_without_tuning(
+    monkeypatch, speculative
+):
+    """After the pool rebind the same dummy forwards run once more inside
+    kernel_warmup, so kernels that take the cache compile for the rebuilt
+    arena; tactics are neither tuned nor loaded or saved again."""
+    events = []
+
+    def forward(**kwargs):
+        assert not torch.is_grad_enabled()
+        assert tuning_module.is_warming_up()
+        assert not tuning_module.is_autotuning()
+        events.append(("target", kwargs["input_ids"].numel()))
+
+    def draft(*, batch_sizes, graph_phase):
+        assert (batch_sizes, graph_phase) == ((1,), False)
+        assert tuning_module.is_warming_up()
+        events.append("draft")
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(chunked_prefill_size=16),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **kwargs: events.append("scrub"),
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(warmup_decode_path=draft),
+        drafter=object() if speculative else None,
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=events,
+    )
+    for name in (
+        "load_autotune_cache",
+        "save_autotune_cache",
+        "set_autotune_max_num_tokens",
+    ):
+        _tap(
+            monkeypatch,
+            executor_module,
+            name,
+            lambda *args, name=name: events.append(name),
+        )
+    ModelExecutor.warmup_kernels_on_rebound_pool(executor)
+    assert events == [
+        "scrub",
+        ("target", 16),
+        *([("draft_experts", 16), "draft"] if speculative else []),
+    ]
+    assert not tuning_module.is_warming_up()
 
 
 @pytest.mark.parametrize("speculative", [False, True])

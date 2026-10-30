@@ -1404,6 +1404,13 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
+        # The warmup above ran on the probe's small KV arena; kernels that
+        # take the cache compile again for the rebuilt one, before serving.
+        with (
+            startup_phase("kernels.rebound_warmup"),
+            current_platform().restore_stack_limit(),
+        ):
+            executor.warmup_kernels_on_rebound_pool()
         if (
             draft is not None
             and server_args.speculative_algorithm == "DFLASH"

@@ -135,6 +135,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             if has_draft and not prefill_only:
                 self.warmup_decode_path(batch_sizes=(1,), graph_phase=False)
 
+        def warmup_kernels_on_rebound_pool(self):
+            events.append(("kernel warmup", self.generation))
+
         def release_graphs(self):
             events.append(("release", self.generation))
 
@@ -197,6 +200,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", lambda pool: [])
     args = SimpleNamespace(
         disaggregation_mode="null",
+        enable_external_encoder=False,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -229,6 +233,8 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         assert probe_index < rebind_index
         if has_draft and not prefill_only:
             assert events.index(("warmup", 0, (1,), False)) < probe_index
+        # Kernels that take the cache compile for the rebuilt pool.
+        assert rebind_index < events.index(("kernel warmup", 1))
         if expected_rewarm:
             assert rebind_index < events.index(rebound_warmup)
         if warmup_fails:

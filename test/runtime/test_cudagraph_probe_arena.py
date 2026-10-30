@@ -365,6 +365,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             free[0] -= tune_keeps + (1 << 30)
             stack[0] += 1 << 30
 
+        def warmup_kernels_on_rebound_pool(self):
+            pass
+
         def capture_graphs(self, *, entries, observer):
             raise _ServingCapture
 
@@ -507,6 +510,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        "warmup_kernels_on_rebound_pool",
         "capture_graphs",
         "set_random_seed",
     }
@@ -519,10 +523,11 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        "warmup_kernels_on_rebound_pool",
         "capture_graphs",
         "set_random_seed",
     ]
-    refusal, probe_build, _, _, serving, _ = calls
+    refusal, probe_build, _, _, _, serving, _ = calls
     assert [ast.unparse(arg) for arg in refusal.args] == ["server_args"]
     # The target's model: the narrowing floor must not read the draft's.
     (narrowing,) = (

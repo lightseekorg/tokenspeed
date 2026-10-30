@@ -512,7 +512,10 @@ FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
 The dummy extend has no cached prefix, so the MHA backend, which sends such
 an extend to its prefill kernel, also runs its cached-prefix extend kernel on
 the same rows during this traversal; that kernel compiles every variant a
-later batch can pick.
+later batch can pick. The traversal first runs on the probe build, before the
+real KV pool exists, so it runs once more on the rebuilt pool: Triton keys a
+binary on whether a tensor's storage fits in 2 GB on AMD, and kernels that
+take the cache would otherwise compile again for the real arena while serving.
 
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
