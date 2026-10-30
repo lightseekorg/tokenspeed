@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import functools
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -367,7 +368,10 @@ def make_cutlass_fused_moe(
 
     Returns:
         A callable with FlashInfer's ``cutlass_fused_moe`` arguments and return
-        values. Private modes additionally accept ``expected_m`` (positive
+        values. Private modes also accept ``prepared_input`` from
+        ``route_quant_fp8`` to consume its FP8 rows and maps without copying.
+        The caller retains and refreshes this storage after all consumers retire.
+        Private modes additionally accept ``expected_m`` (positive
         uint32 or None). The caller owns the estimate and its routing assumptions.
         The mode is fixed for the callable's lifetime; create a new callable and
         recapture graphs to change it. Unsupported private builds raise at init.
@@ -398,6 +402,8 @@ def make_cutlass_fused_moe(
             optimized, max_num_stages_fc1, max_num_stages_fc2
         )
 
+    signature = inspect.signature(entrypoint)
+
     def apply(*args, **kwargs):
         if any(
             name in kwargs
@@ -410,6 +416,42 @@ def make_cutlass_fused_moe(
             raise TypeError(
                 "Choose the SM90 MoE mode and stage bounds during initialization"
             )
+        bound = signature.bind(*args, **kwargs)
+        if bound.arguments.get("prepared_input") is not None:
+            bound.apply_defaults()
+            arguments = bound.arguments
+            from tokenspeed_kernel.ops.moe.route_quant import _validate_prepared_input
+
+            if (
+                not arguments["use_deepseek_fp8_block_scale"]
+                or arguments["min_latency_mode"]
+                or arguments["enable_alltoall"]
+                or arguments["tp_size"] != 1
+                or arguments["fc1_expert_biases"] is not None
+                or arguments["fc2_expert_biases"] is not None
+            ):
+                raise ValueError(
+                    "Prepared routes require bias-free SM90 block-FP8 without TP/all-to-all"
+                )
+            experts = arguments["fc1_expert_weights"].shape[0]
+            prepared = arguments["prepared_input"]
+            _validate_prepared_input(
+                prepared,
+                input=arguments["input"],
+                ids=arguments["token_selected_experts"],
+                experts=experts,
+                expert_offset=experts * arguments["ep_rank"],
+            )
+            # Transposing the slot-major view changes only its metadata.
+            arguments["prepared_input"] = [
+                prepared.packed,
+                prepared.scales,
+                prepared.source_rows,
+                prepared.inverse.T.reshape(-1),
+                prepared.offsets,
+            ]
+            arguments["enable_sm90_moe_optimizations"] = optimized
+            return entrypoint(*bound.args, **bound.kwargs)
         return entrypoint(*args, enable_sm90_moe_optimizations=optimized, **kwargs)
 
     return apply

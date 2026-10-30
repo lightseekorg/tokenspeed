@@ -52,7 +52,37 @@ capture. Choose `default` for upstream FlashInfer, `expected_m` for the per-call
 hint backport, or `optimized` to also enable expert-tile prefix sums and direct
 tile-to-expert lookup. Both private modes accept independent pipeline stage
 caps for FC1 and FC2.
-Existing `moe_plan` selection stays unchanged.
+The `cute_dsl` MoE solution connects prepared routes to this native consumer
+through `moe_plan`, `moe_process_weights`, and `moe_apply`. Select it explicitly
+for BF16 inputs with a positive width divisible by 128, block-FP8 weights,
+standard SwiGLU, and top-k in
+1..32 with distinct expert IDs per token. This constraint also covers calls
+that use native input preparation, whose permutation requires distinct IDs.
+The standalone route quantizer accepts repeated IDs, but that broader contract
+does not extend to the complete MoE solution.
+It prepares two cached native modules before processing weights. Batches of at
+most 16 tokens use FC1 stage cap 4 and expert lookup; larger batches use the
+original stage and lookup policies. Both retain native FC2 and expected-M
+selection. Module compilation happens during initialization, before warmup and
+graph capture; weight preprocessing runs once and both modules share the same
+processed tensors. Existing higher-priority MoE solutions retain their
+automatic selection preference.
+
+At TP=1, supported token buckets and local expert counts use the registered
+route quantizer. Other token counts, TP configurations, and larger local expert
+counts use the selected native callable's input preparation. Every call owns its
+route buffers; graph capture keeps the allocator's captured storage alive.
+Both paths preserve native GEMM and finalized-output semantics. Deferred output,
+all-to-all, clamped activation, and the batch-invariant numerical envelope are
+not advertised by this solution.
+
+Hidden width and local expert count come from the prepared weight tensors;
+the input quantizer does not assume a particular expert intermediate size.
+Width and top-k are model-static compilation parameters. Tests vary routing,
+expert-count boundaries, widths and intermediate sizes independently using
+synthetic tensors. The E4M3 weights, FP32 scales and 128x128 scale blocks follow
+the native block-FP8 contract. Other quantization formats remain separate
+registry choices; tensors are never reinterpreted to fit this solution.
 
 ```python
 from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
@@ -417,6 +447,51 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## Route packing and input quantization
+
+`route_quant_fp8(input, ids, experts=..., expert_offset=..., solution=...)`
+produces packed block-FP8 rows and their native expert offsets in one launch.
+The Hopper implementation accepts BF16 inputs with a positive width divisible
+by 128, a contiguous local interval with 1–1024 experts, and model-static top-k
+values from 1 to 32.
+Negative and nonlocal IDs have inverse row -1 and produce no packed row.
+The currently implemented token buckets are 1, 8, 16, 32, 64, 128, 256, 1024,
+and 4096. Callers retain their existing producer for other input geometry.
+These are API bounds; validation and performance coverage must be established
+for a model before selecting this producer in its execution plan.
+
+A `PreparedMoEInput` retains the original inputs, the packed data, and the
+same invocation's maps. Its logical inverse map is `[tokens, topk]` with
+native slot-major storage. Only rows below `offsets[-1]` and their referenced
+scale entries are initialized. Consumers must use these maps together and
+keep the object alive until their reads complete. Refresh uses the original
+input objects and existing output storage after earlier readers retire.
+
+Model dimensions and token buckets select compiled variants. Warm the
+selected variants before graph capture. Graph replay refreshes the route
+metadata from the live input tensors; it does not run the Python dispatcher.
+
+### Prepared input consumption
+
+The private SM90 runner accepts `prepared_input` from `route_quant_fp8`, bound
+to the same input and expert IDs. It reads the producer's packed FP8 rows,
+FP32 scales, offsets and slot-major inverse directly. The native expert GEMMs,
+activation and weighted finalizer retain their algorithms and stage settings.
+The consumer forwards `use_fused_finalize` unchanged to the native runner;
+prepared input does not select a different finalization policy. The registered
+CuTe DSL path reads `plan["cutlass_fused_finalize"]`, including the value set by
+`--no-moe-cutlass-fused-finalize` at server startup. Set the plan before warmup
+and CUDA graph capture; its default is True. This setting alone does not
+establish batch-invariant execution. Other callers keep their existing input
+producer.
+
+Packed capacity is rounded to four rows for TMA; scale capacity includes the
+per-expert padding. Only rows below `offsets[-1]` are valid. The native consumer
+uses these allocation extents even after a larger batch has increased its own
+workspace capacity. Both eager execution and capture use this interface.
+Retain every prepared tensor through graph retirement, and refresh only after
+all consumers of the previous invocation have completed.
 
 ## Kimi-K3 router
 
