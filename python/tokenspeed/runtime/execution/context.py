@@ -108,12 +108,12 @@ class InputLogprobRows:
     ``rows_per_rank`` is the plan's row count on every rank of the group,
     the split of the activation gather that puts the whole plan's rows on
     every rank, and ``gathered_to_rows`` puts the gathered rows (rank by
-    rank) back in row order (``QueryShardPlan.split_rows``); without a shard
-    both must be passed explicitly as ``None`` and ``rows`` are already the
-    whole plan's. All index
-    tensors are int64 on the device. ``chunk_tokens``
-    bounds how many rows the processor pushes through the LM head at once (a
-    memory knob, not a numerics one: log-softmax is row-local).
+    rank) back in row order (``QueryShardPlan.split_rows``); without a
+    shard both must be passed explicitly as ``None`` and ``rows`` are
+    already the whole plan's. All index tensors are int64 on the device.
+    ``chunk_tokens`` bounds how many rows the processor pushes through the
+    LM head at once (a memory knob, not a numerics one: log-softmax is
+    row-local).
     """
 
     rows: torch.Tensor

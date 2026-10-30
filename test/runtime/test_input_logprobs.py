@@ -128,10 +128,10 @@ def test_executor_flags_an_out_of_vocab_target_instead_of_scoring_it(monkeypatch
 def test_executor_stages_a_shards_rows_of_the_plan(monkeypatch):
     """Under a query shard each rank keeps as its rows the plan's rows inside
     its shard, as indices into it, with the per-rank split of the activation
-    gather and the index that restores plan order after it; the targets and slots stay the whole plan's (every rank scores
-    every row once the activations are gathered) and the target audit runs
-    over the whole plan on every rank, so the NaN flags agree across the
-    group."""
+    gather and the index that restores plan order after it; the targets and
+    slots stay the whole plan's (every rank scores every row once the
+    activations are gathered) and the target audit runs over the whole plan
+    on every rank, so the NaN flags agree across the group."""
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
     # Two requests of 4 and 6 rows over four ranks, one row per zigzag
