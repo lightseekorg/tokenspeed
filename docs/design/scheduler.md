@@ -369,7 +369,14 @@ prompt-end rule. A prompt that repeats a previous reply verbatim therefore
 resumes at `C`, or at a prompt end the rule kept. The skipped entries occupy
 no cache block and never reach Host. A retraction still publishes its frontier
 (§2), the D role publishes as before, and a model without State groups keeps
-its tails: they are resume points there.
+its tails: they are resume points there. With aligned State checkpoints
+(below), `C` is the prompt's last segment entrance -- for any prompt longer
+than one segment, whatever the chunk budget -- so the rule covers a prompt end
+in the first page past it. It never skips an aligned checkpoint: a covered
+prompt end is never a page boundary, and a finish past the prompt end holds a
+decode-produced state, which those groups keep private anyway. Their other
+unaligned prompt ends still publish a KV tail, although no hit resumes there
+either.
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
