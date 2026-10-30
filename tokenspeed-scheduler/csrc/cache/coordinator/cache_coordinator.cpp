@@ -74,6 +74,13 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
                 "group allocator shard count must match its group spec");
         const auto& spec = groups_[i].Spec();
+        _assert(spec.checkpoint_granularity >= 1, "checkpoint grain must be positive");
+        if (spec.checkpoint_granularity > 1) {
+            _assert(spec.attn_kind == AttnKind::kState, "only State groups constrain checkpoints");
+            _assert(checkpoint_granularity_ == 1 || checkpoint_granularity_ == spec.checkpoint_granularity,
+                    "restricted State groups must use the same checkpoint grain");
+            checkpoint_granularity_ = spec.checkpoint_granularity;
+        }
         pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         if (host_pool_ != nullptr) {
             host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
@@ -453,6 +460,9 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
     };
     tail_hits.hits.assign(tail_keys.size(), 0);
     if (GroupIsState(i)) {
+        if ((full_tokens + tail_tokens) % group.Spec().checkpoint_granularity != 0) {
+            return false;
+        }
         if (tail_tokens > 0) {
             _assert(tail_keys.size() == 1, "a State group has one key per boundary");
             if (!contains(tail_keys[0])) {
@@ -2288,6 +2298,11 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         // A natural checkpoint: slot 1 holds the state the forward that ended
         // at this point wrote, keyed like the point itself.
         if (!completed.publish_state || completed.prefix_hashes.empty() && !completed.tail) {
+            return ranges;
+        }
+        const std::int32_t boundary_tokens =
+            hashed_prefix_pages * prefix_granularity_ + (completed.tail ? completed.tail->tail_tokens : 0);
+        if (boundary_tokens % groups_[group_index].Spec().checkpoint_granularity != 0) {
             return ranges;
         }
         const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();

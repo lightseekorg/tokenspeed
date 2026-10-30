@@ -70,8 +70,10 @@ Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
-tree. FlashInfer can share mutable include-directory storage across native
-modules, so a module loaded later must not redirect private kernel compilation.
+tree. FlashInfer shares one mutable include-directory store across native
+modules, so the private modules use their own: a module loaded later must not
+redirect private kernel compilation, and a private module must not redirect the
+installed module's cold compilation to patched headers.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
@@ -109,6 +111,34 @@ pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
 reads the expert offsets once into shared memory while its barriers are set up,
 and fills the lookup table per expert instead of searching per tile.
 
+### Fused SM90 gated FC1
+
+The private `optimized` mode fuses eligible block-FP8 SwiGLU calls with
+hidden size 512, intermediate size 1024, at most 256 input rows, and an
+`expected_m` value that is positive and less than 32. Bias, LoRA, AWQ,
+min-latency mode, and a separate FC2 FP8 quantization scale retain their
+existing paths. The supported paired tile has 128 output channels per half and
+at most 32 token rows; other shapes retain the existing execution path.
+
+A paired tile computes matching gate/up blocks and applies SwiGLU and 1x128
+FP8 quantization before writing its output. Both existing BF16 rounding points
+are preserved: after FC1 accumulation and after SwiGLU. FC2 consumes the dense
+FP8 buffer and padded scales directly. Its BF16 output uses separate workspace,
+and the input descriptor is bounded by the current invocation's capacity.
+
+With `enable_pdl=True`, only the fused FC1 and its FC2 launch as programmatic
+dependents; other grouped GEMMs stay stream-ordered, as upstream. The matching
+eight-stage FC2 can load its first weight tile and weight scales into shared
+memory before waiting for FC1. FC1 triggers dependents only after its own
+dependency wait and writes neither routing metadata nor weights; activation
+and activation-scale reads remain after the dependency wait.
+`enable_pdl=False` keeps all grouped launches ordered and disables this
+first-tile prefetch.
+
+Prepare and warm the callable before graph capture. Fusion and prefetch variants
+have distinct content-keyed kernel caches, and route metadata is refreshed on
+replay. Performance depends on routing; benchmark the intended workload.
+
 ### NVFP4 routing-map padding
 
 The pinned FlashInfer version (0.7.2.post1) initializes unused rows inside active
@@ -122,6 +152,9 @@ guard entry are not part of this initialization contract.
 `thirdparty/flashinfer/trtllm_moe.py` uses the upstream native module while
 retaining the private runner for the small-batch tactic policy described
 later. Warmup must finish before graph capture.
+
+Prepared routing gates PDL with the caller's `enable_pdl` and FlashInfer's public
+`utils.device_support_pdl` check, matching the upstream fused entry points.
 
 Regression coverage includes live and padded mapping entries, local expert
 partitions, PDL on/off, changing routing within one captured shape, graph replay

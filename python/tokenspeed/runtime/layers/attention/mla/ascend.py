@@ -36,7 +36,6 @@ from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
     ascend_mla_prefill_backend,
 )
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 
@@ -283,12 +282,7 @@ class FusedMLADecode:
         rows = hidden.shape[0]
         query, qnorm, latent, nope_positions = self.outputs[rows]
         locations = ctx.attn_backend.write_locations(layer.attn_mqa, ctx.forward_mode)
-        slots, owned = resolve_cache_slots(
-            locations, backend.cache_placement(layer.attn_mqa)
-        )
-        if owned is not None:
-            slots = torch.where(owned, slots, -1)
-        slots = slots.to(dtype=torch.int64).contiguous()
+        slots = backend.prepare_prolog_metadata(locations)
         cache = ctx.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 576)
         if self.weights["rotary_mode"]:
             positions = positions.to(dtype=torch.int64).contiguous()
@@ -323,18 +317,13 @@ class FusedMLADecode:
             out=self.attention_outputs[rows][0],
             lse=self.attention_outputs[rows][1],
         )
-        empty = visible.flatten()[:, None] == 0
-        partial = partial.masked_fill(empty[..., None], 0)
-        lse = lse.masked_fill(empty, -torch.inf)
-        metadata = backend.forward_decode_metadata
-        active = metadata.page_table[metadata.num_extends :].ne(0).any(-1)
-        active = active.repeat_interleave(metadata.q_len_per_req)
-        lse = torch.where(active[:, None], lse, 0)
         producer, maximum, total = self.owner.outputs[rows]
-        producer.copy_(partial.transpose(0, 1))
-        maximum.copy_(lse[None])
         result = self.merge(
-            producer,
+            partial,
+            lse=lse,
+            visible=visible,
+            active=backend._current_active,
+            producer=producer,
             maximum=maximum,
             total=total,
             peers=self.owner.tables[rows],
@@ -345,9 +334,10 @@ class FusedMLADecode:
             dtype=hidden.dtype,
             device=hidden.device,
         )
-        layer.project_attended_heads(
-            result.transpose(0, 1).contiguous(), ctx, output, gate=None
-        )
+        attended = result.transpose(0, 1)
+        if layer.head_tp_exchanges(ctx):
+            attended = attended.contiguous()
+        layer.project_attended_heads(attended, ctx, output, gate=None)
         return layer.o_proj(output)[0]
 
 

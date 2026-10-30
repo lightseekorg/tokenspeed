@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import NamedTuple
 
 import lib.tal.host_device as _host_device_module
-import triton.experimental.gluon as g
 from lib.moe.rocm.memory_ops import MakeBufferResource
 from lib.moe.rocm.ops.mxfp4_activation import MxFp4ActivationLayout
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.host_device import host_device
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 class WorkspaceState(NamedTuple):

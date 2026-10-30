@@ -573,13 +573,16 @@ def mm(
             ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
             also be E4M3 codes with canonical ``[M, K/32]`` UE8M0 ``A_scales``.
     """
-    if plan is not None and (
-        prepacked_scales
-        or quant not in (None, "none")
-        or A_scales is not None
-        or B_scales is not None
+    if plan is not None and prepacked_scales:
+        raise ValueError("A GEMM plan cannot use prepacked online quantization")
+    if (
+        plan is not None
+        and quant not in (None, "none")
+        and (A_scales is None or B_scales is None)
     ):
-        raise ValueError("A dense GEMM plan cannot use online quantization")
+        raise ValueError(
+            "A quantized GEMM plan requires prequantized operands and scales"
+        )
     override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)

@@ -22,10 +22,10 @@
 
 """Native MoE quantization helpers, including the standalone online routines."""
 
-import triton.experimental.gluon as g
-import triton.language as tl
 from lib.gemm.rocm.intrinsics import amdgcn_cvt_pk_fp8_f32, amdgcn_rcpf
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import tl
 
 kQuantBlockK = l.constexpr(128)
 kFp8E4m3Max = l.constexpr(448.0)

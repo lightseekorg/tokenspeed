@@ -223,6 +223,13 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_lowest_id_tie_break_and_nan_scores
     tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_public_entry_point_selects_and_captures
     tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_token_count_does_not_recompile
+    # DeepSeek V4.1 router: the fused GEMV and sqrt-softplus top-k against the
+    # logits path, one binary across token counts, and top-k selection for
+    # biased and hash routing.
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_fused_router_matches_logits_path[17-256]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_gfx1250_fused_router_reuses_compilation_across_token_counts
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/gluon_sqrt_softplus_topk_gfx1250/bias-tokens17@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/gluon_sqrt_softplus_topk_gfx1250/hash@mi450]
     # Length-128 Hadamard: BF16 and FP32 against the Sylvester matrix, one
     # binary across row counts, and selection, including strided FP32 input.
     tokenspeed-kernel/test/amd/gfx1250/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_matches_sylvester[dtype0-0.02-0.02]
@@ -270,7 +277,7 @@ env:
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-1-gluon_mm_mxfp8_ue8m0_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-1-gluon_mm_fp8_blockscale_gfx1250]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-17]
-    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_cuda_graph_replay[24]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_largem_cuda_graph_replay[ue8m0-24]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[1792-5120-129]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[4096-1280-129]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-129]
@@ -283,6 +290,14 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_wide_tile_preserves_strided_out
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_reuses_kernels_across_row_counts
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-False-64-gluon_mm_fp8_blockscale_gfx1250]
+    # FP8 block-scale through the BK512 kernel's FP32 mode: a single K tile, a
+    # clustered multi-tile K walk with ragged rows, split K, and selection;
+    # and a partial single UE8M0 K tile.
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_fp8_blockscale_largem_matches_dequantized_reference[4096-512-65]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_fp8_blockscale_largem_matches_dequantized_reference[1024-4096-129]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_fp8_blockscale_largem_matches_dequantized_reference[1024-4096-16]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_single_k_tile_matches_dequantized_reference[2048-288-17]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-False-65-gluon_mm_fp8_blockscale_largem_gfx1250]
 install:
   - |
     set -eu

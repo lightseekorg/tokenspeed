@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_recent_write,
     qwen4_exp_qsa_selected_slots,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
@@ -52,11 +53,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("query_lengths", [4, [3, 4, 5]])
+@pytest.mark.parametrize(
+    "seq_lengths,query_lengths",
+    [((3, 14, 23), 4), ((3, 14, 23), [3, 4, 5]), ((1, 14, 23), 6)],
+)
 def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
-    device: str, query_lengths: int | list[int]
+    device: str, query_lengths: int | list[int], seq_lengths: tuple[int, ...]
 ) -> None:
-    seq_lens = torch.tensor([3, 14, 23], device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(seq_lengths, device=device, dtype=torch.int32)
     if not isinstance(query_lengths, int):
         query_lengths = torch.tensor(query_lengths, device=device, dtype=torch.int64)
     total_tokens = (
@@ -119,7 +123,7 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
     expected_recent = torch.where(
         (expected_positions >= 0) & (recent_pages > 0), expected_recent, 0
     ).to(torch.int32)
-    expected_blocks = ((expected_positions + 1) // ratio).to(torch.int32)
+    expected_blocks = ((expected_positions + 1).clamp_min(0) // ratio).to(torch.int32)
 
     references = (
         expected_positions,
@@ -463,6 +467,84 @@ def test_qwen4_exp_qsa_fused_draft_staging_reads_old_ring_first(
     )
     for actual, expected in zip(actual_scratch, expected_scratch, strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_qwen4_exp_qsa_draft_group_start_cuda_graph(
+    device: str, enable_pdl: bool
+) -> None:
+    torch.manual_seed(29)
+    ratio, head_dim, rotary_dim = 4, 16, 8
+    keys = torch.randn(4, 1, head_dim, device=device, dtype=torch.bfloat16)
+    logical = torch.arange(4, 8, device=device, dtype=torch.int64)
+    requests = torch.zeros(1, device=device, dtype=torch.int64)
+    recent_locs = (64 + logical).to(torch.int32)
+    qsa_locs = (256 + logical).to(torch.int32)
+    positions = logical[:, None].expand(-1, 3).contiguous()
+    raw = torch.randn(2, ratio, 1, head_dim, device=device, dtype=keys.dtype)
+    raw_positions = torch.zeros(2, 3, device=device, dtype=torch.int64)
+    weight = torch.rand(head_dim, device=device) + 0.5
+    rope = torch.randn(32, rotary_dim, device=device)
+    compressed = torch.zeros(2, 64, 1, head_dim, device=device, dtype=keys.dtype)
+    draft_raw = torch.randn(1, ratio, 1, head_dim, device=device, dtype=keys.dtype)
+    tags = torch.empty(1, ratio, device=device, dtype=torch.int64)
+    draft_positions = torch.empty(1, 3, device=device, dtype=torch.int64)
+
+    def reset():
+        # A round starting at position 1 can stage tags 1/2/3 without writing
+        # the group-start header. Position 4 must not use that header for RoPE.
+        tags.copy_(torch.tensor([[-1, 1, 2, 3]], device=device))
+        draft_positions.fill_(1 << 40)
+        compressed.zero_()
+
+    def forward():
+        for step in range(ratio):
+            qwen4_exp_qsa_compress_and_store(
+                keys[step : step + 1],
+                logical[step : step + 1],
+                requests,
+                recent_locs[step : step + 1],
+                raw,
+                positions[step : step + 1],
+                raw_positions,
+                weight,
+                1e-6,
+                rope,
+                qsa_locs[step : step + 1],
+                compressed,
+                64,
+                ratio,
+                256,
+                draft_raw_cache=draft_raw,
+                draft_logical_positions=tags,
+                draft_position_cache=draft_positions,
+                enable_pdl=enable_pdl,
+                stage_verify_buffers=None,
+                stage_draft=True,
+            )
+
+    reset()
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for _ in range(2):
+        keys.normal_()
+        reset()
+        graph.replay()
+        pooled = keys.float().mean(dim=0).squeeze(0)
+        norm = pooled * torch.rsqrt(pooled.square().mean() + 1e-6) * weight
+        half = rotary_dim // 2
+        cos, sin = rope[4, :half], rope[4, half:]
+        rotated = norm.clone()
+        rotated[:half] = norm[:half] * cos - norm[half:rotary_dim] * sin
+        rotated[half:rotary_dim] = norm[half:rotary_dim] * cos + norm[:half] * sin
+        expected = torch.zeros_like(compressed)
+        expected[1, 1, 0] = rotated.to(keys.dtype)
+        torch.testing.assert_close(compressed, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(draft_raw[0], keys, rtol=0, atol=0)
+        torch.testing.assert_close(tags[0], logical, rtol=0, atol=0)
+        torch.testing.assert_close(draft_positions, positions[:1], rtol=0, atol=0)
 
 
 def test_qwen4_exp_qsa_ignores_negative_draft_scratch_tags(device: str) -> None:
@@ -1978,3 +2060,124 @@ def test_portable_stream_keeps_fp32_boundary_precision(device):
     for row, frontier in enumerate(frontiers):
         expected = torch.arange(frontier - topk, frontier, device=device)
         torch.testing.assert_close(actual[row].long().sort().values, expected)
+
+
+@pytest.mark.parametrize("uniform", [False, True])
+@pytest.mark.parametrize("reset_tags", [False, True])
+def test_qsa_metadata_warmup_covers_page_table_strides(
+    device: str, uniform: bool, reset_tags: bool
+) -> None:
+    kernel = qsa_ops._qwen4_exp_qsa_prepare_metadata_kernel
+    # Earlier tests must not supply the specialization this warmup missed.
+    torch.cuda.synchronize()
+    kernel.device_caches.clear()
+    seq_lens = torch.tensor([8, 20], dtype=torch.int32, device=device)
+    lengths = 4 if uniform else torch.full_like(seq_lens, 4)
+    recent_table = torch.tensor([[3], [7]], dtype=torch.int32, device=device)
+    tags = torch.empty((2, 4), dtype=torch.int64, device=device) if reset_tags else None
+    owners = torch.arange(2, device=device).repeat_interleave(4)
+    positions = seq_lens[owners].long() - 4 + torch.arange(4, device=device).repeat(2)
+
+    def table(width):
+        return torch.arange(1, 1 + 2 * width, dtype=torch.int32, device=device).reshape(
+            2, width
+        )
+
+    def run(qsa_table):
+        actual = qwen4_exp_qsa_prepare_metadata(
+            seq_lens,
+            lengths,
+            8,
+            qsa_table,
+            64,
+            recent_table,
+            64,
+            4,
+            enable_pdl=False,
+            draft_logical_positions=tags,
+        )
+        expected = (
+            positions,
+            owners,
+            (qsa_table[owners, 0].long() * 64 + positions).int(),
+            (recent_table[owners, 0].long() * 64 + positions).int(),
+            ((positions + 1) // 4).int(),
+        )
+        for value, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(value, reference)
+        if reset_tags:
+            torch.testing.assert_close(
+                tags, torch.full_like(tags, torch.iinfo(torch.int64).min)
+            )
+
+    with kernel_warmup(enabled=True):
+        run(table(16))
+    with assert_no_triton_compile(kernel):
+        for width in (17, 1, 2, 16, 31, 32, 33):
+            run(table(width))
+        # Shortened views can also retain a persistent allocation's stride.
+        storage = table(32)
+        for width in (1, 17, 32):
+            run(storage[:, :width])
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_qsa_recent_write_warmup_covers_request_limits(
+    device: str, masked: bool
+) -> None:
+    kernel = qsa_ops._qwen4_exp_qsa_recent_write_kernel
+    torch.cuda.synchronize()
+    kernel.device_caches.clear()
+    batch, width, ratio, dim = 18, 6, 4, 8
+    rows = batch * width
+    logical = torch.arange(width, device=device).repeat(batch)
+    requests = torch.arange(batch, device=device).repeat_interleave(width)
+    locs = ((requests + 1) * 64 + logical).int()
+    token_k = torch.randn(rows, 1, dim, dtype=torch.bfloat16, device=device)
+    positions = torch.stack((logical, logical + 1000, logical + 2000), dim=1)
+    write_mask = torch.arange(rows, device=device) % 5 != 0 if masked else None
+
+    def run(limit):
+        raw = torch.full(
+            (batch + 1, ratio, 1, dim), 12, dtype=token_k.dtype, device=device
+        )
+        position_cache = torch.full(
+            (batch + 1, 3), -7, dtype=torch.int64, device=device
+        )
+        expected_raw, expected_positions = _ref_recent_write(
+            token_k,
+            logical,
+            requests,
+            locs,
+            positions,
+            raw.clone(),
+            position_cache.clone(),
+            64,
+            ratio,
+            write_mask=write_mask,
+            request_limit=limit,
+        )
+        qwen4_exp_qsa_recent_write(
+            token_k,
+            logical,
+            requests,
+            locs,
+            positions,
+            raw,
+            position_cache,
+            64,
+            ratio,
+            write_mask=write_mask,
+            request_limit=limit,
+            enable_pdl=False,
+        )
+        torch.testing.assert_close(raw, expected_raw)
+        torch.testing.assert_close(position_cache, expected_positions)
+
+    # Startup prefill reaches the unlimited writer. Pure target verification
+    # returns before this operator when request_limit == 0.
+    with kernel_warmup(enabled=True):
+        run(None)
+    with assert_no_triton_compile(kernel):
+        for limit in (1, 17, 16, 0, 2, 31, 32, 33, None):
+            run(limit)
