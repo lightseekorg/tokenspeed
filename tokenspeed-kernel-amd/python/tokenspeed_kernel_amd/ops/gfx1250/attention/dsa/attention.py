@@ -44,6 +44,7 @@ __all__ = [
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048, 2049, 2050, 2051)
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _GFX1250_COMPUTE_UNITS = 256
+_MAX_KV_SPLITS = 16
 
 
 @gluon.constexpr_function
@@ -1089,7 +1090,7 @@ def _select_num_kv_splits(
     # Choose how many full waves of CTAs are needed to occupy the GPU.
     base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), block_h))
     if kv_lora_rank == 512:
-        target_waves = 2 if block_k == 64 else 1
+        target_waves = 2
     elif block_k == 64:
         target_waves = 2
     else:
@@ -1101,7 +1102,7 @@ def _select_num_kv_splits(
     if kv_lora_rank == 128 and block_k == 32 and effective_topk <= 1024:
         max_splits = 8
     else:
-        max_splits = 16
+        max_splits = _MAX_KV_SPLITS
     num_kv_splits = min(work_tiles, max_splits, occupancy_splits)
 
     # The reducer maps the full split axis into one BlockedLayout/TDM tile,
@@ -1436,6 +1437,16 @@ def launch_gluon_dsa_decode_gfx1250(
             )
         ):
             out_view = out.view(q.shape[0], q.shape[1], kv_lora_rank)
+        # A 16-head tile gathers each selected row once per token rather than
+        # once per 8 heads. Keep 8 heads while 16-head workgroups, even fully
+        # split, would leave CUs idle.
+        block_h = 8
+        if (
+            q.shape[1] >= 16
+            and q.shape[0] * triton.cdiv(q.shape[1], 16) * _MAX_KV_SPLITS
+            >= _GFX1250_COMPUTE_UNITS
+        ):
+            block_h = 16
         result = _run_dense(
             q,
             kv_cache,
@@ -1444,7 +1455,7 @@ def launch_gluon_dsa_decode_gfx1250(
             softmax_scale=scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
-            block_h=8,
+            block_h=block_h,
             max_seqlen_k=max_seqlen_k,
             split_kv=True,
             out=out_view,
