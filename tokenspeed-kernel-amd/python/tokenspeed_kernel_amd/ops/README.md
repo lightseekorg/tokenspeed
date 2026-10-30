@@ -771,8 +771,9 @@ share one softmax, with the attention sink applied once.
 - The gfx950 prefill kernel accepts contiguous BF16 queries shaped
   `(tokens, heads, 512)`, a dense BF16 KV workspace, contiguous int32 selected
   indices and lengths, and a contiguous BF16 or FP32 sink. Registered selected
-  widths are 128, 384, 512, 640, 768, 1024, and 1152. `q` and the workspace
-  must each be smaller than 2 GiB (32-bit buffer offsets).
+  widths are 128, 384, 512, 640, 768, 1024, and 1152; gfx1250 also registers
+  133, the DSpark draft window of 128 rows plus the 5-row block. `q` and the
+  workspace must each be smaller than 2 GiB (32-bit buffer offsets).
 - The gfx950 decode kernel specializes for one to six tokens, 16 or 32 heads,
   128 SWA slots, 1024 compressed-cache slots, and 64-row pages. Both cache
   segments are required.
@@ -1020,6 +1021,12 @@ BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
 scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
 BF16 power of two, the E4M3 global scale as BF16. V is read from LDS only
 after QK, so the K and V operands are never live together.
+
+Unlike gfx950, each split stores its `P @ V` partial in FP16, normalized by
+the split's own denominator, which bounds it by the largest value row.
+Zero-query groups still store only the row sum and count, but the reduce
+applies the single-split closed form to their totals instead of merging
+splits.
 
 A workgroup stages its slots in LDS, resolving each position's gather row (-1
 when unusable) in one pass, since TDM takes row indices in SGPRs. Its tiles

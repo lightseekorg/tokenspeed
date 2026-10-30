@@ -1077,10 +1077,11 @@ def _merge_partials(
     """BF16 [heads, dims] merge of 16 heads' split partials and their sink.
 
     Partials are FP16 and normalized by their split's denominator, so each
-    split weighs in with its denominator times its max rescale. All splits (at most SPLIT_BLOCK, a power of two) load at once, unmasked,
-    at clamped splits and heads: splits and heads sit in registers, and a
-    mask uniform per register would become a branch and a full wait around
-    every load. A clamped split's weight is zero; clamped heads are not stored.
+    split weighs in with its denominator times its max rescale. All splits
+    (at most SPLIT_BLOCK, a power of two) load at once, unmasked, at clamped
+    splits and heads: splits and heads sit in registers, and a mask uniform
+    per register would become a branch and a full wait around every load. A
+    clamped split's weight is zero; clamped heads are not stored.
     """
     layout: gl.constexpr = _reduce_layout(DIM_BLOCK)
     stat_layout: gl.constexpr = gl.SliceLayout(2, layout)
@@ -1542,8 +1543,10 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
             (tokens, head_blocks), dtype=torch.int32, device=q.device
         )
     else:
-        # Placeholders: a single split never touches the partials.
-        part_stats = part_acc = part_row_sum = sink
+        # Placeholders: a single split never touches the partials. Their
+        # element types are compile keys, so they match the split buffers.
+        part_stats = part_row_sum = sink
+        part_acc = sink.view(torch.float16)
         part_count = part_active = swa_lens_i
     gluon_dsv41_selected_attention_gfx1250[(tokens, splits, head_blocks)](
         q,
