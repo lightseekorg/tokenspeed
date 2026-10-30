@@ -238,7 +238,9 @@ class HostCacheExecutor:
         self.host_group_packing = tuple(
             packing * shard_by_id[group.group_id]
             for group, packing in zip(
-                self.layout.groups, compute_host_group_packing(self.layout), strict=True
+                self.layout.groups,
+                compute_host_group_packing(self.layout),
+                strict=True,
             )
         )
 
@@ -327,7 +329,10 @@ class HostCacheExecutor:
                     "--retraction-snapshot-ratio rather than "
                     "--retraction-snapshot-host-gb"
                 )
-        validate_host_group_packing(self.host_group_packing, cpu_group=world_cpu_group)
+        validate_host_group_packing(
+            self.host_group_packing,
+            cpu_group=world_cpu_group,
+        )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
         l2_pinned_bytes = pinned_host_bytes(l2_bytes)

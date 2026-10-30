@@ -109,8 +109,9 @@ def test_failed_startup_stops_the_process_and_preserves_logs(ignore_sigterm):
     script = (
         "import signal, sys, time\n"
         f"signal.signal(signal.SIGTERM, signal.SIG_IGN if {ignore_sigterm} else signal.SIG_DFL)\n"
-        "print('ready', flush=True)\n"
+        # The parent may terminate the child as soon as it reads the ready marker.
         "print('startup details', file=sys.stderr, flush=True)\n"
+        "print('ready', flush=True)\n"
         "time.sleep(60)\n"
     )
     proc = subprocess.Popen(
