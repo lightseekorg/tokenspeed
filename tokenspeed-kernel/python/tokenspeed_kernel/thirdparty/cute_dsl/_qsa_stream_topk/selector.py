@@ -60,7 +60,9 @@ class SplitSelector(SelectorPrimitives):
             if cutlass.const_expr(self.cache_encoded):
                 value = values[item]
             else:
-                value = _load_global_u32(values.iterator + item * self.threads * 2)
+                value = _load_global_u32(
+                    values.iterator + item * self.threads * 2,
+                )
             bits = value - cutlass.Uint32(1)
             valid = value != 0
         else:
@@ -102,6 +104,26 @@ class SplitSelector(SelectorPrimitives):
         total = warp_sums[self.warps - 1]
         cute.arch.sync_threads()
         return before + inclusive, total
+
+    @cute.jit
+    def _scan_selection_counts(
+        self,
+        greater: cutlass.Int32,
+        equal: cutlass.Int32,
+        warp_sums: cute.Tensor,
+        tidx: cutlass.Int32,
+        lane: cutlass.Int32,
+    ):
+        # At most 512 strict winners fit in 10 low bits. Each thread only
+        # reserves up to 512 ties; a block of 1024 threads therefore fits
+        # all tie prefixes in the remaining 22 bits without negative ranks.
+        equal = cutlass.min(equal, cutlass.Int32(_TOPK))
+        counts = greater | (equal << 10)
+        inclusive, total = self._block_scan(counts, warp_sums, tidx, lane)
+        greater_base = (inclusive & 0x3FF) - greater
+        equal_base = ((inclusive >> 10) & 0x3FFFFF) - equal
+        total_greater = total & 0x3FF
+        return greater_base, equal_base, total_greater
 
     @cute.jit
     def _find_bucket(
@@ -168,7 +190,12 @@ class SplitSelector(SelectorPrimitives):
                     self._add_bucket(histogram, bucket, tidx, lane)
                 cute.arch.sync_threads()
                 coarse, remaining = self._find_bucket(
-                    histogram, scalars, warp_sums, cutlass.Int32(_TOPK), tidx, lane
+                    histogram,
+                    scalars,
+                    warp_sums,
+                    cutlass.Int32(_TOPK),
+                    tidx,
+                    lane,
                 )
                 prefix = cutlass.Uint32(0)
                 for round_idx in cutlass.range_constexpr(4):
@@ -191,7 +218,13 @@ class SplitSelector(SelectorPrimitives):
                             and (ordered & cutlass.Uint32(mask)) == prefix
                         ):
                             bucket = cutlass.Int32(
-                                (ordered >> cutlass.Uint32(shift)) & cutlass.Uint32(255)
+                                (
+                                    ordered
+                                    >> cutlass.Uint32(
+                                        shift,
+                                    )
+                                )
+                                & cutlass.Uint32(255)
                             )
                         self._add_bucket(histogram, bucket, tidx, lane)
                     cute.arch.sync_threads()
@@ -210,11 +243,17 @@ class SplitSelector(SelectorPrimitives):
                         greater += 1
                     if valid and ordered == prefix:
                         equal += 1
-                counts = greater | (equal << 16)
-                inclusive, total = self._block_scan(counts, warp_sums, tidx, lane)
-                greater_base = (inclusive & 0xFFFF) - greater
-                equal_base = ((inclusive >> 16) & 0xFFFF) - equal
-                total_greater = total & 0xFFFF
+                (
+                    greater_base,
+                    equal_base,
+                    total_greater,
+                ) = self._scan_selection_counts(
+                    greater,
+                    equal,
+                    warp_sums,
+                    tidx,
+                    lane,
+                )
                 for item in cutlass.range_constexpr(cute.size(values)):
                     bits, valid, logical_id = self._entry(
                         values, item, packed, count, base, tidx
@@ -236,7 +275,11 @@ class SplitSelector(SelectorPrimitives):
 
 class PackedMerge(SplitSelector):
     def __init__(self, splits: int, partial_count: int, enable_pdl: bool):
-        super().__init__(1024, (splits * partial_count + 1023) // 1024, enable_pdl)
+        super().__init__(
+            1024,
+            (splits * partial_count + 1023) // 1024,
+            enable_pdl,
+        )
         self.splits = splits
         self.partial_count = partial_count
 
@@ -292,18 +335,39 @@ class PackedMerge(SplitSelector):
                 cute.recast_ptr(histogram.iterator, dtype=cutlass.Int64),
                 cute.make_layout((256,)),
             )
-            exact = cute.make_tensor(histogram.iterator + 512, cute.make_layout((256,)))
-            lower = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+            exact = cute.make_tensor(
+                histogram.iterator + 512,
+                cute.make_layout((256,)),
+            )
+            lower = (
+                cutlass.Uint32(1)
+                << cutlass.Uint32(
+                    lane,
+                )
+            ) - cutlass.Uint32(1)
             greater_offset = cutlass.Int32(0)
             tie_offset = cutlass.Int32(0)
             for item in cutlass.range_constexpr(self.entries):
-                bits, valid, position = self._entry(values, item, True, count, 0, tidx)
+                bits, valid, position = self._entry(
+                    values,
+                    item,
+                    True,
+                    count,
+                    0,
+                    tidx,
+                )
                 bucket = cutlass.Int32(256)
                 if valid:
                     bucket = self._coarse(bits)
-                greater_mask = cute.arch.vote_ballot_sync(valid and bucket < coarse)
-                tie_mask = cute.arch.vote_ballot_sync(valid and bucket == coarse)
-                packed = ((cutlass.Int64(bits) + 1) << 32) | cutlass.Int64(position)
+                greater_mask = cute.arch.vote_ballot_sync(
+                    valid and bucket < coarse,
+                )
+                tie_mask = cute.arch.vote_ballot_sync(
+                    valid and bucket == coarse,
+                )
+                packed = ((cutlass.Int64(bits) + 1) << 32) | cutlass.Int64(
+                    position,
+                )
                 if valid and bucket < coarse:
                     rank = cutlass.Int32(cute.arch.popc(greater_mask & lower))
                     selected[greater_base + greater_offset + rank] = packed
@@ -345,7 +409,13 @@ class PackedMerge(SplitSelector):
                             and (ordered & cutlass.Uint32(mask)) == prefix
                         ):
                             bucket = cutlass.Int32(
-                                (ordered >> cutlass.Uint32(shift)) & cutlass.Uint32(255)
+                                (
+                                    ordered
+                                    >> cutlass.Uint32(
+                                        shift,
+                                    )
+                                )
+                                & cutlass.Uint32(255)
                             )
                         matching = _match_any(bucket)
                         if bucket < 256 and (matching & lower) == 0:
@@ -365,12 +435,14 @@ class PackedMerge(SplitSelector):
                     previous = scan - local_total
                     for item in cutlass.range_constexpr(8):
                         after = previous + counts[item]
-                        if previous < rank_remaining and after >= rank_remaining:
+                        if previous < rank_remaining <= after:
                             scalars[0] = lane * 8 + item
                             scalars[1] = rank_remaining - previous
                         previous = after
                     cute.arch.sync_warp()
-                    prefix |= cutlass.Uint32(scalars[0]) << cutlass.Uint32(shift)
+                    prefix |= cutlass.Uint32(
+                        scalars[0],
+                    ) << cutlass.Uint32(shift)
                     rank_remaining = scalars[1]
                 greater_count = cutlass.Int32(0)
                 equal_count = cutlass.Int32(0)
@@ -382,20 +454,23 @@ class PackedMerge(SplitSelector):
                         equal_count += 1
                 packed_counts = greater_count | (equal_count << 16)
                 inclusive_counts = self._warp_scan(packed_counts, lane)
-                all_greater = cute.arch.shuffle_sync(inclusive_counts & 0xFFFF, 31)
-                greater_position = (inclusive_counts & 0xFFFF) - greater_count
-                equal_position = ((inclusive_counts >> 16) & 0xFFFF) - equal_count
+                all_greater = cute.arch.shuffle_sync(
+                    inclusive_counts & 0xFFFF,
+                    31,
+                )
+                greater_start = (inclusive_counts & 0xFFFF) - greater_count
+                equal_start = ((inclusive_counts >> 16) & 0xFFFF) - equal_count
                 target = cutlass.Int32(_TOPK) - total_greater
                 for item in cutlass.range_constexpr(8):
                     index = lane + item * 32
                     ordered = tie_bits[item] ^ cutlass.Uint32(0xFFFFFFFF)
                     destination = cutlass.Int32(_TOPK)
                     if index < total_ties and ordered < prefix:
-                        destination = greater_position
-                        greater_position += 1
+                        destination = greater_start
+                        greater_start += 1
                     elif index < total_ties and ordered == prefix:
-                        destination = all_greater + equal_position
-                        equal_position += 1
+                        destination = all_greater + equal_start
+                        equal_start += 1
                     if destination < target:
                         selected[total_greater + destination] = ties[index]
             cute.arch.sync_threads()
@@ -443,13 +518,23 @@ class PackedMerge(SplitSelector):
         lane = cute.arch.lane_idx()
         smem = utils.SmemAllocator()
         histogram = smem.allocate_tensor(
-            cutlass.Int32, cute.make_layout((self.warps, 256), stride=(256, 1)), 128
+            cutlass.Int32,
+            cute.make_layout((self.warps, 256), stride=(256, 1)),
+            128,
         )
         warp_sums = smem.allocate_tensor(
             cutlass.Int32, cute.make_layout((self.warps,)), 16
         )
-        scalars = smem.allocate_tensor(cutlass.Int32, cute.make_layout((2,)), 16)
-        selected = smem.allocate_tensor(cutlass.Int64, cute.make_layout((_TOPK,)), 128)
+        scalars = smem.allocate_tensor(
+            cutlass.Int32,
+            cute.make_layout((2,)),
+            16,
+        )
+        selected = smem.allocate_tensor(
+            cutlass.Int64,
+            cute.make_layout((_TOPK,)),
+            128,
+        )
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
         valid = complete[row]
@@ -495,13 +580,25 @@ class PackedMerge(SplitSelector):
             else:
                 values = cute.make_tensor(
                     words.iterator + row * partials.shape[1] * 2 + tidx * 2 + 1,
-                    cute.make_layout((self.entries,), stride=(self.threads * 2,)),
+                    cute.make_layout(
+                        (self.entries,),
+                        stride=(self.threads * 2,),
+                    ),
                 )
                 self._select_compact(
-                    values, valid, histogram, scalars, warp_sums, selected, tidx, lane
+                    values,
+                    valid,
+                    histogram,
+                    scalars,
+                    warp_sums,
+                    selected,
+                    tidx,
+                    lane,
                 )
             if tidx < _TOPK:
-                position = cutlass.Int32(selected[tidx] & cutlass.Int64(0xFFFFFFFF))
+                position = cutlass.Int32(
+                    selected[tidx] & cutlass.Int64(0xFFFFFFFF),
+                )
                 if cutlass.const_expr(self.partial_count < _TOPK):
                     output[row, tidx] = position
                 else:
@@ -512,12 +609,24 @@ class PackedMerge(SplitSelector):
 
 class SplitMerge(SplitSelector):
     def __init__(
-        self, splits: int, partial_count: int, enable_pdl: bool, linear_bins: bool
+        self,
+        splits: int,
+        partial_count: int,
+        enable_pdl: bool,
+        linear_bins: bool,
     ):
-        super().__init__(1024, (splits * partial_count + 1023) // 1024, enable_pdl)
+        super().__init__(
+            1024,
+            (splits * partial_count + 1023) // 1024,
+            enable_pdl,
+        )
         self.splits = splits
         self.partial_count = partial_count
         self.linear_bins = linear_bins
+        self.fine_bits = 11
+        self.fine_bins = 1 << self.fine_bits
+        self.fine_shift = 28 - self.fine_bits
+        self.fine_base = 112 << (self.fine_bits - 5)
 
     @cute.jit
     def _rank_small_ties(
@@ -575,29 +684,58 @@ class SplitMerge(SplitSelector):
         return before + inclusive
 
     @cute.jit
-    def _fine_coarse(self, bits: cutlass.Uint32):
-        value = cutlass.Float32(
-            _llvm.bitcast(cutlass.Float32.mlir_type, bits.ir_value())
+    def _find_fine_bucket(
+        self,
+        flat: cute.Tensor,
+        scalars: cute.Tensor,
+        warp_sums: cute.Tensor,
+        tidx: cutlass.Int32,
+        lane: cutlass.Int32,
+    ):
+        # Adjacent bins stay in one thread; scan their total across the CTA,
+        # then locate the exact boundary within that thread's small interval.
+        counts = cute.make_rmem_tensor(
+            (self.fine_bins // self.threads,),
+            cutlass.Int32,
         )
+        total = cutlass.Int32(0)
+        for item in cutlass.range_constexpr(self.fine_bins // self.threads):
+            counts[item] = flat[tidx * (self.fine_bins // self.threads) + item]
+            total += counts[item]
+        inclusive = self._fine_scan(total, warp_sums, tidx, lane)
+        before = inclusive - total
+        for item in cutlass.range_constexpr(self.fine_bins // self.threads):
+            after = before + counts[item]
+            if before < _TOPK and after >= _TOPK:
+                scalars[0] = tidx * (self.fine_bins // self.threads) + item
+                scalars[1] = cutlass.Int32(_TOPK) - before
+                scalars[2] = counts[item]
+            before = after
+        # All histogram readers finish before the storage becomes tie scratch.
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _fine_coarse(self, bits: cutlass.Uint32):
         if cutlass.const_expr(self.linear_bins):
+            value = cutlass.Float32(
+                _llvm.bitcast(cutlass.Float32.mlir_type, bits.ir_value())
+            )
             # Clamp before integer conversion, including FP32 overflow.
-            scaled = value * cutlass.Float32(16)
+            scaled = value * cutlass.Float32(self.fine_bins // 64)
             index = cutlass.Int32(0)
-            if scaled >= cutlass.Float32(1023):
-                index = cutlass.Int32(1023)
+            if scaled >= cutlass.Float32(self.fine_bins - 1):
+                index = cutlass.Int32(self.fine_bins - 1)
             elif scaled > cutlass.Float32(0):
                 index = cutlass.Int32(scaled)
-            bucket = cutlass.Int32(1023) - index
         else:
-            half = cutlass.Float16(value)
-            half_bits = cutlass.Uint16(
-                _llvm.bitcast(cutlass.Uint16.mlir_type, half.ir_value())
+            # Positive FP32 bit patterns are ordered. Keep six mantissa bits
+            # per exponent; clamped tails still use exact FP32 refinement.
+            index = cutlass.Int32(bits >> self.fine_shift) - self.fine_base
+            index = cutlass.min(
+                cutlass.max(index, cutlass.Int32(0)),
+                cutlass.Int32(self.fine_bins - 1),
             )
-            bucket = cutlass.Int32(
-                ((half_bits ^ cutlass.Uint16(0xFFFF)) & cutlass.Uint16(0x7FFF))
-                >> cutlass.Uint16(5)
-            )
-        return bucket
+        return cutlass.Int32(self.fine_bins - 1) - index
 
     @cute.jit
     def _select_fine(
@@ -615,34 +753,38 @@ class SplitMerge(SplitSelector):
         flat = cute.make_tensor(
             histogram.iterator, cute.make_layout((self.warps * 256,))
         )
-        flat[tidx] = cutlass.Int32(0)
+        for item in cutlass.range_constexpr(self.fine_bins // self.threads):
+            histogram_index = tidx * (self.fine_bins // self.threads) + item
+            flat[histogram_index] = cutlass.Int32(
+                0,
+            )
         cute.arch.sync_threads()
         lower = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
         zero_count = cutlass.Int32(0)
         for item in cutlass.range_constexpr(self.entries):
             bits, valid, _ = self._entry(values, item, True, count, 0, tidx)
-            bucket = cutlass.Int32(1024)
+            bucket = cutlass.Int32(self.fine_bins)
             if valid:
                 bucket = self._fine_coarse(bits)
-            if bucket == 1023:
+            if bucket == self.fine_bins - 1:
                 zero_count += 1
-            elif bucket < 1023:
+            elif bucket < self.fine_bins - 1:
                 cute.arch.atomic_add(
-                    flat.iterator + bucket, cutlass.Int32(1), sem="relaxed", scope="cta"
+                    flat.iterator + bucket,
+                    cutlass.Int32(1),
+                    sem="relaxed",
+                    scope="cta",
                 )
         warp_zeros = cute.arch.warp_redux_sync(zero_count, "add", 0xFFFFFFFF)
         if lane == 0 and warp_zeros > 0:
             cute.arch.atomic_add(
-                flat.iterator + 1023, warp_zeros, sem="relaxed", scope="cta"
+                flat.iterator + self.fine_bins - 1,
+                warp_zeros,
+                sem="relaxed",
+                scope="cta",
             )
         cute.arch.sync_threads()
-        bucket_count = flat[tidx]
-        inclusive = self._fine_scan(bucket_count, warp_sums, tidx, lane)
-        if inclusive >= _TOPK and inclusive - bucket_count < _TOPK:
-            scalars[0] = tidx
-            scalars[1] = cutlass.Int32(_TOPK) - (inclusive - bucket_count)
-            scalars[2] = bucket_count
-        cute.arch.sync_threads()
+        self._find_fine_bucket(flat, scalars, warp_sums, tidx, lane)
         coarse = scalars[0]
         remaining = scalars[1]
         total_ties = scalars[2]
@@ -653,18 +795,32 @@ class SplitMerge(SplitSelector):
                 cute.recast_ptr(histogram.iterator, dtype=cutlass.Int64),
                 cute.make_layout((256,)),
             )
-            exact = cute.make_tensor(histogram.iterator + 512, cute.make_layout((256,)))
+            exact = cute.make_tensor(
+                histogram.iterator + 512,
+                cute.make_layout((256,)),
+            )
             if tidx == 0:
                 scalars[4] = cutlass.Int32(0)
                 scalars[5] = cutlass.Int32(0)
             cute.arch.sync_threads()
             for item in cutlass.range_constexpr(self.entries):
-                bits, valid, position = self._entry(values, item, True, count, 0, tidx)
-                bucket = cutlass.Int32(1024)
+                bits, valid, position = self._entry(
+                    values,
+                    item,
+                    True,
+                    count,
+                    0,
+                    tidx,
+                )
+                bucket = cutlass.Int32(self.fine_bins)
                 if valid:
                     bucket = self._fine_coarse(bits)
-                greater_mask = cute.arch.vote_ballot_sync(valid and bucket < coarse)
-                tie_mask = cute.arch.vote_ballot_sync(valid and bucket == coarse)
+                greater_mask = cute.arch.vote_ballot_sync(
+                    valid and bucket < coarse,
+                )
+                tie_mask = cute.arch.vote_ballot_sync(
+                    valid and bucket == coarse,
+                )
                 greater_count = cutlass.Int32(cute.arch.popc(greater_mask))
                 tie_count = cutlass.Int32(cute.arch.popc(tie_mask))
                 greater_base = cutlass.Int32(0)
@@ -679,11 +835,16 @@ class SplitMerge(SplitSelector):
                         )
                     if tie_count > 0:
                         tie_base = cute.arch.atomic_add(
-                            scalars.iterator + 5, tie_count, sem="relaxed", scope="cta"
+                            scalars.iterator + 5,
+                            tie_count,
+                            sem="relaxed",
+                            scope="cta",
                         )
                 greater_base = cute.arch.shuffle_sync(greater_base, 0)
                 tie_base = cute.arch.shuffle_sync(tie_base, 0)
-                packed = ((cutlass.Int64(bits) + 1) << 32) | cutlass.Int64(position)
+                packed = ((cutlass.Int64(bits) + 1) << 32) | cutlass.Int64(
+                    position,
+                )
                 if valid and bucket < coarse:
                     rank = cutlass.Int32(cute.arch.popc(greater_mask & lower))
                     selected[greater_base + rank] = packed
@@ -705,7 +866,8 @@ class SplitMerge(SplitSelector):
                     ties, total_ties, total_greater, selected, tidx, lane, 4
                 )
             else:
-                # One warp refines at most 256 ties; other threads have completed
+                # One warp refines at most 256 ties; other threads have
+                # completed
                 # their definite winners and wait at the final CTA barrier.
                 if warp == 0:
                     tie_bits = cute.make_rmem_tensor((8,), cutlass.Uint32)
@@ -730,7 +892,9 @@ class SplitMerge(SplitSelector):
                             exact[lane * 8 + item] = cutlass.Int32(0)
                         cute.arch.sync_warp()
                         for item in cutlass.range_constexpr(8):
-                            ordered = tie_bits[item] ^ cutlass.Uint32(0xFFFFFFFF)
+                            ordered = tie_bits[item] ^ cutlass.Uint32(
+                                0xFFFFFFFF,
+                            )
                             bucket = cutlass.Int32(256)
                             if (
                                 lane + item * 32 < total_ties
@@ -758,12 +922,14 @@ class SplitMerge(SplitSelector):
                         previous = scan - local_total
                         for item in cutlass.range_constexpr(8):
                             after = previous + counts[item]
-                            if previous < rank_remaining and after >= rank_remaining:
+                            if previous < rank_remaining <= after:
                                 scalars[0] = lane * 8 + item
                                 scalars[1] = rank_remaining - previous
                             previous = after
                         cute.arch.sync_warp()
-                        prefix |= cutlass.Uint32(scalars[0]) << cutlass.Uint32(shift)
+                        prefix |= cutlass.Uint32(
+                            scalars[0],
+                        ) << cutlass.Uint32(shift)
                         rank_remaining = scalars[1]
                     greater_count = cutlass.Int32(0)
                     equal_count = cutlass.Int32(0)
@@ -775,25 +941,29 @@ class SplitMerge(SplitSelector):
                             equal_count += 1
                     packed_counts = greater_count | (equal_count << 16)
                     inclusive_counts = self._warp_scan(packed_counts, lane)
-                    all_greater = cute.arch.shuffle_sync(inclusive_counts & 0xFFFF, 31)
-                    greater_position = (inclusive_counts & 0xFFFF) - greater_count
-                    equal_position = ((inclusive_counts >> 16) & 0xFFFF) - equal_count
+                    all_greater = cute.arch.shuffle_sync(
+                        inclusive_counts & 0xFFFF,
+                        31,
+                    )
+                    greater_start = (inclusive_counts & 0xFFFF) - greater_count
+                    equal_inclusive = (inclusive_counts >> 16) & 0xFFFF
+                    equal_start = equal_inclusive - equal_count
                     target = cutlass.Int32(_TOPK) - total_greater
                     for item in cutlass.range_constexpr(8):
                         index = lane + item * 32
                         ordered = tie_bits[item] ^ cutlass.Uint32(0xFFFFFFFF)
                         destination = cutlass.Int32(_TOPK)
                         if index < total_ties and ordered < prefix:
-                            destination = greater_position
-                            greater_position += 1
+                            destination = greater_start
+                            greater_start += 1
                         elif index < total_ties and ordered == prefix:
-                            destination = all_greater + equal_position
-                            equal_position += 1
+                            destination = all_greater + equal_start
+                            equal_start += 1
                         if destination < target:
                             selected[total_greater + destination] = ties[index]
             cute.arch.sync_threads()
         else:
-            # Large coarse ties (zeros/FP16 overflow) use unchanged exact radix.
+            # Large boundary bins use full exact FP32 radix selection.
             self._select(
                 values,
                 True,
@@ -827,7 +997,11 @@ class SplitMerge(SplitSelector):
 
 class Merge32(SplitMerge):
     def __init__(
-        self, splits: int, partial_count: int, enable_pdl: bool, linear_bins: bool
+        self,
+        splits: int,
+        partial_count: int,
+        enable_pdl: bool,
+        linear_bins: bool,
     ):
         super().__init__(splits, partial_count, enable_pdl, linear_bins)
         self.vector_layout = self.cache_encoded and self.entries >= 4
@@ -870,13 +1044,23 @@ class Merge32(SplitMerge):
         lane = cute.arch.lane_idx()
         smem = utils.SmemAllocator()
         histogram = smem.allocate_tensor(
-            cutlass.Int32, cute.make_layout((self.warps, 256), stride=(256, 1)), 128
+            cutlass.Int32,
+            cute.make_layout((self.warps, 256), stride=(256, 1)),
+            128,
         )
         warp_sums = smem.allocate_tensor(
             cutlass.Int32, cute.make_layout((self.warps,)), 16
         )
-        scalars = smem.allocate_tensor(cutlass.Int32, cute.make_layout((6,)), 16)
-        selected = smem.allocate_tensor(cutlass.Int64, cute.make_layout((_TOPK,)), 128)
+        scalars = smem.allocate_tensor(
+            cutlass.Int32,
+            cute.make_layout((6,)),
+            16,
+        )
+        selected = smem.allocate_tensor(
+            cutlass.Int64,
+            cute.make_layout((_TOPK,)),
+            128,
+        )
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
         valid = complete[row]
@@ -915,7 +1099,14 @@ class Merge32(SplitMerge):
                             encoded = partials[row, index]
                         values[item] = encoded
                 self._select_fine(
-                    values, valid, histogram, scalars, warp_sums, selected, tidx, lane
+                    values,
+                    valid,
+                    histogram,
+                    scalars,
+                    warp_sums,
+                    selected,
+                    tidx,
+                    lane,
                 )
             else:
                 values = cute.make_tensor(
@@ -923,7 +1114,14 @@ class Merge32(SplitMerge):
                     cute.make_layout((self.entries,), stride=(self.threads,)),
                 )
                 self._select_fine(
-                    values, valid, histogram, scalars, warp_sums, selected, tidx, lane
+                    values,
+                    valid,
+                    histogram,
+                    scalars,
+                    warp_sums,
+                    selected,
+                    tidx,
+                    lane,
                 )
             if tidx < _TOPK:
                 output[row, tidx] = cutlass.Int32(
