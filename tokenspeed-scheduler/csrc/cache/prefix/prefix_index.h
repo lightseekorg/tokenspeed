@@ -91,6 +91,14 @@ public:
         CachedBlockMetadata metadata;
     };
 
+    // A read-only policy snapshot; inspecting it neither pins nor touches the
+    // entry. Take a fresh snapshot after any ownership or index mutation.
+    struct CachedBlockSnapshot {
+        CacheBlockLocation location;
+        CachedBlockMetadata metadata;
+        bool pinned;
+    };
+
     explicit PrefixCacheIndex(std::uint32_t group_id) : group_id_{group_id} {}
 
     PrefixCacheIndex(const PrefixCacheIndex&) = delete;
@@ -191,6 +199,22 @@ public:
         }
         ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
         return entry_it == cache_index->entries.end() ? CacheBlockRef{} : entry_it->block_ref;
+    }
+
+    std::optional<CachedBlockSnapshot> Inspect(const BlockPool& pool, const CacheKey& key) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        const ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
+        if (entry_it == cache_index->entries.end()) {
+            return std::nullopt;
+        }
+        return CachedBlockSnapshot{
+            .location = entry_it->block_ref->Location(),
+            .metadata = metadataOf(*entry_it),
+            .pinned = !entry_it->block_ref.unique(),
+        };
     }
 
     // The key this tier publishes `block_ref` under, when the entry's block is

@@ -143,13 +143,13 @@ def make_config(
         role: ``server_args.disaggregation_mode``.
         num_snapshot_pages: The retraction snapshot pool's LCM blocks
             including the null page (``DeviceSpecs.num_snapshot_pages``).
-        host_group_packing: Virtual children per compact Host parent in
-            scheduler group order; empty when both Host pools are absent.
             Required on every role: 1 -- the null page alone -- means no
             image can be taken, so a capacity-blocked round aborts the newest
             resident instead of suspending anyone; more enables suspend and
             restore on the fused and decode roles (the prefill role refuses a
             pool).
+        host_group_packing: Virtual children per compact Host parent in
+            scheduler group order; empty when both Host pools are absent.
         max_retracted_requests: Slot-state arena rows, hence the most
             requests suspended at once; positive exactly when a pool exists.
             A victim whose image does not fit the Host (L2 pins, pool, rows)

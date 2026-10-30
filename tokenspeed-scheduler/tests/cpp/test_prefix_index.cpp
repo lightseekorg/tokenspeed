@@ -77,6 +77,46 @@ TEST(PrefixCacheIndexEvictionOrderTest, DeliversTheOldestAccessEpochFirst) {
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{oldest, middle, newest}));
 }
 
+TEST(PrefixCacheIndexInspectionTest, ReportsCurrentOwnershipWithoutPinningOrTouchingTheEntry) {
+    BlockPool pool(2, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation location = Cache(index, pool, "entry", /*access_epoch=*/10);
+    const CacheKey key = KeyOf("entry");
+    const auto initial = index.Inspect(pool, key);
+    ASSERT_TRUE(initial);
+    EXPECT_EQ(initial->location, location);
+    EXPECT_EQ(initial->metadata.last_access_epoch, 10);
+    EXPECT_FALSE(initial->metadata.was_acquired);
+    EXPECT_FALSE(initial->pinned);
+
+    auto holder = index.Find(pool, key);
+    ASSERT_TRUE(holder);
+    EXPECT_EQ(holder.use_count(), 2);
+    ASSERT_TRUE(index.Inspect(pool, key));
+    EXPECT_TRUE(index.Inspect(pool, key)->pinned);
+    EXPECT_EQ(holder.use_count(), 2);
+    index.Register(pool, holder, key, /*access_epoch=*/30, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                   /*newly_cached=*/nullptr);
+    EXPECT_EQ(index.Inspect(pool, key)->metadata.last_access_epoch, 30);
+    holder = {};
+    EXPECT_FALSE(index.Inspect(pool, key)->pinned);
+
+    // Keeping a snapshot alive must not prevent actual eviction.
+    EXPECT_EQ(index.Evict(pool, location), key);
+    EXPECT_FALSE(index.Inspect(pool, key));
+}
+
+TEST(PrefixCacheIndexInspectionTest, KeepsPoolsSeparateAndDoesNotClaimMissingKeys) {
+    BlockPool device(1, {1});
+    BlockPool host(1, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto location = Cache(index, device, "entry", /*access_epoch=*/7);
+    ASSERT_TRUE(index.Inspect(device, KeyOf("entry")));
+    EXPECT_EQ(index.Inspect(device, KeyOf("entry"))->location, location);
+    EXPECT_FALSE(index.Inspect(host, KeyOf("entry")));
+    EXPECT_FALSE(index.Inspect(device, KeyOf("absent")));
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, DeliversOneEpochPerBatchSortedByLocation) {
     BlockPool pool(4, {1});
     PrefixCacheIndex index(kGroupId);

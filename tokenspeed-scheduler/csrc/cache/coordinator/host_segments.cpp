@@ -117,16 +117,16 @@ std::vector<CacheCoordinator::HostKvDuplicateCandidate> CacheCoordinator::hostKv
                                    return;
                                }
                                const PrefixCacheIndex& index = groups_[i].Index();
-                               const CacheBlockRef host = index.Find(*host_pool_, key);
-                               if (host && host.use_count() == 2) {
-                                   const CacheBlockRef device = index.Find(pool_, key);
-                                   _assert(static_cast<bool>(device), "complete Device prefix lost a KV entry");
+                               const auto host = index.Inspect(*host_pool_, key);
+                               if (host && !host->pinned) {
+                                   const auto device = index.Inspect(pool_, key);
+                                   _assert(device.has_value(), "complete Device prefix lost a KV entry");
                                    candidates.push_back(HostKvDuplicateCandidate{
                                        .group_id = groups_[i].Id(),
-                                       .location = host->Location(),
-                                       .device_epoch = index.MetadataFor(pool_, device->Location())->last_access_epoch,
+                                       .location = host->location,
+                                       .device_epoch = device->metadata.last_access_epoch,
                                        .boundary_tokens = node->boundary_tokens,
-                                       .device_in_use = device.use_count() != 2,
+                                       .device_in_use = device->pinned,
                                    });
                                }
                            });
@@ -234,7 +234,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         if (checkpoint.tail_tokens == 0 || checkpoint.latest_state_access_epoch == 0) {
             return false;
         }
-        const BoundaryTree::Node* root = checkpoint.tail_tokens > 0 ? checkpoint.parent : &checkpoint;
+        const BoundaryTree::Node* root = checkpoint.parent;
         if (root == nullptr) {
             return false;
         }

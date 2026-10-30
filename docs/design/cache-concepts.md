@@ -1131,6 +1131,12 @@ Its responsibilities:
   input tails must not crowd out other sessions after the request advances.
   This is a retention choice, not a claim that deeper State restores the
   shorter boundary; it does not reserve capacity for State.
+  Duplicate-KV planning reads each tier's location, access metadata and pin
+  status together through `PrefixCacheIndex::Inspect`. This snapshot holds no
+  block reference and does not update recency, so collecting candidates neither
+  changes eviction eligibility nor needs a second lookup for Device metadata.
+  Its pin status is valid only until ownership changes; a later plan inspects
+  the entries again.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at

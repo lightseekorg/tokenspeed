@@ -18,9 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Single point of indirection for the triton vendor release package used by
-# tokenspeed-kernel. All in-tree code imports triton symbols from here so the
-# underlying distribution can be swapped in one place.
+# Compare word and byte Host-cache transfers with mixed field alignment.
 
 from __future__ import annotations
 
