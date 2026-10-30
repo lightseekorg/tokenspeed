@@ -970,10 +970,10 @@ def launch_gluon_mm_mxfp8_ue8m0_gfx1250(
     """Project E4M3 matrices with row-major `[1,32]` raw UE8M0 scales.
 
     A one-wave producer computes ``16 x 16`` output tiles with 512-wide TDM
-    transfers and native scaled WMMA. The V4.1 ``1792 x 5120`` Q/KV and
-    ``576 x 5120`` shared-up projections use five K partitions; other accepted
-    shapes run directly. Split partials are accumulated in FP32 and reduced to
-    BF16 by a second kernel.
+    transfers and native scaled WMMA. The V4.1 ``576 x 5120`` projection uses
+    five K partitions; other accepted shapes, including the ``1792 x 5120``
+    Q/KV projection, run directly. Split partials are accumulated in FP32 and
+    reduced to BF16 by a second kernel.
 
     Args:
         A: Row-major E4M3 activation matrix `[M,K]`, with `1 <= M <= 16`.

@@ -165,8 +165,10 @@ def test_gluon_dsv4_prefill_registered_widths(width: int) -> None:
 @pytest.mark.skipif(not is_cdna5(), reason="gfx1250 dense dsv4_prefill gluon")
 @pytest.mark.parametrize("requests", [1, 16])
 def test_gluon_dsv4_prefill_dspark_window(requests: int) -> None:
-    """DSpark draft attention: each request's 5 block rows select its 128-row
-    window plus the block, over 64 heads of which 48 are zero-padded."""
+    """DSpark draft attention: 5 block rows select a 128-row window plus the block.
+
+    The 64 heads include 48 zero-padded ones.
+    """
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.prefill import (
         launch_gluon_dsv4_prefill_gfx1250,
     )
