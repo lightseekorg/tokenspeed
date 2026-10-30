@@ -24,7 +24,6 @@ from pathlib import Path
 
 import pytest
 import torch
-from flashinfer.autotuner import AutoTuner
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.tuning import (
     autotune,
@@ -32,6 +31,9 @@ from tokenspeed_kernel.ops.tuning import (
     save_autotune_cache,
 )
 from tokenspeed_kernel.platform import current_platform
+
+if current_platform().is_blackwell:
+    from flashinfer.autotuner import AutoTuner
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_blackwell, reason="Blackwell only"
