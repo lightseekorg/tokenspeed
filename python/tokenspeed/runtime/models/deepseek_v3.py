@@ -58,7 +58,6 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.utils import get_layer_id
 
 _platform = current_platform()
 _is_blackwell = _platform.is_blackwell
