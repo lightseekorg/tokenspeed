@@ -1280,6 +1280,8 @@ attention uses its own split kernels.
   x row blocks) and `max_seqlen_k`, capped at 64 splits. The count does not
   read device-resident lengths, so graphs pass the maximum context as
   `max_seqlen_k` and replay for any batch composition.
+- Optionally, full attention takes a `schedule` from `mha_decode_schedule`
+  instead (see Balanced split schedule).
 
 #### Algorithm
 
@@ -1326,6 +1328,42 @@ the page.
 Every split stores its partial output and LSE, with an LSE of -inf for rows
 without keys in it, so the reduce merges stored partials without reading the
 cache lengths.
+
+#### Balanced split schedule
+
+Under a captured graph the split count above comes from the padded batch and
+the model's context limit, so a batch of a few long requests among short or
+padding ones gives every request the same split count, and the long
+requests' work-groups run alone while CUs idle. `mha_decode_schedule_policy`
+(`supports_`/`prefers_gluon_mha_decode_balanced_gfx950`) decides on the host,
+from each request's page count, when a balanced schedule beats it; the caller
+then computes one per step with
+`mha_decode_schedule` (`gluon_mha_decode_schedule_gfx950`, one wave) and
+passes it to `mha_decode_with_kvcache`, which then selects
+`gluon_mha_decode_balanced_gfx950` and its reduce,
+`gluon_mha_decode_balanced_reduce_gfx950`.
+
+- Full attention only. Every split covers the same number of pages, the
+  fewest whose work items fit 512 (two per CU), at least 2 and at most 128
+  splits per request; a padding request takes one. The grid holds at most
+  max(512, one per row block) items; positions past the last item exit.
+- A work-group finds its request by comparing its slot with 64 requests' first
+  slots per round of vector loads, and items run in XCD-contiguous order (the
+  FP16 GEMM's `_remap_xcd`), so the row blocks of a slot, which read the same
+  pages, share one XCD's L2. Splits are bounded by the live `cache_seqlens`
+  and a request's last split runs to its end, so a schedule older than the
+  lengths (a drafter's steps) still covers every key.
+- Page loads pipeline two deep. A one-wave work-group pipelines only while
+  the items leave each CU at most one work-group or its split spans 32 pages
+  or more; multi-wave work-groups always do.
+- The reduce finds a row's partials from its request's first slot and split
+  count, stored next to each other, and loads them 16 bytes per lane in one
+  tile of 16 or 64 splits. A row without keys merges to its sink alone.
+- The policy weighs each path's busiest CU (items over the CUs times the
+  pages each streams, plus 3 pages per balanced item for its lookup) and
+  considers balancing only from 512 pages on (thresholds measured on MI350X).
+  Batch sizes and lengths are runtime values: the kernels compile once per
+  layer shape.
 
 ### gfx950 MHA prefill
 
