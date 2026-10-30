@@ -75,6 +75,44 @@ modules, so a module loaded later must not redirect private kernel compilation.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
+### Deferred block-FP8 finalization
+
+`prepare_sm90_fp8_moe_routes` retains both expert GEMMs in the native runner
+and defers only the weighted route reduction. It returns BF16 expert rows,
+the original slot-major inverse map viewed as `[tokens, topk]`, route weights,
+and expert offsets written by the same invocation. The final offset bounds
+initialized rows; remote routes must not read the unused allocation tail.
+Caller-provided destinations must be disjoint and remain live until all
+consumers finish. Graph replay refreshes their contents without changing
+addresses. Separate streams require ordinary producer/consumer dependencies.
+The adapter explicitly disables native fused finalization. Direct native calls
+with deferred destinations must also pass `use_fused_finalize=False`; a
+conflicting request raises before any destination is written.
+
+`combine_quant_fp8` reduces routes in slot order, rounds the sum to BF16, and
+quantizes each 128-channel block to E4M3. Scales use logical `[tokens, hidden/128]` and
+physical stride `(1, tokens)`. It consumes either token-major or slot-major
+maps directly. The current solution supports Hopper, positive hidden sizes
+divisible by 128, model-static top-k in 1..32, finite inputs, and 1..4096 tokens.
+Expert counts remain native-runner inputs. Changing width or top-k requires
+startup warmup of its compiled variant. These API bounds do not establish
+validation or performance coverage for an untested model. Token counts and dependent strides are
+runtime parameters, not new compilation variants. Warm both map layouts that
+will be used before graph capture.
+
+This operation leaves output projection and communication to their existing
+callers. It does not select a new model execution path automatically, and
+deferred outputs must not be passed to the ordinary finalizer as well.
+
+The native adapter infers hidden width H and intermediate width I from the
+input and processed expert weights. H and I must be positive multiples of 128.
+FC1 weights have shape `[experts, 2*I, H]` and FC2 weights `[experts, H, I]`;
+their FP32 scale shapes follow the native 128x128 weight blocks. BF16 activations
+and E4M3 weights are the supported numerical contract for this entry point.
+The adapter retains native TP, bias and communication restrictions; it does not
+reinterpret other quantization formats or select a model-specific path.
+Tests use synthetic expert counts, routing and dimensions independently.
+
 `expected_m` is a positive uint32 hint for both expert GEMMs in one call;
 omitting it preserves the native estimate. For complete local expert groups,
 use `max(1, ceil(local_rows * top_k / local_experts))`; replicated-input EP

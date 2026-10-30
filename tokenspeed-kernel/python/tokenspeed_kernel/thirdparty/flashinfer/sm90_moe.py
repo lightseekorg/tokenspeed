@@ -413,3 +413,217 @@ def make_cutlass_fused_moe(
         return entrypoint(*args, enable_sm90_moe_optimizations=optimized, **kwargs)
 
     return apply
+
+
+def _validate_deferred_weight_geometry(input, fc1, fc2, fc1_scales, fc2_scales):
+    """Validate the native block-FP8 tensor geometry before device dispatch."""
+    import torch
+
+    if (
+        input.ndim != 2
+        or input.shape[1] <= 0
+        or input.shape[1] % 128
+        or input.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "Deferred block-FP8 MoE requires BF16 input with a positive 128-aligned width"
+        )
+    if fc1.ndim != 3 or fc2.ndim != 3:
+        raise ValueError("Expected rank-three FC1 and FC2 expert weights")
+    experts, hidden, intermediate = fc1.shape[0], input.shape[1], fc2.shape[2]
+    if experts < 1 or intermediate <= 0 or intermediate % 128:
+        raise ValueError(
+            "Expected local experts and a positive 128-aligned intermediate size"
+        )
+    for tensor, shape, dtype in (
+        (fc1, (experts, 2 * intermediate, hidden), torch.float8_e4m3fn),
+        (fc2, (experts, hidden, intermediate), torch.float8_e4m3fn),
+        (fc1_scales, (experts, 2 * intermediate // 128, hidden // 128), torch.float32),
+        (fc2_scales, (experts, hidden // 128, intermediate // 128), torch.float32),
+    ):
+        if tensor.shape != shape or tensor.dtype != dtype:
+            raise ValueError("Incompatible block-FP8 weight or scale geometry")
+    return experts, hidden, intermediate
+
+
+def make_cutlass_moe_routes(
+    *, mode: MoEMode, max_num_stages_fc1: int, max_num_stages_fc2: int
+) -> Callable:
+    """Prepare the whole native MoE with caller-owned, deferred route outputs.
+
+    Both native expert GEMMs and the routing producer remain in one runner.
+    Only the final weighted reduction is deferred. The returned callable
+    accepts processed BF16/FP8 model tensors and explicit EP/PDL/load-hint
+    settings. Its outputs retain the original slot-major route map.
+    """
+    if mode not in ("expected_m", "optimized"):
+        raise ValueError(
+            "Deferred SM90 MoE requires a private expected_m or optimized mode"
+        )
+    import torch
+    from flashinfer import ActivationType
+    from tokenspeed_kernel.ops.moe.combine_quant import DeferredMoERoutes
+
+    native = make_cutlass_fused_moe(
+        mode=mode,
+        max_num_stages_fc1=max_num_stages_fc1,
+        max_num_stages_fc2=max_num_stages_fc2,
+    )
+
+    def apply(
+        input,
+        token_selected_experts,
+        token_final_scales,
+        fc1_expert_weights,
+        fc2_expert_weights,
+        fc1_scales,
+        fc2_scales,
+        *,
+        ep_size,
+        ep_rank,
+        expected_m,
+        enable_pdl,
+        out=None,
+        workspace_buffer=None,
+    ):
+        experts, hidden, intermediate = _validate_deferred_weight_geometry(
+            input, fc1_expert_weights, fc2_expert_weights, fc1_scales, fc2_scales
+        )
+        tokens = input.shape[0]
+        if not 1 <= tokens <= 4096:
+            raise ValueError("Deferred block-FP8 MoE supports 1..4096 tokens")
+        if (
+            type(ep_size) is not int
+            or type(ep_rank) is not int
+            or ep_size < 1
+            or not 0 <= ep_rank < ep_size
+        ):
+            raise ValueError("Invalid expert-parallel size or rank")
+        if (
+            type(enable_pdl) is not bool
+            or type(expected_m) is not int
+            or not 0 < expected_m <= 2**32 - 1
+        ):
+            raise ValueError("PDL and a positive uint32 expected_m must be explicit")
+        if (
+            token_selected_experts.ndim != 2
+            or not 1 <= token_selected_experts.shape[1] <= 32
+        ):
+            raise ValueError("Deferred route IDs require 1..32 slots")
+        topk = token_selected_experts.shape[1]
+        if tokens * topk * hidden > 2**31 - 1:
+            raise ValueError("Deferred outputs exceed the int32 indexing range")
+        specs = (
+            (token_selected_experts, (tokens, topk), torch.int32),
+            (token_final_scales, (tokens, topk), torch.float32),
+            (
+                fc1_expert_weights,
+                (experts, 2 * intermediate, hidden),
+                torch.float8_e4m3fn,
+            ),
+            (fc2_expert_weights, (experts, hidden, intermediate), torch.float8_e4m3fn),
+            (
+                fc1_scales,
+                (experts, 2 * intermediate // 128, hidden // 128),
+                torch.float32,
+            ),
+            (fc2_scales, (experts, hidden // 128, intermediate // 128), torch.float32),
+        )
+        if (
+            experts < 1
+            or experts * ep_size * tokens > 2**31 - 1
+            or not input.is_cuda
+            or not input.is_contiguous()
+            or input.data_ptr() % 16
+        ):
+            raise ValueError(
+                "Deferred input must be contiguous CUDA storage with local experts"
+            )
+        for tensor, shape, dtype in specs:
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device != input.device
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError(
+                    "Incompatible deferred MoE route or processed-weight tensor"
+                )
+        if out is None:
+            out = (
+                torch.empty(
+                    (tokens * topk, hidden), dtype=torch.bfloat16, device=input.device
+                ),
+                torch.empty((tokens * topk,), dtype=torch.int32, device=input.device),
+                torch.empty((experts + 1,), dtype=torch.int64, device=input.device),
+            )
+        partial, route_map, offsets = out
+        for tensor, shape, dtype in (
+            (partial, (tokens * topk, hidden), torch.bfloat16),
+            (route_map, (tokens * topk,), torch.int32),
+            (offsets, (experts + 1,), torch.int64),
+        ):
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device != input.device
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError("Incompatible deferred MoE destination")
+        sources = [input, *(tensor for tensor, _, _ in specs)]
+        if workspace_buffer is not None:
+            if (
+                workspace_buffer.dtype != torch.uint8
+                or workspace_buffer.device != input.device
+                or not workspace_buffer.is_contiguous()
+                or workspace_buffer.data_ptr() % 16
+            ):
+                raise ValueError("Workspace must be aligned contiguous CUDA bytes")
+            sources.append(workspace_buffer)
+        ranges = [
+            (t.untyped_storage().data_ptr(), t.untyped_storage().nbytes())
+            for t in sources
+        ]
+        for tensor in out:
+            start, size = (
+                tensor.untyped_storage().data_ptr(),
+                tensor.untyped_storage().nbytes(),
+            )
+            if any(
+                max(start, other) < min(start + size, other + extent)
+                for other, extent in ranges
+            ):
+                raise ValueError("Deferred MoE destinations must have disjoint storage")
+            ranges.append((start, size))
+        native(
+            input=input,
+            output=partial,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            fc1_expert_weights=fc1_expert_weights,
+            fc2_expert_weights=fc2_expert_weights,
+            output_dtype=torch.bfloat16,
+            quant_scales=[fc1_scales, fc2_scales],
+            use_deepseek_fp8_block_scale=True,
+            use_fused_finalize=False,
+            activation_type=ActivationType.Swiglu,
+            tp_size=1,
+            tp_rank=0,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            expected_m=expected_m,
+            enable_pdl=enable_pdl,
+            workspace_buffer=workspace_buffer,
+            route_map=route_map,
+            expert_offsets=offsets,
+        )
+        return DeferredMoERoutes(
+            partial,
+            route_map.view(topk, tokens).transpose(0, 1),
+            token_final_scales,
+            offsets,
+        )
+
+    return apply
