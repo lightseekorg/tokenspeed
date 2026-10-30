@@ -1368,7 +1368,8 @@ the partials by LSE.
   device-resident lengths, so graphs replay for any batch composition.
   Sliding-window attention does not split.
 - The request count is an unspecialized runtime argument. The tile (64 or
-  128 rows), the pipeline depth (1 or 4), the grid (ragged or per request)
+  128 rows, or 256 on eight waves), the pipeline depth (1 or 4; always 4 for
+  the 8-wave tile), the grid (ragged or per request)
   and whether the split count is a multiple of 16 also follow the batch but
   compile into the kernels: the tile and depth size the LDS buffers, and
   as runtime values the other two cost 6-9% on short extends (1.5% on
@@ -1381,6 +1382,13 @@ the partials by LSE.
 Each work-group owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
+With head dim 64 and 16-bit K/V, 256-row tiles on eight waves (below) take
+over when each work-group streams many cached keys: under full attention a
+cached prefix (`max_seqlen_k - max_seqlen_q`) of at least 8192 keys; under a
+window of at least 2047 keys a prefix of at least the window and one to four
+work-groups per CU over the launch. `max_seqlen_k` should be the longest
+request's length, as serving passes for pure extends; the context limit would
+send short-prefix extends to the slower 8-wave tile.
 
 K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. The copies are
 software-pipelined four deep: four LDS buffers, three pages prefetched per wave
@@ -1399,6 +1407,19 @@ window edge are masked. Each page index is already in an SGPR from its scalar
 load, so each copy takes its 64-bit page address from a buffer descriptor based
 at that page, the KV head from the scalar offset, and reuses loop-invariant
 32-bit lane offsets within the page.
+
+The 8-wave tile runs a warp-pipelined page loop, as in the MLA 8-wave prefill:
+each wave owns 32 rows, and an iteration finishes one page in four clusters
+(read K and copy V; QK MFMAs with the previous page's exp2 and row sums; read
+V and copy K; PV MFMAs with the next page's row maxima). The two waves on a
+SIMD run one cluster apart, and the copy clusters raise their priority with
+`s_setprio`, so one wave's MFMAs and softmax overlap the other's LDS reads and
+copies. K and V pass through 4-slot LDS rings, K four pages ahead and V two.
+The running maximum moves only when a page raises it by more than 2^8, so most
+pages skip the accumulator rescale, and a wave whose 32 rows all kept their
+maximum skips it with one scalar branch. A wave uses about 196 VGPRs, so one
+8-wave work-group runs per CU; the split count therefore counts each as two
+4-wave work-groups.
 
 ### gfx950 MLA extend
 
