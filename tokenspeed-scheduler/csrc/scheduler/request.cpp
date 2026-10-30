@@ -29,6 +29,7 @@ namespace tokenspeed {
 
 Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
+      session_id_{spec.session_id},
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},

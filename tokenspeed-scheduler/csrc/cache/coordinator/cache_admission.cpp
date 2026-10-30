@@ -1009,7 +1009,7 @@ void CacheCoordinator::ReleaseStateInputs(std::span<BlockTable> tables) {
 
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
-    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments) {
+    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments, const std::string& session_id) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].table != nullptr, "group demand requires a block table");
@@ -1077,6 +1077,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 "request access epoch was not issued by this coordinator");
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
+    if (!request_access_epoch && !session_id.empty()) {
+        session_access_[access_epoch] = sessionTag(session_id);
+    }
     // The boundaries inside a block, per tier: the hitter's table ends in a
     // private copy of the Device tail's partial block, or in a fresh page the
     // Host tail is loaded into.
@@ -1411,8 +1414,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
             }
             // The planner protected this entry; claim it like a prefix hit.
             const std::array<CacheKey, 1> keys{slot.key};
-            PrefixMatch hit = groups_[i].Index().AcquireMatched(pool_, keys, /*begin_blocks=*/0,
-                                                                GroupPrefixProbe{.hits = {1}}, request_access_epoch);
+            PrefixMatch hit =
+                groups_[i].Index().AcquireMatched(pool_, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
+                                                  request_access_epoch, SessionForAccess(request_access_epoch));
             claimed[i][j] = std::move(hit.blocks.front());
         }
     }

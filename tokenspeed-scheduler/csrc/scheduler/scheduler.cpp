@@ -465,6 +465,18 @@ bool Scheduler::CanAbortBeforeAdmission(const std::string& id) const {
            it->second->IsAnyOf<fsm::Submitted, fsm::Prefetching>();
 }
 
+std::vector<std::int64_t> Scheduler::AdmissionCapacityCurve(std::int32_t token_step) const {
+    _assert(token_step > 0, "capacity curve step must be positive");
+    CapacityModel model(config_);
+    std::vector<std::int64_t> curve;
+    for (std::int64_t tokens = 0; tokens < MaxSingleRequestTokens(); tokens += token_step) {
+        const auto upper =
+            static_cast<std::int32_t>(std::min<std::int64_t>(tokens + token_step, MaxSingleRequestTokens()));
+        curve.push_back(model.LcmBlocksNeededFor(model.SingleRequestGroupPages(upper)));
+    }
+    return curve;
+}
+
 ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     std::erase_if(requests_, [this](const auto& request) {
@@ -472,6 +484,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             return false;
         }
         releaseStorage(*request);
+        coordinator_.ForgetSessionAccess(request->SessionEpoch());
         kv_event_hash_progress_.erase(request->Id());
         requests_by_id_.erase(request->Id());
         return true;

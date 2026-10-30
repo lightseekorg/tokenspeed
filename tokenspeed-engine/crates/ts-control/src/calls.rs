@@ -53,7 +53,8 @@
 //!   flush_cache = true, weight_version}])`;
 //! * `release_memory_occupation([{tags}])`,
 //!   `resume_memory_occupation([{tags}])`;
-//! * `rebalance_experts()`.
+//! * `rebalance_experts()`;
+//! * `demote_sessions([{session_ids, ended}])`: explicit cache eviction hints.
 
 use std::time::{Duration, Instant};
 
@@ -142,6 +143,29 @@ pub fn translate(call: &ControlCall, now: Instant) -> Result<Translated, String>
 fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> {
     let body = Body::of(method, args)?;
     Ok(match method {
+        "demote_sessions" => {
+            let session_ids = body.strs("session_ids")?;
+            if session_ids.len() > 4096
+                || session_ids
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 4096)
+            {
+                return Err(
+                    "demote_sessions requires at most 4096 nonempty bounded session ids".into(),
+                );
+            }
+            let ended = body
+                .get("ended")
+                .and_then(boolean)
+                .ok_or_else(|| body.missing("ended (boolean)"))?;
+            ControlRequest::DemoteSessions(ts_wire::control::DemoteSessionsReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                session_ids,
+                ended,
+            })
+        }
+
         "pause_generation" => ControlRequest::PauseScheduler(PauseSchedulerReqInput {
             rid: None,
             http_worker_ipc: None,
@@ -246,6 +270,7 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
 
 /// The methods [`rl_operation`] serves.
 const RL_METHODS: &[&str] = &[
+    "demote_sessions",
     "pause_generation",
     "continue_generation",
     "init_weights_update_group",
@@ -751,5 +776,39 @@ mod tests {
         assert!(error.contains("takes no body"), "{error}");
         let error = rl("pause_generation", vec!["wait".into()]).unwrap_err();
         assert!(error.contains("takes [body]"), "{error}");
+    }
+    #[test]
+    fn demotion_requires_explicit_end_semantics_and_bounded_ids() {
+        let ids = Value::Array(vec!["s".into()]);
+        assert!(rl(
+            "demote_sessions",
+            vec![body(vec![("session_ids", ids.clone())])]
+        )
+        .is_err());
+        let request = rl(
+            "demote_sessions",
+            vec![body(vec![
+                ("session_ids", ids),
+                ("ended", Value::Bool(false)),
+            ])],
+        )
+        .unwrap();
+        let ControlRequest::DemoteSessions(request) = request else {
+            panic!("demotion request");
+        };
+        assert_eq!(request.session_ids, ["s"]);
+        assert!(!request.ended);
+        assert!(rl(
+            "demote_sessions",
+            vec![body(vec![
+                ("session_ids", Value::Array(vec!["".into()])),
+                ("ended", Value::Bool(true))
+            ])]
+        )
+        .is_err());
+        assert!(
+            rl("get_admission", Vec::new()).is_err(),
+            "structured snapshots require the typed control API"
+        );
     }
 }

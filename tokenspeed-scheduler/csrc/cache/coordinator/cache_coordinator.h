@@ -29,6 +29,7 @@
 #include <span>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -87,6 +88,13 @@ public:
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                      bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                      bool stream_device_cache_to_host, bool write_back_evictions);
+    std::size_t DemoteSession(const std::string& session_id, bool ended);
+    std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
+    void ForgetSessionAccess(std::uint64_t epoch) { session_access_.erase(epoch); }
+    SessionCacheOwner SessionForAccess(std::uint64_t epoch) const {
+        const auto it = session_access_.find(epoch);
+        return it == session_access_.end() ? nullptr : it->second;
+    }
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
@@ -289,7 +297,7 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments);
+                                         bool evict_blocks_past_segments, const std::string& session_id = {});
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;
@@ -545,7 +553,7 @@ public:
     // content hashes (chain hashes and tail hashes alike) for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
-    std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+    std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     // One Host block per (group, bucket) entry, in the bucket of the Device
     // block it will mirror -- under page-cyclic sharding the owner of a Host
@@ -1045,6 +1053,10 @@ private:
     // Some group is prefix-closed, and needs every page below a boundary: a
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
+    SessionCacheOwner sessionTag(const std::string& id);
+    std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
+    std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
+    std::size_t session_tags_since_sweep_{0};
     std::uint64_t next_access_epoch_{0};
     // Issued access epochs start at 1. A superseded input is re-registered
     // at this one (MarkSupersededStateInput), below every other cache entry

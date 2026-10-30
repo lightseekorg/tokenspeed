@@ -47,6 +47,9 @@ public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
+    const std::string& SessionId() const { return session_id_; }
+    std::uint64_t SessionEpoch() const { return session_epoch_; }
+    void SetSessionEpoch(std::uint64_t epoch) { session_epoch_ = epoch; }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -314,6 +317,8 @@ private:
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
+    std::string session_id_;
+    std::uint64_t session_epoch_{0};
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
