@@ -1444,3 +1444,47 @@ def test_spec_candidates_use_output_bounds_without_narrowing_inputs(
         assert ib.input_ids_buf[:2].tolist() == [100, 127]
     # The drafter-owned source is never rewritten by input preparation.
     assert runtime.future_input_map[2].tolist() == [100, *draft_ids]
+
+
+def test_window_only_ngram_buffers_and_kwargs(monkeypatch):
+    """LongCat window mode: raw predecessor window, no Engram hash buffers."""
+    device = "cpu"
+    monkeypatch.setattr(
+        InputBuffers,
+        "_bulk_pinned",
+        lambda self, *specs: [torch.empty(n, dtype=dtype) for n, dtype in specs],
+    )
+    ib = InputBuffers(
+        max_bs=4, max_num_tokens=32, state_write_padding_pool_index=5, device=device
+    )
+    ib.init_ngram_buffers(3, None, VOCAB_SIZE)
+    assert ib.ngram_hash_ids_buf is None and ib.ngram_padding_hash is None
+    runtime = RuntimeStates(
+        req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=1, device=device
+    )
+    runtime.init_ngram_state(3)
+    runtime.valid_cache_lengths.fill_(0)
+    ib.req_pool_indices_buf[:1] = torch.tensor([2], dtype=torch.int64)
+    ib.input_ids_buf[:3] = torch.tensor([10, 11, 12], dtype=torch.int64)
+    states = {"a": _state([10, 11, 12], [])}
+    op = _op(states, ["a"], [2], [3], [0], [0], [])
+    snapshot = _ngram_inputs(op, states, 3)
+    ib.fill_ngram_inputs(snapshot, 3, runtime, op)
+    kwargs = ib.ngram_model_kwargs(3)
+    assert "ngram_previous_tokens" in kwargs and "engram_hash_ids" not in kwargs
+    assert "engram_token_mask" not in kwargs
+    win = kwargs["ngram_previous_tokens"]
+    assert list(win.shape) == [3, 3]
+    # window cols (newest first) hold the token's predecessors; the first
+    # token of the request has none, later tokens read earlier ids.
+    assert win[0, :].tolist() == [-1, -1, -1]
+    assert win[1, 0] == 10 and win[1, 1] == -1
+    assert win[2, 0] == 11 and win[2, 1] == 10
+
+
+def test_engram_context_len_selects_longcat_window():
+    longcat = SimpleNamespace(emb_neighbor_num=4, ngram_context_len=3)
+    assert engram_context_len(longcat) == 3
+    qwen4 = SimpleNamespace(ple_layer_ids=[1], ngram_context_len=2, emb_neighbor_num=0)
+    assert engram_context_len(qwen4) == 0
+    assert engram_context_len(SimpleNamespace()) == 0

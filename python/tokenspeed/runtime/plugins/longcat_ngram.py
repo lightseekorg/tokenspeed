@@ -78,6 +78,11 @@ def _ensure_ngram_config(config) -> None:
         config.eos_token_id = 2
     if not hasattr(config, "pad_token_id"):
         config.pad_token_id = None
+    # Caller-owned predecessor-window width (n-1): the shared ngram-history
+    # machinery (``prepare_ngram_inputs`` / ``fill_ngram_inputs``) resolves
+    # per-token predecessor windows for this model, so the executor hands the
+    # embedding its predecessor window instead of request-level history rows.
+    config.ngram_context_len = config.emb_neighbor_num - 1
     return config
 
 
@@ -205,25 +210,34 @@ class NgramEmbedding(nn.Module):
             if embedders is not None:
                 self._modules["embedders"] = embedders
 
-    def _shift_right_ignore_eos(self, tensor: torch.Tensor, n: int) -> torch.Tensor:
-        """Shift right by ``n``, resetting at EOS boundaries (vectorized).
+    def _window_from_context(
+        self, context: torch.Tensor, committed: int
+    ) -> torch.Tensor:
+        """Build the per-token predecessor window from full context rows.
 
-        Equivalent to the checkpoint reference loop: within every segment
-        bounded by EOS tokens, position ``j`` copies ``tensor[j - n]`` when
-        ``j - n`` lies in the same segment, and stays zero otherwise.
+        ``context`` ``[.., committed + seq_len]`` holds each row's committed
+        history prefix followed by its input ids; ``committed`` is the prefix
+        width (0 when there is none). The returned window
+        ``[.., seq_len, n - 1]`` holds raw predecessor ids (``-1`` where the
+        predecessor lies before the context start), newest first: column
+        ``d - 1`` is the token ``d`` positions back.
         """
-        eos = (tensor == self.config.eos_token_id).to(tensor.dtype)
-        # Segment id of position j = number of EOS strictly before j.
-        seg = eos.cumsum(dim=-1) - eos
-        result = torch.zeros_like(tensor)
-        seq_len = tensor.size(-1)
-        if n < seq_len:
-            result[:, n:] = tensor[:, :-n]
-            same = seg[:, n:] == seg[:, :-n]
-            result[:, n:] = torch.where(
-                same, result[:, n:], torch.zeros_like(result[:, n:])
-            )
-        return result
+        seq_len = context.size(-1) - committed
+        window = torch.full(
+            (*context.shape[:-1], seq_len, self.n - 1),
+            -1,
+            dtype=context.dtype,
+            device=context.device,
+        )
+        for d in range(1, self.n):
+            # Predecessor of position ``p`` is ``context[p + committed - d]``;
+            # shift the row right by ``d`` (left edge ``-1``) and read the
+            # input positions.
+            shifted = torch.full_like(context, -1)
+            if d < context.size(-1):
+                shifted[..., d:] = context[..., :-d]
+            window[..., d - 1] = shifted[..., committed : committed + seq_len]
+        return window
 
     def _precompute_vocab_mods(self):
         """Polynomial rolling-hash moduli per (neighbor, split) pair, cached."""
@@ -246,18 +260,82 @@ class NgramEmbedding(nn.Module):
         self._vocab_mods_cache = vocab_mods
         return vocab_mods
 
-    def _get_ngram_ids(
+    def forward_from_window(
         self,
         input_ids: torch.Tensor,
-        shifted_ids: dict[int, torch.Tensor],
-        vocab_mods: list[int],
-        ngram: int,
+        predecessor_window: torch.Tensor,
+        *,
+        query_shard=None,
     ) -> torch.Tensor:
-        """Compute n-gram hash IDs using the polynomial rolling hash."""
-        ngram_ids = input_ids.clone()
-        for k in range(2, ngram + 1):
-            ngram_ids = ngram_ids + shifted_ids[k] * vocab_mods[k - 2]
-        return ngram_ids
+        """Stateless forward from a per-token predecessor window.
+
+        Args:
+            input_ids: ``[.., seq_len]`` current token ids.
+            predecessor_window: ``[.., seq_len, n-1]`` raw predecessor token
+                ids, column ``d-1`` holding the token ``d`` positions back
+                (newest first), ``-1`` where no predecessor exists. The window
+                already folds each request's committed history in (shared
+                ngram-history machinery, ``prepare_ngram_inputs``).
+            query_shard: Forward query-shard plan forwarded to the base word
+                embedding (query context parallelism).
+
+        Returns:
+            ``[.., seq_len, hidden_size]`` enriched embeddings.
+        """
+        seq_len = input_ids.size(-1)
+
+        # Base word embeddings (TP/query-shard aware through the embedding
+        # module); the clone keeps the checkpoint's in-place-friendly layout.
+        if query_shard is not None:
+            x = self.word_embeddings(input_ids, query_shard=query_shard).clone()
+        else:
+            x = self.word_embeddings(input_ids).clone()
+
+        # EOS reset, vectorized over the window columns (newest first): the
+        # predecessor at distance ``d`` contributes zero when any of the ``d``
+        # tokens immediately before the current token is EOS (or is dead),
+        # which is ``_shift_right_ignore_eos`` on the concatenated context.
+        eos = self.config.eos_token_id
+        crossed = (predecessor_window == eos).cumsum(-1) > 0
+        effective = predecessor_window.masked_fill(
+            (predecessor_window < 0) | crossed, 0
+        )
+
+        vocab_mods = self._precompute_vocab_mods()
+
+        shifted = {}
+        for d in range(1, self.n):
+            shifted[d] = effective[..., d - 1]
+
+        for i in range(2, self.n + 1):
+            for j in range(self.k):
+                index = (i - 2) * self.k + j
+                emb_vocab_dim = int(self.m + index * 2 + 1)
+
+                ngram_ids = input_ids.clone()
+                mods = vocab_mods[(i, j)]
+                for k in range(2, i + 1):
+                    ngram_ids = ngram_ids + shifted[k - 1] * mods[k - 2]
+                new_ids = ngram_ids % emb_vocab_dim
+
+                # Host-resident lookup (W18 scheme 2): the ids were hashed on
+                # the NPU; move only this batch's rows to the CPU, gather the
+                # embedder rows there, and bring the small result back to the
+                # device for the (NPU-resident) post projection.  Numerically
+                # identical to an on-device ``embedder(new_ids)`` — same ids,
+                # same weights — and leaves the ~63 GB tables off the device.
+                host_weight = self._host_embedders[index]
+                new_ids_cpu = new_ids.to("cpu")
+                x_ngram = F.embedding(
+                    new_ids_cpu,
+                    host_weight,
+                    padding_idx=self.config.pad_token_id,
+                ).to(x.device)
+                x_proj = self.post_projs[index](x_ngram)
+                x = x + x_proj.to(x.device)
+
+        x = x / (1 + self.k * (self.n - 1))
+        return x
 
     def forward(
         self,
@@ -279,56 +357,18 @@ class NgramEmbedding(nn.Module):
         Returns:
             ``[batch, seq_len, hidden_size]`` enriched embeddings.
         """
-        seq_len = input_ids.size(-1)
-
         if ngram_context is not None:
+            committed = self.n - 1
             context = torch.cat(
-                [ngram_context[..., -(self.n - 1) :], input_ids], dim=-1
+                [ngram_context[..., -committed:], input_ids], dim=-1
             )
         else:
+            committed = 0
             context = input_ids
-
-        # Base word embeddings (TP/query-shard aware through the embedding
-        # module); the clone keeps the checkpoint's in-place-friendly layout.
-        if query_shard is not None:
-            x = self.word_embeddings(input_ids, query_shard=query_shard).clone()
-        else:
-            x = self.word_embeddings(input_ids).clone()
-
-        vocab_mods = self._precompute_vocab_mods()
-
-        shifted_ids = {}
-        for i in range(2, self.n + 1):
-            shifted_ids[i] = self._shift_right_ignore_eos(context, i - 1)
-
-        for i in range(2, self.n + 1):
-            for j in range(self.k):
-                index = (i - 2) * self.k + j
-                emb_vocab_dim = int(self.m + index * 2 + 1)
-
-                ngram_ids = self._get_ngram_ids(
-                    context, shifted_ids, vocab_mods[(i, j)], ngram=i
-                )
-                new_ids = (ngram_ids % emb_vocab_dim)[..., -seq_len:]
-
-                # Host-resident lookup (W18 scheme 2): the ids were hashed on
-                # the NPU; move only this batch's rows to the CPU, gather the
-                # embedder rows there, and bring the small result back to the
-                # device for the (NPU-resident) post projection.  Numerically
-                # identical to an on-device ``embedder(new_ids)`` — same ids,
-                # same weights — and leaves the ~63 GB tables off the device.
-                host_weight = self._host_embedders[index]
-                new_ids_cpu = new_ids.to("cpu")
-                x_ngram = F.embedding(
-                    new_ids_cpu,
-                    host_weight,
-                    padding_idx=self.config.pad_token_id,
-                ).to(x.device)
-                x_proj = self.post_projs[index](x_ngram)
-                x = x + x_proj.to(x.device)
-
-        x = x / (1 + self.k * (self.n - 1))
-        return x
+        window = self._window_from_context(context, committed)
+        return self.forward_from_window(
+            input_ids, window, query_shard=query_shard
+        )
 
 
 class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
@@ -357,23 +397,34 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
         ``min(committed, n - 1)`` committed tokens of request ``r`` right-
         justified (missing predecessors are zero). A zero predecessor
         contributes zero to the polynomial hash, identical to the reference
-        implementation's "no predecessor" behavior.
+        implementation's "no predecessor" behavior. Vectorized: one ragged
+        gather, no per-row loop.
         """
         n_1 = self.ngram_embeddings.n - 1
         bs = view.req_pool_indices.shape[0]
-        hist = torch.zeros(
-            (bs, n_1), dtype=input_ids.dtype, device=input_ids.device
-        )
-        history = view.history_token_ids
+        if bs == 0:
+            return torch.zeros(
+                (0, n_1), dtype=input_ids.dtype, device=input_ids.device
+            )
+        history = view.history_token_ids  # [pool, max_committed]
         committed = view.committed_lengths
-        for r in range(bs):
-            slot = int(view.req_pool_indices[r])
-            hl = int(committed[slot])
-            take = min(hl, n_1)
-            if take > 0:
-                hist[r, n_1 - take :] = history[slot, hl - take : hl].to(
-                    device=input_ids.device, dtype=input_ids.dtype
-                )
+        slots = view.req_pool_indices
+        hl = committed[slots]  # [bs]
+        take = hl.clamp(max=n_1)  # [bs]
+        # Gather the last ``take`` committed tokens right-justified.
+        idx = (
+            torch.arange(n_1, device=input_ids.device, dtype=torch.int64)[None, :]
+            - take[:, None]
+            + hl[:, None]
+        )
+        valid = (idx >= 0) & (idx < hl[:, None])
+        flat = slots.to(input_ids.device).unsqueeze(-1) * history.size(-1) + idx.clamp_min(
+            0
+        )
+        gathered = history.reshape(-1)[flat]  # [bs, n-1]
+        hist = gathered.masked_fill(~valid, 0).to(
+            device=input_ids.device, dtype=input_ids.dtype
+        )
         return hist
 
     def _ngram_embed_packed(self, input_ids: torch.Tensor, view, ctx) -> torch.Tensor:
@@ -408,6 +459,7 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
     def _ngram_embed(self, input_ids: torch.Tensor, ctx, kwargs) -> torch.Tensor:
         """Compute the N-gram input embeddings for this forward."""
         view = kwargs.get("request_token_history")
+        window = kwargs.get("ngram_previous_tokens")
         if input_ids.dim() == 2:
             # Direct ``[bs, seq]`` ids (verification / decode views): attach
             # the per-row committed history when the executor provides it.
@@ -418,6 +470,13 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
                 input_ids, ngram_context=ngram_context, query_shard=ctx.query_shard
             )
         # 1-D packed serving layout.
+        if window is not None:
+            # The shared ngram-history machinery (``prepare_ngram_inputs``)
+            # already resolved per-token predecessor windows for the packed
+            # batch, committed history folded in.
+            return self.ngram_embeddings.forward_from_window(
+                input_ids, window, query_shard=ctx.query_shard
+            )
         if view is not None:
             return self._ngram_embed_packed(input_ids, view, ctx)
         # No history view (defensive; the profile enables one in serving):
@@ -471,6 +530,14 @@ class LongcatFlashNgramForCausalLM(LongcatFlashForCausalLM):
     """
 
     model_cls = _RuntimeLongcatNgramModel
+
+    def get_ngram_hash_parameters(self) -> None:
+        """The n-gram embedding hashes with its own polynomial; no Engram params.
+
+        Returning ``None`` keeps the executor's caller-owned ngram buffers in
+        window-only mode (raw predecessor window, no Engram hash buffers).
+        """
+        return None
 
     @classmethod
     def model_profile(cls, hf_config):

@@ -344,11 +344,11 @@ def prepare_ngram_inputs(
     previous: torch.Tensor,
     token_mask: torch.Tensor,
     prefix: torch.Tensor,
-    hashes: torch.Tensor,
+    hashes: torch.Tensor | None,
     total: int,
     vocab_size: int,
     uniform_length: int,
-    hash_params: NGramHashParams,
+    hash_params: NGramHashParams | None,
 ) -> None:
     """Resolve raw lookbacks, token masks and hashes in one read-only state pass.
 
@@ -362,6 +362,10 @@ def prepare_ngram_inputs(
     [capacity,layers,3*heads] are caller-owned stable outputs. Rows after
     ``total`` are dead padding. Uniform positive request length selects direct
     indexing; zero selects ragged indexing. All modes use this same operation.
+
+    ``hash_params`` and ``hashes`` may be ``None`` together: a caller that
+    only needs the raw predecessor window (LongCat's n-gram embedding hashes
+    with its own polynomial) leaves the hash columns unresolved.
     """
     bs = slots.numel()
     if not ids.is_cuda:
@@ -392,11 +396,16 @@ def prepare_ngram_inputs(
         token_mask[:total].copy_((ids[:total] >= 0) & (ids[:total] < vocab_size))
         previous[total:].fill_(-1)
         token_mask[total:].zero_()
-        hashes.copy_(hash_params.hash(ids[: previous.shape[0]], previous, token_mask))
+        if hash_params is not None:
+            assert hashes is not None
+            hashes.copy_(
+                hash_params.hash(ids[: previous.shape[0]], previous, token_mask)
+            )
         return
     capacity = previous.shape[0]
     if max(capacity, bs) == 0:
         return
+    assert hash_params is not None and hashes is not None
     layers, _, heads = hash_params.primes.shape
     # Small tiles minimize latency; larger runs amortize programs and skip
     # history reads once all predecessors are inside the packed input.

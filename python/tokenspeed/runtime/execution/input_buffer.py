@@ -185,19 +185,17 @@ class InputBuffers:
     def init_ngram_buffers(
         self, context_len: int, hash_params: NGramHashParams | None, vocab_size: int
     ) -> None:
-        """Allocate forward-sized, pointer-stable Engram inputs; no request cache."""
+        """Allocate forward-sized, pointer-stable n-gram inputs; no request cache.
+
+        ``hash_params`` is required by Engram, which reads pre-hashed ids; a
+        model that only needs the raw per-token predecessor window (LongCat's
+        n-gram embedding hashes with its own polynomial) passes ``None`` and
+        gets the window and mask buffers without the hash buffers.
+        """
         if context_len == 0:
             return
-        if context_len != 3 or hash_params is None:
-            raise ValueError(
-                "Engram preparation requires three-token history and hash constants"
-            )
-        if hash_params.token_map.numel() < vocab_size:
-            # Preparation treats every id below vocab_size as a valid token.
-            raise ValueError(
-                f"Engram token map covers {hash_params.token_map.numel()} ids, "
-                f"fewer than the vocabulary of {vocab_size}"
-            )
+        if context_len != 3:
+            raise ValueError("Engram preparation requires three-token history")
         self.ngram_hash_params = hash_params
         self._ngram_vocab_size = vocab_size
         self.ngram_previous_tokens_buf = torch.full(
@@ -215,6 +213,16 @@ class InputBuffers:
         self.ngram_prefix_buf = torch.full(
             (self.max_bs, context_len), -1, dtype=torch.int64, device=self.device
         )
+        if hash_params is None:
+            self.ngram_padding_hash = None
+            self.ngram_hash_ids_buf = None
+            return
+        if hash_params.token_map.numel() < vocab_size:
+            # Preparation treats every id below vocab_size as a valid token.
+            raise ValueError(
+                f"Engram token map covers {hash_params.token_map.numel()} ids, "
+                f"fewer than the vocabulary of {vocab_size}"
+            )
         self.ngram_padding_hash = hash_params.hash(
             self.input_ids_buf[:1],
             self.ngram_previous_tokens_buf[:1],
@@ -225,11 +233,19 @@ class InputBuffers:
         ).clone()
 
     def ngram_model_kwargs(self, num_tokens: int) -> dict[str, torch.Tensor]:
-        """Borrow pointer-stable prepared hashes and masks for every model forward."""
+        """Borrow pointer-stable prepared n-gram inputs for every model forward.
+
+        Engram reads the pre-hashed ids; a window-only model (LongCat's
+        n-gram embedding hashes with its own polynomial) reads the raw
+        per-token predecessor window instead.
+        """
         if self.ngram_previous_tokens_buf is None:
             return {}
         assert self.ngram_token_mask_buf is not None
-        assert self.ngram_hash_ids_buf is not None
+        if self.ngram_hash_ids_buf is None:
+            return {
+                "ngram_previous_tokens": self.ngram_previous_tokens_buf[:num_tokens],
+            }
         return {
             "engram_hash_ids": self.ngram_hash_ids_buf[:num_tokens],
             "engram_token_mask": self.ngram_token_mask_buf[:num_tokens],
@@ -257,9 +273,6 @@ class InputBuffers:
         assert self.ngram_token_mask_buf is not None
         assert self.ngram_seed_buf is not None
         assert self.ngram_prefix_buf is not None
-        assert self.ngram_hash_ids_buf is not None
-        assert self.ngram_hash_params is not None
-        assert self.ngram_padding_hash is not None
         tail = runtime_states.ngram_accepted_tokens
         needs_seed = runtime_states.ngram_needs_seed
         assert tail is not None and needs_seed is not None
@@ -279,7 +292,11 @@ class InputBuffers:
         if bs == 0:
             self.ngram_previous_tokens_buf[:refresh_tokens].fill_(-1)
             self.ngram_token_mask_buf[:refresh_tokens].zero_()
-            self.ngram_hash_ids_buf[:refresh_tokens].copy_(self.ngram_padding_hash)
+            if self.ngram_hash_ids_buf is not None:
+                assert self.ngram_padding_hash is not None
+                self.ngram_hash_ids_buf[:refresh_tokens].copy_(
+                    self.ngram_padding_hash
+                )
             self._ngram_active_tokens = 0
             return
 
@@ -326,7 +343,11 @@ class InputBuffers:
             self.ngram_previous_tokens_buf[:refresh_tokens],
             self.ngram_token_mask_buf[:refresh_tokens],
             self.ngram_prefix_buf[:bs],
-            self.ngram_hash_ids_buf[:refresh_tokens],
+            (
+                self.ngram_hash_ids_buf[:refresh_tokens]
+                if self.ngram_hash_ids_buf is not None
+                else None
+            ),
             total_tokens,
             runtime_states.input_vocab_size,
             uniform_length,
@@ -753,15 +774,12 @@ class InputBuffers:
         """Prepare padded decode graph inputs for a rank with no real tokens."""
         if self.ngram_previous_tokens_buf is not None:
             assert self.ngram_token_mask_buf is not None
-            assert (
-                self.ngram_hash_ids_buf is not None
-                and self.ngram_padding_hash is not None
-            )
             assert self.ngram_seed_buf is not None
             assert self.ngram_prefix_buf is not None
-            assert self.ngram_hash_params is not None
             # Empty requests prepare dummy and idle padding without reading
             # accepted history; the executor controls the warmup scope.
+            # Window-only models (LongCat n-gram, hash_params=None) leave the
+            # hash buffers unallocated; prepare_ngram_inputs skips hashing.
             empty = self.ngram_seed_buf[:0]
             context_len = self.ngram_previous_tokens_buf.shape[1]
             prepare_ngram_inputs(
@@ -777,7 +795,11 @@ class InputBuffers:
                 previous=self.ngram_previous_tokens_buf[:total_tokens],
                 token_mask=self.ngram_token_mask_buf[:total_tokens],
                 prefix=self.ngram_prefix_buf[:0],
-                hashes=self.ngram_hash_ids_buf[:total_tokens],
+                hashes=(
+                    self.ngram_hash_ids_buf[:total_tokens]
+                    if self.ngram_hash_ids_buf is not None
+                    else None
+                ),
                 total=0,
                 vocab_size=self._ngram_vocab_size,
                 uniform_length=0,

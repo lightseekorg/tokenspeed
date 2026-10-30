@@ -77,12 +77,25 @@ _DECODE_ALLOCATION_POLICIES = {
 
 
 def engram_context_len(text_config) -> int:
-    """Select caller-owned Engram inputs, not Qwen4's LCM-owned PLE state."""
-    if not getattr(text_config, "engram_layer_ids", ()):
-        return 0
-    if getattr(text_config, "ngram_context_len", None) != 3:
-        raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
-    return text_config.ngram_context_len
+    """Select caller-owned n-gram history inputs, not Qwen4's LCM-owned PLE state.
+
+    Engram (DeepSeek V4.1) and the LongCat n-gram embedding both read
+    per-token predecessor windows through the shared ``prepare_ngram_inputs``
+    machinery; the Qwen4-Exp PLE path owns its state through the LCM cache
+    (``ple_layer_ids``) and must not get caller-owned inputs.
+    """
+    if getattr(text_config, "engram_layer_ids", ()):
+        if getattr(text_config, "ngram_context_len", None) != 3:
+            raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
+        return text_config.ngram_context_len
+    # LongCat's n-gram embedding (``emb_neighbor_num`` n-gram size) reads a
+    # three-token predecessor window; derive the width from the hyper-parameter
+    # so the gate holds even before ``_ensure_ngram_config`` runs on model
+    # construction.
+    neighbor_num = getattr(text_config, "emb_neighbor_num", 0)
+    if neighbor_num and neighbor_num - 1 == 3:
+        return 3
+    return 0
 
 
 @dataclass(frozen=True)
