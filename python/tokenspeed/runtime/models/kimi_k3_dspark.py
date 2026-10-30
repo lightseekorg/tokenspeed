@@ -65,7 +65,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbe
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 from tokenspeed.runtime.models.dflash import DFlashMLP
 from tokenspeed.runtime.models.dspark import VanillaMarkov
@@ -715,10 +715,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
     def post_load_weights(self) -> None:
         """Precompute the absorbed decode factors from kv_b_proj."""
         for layer in self.layers:
-            self_attn = layer.self_attn
-            self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                self_attn.kv_b_proj.weight, self_attn
-            )
+            absorb_mla_kv_b_proj(layer.self_attn)
         if self.fc_norm is not None:
             self._fc_norm_weight = torch.stack(
                 [norm.weight.detach() for norm in self.fc_norm], dim=0

@@ -86,7 +86,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3MoE,
     MoEGate,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 from tokenspeed.runtime.models.glm5 import (
     GlmDsaDecodeTopK,
@@ -950,10 +950,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         self._absorbed_kv_b_version = -1
 
     def _prepare_absorbed_mla_weights(self) -> None:
-        self.w_kc, self.w_vc = _prepare_mla_kv_b_proj_weights(
-            self.kv_b_proj.weight,
-            self,
-        )
+        absorb_mla_kv_b_proj(self)
         self._absorbed_kv_b_version = self.kv_b_proj.weight._version
 
     @break_point
