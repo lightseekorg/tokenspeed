@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import ctypes as C
 import os
 
 import torch
@@ -885,57 +884,22 @@ class AscendDSAPrefill:
                 raise ValueError(
                     "DSA Prefill needs contiguous matching BF16 cache planes"
                 )
-        path = os.environ.get("TOKENSPEED_DSA_CP_LIBRARY")
-        if not path:
-            raise RuntimeError("Set TOKENSPEED_DSA_CP_LIBRARY to libdsa_cp_prefill.so")
-        self.lib = C.CDLL(path)
-        self.lib.DsaCpPrefillAbiVersion.restype = C.c_uint32
-        if self.lib.DsaCpPrefillAbiVersion() != 2:
+        import flash_ops  # noqa: F401
+
+        if not hasattr(torch.ops.custom, "npu_dsa_cp_all_gather"):
+            raise RuntimeError("flash_ops is missing the Tensor-schema DSA CP adapter")
+        if torch.ops.custom.npu_dsa_cp_abi_version() != 2:
             raise RuntimeError("DSA CP native ABI does not match this runtime")
-        self.lib.DsaCpRootInfoBytes.restype = C.c_uint64
-        signatures = {
-            "DsaCpGetRootInfo": [C.c_void_p],
-            "DsaCpCreateComm": [
-                C.c_void_p,
-                C.c_uint32,
-                C.c_uint32,
-                C.POINTER(C.c_void_p),
-            ],
-            "DsaCpDestroyComm": [C.c_void_p],
-            "DsaCpAllGather": [
-                C.c_void_p,
-                C.c_void_p,
-                C.c_void_p,
-                C.c_void_p,
-                C.c_uint64,
-            ],
-            "DsaCpPatch": [C.c_void_p] * 6 + [C.c_uint64] * 4 + [C.c_uint32] * 4,
-        }
-        if max_history_rows:
-            signatures["DsaCpAllGatherV"] = (
-                [C.c_void_p] * 4 + [C.c_uint64] + [C.c_void_p] * 2
-            )
-            signatures["DsaCpPatchMapped"] = (
-                [C.c_void_p] * 7 + [C.c_uint64] * 5 + [C.c_uint32] * 4
-            )
-        for name, arguments in signatures.items():
-            function = getattr(self.lib, name)
-            function.argtypes = arguments
-            function.restype = C.c_int
-        self.comm = C.c_void_p()
+        self.comm = 0
         if self.degree > 1:
-            root = C.create_string_buffer(self.lib.DsaCpRootInfoBytes())
-            if self.rank == 0:
-                self._check(self.lib.DsaCpGetRootInfo(root), "root info")
-            objects = [root.raw if self.rank == 0 else None]
+            root = torch.ops.custom.npu_dsa_cp_root_info() if self.rank == 0 else None
+            objects = [bytes(root.tolist()) if root is not None else None]
             dist.broadcast_object_list(objects, src=ranks[0], group=bootstrap_group)
-            root = C.create_string_buffer(objects[0], len(objects[0]))
-            self._check(
-                self.lib.DsaCpCreateComm(
-                    root, self.degree, self.rank, C.byref(self.comm)
-                ),
-                "create AICPU communicator",
+            root = torch.tensor(list(objects[0]), dtype=torch.uint8, device="cpu")
+            self.comm = torch.ops.custom.npu_dsa_cp_create_comm(
+                root, self.degree, self.rank
             )
+
         if max_current_rows < 1:
             raise ValueError("DSA Prefill needs a positive current-token capacity")
         self.max_current_rows = max_current_rows
@@ -984,10 +948,10 @@ class AscendDSAPrefill:
         if self._bounded_history:
             self.index[:history_null_rows].zero_()
             self.kv[:history_null_rows].zero_()
-        self._history_slots = None
         self._history_counts = ()
-        self._history_arguments = []
-        self._patch_slots = None
+        self._meta = {}
+        self._cache_sources = {}
+        self.compute_stream = None
         self.stream = torch.npu.Stream(device=self.device)
         self.index_ready = torch.npu.Event(enable_timing=True)
         self.kv_ready = torch.npu.Event(enable_timing=True)
@@ -1046,9 +1010,6 @@ class AscendDSAPrefill:
                 or value.numel() != self.local_rows * width
             ):
                 raise ValueError("DSA Prefill cache geometry changed after preparation")
-        self.layer_id = layer_id
-        self._sources = (kv_cache, index_cache)
-        self._started = {128: False, 576: False}
         if self._bounded_history:
             if (
                 history_slots is None
@@ -1066,10 +1027,27 @@ class AscendDSAPrefill:
                 raise ValueError(
                     "Prefill page gather exceeds the prepared history capacity"
                 )
-        self._history_slots = history_slots
+        compute = torch.npu.current_stream(self.device)
+        if self.compute_stream is not None and compute != self.compute_stream:
+            raise RuntimeError("DSA Prefill must reuse its original compute stream")
+        sources = self._cache_sources.get(layer_id)
+        if sources is not None and any(
+            old.data_ptr() != new.data_ptr()
+            for old, new in zip(sources, (kv_cache, index_cache), strict=True)
+            if old is not None
+        ):
+            raise ValueError("DSA Prefill layer cache storage changed")
+        self.compute_stream = compute
+        if sources is None:
+            sources = self._cache_sources[layer_id] = (kv_cache, index_cache)
+        self.layer_id = layer_id
+        self._sources = sources
+        # finish joins all side-stream reads on this same producer stream.
+        # Device metadata may therefore be released/reused in stream order.
+        self._meta = {"history_slots": history_slots}
+        self._started = {128: False, 576: False}
         self._history_counts = () if history_counts is None else tuple(history_counts)
-        self._history_arguments = []
-        self.source_ready.record(torch.npu.current_stream(self.device))
+        self.source_ready.record(compute)
         with torch.npu.stream(self.stream):
             self.stream.wait_event(self.source_ready)
             if self._consumed_recorded:
@@ -1080,8 +1058,6 @@ class AscendDSAPrefill:
                     0, (index_cache, self.index[: self.history_rows], self.index_ready)
                 )
             for source, target, ready in gathers:
-                source.record_stream(self.stream)
-                target.record_stream(self.stream)
                 if not has_history:
                     pass
                 elif self._bounded_history:
@@ -1090,9 +1066,11 @@ class AscendDSAPrefill:
                     count = self._history_counts[self.rank]
                     packed = self.history_send[: count * width].view(count, width)
                     torch.index_select(
-                        source.view(-1, width), 0, self._history_slots, out=packed
+                        source.view(-1, width),
+                        0,
+                        self._meta["history_slots"],
+                        out=packed,
                     )
-                    self._history_slots.record_stream(self.stream)
                     receive = target[
                         self.history_null_rows : self.history_null_rows
                         + sum(self._history_counts)
@@ -1100,41 +1078,27 @@ class AscendDSAPrefill:
                     if self.degree == 1:
                         receive.copy_(packed)
                     elif sum(self._history_counts):
-                        counts = (C.c_uint64 * self.degree)(
-                            *(n * width for n in self._history_counts)
+                        counts = torch.tensor(
+                            [n * width for n in self._history_counts],
+                            dtype=torch.int64,
+                            device="cpu",
                         )
-                        offsets = (C.c_uint64 * self.degree)(
-                            *(
+                        offsets = torch.tensor(
+                            [
                                 sum(self._history_counts[:r]) * width
                                 for r in range(self.degree)
-                            )
+                            ],
+                            dtype=torch.int64,
+                            device="cpu",
                         )
-                        self._history_arguments.append((counts, offsets))
-                        self._check(
-                            self.lib.DsaCpAllGatherV(
-                                self.comm,
-                                self.stream.npu_stream,
-                                self.history_send.data_ptr(),
-                                receive.data_ptr(),
-                                packed.numel(),
-                                counts,
-                                offsets,
-                            ),
-                            "bounded AICPU AllGatherV",
+                        self._meta[("history", width)] = (counts, offsets)
+                        torch.ops.custom.npu_dsa_cp_all_gather_v(
+                            packed, receive, counts, offsets, self.comm
                         )
                 elif self.degree == 1:
                     target.copy_(source.view_as(target))
                 else:
-                    self._check(
-                        self.lib.DsaCpAllGather(
-                            self.comm,
-                            self.stream.npu_stream,
-                            source.data_ptr(),
-                            target.data_ptr(),
-                            source.numel(),
-                        ),
-                        "AICPU AllGather",
-                    )
+                    torch.ops.custom.npu_dsa_cp_all_gather(source, target, self.comm)
                 ready.record(self.stream)
 
     def gather_current(self, layer_id, value, *, width, total_rows):
@@ -1142,7 +1106,9 @@ class AscendDSAPrefill:
 
         Both phases use the same communication stream. Complete aligned pages
         are read directly from this receive region; only boundary pages need
-        stitching into the historical page layout.
+        stitching into the historical page layout. Only actual rows are sent.
+        Inputs are copied into persistent send planes on the compute stream;
+        patch and finish join communication before those planes are reused.
         """
         if (
             layer_id != self.layer_id
@@ -1177,29 +1143,42 @@ class AscendDSAPrefill:
         ready = self.index_current_ready if width == 128 else self.kv_current_ready
         source = value.view(-1, width)
         compute = torch.npu.current_stream(self.device)
-        if local_count != send_rows:
-            padded = (self.send_index if width == 128 else self.send_kv)[:send_rows]
-            padded.zero_()
-            padded[:local_count].copy_(source)
-            source = padded
+        if compute != self.compute_stream:
+            raise RuntimeError("DSA Prefill must reuse its original compute stream")
+        send = (self.send_index if width == 128 else self.send_kv)[:local_count]
+        send.copy_(source)
+        # These planes live for the transport's lifetime. The producer input
+        # only participates in a normal copy on its own compute stream.
+        source = send
+        aligned = total_rows == self.degree * send_rows
+        if self.degree > 1 and total_rows and not aligned:
+            counts = torch.tensor(
+                [
+                    (total_rows // self.degree + (r < total_rows % self.degree)) * width
+                    for r in range(self.degree)
+                ],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            offsets = (
+                torch.arange(self.degree, dtype=torch.int64, device="cpu")
+                * send_rows
+                * width
+            )
+            self._meta[("current", width)] = (counts, offsets)
         producer.record(compute)
         with torch.npu.stream(self.stream):
             self.stream.wait_event(producer)
-            for tensor in (value, source, target):
-                tensor.record_stream(self.stream)
             if send_rows:
                 if self.degree == 1:
-                    receive.copy_(source)
+                    receive[:local_count].copy_(source)
+                elif aligned:
+                    torch.ops.custom.npu_dsa_cp_all_gather(source, receive, self.comm)
                 else:
-                    self._check(
-                        self.lib.DsaCpAllGather(
-                            self.comm,
-                            self.stream.npu_stream,
-                            source.data_ptr(),
-                            receive.data_ptr(),
-                            source.numel(),
-                        ),
-                        "current AICPU AllGather",
+                    # Preserve the native patch/page stride without sending
+                    # or initializing the gaps between actual rank payloads.
+                    torch.ops.custom.npu_dsa_cp_all_gather_v(
+                        source, receive, counts, offsets, self.comm
                     )
             ready.record(self.stream)
         self._started[width] = True
@@ -1254,12 +1233,14 @@ class AscendDSAPrefill:
             raise ValueError(
                 "Bounded Prefill commit needs matching compact write slots"
             )
-        self._patch_slots = mapped_slots
+        stream = torch.npu.current_stream(self.device)
+        if stream != self.compute_stream:
+            raise RuntimeError("DSA Prefill must reuse its original compute stream")
         # The router publishes int32 slots; the native transport ABI reads int64.
         committed_slots = slots_workspace[: slots.numel()]
         committed_slots.copy_(slots)
         slots = committed_slots
-        stream = torch.npu.current_stream(self.device)
+        self._meta[("patch", width)] = (slots, direct, mapped_slots)
         target, cache, ready = (
             (self.index, self._sources[1], self.index_current_ready)
             if width == 128
@@ -1267,42 +1248,58 @@ class AscendDSAPrefill:
         )
         # The communication stream already orders history before current.
         stream.wait_event(ready)
-        for tensor in (slots, direct, target, cache):
-            tensor.record_stream(stream)
-        if mapped_slots is not None:
-            mapped_slots.record_stream(stream)
-        self._check(
-            (
-                self.lib.DsaCpPatchMapped
-                if self._bounded_history
-                else self.lib.DsaCpPatch
-            )(
-                stream.npu_stream,
-                target[self.history_rows :].data_ptr(),
-                slots.data_ptr(),
-                cache.data_ptr(),
-                target.data_ptr(),
-                direct.data_ptr(),
-                *([mapped_slots.data_ptr()] if self._bounded_history else []),
+        if self._bounded_history:
+            torch.ops.custom.npu_dsa_cp_patch_mapped(
+                target[self.history_rows :],
+                slots,
+                cache,
+                target,
+                direct,
+                mapped_slots,
                 slots.numel(),
                 self.local_rows,
                 virtual_blocks,
                 self._send_rows,
-                *([self.history_rows] if self._bounded_history else []),
+                self.history_rows,
                 block_rows,
                 self.degree,
                 self.rank,
                 width,
-            ),
-            "current-row commit",
-        )
+            )
+        else:
+            torch.ops.custom.npu_dsa_cp_patch(
+                target[self.history_rows :],
+                slots,
+                cache,
+                target,
+                direct,
+                slots.numel(),
+                self.local_rows,
+                virtual_blocks,
+                self._send_rows,
+                block_rows,
+                self.degree,
+                self.rank,
+                width,
+            )
         return target
 
     def finish(self, layer_id):
         """Release the workspace after SFA, ordered by a device event."""
         if self.layer_id != layer_id:
             raise RuntimeError("DSA Prefill completion differs from its active layer")
-        self.consumed.record(torch.npu.current_stream(self.device))
+        stream = torch.npu.current_stream(self.device)
+        if stream != self.compute_stream:
+            raise RuntimeError("DSA Prefill must reuse its original compute stream")
+        # Also join work when a caller does not patch one of the planes.
+        for width, history, current in (
+            (128, self.index_ready, self.index_current_ready),
+            (576, self.kv_ready, self.kv_current_ready),
+        ):
+            if width == 128 and not self._has_index:
+                continue
+            stream.wait_event(current if self._started[width] else history)
+        self.consumed.record(stream)
         self._consumed_recorded = True
         self.layer_id = None
         self._sources = None
@@ -1311,9 +1308,12 @@ class AscendDSAPrefill:
         """Drain owned work and release the communicator at shutdown."""
         if self._closed:
             return
-        torch.npu.current_stream(self.device).synchronize()
+        if self.compute_stream is not None:
+            self.compute_stream.synchronize()
         self.stream.synchronize()
-        if self.comm.value:
-            self._check(self.lib.DsaCpDestroyComm(self.comm), "destroy communicator")
-            self.comm = C.c_void_p()
+        if self.comm:
+            torch.ops.custom.npu_dsa_cp_destroy_comm(self.comm)
+            self.comm = 0
+        self._meta.clear()
+        self._cache_sources.clear()
         self._closed = True

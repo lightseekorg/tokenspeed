@@ -69,7 +69,7 @@ KV page counts, including each cached prefix. Native Prefill reuses the host
 page table to compact referenced owner pages once per batch and gathers unequal
 contributions with HCCL AllGatherV; no device count readback is needed. This
 requires the library's `DsaCpAllGatherV` and `DsaCpPatchMapped` exports. Reserve
-the bounded history send/receive planes, a null page and current-row padding
+the bounded history send/receive planes, a null page and aligned current-row capacity
 before sizing the cache arena. Decode and the shared cache writer keep their
 existing contracts.
 The scheduler wheel and `ts-host` must both be rebuilt when adding this
@@ -145,3 +145,27 @@ python -m smg launch --help
 PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}" \
     python -m tokenspeed.runtime.entrypoints.engine --help
 ```
+
+### Native DSA transport boundary
+
+DSA/MLA prefill uses the `flash_ops` `npu_dsa_cp_*` Tensor adapters for the
+existing native transport ABI. Each multi-rank transport owns an opaque
+communicator ID; single-device patching needs no communicator. Bounded history
+sends only the packed rows, holds CPU count tensors in the per-forward metadata,
+and uses mapped patching under the same bounded-history selection as before.
+Current KV/Index-K rows are copied on the producer stream into persistent send
+planes, without zero padding. Aligned equal contributions use AllGather;
+otherwise AllGatherV sends actual row counts into the native page-aligned
+receive offsets. The gaps are neither initialized nor transmitted.
+
+Each layer's cache references are retained from its first prefetch. Send,
+receive and history workspace keep fixed allocations across forwards.
+A per-forward dictionary holds metadata through consumption. Prefetch,
+producers, patch and finish must use the same compute stream; finish joins all
+communication before the next forward can reuse storage or release metadata.
+This stream ordering is required in addition to owning Tensor references.
+Schemas declare cache/workspace mutations and returned aliases.
+
+Run `test/test_mla_cp_transport.py` with `torchrun` at world sizes 1 and 2 and
+set `TEST_OUTPUT` to an existing result directory. It covers bounded/unbounded
+history, uneven/empty owners, both KV planes and queued workspace reuse.
