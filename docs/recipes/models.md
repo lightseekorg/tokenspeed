@@ -148,7 +148,6 @@ ts serve \
     --moe-backend flashinfer_trtllm \
     --enable-prefix-caching \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -167,7 +166,6 @@ ts serve \
     --trust-remote-code \
     --enable-prefix-caching \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -199,7 +197,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -228,7 +225,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 9 \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -243,9 +239,9 @@ Notes:
   mismatched launch fails fast instead of drafting a wrong-width block. See
   [Speculative decoding](../configuration/server.md#speculative-decoding)
   for the DSpark and DFlash conventions.
-- `--prefix-granularity 128` matches the target's MSA cache granularity. The draft writes its KV at
-  the target's cache locations and shares the target's page table, so it
-  inherits that granularity. Do not set a separate draft granularity.
+- The draft writes its KV at the target's cache locations and shares the
+  target's page table, so it inherits the target's 128-token MSA prefix
+  granularity.
 - The draft's 1024-token sliding window is an attention mask its own layers
   apply. It is deliberately not a cache-retention policy, because the draft's
   pages are the target's pages.
@@ -287,7 +283,6 @@ tokenspeed serve "$model_dir" \
     --speculative-num-steps 7 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
-    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -744,7 +739,6 @@ python -m tokenspeed.cli serve Qwen/Qwen3-0.6B \
   --max-num-seqs 4 \
   --max-total-tokens 16384 \
   --chunked-prefill-size 4096 \
-  --prefix-granularity 128 \
   --max-cudagraph-capture-size 4 \
   --cudagraph-capture-sizes 1 2 4 \
   --disable-autotune \
@@ -1088,8 +1082,7 @@ This backend supports at most 1024 prefill or decode tokens per rank.
 
 DeepSeek V4 uses FP8 KV cache.
 `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
-and `--tool-call-parser deepseek_v4`, and auto-sets `prefix_granularity=256`
-(pass `--prefix-granularity N` with `N != 64` to override).
+and `--tool-call-parser deepseek_v4`.
 
 ### NVIDIA
 

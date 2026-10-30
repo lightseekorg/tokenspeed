@@ -60,6 +60,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     apply_pd_transfer_policies,
 )
 
+# A multiple of every FlatKV group's span (128 and 64 tokens): one prefix page
+# holds whole pages of all four groups.
+_V41_PREFIX_GRANULARITY = 256
+
 
 class DeepseekV41Recipe(CacheRecipe):
     """Target Flash FlatKV for decode/verify, plus checkpoint-local DSpark windows.
@@ -76,6 +80,11 @@ class DeepseekV41Recipe(CacheRecipe):
     def _row_layout(self):
         """Return the row widths and packing the configured cache format uses."""
         return self.attn_config.component(DeepseekV41Config).row_layout()
+
+    @property
+    @override
+    def prefix_granularity(self) -> int:
+        return _V41_PREFIX_GRANULARITY
 
     @property
     @override

@@ -541,7 +541,6 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=512,
         max_bs=4,
         components=(spec,),

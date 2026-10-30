@@ -322,7 +322,6 @@ def backend_factory(cuda_env, gpu_pool, cache_dtype):
             device="cuda",
             dtype=torch.bfloat16,
             kv_cache_dtype=cache_dtype,
-            prefix_granularity=_KERNEL_PAGE,
             kernel_page_size=_KERNEL_PAGE,
             context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,

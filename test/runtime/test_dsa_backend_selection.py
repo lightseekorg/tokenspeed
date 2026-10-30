@@ -78,7 +78,6 @@ def _config(monkeypatch, device, backend_name, **overrides):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=4096,
         max_bs=4,
         kvp_size=8,
@@ -143,7 +142,7 @@ def test_ascend_bf16_kv_keeps_native_row_layout(monkeypatch):
         _mla_layer_fields,
     )
 
-    fields = _mla_layer_fields(config, 0, 0)
+    fields = _mla_layer_fields(config, 128, 0, 0)
     assert fields[0].shape == (128, 1, 576)
     assert fields[0].dtype == "bfloat16"
     assert fields[0].payload_bytes == 128 * 576 * 2

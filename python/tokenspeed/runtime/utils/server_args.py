@@ -30,7 +30,6 @@ import socket
 from collections.abc import Sequence
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
@@ -382,8 +381,6 @@ class ServerArgs:
     # Optional bound on summed per-request KV pages in a local prefill batch.
     chunk_prefill_kv_size: int | None = None
     enable_mixed_batch: bool = False
-    # Scheduler cache-reuse identity granularity in tokens.
-    prefix_granularity: int = 64
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -732,10 +729,6 @@ class ServerArgs:
     enable_allreduce_fusion: bool = False
 
     enable_expert_parallel: bool = False
-
-    @property
-    def mamba_cache_chunk_size(self) -> int:
-        return max(FLA_CHUNK_SIZE, self.prefix_granularity)
 
     @property
     def spec_context_pad(self) -> int:
@@ -2511,7 +2504,7 @@ class ServerArgs:
             '"fp8_e4m3" (unit scale, or the checkpoint\'s per-tensor KV-cache '
             'scales where the model loads them). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
-            "requires --block-size 128 with an MHA attention backend.",
+            "requires an MHA attention backend.",
         )
         parser.add_argument(
             "--kv-cache-quant-method",
@@ -2606,16 +2599,6 @@ class ServerArgs:
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the "
             "same iteration. Not supported with aggregated DCP.",
-        )
-        parser.add_argument(
-            "--prefix-granularity",
-            "--block-size",  # deprecated alias
-            dest="prefix_granularity",
-            metavar="PREFIX_GRANULARITY",
-            type=int,
-            default=ServerArgs.prefix_granularity,
-            help="Scheduler prefix granularity in tokens: the identity "
-            "boundary of cache reuse. (--block-size is a deprecated alias.)",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",

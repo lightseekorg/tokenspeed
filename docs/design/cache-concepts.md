@@ -356,7 +356,9 @@ value, that is a design smell to justify, not a default to reach for.
 
 Provenance discipline: each quantity is sourced from its own domain and never
 laundered through another's name. The contract's `prefix_granularity` comes
-from the memory plan, not read back out of pool state. The arena carries
+from the memory plan, not read back out of pool state, and the plan takes it
+from the model's cache recipe (`CacheRecipe.prefix_granularity`, abstract on
+the base): no launch option sets it. The arena carries
 **two** scalars with distinct roles: `CacheArena.prefix_granularity` is the
 identity grain, used for contract publication and plan-consistency checks.
 Other runtime arithmetic must not reach for it.
@@ -369,8 +371,12 @@ in the specs as `block_granularity`, and blocks narrower than P (V4's SWA
 window) or spanning no tokens at all (recurrent state) are the norm, not the
 exception. A backend's
 `kernel_page_size` comes from the kernel registry or an explicit config
-override, never from `prefix_granularity` as a fallback. The CLI flag is
-`--prefix-granularity` (`--block-size` remains a deprecated alias).
+override, never from `prefix_granularity` as a fallback. The dependency runs
+the other way only: a recipe sizes P to hold whole pages of the kernels that
+read its blocks. The ordinary recipe makes one block span P, so its P is the
+lcm of 64, a fixed-page leaf's page (the registry pins it on the side's
+config before planning), the MSA sparse page, and the MXFP8 scale tile; the
+other recipes state a constant that is a multiple of their group spans.
 
 Layerwise L2 load fences guard the first access to every field owned by a
 layer, not just the conventional paged-KV buffers. Model-owned side caches

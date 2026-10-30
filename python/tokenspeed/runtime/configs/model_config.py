@@ -35,10 +35,6 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
-    DEEPSEEK_V4_PAGE_SIZE,
-    TRTLLM_MHA_PAGE_SIZE,
-)
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
@@ -136,7 +132,6 @@ class _AttentionFamilySpec:
     configure: Callable[[object, ServerArgs], None]
     # A name, or a function of the launch returning one (None: no default).
     default_backend: str | Callable[[ServerArgs], str | None] | None = None
-    default_prefix_granularity: int | None = None
 
 
 def override_model_config(model_config, ext_yaml):
@@ -300,7 +295,6 @@ def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> Non
         server_args,
         name="dots3-note",
         default_backend="mla" if is_mtp else "dsa",
-        default_prefix_granularity=None,
         is_draft_worker=is_mtp,
     )
     configure = configure_mla_attention if is_mtp else configure_dsa_attention
@@ -341,9 +335,8 @@ def beam_default_attention_backend(server_args: ServerArgs) -> str | None:
     """Beam's ``--attention-backend`` when the launch names none.
 
     The TRT-LLM-gen paged FMHA leaf (``trtllm``) where it was admitted: NVIDIA
-    SM100 to SM103, a BF16 KV cache, a ``--prefix-granularity`` holding whole
-    64-token leaf pages, ``--numerics auto`` (its decode picks the KV split
-    count per batch bucket, which rl-bitwise excludes) and no
+    SM100 to SM103, a BF16 KV cache, ``--numerics auto`` (its decode picks the
+    KV split count per batch bucket, which rl-bitwise excludes) and no
     ``attention.mha_*`` kernel override (the leaf calls FlashInfer directly, so
     such an override would be silently ignored). Otherwise None: the backend
     stays unset, i.e. today's ranked ``mha`` leaf. One INFO line says which, and
@@ -359,13 +352,6 @@ def beam_default_attention_backend(server_args: ServerArgs) -> str | None:
     ):
         # An auto KV cache takes the model dtype (auto: the checkpoint's).
         reason = f"--kv-cache-dtype auto follows --dtype {server_args.dtype}, not BF16"
-    if not reason and server_args.prefix_granularity % TRTLLM_MHA_PAGE_SIZE:
-        # A cache block must hold whole leaf pages (group_tables rejects it at
-        # startup); the unset mha leaf takes the block as its page instead.
-        reason = (
-            f"--prefix-granularity {server_args.prefix_granularity} is not a "
-            f"multiple of the leaf's {TRTLLM_MHA_PAGE_SIZE}-token pages"
-        )
     if not reason and server_args.numerics != "auto":
         reason = (
             f"--numerics {server_args.numerics}: the TRT-LLM decode splits KV "
@@ -517,7 +503,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="dots3-note",
         architectures=frozenset({"Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN"}),
         configure=configure_dots3_note_attention,
-        default_prefix_granularity=128,
     ),
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
@@ -526,15 +511,11 @@ _ATTENTION_FAMILY_SPECS = (
         ),
         configure=configure_deepseek_v41_attention,
         default_backend="deepseek_v41",
-        default_prefix_granularity=256,
     ),
     _AttentionFamilySpec(
         name="DeepSeek V4",
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
         configure=configure_deepseek_v4_attention,
-        # V4 kernels need P to be a multiple of their fixed page; default to
-        # exactly one page rather than restating the number.
-        default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
     ),
     _AttentionFamilySpec(
         name="GLM",
@@ -551,7 +532,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="MiniMax MSA",
         architectures=_MSA_ARCHITECTURES,
         configure=configure_minimax_m3_attention,
-        default_prefix_granularity=128,
     ),
     _AttentionFamilySpec(
         name="Beam",
@@ -639,25 +619,13 @@ def _apply_attention_defaults(
     *,
     name: str,
     default_backend: str | Callable[[ServerArgs], str | None] | None,
-    default_prefix_granularity: int | None,
     is_draft_worker: bool,
 ) -> None:
-    """Fill launch arguments the user left at their defaults.
+    """Fill the attention backend the user left at its default.
 
     A callable ``default_backend`` is asked only when the backend field it
     would fill is unset, and may return None to leave it unset.
     """
-    if default_prefix_granularity is not None:
-        granularity_default = ServerArgs.__dataclass_fields__[
-            "prefix_granularity"
-        ].default
-        if server_args.prefix_granularity == granularity_default:
-            logger.info(
-                f"{name!s} default prefix_granularity="
-                f"{default_prefix_granularity:d}; pass --prefix-granularity "
-                f"with a value other than {granularity_default:d} to keep that value.",
-            )
-            server_args.prefix_granularity = default_prefix_granularity
     if callable(default_backend):
         unset = (
             server_args.drafter_attention_backend
@@ -983,9 +951,6 @@ class ModelConfig:
                 server_args,
                 name=resolve_architecture(self.hf_config),
                 default_backend=self.model_profile.default_attention_backend,
-                default_prefix_granularity=(
-                    self.model_profile.default_prefix_granularity
-                ),
                 is_draft_worker=bool(is_draft_worker),
             )
             self.model_profile.configure_attention(self, server_args)
@@ -994,7 +959,6 @@ class ModelConfig:
                 server_args,
                 name=attention_family.name,
                 default_backend=attention_family.default_backend,
-                default_prefix_granularity=attention_family.default_prefix_granularity,
                 is_draft_worker=bool(is_draft_worker),
             )
             attention_family.configure(self, server_args)

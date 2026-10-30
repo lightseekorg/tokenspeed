@@ -385,7 +385,6 @@ def _dsa_attn_config(**overrides):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=4096,
         max_bs=4,

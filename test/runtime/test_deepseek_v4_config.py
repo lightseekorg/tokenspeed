@@ -1221,62 +1221,6 @@ class TestDeepseekV4Config:
 
         assert (model_config.quantization) == ("fp8")
 
-    def test_model_config_overrides_default_block_size_for_deepseek_v4(self):
-        def make_hf_config():
-            return SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"],
-                model_type="deepseek_v4",
-                head_dim=512,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                rope_scaling=None,
-                hidden_size=4096,
-                num_attention_heads=8,
-                num_key_value_heads=8,
-                num_hidden_layers=1,
-                vocab_size=32000,
-                quantization_config=None,
-            )
-
-        def build(prefix_granularity):
-            server_args = SimpleNamespace(
-                mapping=None,
-                prefix_granularity=prefix_granularity,
-                speculative_algorithm=None,
-                load_format="auto",
-                ext_yaml=None,
-                validate_tp_batch_invariant_weights=lambda *args: None,
-            )
-            hf_config = make_hf_config()
-            with (
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_config",
-                    return_value=hf_config,
-                ),
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_generation_config",
-                    return_value=SimpleNamespace(eos_token_id=None),
-                ),
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_hf_text_config",
-                    return_value=hf_config,
-                ),
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_context_length",
-                    return_value=4096,
-                ),
-                patch.object(ModelConfig, "_verify_quantization"),
-            ):
-                ModelConfig(
-                    "stub",
-                    model_override_args="{}",
-                    server_args=server_args,
-                )
-            return server_args
-
-        assert (build(64).prefix_granularity) == (256)
-        assert (build(128).prefix_granularity) == (128)
-
     def test_model_config_advertises_v4_dspark_prefix_replay_requirement(self):
         hf_config = SimpleNamespace(
             architectures=["DeepseekV4ForCausalLMDSpark"],
@@ -1300,7 +1244,6 @@ class TestDeepseekV4Config:
             enable_prefix_caching=True,
             speculative_num_steps=5,
             speculative_num_draft_tokens=6,
-            prefix_granularity=256,
             load_format="auto",
             ext_yaml=None,
         )

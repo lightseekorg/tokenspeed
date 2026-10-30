@@ -58,7 +58,6 @@ def _profile(**overrides) -> ModelProfile:
         cache_family="fixture_family",
         linear_attention="fixture_linear",
         default_attention_backend="mla",
-        default_prefix_granularity=64,
         request_token_history=True,
         is_multimodal=False,
         tokenizer_kwargs={"fix_mistral_regex": True},
@@ -547,7 +546,6 @@ def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
         args,
         name="Fixture",
         default_backend="fixture_backend",
-        default_prefix_granularity=None,
         is_draft_worker=True,
     )
     assert args.drafter_attention_backend == "fixture_backend"
@@ -556,7 +554,6 @@ def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
         args,
         name="Fixture",
         default_backend="target_backend",
-        default_prefix_granularity=None,
         is_draft_worker=False,
     )
     assert args.attention_backend == "target_backend"
@@ -654,7 +651,6 @@ def test_attention_instances_per_layer_has_no_fallback() -> None:
         cache_family="fixture_family",
         linear_attention=None,
         default_attention_backend=None,
-        default_prefix_granularity=None,
         request_token_history=False,
         is_multimodal=False,
         tokenizer_kwargs={},
@@ -702,7 +698,6 @@ def test_superseded_draft_profile_default_is_reported(caplog, monkeypatch) -> No
             args,
             name="Fixture",
             default_backend="draft_default",
-            default_prefix_granularity=None,
             is_draft_worker=True,
         )
     assert args.drafter_attention_backend == "target_choice"
