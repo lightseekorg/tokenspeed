@@ -43,9 +43,9 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _local_visible_lengths,
-    _split_slots_by_owner,
+    _triton_expand_owner_segments,
     kvp_local_visible_lengths,
-    split_slots_by_owner,
+    triton_expand_owner_segments,
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
@@ -88,62 +88,74 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(5, 1024, 4, 16)
 
 
-@pytest.mark.parametrize("degree", [1, 3, 4, 16])
-def test_split_slots_by_owner_matches_the_per_row_layout(
-    device: str, degree: int
+@pytest.mark.parametrize("max_rows", [4, 64, 256])
+def test_expand_owner_segments_matches_the_per_row_layout(
+    device: str, max_rows: int
 ) -> None:
-    rows_per_block = 128
-
-    def run(rows, rank):
-        # Distinct shuffled blocks, every row owned: blocks 1.. of a virtual space.
-        blocks = torch.randperm(4 * rows // rows_per_block + 64)[: rows // 7 + 1] + 1
-        offsets = torch.randint(0, rows_per_block, (rows,))
-        slots = (
-            blocks[torch.randint(0, blocks.numel(), (rows,))] * rows_per_block + offsets
-        ).to(torch.int32)
-        owner = (slots.to(torch.int64) // rows_per_block - 1) % degree
-        counts = torch.bincount(owner, minlength=degree)
-        send_rows = int(counts.max()) + 5
-        # The per-row reference: each owner's rows in order.
-        expected_index = torch.empty(rows, dtype=torch.int64)
-        seen = [0] * degree
-        for i, o in enumerate(owner.tolist()):
-            expected_index[i] = o * send_rows + seen[o]
-            seen[o] += 1
-        mine = owner == rank
-        previous = slots.to(torch.int64) // rows_per_block - 1
-        expected_fetch = (
-            (previous // degree + 1) * rows_per_block + slots % rows_per_block
-        )[mine]
-        gathered = torch.full((rows,), -1, dtype=torch.int32, device=device)
-        fetch = torch.full((send_rows,), -7, dtype=torch.int32, device=device)
-        split_slots_by_owner(
-            slots.to(device),
-            block_granularity=rows_per_block,
-            degree=degree,
-            rank=rank,
-            send_rows=send_rows,
+    def run(count, generator, skew):
+        # Segments of 1..max_rows rows tile [0, total); their output rows are
+        # a shuffled tiling shifted by 3; about a third are this rank's,
+        # which send in segment order from random source slots.
+        rows = torch.randint(1, max_rows + 1, (count,), generator=generator)
+        first = torch.cumsum(rows, 0) - rows
+        shuffled = torch.randperm(count, generator=generator)
+        output = (torch.cumsum(rows[shuffled], 0) - rows[shuffled])[
+            torch.argsort(shuffled)
+        ] + 3
+        mine = torch.rand(count, generator=generator) < 0.35
+        fetch_row = torch.where(mine, torch.cumsum(rows * mine, 0) - rows * mine, -1)
+        source = torch.randint(0, 1 << 30, (count,), generator=generator)
+        segments = torch.stack((first, rows, output, fetch_row, source)).to(torch.int32)
+        total, sent = int(rows.sum()), int((rows * mine).sum())
+        expected_index = torch.full((total + 2,), -1, dtype=torch.int64)
+        expected_fetch = torch.full((sent + 2,), -7, dtype=torch.int64)
+        for s in range(count):
+            for k in range(int(rows[s])):
+                expected_index[int(first[s]) + k] = int(output[s]) + k
+                if bool(mine[s]):
+                    expected_fetch[int(fetch_row[s]) + k] = int(source[s]) + k
+        # Both outputs are views of one buffer, as the planner passes them,
+        # each starting ``skew`` int32 entries past a 16-byte boundary.
+        gathered_skew, fetch_skew = skew
+        fetch_start = -(-(gathered_skew + total + 2) // 4) * 4 + fetch_skew
+        buffer = torch.full(
+            (fetch_start + sent + 2,), -1, dtype=torch.int32, device=device
+        )
+        gathered = buffer[gathered_skew : gathered_skew + total + 2]
+        fetch = buffer[fetch_start:]
+        fetch.fill_(-7)
+        triton_expand_owner_segments(
+            segments.to(device),
+            max_rows=max_rows,
             gathered_index=gathered,
             fetch=fetch,
         )
         torch.testing.assert_close(
             gathered.cpu().long(), expected_index, rtol=0, atol=0
         )
-        own = int(counts[rank])
-        torch.testing.assert_close(
-            fetch.cpu()[:own].long(), expected_fetch, rtol=0, atol=0
-        )
-        assert (fetch.cpu()[own:] == -7).all()
+        # Entries past this rank's rows keep their contents.
+        torch.testing.assert_close(fetch.cpu().long(), expected_fetch, rtol=0, atol=0)
 
-    # Several 1024-row blocks and a partial one carry each owner's count.
-    for rank in {0, degree // 2, degree - 1}:
-        run(3000, rank)
-    # A rank is fixed per process; row counts and send widths follow the
-    # history, and one binary serves them all.
-    with assert_no_triton_compile(_split_slots_by_owner):
-        run(5, degree - 1)
-        run(1024, degree - 1)
-        run(4099, degree - 1)
+    generator = torch.Generator().manual_seed(max_rows)
+    run(37, generator, (0, 0))
+    # Segment counts, and so the outputs' starts in the planner's buffer,
+    # follow the history; one binary serves them all.
+    with assert_no_triton_compile(_triton_expand_owner_segments):
+        run(1, generator, (1, 0))
+        run(16, generator, (0, 3))
+        run(300, generator, (2, 1))
+        run(1037, generator, (0, 0))
+
+
+def test_expand_owner_segments_rejects_a_table_past_int32_indexing() -> None:
+    # Two entries past 2**31, where the kernel's int32 table offsets would
+    # wrap; meta tensors carry the shapes without allocating them.
+    segments = torch.empty((5, 2**31 // 5 + 1), dtype=torch.int32, device="meta")
+    rows = torch.empty(1, dtype=torch.int32, device="meta")
+    with pytest.raises(ValueError, match="int32"):
+        triton_expand_owner_segments(
+            segments, max_rows=64, gathered_index=rows, fetch=rows
+        )
 
 
 @pytest.mark.parametrize("extra_ranges", [0, 60])

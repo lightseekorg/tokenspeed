@@ -120,7 +120,7 @@ def test_flashmla_prefill_plans_without_device_downloads(
             extend_prefix_lens_cpu=prefix_cpu,
             extend_with_prefix=with_prefix,
             query_shard=None,
-            page_table_cpu=None,
+            block_table_cpu=None,
         )
         if with_prefix:
             output = leaf.prefill_wrapper_paged.run(

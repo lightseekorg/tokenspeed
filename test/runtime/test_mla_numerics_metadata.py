@@ -152,7 +152,7 @@ def _prepare(backend, prefixes):
         extend_prefix_lens_cpu=prefix,
         extend_with_prefix=any(prefixes),
         query_shard=None,
-        page_table_cpu=pages.cpu(),
+        block_table_cpu=pages.cpu(),
     )
     return backend.forward_prefill_metadata, pages
 

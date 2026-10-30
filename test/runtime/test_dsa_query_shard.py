@@ -100,7 +100,9 @@ def _backend(
     backend.kpool_runtime = None
     backend.kvp_group = (rank,)
     backend.kvp_rank = 0
-    backend.kvp_block_granularity = None
+    # One kernel page per scheduler block: the host block table is the page
+    # table.
+    backend.kvp_block_granularity = PAGE
     backend.kvp_virtual_block_count = None
     backend.qcp_group = tuple(range(WORLD)) if qcp else (0,)
     backend.qcp_rank = rank if qcp else 0
@@ -118,7 +120,8 @@ def _backend(
 
 
 def _page_table() -> torch.Tensor:
-    """Kernel pages per request (page 0 is the hole); history lengths [6, 5, 5]."""
+    """Kernel pages per request (page 0 is the hole); history lengths [6, 5, 5].
+    A scheduler block is one kernel page, so this is the host block table too."""
     return torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0], [7, 8, 9, 0]], dtype=torch.int32)
 
 
@@ -142,7 +145,7 @@ def _init(backend: dsa.DSABackend, plan: QueryShardPlan) -> None:
         extend_prefix_lens_cpu=torch.tensor(PREFIX, dtype=torch.int32),
         extend_with_prefix=True,
         query_shard=plan,
-        page_table_cpu=table,
+        block_table_cpu=table,
     )
 
 
@@ -159,7 +162,7 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     _init(backend, plan)
     # The dense delegate sees the whole span and no shard.
     assert delegate_calls and delegate_calls[0]["query_shard"] is None
-    assert delegate_calls[0]["page_table_cpu"] is None
+    assert delegate_calls[0]["block_table_cpu"] is None
     meta = backend.require_query_shard_metadata()
     assert meta.plan is plan
     assert [g.requests for g in meta.groups] == [slice(0, 2), slice(2, 3)]
@@ -178,6 +181,35 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
         assert group.gather.group == (0,)
         assert group.gather.owned_rows_per_rank == (group.rows,)
         assert group.gather.virtual_slots.numel() == group.rows
+
+
+def test_the_owner_counts_read_the_block_table_at_the_group_granularity():
+    """A scheduler block of two kernel pages: the host block table has half
+    the page table's columns, and the owner counts read it at the group's
+    block granularity, not the kernel page size."""
+    backend = _backend(0, workspace_rows=11, index_k_format="fp8_scaled")
+    backend.kvp_block_granularity = 2 * PAGE
+    blocks = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    # Block b holds kernel pages 2b and 2b + 1.
+    pages = (blocks.unsqueeze(-1) * 2 + torch.arange(2)).reshape(3, 4).int()
+    backend.init_forward_metadata(
+        3,
+        3,
+        torch.tensor(HISTORY, dtype=torch.int32),
+        pages,
+        ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor(EXTEND, dtype=torch.int32),
+        extend_seq_lens_cpu=torch.tensor(EXTEND, dtype=torch.int32),
+        extend_prefix_lens=torch.tensor(PREFIX, dtype=torch.int32),
+        extend_prefix_lens_cpu=torch.tensor(PREFIX, dtype=torch.int32),
+        extend_with_prefix=True,
+        query_shard=_plan(0),
+        block_table_cpu=blocks,
+    )
+    meta = backend.require_query_shard_metadata()
+    # Two blocks of four rows cover each history; read as kernel pages of
+    # two rows, they would cover four and be refused.
+    assert [g.gather.owned_rows_per_rank for g in meta.groups] == [(11,), (5,)]
 
 
 def test_a_history_over_the_workspace_is_refused_and_an_unsharded_init_clears():
@@ -201,7 +233,7 @@ def test_a_history_over_the_workspace_is_refused_and_an_unsharded_init_clears():
         extend_prefix_lens_cpu=torch.tensor(PREFIX, dtype=torch.int32),
         extend_with_prefix=True,
         query_shard=None,
-        page_table_cpu=None,
+        block_table_cpu=None,
     )
     assert backend.query_shard_metadata is None
     with pytest.raises(RuntimeError, match="not a sharded"):
@@ -210,7 +242,7 @@ def test_a_history_over_the_workspace_is_refused_and_an_unsharded_init_clears():
 
 def test_a_sharded_init_needs_the_host_table_and_the_workspace():
     backend = _backend(0, workspace_rows=11, index_k_format="fp8_scaled")
-    with pytest.raises(RuntimeError, match="host page table"):
+    with pytest.raises(RuntimeError, match="host block table"):
         backend.init_forward_metadata(
             3,
             3,
@@ -223,10 +255,15 @@ def test_a_sharded_init_needs_the_host_table_and_the_workspace():
             extend_prefix_lens_cpu=torch.tensor(PREFIX, dtype=torch.int32),
             extend_with_prefix=True,
             query_shard=_plan(0),
-            page_table_cpu=None,
+            block_table_cpu=None,
         )
     backend = _backend(0, workspace_rows=0, index_k_format="fp8_scaled")
     with pytest.raises(RuntimeError, match="workspace"):
+        _init(backend, _plan(0))
+    # The host block table's rows per entry come from the cache geometry.
+    backend = _backend(0, workspace_rows=11, index_k_format="fp8_scaled")
+    backend.kvp_block_granularity = None
+    with pytest.raises(RuntimeError, match="DSA cache geometry is not configured"):
         _init(backend, _plan(0))
 
 

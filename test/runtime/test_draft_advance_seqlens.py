@@ -99,7 +99,7 @@ def test_trtllm_mixed_prefill_metadata_uses_extend_rows():
         extend_prefix_lens_cpu=prefix_lens,
         extend_with_prefix=True,
         query_shard=None,
-        page_table_cpu=None,
+        block_table_cpu=None,
     )
 
     metadata = be.forward_prefill_metadata
@@ -136,7 +136,7 @@ def test_trtllm_target_mixed_metadata_keeps_decode_rows():
         extend_prefix_lens_cpu=prefix_lens,
         extend_with_prefix=False,
         query_shard=None,
-        page_table_cpu=None,
+        block_table_cpu=None,
     )
 
     metadata = be.forward_prefill_metadata
@@ -177,7 +177,7 @@ def _init_round(be, mode, extends, decode_kv_lens, width):
         extend_prefix_lens_cpu=prefix_lens,
         extend_with_prefix=bool(prefix_lens.any()),
         query_shard=None,
-        page_table_cpu=None,
+        block_table_cpu=None,
     )
     return seq_lens, page_table
 

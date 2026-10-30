@@ -27,8 +27,11 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import split_slots_by_owner
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    triton_expand_owner_segments,
+)
 
 from tokenspeed.runtime.distributed.comm_backend import (
     CommBackend,
@@ -43,7 +46,7 @@ from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     cyclic_slot_owner,
-    owned_prefix_chunk_rows,
+    prefix_chunk_segments,
     resolve_cache_slots,
 )
 
@@ -281,9 +284,9 @@ class PrefixHistoryWindow:
         rank: This rank's position in ``group``.
         owned_rows_per_rank: Host counts of the window rows each owner holds.
         send_rows: Rows every rank contributes to the all-gather.
-        fetch_slots: ``[send_rows]`` physical slots this rank sends, in the
-            virtual slots' integer dtype: its own rows in order, then slot 0
-            (the null page) for the tail nobody reads.
+        fetch_slots: ``[send_rows]`` int32 physical slots this rank sends:
+            its own rows in order, then slot 0 (the null page) for the tail
+            nobody reads.
         gathered_index: ``[rows]`` int32 row of the all-gather output that
             holds each row of the window, loop-major.
         loop_bounds: ``[first loop's start, ..., last loop's end]`` row
@@ -302,81 +305,139 @@ class PrefixHistoryWindow:
 def plan_prefix_history_gather(
     chunk_kv_indices_list: Sequence[torch.Tensor],
     *,
-    page_table_cpu: torch.Tensor,
+    block_table_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     chunk_len: int,
-    page_size: int,
     placement: CachePlacement,
 ) -> tuple[PrefixHistoryWindow, ...]:
     """Plan one forward's page-owner gathers of its prefix-chunk loops.
 
     Consecutive loops share a window (``PREFIX_HISTORY_WINDOW_LOOPS``); every
-    MLA layer reuses the plan. The owned-row counts come from the host page
-    table, so nothing waits on the device; one kernel per window
-    (``split_slots_by_owner``) gives every row its all-gather output row and
-    this rank's rows their physical slots.
+    MLA layer reuses the plan. Ownership is per scheduler block, and the rows
+    one loop reads of one request inside one block (a segment,
+    ``prefix_chunk_segments``) are consecutive in the owner's physical slots
+    and, sent in order, in the all-gather output. So the host lays out every
+    segment of every window from the host block table -- work per block, not
+    per row, and nothing waits on the device -- and one launch
+    (``triton_expand_owner_segments``) expands the segments into every
+    window's per-row ``gathered_index`` and ``fetch_slots``. The loops'
+    device slots are only counted, never read.
 
     Args:
         chunk_kv_indices_list: Each loop's ``[rows]`` virtual slots, position
             order (``chunk.get_chunks_paged``), identical on every rank.
-        page_table_cpu: ``[requests, columns]`` host kernel-page table of the
-            extend requests.
+        block_table_cpu: ``[requests, columns]`` host block table of the
+            extend requests (virtual scheduler blocks of
+            ``placement.block_granularity`` rows): the stage the loops'
+            kernel page table was expanded from. Both the page owners and
+            the owners' physical send slots come from it.
         prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
         chunk_len: Prefix rows every request contributes to one loop.
-        page_size: Tokens per kernel page.
         placement: The MLA history group's page ownership.
 
     Returns:
         The windows, in loop order.
     """
-    counts = owned_prefix_chunk_rows(
-        page_table_cpu,
+    loops = chunk_kv_indices_list
+    if not loops:
+        return ()
+    segments = prefix_chunk_segments(
+        block_table_cpu,
         prefix_lens_cpu,
         chunk_len=chunk_len,
-        num_chunks=len(chunk_kv_indices_list),
-        page_size=page_size,
+        num_chunks=len(loops),
         placement=placement,
     )
+    loop_rows = segments.loop_rows.tolist()
+    if [loop.numel() for loop in loops] != loop_rows:
+        raise ValueError(
+            f"the prefix loops' {[loop.numel() for loop in loops]} rows are not "
+            f"the block table's {loop_rows}"
+        )
+    # Rank k's rows of a window go out in order as rows k * send_rows onward
+    # of its all-gather, so a segment's rows follow the rows of the earlier
+    # segments its owner holds in the window: a stable sort of the segments
+    # by (window, owner) and one running sum place every segment.
     degree = len(placement.group)
+    num_windows = -(-len(loops) // PREFIX_HISTORY_WINDOW_LOOPS)
+    window = segments.loop // PREFIX_HISTORY_WINDOW_LOOPS
+    key = window * degree + segments.owner
+    # Keys of 16 bits or less take numpy's linear-time radix sort.
+    order = np.argsort(
+        key.astype(np.min_scalar_type(num_windows * degree)), kind="stable"
+    )
+    owned = np.bincount(
+        key, weights=segments.rows, minlength=num_windows * degree
+    ).astype(np.int64)
+    # Rows ahead of each segment among its owner's in the window: rows of
+    # the earlier segments in sorted order, less the earlier keys' rows.
+    rows_sorted = segments.rows[order]
+    ahead = np.empty_like(rows_sorted)
+    ahead[order] = (
+        np.cumsum(rows_sorted) - rows_sorted - (np.cumsum(owned) - owned)[key[order]]
+    )
+    owned = owned.reshape(num_windows, degree)
+    send_rows = owned.max(axis=1)
+    fetch_bounds = np.zeros(num_windows + 1, dtype=np.int64)
+    np.cumsum(send_rows, out=fetch_bounds[1:])
+    row_bounds = np.zeros(len(loops) + 1, dtype=np.int64)
+    np.cumsum(segments.loop_rows, out=row_bounds[1:])
+    # The kernel adds a row's offset to every int32 entry: all-gather output
+    # rows stay below degree * rows, and a physical slot plus its offset
+    # below the end of the rank's last local block.
+    slot_end = (
+        (placement.virtual_block_count - 2) // degree + 2
+    ) * placement.block_granularity
+    if row_bounds[-1] * degree >= 2**31 or slot_end > 2**31:
+        raise ValueError("prefix history rows or slots overflow int32")
+    device = loops[0].device
+    # The segment table, built in pinned memory so that one asynchronous
+    # upload feeds the forward's one launch. Per segment: its first row of
+    # the forward's rows (every window's gathered_index, loop order), rows,
+    # all-gather output row in its window, entry of the forward's send slots
+    # (-1: another rank's) and the owner's physical slot of its first row.
+    staged = torch.empty(
+        (5, segments.rows.size), dtype=torch.int32, pin_memory=device.type == "cuda"
+    )
+    table = staged.numpy()
+    table[0] = segments.row
+    table[1] = segments.rows
+    table[2] = segments.owner * send_rows[window] + ahead
+    table[3] = np.where(
+        segments.owner == placement.rank, fetch_bounds[window] + ahead, -1
+    )
+    table[4] = segments.local_slot
+    row_bounds, fetch_bounds = row_bounds.tolist(), fetch_bounds.tolist()
+    # One buffer: every window's gathered_index, then every window's send
+    # slots. Every rank sends send_rows rows a window: its own first, then
+    # local slot 0 -- a row of the null page, left by the zero fill -- for
+    # the tail no gathered_index entry reads.
+    buffer = torch.zeros(
+        row_bounds[-1] + fetch_bounds[-1], dtype=torch.int32, device=device
+    )
+    gathered_index = buffer[: row_bounds[-1]]
+    fetch = buffer[row_bounds[-1] :]
+    triton_expand_owner_segments(
+        staged.to(device, non_blocking=True),
+        max_rows=placement.block_granularity,
+        gathered_index=gathered_index,
+        fetch=fetch,
+    )
     windows = []
-    for first in range(0, len(chunk_kv_indices_list), PREFIX_HISTORY_WINDOW_LOOPS):
-        loops = chunk_kv_indices_list[first : first + PREFIX_HISTORY_WINDOW_LOOPS]
-        slots = torch.cat(loops) if len(loops) > 1 else loops[0]
-        owned = tuple(counts[first : first + len(loops)].sum(dim=0).tolist())
-        if sum(owned) != slots.numel():
-            raise ValueError(
-                f"owned rows sum to {sum(owned)} but the window has "
-                f"{slots.numel()} rows"
-            )
-        send_rows = max(owned)
-        # One launch splits the rows by owner. Every rank sends send_rows
-        # rows: its own first, then local slot 0 -- a row of the null page --
-        # for the tail no gathered_index entry reads.
-        fetch = slots.new_zeros(send_rows)
-        gathered_index = torch.empty(
-            slots.shape, dtype=torch.int32, device=slots.device
-        )
-        split_slots_by_owner(
-            slots,
-            block_granularity=placement.block_granularity,
-            degree=degree,
-            rank=placement.rank,
-            send_rows=send_rows,
-            gathered_index=gathered_index,
-            fetch=fetch,
-        )
-        bounds = [0]
-        for loop in loops:
-            bounds.append(bounds[-1] + loop.numel())
+    for index, (owned_rows, sent_rows) in enumerate(
+        zip(owned.tolist(), send_rows.tolist())
+    ):
+        first = index * PREFIX_HISTORY_WINDOW_LOOPS
+        bounds = row_bounds[first : first + PREFIX_HISTORY_WINDOW_LOOPS + 1]
         windows.append(
             PrefixHistoryWindow(
                 group=placement.group,
                 rank=placement.rank,
-                owned_rows_per_rank=owned,
-                send_rows=send_rows,
-                fetch_slots=fetch,
-                gathered_index=gathered_index,
-                loop_bounds=tuple(bounds),
+                owned_rows_per_rank=tuple(owned_rows),
+                send_rows=sent_rows,
+                fetch_slots=fetch[fetch_bounds[index] : fetch_bounds[index + 1]],
+                gathered_index=gathered_index[bounds[0] : bounds[-1]],
+                loop_bounds=tuple(bound - bounds[0] for bound in bounds),
             )
         )
     return tuple(windows)
@@ -411,14 +472,13 @@ class PrefixHistoryGather:
     layer's history in the same order.
     """
 
-    def __init__(self, placement: CachePlacement, *, page_size: int, comm: CommBackend):
+    def __init__(self, placement: CachePlacement, *, comm: CommBackend):
         self._placement = placement
-        self._page_size = page_size
         self._comm = comm
         # The current forward's loops and planning inputs, and its windows
         # once the first read planned them.
         self._chunk_kv_indices_list: Sequence[torch.Tensor] = ()
-        self._page_table_cpu: torch.Tensor | None = None
+        self._block_table_cpu: torch.Tensor | None = None
         self._prefix_lens_cpu: torch.Tensor | None = None
         self._chunk_len = 0
         self._windows: tuple[PrefixHistoryWindow, ...] | None = None
@@ -428,19 +488,17 @@ class PrefixHistoryGather:
         self._sharded_layer_ids: list[int] | None = None
 
     @classmethod
-    def on_history_groups(
-        cls, placement: CachePlacement, *, page_size: int
-    ) -> PrefixHistoryGather:
+    def on_history_groups(cls, placement: CachePlacement) -> PrefixHistoryGather:
         """Reads that gather on the named KVP history groups, which the
         distributed initializer creates whenever KVP is on."""
         comm = get_global_backend().for_named_groups(KVP_HISTORY_GROUP_NAME)
-        return cls(placement, page_size=page_size, comm=comm)
+        return cls(placement, comm=comm)
 
     def prepare(
         self,
         chunk_kv_indices_list: Sequence[torch.Tensor],
         *,
-        page_table_cpu: torch.Tensor | None,
+        block_table_cpu: torch.Tensor | None,
         prefix_lens_cpu: torch.Tensor,
         chunk_len: int,
     ) -> None:
@@ -450,8 +508,9 @@ class PrefixHistoryGather:
             chunk_kv_indices_list: Each loop's ``[rows]`` virtual slots,
                 position order (``chunk.get_chunks_paged``), identical on
                 every rank.
-            page_table_cpu: ``[requests, columns]`` host kernel-page table of
-                the extend requests; required when there are loops.
+            block_table_cpu: ``[requests, columns]`` host block table of the
+                extend requests (virtual scheduler blocks); required when
+                there are loops.
             prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
             chunk_len: Prefix rows every request contributes to one loop.
         """
@@ -460,13 +519,13 @@ class PrefixHistoryGather:
         for launched in self._launched.values():
             launched.work.wait()
         self._launched.clear()
-        if chunk_kv_indices_list and page_table_cpu is None:
+        if chunk_kv_indices_list and block_table_cpu is None:
             raise RuntimeError(
-                "a page-sharded MLA prefix needs the host page table to split "
+                "a page-sharded MLA prefix needs the host block table to split "
                 "its history gather by page owner"
             )
         self._chunk_kv_indices_list = chunk_kv_indices_list
-        self._page_table_cpu = page_table_cpu
+        self._block_table_cpu = block_table_cpu
         self._prefix_lens_cpu = prefix_lens_cpu
         self._chunk_len = chunk_len
         # A forward without prefix loops has nothing to gather.
@@ -479,10 +538,9 @@ class PrefixHistoryGather:
         if self._windows is None:
             self._windows = plan_prefix_history_gather(
                 self._chunk_kv_indices_list,
-                page_table_cpu=self._page_table_cpu,
+                block_table_cpu=self._block_table_cpu,
                 prefix_lens_cpu=self._prefix_lens_cpu,
                 chunk_len=self._chunk_len,
-                page_size=self._page_size,
                 placement=self._placement,
             )
         return self._windows

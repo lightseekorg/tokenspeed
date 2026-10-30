@@ -59,7 +59,7 @@ def gather_paged_history(
     counts = owned_history_rows(
         table_cpu[None, :],
         torch.tensor([pages * 64], dtype=torch.int64),
-        page_size=64,
+        block_granularity=64,
         placement=placement,
     )[:, 0].tolist()
     logical = torch.arange(pages * 64, device=cache.device, dtype=torch.int64)

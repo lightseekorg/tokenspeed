@@ -59,13 +59,16 @@ unconditionally, so the router and every other runner-facing node call
 `reject_bounded_replay` and fail loud on a non-zero replay instead of
 rewriting rows the prefix hit already shares. Likewise every node without a
 gathered-history extend arm calls `reject_query_shard`; the router forwards
-the shard to its leaves together with `page_table_cpu`, the host mirror of
-the extend rows of each leaf's kernel page table (built for a sharded
-forward, and for an extend with a prefix on a KVP page-sharded group; `None`
-otherwise). The one leaf that attends a shard — GPU DSA — counts page
-ownership from it on the host, and an MLA leaf declaring `supports_mla_dcp`
-hands it to `_prepare_prefix_history`, which splits the prefix-chunk gathers
-by page owner the same way. No default values: the runner
+the shard to its leaves together with `block_table_cpu`, the extend rows of
+the leaf's group in the runner's host block table (scheduler blocks, handed
+for a sharded forward, and for an extend with a prefix on a KVP page-sharded
+group; `None` otherwise). Page ownership is a per-block fact, so nothing is
+expanded to kernel pages on the host. The one leaf that attends a shard —
+GPU DSA — counts page ownership from it on the host, and an MLA leaf
+declaring `supports_mla_dcp` hands it to `_prepare_prefix_history`, whose
+prefix-chunk gathers take both the page owners and the owners' physical send
+slots from it: it must be the stage `page_table` was expanded from, and the
+loops' device slots are only counted. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
 can never see a silently-defaulted one. This is deliberate — a `= False`
@@ -1344,7 +1347,11 @@ rows.
 ## One block-table route: router + leaves
 
 The layering between the scheduler's block vocabulary and the kernels' page
-vocabulary is fixed, with exactly one conversion point:
+vocabulary is fixed, with exactly one block-to-page conversion point, the
+router. The one leaf that reads block ids is the KVP prefix-chunk gather
+plan (`dcp/placement.py: prefix_chunk_segments`): it takes page owners and
+the owners' physical send slots from the same host block rows the router
+expands, never kernel pages.
 
 | layer | sees | never sees |
 |---|---|---|
@@ -1353,7 +1360,7 @@ vocabulary is fixed, with exactly one conversion point:
 | **`CacheGroupRouter`** | attention group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, and KV write-location slot math | kernel calls |
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view, and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE state table, input/output state blocks, and verify workspace | Mamba metadata and verify context, persistent cache allocation |
-| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `page_table_cpu`, the host mirror of its extend rows, for page-owner counts | groups, block tables, contracts, draft/target table provenance |
+| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `block_table_cpu`, its group's host block rows of the extend requests (ownership is per block): the query-shard gather counts page owners from it, and the KVP prefix-chunk gather takes both page owners and the owners' physical send slots from it, so it must be the stage `page_table` was expanded from | groups, device block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own groups' raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the
@@ -1916,7 +1923,7 @@ The contract a model (in tree or a plugin) implements:
   `registry._prepare_fixed_workspaces` and shared with the draft tree, whose
   extend step never gathers concurrently), each with its `row_base` in the request-major
   history-row numbering, this rank's `local_query` slice, and a
-  `HistoryGatherPlan` (per-owner row counts from `page_table_cpu`,
+  `HistoryGatherPlan` (per-owner row counts from `block_table_cpu`,
   `dcp/placement.py: owned_history_rows`). For the indexer the model calls
   `backend.gather_history_index_k(layer_id, pool, group)` per group, which
   returns the group's index keys in position order in the leaf's
@@ -2174,7 +2181,8 @@ mapping remains a separate consumer of the shared mapping helpers
   argument and per-forward row metadata rides `ForwardContext`.
 * Every `init_forward_metadata` signature carries `query_shard` with no
   default (`test_unified_decode_path.py` binds it on every runner-facing node
-  and leaf; leaves also take `page_table_cpu`), and
+  and leaf); leaves also take `block_table_cpu`, the router's raw host block
+  rows (`test_cache_group_router.py`), and
   `grep -rn "input_num_tokens" python/tokenspeed/runtime/models/longcat_flash.py
   python/tokenspeed/runtime/models/base/causal_lm.py` stays empty — a model
   under query context parallelism reads its row count from its tensors or

@@ -15,6 +15,18 @@ This scheduler/lifecycle operation consumes a CPU range list outside CUDA graph
 capture. Capturing it fails explicitly rather than retaining a temporary pinned
 metadata pointer in a graph. Model forward graph replay is unchanged.
 
+## Owner-split gathers
+
+`triton_cache_placement.triton_expand_owner_segments` lays rows out for an
+all-gather over KVP page owners. The caller plans on the host per segment —
+a run of rows inside one scheduler block, so one owner, consecutive physical
+slots and consecutive all-gather output rows — and the kernel expands every
+segment to per-row output rows and this rank's send slots in one launch
+(segments in parallel, rows in tiles). Host work is `O(blocks)` rather than
+`O(rows)`; segment counts are runtime values, the row tile follows the
+block granularity, fixed per server, and the outputs (views of one buffer at
+per-forward offsets) are not specialized on alignment.
+
 ## Sparse KV offloading
 
 `offload.py` is the runtime boundary. NVIDIA uses the registered
