@@ -142,8 +142,10 @@ def _select_split_k(contract: str, m: int, n: int, k: int) -> int:
     The V4 FP32-scale Q/KV projections use four or seven partitions while the
     batch occupies fewer than 16 rows. Their full-row tiles stay direct because
     the extra reduction launch outweighs additional producer workgroups. The
-    V4.1 Q/KV and shared-up projections use five partitions for every supported
-    decode batch. All unlisted shapes use the direct path.
+    V4.1 576-column projection uses five partitions for every supported decode
+    batch. The 1792-column V4.1 Q/KV projection stays direct: its 112 output
+    tiles keep the weight stream busy, so the reduction launch costs more than
+    the extra producers save. All unlisted shapes use the direct path.
     """
     if contract == "fp32":
         if m == _BLOCK_M:
@@ -154,7 +156,7 @@ def _select_split_k(contract: str, m: int, n: int, k: int) -> int:
             return 7
         return 1
     if contract == "ue8m0":
-        if (n, k) in ((576, 5120), (1792, 5120)):
+        if (n, k) == (576, 5120):
             return 5
         return 1
     raise ValueError(f"unknown MXFP8 scale contract: {contract}")
