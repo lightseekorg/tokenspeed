@@ -112,7 +112,8 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
         )
         tl.store(
             complete_blocks + rows,
-            ((logical + 1) // COMPRESS_RATIO).to(tl.int32),
+            # Padded MTP rows can precede position zero and have no blocks.
+            (tl.maximum(logical + 1, 0) // COMPRESS_RATIO).to(tl.int32),
             mask=mask,
         )
 
@@ -188,7 +189,8 @@ def qwen4_exp_qsa_prepare_metadata(
     Returns:
         Logical positions, request ids, compressed-cache locations,
         recent-cache locations and complete-block counts, all with one entry
-        per flattened query row.
+        per flattened query row. Complete-block counts are nonnegative,
+        including padded MTP rows whose logical positions precede zero.
     """
 
     batch = seq_lens.shape[0]
@@ -551,6 +553,11 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     norm_second = pooled_second * scale * weight_second
     norm_pass = pooled_pass * scale * weight_pass
 
+    qsa_loc = tl.load(qsa_locs + row).to(tl.int64)
+    boundary = ((position + 1) % compress_ratio == 0) & (qsa_loc > 0) & (recent_loc > 0)
+    if HAS_WRITE_MASK:
+        boundary &= tl.load(write_mask + row) != 0
+
     # Group-start RoPE positions: current batch row or cached page header.
     head_source = row - (COMPRESS_RATIO - 1)
     head_expected = position - (COMPRESS_RATIO - 1)
@@ -616,22 +623,20 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
         selected_positions = tl.where(half_mask, p0, 0)
     cos = tl.load(
         cos_sin_cache + selected_positions * stride_cs_n + half_offsets,
-        mask=half_mask,
+        # A non-boundary draft row can have valid tags before its group-start
+        # header has been staged. Only emitted compressed keys need this RoPE.
+        mask=half_mask & boundary,
         other=0.0,
     ).to(tl.float32)
     sin = tl.load(
         cos_sin_cache + selected_positions * stride_cs_n + half + half_offsets,
-        mask=half_mask,
+        mask=half_mask & boundary,
         other=0.0,
     ).to(tl.float32)
     rotated_first = norm_first * cos - norm_second * sin
     rotated_second = norm_second * cos + norm_first * sin
 
     # Scatter at compression-group boundaries only.
-    qsa_loc = tl.load(qsa_locs + row).to(tl.int64)
-    boundary = ((position + 1) % compress_ratio == 0) & (qsa_loc > 0) & (recent_loc > 0)
-    if HAS_WRITE_MASK:
-        boundary &= tl.load(write_mask + row) != 0
     if boundary:
         compressed_page = qsa_loc // compressed_token_page_size
         within = qsa_loc % compressed_token_page_size

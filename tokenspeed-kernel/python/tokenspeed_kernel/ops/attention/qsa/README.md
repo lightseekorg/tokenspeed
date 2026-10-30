@@ -146,6 +146,12 @@ bitwise equivalence with FA2 or a model-level quality acceptance result.
 
 ## Metadata and recent writes
 
+Padded MTP rows with negative logical positions retain them for masking,
+but contribute zero complete blocks to scoring and top-k selection.
+
+Compressed-key RoPE is read only at compression write boundaries. Non-boundary
+draft rows may have valid raw-key tags before their group-start header is staged.
+
 Startup metadata preparation covers integer alignment classes for compressed
 page-table row strides. Recent-cache writes cover these classes for row count
 and the exclusive request-id bound. The ordinary unlimited prefill call also
