@@ -807,62 +807,70 @@ private:
         std::ranges::sort(request_reclaim_candidates_, shouldEvictFirst);
     }
 
-    bool ensureGroupCandidateAvailable(CacheGroupVictimCandidates& group) {
-        if (group.next_candidate_index < group.candidates.size()) {
-            return true;
-        }
+    void loadGroupEpoch(CacheGroupVictimCandidates& group, std::uint64_t epoch) {
         group.candidates.clear();
         group.next_candidate_index = 0;
-        while (!group.index_exhausted) {
-            epoch_scratch_.clear();
-            const bool found_epoch =
-                groups_[group.group_id].Index().NextEvictionEpoch(pool_, group.index_cursor, epoch_scratch_);
-            if (!found_epoch) {
-                group.index_exhausted = true;
-                break;
+        epoch_scratch_.clear();
+        groups_[group.group_id].Index().NextEvictionEpoch(pool_, group.index_cursor, epoch, epoch_scratch_);
+        for (const PrefixCacheIndex::EvictionCandidate& entry : epoch_scratch_) {
+            if (protected_locations_.contains(entry.location) || request_reclaim_locations_.contains(entry.location)) {
+                continue;
             }
-            for (const PrefixCacheIndex::EvictionCandidate& entry : epoch_scratch_) {
-                if (protected_locations_.contains(entry.location) ||
-                    request_reclaim_locations_.contains(entry.location)) {
-                    continue;
-                }
-                group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
-            }
-            // Index order breaks epoch ties by location; eviction policy also
-            // considers boundary tier and logical position, so sort the whole epoch.
-            if (!group.candidates.empty()) {
-                std::ranges::sort(group.candidates, shouldEvictFirst);
-                return true;
-            }
+            group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
         }
-        return false;
+        // The entire epoch participates in boundary and position tie-breaks.
+        std::ranges::sort(group.candidates, shouldEvictFirst);
     }
 
     std::optional<VictimCandidate> nextVictimCandidate() {
-        CacheGroupVictimCandidates* selected_group = nullptr;
-        for (CacheGroupVictimCandidates& group : cache_group_candidates_) {
-            if (!ensureGroupCandidateAvailable(group)) {
+        while (true) {
+            CacheGroupVictimCandidates* selected_group = nullptr;
+            CacheGroupVictimCandidates* next_group = nullptr;
+            std::optional<std::uint64_t> next_epoch;
+            for (CacheGroupVictimCandidates& group : cache_group_candidates_) {
+                if (group.next_candidate_index < group.candidates.size()) {
+                    if (selected_group == nullptr ||
+                        shouldEvictFirst(group.CurrentCandidate(), selected_group->CurrentCandidate())) {
+                        selected_group = &group;
+                    }
+                } else if (!group.index_exhausted) {
+                    const auto epoch = groups_[group.group_id].Index().PeekEvictionEpoch(pool_, group.index_cursor);
+                    if (!epoch) {
+                        group.index_exhausted = true;
+                    } else if (!next_epoch || *epoch < *next_epoch) {
+                        next_epoch = epoch;
+                        next_group = &group;
+                    }
+                }
+            }
+
+            const VictimCandidate* selected = selected_group == nullptr ? nullptr : &selected_group->CurrentCandidate();
+            const bool select_request =
+                next_request_candidate_index_ < request_reclaim_candidates_.size() &&
+                (selected == nullptr ||
+                 shouldEvictFirst(request_reclaim_candidates_[next_request_candidate_index_], *selected));
+            if (select_request) {
+                selected = &request_reclaim_candidates_[next_request_candidate_index_];
+            }
+
+            // Inspect owners only at the globally oldest unread epoch. Even
+            // a fully pinned group's newer entries cannot precede this victim.
+            // Equal epochs must all be read before applying policy tie-breaks.
+            if (next_group != nullptr && (selected == nullptr || *next_epoch <= selected->last_access_epoch)) {
+                loadGroupEpoch(*next_group, *next_epoch);
                 continue;
             }
-            if (selected_group == nullptr ||
-                shouldEvictFirst(group.CurrentCandidate(), selected_group->CurrentCandidate())) {
-                selected_group = &group;
+            if (selected == nullptr) {
+                return std::nullopt;
             }
-        }
-
-        if (next_request_candidate_index_ < request_reclaim_candidates_.size()) {
-            const VictimCandidate& request_candidate = request_reclaim_candidates_[next_request_candidate_index_];
-            if (selected_group == nullptr || shouldEvictFirst(request_candidate, selected_group->CurrentCandidate())) {
+            const VictimCandidate candidate = *selected;
+            if (select_request) {
                 ++next_request_candidate_index_;
-                return request_candidate;
+            } else {
+                ++selected_group->next_candidate_index;
             }
+            return candidate;
         }
-        if (selected_group == nullptr) {
-            return std::nullopt;
-        }
-        const VictimCandidate candidate = selected_group->CurrentCandidate();
-        ++selected_group->next_candidate_index;
-        return candidate;
     }
 
     // The coordinator planned for, read through its public views

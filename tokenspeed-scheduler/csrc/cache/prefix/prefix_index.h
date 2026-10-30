@@ -81,7 +81,7 @@ public:
     class EvictionCursor {
         friend class PrefixCacheIndex;
         const CacheEntries* cache_index_{nullptr};
-        EvictionOrderMap::const_iterator next_;
+        EvictionOrderMap::const_iterator next_{};
     };
 
     // One unpinned entry, paired with the metadata an eviction policy reads.
@@ -230,20 +230,32 @@ public:
         return metadataOf(*entry_it);
     }
 
-    // Appends all unpinned entries of the next epoch containing candidates.
-    // Skips fully pinned epochs and returns false at exhaustion. The cursor
-    // advances continuously, without a tree lookup for each skipped epoch.
-    // Complete epochs let admission apply its policy's tie-breaks locally.
-    bool NextEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor, std::vector<EvictionCandidate>& out) const {
+    // The next epoch, including one whose entries are all pinned. Reading its
+    // order key does not inspect block owners or advance the cursor.
+    std::optional<std::uint64_t> PeekEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor) const {
         if (cursor.cache_index_ == nullptr) {
             cursor.cache_index_ = findCacheEntries(pool);
             if (cursor.cache_index_ == nullptr) {
-                return false;
+                return std::nullopt;
             }
             cursor.next_ = cursor.cache_index_->by_eviction_order.begin();
         }
+        if (cursor.next_ == cursor.cache_index_->by_eviction_order.end()) {
+            return std::nullopt;
+        }
+        return cursor.next_->first.last_access_epoch;
+    }
+
+    // Appends a complete unpinned epoch, skipping fully pinned epochs up to
+    // max_access_epoch. False means either exhaustion or a later epoch; Peek
+    // distinguishes them. A later epoch stays unread for the next call.
+    bool NextEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor, std::uint64_t max_access_epoch,
+                           std::vector<EvictionCandidate>& out) const {
+        if (!PeekEvictionEpoch(pool, cursor)) {
+            return false;
+        }
         const auto end = cursor.cache_index_->by_eviction_order.end();
-        while (cursor.next_ != end) {
+        while (cursor.next_ != end && cursor.next_->first.last_access_epoch <= max_access_epoch) {
             const std::uint64_t epoch = cursor.next_->first.last_access_epoch;
             const std::size_t initial_size = out.size();
             for (; cursor.next_ != end && cursor.next_->first.last_access_epoch == epoch; ++cursor.next_) {

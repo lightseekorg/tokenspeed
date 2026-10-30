@@ -1324,6 +1324,33 @@ TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistor
     EXPECT_TRUE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[2], 2)));
 }
 
+TEST(CacheCoordinatorAdmissionTest, MergesGroupEpochsWithPinnedEntriesInEitherGroupOrder) {
+    for (std::uint32_t state_group : {0u, 1u}) {
+        SCOPED_TRACE(state_group);
+        const std::uint32_t full_group = 1 - state_group;
+        BlockPool pool(3, {1, 1});
+        std::vector<CacheGroupSpec> specs(2);
+        specs[state_group] = CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1};
+        specs[full_group] =
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+        CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false);
+        const auto hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+        CacheBoundaryForGroup(coordinator, pool, hashes[0], full_group, 1, 0, CacheBoundaryKind::kEndpoint);
+        CacheBoundaryForGroup(coordinator, pool, hashes[1], state_group, 2, 0, CacheBoundaryKind::kEndpoint);
+        CacheBoundaryForGroup(coordinator, pool, hashes[2], full_group, 3, 1, CacheBoundaryKind::kEndpoint);
+        CacheBlockRef pinned = coordinator.GroupPrefixIndex(full_group).Find(pool, Key(hashes[0], full_group));
+        ASSERT_TRUE(pinned);
+        std::vector<BlockTable> tables(2);
+        std::vector<GroupDemand> demands(2);
+        demands[state_group] = GroupDemand{.table = &tables[state_group], .extent = StateStep{StateStep::Kind::kKeep}};
+        demands[full_group] = GroupDemand{.table = &tables[full_group], .extent = DenseGrowth{4}};
+        ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false));
+        EXPECT_TRUE(coordinator.GroupPrefixIndex(full_group).Contains(pool, Key(hashes[0], full_group)));
+        EXPECT_FALSE(coordinator.GroupPrefixIndex(state_group).Contains(pool, Key(hashes[1], state_group)));
+        EXPECT_TRUE(coordinator.GroupPrefixIndex(full_group).Contains(pool, Key(hashes[2], full_group)));
+    }
+}
+
 TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionFails) {
     BlockPool pool(3, {1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {

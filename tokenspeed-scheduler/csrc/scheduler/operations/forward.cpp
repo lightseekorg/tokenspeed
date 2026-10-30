@@ -810,24 +810,35 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
     // hashes the candidate's completed pages) runs for as few candidates as
     // possible -- normally one.
     std::vector<Request*> ranked;
-    std::vector<Request*> decodes;
+    struct DecodeCandidate {
+        Request* request;
+        std::int32_t releasable_blocks;
+    };
+    std::vector<DecodeCandidate> decodes;
     Request* newest = nullptr;
     for (Request* request : candidates) {
         if (!retractable(*request)) {
             continue;
         }
         newest = request;  // candidates arrive in submission order
-        (request->Is<fsm::Prefilling>() ? ranked : decodes).push_back(request);
+        if (request->Is<fsm::Prefilling>()) {
+            ranked.push_back(request);
+        } else {
+            decodes.push_back(
+                DecodeCandidate{request, coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef())});
+        }
     }
     std::ranges::stable_sort(ranked,
                              [](const Request* a, const Request* b) { return a->TokenSize() > b->TokenSize(); });
-    const auto decode_rank = [this](const Request* request) {
-        return std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
-                          request->GeneratedTokens(), request->Id()};
+    const auto decode_rank = [](const DecodeCandidate& candidate) {
+        return std::tuple{-candidate.releasable_blocks, candidate.request->GeneratedTokens(), candidate.request->Id()};
     };
-    std::ranges::stable_sort(
-        decodes, [&decode_rank](const Request* a, const Request* b) { return decode_rank(a) < decode_rank(b); });
-    ranked.insert(ranked.end(), decodes.begin(), decodes.end());
+    std::ranges::stable_sort(decodes, [&decode_rank](const DecodeCandidate& a, const DecodeCandidate& b) {
+        return decode_rank(a) < decode_rank(b);
+    });
+    for (const DecodeCandidate& candidate : decodes) {
+        ranked.push_back(candidate.request);
+    }
     VictimChoice newest_choice{.victim = newest};
     for (Request* request : ranked) {
         const std::optional<ImageShortfall> shortfall = imageShortfall(*request);
@@ -1060,6 +1071,16 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     }
 
     while (true) {
+        // No ranked choice can run while every resident is still being
+        // written. Avoid hashing and planning images that would all wait.
+        // With any quiescent resident, retain the full ranking and fit probe:
+        // a better-ranked busy victim must not be bypassed.
+        if (std::ranges::none_of(candidates, [this](const Request* request) {
+                return request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
+                       request->ResultsInFlight() == 0 && !pdTransferInFlight(*request);
+            })) {
+            return;
+        }
         VictimChoice choice = chooseVictim(candidates, /*ignore_exemption=*/false);
         // A finished request whose last forward is still out frees its pages
         // when that forward lands (settleFinishedRequests), so a round that

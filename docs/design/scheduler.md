@@ -552,6 +552,12 @@ snapshot pool (`SchedulerConfig::HasSnapshotPool()`, §4) and a blob slot; a
 round that finds no victim it can image falls back to the last resort below
 and **aborts** one instead, so a capacity block never waits on a host budget.
 
+When every resident still has an outstanding forward or PD transfer, capacity
+retraction waits before ranking or planning images: no possible choice can
+quiesce in that round. Otherwise the normal rank and Host-fit order applies,
+including waiting for a better-ranked busy victim. Decode release counts are
+computed once per candidate for each ranking pass, before sorting.
+
 **A retracted request loses no work.** It is *suspended*: its block tables are
 imaged to Host byte-for-byte, its Device pages are released, and the restore
 (§4) copies the image back into fresh pages and resumes the request in the

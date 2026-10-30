@@ -1224,7 +1224,10 @@ empty parents fit with zero eviction; otherwise select eviction candidates
 until the plan fits. Request-reclaimable candidates are collected and sorted
 once; each cache group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
-request reclaim. Selection compares the next candidate from each group with
+request reclaim. The groups' unread epochs are merged by access time before
+inspecting block owners: a newer epoch, even if every entry is pinned, is not
+scanned to select an older candidate from another group. Complete equal epochs
+still participate in every policy tie-break. Selection compares the next candidate from each group with
 the next request-reclaimable candidate using one policy: LRU access epoch,
 then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Each candidate expands into a

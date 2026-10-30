@@ -1127,6 +1127,35 @@ TEST_F(CapacityBlockPrefixCacheSuite, FailedAdmissionLeavesCacheProgressUncommit
         << "page 2 was never published: the failed admission's progress leaked into the request";
 }
 
+TEST_F(CapacityBlockSuite, AllBusyResidentsWaitUntilTheirResultsLand) {
+    Submit(MakeRequestSpec("r1", 2));
+    Submit(MakeRequestSpec("r2", 2, 101));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    PlanOnce();
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    PlanOnce();
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    Submit(MakeRequestSpec("waiting", 1, 201));
+    const ExecutionPlan waiting = PlanOnce();
+    EXPECT_TRUE(waiting.aborts.empty());
+    EXPECT_EQ(FindSnapshotStore(waiting), nullptr);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 2u);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+    const ExecutionPlan resumed = PlanOnce();
+    const SnapshotStoreBatch* store = FindSnapshotStore(resumed);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_TRUE(resumed.aborts.empty());
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+}
+
 TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 12);
 
