@@ -88,6 +88,7 @@ def _select(fn, logits, candidates, topk, live_widths=None):
         (192, 2048, 512, None),
         (192, 4608, 512, "ordered"),
         (64, 16384, 512, "shuffled"),
+        (16, 32768, 2048, "shuffled"),
         (8, 100, 512, None),
         (16, 3000, 300, "ordered"),
         (16, 777, 1, None),
