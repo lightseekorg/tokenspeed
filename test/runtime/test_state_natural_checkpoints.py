@@ -20,7 +20,11 @@
 
 """Exercise chunked prefill and decode through the runtime configuration bridge."""
 
+from test.ci_system.ci_register import register_cuda_ci
+
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 

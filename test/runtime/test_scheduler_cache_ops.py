@@ -24,10 +24,13 @@ rank-sync payload, and the retraction and prefetch fields of ``make_config``."""
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
 from test.l3_test_utils import storage_ops, storage_scheduler
 from types import SimpleNamespace
 
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 

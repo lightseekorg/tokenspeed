@@ -30,8 +30,12 @@ and its first chunk starts right at the hit.
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
+
 import numpy as np
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 pytest.importorskip("tokenspeed_scheduler")
 
