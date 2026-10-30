@@ -26,7 +26,11 @@ import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
-from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    select_kernel,
+    spec_matches_traits,
+)
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     ScaleFormat,
@@ -433,6 +437,42 @@ def mha_extend_with_kvcache(
         )
 
 
+# Feature of decode kernels that take a split schedule (mha_decode_schedule).
+_SPLIT_SCHEDULE = frozenset({"split_schedule"})
+
+
+def _decode_selection(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    max_seqlen_q: int,
+    window_left: int,
+    logit_cap: float,
+    sinks: torch.Tensor | None,
+    return_lse: bool,
+    q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    fp8_kv_scales: tuple[float, float] | None,
+):
+    """Signature, scale kwargs and traits that select a decode kernel; shared
+    by mha_decode_with_kvcache and mha_decode_schedule so both pick the same
+    solution."""
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
+    )
+    traits = {
+        "q_len": max_seqlen_q,
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
+    }
+    return signature, scale_kwargs, traits
+
+
 def mha_decode_with_kvcache(
     # attention inputs
     q: torch.Tensor,
@@ -452,6 +492,7 @@ def mha_decode_with_kvcache(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     fp8_kv_scales: tuple[float, float] | None = None,
+    schedule: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -485,27 +526,34 @@ def mha_decode_with_kvcache(
         fp8_kv_scales: ``(k_scale, v_scale)`` of a per-tensor scaled FP8
             cache, whose rows hold ``K / k_scale`` and ``V / v_scale``;
             ``None`` for a unit-scale cache.
+        schedule: The split schedule :func:`mha_decode_schedule` returned for
+            this call's shape and current lengths, or None. A schedule selects
+            only kernels that read one.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
-    signature, scale_kwargs = _blockscaled_signature_and_scales(
-        q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
+    signature, scale_kwargs, traits = _decode_selection(
+        q,
+        k_cache,
+        v_cache,
+        max_seqlen_q,
+        window_left,
+        logit_cap,
+        sinks,
+        return_lse,
+        q_scale,
+        k_scale,
+        v_scale,
+        fp8_kv_scales,
     )
-
-    # Select kernel
-    traits = {
-        "q_len": max_seqlen_q,
-        "head_dim": q.shape[-1],
-        "page_size": k_cache.shape[1],
-        "logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-        "sinks": sinks is not None,
-        "sliding_window": window_left >= 0,
-    }
+    schedule_kwargs = {}
+    if schedule is not None:
+        schedule_kwargs["schedule"] = schedule
     kernel = select_kernel(
         "attention",
         "mha_decode_with_kvcache",
         signature,
+        features=_SPLIT_SCHEDULE if schedule is not None else None,
         traits=traits,
         solution=solution,
         override=override,
@@ -555,6 +603,114 @@ def mha_decode_with_kvcache(
             max_seqlen_q=max_seqlen_q,
             enable_pdl=pdl_enabled(),
             **scale_kwargs,
+            **schedule_kwargs,
+        )
+
+
+def mha_decode_schedule(
+    # attention inputs
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    # attention options
+    *,
+    window_left: int,
+    logit_cap: float,
+    sinks: torch.Tensor | None,
+    return_lse: bool,
+    q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    fp8_kv_scales: tuple[float, float] | None,
+    out: torch.Tensor | None,
+    # dispatch options
+    solution: str | None,
+) -> torch.Tensor | None:
+    """Split schedule for the decode calls of one layer shape.
+
+    Some decode kernels split each request's keys by the lengths of the whole
+    batch. They read the split counts from a schedule computed once per step
+    from ``cache_seqlens``, instead of computing them in every layer. Call
+    this after the lengths change, with the arguments of the
+    :func:`mha_decode_with_kvcache` calls that will read it, and pass the
+    result to them as ``schedule``.
+
+    Args:
+        q, k_cache, v_cache, cache_seqlens, max_seqlen_q, window_left,
+        logit_cap, sinks, return_lse, q_scale, k_scale, v_scale,
+        fp8_kv_scales: As for :func:`mha_decode_with_kvcache`; they select the
+            same kernel.
+        out: int32 [>= batch + 1, 2] tensor to write the schedule into in
+            place (a persistent buffer keeps the address a captured graph
+            reads), or None to allocate one.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        The schedule, or None when the kernel selected for these arguments
+        reads none.
+    """
+    signature, _, traits = _decode_selection(
+        q,
+        k_cache,
+        v_cache,
+        max_seqlen_q,
+        window_left,
+        logit_cap,
+        sinks,
+        return_lse,
+        q_scale,
+        k_scale,
+        v_scale,
+        fp8_kv_scales,
+    )
+    # The decode call's own selection, overrides included, decides whether
+    # its kernel reads a schedule; the schedule kernel is that solution's.
+    decode = select_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+    )
+    decode_spec = KernelRegistry.get().get_by_name(decode.name)
+    if not _SPLIT_SCHEDULE <= decode_spec.features:
+        return None
+    try:
+        kernel = select_kernel(
+            "attention",
+            "mha_decode_schedule",
+            signature,
+            traits=traits,
+            solution=decode_spec.solution,
+        )
+    except NoKernelFoundError:
+        # This call shape takes no schedule (a sliding window).
+        return None
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "max_seqlen_q": max_seqlen_q,
+    }
+    ShapeCapture.get().record(
+        "attention", "mha_decode_schedule", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "mha_decode_schedule",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k_cache=k_cache,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            window_left=window_left,
+            out=out,
         )
 
 
@@ -572,4 +728,5 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "mha_decode_schedule",
 ]

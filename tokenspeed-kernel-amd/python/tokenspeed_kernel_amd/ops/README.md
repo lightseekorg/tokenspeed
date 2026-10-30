@@ -1272,10 +1272,15 @@ attention uses its own split kernels.
   decode, the verify width for speculative verify): query `i` sees the keys
   before `cache_seqlens - (max_seqlen_q - 1 - i)`, so every length counts at
   least the request's queries.
-- Full attention sizes its splits from `cache_seqlens` when the kernel runs,
-  not from `max_seqlen_k` or the batch size, so a captured graph replays any
-  batch composition with splits fitted to its lengths and compiles nothing
-  per batch.
+- Full attention reads a split schedule that
+  `gluon_mha_decode_schedule_gfx950` computes from `cache_seqlens` once per
+  step, for every layer of the same shape (`mha_decode_schedule`). It does
+  not depend on `max_seqlen_k` or the batch size, so a captured graph replays
+  any batch composition with splits fitted to its lengths and compiles
+  nothing per batch. The launcher computes its own when given none.
+- Each split is bounded by the live `cache_seqlens` and a request's last
+  split runs to its end, so lengths that grew after the schedule (a
+  drafter's steps) are still covered.
 
 #### Algorithm
 
@@ -1288,14 +1293,17 @@ once per token. The block covers the keys of its last query position and,
 under a sliding window, from its first one's window start; each row masks its
 own causal end and window start.
 
-Full attention runs one round of at most 512 work items, two per CU. Each
-work-group reads the lengths and derives the same schedule: every split
-covers the same number of pages, chosen so the batch's items fill the round,
-a padding request takes one split per row block, and a request takes at most
-128. Items follow request order, so the grid has one work-group per possible
-item and the ones past the last item exit. The decode kernel records each row
-block's first item and split count for the reduce, and stores a row's
-partials next to each other so the reduce reads them with 16-byte loads.
+Full attention runs one round of at most 512 work items, two per CU. The
+schedule kernel, one wave, sizes the splits: every split covers the same
+number of pages, chosen so the batch's items fill the round, a padding
+request takes one split per row block, and a request takes at most 128. It
+writes each request's first slot (one split of every row block) and split
+count. Slots follow request order, so the grid has one work-group per
+possible item and the ones past the last item exit; a work-group finds its
+request by comparing its slot with 64 requests' first slots per vector load.
+The decode kernel stores a row's partials next to each other, and the reduce
+finds them from the request's first slot and split count and reads them with
+16-byte loads.
 
 K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. A split's
 page loads are software-pipelined two deep: two LDS buffers, one page

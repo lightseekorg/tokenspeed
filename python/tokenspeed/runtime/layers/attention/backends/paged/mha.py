@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.mha import (
+    mha_decode_schedule,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,
@@ -150,11 +151,37 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+        # Split schedule of the decode kernels (mha_decode_schedule): computed
+        # by the first decode layer of each shape after the lengths change,
+        # into one persistent buffer sized like seq_lens_buf, and read by the
+        # later layers of that shape. _decode_schedules maps the shapes seen
+        # since the lengths last changed to their schedule (None when their
+        # kernel reads none); _decode_schedule_shape is the shape whose
+        # schedule the buffer holds.
+        self.decode_schedule_buf: torch.Tensor | None = None
+        self._decode_schedules: dict[tuple, torch.Tensor | None] = {}
+        self._decode_schedule_shape: tuple | None = None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self.forward_decode_metadata = None
         self.forward_extend_metadata = None
+        self.decode_schedule_buf = None
+        self._reset_decode_schedules()
+
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        super().init_cuda_graph_state(max_bs)
+        # One header row and one row per decode metadata entry.
+        self.decode_schedule_buf = torch.empty(
+            (self.seq_lens_buf.shape[0] + 1, 2), dtype=torch.int32, device=self.device
+        )
+        self._reset_decode_schedules()
+
+    def _reset_decode_schedules(self) -> None:
+        """The decode lengths changed: the next decode layer of each shape
+        recomputes its schedule."""
+        self._decode_schedules.clear()
+        self._decode_schedule_shape = None
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         # Decode metadata exists only in decode rounds.
@@ -293,6 +320,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
             self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
+        self._reset_decode_schedules()
 
     def decode_buffer_targets(
         self, bs: int
@@ -310,6 +338,15 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> None:
         del seq_lens, num_extends
         self.forward_decode_metadata = self._decode_views(bs)
+        self._reset_decode_schedules()
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        super().advance_draft_forward_metadata(seq_lens)
+        self._reset_decode_schedules()
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        super().fill_block_decode_seq_lens(bs, block_seq_lens)
+        self._reset_decode_schedules()
 
     # ------------------------------------------------------------------
     # Forward
@@ -342,6 +379,10 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
+        sinks = kwargs.get("sinks")
+        schedule = self._decode_schedule(
+            q, k_cache, v_cache, metadata, max_seqlen_q, layer, sinks, scale_kwargs
+        )
         output = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -350,13 +391,66 @@ class MHAAttnBackend(PagedAttentionBackend):
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
-            sinks=kwargs.get("sinks"),
+            sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
+            schedule=schedule,
             solution=self.kernel_solution,
             **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _decode_schedule(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: MHADecodeMetadata,
+        max_seqlen_q: int,
+        layer: PagedAttention,
+        sinks: torch.Tensor | None,
+        scale_kwargs: dict,
+    ) -> torch.Tensor | None:
+        """The split schedule of this layer's decode call: computed once per
+        layer shape after the lengths change, and shared by the later layers
+        of that shape. Layers of another shape in between (models whose layers
+        differ in heads) recompute it into the same buffer; the stream orders
+        each layer's read after the write it needs."""
+        shape = (
+            q.shape[1],
+            q.dtype,
+            k_cache.shape,
+            metadata.seq_lens.shape[0],
+            max_seqlen_q,
+            layer.sliding_window_size,
+            layer.logit_cap,
+            sinks is not None,
+        )
+        if shape in self._decode_schedules:
+            schedule = self._decode_schedules[shape]
+            if schedule is None or self._decode_schedule_shape == shape:
+                return schedule
+        schedule = mha_decode_schedule(
+            q,
+            k_cache,
+            v_cache,
+            metadata.seq_lens,
+            max_seqlen_q,
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            sinks=sinks,
+            return_lse=False,
+            q_scale=scale_kwargs.get("q_scale"),
+            k_scale=scale_kwargs.get("k_scale"),
+            v_scale=scale_kwargs.get("v_scale"),
+            fp8_kv_scales=scale_kwargs.get("fp8_kv_scales"),
+            out=self.decode_schedule_buf,
+            solution=self.kernel_solution,
+        )
+        self._decode_schedules[shape] = schedule
+        if schedule is not None:
+            self._decode_schedule_shape = shape
+        return schedule
 
     def forward_extend(
         self,

@@ -52,16 +52,14 @@ _GFX950_SM_COUNT = 256
 # work-group, well within the 63 loads s_waitcnt vmcnt can leave outstanding.
 _FULL_DECODE_STAGES = 2
 # Full-attention decode splits each request's keys in proportion to its share of
-# the batch's pages, read from cache_seqlens when the kernel runs (see Split
-# Schedule), into at most _FULL_DECODE_TARGET_PROGRAMS work items: as many
-# work-groups as the GPU runs at once with two per CU. A split reads at least
-# _FULL_DECODE_MIN_SPLIT_PAGES pages, and a request takes at most
-# _FULL_DECODE_MAX_SPLITS splits per row block.
+# the batch's pages (see Split Schedule) into at most
+# _FULL_DECODE_TARGET_PROGRAMS work items: as many work-groups as the GPU runs
+# at once with two per CU. A split reads at least _FULL_DECODE_MIN_SPLIT_PAGES
+# pages, and a request takes at most _FULL_DECODE_MAX_SPLITS splits per row
+# block.
 _FULL_DECODE_TARGET_PROGRAMS = 2 * _GFX950_SM_COUNT
 _FULL_DECODE_MIN_SPLIT_PAGES = 2
 _FULL_DECODE_MAX_SPLITS = 128
-# Requests whose lengths one vector load reads while scheduling the splits.
-_SCHEDULE_CHUNK = gl.constexpr(64)
 # Rows of a decode work-group: four waves of one 16-row MFMA tile each.
 _DECODE_MAX_BLOCK_M = 64
 _SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
@@ -197,132 +195,124 @@ class AttentionConfig:
 # Split Schedule
 # ===-----------------------------------------------------------------------===#
 #
-# Full-attention decode sizes its splits from the lengths in cache_seqlens when
-# it runs, so a captured graph adapts to every replay: a padding request (one
-# page) gets one split per row block, and the requests with keys share the
-# rest of the TARGET work items in proportion to their pages. With
-# row_blocks (KV head, row block) pairs per request, every split reads
-# split_pages pages, except a request's last one:
+# Full-attention decode splits each request's keys in proportion to its pages.
+# gluon_mha_decode_schedule_gfx950 computes the split counts from
+# cache_seqlens once per step, and every layer's decode and reduce read them.
+# A padding request (one page) gets one split, and the requests with keys
+# share the rest of the TARGET work items. With row_blocks (KV head, row
+# block) pairs per request, every split reads split_pages pages, except a
+# request's last one:
 #
 #   split_pages = max(cdiv(row_blocks * sum(pages), TARGET - row_blocks * num_requests),
-#                     MIN_SPLIT_PAGES)
-#   splits(r)   = clamp(cdiv(pages(r), split_pages), 1, MAX_SPLITS)
+#                     MIN_SPLIT_PAGES, cdiv(max(pages), MAX_SPLITS))
+#   splits(r)   = max(cdiv(pages(r), split_pages), 1)
 #
 # Rounding each request's splits up adds at most one per row block, so the
 # work items number at most TARGET, or row_blocks * num_requests when the
-# batch alone exceeds it. A request's items are its row blocks times its
-# splits, row block major, and the items of all requests follow in request
-# order. The decode kernel records each row block's first item and split
-# count, from which the split reduce finds its partials.
+# batch alone exceeds it. A slot is one split of one request; its row_blocks
+# work items are adjacent, and the slots of all requests follow in request
+# order. The schedule tensor, int32 [num_requests + 1, 2], holds:
+#
+#   row 0:     (split_pages, number of slots)
+#   row 1 + r: (first slot, split count) of request r
+#
+# The decode kernel bounds each split by the live cache_seqlens, and a
+# request's last split runs to its end, so a schedule computed from other
+# lengths still covers every key; it only balances the work less evenly.
+
+# Schedule rows one vector load covers: a decode work-group finds its request
+# with one load for batches of up to this many requests.
+_SCHEDULE_CHUNK = gl.constexpr(64)
 
 
-@gluon.jit
-def _load_lengths(cache_seqlens_ptr, start, end, layout: gl.constexpr):
-    """Lengths of requests [start, start + _SCHEDULE_CHUNK) before ``end``, 0
-    past it."""
-    index = start + gl.arange(0, _SCHEDULE_CHUNK, layout=layout)
-    return gl.load(cache_seqlens_ptr + index, mask=index < end, other=0)
-
-
-@gluon.jit
-def _request_splits(
-    seq_lens, split_pages, PAGE_SIZE: gl.constexpr, MAX_SPLITS: gl.constexpr
-):
-    pages = cdiv(gl.maximum(seq_lens, 0), PAGE_SIZE)
-    return gl.minimum(gl.maximum(cdiv(pages, split_pages), 1), MAX_SPLITS)
-
-
-@gluon.jit
-def _split_pages(
+@gluon.jit(do_not_specialize=("num_requests",))
+def gluon_mha_decode_schedule_gfx950(
     cache_seqlens_ptr,
+    schedule_ptr,
     num_requests,
-    first_lens,
     ROW_BLOCKS: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     TARGET_PROGRAMS: gl.constexpr,
     MIN_SPLIT_PAGES: gl.constexpr,
+    MAX_SPLITS: gl.constexpr,
     PAGE_ALIGN: gl.constexpr,
-    layout: gl.constexpr,
 ):
-    """Pages per split, from the lengths of the first _SCHEDULE_CHUNK requests
-    (``first_lens``) and of the rest, loaded here."""
-    total = gl.sum(cdiv(gl.maximum(first_lens, 0), PAGE_SIZE), axis=0)
-    for start in range(_SCHEDULE_CHUNK, num_requests, _SCHEDULE_CHUNK):
-        seq_lens = _load_lengths(cache_seqlens_ptr, start, num_requests, layout)
-        total += gl.sum(cdiv(gl.maximum(seq_lens, 0), PAGE_SIZE), axis=0)
+    """Write the split schedule of ``num_requests`` requests; one wave."""
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    offs = gl.arange(0, _SCHEDULE_CHUNK, layout=layout)
+    total = num_requests * 0
+    longest = total
+    for start in range(0, num_requests, _SCHEDULE_CHUNK):
+        index = start + offs
+        seq_lens = gl.load(
+            cache_seqlens_ptr + index, mask=index < num_requests, other=0
+        )
+        pages = cdiv(gl.maximum(seq_lens, 0), PAGE_SIZE)
+        total += gl.sum(pages, axis=0)
+        longest = gl.maximum(longest, gl.max(pages, axis=0))
     # Items left once every (request, row block) has its first split.
     spare = gl.maximum(TARGET_PROGRAMS - ROW_BLOCKS * num_requests, 1)
     split_pages = gl.maximum(cdiv(total * ROW_BLOCKS, spare), MIN_SPLIT_PAGES)
+    # No request takes more than MAX_SPLITS splits.
+    split_pages = gl.maximum(split_pages, cdiv(longest, MAX_SPLITS))
     # The pipelined loop consumes PAGE_ALIGN pages per iteration, so a longer
     # split takes a whole number of iterations instead of computing on pages
     # past its end.
-    return gl.where(
+    split_pages = gl.where(
         split_pages > PAGE_ALIGN,
         cdiv(split_pages, PAGE_ALIGN) * PAGE_ALIGN,
         split_pages,
     )
+    first_slot = num_requests * 0
+    for start in range(0, num_requests, _SCHEDULE_CHUNK):
+        index = start + offs
+        valid = index < num_requests
+        seq_lens = gl.load(cache_seqlens_ptr + index, mask=valid, other=0)
+        pages = cdiv(gl.maximum(seq_lens, 0), PAGE_SIZE)
+        splits = gl.where(valid, gl.maximum(cdiv(pages, split_pages), 1), 0)
+        ends = first_slot + gl.cumsum(splits, axis=0)
+        row = schedule_ptr + 2 * (1 + index)
+        gl.store(row, ends - splits, mask=valid)
+        gl.store(row + 1, splits, mask=valid)
+        first_slot += gl.sum(splits, axis=0)
+    gl.store(schedule_ptr, split_pages)
+    gl.store(schedule_ptr + 1, first_slot)
 
 
 @gluon.jit
-def _find_item(
-    cache_seqlens_ptr,
-    num_requests,
-    item,
-    ROW_BLOCKS: gl.constexpr,
-    PAGE_SIZE: gl.constexpr,
-    MAX_SPLITS: gl.constexpr,
-    TARGET_PROGRAMS: gl.constexpr,
-    MIN_SPLIT_PAGES: gl.constexpr,
-    PAGE_ALIGN: gl.constexpr,
-    layout: gl.constexpr,
+def _find_slot(
+    schedule_ptr, cache_seqlens_ptr, num_requests, slot, layout: gl.constexpr
 ):
-    """Return the request holding work item ``item``, its length, its first
-    item, its split count, the pages per split, and the batch's item count.
-    The request is num_requests past the last item."""
-    # One load covers batches of up to _SCHEDULE_CHUNK requests; larger ones
-    # load the rest a chunk at a time.
-    seq_lens = _load_lengths(cache_seqlens_ptr, 0, num_requests, layout)
-    split_pages = _split_pages(
-        cache_seqlens_ptr,
-        num_requests,
-        seq_lens,
-        ROW_BLOCKS,
-        PAGE_SIZE,
-        TARGET_PROGRAMS,
-        MIN_SPLIT_PAGES,
-        PAGE_ALIGN,
-        layout,
-    )
+    """Return the request holding ``slot`` with its length, first slot and
+    split count, read from the schedule (its last request when ``slot`` lies
+    past the last slot)."""
     offs = gl.arange(0, _SCHEDULE_CHUNK, layout=layout)
-    chunk_first = num_requests * 0
-    request = num_requests
-    seq_len = chunk_first
-    first_item = chunk_first
-    splits = chunk_first + 1
+    request = num_requests * 0
+    seq_len = request
+    first_slot = request
+    splits = request + 1
+    # Requests' first slots increase, so the request holding ``slot`` is the
+    # last one whose first slot is at most ``slot``. One chunk covers batches
+    # of up to _SCHEDULE_CHUNK requests.
     for start in range(0, num_requests, _SCHEDULE_CHUNK):
-        if start > 0:
-            seq_lens = _load_lengths(cache_seqlens_ptr, start, num_requests, layout)
-        valid = start + offs < num_requests
-        request_splits = _request_splits(seq_lens, split_pages, PAGE_SIZE, MAX_SPLITS)
-        items = gl.where(valid, request_splits * ROW_BLOCKS, 0)
-        ends = chunk_first + gl.cumsum(items, axis=0)
-        # Requests of this chunk whose items all precede ``item``. Lanes past
-        # the batch end where the chunk ends, so they count only when
-        # ``item`` lies past the chunk as well.
-        before = gl.sum((ends <= item).to(gl.int32), axis=0)
-        found = (start + before < num_requests) & (before < _SCHEDULE_CHUNK)
-        found = found & (request == num_requests)
-        lane = offs == before
-        request = gl.where(found, start + before, request)
+        index = start + offs
+        valid = index < num_requests
+        # Buffer loads return 0 for the masked lanes without branching
+        # around each load.
+        row = 2 * (1 + index)
+        firsts = cdna4.buffer_load(schedule_ptr, row, mask=valid, other=0)
+        counts = cdna4.buffer_load(schedule_ptr, row + 1, mask=valid, other=0)
+        seq_lens = cdna4.buffer_load(cache_seqlens_ptr, index, mask=valid, other=0)
+        before = gl.sum(((firsts <= slot) & valid).to(gl.int32), axis=0)
+        lane = offs == before - 1
+        found = before > 0
+        request = gl.where(found, start + before - 1, request)
         seq_len = gl.where(found, gl.sum(gl.where(lane, seq_lens, 0), axis=0), seq_len)
-        first_item = gl.where(
-            found, gl.sum(gl.where(lane, ends - items, 0), axis=0), first_item
+        first_slot = gl.where(
+            found, gl.sum(gl.where(lane, firsts, 0), axis=0), first_slot
         )
-        splits = gl.where(
-            found, gl.sum(gl.where(lane, request_splits, 0), axis=0), splits
-        )
-        chunk_first += gl.sum(items, axis=0)
-    return request, seq_len, first_item, splits, split_pages, chunk_first
+        splits = gl.where(found, gl.sum(gl.where(lane, counts, 0), axis=0), splits)
+    return request, seq_len, first_slot, splits
 
 
 # ===-----------------------------------------------------------------------===#
@@ -350,7 +340,7 @@ class AttentionProgram:
     split_start: gl.tensor
     split_end: gl.tensor
     mask_start: gl.tensor
-    item: gl.tensor
+    block_item: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -373,7 +363,7 @@ class AttentionProgram:
         split_start,
         split_end,
         mask_start,
-        item,
+        block_item,
     ):
         self.cfg = gl.constexpr(cfg)
         self.q_ptr = q_ptr
@@ -393,7 +383,7 @@ class AttentionProgram:
         self.split_start = split_start
         self.split_end = split_end
         self.mask_start = mask_start
-        self.item = item
+        self.block_item = block_item
 
     @gluon.jit
     def create(
@@ -423,8 +413,9 @@ class AttentionProgram:
             gl.program_id(1),
             gl.program_id(2),
             cfg.NUM_KV_SPLITS,
-            1,
-            gl.program_id(2),
+            0,  # split_pages: the split grid divides each request's pages
+            gl.program_id(2),  # block_item: the split grid stores by split_id
+            False,
         )
 
     @gluon.jit
@@ -437,35 +428,27 @@ class AttentionProgram:
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        schedule_ptr,
         num_requests,
-        TARGET_PROGRAMS: gl.constexpr,
-        MIN_SPLIT_PAGES: gl.constexpr,
-        PAGE_ALIGN: gl.constexpr,
     ):
         """Locate this program's work item in a one-dimensional grid.
 
-        The items are each request's row blocks times its splits, in request
-        order (see _find_item). Returns the program, whether the grid
-        position holds an item (positions past the last item have no work),
-        the batch's item count, and the request's split count.
+        Item ``i`` is row block ``i % row_blocks`` of slot ``i // row_blocks``
+        of the split schedule (see Split Schedule). Returns the program,
+        whether the grid position holds an item (positions past the last item
+        have no work), the batch's item count, and the request's split count.
         """
         layout: gl.constexpr = gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
+        row_blocks: gl.constexpr = cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS
         item = gl.program_id(0)
-        request, seq_len, first_item, splits, split_pages, num_items = _find_item(
-            cache_seqlens_ptr,
-            num_requests,
-            item,
-            cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS,
-            cfg.PAGE_SIZE,
-            cfg.NUM_KV_SPLITS,
-            TARGET_PROGRAMS,
-            MIN_SPLIT_PAGES,
-            PAGE_ALIGN,
-            layout,
+        slot = item // row_blocks
+        head_block = item - slot * row_blocks
+        split_pages = gl.load(schedule_ptr)
+        num_slots = gl.load(schedule_ptr + 1)
+        request, seq_len, first_slot, splits = _find_slot(
+            schedule_ptr, cache_seqlens_ptr, num_requests, slot, layout
         )
-        has_work = request < num_requests
-        head_block = (item - first_item) // splits
-        split_id = item - first_item - head_block * splits
+        split_id = slot - first_slot
         program = AttentionProgram.locate(
             cfg,
             q_ptr,
@@ -475,15 +458,18 @@ class AttentionProgram:
             cache_seqlens_ptr,
             mid_o_ptr,
             mid_lse_ptr,
-            gl.minimum(request, num_requests - 1),
+            request,
             seq_len,
             head_block,
             split_id,
             splits,
             split_pages,
-            item,
+            # The row block's partials follow its first one, at its share of
+            # the request's slots times row blocks.
+            first_slot * row_blocks + head_block * splits,
+            True,
         )
-        return program, has_work, num_items, splits
+        return program, slot < num_slots, num_slots * row_blocks, splits
 
     @gluon.jit
     def locate(
@@ -500,10 +486,16 @@ class AttentionProgram:
         head_block,
         split_id,
         num_splits,
-        min_split_pages,
-        item,
+        split_pages,
+        block_item,
+        SCHEDULED: gl.constexpr,
     ):
         """Bound the keys of one request's row block and split.
+
+        A split of the split schedule (``SCHEDULED``) covers ``split_pages``
+        pages, and the request's last split runs to its end, so lengths that
+        grew since the schedule was computed are still covered. A split grid
+        divides each request's pages evenly over NUM_KV_SPLITS splits.
 
         The rows of a block share one pass over the union of the keys they
         see: up to its last row's causal end and, under a sliding window, from
@@ -535,9 +527,17 @@ class AttentionProgram:
         first_page = kv_start // cfg.PAGE_SIZE
         end_page = cdiv(cache_len, cfg.PAGE_SIZE)
         num_pages = end_page - first_page
-        pages_per_split = gl.maximum(cdiv(num_pages, num_splits), min_split_pages)
-        split_start_page = first_page + split_id * pages_per_split
-        split_end_page = min(split_start_page + pages_per_split, end_page)
+        if SCHEDULED:
+            split_start_page = first_page + split_id * split_pages
+            split_end_page = gl.where(
+                split_id == num_splits - 1,
+                end_page,
+                min(split_start_page + split_pages, end_page),
+            )
+        else:
+            pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
+            split_start_page = first_page + split_id * pages_per_split
+            split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
         split_end = min(split_end_page * cfg.PAGE_SIZE, cache_len)
         # Under full attention, every row of the block sees the split's keys
@@ -563,7 +563,7 @@ class AttentionProgram:
             split_start,
             split_end,
             mask_start,
-            item,
+            block_item,
         )
 
     @gluon.jit
@@ -881,8 +881,7 @@ class AttentionProgram:
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
         valid = self.row_valid(offs_m)
         part_o, part_lse = self.split_partial(acc, l_i, m_i)
-        first = (self.item - self.split_id) * cfg.BLOCK_M
-        rows = first + offs_m * splits + self.split_id
+        rows = self.block_item * cfg.BLOCK_M + offs_m * splits + self.split_id
         cdna4.buffer_store(
             part_o,
             self.mid_o_ptr,
@@ -1183,7 +1182,7 @@ def gluon_mha_decode_gfx950(
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_lse_ptr,
-    block_items_ptr,
+    schedule_ptr: tl.const,
     num_requests,
     Q_STRIDE_B: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
@@ -1202,7 +1201,6 @@ def gluon_mha_decode_gfx950(
     IS_FP8: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     TARGET_PROGRAMS: gl.constexpr,
-    MIN_SPLIT_PAGES: gl.constexpr,
 ):
     """Full-attention split of one work item of the split schedule; the grid
     has one program per possible item, and the ones past the last item exit."""
@@ -1233,10 +1231,8 @@ def gluon_mha_decode_gfx950(
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        schedule_ptr,
         num_requests,
-        TARGET_PROGRAMS,
-        MIN_SPLIT_PAGES,
-        NUM_STAGES,
     )
     if NUM_WARPS == 1:
         # A one-wave work-group computes every page itself, and the pipeline's
@@ -1250,16 +1246,6 @@ def gluon_mha_decode_gfx950(
         # Every multi-wave work-group pipelines.
         pipeline = num_items >= 0
     if has_work:
-        if program.split_id == 0:
-            # The reduce finds a row block's partials from its first item and
-            # split count, so it does not evaluate the schedule again.
-            block = (
-                program.batch * (NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS)
-                + program.kv_head * cfg.NUM_ROW_BLOCKS
-                + program.row_start // BLOCK_M
-            )
-            gl.store(block_items_ptr + 2 * block, program.item)
-            gl.store(block_items_ptr + 2 * block + 1, splits)
         _decode_item(
             program, q_ptr, k_cache_ptr, v_cache_ptr, pipeline, splits, NUM_STAGES
         )
@@ -1446,7 +1432,7 @@ def gluon_mha_decode_reduce_gfx950(
     out_ptr,
     sink_ptr,
     k_cache_ptr,  # unused for loads; only its dtype feeds the shared config
-    block_items_ptr,
+    schedule_ptr: tl.const,
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     MAX_SPLITS: gl.constexpr,
@@ -1493,12 +1479,15 @@ def gluon_mha_decode_reduce_gfx950(
         q_head - kv_head * cfg.GROUP_SIZE
     )
     row_block = row // cfg.BLOCK_M
-    # The row block's first work item and split count, from the decode kernel.
-    block = (request * cfg.NUM_KV_HEADS + kv_head) * cfg.NUM_ROW_BLOCKS + row_block
-    first_item = gl.load(block_items_ptr + 2 * block)
-    splits = gl.load(block_items_ptr + 2 * block + 1)
-    # The row's partials follow one another from first_row on.
-    first_row = first_item * cfg.BLOCK_M + (row - row_block * cfg.BLOCK_M) * splits
+    head_block = kv_head * cfg.NUM_ROW_BLOCKS + row_block
+    # The request's first slot and split count (see Split Schedule) place the
+    # row block's partials, which the decode kernel stored row by row.
+    first_slot = gl.load(schedule_ptr + 2 * (1 + request))
+    splits = gl.load(schedule_ptr + 2 * (1 + request) + 1)
+    block_item = (
+        first_slot * (cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS) + head_block * splits
+    )
+    first_row = block_item * cfg.BLOCK_M + (row - row_block * cfg.BLOCK_M) * splits
 
     # A chunk holds 64 values per lane, so splits up to 64 (head dim 64) or
     # 32 (head dim 128) load at once.
@@ -1638,11 +1627,13 @@ def get_config(
         num_kv_splits = builtins.max(1, min(target_splits, num_pages))
         num_programs = num_requests * head_blocks * num_kv_splits
     else:
-        # The schedule reads the lengths when the kernel runs; max_seqlen_k
-        # (the model's context limit under graph capture) does not size it.
+        # The split schedule sizes the splits from the lengths each step;
+        # max_seqlen_k (the model's context limit under graph capture) does
+        # not. The grid covers the most work items any schedule makes.
         num_kv_splits = _FULL_DECODE_MAX_SPLITS
-        num_programs = builtins.max(
-            _FULL_DECODE_TARGET_PROGRAMS, num_requests * head_blocks
+        num_programs = min(
+            builtins.max(_FULL_DECODE_TARGET_PROGRAMS, num_requests * head_blocks),
+            num_requests * head_blocks * num_kv_splits,
         )
     return LaunchConfig(
         num_q_heads=q.shape[1],
@@ -1663,6 +1654,70 @@ def get_config(
     )
 
 
+def launch_gluon_mha_decode_schedule_gfx950(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    window_left: int,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute the split schedule full-attention decode reads (see Split
+    Schedule) from the requests' current ``cache_seqlens``.
+
+    Args:
+        q: Query of the decode call, [num_requests * max_seqlen_q, heads, dim].
+        k_cache: Paged key cache of the decode call.
+        cache_seqlens: The decode call's cache lengths.
+        max_seqlen_q: Query tokens per request of the decode call.
+        window_left: The decode call's window; only full attention (-1)
+            reads a schedule.
+        out: int32 [>= num_requests + 1, 2] tensor to write the schedule into,
+            or None to allocate one.
+
+    Returns:
+        The schedule.
+    """
+    if window_left >= 0:
+        raise ValueError(
+            "gluon_mha_decode_schedule_gfx950 schedules full attention, got "
+            f"window_left={window_left}"
+        )
+    num_requests = q.shape[0] // max_seqlen_q
+    num_kv_heads = k_cache.shape[2]
+    group_size = q.shape[1] // num_kv_heads
+    block_m, _ = _row_tile(max_seqlen_q, group_size)
+    num_row_blocks = math.ceil(max_seqlen_q * group_size / block_m)
+    if out is None:
+        out = torch.empty((num_requests + 1, 2), device=q.device, dtype=torch.int32)
+    elif (
+        out.dtype != torch.int32
+        or out.dim() != 2
+        or out.shape[0] < num_requests + 1
+        or out.shape[1] != 2
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"schedule needs a contiguous int32 [>= {num_requests + 1}, 2] "
+            f"tensor, got {out.dtype} {tuple(out.shape)}"
+        )
+    if num_requests > 0:
+        gluon_mha_decode_schedule_gfx950[(1,)](
+            cache_seqlens,
+            out,
+            num_requests,
+            num_kv_heads * num_row_blocks,
+            k_cache.shape[1],
+            _FULL_DECODE_TARGET_PROGRAMS,
+            _FULL_DECODE_MIN_SPLIT_PAGES,
+            _FULL_DECODE_MAX_SPLITS,
+            _FULL_DECODE_STAGES,
+            num_warps=1,
+        )
+    return out
+
+
 def launch_gluon_mha_decode_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1679,7 +1734,17 @@ def launch_gluon_mha_decode_gfx950(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    schedule: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Paged decode attention; see mha_decode_with_kvcache.
+
+    ``schedule`` is the split schedule from
+    launch_gluon_mha_decode_schedule_gfx950 for these requests, computed once
+    per step and shared by every layer of the same shape. Full attention
+    computes its own when it is None; sliding windows take none.
+    """
+    if schedule is not None and window_left >= 0:
+        raise ValueError("sliding-window decode takes no split schedule")
     total_q = q.shape[0]
 
     has_sink = sinks is not None
@@ -1772,8 +1837,17 @@ def launch_gluon_mha_decode_gfx950(
             num_warps=config.num_warps,
         )
     elif config.num_requests > 0:
-        # Full attention always splits the keys, by the schedule in
-        # _find_item; one partial of BLOCK_M rows per work item.
+        # Full attention always splits the keys, by the split schedule; one
+        # partial of BLOCK_M rows per work item.
+        if schedule is None:
+            schedule = launch_gluon_mha_decode_schedule_gfx950(
+                q,
+                k_cache,
+                cache_seqlens,
+                max_seqlen_q=max_seqlen_q,
+                window_left=window_left,
+                out=None,
+            )
         mid_o = torch.empty(
             (config.num_programs, config.block_m, config.head_dim),
             device=q.device,
@@ -1784,10 +1858,6 @@ def launch_gluon_mha_decode_gfx950(
             device=q.device,
             dtype=torch.float32,
         )
-        # Each row block's first work item and split count.
-        block_items = torch.empty(
-            (config.num_requests, head_blocks, 2), device=q.device, dtype=torch.int32
-        )
         gluon_mha_decode_gfx950[(config.num_programs,)](
             q,
             k_cache,
@@ -1796,7 +1866,7 @@ def launch_gluon_mha_decode_gfx950(
             cache_seqlens,
             mid_o,
             mid_lse,
-            block_items,
+            schedule,
             config.num_requests,
             q.stride(0),
             q.stride(1),
@@ -1815,7 +1885,6 @@ def launch_gluon_mha_decode_gfx950(
             is_fp8,
             config.num_stages,
             _FULL_DECODE_TARGET_PROGRAMS,
-            _FULL_DECODE_MIN_SPLIT_PAGES,
             num_warps=config.num_warps,
             **sched_compile_options(),
         )
@@ -1829,7 +1898,7 @@ def launch_gluon_mha_decode_gfx950(
             output,
             sink_arg,
             k_cache,
-            block_items,
+            schedule,
             config.sm_scale,
             page_table.stride(0),
             config.num_kv_splits,

@@ -36,6 +36,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
         launch_gluon_mha_decode_gfx950 as _decode_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        launch_gluon_mha_decode_schedule_gfx950 as _decode_schedule_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
         launch_gluon_mha_extend_gfx950 as _extend_impl,
     )
@@ -52,38 +55,58 @@ if current_platform().is_amd:
         launch_gluon_mha_prefill_gfx1250 as _prefill_gfx1250_impl,
     )
 
+    _GFX950 = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
+    _DECODE_GFX950_SIGNATURES = format_signatures(
+        ("q", "k_cache", "v_cache"),
+        "dense",
+        {
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        },
+    )
+    _DECODE_GFX950_TRAITS = {
+        "head_dim": frozenset({64, 128}),
+        "page_size": frozenset({64}),
+        "logit_cap": frozenset({False}),
+        "return_lse": frozenset({False}),
+        "sinks": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
+    }
+
     @register_kernel(
         "attention",
         "mha_decode_with_kvcache",
         name="gluon_mha_decode_gfx950",
+        features={"split_schedule"},
         solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=format_signatures(
-            ("q", "k_cache", "v_cache"),
-            "dense",
-            {
-                torch.float16,
-                torch.bfloat16,
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            },
-        ),
+        capability=_GFX950,
+        signatures=_DECODE_GFX950_SIGNATURES,
         priority=Priority.SPECIALIZED,
-        traits={
-            "head_dim": frozenset({64, 128}),
-            "page_size": frozenset({64}),
-            "logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
-            "sinks": frozenset({False, True}),
-            "sliding_window": frozenset({False, True}),
-        },
+        traits=_DECODE_GFX950_TRAITS,
     )
     def gluon_mha_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _decode_impl(*args, **kwargs)
+
+    # Full-attention gluon_mha_decode_gfx950 reads this schedule; it matches
+    # the same calls, except sliding windows, which take none.
+    @register_kernel(
+        "attention",
+        "mha_decode_schedule",
+        name="gluon_mha_decode_schedule_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=_DECODE_GFX950_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={**_DECODE_GFX950_TRAITS, "sliding_window": frozenset({False})},
+    )
+    def gluon_mha_decode_schedule_gfx950(**kwargs):
+        return _decode_schedule_impl(**kwargs)
 
     @register_kernel(
         "attention",

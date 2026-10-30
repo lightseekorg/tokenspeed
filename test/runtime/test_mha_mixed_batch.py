@@ -771,6 +771,8 @@ def test_block_decode_after_mixed_excludes_poison_beyond_accepted_history_and_bl
             key[page, position % 16] = 0
             value[page, position % 16] = position
     monkeypatch.setattr(mha, "mha_decode_with_kvcache", _cached_decode_cpu)
+    # The CPU stand-in reads no split schedule.
+    monkeypatch.setattr(mha, "mha_decode_schedule", lambda *args, **kwargs: None)
     layer = PagedAttention(
         5,
         128,

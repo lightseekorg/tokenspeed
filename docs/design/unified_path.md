@@ -432,6 +432,16 @@ on replay. PLE's uniform index bundles are reused during capture only; the
 eager n-gram kernel writes uniform request indices alongside hash IDs, while
 ragged batches construct their indices outside the capture pool.
 
+The MHA leaf's decode split schedule (`mha_decode_schedule`) is per-step
+metadata that the first decode layer of each shape computes, because only the
+layer call knows its shape (heads, query width, window). It writes a
+persistent buffer sized like `seq_lens_buf`, and the later layers of that
+shape read it. Every hook that changes the decode lengths (refresh, publish,
+the drafter's edits) makes the next layer recompute it, so capture records
+the computation and every replay schedules its own lengths. The kernels bound
+each split by the live lengths, so a schedule older than an edit only
+balances the work worse; it never misses keys.
+
 GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
 and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
 use uninitialized output and a placeholder for a disabled intermediate cache:

@@ -527,6 +527,48 @@ def test_verify_splits_follow_replayed_lengths() -> None:
         torch.testing.assert_close(invoke(), replayed, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("max_seqlen_q", [1, VERIFY_TOKENS], ids=["decode", "verify"])
+def test_one_schedule_serves_every_layer_and_grown_lengths(max_seqlen_q: int) -> None:
+    """A step computes its split schedule once and every layer reads it. A
+    drafter step grows the lengths after the schedule was computed; each
+    split is bounded by the live lengths and a request's last split runs to
+    its end, so the old schedule still covers every key."""
+    grown = [1000 * PAGE_SIZE + 33, 3 * PAGE_SIZE + 9, 17 * PAGE_SIZE, 640 * PAGE_SIZE]
+    inputs = _verify_inputs(
+        grown, max_seqlen_q, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 43
+    )
+    # The schedule sees every request 500 pages shorter, the first and
+    # last with far fewer splits than their grown lengths take.
+    scheduled = torch.tensor(
+        [max(max_seqlen_q, length - 500 * PAGE_SIZE) for length in grown],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    schedule = decode.launch_gluon_mha_decode_schedule_gfx950(
+        inputs["q"],
+        inputs["k_cache"],
+        scheduled,
+        max_seqlen_q=max_seqlen_q,
+        window_left=-1,
+        out=None,
+    )
+    fresh = decode.launch_gluon_mha_decode_schedule_gfx950(
+        inputs["q"],
+        inputs["k_cache"],
+        inputs["cache_seqlens"],
+        max_seqlen_q=max_seqlen_q,
+        window_left=-1,
+        out=None,
+    )
+    assert not torch.equal(schedule, fresh)
+    expected = _verify_reference(inputs, -1, None)
+    for _ in range(2):
+        _check_verify(
+            gluon_mha_decode_gfx950(**inputs, window_left=-1, schedule=schedule),
+            expected,
+        )
+
+
 def test_full_decode_batch_past_one_schedule_chunk() -> None:
     """The split schedule reads the lengths 64 requests at a time; 80
     requests of mixed lengths take two chunks."""

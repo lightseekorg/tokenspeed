@@ -276,8 +276,8 @@ def test_mha_decode_batch_size():
     table_width = 64
 
     def run(batch):
-        # The split schedule follows the batch's lengths when the kernel runs,
-        # so no batch-derived value reaches the compiled kernels.
+        # The split schedule is computed from the batch's lengths on the
+        # device, so no batch-derived value reaches the compiled kernels.
         decode.launch_gluon_mha_decode_gfx950(
             q=torch.randn(
                 batch * width, heads, dim, device=DEVICE, dtype=torch.bfloat16
@@ -307,7 +307,9 @@ def test_mha_decode_batch_size():
     run(1)
     run(16)
     with assert_no_triton_compile(
-        decode.gluon_mha_decode_gfx950, decode.gluon_mha_decode_reduce_gfx950
+        decode.gluon_mha_decode_schedule_gfx950,
+        decode.gluon_mha_decode_gfx950,
+        decode.gluon_mha_decode_reduce_gfx950,
     ):
         for batch in (3, 5, 7, 12, 24, 40, 70):
             run(batch)
