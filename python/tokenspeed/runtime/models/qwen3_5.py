@@ -27,6 +27,7 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
+from tokenspeed_kernel.op_profile import profiled
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.platform import current_platform
 
@@ -669,6 +670,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             query_sharded=False,
         )
 
+    @profiled(level="layer")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -938,6 +940,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Hook: subclasses narrow residual to match a sliced attn output."""
         return residual
 
+    @profiled(level="layer")
     def forward(
         self,
         positions: torch.Tensor,

@@ -23,6 +23,7 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -89,6 +90,7 @@ from tokenspeed.runtime.execution.types import (
     RequestHistorySeeds,
     StopCriteria,
 )
+from tokenspeed.runtime.execution.utilization_profile import RuntimeUtilizationProfile
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
@@ -575,6 +577,15 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.model_runner = model_runner
+        self.utilization_profile = RuntimeUtilizationProfile.from_env(
+            model=model_runner.model,
+            model_id=model_runner.model_config.model_path,
+            rank=config.global_rank,
+            device=config.device,
+            enforce_eager=config.enforce_eager,
+            disable_prefill_graph=config.disable_prefill_graph,
+            speculative=config.spec_algo is not None,
+        )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -2529,9 +2540,16 @@ class ModelExecutor:
                             time.perf_counter() - sampling_start
                         ) * 1000.0
 
-                with nvtx_range(
-                    f"forward_step ext={num_extends} dec={bs - num_extends}",
-                    color="blue",
+                with (
+                    (
+                        self.utilization_profile.iteration(step=self.log_step)
+                        if self.utilization_profile is not None
+                        else nullcontext()
+                    ),
+                    nvtx_range(
+                        f"forward_step ext={num_extends} dec={bs - num_extends}",
+                        color="blue",
+                    ),
                 ):
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0

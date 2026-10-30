@@ -29,8 +29,10 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 if TYPE_CHECKING:
     import torch
 
+    from tokenspeed_kernel.op_profile import OpProfile
     from tokenspeed_kernel.selection import SelectedKernel
 
+from tokenspeed_kernel.op_profile import wrap_op_for_profiling
 from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
 from tokenspeed_kernel.signature import FormatSignature
 
@@ -280,8 +282,17 @@ class KernelRegistry:
 
     # ---- Registration ----
 
-    def register(self, spec: KernelSpec, impl: Callable) -> None:
-        """Register a kernel specification and its implementation."""
+    def register(
+        self, spec: KernelSpec, impl: Callable, *, profile: OpProfile | None = None
+    ) -> None:
+        """Register a kernel specification and its implementation.
+
+        profile optionally enables op metadata collection for a synchronous
+        function. Omission stores impl unchanged. Retrieve the registered
+        callable through get_impl; registration returns None.
+        """
+        if profile is not None:
+            impl = wrap_op_for_profiling(impl, spec=spec, profile=profile)
         if spec.name in self._by_name:
             # Allow re-registration (plugin override)
             self._unregister(spec.name)
@@ -397,6 +408,7 @@ def register_kernel(
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
     weight_preprocessor: Callable | tuple[tuple[str, ...], Callable] | None = None,
+    profile: OpProfile | None = None,
 ) -> Callable:
     """Decorator to register a kernel function or stateful kernel class.
 
@@ -411,6 +423,9 @@ def register_kernel(
     ``weight_preprocessor`` is a pair of source attribute names and a function
     accepting those tensors and returning the transformed tensors. Plain
     layer-mutating callbacks remain supported until their backends migrate.
+
+    ``profile`` opts synchronous functions into op/layer host metadata collection.
+    Omission leaves the implementation unchanged; stateful classes are not yet supported.
 
     Example::
 
@@ -453,8 +468,11 @@ def register_kernel(
             weight_preprocessor=normalized_weight_preprocessor,
         )
 
-        KernelRegistry.get().register(spec, impl)
-        return impl
+        registry = KernelRegistry.get()
+        registry.register(spec, impl, profile=profile)
+        registered = registry.get_impl(kernel_name)
+        assert registered is not None
+        return registered
 
     return decorator
 
