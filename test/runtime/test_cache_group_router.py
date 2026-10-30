@@ -1755,12 +1755,7 @@ class TestPagedLeafRebindTest:
         )
 
         self._check(
-            MHAAttnBackend,
-            [
-                "decode_schedule_buf",
-                "forward_decode_metadata",
-                "forward_extend_metadata",
-            ],
+            MHAAttnBackend, ["forward_decode_metadata", "forward_extend_metadata"]
         )
 
     def test_msa_leaf_forgets_the_previous_forward(self):

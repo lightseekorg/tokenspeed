@@ -74,7 +74,7 @@ def _enter(observer, result):
         return result
 
 
-def _decode_runner(capture_bs, variants=None, kernel_variants=(), kernel_max_bs=None):
+def _decode_runner(capture_bs, variants=None):
     """A ForwardStepRunner with only what ``capture`` reads."""
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.capture_bs = list(capture_bs)
@@ -85,13 +85,6 @@ def _decode_runner(capture_bs, variants=None, kernel_variants=(), kernel_max_bs=
     runner.graphs = {}
     runner.output_buffers = {}
     runner._placeholder_tables = {}
-    runner.attn_backend = SimpleNamespace(
-        decode_kernel_variants=lambda bs: (
-            tuple(kernel_variants)
-            if kernel_max_bs is None or bs <= kernel_max_bs
-            else ()
-        )
-    )
     runner.sampling_backend = variants and SimpleNamespace(
         cuda_graph_capture_variants=lambda _n: tuple(variants)
     )
@@ -186,29 +179,6 @@ def test_the_decode_probe_samples_the_probe_positions_of_each_variant(variants) 
 
     serving.disable = True
     assert serving.capture_ladders(None) == {}
-
-
-def test_each_decode_kernel_variant_captures_every_sampler_variant_again() -> None:
-    """An attention backend's decode kernel variant joins the graph key: the
-    runner records the whole ladder once per (sampler, kernel) variant."""
-    runner = _decode_runner([1, 2, 4], ("default", "penalties"), ("balanced",))
-    runner.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-    variants = {variant for variant, _bs in runner.graphs}
-    assert variants == {
-        "default",
-        "penalties",
-        "default+balanced",
-        "penalties+balanced",
-    }
-    assert len(runner.graphs) == 4 * 3
-
-
-def test_a_decode_kernel_variant_captures_only_where_it_can_win() -> None:
-    """Batch sizes past the variant's bound get no graph of it."""
-    runner = _decode_runner([1, 2, 4, 8], None, ("balanced",), kernel_max_bs=2)
-    runner.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-    assert sorted(bs for v, bs in runner.graphs if v == "default+balanced") == [1, 2]
-    assert sorted(bs for v, bs in runner.graphs if v == "default") == [1, 2, 4, 8]
 
 
 def test_the_probe_positions_are_the_widest_few_and_two_down_the_ladder() -> None:

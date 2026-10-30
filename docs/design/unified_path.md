@@ -617,25 +617,6 @@ capture; a new override must name its kernel-imposed asymmetry here. Leaf
 capture/refresh signatures are pinned by
 `test_unified_decode_path.py::TestLeafSignatureConformanceTest`.
 
-### Decode kernel variants
-
-A backend may offer decode kernel variants besides its default
-(`decode_kernel_variants()`, empty by default): alternative kernels for the
-same decode work that pay only for some batches. Every decode step, eager or
-graph, asks `select_decode_kernel_variant(bs, actual_bs, block_tables_cpu)`,
-a host-only decision from the step's host block tables (no device sync), and
-passes the answer to the refresh as `decode_kernel_variant`, which computes
-the variant's per-step state in place into persistent buffers (as DSA plans
-its indexer). The runner captures every decode batch size once per variant,
-as per sampler variant (graph key `(sampler variant [+ kernel variant], bs)`),
-so each one doubles the decode graphs; a graph step runs a variant only if
-its graph was captured, and the startup decode warmup compiles every variant
-for eager decode. The router offers the variants of its full-history groups'
-leaves, each request's blocks there (in kernel pages) bounding its length.
-Variants change only attention kernels, never a collective, so ranks of one
-step may pick different ones. The MHA leaf's `balanced_splits` is the one
-variant today (see `MHAAttnBackend`).
-
 ### Graded CUDA-graph support
 
 A backend's static graph capability is a class attribute,

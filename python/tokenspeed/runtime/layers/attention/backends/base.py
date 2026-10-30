@@ -513,44 +513,10 @@ class AttentionBackend(CachePoolBinding, ABC):
                 half this refresh describes; 0 for pure decode.
             for_graph_replay: A graph is in play (live replay or capture
                 seeding). Branch on it only for graph-mechanics asymmetries.
-            **kwargs: ``decode_kernel_variant``, the step's variant from
-                :meth:`select_decode_kernel_variant` (None or absent: the
-                default); the capture seeding passes the variant it records.
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement refresh_decode_metadata"
         )
-
-    def decode_kernel_variants(self, bs: int) -> tuple[str, ...]:
-        """Decode kernel variants, besides the default, this backend can run
-        a step of ``bs`` requests with: only those that can win at that
-        size. The graph runner captures each decode batch size once per such
-        variant, and a step picks one with
-        :meth:`select_decode_kernel_variant`. A variant changes only this
-        backend's kernels, never a collective, so ranks may run different
-        ones. Most backends have none."""
-        del bs
-        return ()
-
-    def select_decode_kernel_variant(
-        self,
-        bs: int,
-        actual_bs: int,
-        block_tables_cpu: Mapping[str, torch.Tensor],
-    ) -> str | None:
-        """The decode kernel variant for this step, or None for the default,
-        decided on the host before the decode metadata refresh, which then
-        receives it as ``decode_kernel_variant``.
-
-        Args:
-            bs: Requests the step runs (the padded graph batch).
-            actual_bs: Live requests; the rest are padding.
-            block_tables_cpu: The host mirror of the step's ``block_tables``
-                (``group_id -> [actual_bs, cols]``, -1 past each request's
-                blocks).
-        """
-        del bs, actual_bs, block_tables_cpu
-        return None
 
     def init_forward_metadata_capture_cuda_graph(
         self,

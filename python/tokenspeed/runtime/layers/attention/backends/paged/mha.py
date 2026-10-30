@@ -26,8 +26,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.mha import (
-    mha_decode_schedule,
-    mha_decode_schedule_policy,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,
@@ -60,12 +58,6 @@ _KERNEL_SOLUTION_BY_BACKEND = {
     "triton": "triton",
     "flashinfer": "flashinfer",
 }
-
-
-# The decode kernel variant whose full-attention layers split each request's
-# keys by a schedule balanced over the step's lengths (mha_decode_schedule)
-# instead of the default's even split of every request.
-DECODE_VARIANT_BALANCED = "balanced_splits"
 
 
 def _fp8_scale_kwargs(layer: PagedAttention) -> dict:
@@ -120,17 +112,7 @@ class MHADecodeMetadata:
 
 
 class MHAAttnBackend(PagedAttentionBackend):
-    """Standard MHA leaf routed through tokenspeed_kernel attention APIs.
-
-    Decode kernel variant ``balanced_splits``: where the kernel library
-    offers a split schedule for this leaf's full-attention calls (gfx950)
-    and the context limit can reach where it pays, the target's decode and
-    verify can split each request's keys by a schedule balanced over the
-    step's lengths. ``mha_decode_schedule_policy`` picks it per step from
-    the requests' page counts; the refresh then computes the schedule
-    (``mha_decode_schedule``) in place into ``decode_schedule_buf``, which
-    every full-attention layer of the leaf's shape reads.
-    """
+    """Standard MHA leaf routed through tokenspeed_kernel attention APIs."""
 
     # Every kernel call site forwards layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
@@ -172,20 +154,11 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
-        # The balanced variant: its host policy (resolved once, lazily;
-        # False when there is none), whether the current step runs it, the
-        # schedule its refresh computes in place, and which layers read it.
-        self._balanced_policy = None
-        self._balanced = False
-        self.decode_schedule_buf: torch.Tensor | None = None
-        self._schedule_calls: dict[int, dict] = {}
-        self._layer_reads_schedule: dict[tuple[int, int], bool] = {}
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self.forward_decode_metadata = None
         self.forward_extend_metadata = None
-        self.decode_schedule_buf = None
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         # Decode metadata exists only in decode rounds.
@@ -300,139 +273,6 @@ class MHAAttnBackend(PagedAttentionBackend):
             ),
         )
 
-    def init_cuda_graph_state(self, max_bs: int) -> None:
-        super().init_cuda_graph_state(max_bs)
-        # One header row and one row per request (mha_decode_schedule).
-        self.decode_schedule_buf = torch.zeros(
-            (self.seq_lens_buf.shape[0] + 1, 2), dtype=torch.int32, device=self.device
-        )
-
-    # ------------------------------------------------------------------
-    # Balanced decode variant
-    # ------------------------------------------------------------------
-
-    def _schedule_call(self, rows: int) -> dict:
-        """Meta tensors with the shapes and dtypes of this leaf's
-        full-attention decode calls over ``rows`` query rows, and their
-        options, for the schedule API (it reads only metadata); cached per
-        row count."""
-        call = self._schedule_calls.get(rows)
-        if call is None:
-            query_dtype = self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype
-            kv = torch.empty(
-                (1, self.kernel_page_size, self.tp_kv_head_num, self.head_dim),
-                dtype=self.kv_cache_dtype,
-                device="meta",
-            )
-            call = dict(
-                q=torch.empty(
-                    (rows, self.tp_q_head_num, self.head_dim),
-                    dtype=query_dtype,
-                    device="meta",
-                ),
-                k_cache=kv,
-                v_cache=kv,
-                max_seqlen_q=self.verify_floor,
-                solution=self.kernel_solution,
-            )
-            self._schedule_calls[rows] = call
-        return call
-
-    def _policy(self):
-        """The balanced variant's host policy for this leaf's calls, resolved
-        once; None when it has none. The target's decode or verify only:
-        drafters keep the default (their round graphs are captured once per
-        batch size)."""
-        if self._balanced_policy is None:
-            policy = None
-            if not (self.is_draft or self.block_decode_active or self.is_mxfp8):
-                policy = mha_decode_schedule_policy(
-                    max_seqlen_k=self.max_context_len,
-                    **self._schedule_call(self.verify_floor),
-                )
-            self._balanced_policy = policy or False
-        return self._balanced_policy or None
-
-    def decode_variant_min_pages(self) -> int:
-        policy = self._policy()
-        return 0 if policy is None else policy.min_pages
-
-    def decode_kernel_variants(self, bs: int) -> tuple[str, ...]:
-        # Past max_requests every request's row blocks already fill the
-        # schedule's work items, so the variant cannot win there.
-        policy = self._policy()
-        if policy is None or bs > policy.max_requests:
-            return ()
-        return (DECODE_VARIANT_BALANCED,)
-
-    def prefer_decode_kernel_variant(self, pages) -> str | None:
-        if not self.decode_kernel_variants(len(pages)):
-            return None
-        return DECODE_VARIANT_BALANCED if self._policy().prefers(pages) else None
-
-    def use_decode_kernel_variant(self, variant: str | None) -> None:
-        if variant is not None and (
-            variant != DECODE_VARIANT_BALANCED or self._policy() is None
-        ):
-            raise ValueError(f"MHAAttnBackend has no decode variant {variant!r}")
-        self._balanced = variant is not None
-
-    def _refresh_decode_schedule(self, bs: int) -> None:
-        """Under the balanced variant, compute the step's schedule from the
-        lengths the refresh just wrote, in place, before any layer (or a
-        graph replay) reads it."""
-        if not self._balanced:
-            return
-        schedule = mha_decode_schedule(
-            cache_seqlens=self.seq_lens_buf[:bs],
-            out=self.decode_schedule_buf,
-            **self._schedule_call(bs * self.verify_floor),
-        )
-        assert schedule is not None, "the balanced variant was offered"
-
-    def _decode_schedule(
-        self,
-        layer: PagedAttention,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        max_seqlen_q: int,
-        sinks: torch.Tensor | None,
-        scale_kwargs: dict,
-    ) -> torch.Tensor | None:
-        """The step's schedule for a layer call that reads one: the balanced
-        variant's full-attention layers of the shape it was computed for,
-        whose arguments select a schedule-reading kernel."""
-        if not self._balanced or layer.sliding_window_size >= 0:
-            return None
-        key = (layer.layer_id, max_seqlen_q)
-        reads = self._layer_reads_schedule.get(key)
-        if reads is None:
-            reads = (
-                q.shape[1] == self.tp_q_head_num
-                and k_cache.shape[2] == self.tp_kv_head_num
-                and max_seqlen_q == self.verify_floor
-                and mha_decode_schedule_policy(
-                    q=q,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=self.max_context_len,
-                    window_left=-1,
-                    logit_cap=layer.logit_cap,
-                    sinks=sinks,
-                    return_lse=False,
-                    q_scale=None,
-                    k_scale=None,
-                    v_scale=None,
-                    fp8_kv_scales=scale_kwargs.get("fp8_kv_scales"),
-                    solution=self.kernel_solution,
-                )
-                is not None
-            )
-            self._layer_reads_schedule[key] = reads
-        return self.decode_schedule_buf if reads else None
-
     def _decode_views(self, bs: int) -> MHADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers: one
         builder for capture and refresh, cached per bs — pointer-stable."""
@@ -479,7 +319,6 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
             self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
-        self._refresh_decode_schedule(bs)
 
     def decode_buffer_targets(
         self, bs: int
@@ -497,7 +336,6 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> None:
         del seq_lens, num_extends
         self.forward_decode_metadata = self._decode_views(bs)
-        self._refresh_decode_schedule(bs)
 
     # ------------------------------------------------------------------
     # Forward
@@ -531,10 +369,6 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
-        sinks = kwargs.get("sinks")
-        schedule = self._decode_schedule(
-            layer, q, k_cache, v_cache, max_seqlen_q, sinks, scale_kwargs
-        )
         output = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -543,10 +377,9 @@ class MHAAttnBackend(PagedAttentionBackend):
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
-            sinks=sinks,
+            sinks=kwargs.get("sinks"),
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
-            schedule=schedule,
             solution=self.kernel_solution,
             **scale_kwargs,
         )

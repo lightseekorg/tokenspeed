@@ -1218,7 +1218,6 @@ class DFlash(BaseDrafter):
                 forward_mode=ForwardMode.DECODE,
                 block_tables=self.round_block_tables,
                 num_extends=metadata_num_extends,
-                decode_kernel_variant=None,
             )
         else:
             self.attn_backend.fill_block_decode_seq_lens(bs, seq_lens_after)

@@ -49,7 +49,6 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import compact_window_rows
 
@@ -158,7 +157,6 @@ class CacheGroupRouter(AttentionBackend):
         self._leaf_factory = leaf_factory
         self._consumed_group_ids = consumed_group_ids
         self.leaves: dict[str, PagedAttentionBackend] = {}
-        self._full_history_leaves: list[tuple[str, PagedAttentionBackend]] = []
         self._geometry: CacheGroupGeometry | None = None
         self._offload_adapter: KVOffloadAdapter | None = None
         self.is_draft = bool(is_draft)
@@ -183,14 +181,6 @@ class CacheGroupRouter(AttentionBackend):
         self._check_routable(geometry, tuple(leaves))
         self._geometry = geometry
         self.leaves = dict(sorted(leaves.items()))
-        # Decode kernel variants come from full-history groups (no window)
-        # only: a windowed group's table spans just its window, so its
-        # leaves never see a request's whole length.
-        self._full_history_leaves = [
-            (gid, leaf)
-            for gid, leaf in self.leaves.items()
-            if geometry.windows.get(gid) is None
-        ]
         self._forget_bound_pool_state()
 
     # ------------------------------------------------------------------
@@ -759,71 +749,6 @@ class CacheGroupRouter(AttentionBackend):
             )
             leaf.set_request_slots(req_pool_indices[:bs])
 
-    def _variant_leaves(self, bs: int) -> list[tuple[str, PagedAttentionBackend]]:
-        """The full-history leaves offering decode kernel variants at
-        ``bs`` requests."""
-        return [
-            (gid, leaf)
-            for gid, leaf in self._full_history_leaves
-            if leaf.decode_kernel_variants(bs)
-        ]
-
-    def decode_kernel_variants(self, bs: int) -> tuple[str, ...]:
-        return tuple(
-            dict.fromkeys(
-                variant
-                for _gid, leaf in self._variant_leaves(bs)
-                for variant in leaf.decode_kernel_variants(bs)
-            )
-        )
-
-    def select_decode_kernel_variant(
-        self,
-        bs: int,
-        actual_bs: int,
-        block_tables_cpu: Mapping[str, torch.Tensor],
-    ) -> str | None:
-        """The variant every full-history leaf offering variants picks for
-        the step, from its group's host table: a request's blocks there,
-        expanded to the leaf's kernel pages, bound its length from above.
-        None (the default) unless they all pick the same one."""
-        choice = None
-        for gid, leaf in self._variant_leaves(bs):
-            table = block_tables_cpu.get(gid)
-            if table is None or actual_bs == 0:
-                return None
-            pages_per_block = self.geometry.granularity_of(gid) // leaf.kernel_page_size
-            # The scheduler pads every row to the batch's longest block
-            # count, so the table's width bounds the longest request.
-            if table.shape[1] * pages_per_block < leaf.decode_variant_min_pages():
-                return None
-            # NumPy on the host table's memory: a torch reduction this size
-            # spreads over intra-op threads, which costs milliseconds.
-            blocks = np.count_nonzero(table[:actual_bs].numpy() >= 0, axis=1)
-            # Padding requests replay at one page.
-            variant = leaf.prefer_decode_kernel_variant(
-                (blocks * pages_per_block).tolist() + [1] * (bs - actual_bs)
-            )
-            if variant is None or choice not in (None, variant):
-                return None
-            choice = variant
-        return choice
-
-    def _use_decode_kernel_variant(self, bs: int, variant: str | None) -> None:
-        """Hand the step's variant to the full-history leaves offering it at
-        ``bs`` requests; every other leaf runs its default."""
-        offering = (
-            {
-                gid
-                for gid, leaf in self._variant_leaves(bs)
-                if variant in leaf.decode_kernel_variants(bs)
-            }
-            if variant is not None
-            else set()
-        )
-        for gid, leaf in self.leaves.items():
-            leaf.use_decode_kernel_variant(variant if gid in offering else None)
-
     def refresh_decode_metadata(
         self,
         bs: int,
@@ -835,15 +760,11 @@ class CacheGroupRouter(AttentionBackend):
         block_tables: Mapping[str, torch.Tensor],
         num_extends: int = 0,
         for_graph_replay: bool = False,
-        decode_kernel_variant: str | None = None,
         **kwargs,
     ) -> None:
         """The single decode path: fill the stacks from this step's tables,
-        derive the decode write window, refresh every leaf in place.
-        ``decode_kernel_variant`` is the step's variant (None: the default
-        kernels, as the draft refresh, which picks none, leaves it)."""
+        derive the decode write window, refresh every leaf in place."""
         del kwargs
-        self._use_decode_kernel_variant(bs, decode_kernel_variant)
         self.sparse_topk.clear()
         if forward_mode.is_extend_or_mixed():
             raise RuntimeError(
@@ -905,14 +826,12 @@ class CacheGroupRouter(AttentionBackend):
         forward_mode: ForwardMode,
         *,
         block_tables: Mapping[str, torch.Tensor],
-        decode_kernel_variant: str | None = None,
         **kwargs,
     ) -> None:
         """Capture seeding: the idle fill over the same stacks replay
         refreshes, then each leaf's own capture hook (the leaf default is
         its idle refresh; FlashMLA installs its recorded tile schedule)."""
         del kwargs
-        self._use_decode_kernel_variant(bs, decode_kernel_variant)
         self.sparse_topk.clear()
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
