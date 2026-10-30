@@ -35,12 +35,10 @@ hybrid buckets with upward mapping; N/K, the scale contract and profiling
 strategy remain in the cache key. Activation scales and output rows follow each
 M bucket.
 Entries from earlier profiling strategies are not reused.
-The normal startup cache save/load path persists the selected configurations.
-When a cache contains compatible winners for the current device, loading it
-precompiles those winners and the fixed fallback tiles before the first request.
-This adds startup time but avoids compiling an unseen winner during inference.
-FlashInfer's preparation phase compiles the valid dynamic-shape variants only
-when a tuning-cache miss needs profiling.
+The normal startup cache save/load path persists the selected configurations;
+loading it does not compile kernels. A cached tactic is compiled on its first
+eager use and reused for later calls. FlashInfer's preparation phase compiles
+the valid dynamic-shape variants only when a tuning-cache miss needs profiling.
 
 Outside the tuning context, calls use FlashInfer's cached choice. If the M bucket
 is missing, the default serving path searches cached buckets for the closest M
@@ -48,7 +46,8 @@ with the same N/K, scale contract and device; ties use the smaller M. If no
 compatible entry exists, the previous fixed-tile rule applies. `--disable-autotune`
 skips new searches; an existing loaded cache can still be used. An eager launch
 prepares the three fallback configurations when needed. `prepare(device)` can
-also prepare them explicitly.
+also prepare them explicitly. Run each tactic eagerly before using it in a CUDA
+graph.
 The adapter passes the current PyTorch stream on every launch, so the same
 call path works in eager execution, auxiliary streams, and CUDA graphs.
 Input pointers and stream handles are never cached.

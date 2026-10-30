@@ -216,8 +216,8 @@ def test_eager_warmup_covers_all_fallback_tiles(monkeypatch):
 
 
 @torch.inference_mode()
-def test_loaded_tactics_are_precompiled_and_match_hybrid_buckets(tmp_path, monkeypatch):
-    """Loaded tactics are ready for eager and graph execution, including misses."""
+def test_loaded_tactics_compile_lazily_and_match_hybrid_buckets(tmp_path, monkeypatch):
+    """Loaded tactics compile on first use and work with eager and graph execution."""
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
 
@@ -239,12 +239,17 @@ def test_loaded_tactics_are_precompiled_and_match_hybrid_buckets(tmp_path, monke
             key_512 = key
     path = tmp_path / "hybrid-configs.json"
     path.write_text(json.dumps(configs))
+    compiled = []
+    original_compile = launcher._compile
+
+    def record_compile(*args):
+        compiled.append(args[-1])
+        return original_compile(*args)
+
+    monkeypatch.setattr(launcher, "_compile", record_compile)
     assert load_autotune_cache(str(path), None, 0)
+    assert not compiled
 
-    def unexpected_compile(*args, **kwargs):
-        pytest.fail("Loaded FP8 tactics must be compiled before serving")
-
-    monkeypatch.setattr(launcher, "_compile", unexpected_compile)
     selected = []
     original_run = runner_module._run
 
@@ -258,6 +263,7 @@ def test_loaded_tactics_are_precompiled_and_match_hybrid_buckets(tmp_path, monke
         actual = _mm(inputs)
         assert selected[-1] == expected
         torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+    assert compiled.count(upper) == 1
 
     # With the exact bucket missing, equidistant cached buckets prefer smaller M.
     del tuner._file_configs[key_512]

@@ -43,7 +43,6 @@ class _FakeTuner:
         self.active = False
         self.is_tuning_mode = False
         self._blocklist = types.SimpleNamespace(_invalid={})
-        self._file_configs = {}
 
     def load_configs(self, path: str) -> bool:
         assert Path(path).read_bytes() == b"tactics"

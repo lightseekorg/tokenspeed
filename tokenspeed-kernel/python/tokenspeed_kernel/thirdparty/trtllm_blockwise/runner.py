@@ -47,11 +47,7 @@ from flashinfer.fused_moe.utils import (
 from tokenspeed_kernel.thirdparty.trtllm_blockwise._kernel import (
     Sm100BlockwiseGemmKernel,
 )
-from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import (
-    _prepare,
-    _run,
-    prepare,
-)
+from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import _prepare, _run
 
 
 @lru_cache(maxsize=512)
@@ -169,24 +165,6 @@ class BlockwiseGemmRunner(TunableRunner):
 
 
 _runner = BlockwiseGemmRunner()
-
-
-def prepare_cached_tactics(tuner):
-    """Prepare persisted tactics for the current device before serving."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    prefix = "('trtllm_cutedsl_fp8_blockscale', 'BlockwiseGemmRunner', "
-    suffix = f", {(*_CACHE_EXTRAS, device.index)!r})"
-    tactics = {
-        tactic
-        for key, (runner_name, tactic) in tuner._file_configs.items()
-        if key.startswith(prefix)
-        and key.endswith(suffix)
-        and runner_name == "BlockwiseGemmRunner"
-        and tactic != -1
-    }
-    if tactics:
-        prepare(device)
-        _prepare(device, sorted(tactics))
 
 
 def run(a, b, a_scales, b_scales, out):
