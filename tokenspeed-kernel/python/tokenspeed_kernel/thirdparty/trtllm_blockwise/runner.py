@@ -47,7 +47,7 @@ from flashinfer.fused_moe.utils import (
 from tokenspeed_kernel.thirdparty.trtllm_blockwise._kernel import (
     Sm100BlockwiseGemmKernel,
 )
-from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import _prepare, _run
+from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import _run
 
 
 @lru_cache(maxsize=512)
@@ -152,10 +152,7 @@ class BlockwiseGemmRunner(TunableRunner):
             )
         ]
 
-    def forward(self, inputs, tactic=-1, do_preparation: bool = False):
-        if do_preparation:
-            # FlashInfer runs this phase only when a cache miss needs profiling.
-            _prepare(inputs[0].device, self.get_valid_tactics(inputs, None))
+    def forward(self, inputs, tactic=-1):
         if self._profile_inputs and is_in_profile_measurement():
             inputs = self._profile_inputs[
                 self._profile_step % len(self._profile_inputs)

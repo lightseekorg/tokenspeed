@@ -17,7 +17,7 @@ and FP32 weight scales [N/128,K/128]. Output is BF16, accumulation is FP32.
 N and K must be divisible by 128. Scale layout copies do not change values.
 No E8M0 conversion or weight requantization is performed.
 
-CuTe-DSL and TVM-FFI load when this backend is first prepared.
+CuTe-DSL and TVM-FFI load when this backend is first used.
 During startup autotuning, the adapter searches the configurations enumerated by
 TRT-LLM's `CuteDSLFp8BlackwellRunner` at the source commit above: MMA tiles
 64x128, 128x128 and 256x128, 1-CTA/2-CTA instructions, and clusters whose
@@ -37,17 +37,17 @@ M bucket.
 Entries from earlier profiling strategies are not reused.
 The normal startup cache save/load path persists the selected configurations;
 loading it does not compile kernels. A cached tactic is compiled on its first
-eager use and reused for later calls. FlashInfer's preparation phase compiles
-the valid dynamic-shape variants only when a tuning-cache miss needs profiling.
+eager use and reused for later calls. During tuning, FlashInfer's untimed
+per-tactic warmup compiles each candidate before measurement. No separate
+preparation step compiles unused tactics.
 
 Outside the tuning context, calls use FlashInfer's cached choice. If the M bucket
 is missing, the default serving path searches cached buckets for the closest M
 with the same N/K, scale contract and device; ties use the smaller M. If no
 compatible entry exists, the previous fixed-tile rule applies. `--disable-autotune`
-skips new searches; an existing loaded cache can still be used. An eager launch
-prepares the three fallback configurations when needed. `prepare(device)` can
-also prepare them explicitly. Run each tactic eagerly before using it in a CUDA
-graph.
+skips new searches; an existing loaded cache can still be used. The fallback
+uses the same compile-on-first-use path as tuned tactics. Run each selected
+tactic eagerly before using it in a CUDA graph.
 The adapter passes the current PyTorch stream on every launch, so the same
 call path works in eager execution, auxiliary streams, and CUDA graphs.
 Input pointers and stream handles are never cached.
