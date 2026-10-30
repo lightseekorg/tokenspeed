@@ -4,8 +4,11 @@ from unittest import mock
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 import tokenspeed.runtime.models.qwen3_5_nextn as nextn_module
+from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.factory import _check_shared_head_layout
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
 from tokenspeed.runtime.layers.logits_processor import (
@@ -15,6 +18,7 @@ from tokenspeed.runtime.layers.logits_processor import (
 )
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.qwen3_5_nextn import (
     Qwen3_5ForConditionalGenerationNextN,
     _resolve_mtp_quant_config,
@@ -49,14 +53,7 @@ def test_attention_dp_draft_lm_head_receives_quant_config(monkeypatch):
     monkeypatch.setattr(
         nextn_module, "LogitsProcessor", mock.Mock(return_value=nn.Module())
     )
-    mapping = SimpleNamespace(
-        attn=SimpleNamespace(
-            has_dp=True,
-            tp_rank=0,
-            tp_size=1,
-            tp_group=None,
-        )
-    )
+    mapping = Mapping(rank=0, world_size=2, attn_tp_size=1, attn_dp_size=2)
     config = SimpleNamespace(
         hidden_size=4,
         vocab_size=8,
@@ -79,6 +76,61 @@ def test_attention_dp_draft_lm_head_receives_quant_config(monkeypatch):
         quant_config=quant_config,
         prefix="lm_head",
     )
+
+
+class _EmbeddingOnlyDraft(nn.Module):
+    """CPU stand-in for the transformer; only its shared embedding is needed."""
+
+    def __init__(self, config, mapping, quant_config, prefix):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+
+
+class _HeadOnlyTarget(BaseCausalLM):
+    model_cls = _EmbeddingOnlyDraft
+
+
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("attn_tp", [1, 2, 4])
+@pytest.mark.parametrize("tied", [False, True])
+def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, tied):
+    mapping = Mapping(
+        rank=rank, world_size=8, attn_tp_size=attn_tp, attn_dp_size=8 // attn_tp
+    )
+    config = PretrainedConfig(
+        hidden_size=4,
+        vocab_size=8,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=tied,
+    )
+    # The GPU transformer and CUDA cache management are outside this test;
+    # the head, logits processors and factory layout check are real classes.
+    monkeypatch.setattr(nextn_module, "Qwen3_5DraftForCausalLM", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    with torch.no_grad():
+        target.lm_head.weight.copy_(
+            torch.arange(target.lm_head.weight.numel()).reshape_as(
+                target.lm_head.weight
+            )
+            / 100
+            - 0.16
+        )
+    draft = Qwen3_5ForConditionalGenerationNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
+
+    hidden = (
+        torch.arange(3 * config.hidden_size, dtype=torch.float32).reshape(3, -1) / 7
+    )
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    actual = draft.logits_processor._get_logits(
+        hidden, draft.lm_head, metadata, require_full_vocab=False
+    )
+    expected = torch.nn.functional.linear(hidden, target.lm_head.weight)
+    torch.testing.assert_close(actual, expected)
 
 
 class _DraftModel(nn.Module):

@@ -2594,7 +2594,9 @@ class KimiLinearMoE(nn.Module):
         if self.execution_plan.use_mega_moe:
             from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 
-            moe_runner = runner.get_runner(self.experts.plan, self.experts)
+            moe_runner = runner.get_runner(
+                self.experts.plan, self.experts, prequantized=True
+            )
             activation, scales, ids, weights = moe_runner.input_buffers(
                 num_tokens, max_tokens
             )

@@ -1531,6 +1531,11 @@ than failing at its first forward (`BaseCausalLM.set_embed_and_head` refuses
 both sides are shared and the draft's copies are dropped before the KV-cache
 budget is profiled, as before.
 
+A drafter sharing a target head constructs its head and logits processor from
+`mapping.lm_head`, just like the target. Attention TP is a separate layout:
+under attention DP the head is normally replicated even when attention uses
+multiple ranks. The factory checks the two logits layouts before binding.
+
 Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
 produced after L. AttnRes tap L is produced at L+1's entry by that layer's
 mixer, before input-layer normalization or snapshot mutation; the final tap
