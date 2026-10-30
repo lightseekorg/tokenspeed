@@ -715,7 +715,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.config = config
         self.alt_stream = alt_stream
-        self.cli_factor = getattr(config, "cli_factor", 1)
         self.prefix = prefix
 
         # modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
@@ -1999,14 +1998,6 @@ class DeepseekV3DecoderLayer(nn.Module):
         layer narrows it to the live rows on a narrowing step."""
         return residual
 
-    def input_layer_norm_fn(self, hidden_states, residual):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        return hidden_states, residual
-
     def forward_mlp(
         self,
         hidden_states,
@@ -2029,8 +2020,6 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 
 class DeepseekV3Model(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2040,7 +2029,6 @@ class DeepseekV3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -2048,7 +2036,6 @@ class DeepseekV3Model(nn.Module):
             config.hidden_size,
         )
         self.alt_stream = torch.cuda.Stream()
-        # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
                 DeepseekV3DecoderLayer(
@@ -2113,32 +2100,14 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         self,
         config: PretrainedConfig,
         mapping: Mapping,
-        model: DeepseekV3Model | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        self._model_override = model
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-        )
-
-    def resolve_model(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-    ) -> DeepseekV3Model:
-        if self._model_override is not None:
-            return self._model_override
-        return self.model_cls(
-            config,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
         )
 
     def post_init(self) -> None:
@@ -2242,16 +2211,6 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             ep_size=self.mapping.moe.ep_size,
         )
         for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 if num_nextn_layers > 0 and name.startswith("model.layers"):

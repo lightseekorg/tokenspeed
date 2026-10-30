@@ -79,7 +79,6 @@ class GlmMoeDsaModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -112,13 +111,9 @@ class GlmMoeDsaModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids)
         hidden_states = torch.where(positions.unsqueeze(-1) == 0, 0, hidden_states)
         if captured_hidden_states is None:
             if not ctx.forward_mode.is_idle():

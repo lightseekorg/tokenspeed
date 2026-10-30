@@ -191,11 +191,9 @@ from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -4486,11 +4484,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.vision is None:
             return {}
         return {"image_encoder": self.make_encoder_cudagraph_wrapper(mapping)}
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def multimodal_input_embeds(

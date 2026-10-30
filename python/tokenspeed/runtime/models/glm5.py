@@ -1269,7 +1269,6 @@ class GlmMoeDsaModel(DeepseekV3Model):
     ) -> None:
         nn.Module.__init__(self)
         self.mapping = mapping
-        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -1343,14 +1342,12 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
         self,
         config: PretrainedConfig,
         mapping: Mapping,
-        model: GlmMoeDsaModel | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
             config,
             mapping,
-            model=model,
             quant_config=quant_config,
             prefix=prefix,
         )
