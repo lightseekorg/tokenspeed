@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_fused_lamport_allreduce_routed_rmsnorm_sum,
     iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
+    iris_fused_routed_rmsnorm_sum_lamport_allgather,
     iris_routed_rmsnorm_weighted_sum_write_through,
 )
 from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
@@ -96,6 +97,11 @@ _MUSE_ROUTE_WIDTH = 4096
 # Rows match the single-row tail bit for bit within 1-8 rows; 16 rows take
 # the replicated path.
 _MUSE_MOETAIL_MAX_ROWS = 8
+# Expert TP8 below the owned-row cutoff: from this many tokens, completing
+# the raw routes on token owners, normalizing there and gathering the 8x
+# smaller sums beat the route all-reduce plus replicated normalization in
+# 8-rank graph replay. TODO(measure): set from bench5.
+_MUSE_ROUTE_SCATTER_MIN_ROWS = 44
 
 
 class MuseIrisState:
@@ -1176,6 +1182,128 @@ class MuseIrisState:
             num_warps=num_warps,
         )
         return self.gather.output[: num_tokens * width].view(num_tokens, width)
+
+    def can_reduce_scatter_routes_all_gather(self, rows: int) -> bool:
+        """Whether expert TP8 completes ``rows`` tokens' routes on their owners.
+
+        Depends only on the row count and prepared capacity, so every rank
+        decides alike; a producer may then write into
+        ``acquire_owned_route_input`` before the reduction.
+        """
+        return (
+            self.world_size == 8
+            and self.reduction.lamport_region is not None
+            and _MUSE_ROUTE_SCATTER_MIN_ROWS <= rows < _MUSE_OWNED_MIN_ROWS
+            and rows <= self.owned_route_max_rows
+            and triton.cdiv(rows, self.world_size) * _MUSE_ROUTE_WIDTH
+            <= self.reduction.lamport_max_numel
+        )
+
+    def reduce_scatter_routed_rmsnorm_sum_all_gather(
+        self,
+        routes: torch.Tensor,
+        rows: int,
+        route_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+    ) -> torch.Tensor:
+        """Sum expert TP routes on token owners, normalize there, gather the sums.
+
+        ``routes`` holds this rank's canonical partial routes
+        ``[rows * 8, 4096]``, ideally written into ``acquire_owned_route_input``.
+        ``reduce_scatter_owned_routes`` completes each owner's
+        ceil(rows / 8) tokens; the owner applies the routed RMSNorm and
+        weighted sum in the portable path's arithmetic and the BF16
+        ``[rows, 4096]`` sums are gathered through the Lamport one-shot
+        mailbox into independent storage.
+        """
+        assert self.can_reduce_scatter_routes_all_gather(rows)
+        assert route_weights.shape == (rows, _MUSE_TOPK)
+        assert route_weights.dtype == torch.float32 and route_weights.is_contiguous()
+        assert norm_weight.shape == (_MUSE_ROUTE_WIDTH,)
+        assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
+        assert all(
+            value.device == self.all_reduce.device
+            for value in (route_weights, norm_weight)
+        )
+        owned = self.reduce_scatter_owned_routes(routes, None, rows)
+        output = torch.empty(
+            (rows, _MUSE_ROUTE_WIDTH),
+            dtype=torch.bfloat16,
+            device=self.all_reduce.device,
+        )
+        self._launch_route_sum_gather(
+            owned,
+            route_weights,
+            norm_weight,
+            output,
+            rows,
+            eps,
+            weight_offset,
+            compile_only=False,
+        )
+        return output
+
+    def warmup_reduce_scatter_routed_rmsnorm_sum_all_gather(
+        self, norm_weight: torch.Tensor, eps: float, weight_offset: float
+    ) -> None:
+        """Compile the owner-side route norm and gather without running it.
+
+        Startup's warmup prefill takes owned rows, and decode capture may not
+        reach the row window, so the first such batch would compile it.
+        """
+        rows = _MUSE_ROUTE_SCATTER_MIN_ROWS
+        if not self.can_reduce_scatter_routes_all_gather(rows):
+            return
+        device = self.all_reduce.device
+        self._launch_route_sum_gather(
+            self.owned_route_output[: triton.cdiv(rows, self.world_size)],
+            torch.empty((rows, _MUSE_TOPK), dtype=torch.float32, device=device),
+            norm_weight,
+            torch.empty((rows, _MUSE_ROUTE_WIDTH), dtype=torch.bfloat16, device=device),
+            rows,
+            eps,
+            weight_offset,
+            compile_only=True,
+        )
+
+    def _launch_route_sum_gather(
+        self,
+        owned: torch.Tensor,
+        route_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        output: torch.Tensor,
+        rows: int,
+        eps: float,
+        weight_offset: float,
+        *,
+        compile_only: bool,
+    ) -> None:
+        kernel = iris_fused_routed_rmsnorm_sum_lamport_allgather
+        args = (
+            owned,
+            route_weights,
+            norm_weight,
+            output,
+            self.reduction.lamport_region,
+            self.reduction.lamport_epochs,
+            self.reduction.lamport_peer_addresses[: self.world_size],
+            rows,
+        )
+        options = dict(
+            RANK=self.all_reduce.rank_in_group,
+            WIDTH=_MUSE_ROUTE_WIDTH,
+            EPS=eps,
+            WEIGHT_OFFSET=weight_offset,
+            MAX_ELEMENTS=self.reduction.lamport_max_numel,
+            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            num_warps=8,
+        )
+        if compile_only:
+            kernel.warmup(*args, grid=(1,), **options)
+        else:
+            kernel[(owned.shape[0],)](*args, **options)
 
     def can_all_gather_rmsnorm_mxfp4_quant(
         self,
