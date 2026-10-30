@@ -257,6 +257,35 @@ def test_mha_extend_startup_warmup_covers_every_variant(window):
             run(queries, 300)
 
 
+def test_mm_a16w16_decode_startup_warmup_covers_every_row_bucket():
+    from tokenspeed_kernel.ops.gemm import mv
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm as dense16
+
+    # Muse Spark TP8 pre-expert projection: its row buckets use five tile
+    # configs, split-K and single-pass.
+    n, k = 512, 8192
+    weight = torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16) / k**0.5
+    x = torch.randn(256, k, device=DEVICE, dtype=torch.bfloat16)
+
+    def run(rows):
+        out = mv(x[:rows], weight)
+        expected = x[:rows].float() @ weight.float().T
+        # One BF16 rounding (2**-8 relative) of an FP32 sum of unit-scale
+        # outputs, plus the split-K summation order.
+        torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+
+    # Startup runs one row count; the decode GEMM compiles the other buckets
+    # then.
+    with kernel_warmup(enabled=True):
+        run(8)
+    with assert_no_triton_compile(dense16.gluon_mm_a16w16_medium_gfx950):
+        # Every bucket from 4 to 256 rows, with row counts on and off
+        # multiples of 16 inside one bucket.
+        for rows in (2, 3, 16, 17, 31, 32, 33, 48, 64, 100, 128, 129, 200, 256):
+            run(rows)
+
+
 def test_mxfp8_gemm_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
 

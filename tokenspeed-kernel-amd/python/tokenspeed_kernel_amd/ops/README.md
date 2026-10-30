@@ -71,6 +71,9 @@ Qwen3.8-Flash-Next decode batches.
   entry beat `torch.mm` (hipBLASLt) by at least 4%, at the row counts its
   model sends, in cold-cache sweeps at Kimi K3 TP8, Muse Spark TP4/TP8 and
   Qwen3.8-Flash-Next TP2 shapes; table comments note the exceptions.
+  `M` is an unspecialized runtime argument; each bucket's config is a separate
+  binary, which `warmup_gluon_mm_a16w16_decode_gfx950` compiles for every
+  bucket of a shape at startup.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets

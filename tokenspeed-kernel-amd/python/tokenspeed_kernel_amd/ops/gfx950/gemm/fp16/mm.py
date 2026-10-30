@@ -616,7 +616,9 @@ def gluon_mm_a16w16_splitk_reduce_gfx950(
     )
 
 
-@gluon.jit(launch_metadata=_dense16_mediumm_launch_metadata)
+# M is the row count and follows the batch. Without do_not_specialize, Triton
+# would compile a separate binary whenever M moves on or off a multiple of 16.
+@gluon.jit(launch_metadata=_dense16_mediumm_launch_metadata, do_not_specialize=("M",))
 def gluon_mm_a16w16_medium_gfx950(
     a_ptr,
     b_ptr,
@@ -1831,17 +1833,71 @@ def launch_gluon_mm_a16w16_decode_gfx950(
             f"decode dense16 GEMM has no measured config for M={M}, N={N}, K={K}"
         )
 
-    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
     C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
-    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    split_k = config[6]
+    num_tiles = triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
     if split_k > 1:
         check_splitk_counters(
             counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
         )
-        partial = _get_partial_scratch(A.device, num_tiles, split_k, block_n, block_m)
+        partial = _get_partial_scratch(
+            A.device, num_tiles, split_k, config[1], config[0]
+        )
     else:
         partial = counters = C
-    gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](
+    args, options = _decode_launch(A, B, C, partial, counters, config)
+    gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](*args, **options)
+    return C
+
+
+def warmup_gluon_mm_a16w16_decode_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    out: torch.Tensor | None = None,
+) -> None:
+    """Compile the decode GEMM for every row bucket of B's shape, without running.
+
+    Each M bucket of ``_DECODE_CONFIGS`` has its own tile config, a separate
+    binary, so a server warming up on one row count would otherwise compile
+    the others on a later batch.
+
+    Args:
+        A: ``[M, K]`` activation as launch_gluon_mm_a16w16_decode_gfx950
+            takes it; its row count does not matter.
+        B: ``[N, K]`` weight.
+        out_dtype: Output dtype of the launches to compile for.
+        out: Optional ``[M, N]`` destination the launches write.
+    """
+    M, K = A.shape
+    N = B.shape[0]
+    C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
+    for config in set(_DECODE_CONFIGS.get((N, K), {}).values()):
+        if config[6] > 1:
+            # Split-K launches take FP32 partials and int32 counters; compiling
+            # needs only their dtype and alignment, not their size.
+            partial = _allocate_partial_scratch(A.device, 1, 1, config[1], config[0])
+            counters = torch.zeros((1,), dtype=torch.int32, device=A.device)
+        else:
+            partial = counters = C
+        args, options = _decode_launch(A, B, C, partial, counters, config)
+        gluon_mm_a16w16_medium_gfx950.warmup(*args, grid=(1,), **options)
+
+
+def _decode_launch(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    partial: torch.Tensor,
+    counters: torch.Tensor,
+    config: tuple[int, int, int, int, int, int, int, int],
+) -> tuple[tuple, dict]:
+    # Arguments and launch options of one decode GEMM launch under config.
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    M, K = A.shape
+    N = B.shape[0]
+    args = (
         A,
         B,
         C,
@@ -1862,6 +1918,8 @@ def launch_gluon_mm_a16w16_decode_gfx950(
         C.stride(1),
         C.stride(0),
         C.stride(1),
+    )
+    options = dict(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -1875,7 +1933,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
-    return C
+    return args, options
 
 
 _GROUPED_M_BUCKETS = (4, 8, 16, 32, 64, 128)

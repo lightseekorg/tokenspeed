@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -117,6 +118,9 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        warmup_gluon_mm_a16w16_decode_gfx950 as _mm_a16w16_decode_warmup_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         gluon_fp32_router_gemv_num_counters_gfx950 as _fp32_router_gemv_counters,
@@ -348,6 +352,10 @@ if platform.is_amd:
         Returns:
             ``[M, N]`` output in ``x``'s dtype.
         """
+        if is_warming_up():
+            # Each row bucket has its own tile config; compile every one at
+            # startup rather than on a later batch's forward.
+            _mm_a16w16_decode_warmup_impl(x, weight, x.dtype, out=out)
         counters = zeroed_state(
             _mm_a16w16_decode_counters(x.shape[0], weight.shape[0], x.shape[1]),
             dtype=torch.int32,
