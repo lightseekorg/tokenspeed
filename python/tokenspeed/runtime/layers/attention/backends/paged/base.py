@@ -380,6 +380,32 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 a shared in-place refresh cannot express.
         """
 
+    def decode_kernel_variants(self, bs: int) -> tuple[str, ...]:
+        """Decode kernel variants, besides the default, this leaf can run a
+        step of ``bs`` requests with (see
+        AttentionBackend.decode_kernel_variants)."""
+        del bs
+        return ()
+
+    def decode_variant_min_pages(self) -> int:
+        """A step whose longest request spans fewer of this leaf's kernel
+        pages selects no decode kernel variant; the router skips the
+        selection then."""
+        return 0
+
+    def select_decode_kernel_variant(self, pages: Sequence[int]) -> str | None:
+        """This leaf's decode kernel variant for a step whose requests hold
+        ``pages`` of its kernel pages each (an upper bound from the host
+        tables; a padding request counts one), or None for the default."""
+        del pages
+        return None
+
+    def use_decode_kernel_variant(self, variant: str | None) -> None:
+        """Run the following decode steps with ``variant`` (None: the
+        default); the router calls it before refreshing the leaf."""
+        if variant is not None:
+            raise ValueError(f"{type(self).__name__} has no decode variant {variant!r}")
+
     def decode_buffer_targets(
         self, bs: int
     ) -> tuple[torch.Tensor, torch.Tensor] | None:

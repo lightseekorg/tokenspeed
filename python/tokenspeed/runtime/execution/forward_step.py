@@ -394,6 +394,19 @@ class ForwardStepRunner:
                 self.graphs[(variant, bs)] = graph
                 self.output_buffers[(variant, bs)] = output_buffers
 
+    def _decode_graph_variant(
+        self, sampler_variant: str, kernel_variant: str | None
+    ) -> str:
+        """The graph key's variant: the sampler's, joined with the attention
+        backend's decode kernel variant when the step runs one."""
+        if kernel_variant is None:
+            return sampler_variant
+        return f"{sampler_variant}+{kernel_variant}"
+
+    def _split_graph_variant(self, variant: str) -> tuple[str, str | None]:
+        sampler_variant, _, kernel_variant = variant.partition("+")
+        return sampler_variant, kernel_variant or None
+
     @property
     def capture_plan(self) -> dict[str, list[int]]:
         """Batch sizes a full capture records, per sampler variant, in order.
@@ -405,9 +418,18 @@ class ForwardStepRunner:
         if self.disable:
             return {}
         ladder = sorted(self.capture_bs, reverse=True)
-        return {
+        plan = {
             variant: list(ladder) for variant in self._cuda_graph_capture_variants()
         }
+        # Each attention decode kernel variant records every sampler variant
+        # again, at the batch sizes where it can win: a step picks both.
+        for bs in ladder:
+            for kernel_variant in self.attn_backend.decode_kernel_variants(bs):
+                for variant in self._cuda_graph_capture_variants():
+                    plan.setdefault(
+                        self._decode_graph_variant(variant, kernel_variant), []
+                    ).append(bs)
+        return plan
 
     def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
         """Each variant's batch sizes off the plan, and the positions ``entries`` samples.
@@ -464,8 +486,42 @@ class ForwardStepRunner:
             return CUDA_GRAPH_VARIANT_DEFAULT
         return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
 
-    def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
-        variant = self._cuda_graph_replay_variant()
+    def _decode_kernel_variant(
+        self,
+        padded_bs: int,
+        actual_bs: int,
+        block_tables_cpu: dict,
+        *,
+        use_graph: bool,
+    ) -> str | None:
+        """The target backend's decode kernel variant for a step, from the
+        host tables (no device sync), or None for the default. Eager decode
+        and graph replay ask the same selector; a graph step runs a variant
+        only if its graph was captured. A backend's variants are its
+        kernels' alternatives for the same work, never a different
+        collective, so ranks of one step may pick different ones."""
+        variants = self.attn_backend.decode_kernel_variants(padded_bs)
+        if not variants:
+            return None
+        if use_graph:
+            sampler_variant = self._cuda_graph_replay_variant()
+            variants = tuple(
+                variant
+                for variant in variants
+                if (self._decode_graph_variant(sampler_variant, variant), padded_bs)
+                in self.graphs
+            )
+            if not variants:
+                return None
+        variant = self.attn_backend.select_decode_kernel_variant(
+            padded_bs, actual_bs, block_tables_cpu
+        )
+        return variant if variant in variants else None
+
+    def _cuda_graph_key(self, bs: int, kernel_variant: str | None) -> tuple[str, int]:
+        variant = self._decode_graph_variant(
+            self._cuda_graph_replay_variant(), kernel_variant
+        )
         key = (variant, bs)
         if key in self.graphs:
             return key
@@ -531,6 +587,7 @@ class ForwardStepRunner:
         )
         graph = graph_cls()
         self._prepare_request_token_history_graph_inputs(active_bs=0, padded_bs=bs)
+        sampler_variant, kernel_variant = self._split_graph_variant(variant)
 
         capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
@@ -634,11 +691,11 @@ class ForwardStepRunner:
             for _ in range(4):
                 self.device_module.synchronize()
                 dist.barrier()
-                self._prepare_sampling_capture(bs=bs, variant=variant)
+                self._prepare_sampling_capture(bs=bs, variant=sampler_variant)
                 # Keep warmup seq_lens >= q_len_per_req so no query row gets an
                 # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
-                self._init_capture_metadata(bs)
+                self._init_capture_metadata(bs, kernel_variant)
                 run_once()
             # Order the reset below after the last warmup's stateful kernels.
             self.device_module.synchronize()
@@ -654,13 +711,13 @@ class ForwardStepRunner:
         # Warmups can switch a backend back to eager metadata objects. Restore
         # the graph-backed metadata immediately before capture so replay-time
         # metadata refreshes update the same tensors recorded by the graph.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, kernel_variant)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
-        self._prepare_sampling_capture(bs=bs, variant=variant)
+        self._prepare_sampling_capture(bs=bs, variant=sampler_variant)
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, kernel_variant)
 
         self.deepep_adapter.capture()
 
@@ -800,18 +857,22 @@ class ForwardStepRunner:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
-                if self.capturable_grammar is not None:
-                    self.capturable_grammar.add_batch(
-                        grammars=[None] * bs,
-                        bs=bs,
-                        has_candidates=False,
-                        output_layout=ctx.output_layout,
-                    )
-                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
-                self._init_capture_metadata(bs)
-                self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
-                self.device_module.synchronize()
-                dist.barrier()
+                # Every decode kernel variant compiles here, so eager decode
+                # can select one without compiling while serving.
+                kernel_variants = (None, *self.attn_backend.decode_kernel_variants(bs))
+                for kernel_variant in kernel_variants:
+                    if self.capturable_grammar is not None:
+                        self.capturable_grammar.add_batch(
+                            grammars=[None] * bs,
+                            bs=bs,
+                            has_candidates=False,
+                            output_layout=ctx.output_layout,
+                        )
+                    self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                    self._init_capture_metadata(bs, kernel_variant)
+                    self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+                    self.device_module.synchronize()
+                    dist.barrier()
 
                 if self.capturable_grammar is not None:
                     self.capturable_grammar.reset_state()
@@ -830,7 +891,7 @@ class ForwardStepRunner:
         """
         return {gid: table[:bs] for gid, table in self._placeholder_tables.items()}
 
-    def _init_capture_metadata(self, bs: int):
+    def _init_capture_metadata(self, bs: int, kernel_variant: str | None):
         tables = self.placeholder_block_tables(bs)
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
@@ -839,6 +900,7 @@ class ForwardStepRunner:
             ForwardMode.DECODE,
             block_tables=tables,
             num_tokens=bs * self.max_tokens_per_req,
+            decode_kernel_variant=kernel_variant,
         )
         if self.draft_attn_backend is not None:
             # One arena, one contract: the draft consumes its own groups out
@@ -1146,7 +1208,11 @@ class ForwardStepRunner:
 
         # _can_use_graph already requires a decode mode, so this branches on
         # the mode alone: decode → unified refresh; extend/mixed → construct.
+        kernel_variant = None
         if ctx.forward_mode.is_decode():
+            kernel_variant = self._decode_kernel_variant(
+                padded_bs, bs, block_tables_cpu, use_graph=use_graph
+            )
             self._prepare_decode_metadata(
                 padded_bs,
                 bs,
@@ -1156,6 +1222,7 @@ class ForwardStepRunner:
                 use_graph=use_graph,
                 settle=settle,
                 block_tables=block_tables,
+                decode_kernel_variant=kernel_variant,
             )
         else:
             settle()
@@ -1191,7 +1258,7 @@ class ForwardStepRunner:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
-            graph_key = self._cuda_graph_key(padded_bs)
+            graph_key = self._cuda_graph_key(padded_bs, kernel_variant)
             graph = self.graphs[graph_key]
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)

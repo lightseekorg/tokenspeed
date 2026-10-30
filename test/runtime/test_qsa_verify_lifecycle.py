@@ -141,7 +141,8 @@ def _runner(
     wrapper._padded_bs = lambda bs, ctx: 4
     wrapper._prepare_decode_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._init_forward_metadata = lambda *args, **kwargs: events.append("metadata")
-    wrapper._cuda_graph_key = lambda bs: bs
+    wrapper._decode_kernel_variant = lambda *args, **kwargs: None
+    wrapper._cuda_graph_key = lambda bs, kernel_variant: bs
     wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
     wrapper._expert_load_rows = None
     wrapper._graph_debug = False
