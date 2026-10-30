@@ -58,6 +58,7 @@ def scheduler(*, role, groups=1, host=32, timeout=100):
         )
         for i in range(groups)
     ]
+    cfg.host_group_packing = [1] * groups
     result = ts.Scheduler(cfg)
     tick(result, 1, forward=True, storage=True)
     return result
@@ -465,6 +466,7 @@ def mixed_replay_scheduler():
             replayable=True,
         ),
     ]
+    cfg.host_group_packing = [1, 1]
     result = ts.Scheduler(cfg)
     tick(result, 1, forward=True, storage=True)
     return result

@@ -104,6 +104,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
     supports_mla_dcp: bool = False
+    prefill_needs_host_page_table: bool = False
 
     @classmethod
     def resolve_kernel_page_size(

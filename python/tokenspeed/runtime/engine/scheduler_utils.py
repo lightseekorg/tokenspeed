@@ -126,6 +126,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    max_kv_page_num: int = 0,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -177,6 +178,10 @@ def make_config(
             spans a long prompt's last prefix-page boundary before its replay
             tail also writes the State checkpoint there. Requires prefix
             caching.
+        max_kv_page_num: Per-local-prefill-batch budget for the sum of
+            ``ceil((cached prefix + current chunk) / prefix_granularity)``
+            across requests. 0 leaves the budget unbounded. Derived from
+            ``--chunk-prefill-kv-size``.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -199,6 +204,8 @@ def make_config(
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
+    if max_kv_page_num:
+        cfg.max_kv_page_num = max_kv_page_num
     cfg.max_batch_size = max_batch_size
     cfg.prefix_granularity = prefix_granularity
 

@@ -91,6 +91,7 @@ public:
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
     bool GroupIsState(std::size_t i) const;
+    std::int32_t CheckpointGranularity() const noexcept { return checkpoint_granularity_; }
     // Group blocks one boundary's content hash expands to: the blocks of a
     // prefix page for a History group, one state for a State group.
     std::int32_t BlocksPerBoundary(std::int32_t i) const;
@@ -1061,6 +1062,7 @@ private:
     bool write_back_evictions_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
+    std::int32_t checkpoint_granularity_{1};
     std::int32_t replay_window_tokens_{0};
     // How many groups are State groups. With any, a boundary serves a resume
     // only with a checkpoint boundary at or under it.

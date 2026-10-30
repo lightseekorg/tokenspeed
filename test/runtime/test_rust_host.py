@@ -199,12 +199,47 @@ def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
 
 def test_request_length_limits_reserve_the_first_decode_window():
     assert request_length_limits(
-        context_len=4096, max_single_request_tokens=1000, decode_input_tokens=4
+        context_len=4096,
+        max_single_request_tokens=1000,
+        decode_input_tokens=4,
+        max_kv_page_num=0,
+        prefix_granularity=128,
     ) == (1000, 996)
     with pytest.raises(RuntimeError, match="cannot admit one request"):
         request_length_limits(
-            context_len=4096, max_single_request_tokens=4, decode_input_tokens=4
+            context_len=4096,
+            max_single_request_tokens=4,
+            decode_input_tokens=4,
+            max_kv_page_num=0,
+            prefix_granularity=128,
         )
+
+
+@pytest.mark.parametrize(
+    "pages,max_input,valid",
+    [
+        (0, 4095, True),
+        (16, 2047, True),
+        (16, 2048, False),
+        (16, 2049, False),
+        (17, 2048, True),
+    ],
+)
+def test_prefill_kv_capacity_must_exceed_the_unchanged_prompt_limit(
+    pages, max_input, valid
+):
+    args = dict(
+        context_len=max_input + 1,
+        max_single_request_tokens=max_input + 32,
+        decode_input_tokens=1,
+        max_kv_page_num=pages,
+        prefix_granularity=128,
+    )
+    if valid:
+        assert request_length_limits(**args) == (max_input + 1, max_input)
+    else:
+        with pytest.raises(ValueError, match="greater than max_req_input_len"):
+            request_length_limits(**args)
 
 
 # ----------------------------------------------------------------------

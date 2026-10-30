@@ -68,8 +68,11 @@ def test_process_weights_preserves_canonical_scales(
 
 @pytest.mark.parametrize("m", [1, 65, 129])
 def test_cutedsl_warmup_covers_capture_tiles(m: int, monkeypatch) -> None:
-    from tokenspeed_kernel.thirdparty import trtllm_blockwise
+    from flashinfer.autotuner import AutoTuner
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
 
+    AutoTuner.get().clear_cache()
+    monkeypatch.setattr(launcher, "_compiled", {})
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "trtllm_cutedsl")
     layer = _make_layer(256, 512)
     method = _method()
@@ -81,7 +84,7 @@ def test_cutedsl_warmup_covers_capture_tiles(m: int, monkeypatch) -> None:
     def unexpected_compile(*args, **kwargs):
         pytest.fail("CuTe-DSL compiled after eager warmup")
 
-    monkeypatch.setattr(trtllm_blockwise, "_compile", unexpected_compile)
+    monkeypatch.setattr(launcher, "_compile", unexpected_compile)
     x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

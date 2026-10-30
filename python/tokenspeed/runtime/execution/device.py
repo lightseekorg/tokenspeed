@@ -1520,6 +1520,12 @@ def build_device_side(
             memory_plan=views.token_to_kv_pool.arena.plan,
             attention_backend_name=attention.attention_backend_name,
             draft_attention_backend_name=attention.draft_attention_backend_name,
+            checkpoint_granularities=tuple(
+                (spec.group_id, spec.checkpoint_granularity)
+                for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
+                if spec.checkpoint_granularity is not None
+                and spec.checkpoint_granularity > 1
+            ),
         )
 
     kv_transfer = kv_transfer_builder(

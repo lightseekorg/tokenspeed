@@ -319,6 +319,7 @@ fn group_spec(value: &Value) -> GroupSpec {
         replayable: value["replayable"].as_bool().expect("a flag"),
         transfer_policy: value["transfer_policy"].as_str().map(str::to_owned),
         shard_count: int(&value["shard_count"]),
+        checkpoint_granularity: optional("checkpoint_granularity"),
     }
 }
 

@@ -83,6 +83,9 @@ struct SchedulerConfig {
     }
 
     std::int32_t max_scheduled_tokens{};
+    // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
+    // all local prefill requests in one batch. Zero leaves this unbounded.
+    std::int32_t max_kv_page_num{0};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the

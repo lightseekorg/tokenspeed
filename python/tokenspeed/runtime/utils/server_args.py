@@ -44,6 +44,7 @@ from tokenspeed.runtime.configs.numerics import (
     ROUTER_TOPKS,
     SAMPLING_STREAMS,
     YARN_RAMP_MASK_DEVICES,
+    resolve_numerics_envelope,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
@@ -378,6 +379,8 @@ class ServerArgs:
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
+    # Optional bound on summed per-request KV pages in a local prefill batch.
+    chunk_prefill_kv_size: int | None = None
     enable_mixed_batch: bool = False
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
@@ -1789,9 +1792,11 @@ class ServerArgs:
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
+        from tokenspeed.runtime.plugins import ensure_loaded
+
+        ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
-        if self.numerics != "auto":
-            self._resolve_rl_bitwise()
+        resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
             self.enable_allreduce_fusion = False
@@ -1823,7 +1828,7 @@ class ServerArgs:
                 )
 
     def _resolve_rl_bitwise(self):
-        """The rl-bitwise block: every envelope beyond auto runs it."""
+        """Resolve the built-in RL policy; plugins provide their own resolver."""
         # Collectives: one association order per reduction. NCCL's ring
         # chunks by message size, so a plain NCCL sum is run-stable but not
         # batch-size-invariant; batch_invariant_collectives routes every
@@ -2329,6 +2334,8 @@ class ServerArgs:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
             raise ValueError("--input-logprob-chunk-tokens must be positive")
+        if self.chunk_prefill_kv_size is not None and self.chunk_prefill_kv_size <= 0:
+            raise ValueError("--chunk-prefill-kv-size must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -2370,6 +2377,9 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        from tokenspeed.runtime.plugins import ensure_loaded
+
+        ensure_loaded()
         parser.allow_abbrev = False
 
         # Model and port args
@@ -2767,6 +2777,18 @@ class ServerArgs:
                 "Maximum prefill-token budget used when chunked prefill is "
                 "disabled. Per-iteration scheduling is controlled by "
                 "--chunked-prefill-size."
+            ),
+        )
+        parser.add_argument(
+            "--chunk-prefill-kv-size",
+            type=int,
+            default=ServerArgs.chunk_prefill_kv_size,
+            help=(
+                "Prefill batch KV capacity in tokens, including cached prefixes. "
+                "Converted to a page budget; each request is rounded up separately "
+                "before summing. Its page-aligned capacity must exceed the maximum "
+                "prompt length; an undersized budget fails startup. Omit to keep "
+                "the existing unbounded batch policy."
             ),
         )
         # Other runtime options
@@ -3910,7 +3932,7 @@ class ServerArgs:
             "trainer-operation-order switches (docs/design/numerics.md, "
             "alignment.trainer) so a teacher-forced pass reproduces the RL "
             "trainer's logprobs; a model serves it only once its profile "
-            "declares it verified.",
+            "declares it verified. Plugins may register additional envelopes.",
         )
         parser.add_argument(
             "--yarn-ramp-mask-device",

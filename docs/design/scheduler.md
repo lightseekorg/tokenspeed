@@ -11,6 +11,16 @@ prefix granularity, cache groups, LCM blocks).
 
 ## 1. Admission is per chunk
 
+An optional `--chunk-prefill-kv-size` also bounds the KV read by a local
+prefill batch. The runtime converts its token capacity to
+`max_kv_page_num` using `prefix_granularity`. Admission rounds each request's
+cached-prefix-plus-current-chunk length up separately, then sums those page
+counts; shared prefixes still count for every request. A candidate may use only
+the remaining pages. When configured, the page-aligned token capacity must be
+strictly greater than `max_req_input_len`; startup rejects an undersized budget
+instead of reducing the prompt limit. Decode and remote PD landing do not spend
+this local-prefill budget. Omitting the limit preserves the existing policy.
+
 The scheduler schedules a prompt's prefill in chunks bounded by
 `max_scheduled_tokens` (`--chunked-prefill-size`). It admits capacity **for
 the chunk being
@@ -238,6 +248,19 @@ state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
 
+For State groups with `checkpoint_granularity > 1`, only prefill-produced
+states may become reusable checkpoints. Publication remains in the ordinary
+scheduling path: a later admission publishes any retained in-forward
+checkpoint before rotating or reclaiming the owner's blocks. The first fused
+decode admission may deliver the preceding prefill's prompt-end and interior
+checkpoints; it does not publish a decode-produced state. Later decode states
+stay private at finish and retraction even when their positions are aligned.
+A prefill finish may still publish its endpoint, and retraction still saves
+the private live state for that request's own restore. The D role does not
+publish its transferred prompt state in this restricted mode. Unrestricted
+State groups keep the policy above. Forward result events carry no checkpoint
+data and do not trigger publication.
+
 **In-forward checkpoint (opt-in).** By default a prompt that diverges inside
 the last page of an earlier long prompt, or resends it, resumes from an
 earlier checkpoint: the prompt-end state cannot serve a hit that must replay
@@ -311,12 +334,11 @@ KV with a Host checkpoint resumes, loading the checkpoint alone. When the KV
 groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. No alignment is
-ever imposed on a chunk for the state's sake, and apart from the opt-in
+shares the prefix resumes at the KV boundary in every group. For unrestricted
+State groups no alignment is imposed on a chunk, and apart from the opt-in
 in-forward checkpoint above no checkpoint is produced inside a forward: a
 chunk's state output is its own natural checkpoint.
-`CacheProgress::junction_tokens` is the only progress a State group adds to
-the request; the backend contract for the two slots is in
+The backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
 
 **A superseded input leaves first.** A prompt that resumes at a tail
@@ -345,6 +367,20 @@ resume at -- is never marked. On the fused role a turn also publishes its
 prompt end, at its first decode and at the same epoch: that one and the end
 state still rank level, since which of them the next turn resumes at depends
 on whether the client sends the reply back as it was generated.
+
+**Aligned state checkpoints.** A State group can declare
+`checkpoint_granularity`, a multiple of the prefix-hash grain. Its published
+and matched states must end on that boundary. Intermediate prefill forwards
+end on whole segments; a remaining prompt fitting the budget runs once. The
+existing in-forward checkpoint mechanism saves the entrance of its last
+segment, `(prompt_tokens - 1) / grain * grain`, including when the whole
+prompt fits one round. Thus 8192 tokens run in one forward while saving the
+state at 4096. Prefix reuse stays strictly below the prompt length, so a full
+8192 match resumes at most at 4096. Only that extra entrance is retained;
+aligned prefill endpoints remain reusable through the same admission path.
+A decode step reaching an aligned position creates no checkpoint. The grain constrains
+each request's logical position, independently of its packed batch offset.
+Unrestricted groups preserve their original scheduling and publication.
 
 **Capacity.** A State group holds at most two blocks per live request on
 every role — the pair, never a page per token — so `ReservePrefillDemands`

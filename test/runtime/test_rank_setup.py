@@ -134,6 +134,22 @@ def test_make_config_requires_and_maps_the_host_write_policy():
     assert cfg.host_write_policy == policy.WriteBack
 
 
+@pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])
+def test_prefill_kv_budget_is_translated_to_scheduler_pages(tokens, pages):
+    flags = [] if tokens is None else ["--chunk-prefill-kv-size", str(tokens)]
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.max_kv_page_num == pages
+
+
+@pytest.mark.parametrize("tokens", [0, -1])
+def test_prefill_kv_budget_must_be_positive_when_supplied(tokens):
+    with pytest.raises(ValueError, match="chunk-prefill-kv-size"):
+        ServerArgs(model="x", max_num_seqs=8, chunk_prefill_kv_size=tokens)
+
+
 def test_an_engine_with_l3_passes_its_prefetch_threshold():
     args = ServerArgs(model="x", max_num_seqs=8, kvstore_storage_backend="memory")
     cfg = _config(
