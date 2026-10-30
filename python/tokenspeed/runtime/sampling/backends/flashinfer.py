@@ -176,9 +176,19 @@ class FlashInferSamplingBackend(SamplingBackend):
     supports_tree_verify = True
     _SUPPORTS_DP_VERIFY = True
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
+    # Only as the block-rejection benchmark mode; checked in __init__.
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
+        if config.synthetic_acceptance_length is not None and not (
+            config.enable_block_rejection and config.enable_speculative_sampling
+        ):
+            raise ValueError(
+                "synthetic acceptance on a flashinfer backend requires block "
+                "rejection with speculative sampling; otherwise use the greedy "
+                "sampling backend"
+            )
         super().__init__(config)
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
@@ -825,11 +835,16 @@ class FlashInferSamplingBackend(SamplingBackend):
                 if use_draft_prob
                 else None
             )
-            if self.config.enable_block_rejection:
-                if draft_probs is None:
-                    raise RuntimeError(
-                        "block verification requires recorded draft probabilities"
-                    )
+            synthetic = self.config.synthetic_acceptance_length is not None
+            if self.config.enable_block_rejection and draft_probs is None:
+                raise RuntimeError(
+                    "block verification requires recorded draft probabilities"
+                )
+            # Synthetic acceptance mirrors vLLM's rejection_sample_method
+            # "synthetic": the standard draft-probability chain rule below runs
+            # for its cost, then the forced lengths replace its outcome. The
+            # block verifier is a different rejection method and is not run.
+            if self.config.enable_block_rejection and not synthetic:
                 block_speculative_sampling(
                     predicts=predict,
                     accept_index=accept_index,
@@ -865,6 +880,20 @@ class FlashInferSamplingBackend(SamplingBackend):
                     predict=predict,
                     accept_index=accept_index,
                     accept_length=accept_length,
+                )
+            if synthetic:
+                lengths = self.synthetic_lengths(
+                    candidates, sampling_info.batch_row_offset
+                )
+                self.write_synthetic_outputs(
+                    candidates,
+                    self.sample_synthetic_targets(
+                        target_probs, lengths, final_coins[:bs]
+                    ),
+                    lengths,
+                    predict,
+                    accept_index,
+                    accept_length,
                 )
 
             accept_length += 1

@@ -29,6 +29,8 @@ arguments.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -151,6 +153,70 @@ def test_verify_gathers_recorded_rows_and_selects_the_draft_prob_rule(
         tree=None,
     )
     assert seen["use_draft_prob"] is False and seen["draft_probs"] is None
+
+
+def _block_synthetic_config(al: float | None) -> SamplingBackendConfig:
+    return replace(
+        _config(enable=True),
+        enable_block_rejection=True,
+        synthetic_acceptance_length=al,
+    )
+
+
+def _block_kernel_must_not_run(**kwargs):
+    raise AssertionError("synthetic acceptance replaces the block verifier")
+
+
+@pytest.mark.parametrize("al, allowed", [(1.0, {1}), (2.4, {2, 3}), (3.0, {3})])
+def test_block_rejection_synthetic_runs_the_draft_prob_rule_then_forces_lengths(
+    monkeypatch, al, allowed
+):
+    seen: dict = {}
+    _fake_kernels(monkeypatch, fi, seen)
+    monkeypatch.setattr(fi, "block_speculative_sampling", _block_kernel_must_not_run)
+    backend = fi.FlashInferSamplingBackend(_block_synthetic_config(al))
+
+    torch.manual_seed(0)
+    recorded = _recorded_draft_probs()
+    logits = torch.randn(2 * N, VOCAB)
+    # The cutoff token must come from the target's support at its position.
+    logits[:, VOCAB // 2 :] = float("-inf")
+    candidates = torch.randint(0, VOCAB, (2, N), dtype=torch.int64)
+    observed = set()
+    for _ in range(8):
+        # Refreshes synthetic lengths and verify coins like prepare_step, from
+        # the capture stream (per-slot refill needs pinned host memory).
+        backend.prepare_capture(2, N)
+        tokens, lengths = backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits.clone()),
+            _info(recorded),
+            candidates,
+            tree=None,
+        )
+        # The standard rule ran on the recorded proposal law before the override.
+        assert seen["use_draft_prob"] is True
+        assert torch.equal(seen["draft_probs"], recorded[[4, 1]])
+        torch.testing.assert_close(lengths, backend._synthetic_lengths[:2])
+        for row, length in enumerate(lengths.tolist()):
+            row_tokens = tokens.reshape(2, N)[row]
+            assert (
+                row_tokens[: length - 1].tolist() == candidates[row, 1:length].tolist()
+            )
+            assert 0 <= row_tokens[length - 1].item() < VOCAB // 2
+            assert backend._accept_index_buf[: 2 * N].view(2, N)[row].tolist() == list(
+                range(row * N, row * N + length)
+            ) + [-1] * (N - length)
+        observed.update(lengths.tolist())
+    assert observed <= allowed
+    if al == 2.4:
+        assert observed == allowed
+
+
+def test_flashinfer_refuses_synthetic_acceptance_without_block_rejection():
+    config = replace(_config(enable=True), synthetic_acceptance_length=2.0)
+    with pytest.raises(ValueError, match="requires block rejection"):
+        fi.FlashInferSamplingBackend(config)
+    fi.FlashInferSamplingBackend(_block_synthetic_config(2.0))
 
 
 def test_verify_refuses_draft_probs_on_a_backend_built_without_the_flag(monkeypatch):

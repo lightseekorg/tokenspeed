@@ -1559,9 +1559,14 @@ class ServerArgs:
                     f"[1, {self.speculative_num_draft_tokens}] "
                     "(the speculative verify width including the target token)"
                 )
-            if self.sampling_backend != "greedy":
+            # Block rejection keeps stochastic DSpark drafting on the path and
+            # forces only the verify outcome, so it uses the flashinfer verifier.
+            if self.sampling_backend != "greedy" and not (
+                self.enable_block_rejection and self.sampling_backend == "flashinfer"
+            ):
                 raise ValueError(
-                    "--synthetic-acceptance-length requires --sampling-backend greedy"
+                    "--synthetic-acceptance-length requires --sampling-backend greedy, "
+                    "or --sampling-backend flashinfer with --enable-block-rejection"
                 )
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
@@ -1659,8 +1664,14 @@ class ServerArgs:
                     "DP sampling, or pipeline parallelism"
                 )
             if self.synthetic_acceptance_length is not None:
-                raise ValueError(
-                    "block rejection correctness requires synthetic acceptance disabled"
+                # vLLM's draft_sample_method=probabilistic with
+                # rejection_sample_method=synthetic: drafts stay sampled, the
+                # standard draft-probability verify runs for its cost, and the
+                # synthetic length replaces both its outcome and block rejection.
+                logger.warning(
+                    "Block rejection with synthetic acceptance: DSpark drafts are "
+                    "sampled and recorded, but the accepted length is forced and "
+                    "the block verifier is not run."
                 )
         if self.enable_speculative_sampling:
             self._validate_speculative_sampling()
@@ -3532,7 +3543,8 @@ class ServerArgs:
             help="Benchmark-only mean accepted length including the guaranteed "
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
-            "for correctness evaluation. Requires --sampling-backend greedy without "
+            "for correctness evaluation. Requires --sampling-backend greedy (or "
+            "flashinfer with --enable-block-rejection) without "
             "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
         parser.add_argument(
@@ -3557,7 +3569,8 @@ class ServerArgs:
             help="Opt in to DSpark stochastic drafting and block rejection verification. "
             "Requires --enable-speculative-sampling and --sampling-backend flashinfer. "
             "Supports aggregate TP (including DCP), without DP or PP. "
-            "Synthetic acceptance is refused; greedy requests remain greedy.",
+            "With --synthetic-acceptance-length, drafts stay sampled but the "
+            "accepted length is forced (benchmark only); greedy requests remain greedy.",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",

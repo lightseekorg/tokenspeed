@@ -155,6 +155,36 @@ def test_prefix_bonus_indices_and_mixed_row_offset(width):
     torch.testing.assert_close(accepted + 1, lengths)
 
 
+def test_synthetic_targets_follow_the_target_row_at_the_cutoff():
+    torch.manual_seed(5)
+    reps, width, vocab = 40000, 3, 6
+    probs = torch.zeros(3, width, vocab)
+    # Every other position puts all mass on token 5, so reading the wrong
+    # position shows up as a 5.
+    probs[:, :, 5] = 1.0
+    probs[0, 0] = torch.tensor([0.5, 0.0, 0.3, 0.2, 0.0, 0.0])
+    probs[1, 1] = torch.tensor([0.0, 0.1, 0.0, 0.0, 0.9, 0.0])
+    probs[2, 2] = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 0.0])  # greedy one-hot
+    lengths = torch.tensor([1, 2, 3], dtype=torch.int32)
+    tokens = SamplingBackend.sample_synthetic_targets(
+        probs.repeat(reps, 1, 1), lengths.repeat(reps), torch.rand(3 * reps)
+    ).view(reps, 3)
+    for row in range(3):
+        expected = probs[row, lengths[row] - 1]
+        observed = torch.bincount(tokens[:, row], minlength=vocab).float() / reps
+        assert observed[expected == 0].sum().item() == 0.0
+        torch.testing.assert_close(observed, expected, atol=0.01, rtol=0.0)
+
+
+def test_synthetic_target_coin_extremes_stay_on_the_support():
+    probs = torch.tensor([[[0.0, 0.25, 0.0, 0.75, 0.0, 0.0]]]).repeat(2, 1, 1)
+    eps = torch.finfo(torch.float32).eps
+    tokens = SamplingBackend.sample_synthetic_targets(
+        probs, torch.tensor([1, 1]), torch.tensor([eps, 1.0 - eps])
+    )
+    assert tokens.tolist() == [1, 3]
+
+
 def test_disabled_preparation_leaves_synthetic_buffers_unallocated():
     backend = _BufferBackend(_config(None, 5, 4, "cpu"))
     backend.prepare_step([], [], [], 4)
@@ -283,6 +313,105 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
         observed.update(lengths.tolist())
     if al == 2.6:
         assert observed == {1, 2, 3}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("al", [1.0, 2.6, 4.0])
+def test_block_rejection_synthetic_verify_and_cuda_graph_replay(al):
+    """Probabilistic-draft synthetic mode on the real flashinfer verify path."""
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends import flashinfer as fi
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    pool, width, vocab = 6, 4, 512
+    config = SamplingBackendConfig(
+        enable_block_rejection=True,
+        enable_speculative_sampling=True,
+        sampling_stream="batch",
+        logprob_order="torch",
+        synthetic_acceptance_length=al,
+        max_bs=5,
+        max_draft_tokens_per_req=width,
+        max_req_pool_size=pool,
+        vocab_size=vocab,
+        device="cuda",
+        random_seed=48,
+    )
+    backend = fi.FlashInferSamplingBackend(config)
+    rids = [f"block-synthetic-{i}" for i in range(5)]
+    params = []
+    for i, rid in enumerate(rids):
+        # Mix sampled and greedy requests in one captured batch.
+        sp = SamplingParams(temperature=0.0 if i % 2 else 1.0, top_k=-1, top_p=0.95)
+        sp.resolve_seed(rid)
+        sp.normalize(None)
+        params.append(sp)
+
+    def prepare():
+        backend.prepare_step(rids, list(range(1, 6)), params, width)
+        backend.limit_synthetic_acceptance(
+            torch.tensor([True, False, False, False], device="cuda"), 1
+        )
+
+    info = SamplingBatchInfo(
+        req_pool_indices=torch.arange(2, 6, dtype=torch.int64, device="cuda"),
+        draft_probs=torch.softmax(
+            torch.randn(pool + 1, width, vocab, device="cuda"), -1
+        ),
+        vocab_size=vocab,
+        device="cuda",
+        batch_row_offset=1,
+    )
+    torch.manual_seed(3)
+    logits = torch.randn(16, vocab, device="cuda") * 4
+    support = torch.zeros(16, vocab, dtype=torch.bool, device="cuda")
+    support[:, : vocab // 2] = True
+    logits.masked_fill_(~support, float("-inf"))
+    candidates = torch.randint(0, vocab, (4, width), dtype=torch.int32, device="cuda")
+
+    def verify():
+        return backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits.clone()),
+            info,
+            candidates,
+            tree=None,
+        )
+
+    def check(tokens, lengths):
+        torch.testing.assert_close(lengths, backend._synthetic_lengths[1:5])
+        assert lengths[0].item() == 1
+        for row, length in enumerate(lengths.tolist()):
+            row_tokens = tokens.reshape(4, width)[row]
+            assert (
+                row_tokens[: length - 1].tolist() == candidates[row, 1:length].tolist()
+            )
+            assert support[row * width + length - 1, row_tokens[length - 1]].item()
+
+    prepare()
+    with patch.object(
+        fi, "block_speculative_sampling", side_effect=AssertionError("not run")
+    ):
+        check(*verify())
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            prepare()
+            verify()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        prepare()
+        with torch.cuda.graph(graph):
+            output, lengths = verify()
+    observed = set()
+    for _ in range(12):
+        prepare()
+        graph.replay()
+        check(output, lengths)
+        observed.update(lengths[1:].tolist())
+    if al == 2.6:
+        assert observed == {2, 3}
 
 
 if __name__ == "__main__":

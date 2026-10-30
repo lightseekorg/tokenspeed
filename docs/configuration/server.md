@@ -621,6 +621,8 @@ AL `2.6`:
 
 Conflicting values between the flag and JSON configuration are rejected.
 The value must be finite and speculative decoding must be enabled.
+The flashinfer backend accepts it only together with `--enable-block-rejection`;
+see [DSpark block verification](#dspark-block-verification-experimental).
 For block drafters with implicit widths, the upper bound is checked against
 the checkpoint's resolved verify width when the sampler is initialized.
 
@@ -1372,8 +1374,18 @@ The output uses the existing accepted-length and state rollback contract.
 The existing per-request proposal RNG and verifier coin streams are reused.
 A stochastic output difference from greedy decoding is expected; validate the
 output distribution and accuracy, rather than requiring identical token IDs.
-Synthetic acceptance is deliberately rejected in this initial correctness path.
-A golden acceptance length is not a substitute for implementing or validating
-the algorithm. Full-vocabulary draft gathering, probability storage, and
+
+Adding `--synthetic-acceptance-length L` gives a benchmark-only mode, the
+equivalent of vLLM's probabilistic draft sampling with synthetic rejection.
+DSpark still drafts by sampling: the full-vocabulary draft logits, the Markov
+steps and the recorded fp32 draft probabilities all stay on the path. Verify
+gathers those probabilities and runs the standard draft-probability chain rule
+for its cost; the synthetic length then replaces its outcome, as in the greedy
+synthetic mode above. The block verifier itself is not run, because synthetic
+rejection replaces it. The token at the cutoff is drawn from the target
+probabilities at that position (the argmax for greedy requests); this costs one
+full-vocabulary pass per request. Do not use generated text for correctness or
+accuracy evaluation; validate the algorithm and its natural acceptance length
+without this flag. Full-vocabulary draft gathering, probability storage, and
 verification reductions all add work; measure their cost and natural acceptance
 length before drawing performance conclusions.
