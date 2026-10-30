@@ -3,5 +3,5 @@ wheel
 psutil
 numpy
 torch
-apache-tvm-ffi==0.1.13.post3
-triton-ascend==3.2.1
+apache-tvm-ffi==0.1.14.post1
+triton-ascend==3.2.2
