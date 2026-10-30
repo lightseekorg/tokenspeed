@@ -455,3 +455,81 @@ over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
+
+## NVFP4 MegaMoE for Qwen3.5
+
+The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and
+Kimi K3 SiTU. Gated SiLU selects the existing kernel epilogue with both SiTU
+parameters set to `None`. BF16 inputs are quantized and staged with routing
+directly into the symmetric workspace in one kernel, including masking unused
+capacity rows. Prequantized packed E2M1 inputs with linear E4M3 block scales
+remain supported for existing callers. Input format is part of the runner's
+tuning key, and calibrated input scales stay runtime tensors across graph replay;
+weights are converted once to interleaved gate/up rows and blocked scales.
+Gate/up global weight scales must match. The adapter currently targets
+SM100/SM103 and requires MoE TP=1.
+
+Qwen3.5 uses precomputed Qwen top-k and a separate, fully replicated shared
+expert with its original sigmoid gate. Select
+`--moe-backend mega_moe --all2all-backend none` with NVFP4 routed weights,
+MoE TP=1 and EP>1. Attention rows must already be scattered before the MoE,
+for example DP4/TP2/EP8 or DP8/TP1/EP8. Layouts with attention TP equal to
+MoE TP*EP (including TP8/EP8) are rejected before weights are constructed.
+The common communication manager handles input and final normalization and
+row gathering; the model needs no additional all-reduce bypass or row slicing.
+
+`Qwen3_5MoeSparseMoeBlock` checks MegaMoE options during construction: EPLB, redundant experts, nontrivial placement
+and external all-to-all backends are unsupported. The NVFP4 weight adapter
+checks MoE TP=1. Weight dtype, activation and
+hardware compatibility are checked by the common MoE kernel planner.
+
+All ranks, including empty token owners, must enter the expert call with the
+same capacity. Existing runner warmup and autotuning reserve the workspace
+before graph capture; returned outputs alias that workspace. Shared experts
+run independently on the existing auxiliary stream during CUDA graph capture
+and replay, overlapping routed experts; the streams join before applying the
+shared sigmoid gate and gathering rows. Warmup retains serialized execution
+so kernel tuning and compilation finish before capture.
+
+Run the kernel regression on Blackwell, for example:
+
+```bash
+PYTHONPATH="tokenspeed-kernel/test:$PYTHONPATH" torchrun --standalone --nproc-per-node=2 \
+  tokenspeed-kernel/test/nvidia/ops/moe/test_trtllm_mega_moe.py \
+  --activation silu --input-format bf16 --capacity 8 --tokens 5
+```
+
+Repeat with `--input-format nvfp4` to cover prequantized inputs, and with
+`--autotune` for tactic coverage. The test compares a dequantized
+reference, uneven/idle ranks, graph replay and alternating capacities.
+
+`test_trtllm_mega_moe_input_stage.py` separately checks byte-exact packed data
+and scales against FlashInfer quantization, route conversion, zero-token owners,
+changing live counts and alternating captured graphs on the same workspace.
+
+Qwen3.5 follows K3's empty-owner path: gate, top-k, quantization and shared
+expert work are skipped when there are no local tokens, but the rank still
+participates in the collective MegaMoE call. Nonempty ranks use normal tuning;
+the model does not disable GEMM tuning for uneven batches.
+
+MegaMoE reserves scratch for every tactic reachable by the selected execution
+mode before CUDA graph capture. With tactic autotuning disabled, this is the
+union of heuristic tactics across all supported token buckets; unused FC2
+write-back scratch is omitted. `MEGAMOE_TACTIC_AUTOTUNE=1` retains the full
+candidate workspace; the upstream candidate set excludes FC2 write-back
+tactics. Token capacity and persistent addresses do not change,
+and launches with an unreserved tactic or capacity are rejected.
+
+The collective scratch arena holds at most 128 source tokens per rank. Larger
+forwards reuse it in rank-identical chunks and copy each completed result to
+a per-call output tensor sized to live local rows before reuse. The collective
+token bound, never
+local row count, determines the number of chunks, so idle ranks still
+participate. This bounds dispatch and combine storage independently of the
+prefill ceiling; it does not reduce the supported forward token count.
+Decode forwards up to 128 tokens per rank retain a single MegaMoE launch.
+
+Kimi K3 can still write packed activations and routes directly into the runner's
+input buffers. Calls within the arena capacity use its symmetric views; larger
+producers receive per-call buffers for their live rows, which are staged one
+chunk at a time. This keeps unconsumed input separate from reused scratch.

@@ -38,7 +38,7 @@ def trtllm_mega_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
         raise ValueError("NVFP4 MegaMoE requires MoE TP=1")
     gate_scale, up_scale = w.w13_weight_scale_2.unbind(dim=1)
     if not torch.equal(gate_scale, up_scale):
-        raise ValueError("NVFP4 SiTU MegaMoE requires equal gate/up weight_scale_2")
+        raise ValueError("NVFP4 MegaMoE requires equal gate/up weight_scale_2")
     experts = w.num_local_experts
     intermediate = w.intermediate_size
     for name in ("w13_weight", "w13_weight_scale"):
@@ -92,7 +92,7 @@ def trtllm_mega_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.uint8}),
     traits={
         "weight_dtype": frozenset({"nvfp4"}),
-        "activation": frozenset({"situ"}),
+        "activation": frozenset({"silu", "situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
@@ -105,7 +105,7 @@ def trtllm_mega_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
 )
 def trtllm_nvfp4_mega_moe_apply(
     plan: dict,
-    x: tuple[torch.Tensor, torch.Tensor],
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     w: torch.nn.Module,
     router_logits: torch.Tensor | None,
     topk_weights: torch.Tensor,
@@ -115,7 +115,7 @@ def trtllm_nvfp4_mega_moe_apply(
     do_finalize: bool,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Dispatch NVFP4 tokens, run SiTU experts, and combine on the source ranks.
+    """Dispatch NVFP4 tokens, run gated SiLU or SiTU experts, and combine on the source ranks.
 
     Uses the upstream heuristic by default. Set MEGAMOE_TACTIC_AUTOTUNE=1
     identically on every EP rank before startup to participate in FlashInfer's
@@ -128,7 +128,7 @@ def trtllm_nvfp4_mega_moe_apply(
 
     Args:
         plan: Selected NVFP4 MoE plan containing the EP process group.
-        x: Packed E2M1 activations and linear E4M3 block scales.
+        x: BF16 activations, or packed E2M1 activations and linear E4M3 scales.
         w: Local expert module with MegaMoE-prepared weights.
         router_logits: Unused; routes are supplied explicitly.
         topk_weights: Final routing weights, including the model routing scale.
@@ -144,11 +144,12 @@ def trtllm_nvfp4_mega_moe_apply(
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
 
     del router_logits, num_tokens_global, enable_pdl
-    if not do_finalize or not isinstance(x, tuple):
-        raise ValueError(
-            "MegaMoE requires prequantized inputs and complete finalization"
-        )
-    runner = get_runner(plan, w)
+    if not do_finalize:
+        raise ValueError("MegaMoE requires complete finalization")
+    prequantized = isinstance(x, tuple)
+    if not prequantized and x.dtype != torch.bfloat16:
+        raise ValueError("MegaMoE requires BF16 or prequantized NVFP4 inputs")
+    runner = get_runner(plan, w, prequantized=prequantized)
     weights = (
         w.w13_weight,
         w.w13_weight_scale,
@@ -158,4 +159,7 @@ def trtllm_nvfp4_mega_moe_apply(
         w.mega_fc2_alpha,
         w.mega_fc1_norm,
     )
-    return runner.run(x, topk_ids, topk_weights, weights, max_num_tokens_per_gpu)
+    routed_input = x if prequantized else (x, w.w13_input_scale_quant)
+    return runner.run(
+        routed_input, topk_ids, topk_weights, weights, max_num_tokens_per_gpu
+    )
