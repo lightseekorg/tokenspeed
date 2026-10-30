@@ -122,6 +122,7 @@ from tokenspeed.runtime.layers.paged_attention import (
     check_block_drafter_storage,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+from tokenspeed.runtime.sampling.diagnostics import sample_with_diagnostics
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
     setup_dp_sampling,
@@ -1513,8 +1514,14 @@ class ModelExecutor:
         ends it: an accepted width is cut at the request's stop token or
         token limit before anything reads it (the state commit, the accepted
         frontier, the drafter, the reported tokens)."""
-        output_tokens, accept_lengths = self._sample_and_verify(
-            logits_output, sampling_info, ctx, candidates
+        output_tokens, accept_lengths = sample_with_diagnostics(
+            logits_output,
+            sampling_info,
+            ctx.output_layout,
+            lambda: self._sample_and_verify(
+                logits_output, sampling_info, ctx, candidates
+            ),
+            enabled=self.sampling_backend.config.enable_output_cumulative_probs,
         )
         if self.drafter is not None:
             # The stop conditions cut what the drafter has the round commit.
@@ -2700,6 +2707,7 @@ class ModelExecutor:
             input_top_logprobs_idx=forward_logprobs.input_top_logprobs_idx,
             output_top_logprobs_val=forward_logprobs.output_top_logprobs_val,
             output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
+            output_token_cumulative_probs=forward_logprobs.output_token_cumulative_probs,
         )
 
     def _input_logprob_rows(

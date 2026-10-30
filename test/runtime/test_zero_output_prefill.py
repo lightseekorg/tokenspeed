@@ -36,6 +36,9 @@ import torch
 
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.logits_processor_output import (
+    LogitsProcessorOutput as Output,
+)
 from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
 )
@@ -74,20 +77,6 @@ def load_symbol(path, name, *, owner=None, **bindings):
     )
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), scope)
     return scope[name]
-
-
-@dataclasses.dataclass
-class Output:
-    next_token_logits: torch.Tensor
-    next_token_ids: torch.Tensor | None = None
-    next_token_logprobs: torch.Tensor | None = None
-    hidden_states: torch.Tensor | None = None
-    logits_layout_plan: object = None
-    input_token_logprobs: torch.Tensor | None = None
-    input_top_logprobs_val: torch.Tensor | None = None
-    input_top_logprobs_idx: torch.Tensor | None = None
-    sampled_top_logprobs_val: torch.Tensor | None = None
-    sampled_top_logprobs_idx: torch.Tensor | None = None
 
 
 class SharedBufferSampler:
