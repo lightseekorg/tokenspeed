@@ -1332,12 +1332,11 @@ cache lengths.
 #### Balanced split schedule
 
 Under a captured graph the split count above follows the padded batch, so a
-few long requests among short ones leave CUs idle. `mha_decode_schedule_policy`
-(`supports_`/`limits_`/`prefers_gluon_mha_decode_balanced_gfx950`) decides on
-the host, from each request's page count, when a balanced schedule pays; the
-caller computes one per step with `mha_decode_schedule`
-(`gluon_mha_decode_schedule_gfx950`) and passes it to
-`mha_decode_with_kvcache`, which then selects
+few long requests among short ones leave CUs idle. For calls whose shape
+takes a balanced schedule (`mha_decode_takes_schedule`, from
+`prefers_gluon_mha_decode_balanced_gfx950`), the caller computes one per step
+with `mha_decode_schedule` (`gluon_mha_decode_schedule_gfx950`) and passes it
+to `mha_decode_with_kvcache`, which then selects
 `gluon_mha_decode_balanced_gfx950` and its reduce,
 `gluon_mha_decode_balanced_reduce_gfx950`.
 
@@ -1357,9 +1356,12 @@ caller computes one per step with `mha_decode_schedule`
 - The reduce finds a row's partials from its request's first slot and split
   count, stored next to each other, and loads them 16 bytes per lane in one
   tile of 16 or 64 splits. A row without keys merges to its sink alone.
-- The policy weighs each path's busiest CU (items over the CUs times the
-  pages each streams, plus 3 pages per balanced item for its lookup) and
-  considers balancing only from 512 pages on (thresholds measured on MI350X).
+- The choice is by shape only: calls whose rows of one KV head take a
+  multi-wave work-group (e.g. speculative verify) take the schedule. There it
+  matched or beat the split grid at every batch (1-64 requests) and length
+  (8k-190k, uniform and mixed) measured on MI355X, counting the 4-7 us
+  schedule once per step; one-wave work-groups (plain decode) lost up to
+  ~20% on uniform batches of 4 or more requests and keep the split grid.
   Batch sizes and lengths are runtime values: the kernels compile once per
   layer shape.
 

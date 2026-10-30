@@ -26,7 +26,6 @@ import builtins
 import math
 from typing import NamedTuple
 
-import numpy as np
 import torch
 from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
@@ -1570,9 +1569,9 @@ def launch_gluon_mha_decode_gfx950(
 # lengths (a drafter's steps since) still covers every key; it only balances
 # the work less evenly.
 #
-# prefers_gluon_mha_decode_balanced_gfx950() decides on the host, from the
-# requests' page counts, when the balanced path beats the split grid; callers
-# use the split grid otherwise.
+# prefers_gluon_mha_decode_balanced_gfx950() tells, from the call's shape
+# alone, whether its calls should take the balanced path; callers use the
+# split grid otherwise.
 
 _BALANCED_TARGET_PROGRAMS = 2 * _GFX950_SM_COUNT
 _BALANCED_MIN_SPLIT_PAGES = 2
@@ -1583,13 +1582,6 @@ _BALANCED_STAGES = 2
 # Splits of at least this many pages are rounded to whole pipeline
 # iterations; shorter ones would lose more to the rounding than they save.
 _BALANCED_ALIGN_MIN_PAGES = 16
-# The balanced path is considered only when the longest request spans at
-# least this many pages (32k tokens at page size 64): below it, it never beat
-# the split grid (measured on MI350X).
-_BALANCED_MIN_PAGES = 512
-# What a balanced work item's schedule lookup costs, in pages streamed, when
-# weighing it against the split grid (measured on MI350X).
-_BALANCED_ITEM_PAGES = 3
 # Schedule rows one round of vector loads covers: a work-group finds its
 # request with three loads (first slots, split counts, lengths) for batches of
 # up to this many requests.
@@ -2332,14 +2324,6 @@ def launch_gluon_mha_decode_balanced_gfx950(
     return output
 
 
-def supports_gluon_mha_decode_balanced_gfx950(
-    max_seqlen_k: int, page_size: int
-) -> bool:
-    """Whether calls whose lengths reach ``max_seqlen_k`` (the model's
-    context limit) can ever prefer the balanced path."""
-    return max_seqlen_k >= _BALANCED_MIN_PAGES * page_size
-
-
 def _balanced_row_blocks_of(
     num_q_heads: int, num_kv_heads: int, max_seqlen_q: int
 ) -> int:
@@ -2348,72 +2332,19 @@ def _balanced_row_blocks_of(
     return num_kv_heads * math.ceil(max_seqlen_q * group_size / block_m)
 
 
-def limits_gluon_mha_decode_balanced_gfx950(
-    *, num_q_heads: int, num_kv_heads: int, max_seqlen_q: int
-) -> tuple[int, int]:
-    """(min_pages, max_requests): the balanced path can be preferred only
-    for batches whose longest request spans at least min_pages pages and
-    that hold at most max_requests requests. With more, every request's row
-    blocks leave at most one work item per request to share out, too few
-    for balancing to beat the split grid."""
-    row_blocks = _balanced_row_blocks_of(num_q_heads, num_kv_heads, max_seqlen_q)
-    return _BALANCED_MIN_PAGES, (_BALANCED_TARGET_PROGRAMS - 1) // row_blocks - 1
-
-
 def prefers_gluon_mha_decode_balanced_gfx950(
-    pages,
-    *,
-    num_q_heads: int,
-    num_kv_heads: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    page_size: int,
+    *, num_q_heads: int, num_kv_heads: int, max_seqlen_q: int
 ) -> bool:
-    """Whether the balanced path beats the split grid for requests holding
-    ``pages`` KV pages each (a padding request counts one), on the host.
+    """Whether full-attention decode calls of this shape should take the
+    balanced path, whatever the batch and lengths.
 
-    Both are weighed by their busiest CU: items over the CUs times the pages
-    each streams. The split grid's split count comes from the padded batch
-    and max_seqlen_k, as get_config chooses it; a balanced item also pays
-    _BALANCED_ITEM_PAGES for its schedule lookup, and its split size is
-    estimated by giving every request its first split before sharing the
-    rest of the items.
-
-    Args:
-        pages: Per-request page counts of the (padded) batch.
-        num_q_heads, num_kv_heads, max_seqlen_q: The decode call's shape.
-        max_seqlen_k: The split grid's max_seqlen_k (the context limit under
-            graphs).
-        page_size: The KV cache's page size.
+    Yes when a request's rows of one KV head (max_seqlen_q x the GQA group)
+    take a multi-wave work-group (e.g. speculative verify): there the
+    balanced path matched or beat the split grid at every batch (1-64
+    requests) and length (8k-190k, uniform and mixed) measured, counting its
+    once-per-step schedule. With one-wave work-groups (e.g. plain decode at
+    GQA groups of 16 or less) it lost up to ~20% on uniform batches of 4 or
+    more requests, so those keep the split grid (MI355X).
     """
-    pages = np.asarray(pages, dtype=np.int64)
-    num_requests = pages.size
-    min_pages, max_requests = limits_gluon_mha_decode_balanced_gfx950(
-        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, max_seqlen_q=max_seqlen_q
-    )
-    if num_requests == 0 or num_requests > max_requests:
-        return False
-    longest = int(pages.max())
-    if longest < min_pages:
-        return False
-    row_blocks = _balanced_row_blocks_of(num_q_heads, num_kv_heads, max_seqlen_q)
-    grid_splits = select_kv_splits(
-        base_ctas=num_requests * row_blocks,
-        num_pages=triton.cdiv(max_seqlen_k, page_size),
-        sm_count=_GFX950_SM_COUNT,
-        max_splits=_FULL_DECODE_MAX_SPLITS,
-    )
-    grid_load = triton.cdiv(
-        num_requests * row_blocks * grid_splits, _GFX950_SM_COUNT
-    ) * triton.cdiv(longest, grid_splits)
-    spare = _BALANCED_TARGET_PROGRAMS - row_blocks * num_requests
-    split_pages = builtins.max(
-        triton.cdiv(row_blocks * int(pages.sum()), spare),
-        _BALANCED_MIN_SPLIT_PAGES,
-        triton.cdiv(longest, _BALANCED_MAX_SPLITS),
-    )
-    slots = int(np.maximum(-(-pages // split_pages), 1).sum())
-    balanced_load = triton.cdiv(row_blocks * slots, _GFX950_SM_COUNT) * (
-        split_pages + _BALANCED_ITEM_PAGES
-    )
-    return balanced_load < grid_load
+    _, num_warps = _row_tile(max_seqlen_q, num_q_heads // num_kv_heads)
+    return num_warps > 1

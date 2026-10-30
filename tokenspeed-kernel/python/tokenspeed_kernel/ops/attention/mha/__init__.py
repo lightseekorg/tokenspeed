@@ -21,9 +21,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from functools import partial
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -444,40 +442,17 @@ def mha_extend_with_kvcache(
 # Feature of decode kernels that take a split schedule (mha_decode_schedule).
 _SPLIT_SCHEDULE = frozenset({"split_schedule"})
 
-# Schedule-reading decode kernel -> (supports, limits, prefers): whether
-# calls whose lengths reach max_seqlen_k can prefer it, the batches that can
-# (min_pages, max_requests), and whether it beats the default decode for a
-# batch's per-request page counts.
-_SCHEDULE_POLICIES: dict[str, tuple[Callable, Callable, Callable]] = {}
+# Schedule-reading decode kernel -> whether calls of a shape (num_q_heads,
+# num_kv_heads, max_seqlen_q) should take it; the others keep the default.
+_SCHEDULE_PREFERS: dict[str, Callable[..., bool]] = {}
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
-        limits_gluon_mha_decode_balanced_gfx950,
-        prefers_gluon_mha_decode_balanced_gfx950,
-        supports_gluon_mha_decode_balanced_gfx950,
-    )
-
-    _SCHEDULE_POLICIES["gluon_mha_decode_balanced_gfx950"] = (
-        supports_gluon_mha_decode_balanced_gfx950,
-        limits_gluon_mha_decode_balanced_gfx950,
         prefers_gluon_mha_decode_balanced_gfx950,
     )
 
-
-@dataclass(frozen=True)
-class DecodeSchedulePolicy:
-    """When a split schedule beats the default decode for one call shape.
-
-    Attributes:
-        min_pages: A batch whose longest request spans fewer KV pages never
-            prefers the schedule.
-        max_requests: Nor does a batch of more requests.
-        prefers: Per-request page counts (a padding request counts one) ->
-            whether the schedule pays for that batch.
-    """
-
-    min_pages: int
-    max_requests: int
-    prefers: Callable[[Sequence[int]], bool]
+    _SCHEDULE_PREFERS["gluon_mha_decode_balanced_gfx950"] = (
+        prefers_gluon_mha_decode_balanced_gfx950
+    )
 
 
 def _decode_selection(
@@ -674,7 +649,7 @@ def mha_decode_schedule(
     computed once per step from ``cache_seqlens``. Call this after the
     lengths change, with the arguments of the :func:`mha_decode_with_kvcache`
     calls that will read it, and pass the result to them as ``schedule``.
-    :func:`mha_decode_schedule_policy` tells when that pays.
+    :func:`mha_decode_takes_schedule` tells which calls take one.
 
     Args:
         q, k_cache, v_cache, cache_seqlens, max_seqlen_q, window_left,
@@ -687,8 +662,8 @@ def mha_decode_schedule(
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
-        The schedule, or None when no decode kernel for these arguments reads
-        one.
+        The schedule, or None when these calls take none
+        (:func:`mha_decode_takes_schedule`).
     """
     kernel = _schedule_kernel(
         "mha_decode_schedule",
@@ -734,13 +709,12 @@ def mha_decode_schedule(
         )
 
 
-def mha_decode_schedule_policy(
+def mha_decode_takes_schedule(
     *,
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     max_seqlen_q: int,
-    max_seqlen_k: int,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -750,56 +724,38 @@ def mha_decode_schedule_policy(
     v_scale: torch.Tensor | None = None,
     fp8_kv_scales: tuple[float, float] | None = None,
     solution: str | None = None,
-) -> DecodeSchedulePolicy | None:
-    """When a split schedule (:func:`mha_decode_schedule`) beats the default
-    decode for these calls, decided on the host.
+) -> bool:
+    """Whether :func:`mha_decode_with_kvcache` calls with these arguments
+    should pass a split schedule (:func:`mha_decode_schedule`): a
+    schedule-reading kernel serves them and beats the default for their
+    shape, whatever the batch and lengths.
 
     Args:
         q, k_cache, v_cache: Tensors of the decode call's dtypes and shapes,
             ``q`` shaped [rows, heads, dim]; only their metadata is read
             (meta tensors work).
-        max_seqlen_q, max_seqlen_k, window_left, logit_cap, sinks, return_lse,
-        q_scale, k_scale, v_scale, fp8_kv_scales, solution: As for
+        max_seqlen_q, window_left, logit_cap, sinks, return_lse, q_scale,
+        k_scale, v_scale, fp8_kv_scales, solution: As for
             :func:`mha_decode_with_kvcache`.
-
-    Returns:
-        None when no batch of these calls can prefer a schedule (no
-        schedule-reading kernel serves them, or their lengths cannot reach
-        where one pays); else the calls' policy.
     """
-    decode = _schedule_kernel(
-        "mha_decode_with_kvcache",
-        q,
-        k_cache,
-        v_cache,
-        max_seqlen_q,
-        window_left,
-        logit_cap,
-        sinks,
-        return_lse,
-        q_scale,
-        k_scale,
-        v_scale,
-        fp8_kv_scales,
-        solution,
-    )
-    policy = None if decode is None else _SCHEDULE_POLICIES.get(decode.name)
-    if policy is None:
-        return None
-    supports, limits, prefers = policy
-    page_size = k_cache.shape[1]
-    if not supports(max_seqlen_k, page_size):
-        return None
-    shape = dict(
-        num_q_heads=q.shape[1], num_kv_heads=k_cache.shape[2], max_seqlen_q=max_seqlen_q
-    )
-    min_pages, max_requests = limits(**shape)
-    return DecodeSchedulePolicy(
-        min_pages=min_pages,
-        max_requests=max_requests,
-        prefers=partial(
-            prefers, max_seqlen_k=max_seqlen_k, page_size=page_size, **shape
-        ),
+    return (
+        _schedule_kernel(
+            "mha_decode_with_kvcache",
+            q,
+            k_cache,
+            v_cache,
+            max_seqlen_q,
+            window_left,
+            logit_cap,
+            sinks,
+            return_lse,
+            q_scale,
+            k_scale,
+            v_scale,
+            fp8_kv_scales,
+            solution,
+        )
+        is not None
     )
 
 
@@ -821,7 +777,8 @@ def _schedule_kernel(
 ):
     """The schedule-reading decode kernel for these arguments
     (``mode="mha_decode_with_kvcache"``) or its solution's kernel for
-    ``mode``, or None when no decode kernel for them reads a schedule.
+    ``mode``, or None when these calls take no schedule (no decode kernel
+    for them reads one, or it does not pay for their shape).
     Memoized on what the selection reads (dtypes, shapes past the rows,
     options, active kernel overrides), since a step computes its schedule on
     the host path."""
@@ -907,6 +864,13 @@ def _select_schedule_kernel(
             traits=traits,
             solution=solution,
         )
+        prefers = _SCHEDULE_PREFERS.get(decode.name)
+        if prefers is None or not prefers(
+            num_q_heads=q.shape[1],
+            num_kv_heads=k_cache.shape[2],
+            max_seqlen_q=max_seqlen_q,
+        ):
+            return None
         if mode == "mha_decode_with_kvcache":
             return decode
         return select_kernel(
@@ -935,6 +899,5 @@ __all__ = [
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
     "mha_decode_schedule",
-    "mha_decode_schedule_policy",
-    "DecodeSchedulePolicy",
+    "mha_decode_takes_schedule",
 ]
