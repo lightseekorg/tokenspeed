@@ -2613,9 +2613,13 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
 // without one, the same holds: f1 evicts h's tail and its checkpoints at 27
 // while g's input is unmarked, and the checkpoint at 22 as well, as g's
 // reclaim, once g finished -- the same prompt as g then loads it back from
-// the Host, or without one starts over.
+// the Host, or without one starts over. The Host has room for every store, so
+// it keeps the checkpoint at 22: with a parent fewer the finishes' stores
+// evict there, where g's hit dated s1's whole prefix alike, and with four KV
+// shards the tie rule (one child first) takes that checkpoint.
 TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersInputUnmarked) {
     device_pages_ = 15;
+    host_pages_ = 14;
     for (const auto& [policy, host_cache] : {std::pair{SchedulerConfig::HostWritePolicy::kWriteBack, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, false}}) {

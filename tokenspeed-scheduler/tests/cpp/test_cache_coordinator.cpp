@@ -2986,6 +2986,65 @@ TEST(CacheCoordinatorHostReplacement, CrossGroupUsesMostRecentChildAccess) {
     }
 }
 
+// Write-through keeps a Host copy of what the Device holds, and a Device hit
+// acquires only the Device's entries. The hit dates the Host copies of its
+// pages, its KV tail and its checkpoint with its own epoch, so the Host's LRU
+// takes a page nobody hit rather than the hot prefix the Host stored before it.
+TEST(CacheCoordinatorHostReplacement, ADeviceHitRefreshesTheHostCopiesItHits) {
+    BlockPool device_pool(16, {1, 1});
+    BlockPool host_pool(5, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    // Two pages and a tail at 10, where the previous turn's prompt ended.
+    const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const ContentHash tail = HashPrefixPage(token_span(tokens).subspan(8, 2), hashes[1]);
+    const std::array hit_keys{Key(hashes[0], 0), Key(hashes[1], 0), Key(tail, 0), Key(tail, 1)};
+    const CacheKey cold = Key("cold", 0);
+    // The Host stored the prefix first, then a page nobody hits, which fills
+    // it; the Device holds the prefix too.
+    for (const CacheKey& key : hit_keys) {
+        CacheBoundaryForGroup(coordinator, host_pool, key.content_hash, key.group_id,
+                              CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*logical_block_index=*/-1);
+    }
+    CacheBoundaryForGroup(coordinator, host_pool, cold.content_hash, cold.group_id,
+                          CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*logical_block_index=*/-1);
+    for (const CacheKey& key : hit_keys) {
+        CacheBoundaryForGroup(coordinator, device_pool, key.content_hash, key.group_id,
+                              CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*logical_block_index=*/-1);
+    }
+    coordinator.CacheHostTail(hashes[1], TailPublication{.tail_tokens = 2, .hash = tail});
+
+    CacheCoordinator::PrefixProbe probe =
+        coordinator.ProbePromptPrefix({.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 10});
+    ASSERT_EQ(probe.device_only_hit_tokens, 10) << "the Device alone resumes at the tail";
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const auto result = AdmitForTest(coordinator, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->load_pairs.empty()) << "the Host supplies nothing";
+    for (const CacheKey& key : hit_keys) {
+        const CacheBlockRef host_copy = coordinator.FindHostCachedBlock(key);
+        ASSERT_TRUE(host_copy);
+        EXPECT_EQ(coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
+                      .MetadataFor(host_pool, host_copy->Location())
+                      ->last_access_epoch,
+                  result->access_epoch)
+            << key.content_hash << " in group " << key.group_id;
+    }
+
+    // One more Host block evicts the least recently used entry.
+    ASSERT_TRUE(coordinator.AcquireHostBlock(0, /*bucket=*/0));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(cold));
+    for (const CacheKey& key : hit_keys) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key)) << key.content_hash << " in group " << key.group_id;
+    }
+}
+
 TEST(CacheCoordinatorHostReplacement, EqualEpochDoesNotProtectPreviouslyAcquiredEntry) {
     BlockPool device_pool(2, {2});
     BlockPool host_pool(1, {2});
@@ -4708,7 +4767,8 @@ INSTANTIATE_TEST_SUITE_P(L3OffAndOn, HostSuffixHitTest, ::testing::Bool());
 
 // A checkpoint on the Device's last full page, aligned: the Device keeps the KV
 // of pages h0-h3, the Host the three checkpoints at 16. The hit is 16 with no
-// KV loaded; a Host copy of the same pages changes nothing.
+// KV loaded; a Host copy of the same pages changes nothing but its epoch, which
+// the Device hit dates as the Host hit dates the checkpoints.
 TEST_P(HostSuffixHitTest, ADeviceKvPrefixResumesAtAHostCheckpointOnItsLastPage) {
     std::vector<CacheBlockLocation> device_pages;
     for (std::size_t page = 0; page < 4; ++page) {
@@ -4743,6 +4803,73 @@ TEST_P(HostSuffixHitTest, ADeviceKvPrefixResumesAtAHostCheckpointOnItsLastPage) 
         for (std::size_t page = 0; page < 4; ++page) {
             EXPECT_EQ(tables[0].Blocks()[page]->Location(), device_pages[page]) << "the Device's own KV page";
         }
+        if (!host_duplicates) {
+            continue;
+        }
+        for (std::size_t page = 0; page < 4; ++page) {
+            const CacheBlockRef host_copy = coordinator_.FindHostCachedBlock(Key(hashes_[page], 0));
+            ASSERT_TRUE(host_copy);
+            EXPECT_EQ(coordinator_.GroupPrefixIndex(0).MetadataFor(host_, host_copy->Location())->last_access_epoch,
+                      result->access_epoch);
+        }
+    }
+}
+
+// A Device hit at a page boundary -- the KV of h0-h3 and the checkpoints at
+// 16 -- dates the Host copies of what it hits with its epoch, and only those:
+// the Host has no copy of h2, and h4, which it holds past the hit, and the
+// checkpoints at 8, which the hit passes, keep their epochs.
+TEST_P(HostSuffixHitTest, ADeviceHitDatesTheHostCopiesOfWhatItHitsAlone) {
+    std::vector<CacheKey> hit_keys;
+    for (std::size_t page = 0; page < 4; ++page) {
+        hit_keys.push_back(Key(hashes_[page], 0));
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        hit_keys.push_back(Key(hashes_[3], group));
+    }
+    std::vector<CacheKey> kept_keys{Key(hashes_[4], 0)};
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        kept_keys.push_back(Key(hashes_[1], group));
+    }
+    for (const CacheKey& key : hit_keys) {
+        if (key.content_hash != hashes_[2]) {
+            Put(host_, key.content_hash, key.group_id);
+        }
+    }
+    for (const CacheKey& key : kept_keys) {
+        Put(host_, key.content_hash, key.group_id);
+    }
+    for (const CacheKey& key : hit_keys) {
+        Put(device_, key.content_hash, key.group_id);
+    }
+    const auto host_epoch = [&](const CacheKey& key) {
+        return coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
+            .MetadataFor(host_, coordinator_.FindHostCachedBlock(key)->Location())
+            ->last_access_epoch;
+    };
+    std::vector<std::uint64_t> kept_epochs;
+    for (const CacheKey& key : kept_keys) {
+        kept_epochs.push_back(host_epoch(key));
+    }
+
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    ASSERT_EQ(probe.device_only_hit_tokens, 16);
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->load_pairs.empty());
+    for (const CacheKey& key : hit_keys) {
+        if (key.content_hash == hashes_[2]) {
+            EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(key));
+        } else {
+            ASSERT_TRUE(coordinator_.ContainsHostCachedBlock(key));
+            EXPECT_EQ(host_epoch(key), result->access_epoch) << key.content_hash << " in group " << key.group_id;
+        }
+    }
+    for (std::size_t i = 0; i < kept_keys.size(); ++i) {
+        ASSERT_TRUE(coordinator_.ContainsHostCachedBlock(kept_keys[i]));
+        EXPECT_EQ(host_epoch(kept_keys[i]), kept_epochs[i])
+            << kept_keys[i].content_hash << " in group " << kept_keys[i].group_id;
     }
 }
 
@@ -12401,9 +12528,10 @@ TEST_F(WriteBackTransactionTest, ASegmentPublishesOnlyAtItsLastAck) {
 
 // The Host holds every block of X already: the eviction copies nothing and
 // issues no op, and the segment settles at once, each entry with the newer of
-// its Host and Device epochs -- the Device's for the pages, which a hit
-// touched after their Host copies were made, the Host's for the tail and its
-// checkpoints, copied after that hit.
+// its Host and Device epochs -- the Device's for the pages, which a second
+// publication of X touched after their Host copies were made (a hit would
+// date the Host copies with it), the Host's for the tail and its checkpoints,
+// copied after that publication.
 TEST_F(WriteBackTransactionTest, ASegmentAlreadyOnTheHostSettlesWithoutAnOp) {
     const std::vector<std::int32_t> tokens = MakeTokens(18);
     std::vector<BlockTable> tables(4);
@@ -12413,8 +12541,8 @@ TEST_F(WriteBackTransactionTest, ASegmentAlreadyOnTheHostSettlesWithoutAnOp) {
     for (std::size_t page = 0; page < 4; ++page) {
         StoreOnHost(keys[page]);
     }
-    CacheCoordinatorTestAccess::MatchPromptPrefix(
-        coordinator_, CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 18});
+    PublishFinal(tables, tokens);
+    coordinator_.Free(tables);
     for (std::size_t member = 4; member < keys.size(); ++member) {
         StoreOnHost(keys[member]);
     }

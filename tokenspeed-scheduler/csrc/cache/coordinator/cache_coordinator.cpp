@@ -1128,6 +1128,23 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
             tails_.Touch(tier->tail->hash);
         }
     }
+    // A Device hit acquires the Device's entries alone. The Host copies of
+    // its pages, tail and checkpoint (write-through's stores, or what a
+    // load-back read) take its epoch here too (Registering an existing entry
+    // only re-dates it, keeping its position and boundary kind), so the
+    // Host's LRU follows their use rather than the order they were stored
+    // in, which would age a hot prefix out of the Host first.
+    if (host_pool_ != nullptr) {
+        forEachStorageDependency(probe.device, *probe.group_keys, /*floor_tokens=*/0,
+                                 [&](const CacheKey& key, std::int32_t /*logical_block*/) {
+                                     PrefixCacheIndex& index = groups_[key.group_id].Index();
+                                     if (CacheBlockRef block = index.Find(*host_pool_, key)) {
+                                         index.Register(*host_pool_, block, key, access_epoch,
+                                                        /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                        /*newly_cached=*/nullptr);
+                                     }
+                                 });
+    }
     out.device = acquireTierWithKeys<CacheTier::kDevice>(*probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
                                                          access_epoch);
     // The storage tier is never acquired: an admission loads Host entries
