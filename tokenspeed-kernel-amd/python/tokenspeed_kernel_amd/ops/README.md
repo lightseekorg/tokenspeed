@@ -1433,6 +1433,13 @@ Sequences are the slowest grid axis, so one sequence's blocks are dispatched
 together. Interleaved with the blocks of sequences that have no keys, as in a
 prefix chunk next to new requests, a long sequence ran about 1.7x slower.
 
+Non-causal FP8 launches whose prefixes are at most 16 tiles compile with
+`amdgpu-sched-strategy=max-memory-clause`. Each block then walks only a few
+tiles, so the launch waits on one block's latency, worst when it shares the
+grid with the output-only blocks of new sequences; clustered memory
+instructions make those launches up to 1.18x faster. Longer prefixes keep the
+default scheduler, which is 3–5% faster there.
+
 ### gfx950 GDN decode and MTP verify
 
 `gluon_gdn_decode_gfx950` runs the sigmoid-gated delta-rule recurrence for

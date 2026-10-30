@@ -1069,6 +1069,7 @@ class LaunchConfig(NamedTuple):
     split_tiles: int
     split_programs: int
     split_slots: int
+    llvm_fn_attrs: str | None
 
 
 # Launches that leave workgroup slots idle split each query block's keys over
@@ -1151,6 +1152,13 @@ def get_config(
     if not split_kv:
         max_splits = 1
         split_slots = 0
+    # Short FP8 prefixes give each block a few key tiles, so a launch is
+    # bound by one block's latency, worst next to the output-only blocks of
+    # new sequences. Clustering memory instructions shortens a block; at
+    # longer prefixes it costs 3-5%.
+    llvm_fn_attrs = None
+    if is_fp8 and not is_causal and max_seqlen_kv <= _SPLIT_MIN_TILES * block_n:
+        llvm_fn_attrs = "amdgpu-sched-strategy=max-memory-clause"
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -1171,6 +1179,7 @@ def get_config(
         split_tiles=split_tiles,
         split_programs=split_programs,
         split_slots=split_slots,
+        llvm_fn_attrs=llvm_fn_attrs,
     )
 
 
@@ -1306,6 +1315,7 @@ def launch_gluon_mla_prefill_gfx1250(
         config.split_kv,
         num_warps=config.num_warps,
         waves_per_eu=config.waves_per_eu,
+        **({"llvm_fn_attrs": config.llvm_fn_attrs} if config.llvm_fn_attrs else {}),
     )
     if config.split_kv:
         gluon_mla_prefill_merge_gfx1250[

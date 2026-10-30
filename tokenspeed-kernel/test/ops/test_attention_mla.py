@@ -187,7 +187,42 @@ def test_gfx1250_mla_prefill_kv_splits(
         is_causal=is_causal,
     )
     assert config.split_kv
+    _check_gfx1250_prefill(q_lens, kv_lens, is_causal, q, k, v, out, lse)
 
+
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [
+        pytest.param((300,), (64,), id="one-tile"),
+        pytest.param((200, 700), (560, 0), id="prefix-then-new-sequence"),
+        pytest.param((700, 200), (0, 560), id="new-sequence-then-prefix"),
+        pytest.param((128, 384, 256), (1000, 64, 1024), id="unequal-prefixes"),
+    ],
+)
+def test_gfx1250_mla_prefill_short_prefix(
+    device: str, q_lens: tuple[int, ...], kv_lens: tuple[int, ...]
+) -> None:
+    """Short FP8 prefixes compile with the memory-clause scheduler."""
+    if not current_platform().is_cdna5:
+        pytest.skip("Short-prefix MLA prefill scheduling targets CDNA5")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla import prefill
+
+    q, k, v, out, lse = _run_gfx1250_prefill(device, q_lens, kv_lens, False)
+    config = prefill.get_config(
+        q=q,
+        k=k,
+        cu_seqlens_q=torch.zeros(len(q_lens) + 1),
+        max_seqlen_q=max(q_lens),
+        max_seqlen_kv=max(kv_lens),
+        softmax_scale=1.0,
+        is_causal=False,
+    )
+    assert not config.split_kv
+    assert config.llvm_fn_attrs == "amdgpu-sched-strategy=max-memory-clause"
+    _check_gfx1250_prefill(q_lens, kv_lens, False, q, k, v, out, lse)
+
+
+def _check_gfx1250_prefill(q_lens, kv_lens, is_causal, q, k, v, out, lse) -> None:
     q_offset = 0
     kv_offset = 0
     for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
@@ -218,10 +253,12 @@ def test_gfx1250_mla_prefill_kv_splits_reuse_compiles(device: str) -> None:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla import prefill
     from utils import assert_no_triton_compile
 
-    # Warm both kernels of each mode with and without splits.
+    # Warm both kernels of each mode with and without splits, and the
+    # short-prefix scheduling.
     for is_causal in (False, True):
         _run_gfx1250_prefill(device, (853, 1045), (853, 1045), is_causal)
         _run_gfx1250_prefill(device, (300,), (5000,), is_causal)
+    _run_gfx1250_prefill(device, (300,), (500,), False)
     with assert_no_triton_compile(
         prefill.gluon_mla_prefill_gfx1250, prefill.gluon_mla_prefill_merge_gfx1250
     ):
@@ -230,6 +267,8 @@ def test_gfx1250_mla_prefill_kv_splits_reuse_compiles(device: str) -> None:
             ((848, 7344), (16384, 0)),
             ((8192,), (16384,)),
             ((257, 31, 1000), (4097, 65, 12000)),
+            ((288, 7904), (560, 0)),
+            ((128, 128, 128), (64, 1024, 0)),
         ):
             _run_gfx1250_prefill(device, q_lens, kv_lens, False)
         for q_lens in ((848,), (2048,), (5376,), (8192,)):
