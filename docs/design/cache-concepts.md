@@ -117,7 +117,7 @@ The pool knows which child slots are occupied, never who holds them. Whether a
 child is pinned by a request table, published by a prefix-cache entry, or held
 by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
 the holders; the pool does not track it, and `CacheBlockRef` does not report
-it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
+it to the pool. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
 (`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
 eviction policy and leak checks, not for per-step accounting.
 
@@ -126,6 +126,14 @@ request fits, it does not enumerate eviction candidates. Under memory pressure,
 it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
+
+The prefix index remembers which entries an eviction traversal found pinned.
+Later admission attempts skip those entries until the last external block owner
+releases them. A one-shot ownership notification restores each entry to its
+original access epoch, including an epoch changed while it was pinned. This
+keeps the same LRU victim order without repeatedly scanning active requests'
+blocks. Temporary lookups do not update this secondary index. The notification
+belongs to block-reference ownership; the pool still tracks placement alone.
 
 The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
 empty parents come from the pool, active parents from the live requests' block

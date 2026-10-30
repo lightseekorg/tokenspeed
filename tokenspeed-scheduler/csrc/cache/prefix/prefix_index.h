@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iterator>
 #include <list>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -126,18 +127,19 @@ public:
             return;
         }
 
-        cache_index.entries.push_back(CacheEntry{
-            .key = key,
-            .block_ref = block_ref,
-            .last_access_epoch = access_epoch,
-            .logical_block_index = logical_block_index,
-            .boundary_kind = boundary_kind,
-            .max_access_epoch = access_epoch,
-        });
+        CacheEntry& entry = cache_index.entries.emplace_back();
+        entry.key = key;
+        entry.block_ref = block_ref;
+        entry.last_access_epoch = access_epoch;
+        entry.logical_block_index = logical_block_index;
+        entry.boundary_kind = boundary_kind;
+        entry.max_access_epoch = access_epoch;
+        entry.available_order = &cache_index.available_order;
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        cache_index.available_order.emplace(evictionOrder(*entry_it), entry_it);
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
         }
@@ -251,26 +253,37 @@ public:
     // distinguishes them. A later epoch stays unread for the next call.
     bool NextEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor, std::uint64_t max_access_epoch,
                            std::vector<EvictionCandidate>& out) const {
-        if (!PeekEvictionEpoch(pool, cursor)) {
+        const auto next_epoch = PeekEvictionEpoch(pool, cursor);
+        if (!next_epoch || *next_epoch > max_access_epoch) {
             return false;
         }
-        const auto end = cursor.cache_index_->by_eviction_order.end();
-        while (cursor.next_ != end && cursor.next_->first.last_access_epoch <= max_access_epoch) {
-            const std::uint64_t epoch = cursor.next_->first.last_access_epoch;
+        auto& available = cursor.cache_index_->available_order;
+        auto next = available.lower_bound(cursor.next_->first);
+        while (next != available.end() && next->first.last_access_epoch <= max_access_epoch) {
+            const std::uint64_t epoch = next->first.last_access_epoch;
             const std::size_t initial_size = out.size();
-            for (; cursor.next_ != end && cursor.next_->first.last_access_epoch == epoch; ++cursor.next_) {
-                const CacheEntry& cache_entry = *cursor.next_->second;
+            while (next != available.end() && next->first.last_access_epoch == epoch) {
+                const auto current = next++;
+                CacheEntry& cache_entry = *current->second;
                 if (cache_entry.block_ref.unique()) {
                     out.push_back(EvictionCandidate{
                         .location = cache_entry.block_ref->Location(),
                         .metadata = metadataOf(cache_entry),
                     });
+                } else {
+                    // Keep the node for allocation-free restoration when the
+                    // last request/transfer owner releases this block. Ordinary
+                    // temporary Find() references need no index maintenance.
+                    cache_entry.pinned_order = available.extract(current);
+                    cache_entry.unique_observer.Observe(cache_entry.block_ref, restoreAvailable, &cache_entry);
                 }
             }
             if (out.size() != initial_size) {
+                cursor.next_ = cursor.cache_index_->by_eviction_order.upper_bound(lastInEpoch(epoch));
                 return true;
             }
         }
+        cursor.next_ = cursor.cache_index_->by_eviction_order.upper_bound(lastInEpoch(max_access_epoch));
         return false;
     }
 
@@ -404,6 +417,9 @@ private:
         bool was_acquired{false};
         // See CachedBlockMetadata::max_access_epoch.
         std::uint64_t max_access_epoch{0};
+        EvictionOrderMap* available_order{nullptr};
+        EvictionOrderMap::node_type pinned_order;
+        CacheBlockUniqueObserver unique_observer;
     };
 
     struct CacheEntries {
@@ -416,7 +432,19 @@ private:
         std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
         std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
         EvictionOrderMap by_eviction_order;
+        // Entries known to be pinned are removed lazily during traversal.
+        // Ownership notifications restore them without changing their age.
+        mutable EvictionOrderMap available_order;
     };
+
+    static EvictionOrder lastInEpoch(std::uint64_t epoch) noexcept {
+        return EvictionOrder{epoch, std::numeric_limits<std::int32_t>::max(), std::numeric_limits<std::int32_t>::max()};
+    }
+
+    static void restoreAvailable(void* context) noexcept {
+        auto& entry = *static_cast<CacheEntry*>(context);
+        entry.available_order->insert(std::move(entry.pinned_order));
+    }
 
     static CachedBlockMetadata metadataOf(const CacheEntry& cache_entry) noexcept {
         return CachedBlockMetadata{
@@ -445,9 +473,17 @@ private:
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }
-        cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
+        auto order_node = cache_index.by_eviction_order.extract(evictionOrder(*entry_it));
+        auto available_node = cache_index.available_order.extract(evictionOrder(*entry_it));
         entry_it->last_access_epoch = access_epoch;
-        cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        order_node.key() = evictionOrder(*entry_it);
+        cache_index.by_eviction_order.insert(std::move(order_node));
+        if (available_node) {
+            available_node.key() = evictionOrder(*entry_it);
+            cache_index.available_order.insert(std::move(available_node));
+        } else {
+            entry_it->pinned_order.key() = evictionOrder(*entry_it);
+        }
     }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
@@ -484,6 +520,8 @@ private:
         return index_it == cache_index.by_location.end() ? cache_index.entries.end() : index_it->second;
     }
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
+        entry_it->unique_observer.Reset();
+        cache_index.available_order.erase(evictionOrder(*entry_it));
         cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());
