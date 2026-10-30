@@ -397,7 +397,8 @@ def test_read_prefix_history_prefetches_one_window_ahead(reuse):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_a_prefetched_window_waits_for_its_layers_host_load():
+@pytest.mark.parametrize("reuse", [False, True])
+def test_a_prefetched_window_waits_for_its_layers_host_load(reuse):
     """A Host load brings a prefix's later pages in layer by layer on a side
     stream, held back before the second latent layer's copy, behind the
     pools' real ``LayerwiseLoadTracker``. Reading the first latent layer
@@ -424,6 +425,7 @@ def test_a_prefetched_window_waits_for_its_layers_host_load():
     pages = [block * subpages + sub for block in blocks for sub in range(subpages)]
     table = torch.zeros((1, len(pages) + 3), dtype=torch.int32)
     table[0, : len(pages)] = torch.tensor(pages, dtype=torch.int32)
+    bounds = _chunk_plan([prefix_len], chunk_len, reuse).boundaries
     chunks = [
         torch.tensor(chunk, dtype=torch.int32, device="cuda")
         for chunk in _chunk_slots(
@@ -433,7 +435,7 @@ def test_a_prefetched_window_waits_for_its_layers_host_load():
                     for p in range(prefix_len)
                 ]
             ],
-            chunk_len,
+            bounds,
         )
     ]
     every_slot = torch.cat(chunks).to(torch.int64)
@@ -475,8 +477,7 @@ def test_a_prefetched_window_waits_for_its_layers_host_load():
         history.prepare(
             chunks,
             page_table_cpu=table,
-            prefix_lens_cpu=torch.tensor([prefix_len]),
-            chunk_len=chunk_len,
+            chunk_bounds_cpu=bounds,
         )
         # Planned before the load starts, so the reads below enqueue at once.
         num_windows = len(history.windows)
