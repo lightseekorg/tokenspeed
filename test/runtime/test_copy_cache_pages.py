@@ -553,14 +553,14 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             finish(prompts, 1000)
             assert scheduler.tail_entries() == 2
 
-            # A copy, a zeroing and a stream-ordered store first, so the round
-            # below loads no kernel and pins no staging memory: either waits
-            # for the device, the store's held-back copy included.
+            # Warm both store rows, plus copying and zeroing, so the round
+            # below loads no kernel and grows no staging buffer: either can
+            # wait for the device, the store's held-back copy included.
             arena.copy_blocks({group: np.asarray([[tail_a, tail_e]])})
             arena.zero_blocks({group: np.asarray([tail_a])})
             executor._start_writing(  # pylint: disable=protected-access
                 [999],
-                [(0, tail_a, 1)],
+                [(0, tail_a, 1), (0, tail_e, 2)],
                 lane=executor._ordered_write_lane,  # pylint: disable=protected-access
                 prerequisite_stream=torch.cuda.current_stream(),
             )

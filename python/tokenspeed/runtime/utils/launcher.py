@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cluster topology discovery from the launcher environment."""
+"""Launcher environment defaults and cluster topology discovery."""
 
 from __future__ import annotations
 
@@ -42,6 +42,27 @@ DIST_INIT_DEFAULT_PORT = 23456
 
 _BRACKET_RE = re.compile(r"\[([^\]]*)\]")
 _EPHEMERAL_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
+
+
+def set_pinned_allocator_default() -> None:
+    """Default large pinned buffers to exact sizes in fresh worker processes."""
+    # PyTorch reads the first defined variable in this order.
+    key = next(
+        (
+            name
+            for name in (
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "PYTORCH_HIP_ALLOC_CONF",
+                "PYTORCH_ALLOC_CONF",
+            )
+            if name in os.environ
+        ),
+        "PYTORCH_ALLOC_CONF",
+    )
+    config = os.environ.get(key, "").strip().rstrip(",")
+    if "pinned_max_round_threshold_mb" not in config:
+        default = "pinned_max_round_threshold_mb:1024"
+        os.environ[key] = f"{config},{default}" if config else default
 
 
 def _split_top_level(hostlist: str) -> list[str]:
