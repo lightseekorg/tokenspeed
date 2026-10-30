@@ -52,6 +52,34 @@ std::vector<CacheCoordinator::HostPlacementPlan::Victim> CacheCoordinator::hostK
         std::int32_t boundary_tokens;
     };
     std::vector<Candidate> candidates;
+    const std::uint64_t scan_generation = ++host_duplicate_scan_generation_;
+    _assert(scan_generation != 0, "Host duplicate scan generation overflow");
+    std::vector<const BoundaryTree::Node*> ancestors;
+    std::vector<const BoundaryTree::Node*> pending;
+    const auto store_pending_at_or_above = [&](const BoundaryTree::Node& node) {
+        ancestors.clear();
+        const BoundaryTree::Node* ancestor = &node;
+        bool store_pending = false;
+        while (ancestor != nullptr) {
+            if (ancestor->host_store_scan_generation == scan_generation) {
+                store_pending = ancestor->host_store_ancestor_pending;
+                break;
+            }
+            ancestors.push_back(ancestor);
+            if (ancestor->pending_host_stores > 0) {
+                store_pending = true;
+                break;
+            }
+            ancestor = ancestor->parent;
+        }
+        // Candidate chains share ancestors. Cache each answer only within
+        // this scan, while Host stores and tree links cannot change.
+        for (const BoundaryTree::Node* visited : ancestors) {
+            visited->host_store_scan_generation = scan_generation;
+            visited->host_store_ancestor_pending = store_pending;
+        }
+        return store_pending;
+    };
     // Membership follows cache insertions and removals. Device-prefix coverage
     // follows page changes, including gaps opened or filled by a restore.
     for (const BoundaryTree::Node* node = boundary_tree_.FirstHostKvDuplicate(); node != nullptr;
@@ -59,14 +87,7 @@ std::vector<CacheCoordinator::HostPlacementPlan::Victim> CacheCoordinator::hostK
         if (!node->device_kv_prefix_complete) {
             continue;
         }
-        bool store_pending = false;
-        for (const BoundaryTree::Node* ancestor = node; ancestor != nullptr; ancestor = ancestor->parent) {
-            if (ancestor->pending_host_stores > 0) {
-                store_pending = true;
-                break;
-            }
-        }
-        if (store_pending) {
+        if (store_pending_at_or_above(*node)) {
             continue;
         }
         // A checkpoint can need this page only within its lookback distance.
@@ -75,7 +96,8 @@ std::vector<CacheCoordinator::HostPlacementPlan::Victim> CacheCoordinator::hostK
         bool window_needs_page = false;
         if (lookback_tokens > 0) {
             const std::int64_t past_end = node->boundary_tokens + lookback_tokens;
-            std::vector<const BoundaryTree::Node*> pending{node};
+            pending.clear();
+            pending.push_back(node);
             while (!pending.empty()) {
                 const BoundaryTree::Node& boundary = *pending.back();
                 pending.pop_back();

@@ -8720,6 +8720,36 @@ TEST_F(HostKvDuplicateReclaimTest, FreeCapacityKeepsAllDuplicates) {
     EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 7);
 }
 
+TEST_F(HostKvDuplicateReclaimTest, EachPlanRechecksAnAncestorStoreThatStartsAndSettles) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(kP, 1));
+    const std::string ancestor = hashes_.front();
+    coordinator_.Free(tables);
+    PublishKvCopiesAndHostOnlyCheckpoints();
+    const CacheKey first_kv = Key(hashes_.front(), 0);
+    const CacheBlockRef checkpoint = coordinator_.AcquireHostCachedBlock(Key(hashes_.back(), 1));
+    HoldFreeCapacity(host_pool_, /*spare_parents=*/0);
+
+    // Populate a scan's answers before an ancestor begins its write-back.
+    auto first = Allocate(std::array<std::uint32_t, 1>{0});
+    ASSERT_EQ(first.stats.allocated, 1u);
+    coordinator_.CacheHostBlock(first.blocks[0], first_kv, std::nullopt);
+    first.blocks.clear();
+
+    CacheCoordinator::EvictedSegment pending;
+    ASSERT_TRUE(CacheCoordinatorTestAccess::RecordDeviceEviction(coordinator_, Key(ancestor, 1), pending));
+    ASSERT_FALSE(pending.members.empty());
+    const auto protected_plan = Allocate(std::array<std::uint32_t, 1>{0});
+    EXPECT_EQ(protected_plan.stats.allocated, 0u);
+    EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(first_kv));
+
+    coordinator_.SettleEvictedSegment(std::move(pending), /*placed_on_host=*/false);
+    const auto settled = Allocate(std::array<std::uint32_t, 1>{0});
+    EXPECT_EQ(settled.stats.allocated, 1u);
+    EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(first_kv));
+    ExpectHostCheckpoints();
+}
+
 TEST_F(HostKvDuplicateReclaimTest, OlderHostStateLeavesBeforeNewerUnheldDeviceKvCopies) {
     const std::string old = CheckpointOnHost(100, {1, 2, 3}, /*device_keeps_checkpoint=*/false);
     PublishKvCopiesAndHostOnlyCheckpoints();

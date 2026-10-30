@@ -140,6 +140,12 @@ keeps the same LRU victim order without repeatedly scanning active requests'
 blocks. Temporary lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
 
+Host duplicate reclamation checks pending stores on a candidate's ancestor
+chain once per scan and reuses that answer for other candidates sharing it.
+The memo and traversal buffers belong to the scan: the next scan rechecks
+store completions and new tree links. This changes traversal cost without
+changing candidate eligibility or eviction order.
+
 The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
 empty parents come from the pool, active parents from the live requests' block
 tables, and cache-only residency is the remainder `total - empty - active`.
