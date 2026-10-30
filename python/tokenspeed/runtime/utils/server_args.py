@@ -570,6 +570,10 @@ class ServerArgs:
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
 
+    # Run an MTP draft's LM head from an MXFP4 copy of the target's head.
+    # Off by default.
+    draft_lm_head_mxfp4: bool = False
+
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
     # Model-declared constrained decoding policy, reported through server info.
@@ -3317,6 +3321,17 @@ class ServerArgs:
                 "attention-TP rank holds a host shard and keeps the all-reduce "
                 "(anonymous mapping, huge-page friendly). auto: sharded when "
                 "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
+            "--draft-lm-head-mxfp4",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.draft_lm_head_mxfp4,
+            help=(
+                "Run the draft's LM head from an MXFP4 copy of the target's "
+                "BF16 head (about a quarter of its size), for drafts that "
+                "share the target's head. The target's logits do not change; "
+                "the draft's tokens, and so the accept rate, can."
             ),
         )
         parser.add_argument(
