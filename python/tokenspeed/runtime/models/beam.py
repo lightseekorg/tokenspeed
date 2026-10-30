@@ -1520,6 +1520,7 @@ class BeamDraftEmbedding:
 
 class BeamForCausalLM(BaseCausalLM):
     model_cls = BeamModel
+    supports_aux_capture = True
 
     def __init__(self, config: Any, mapping: Any, quant_config: Any) -> None:
         config.validate()

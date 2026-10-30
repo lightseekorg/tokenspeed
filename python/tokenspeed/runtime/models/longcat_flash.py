@@ -956,6 +956,7 @@ class _RuntimeLongcatModel(nn.Module):
 
 class LongcatFlashForCausalLM(_BaseCausalLM):
     model_cls = _RuntimeLongcatModel
+    supports_aux_capture = True
     # The MoE layers size their slots from the placement and route through
     # its tables; load_weights fills every placed replica.
     supports_expert_placement = True
@@ -1018,6 +1019,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         return None
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+        self.require_aux_capture()
         self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers

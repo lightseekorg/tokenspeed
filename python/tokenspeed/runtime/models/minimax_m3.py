@@ -845,6 +845,7 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
     """MiniMax-M3 text model with checkpoint-compatible weight loading."""
 
     model_cls = MiniMaxM3Model
+    supports_aux_capture = True
     fall_back_to_pt_during_load = False
 
     # Ordered checkpoint->parameter-dict renames applied by load_weights.

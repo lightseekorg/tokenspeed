@@ -509,6 +509,8 @@ class _CaptureCausalLM:
         self.model = _CaptureModel(num_layers)
         self.capture_aux_hidden_states = False
 
+    supports_aux_capture = True
+    require_aux_capture = BaseCausalLM.require_aux_capture
     set_dflash_layers_to_capture = BaseCausalLM.set_dflash_layers_to_capture
 
 
@@ -556,6 +558,8 @@ class _TapCausalLM:
         self.model = model
         self.capture_aux_hidden_states = False
 
+    supports_aux_capture = True
+    require_aux_capture = BaseCausalLM.require_aux_capture
     set_dflash_layers_to_capture = BaseCausalLM.set_dflash_layers_to_capture
 
 

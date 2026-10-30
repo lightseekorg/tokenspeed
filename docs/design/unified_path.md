@@ -1516,6 +1516,11 @@ Setup calls only the parent interface
 There is no generic DSpark helper probing for a DeepSeek-specific setter, and
 K3 targets need not implement that setter. EAGLE3 selection remains in this same setup
 phase, including its explicit server-argument override.
+The EAGLE3 and DFLASH capture setters run only on a target that opts in with
+`BaseCausalLM.supports_aux_capture`, one whose forward returns the taps
+`layers_to_capture` names. Any other target fails setup instead of handing
+the draft its final hidden state. DeepSeek V4.1 DSpark selects its taps with
+its own `set_dspark_layers_to_capture` and needs no opt-in.
 
 This runs on every PP stage even when that stage has no executing drafter.
 `wire_target` only binds embeddings, heads, and other execution resources; it

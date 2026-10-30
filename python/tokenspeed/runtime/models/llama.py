@@ -261,6 +261,7 @@ class LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLM(BaseCausalLM):
     model_cls = LlamaModel
+    supports_aux_capture = True
 
     # BitsAndBytes target/stacked modules — kept in sync with the Qwen3 / MoE
     # variants so a single quantization config works across the Llama family.
