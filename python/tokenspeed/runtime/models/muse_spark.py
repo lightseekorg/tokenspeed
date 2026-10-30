@@ -1186,6 +1186,22 @@ class MuseSparkMoE(nn.Module):
         if self.tp_size > 1:
             assert norm.weight is not None
             width = norm.weight.shape[0]
+            if (
+                not owned_rows
+                and route_map is None
+                and iris is not None
+                and iris.can_reduce_scatter_routed_rmsnorm_sum_all_gather(num_tokens)
+            ):
+                # Normalize on token owners and gather the 8x smaller sums
+                # instead of all-reducing every route.
+                return iris.reduce_scatter_routed_rmsnorm_sum_all_gather(
+                    routes.reshape(num_tokens * self.topk, width),
+                    num_tokens,
+                    route_weights,
+                    norm.weight,
+                    norm.eps,
+                    norm.weight_offset,
+                )
             if owned_rows:
                 assert iris is not None
                 routes = iris.reduce_scatter_owned_routes(routes, route_map, num_tokens)
@@ -1397,7 +1413,9 @@ class MuseSparkMoE(nn.Module):
         iris = self.iris_state
         norm_weight = self.post_expert_norm.weight
         assert iris is not None and norm_weight is not None
-        if owned_rows:
+        if owned_rows or iris.can_reduce_scatter_routed_rmsnorm_sum_all_gather(
+            num_tokens
+        ):
             return (
                 iris.acquire_owned_route_input(num_tokens)
                 if iris.owned_route_max_rows
@@ -2488,6 +2506,13 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
                 if isinstance(projection, _MuseGatheredLinear):
                     projection.iris_state = state
+        if owned_route_max_rows:
+            # Startup may never run a batch in the expert TP8 owner-side
+            # window; every layer shares the routed norm's eps and center.
+            norm = self.model.layers[0].mlp.post_expert_norm
+            state.warmup_reduce_scatter_routed_rmsnorm_sum_all_gather(
+                norm.weight, norm.eps, norm.weight_offset
+            )
         return True
 
     def __init__(
