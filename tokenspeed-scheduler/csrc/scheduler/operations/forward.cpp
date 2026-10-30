@@ -300,11 +300,45 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     }
     // The KV walk stops at the probe bound; the D role also reads the prompt's
     // last page and its final tokens for the prompt-end state check.
-    match.probe = probe(CacheCoordinator::PromptPrefix{
+    const CacheCoordinator::PromptPrefix prompt{
         .prefix_hashes = hashes,
         .tokens = request->TokenSlice(0, request->PrefillSize()),
         .max_tokens = max_cacheable_tokens,
-    });
+    };
+    match.probe = probe(prompt);
+    // Opt-in diagnostics deliberately walk more than matching needs. Emit
+    // only a successful first admission, using the pre-admission snapshot.
+    static const bool inspect_prefix = std::getenv("TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS") != nullptr;
+    if (inspect_prefix) {
+        const auto boundaries = coordinator_.InspectPrefixAvailability(prompt);
+        std::string rows;
+        for (const auto& boundary : boundaries) {
+            if (!rows.empty()) {
+                rows += ',';
+            }
+            rows += fmt::format("[{},{},{},{}]", boundary.tokens, boundary.device_missing, boundary.host_missing,
+                                boundary.union_missing);
+        }
+        std::string group_names;
+        for (const std::string& id : cache_group_ids_) {
+            if (!group_names.empty()) {
+                group_names += ',';
+            }
+            group_names += id;
+        }
+        std::string prompt_hashes;
+        for (const std::string& hash : hashes) {
+            if (!prompt_hashes.empty()) {
+                prompt_hashes += ',';
+            }
+            prompt_hashes += hash;
+        }
+        match.prefix_diagnostic = fmt::format(
+            "request={} prompt={} bound={} resumed={} kv={} groups={} hashes={} boundaries=[{}]", request->Id(),
+            request->PrefillSize(), prompt.max_tokens,
+            std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens),
+            std::max(match.probe.device.kv_tokens, match.probe.host.kv_tokens), group_names, prompt_hashes, rows);
+    }
     // The chain progress counts full pages only; a tail is a boundary, not a
     // hashed page.
     const std::int32_t hit_prefix_pages =
@@ -511,6 +545,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
+    if (!match.prefix_diagnostic.empty()) {
+        spdlog::info("[PrefixCacheDiagnostic] {}", match.prefix_diagnostic);
+    }
     recordAdmittedPages(plan, *admission);
     // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
     // the Device's prefix (0 when only checkpoints come from Host), and

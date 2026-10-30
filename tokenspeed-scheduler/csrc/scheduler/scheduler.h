@@ -178,6 +178,7 @@ private:
     bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
+        std::string prefix_diagnostic;
         std::vector<std::string> candidate_prefix_hashes;
         std::vector<std::string> extension_hashes;
         std::vector<std::string> prefix_hashes;

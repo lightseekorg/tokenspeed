@@ -261,6 +261,17 @@ public:
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
+
+    // Read-only physical availability, before admission can evict anything.
+    // A bit names a group missing blocks at this boundary. The union permits
+    // arbitrary tier mixing; it is an upper bound, not a resumable prefix.
+    struct PrefixBoundaryAvailability {
+        std::int32_t tokens{0};
+        std::uint64_t device_missing{0};
+        std::uint64_t host_missing{0};
+        std::uint64_t union_missing{0};
+    };
+    std::vector<PrefixBoundaryAvailability> InspectPrefixAvailability(const PromptPrefix& prompt) const;
     // Full pages only: a probe that enumerates no tails.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
 

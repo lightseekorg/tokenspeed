@@ -2330,3 +2330,21 @@ KVStore disabled, using the target router directly. Local offloaded prefill
 and mixed-arena sleep/wake are unsupported. Eager and CUDA-graph decode
 use the same batch, access, and accepted-writeback hooks; execution details are
 in `unified_path.md`, "Sparse KV offloading".
+
+## Diagnosing prefix cache misses
+
+For a diagnostic replay, setting `TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS` emits
+one `PrefixCacheDiagnostic` line per successful first admission. The snapshot
+is taken before admission can evict blocks and includes the request ID, actual
+resume boundary, KV-only boundary, group names, prompt chain hashes, and candidate boundary rows
+`[tokens, device_missing, host_missing, union_missing]`. Each mask uses bit `i`
+for cache group `i`; replayable groups are excluded. Full KV requires the whole
+prefix, sliding groups their lookback, and State groups their checkpoint at
+that exact boundary. Union availability permits arbitrary Device/Host mixing,
+so a zero union mask is an optimistic physical availability bound, not a claim
+that the tier-suffix matching rule can resume there. Missing entries do not
+by themselves distinguish never-published data from evicted data. The hashes
+let an offline analysis confirm shared full pages against completed earlier
+turns, independently of trace estimates. The extra walk and logging are for
+attribution, not performance measurement; leaving
+the environment variable unset omits both and changes no cache policy.

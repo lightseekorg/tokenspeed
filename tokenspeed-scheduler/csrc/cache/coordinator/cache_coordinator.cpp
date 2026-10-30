@@ -904,6 +904,83 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPr
     return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
+std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::InspectPrefixAvailability(
+    const PromptPrefix& prompt) const {
+    _assert(groups_.size() <= 64, "prefix availability uses one bit per cache group");
+    const auto keys = buildGroupKeys(prompt.prefix_hashes);
+    const auto contains = [&](std::size_t i, const CacheKey& key, std::size_t tier) {
+        const PrefixCacheIndex& index = groups_[i].Index();
+        const bool device = tier != 1 && index.Contains(pool_, key);
+        const bool host = tier != 0 && host_pool_ != nullptr && index.Contains(*host_pool_, key);
+        return device || host;
+    };
+    // A closed group's first hole bounds every later boundary. Compute it
+    // once; rescanning the entire prefix per boundary would be quadratic.
+    std::vector<std::array<std::int32_t, 3>> first_missing(groups_.size());
+    for (const std::size_t i : match_order_) {
+        if (!groups_[i].Matcher().IsPrefixClosed()) {
+            continue;
+        }
+        for (std::size_t tier = 0; tier < 3; ++tier) {
+            std::int32_t block = 0;
+            while (static_cast<std::size_t>(block) < keys[i].size() &&
+                   contains(i, keys[i][static_cast<std::size_t>(block)], tier)) {
+                ++block;
+            }
+            first_missing[i][tier] = block;
+        }
+    }
+    std::vector<PrefixBoundaryAvailability> out;
+    forEachCandidateBoundary(
+        prompt, /*floor_tokens=*/0, prompt.max_tokens,
+        [&](std::int32_t page_tokens, std::int32_t tail_tokens, const ContentHash& hash) {
+            std::array<std::uint64_t, 3> missing{};
+            const std::int32_t boundary = page_tokens + tail_tokens;
+            for (const std::size_t i : match_order_) {
+                const auto tail_keys =
+                    tail_tokens > 0 ? tailKeysForGroup(i, hash, tail_tokens) : std::vector<CacheKey>{};
+                for (std::size_t tier = 0; tier < 3; ++tier) {
+                    bool available = true;
+                    if (GroupIsState(i)) {
+                        const CacheKey key =
+                            tail_tokens > 0 ? tail_keys[0]
+                                            : CacheKey{.group_id = groups_[i].Id(),
+                                                       .content_hash = prompt.prefix_hashes[static_cast<std::size_t>(
+                                                           page_tokens / prefix_granularity_ - 1)],
+                                                       .page_offset = 0};
+                        available = contains(i, key, tier);
+                    } else {
+                        const std::int32_t granularity = geometry_[i].BlockGranularity();
+                        const std::int32_t full_blocks = page_tokens / granularity;
+                        if (groups_[i].Matcher().IsPrefixClosed()) {
+                            available = first_missing[i][tier] >= full_blocks;
+                            for (const CacheKey& key : tail_keys) {
+                                available = available && contains(i, key, tier);
+                            }
+                        } else {
+                            const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
+                            for (std::int32_t block = window.first; available && block < window.past_end; ++block) {
+                                const CacheKey& key = block < full_blocks
+                                                          ? keys[i][static_cast<std::size_t>(block)]
+                                                          : tail_keys[static_cast<std::size_t>(block - full_blocks)];
+                                available = contains(i, key, tier);
+                            }
+                        }
+                    }
+                    if (!available) {
+                        missing[tier] |= std::uint64_t{1} << i;
+                    }
+                }
+            }
+            out.push_back({.tokens = boundary,
+                           .device_missing = missing[0],
+                           .host_missing = missing[1],
+                           .union_missing = missing[2]});
+            return true;
+        });
+    return out;
+}
+
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
     return ProbePromptPrefix(PromptPrefix{
         .prefix_hashes = content_hashes,
