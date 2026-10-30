@@ -26,7 +26,6 @@ from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.communication._iris import allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     ProducerBuffer,
-    _iris_drain_subgroup_vmem,
     _iris_group_heap_base,
     _iris_heap_base,
     _iris_peer_pointers,
@@ -35,7 +34,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_subgroup_any,
     _iris_sync_peers,
     _iris_sync_rank_epoch,
-    iris_cache_policy,
+    iris_arch_policy,
 )
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
 from tokenspeed_kernel.platform import current_platform
@@ -119,7 +118,7 @@ class IrisAllGather:
         else:
             output = tensor.new_empty((num_tokens, total_hidden_size))
         chunk_rows = self.producer.data.numel() // total_hidden_size
-        policy = iris_cache_policy()
+        policy = iris_arch_policy()
         subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
         for start in range(0, num_tokens, chunk_rows):
             local = tensor[start : start + chunk_rows]
@@ -324,6 +323,7 @@ def iris_pull_allgather_rows(
     FLAG_ROWS: gl.constexpr,
     BLOCK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """Gather consecutive BF16 row shards into every rank's output.
 
@@ -342,7 +342,7 @@ def iris_pull_allgather_rows(
         + 1
     )
     if PRODUCER_WRITES_THROUGH:
-        _iris_drain_subgroup_vmem()
+        WAIT_VMEM(args=[], constraints="=r,~{memory}")
         gl.barrier()
         _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     else:
@@ -361,7 +361,7 @@ def iris_pull_allgather_rows(
             )
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The next producer may reuse the owner scratch.
-    _iris_drain_subgroup_vmem()
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -522,6 +522,7 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     scale_stride_mblock,
     max_elements: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Gather BF16 row shards through Lamport mailboxes, then RMSNorm + MXFP4.
 
@@ -663,6 +664,6 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
         )
 
     # Finish clearing the consumed packs before advancing the row's stages.
-    _iris_drain_subgroup_vmem()
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))

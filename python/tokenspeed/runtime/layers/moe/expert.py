@@ -93,6 +93,7 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        input_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -342,9 +343,12 @@ class MoELayer(torch.nn.Module):
                 )
             internal_activation_dtype = "mxfp4"
 
-        input_dtype = torch.get_default_dtype()
-        if input_dtype not in {torch.float16, torch.bfloat16}:
-            input_dtype = torch.float16
+        if input_dtype is None:
+            input_dtype = torch.get_default_dtype()
+            if input_dtype not in {torch.float16, torch.bfloat16}:
+                input_dtype = torch.float16
+        elif input_dtype not in {torch.float16, torch.bfloat16}:
+            raise ValueError("MoE input dtype must be FP16 or BF16")
         # The activation dtype the plan is signed for; callers that feed the
         # layer synthetic inputs (kernel tuning) must match it.
         self.input_dtype = input_dtype
@@ -688,6 +692,7 @@ class MoELayer(torch.nn.Module):
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
         routing_prepared: object | None = None,
         deferred_out: torch.Tensor | None = None,
+        valid_token_mask: torch.Tensor | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -716,6 +721,8 @@ class MoELayer(torch.nn.Module):
                 Only kernels advertising prepared routing accept it.
             deferred_out: Optional caller-owned route destination for
                 ``do_finalize=False``; requires ``supports_deferred_out``.
+            valid_token_mask: Optional live-row mask for a kernel that declares
+                ``valid_token_mask`` support. It is never silently discarded.
 
         Returns:
             Finalized ``[tokens, hidden]`` hidden states, or with
@@ -767,6 +774,7 @@ class MoELayer(torch.nn.Module):
                 x_quantized=x_quantized,
                 routing_prepared=routing_prepared,
                 deferred_out=deferred_out,
+                valid_token_mask=valid_token_mask,
             )
             output_scale = topk_output.output_scale
             if isinstance(output_scale, torch.Tensor):
@@ -794,6 +802,7 @@ class MoELayer(torch.nn.Module):
             x_quantized=x_quantized,
             routing_prepared=routing_prepared,
             deferred_out=deferred_out,
+            valid_token_mask=valid_token_mask,
         )
         if not do_finalize and output[1] is None:
             # Some precomputed-route kernels (Triton MXFP4) return no route

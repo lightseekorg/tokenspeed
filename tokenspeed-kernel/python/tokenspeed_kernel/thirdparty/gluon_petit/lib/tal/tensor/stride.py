@@ -32,8 +32,8 @@
 
 """Petit tal/tensor/stride.h coordinate-to-index mapping."""
 
-import triton.experimental.gluon as g
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 @g.constexpr_function

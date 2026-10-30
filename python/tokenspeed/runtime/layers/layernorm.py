@@ -20,6 +20,7 @@
 
 """Fused operators for normalization layers."""
 
+from collections.abc import Callable
 from typing import ClassVar
 
 import torch
@@ -134,10 +135,13 @@ class RMSNorm(torch.nn.Module):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        *,
+        kernel: Callable | None = None,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.kernel = rmsnorm if kernel is None else kernel
 
     def forward(
         self,
@@ -152,7 +156,7 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        return rmsnorm(
+        return self.kernel(
             x,
             self.weight.data,
             self.variance_epsilon,
@@ -175,6 +179,8 @@ class RMSNorm(torch.nn.Module):
         """
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
         """
+        if self.kernel is not rmsnorm:
+            raise ValueError("A selected RMSNorm kernel cannot use all-reduce fusion")
 
         if residual is not None:
 
@@ -213,6 +219,10 @@ class RMSNorm(torch.nn.Module):
         """
         Forward method with reducescatter fusion, prioritizing flashinfer fused operations
         """
+        if self.kernel is not rmsnorm:
+            raise ValueError(
+                "A selected RMSNorm kernel cannot use reduce-scatter fusion"
+            )
 
         if residual is not None:
 

@@ -123,6 +123,9 @@ guard entry are not part of this initialization contract.
 retaining the private runner for the small-batch tactic policy described
 later. Warmup must finish before graph capture.
 
+Prepared routing gates PDL with the caller's `enable_pdl` and FlashInfer's public
+`utils.device_support_pdl` check, matching the upstream fused entry points.
+
 Regression coverage includes live and padded mapping entries, local expert
 partitions, PDL on/off, changing routing within one captured shape, graph replay
 after workspace corruption, untouched allocation slack/guard, and output

@@ -155,3 +155,4 @@ class HostCacheResources:
     memory_plan: CacheMemoryPlan
     attention_backend_name: str
     draft_attention_backend_name: str
+    checkpoint_granularities: tuple[tuple[str, int], ...] = ()

@@ -153,6 +153,11 @@ class WorkspacePool:
     def frozen(self) -> bool:
         return self._frozen
 
+    @property
+    def capacity_bytes(self) -> int:
+        """Current backing allocation size, including unused capacity."""
+        return self._block.numel() * self._block.element_size()
+
 
 _pools: dict[torch.device, WorkspacePool] = {}
 
@@ -160,6 +165,10 @@ _pools: dict[torch.device, WorkspacePool] = {}
 def workspace_pool(device: torch.device | str) -> WorkspacePool:
     """The pool for ``device``, created on first use."""
     key = torch.device(device)
+    # Executor configs name "npu", while tensors report "npu:<index>". Both
+    # must reach the same allocation and the same graph-freeze state.
+    if key.type == "npu" and key.index is None:
+        key = torch.device("npu", torch.get_device_module(key).current_device())
     pool = _pools.get(key)
     if pool is None:
         pool = WorkspacePool(key)

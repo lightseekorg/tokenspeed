@@ -1,4 +1,2 @@
 tokenspeed-iris==0.0.0.post20261013
 tokenspeed-kernel-amd>=0.1.4
-# Petit relies on Gluon compiler behavior not yet available in tokenspeed-triton.
-triton==3.8.0

@@ -25,7 +25,7 @@ import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    _iris_drain_subgroup_vmem,
+    iris_arch_policy,
 )
 
 
@@ -44,6 +44,7 @@ class IrisBroadcast:
         return allocation_bytes((tiles, 2 * IrisBroadcast.WORDS_PER_TILE), torch.uint32)
 
     def __init__(self, peers: IrisGroup, max_words: int):
+        self._arch = iris_arch_policy()
         assert peers.world_size in (4, 8) and max_words > 0
         self.peers = peers
         self.tiles = min(self.MAX_TILES, triton.cdiv(max_words, self.WORDS_PER_TILE))
@@ -85,6 +86,7 @@ class IrisBroadcast:
             BLOCK=self.WORDS_PER_TILE,
             SUBGROUPS=subgroups,
             num_warps=subgroups,
+            WAIT_STORES=self._arch.wait_stores,
         )
 
 
@@ -98,6 +100,7 @@ def iris_lamport_broadcast(
     SOURCE: gl.constexpr,
     BLOCK: gl.constexpr,
     SUBGROUPS: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Broadcast int32 values in place through sentinel-marked TP4/TP8 mailboxes.
 
@@ -181,7 +184,7 @@ def iris_lamport_broadcast(
                 pointers + BLOCK, (bits >> 16)[None, :], mask, cache_modifier=".wt"
             )
             # Every publishing subgroup must finish before the next tile/call.
-            _iris_drain_subgroup_vmem()
+            WAIT_STORES(args=[], constraints="=r,~{memory}")
             gl.barrier()
     else:
         layout: gl.constexpr = gl.BlockedLayout([1], [64], [SUBGROUPS], [0])
@@ -207,5 +210,5 @@ def iris_lamport_broadcast(
             gl.store(mailbox + offsets, sentinel, cache_modifier=".wt")
             gl.store(mailbox + BLOCK + offsets, sentinel, cache_modifier=".wt")
             # Finish clearing the full tile before a later receive can start.
-            _iris_drain_subgroup_vmem()
+            WAIT_STORES(args=[], constraints="=r,~{memory}")
             gl.barrier()

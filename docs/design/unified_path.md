@@ -129,6 +129,13 @@ owner-store and FP32 LSE merge path.
 Bindings must supply Meta implementations for this startup check; a missing
 Meta kernel reports a binding upgrade, separately from unsupported topology.
 
+DSA and MLA share the Ascend CP metadata owner and fused page/length kernel.
+The metadata is refreshed once per step and shared by that step's layers;
+captured buffers keep stable addresses. MLA refreshes FIA's host length binding
+before capture or task update and maps authoritative router slots once before
+the first Prolog. Its normalized FP32 partials use the same direct LSE merge as
+DSA, with empty-shard masking and layout conversion fused at that boundary.
+
 DSA CP prepares its metadata before the first fused Prolog. One device launch
 expands request lengths into causal query rows, compacts owned pages, counts
 visible/initial/window tokens, writes the Indexer's grouped layout, and maps
