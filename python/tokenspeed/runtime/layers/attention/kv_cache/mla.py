@@ -213,7 +213,7 @@ class MLATokenToKVPool(CachePool):
         dst_dtype = dst_dtype or self.dtype
 
         if self.quant_method == "per_token_head":
-            k_lora_cache, k_scale_cache, k_rope_cache = self.kv_buffer[layer_id]
+            k_lora_cache, k_scale_cache, k_rope_cache = self.get_key_buffer(layer_id)
             k_lora = k_lora_cache[loc].view(self.dtype).float()
             k_scale = k_scale_cache[loc]
             k_rope = k_rope_cache[loc].float()

@@ -74,6 +74,7 @@ def host_cache(request, io_backend):
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
@@ -187,6 +188,38 @@ def host_cache(request, io_backend):
         recipe = cache_recipe(
             "dsa",
             model_config=SimpleNamespace(num_attention_layers=3),
+            attn_config=attn_config,
+            draft_model_config=None,
+            draft_attn_config=None,
+            **recipe_args,
+        )
+    elif family == "mla_per_token_head":
+        # DeepSeek-V3 MLA with --kv-cache-quant-method per_token_head: FP8
+        # latent, FP32 scale and BF16 RoPE planes per layer.
+        attn_config = AttnConfig(
+            kv_cache_dtype=torch.float8_e4m3fn,
+            prefix_granularity=64,
+            kernel_page_size=64,
+            components=(
+                MLAConfig(
+                    backend_name="mla",
+                    num_attention_heads=64,
+                    num_kv_heads=64,
+                    head_dim=192,
+                    attn_tp_size=1,
+                    kv_lora_rank=512,
+                    qk_nope_head_dim=128,
+                    qk_rope_head_dim=64,
+                    v_head_dim=128,
+                    scaling=1.0,
+                    kv_cache_dim=576,
+                ),
+            ),
+            **dict(model_wide, kv_cache_quant_method="per_token_head"),
+        )
+        recipe = cache_recipe(
+            "mla",
+            model_config=SimpleNamespace(num_attention_layers=2),
             attn_config=attn_config,
             draft_model_config=None,
             draft_attn_config=None,
@@ -391,6 +424,50 @@ def test_a_draft_context_write_lands_after_its_tail_page_load(host_cache):
     start = page * page_size
     assert torch.equal(latent[start : start + hit].view(torch.uint8), host_rows)
     assert torch.equal(latent[slots].view(torch.uint8), expected)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache",
+    [("mla_per_token_head", "full_attention")],
+    ids=["mla_per_token_head"],
+    indirect=True,
+)
+def test_a_per_token_head_history_read_sees_its_load(host_cache):
+    """The MLA chunked prefix replay reads a Host hit's history through
+    ``get_mla_kv_buffer`` (``read_prefix_history``). With per-token-head
+    planes the read waits for the layer's load as the pool's other accessors
+    do; otherwise it sees what the pages held before."""
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    cache = host_cache
+    pool = cache.pool
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    slots = torch.arange(page * page_size, (page + 1) * page_size, device="cuda")
+    layer = PagedAttention(
+        1, pool.kv_cache_dim, 1.0, 1, 0, rotary_emb=None, qk_norm=None
+    )
+    host_rows = [
+        rows.view(torch.uint8)
+        for rows in pool.get_mla_kv_buffer(layer, slots - page_size, torch.bfloat16)
+    ]
+    # Load destinations are never zeroed: give the page other bytes.
+    cache.arena.zero_blocks({"full_attention": np.asarray([page])})
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    seen = pool.get_mla_kv_buffer(layer, slots, torch.bfloat16)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    for rows, host in zip(seen, host_rows, strict=True):
+        assert torch.equal(rows.view(torch.uint8), host)
 
 
 @pytest.mark.parametrize("io_backend", ["kernel", "direct"])

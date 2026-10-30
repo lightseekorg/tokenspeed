@@ -49,9 +49,8 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     #: A Kimi-K3 replay reaches the latent rows only through get_key_buffer
     #: (the prologue's kv_write_target, the attention break's reads) and the
     #: KDA State through get_component, both of which wait for the layer.
-    #: The accessors that do not wait are not reached: get_state_buffers has
-    #: callers only in tests, and get_mla_kv_buffer's per-token-head branch
-    #: needs per-token-head KV, which this class refuses.
+    #: The accessor that does not wait is not reached: get_state_buffers has
+    #: callers only in tests.
     #: In a mixed round with speculative decoding, the verify rows also reach
     #: State through pointer tables built once, with no wait per layer (verify
     #: seeding, replay descriptors, the post-acceptance commit). That is safe
