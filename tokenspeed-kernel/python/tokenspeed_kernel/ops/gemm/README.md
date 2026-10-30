@@ -84,6 +84,14 @@ channel and dynamically quantize activations per token. This scale format is
 distinct from block scaling. Native FP8 matrix arithmetic uses FP32
 accumulators but need not match sequential FP32 arithmetic.
 
+## Startup tuning coverage
+
+During `ops.tuning.autotune`, FlashInfer MXFP8, per-tensor FP8, CUTLASS NVFP4,
+SM100/103 W4A16, and fused NVFP4 GEMMs cover the shared token budget, including
+larger observed inputs and the enclosing native bucket. Native mappers,
+constraints, and caches are preserved. Explicit buckets and disabled profiling
+retain their semantics; small-M BF16 keeps its existing bound.
+
 ## DeepSeek V4 grouped output projection
 
 The grouped-projection plan describes the projection geometry and source formats.
