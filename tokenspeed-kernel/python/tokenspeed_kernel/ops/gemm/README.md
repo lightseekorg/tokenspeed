@@ -1,5 +1,10 @@
 # GEMM weight preparation
 
+The optional `trtllm_kernel` extension is required for TRT-LLM's fused-A
+projection and cuBLASLt NVFP4 GEMM provider. Without it, the NVFP4 leaf is not
+registered and a direct fused-A call reports the missing package; importing
+other GEMM providers does not require the extension.
+
 ## Blackwell block-FP8 automatic selection
 
 For standard FP32-scaled 128x128 block-FP8 GEMM on SM10x, automatic selection

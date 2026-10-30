@@ -103,6 +103,10 @@ enum Op {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
     },
+    CommitWeightUpdate {
+        success: bool,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     Profile {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
@@ -436,6 +440,10 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::UpdateWeights { payload, reply })
     }
 
+    fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError> {
+        self.ask(|reply| Op::CommitWeightUpdate { success, reply })
+    }
+
     fn profile(&mut self, request: &ProfileReq) -> Result<(bool, String), DataPlaneError> {
         let payload = control_payload(&ControlRequest::Profile(request.clone()))?;
         self.ask(|reply| Op::Profile { payload, reply })
@@ -569,6 +577,7 @@ fn forward_loop(
             match op {
                 Op::Barrier { reply }
                 | Op::IdleForward { reply, .. }
+                | Op::CommitWeightUpdate { reply, .. }
                 | Op::ReleaseMemory { reply, .. }
                 | Op::ResumeMemory { reply, .. }
                 | Op::ApplyExpertPlacement { reply, .. } => {
@@ -727,6 +736,13 @@ fn run(
             let done = plane
                 .call_method1("update_weights", (PyBytes::new(py, &payload),))
                 .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::CommitWeightUpdate { success, reply } => {
+            let done = plane
+                .call_method1("commit_weight_update", (success,))
+                .map(drop)
                 .map_err(python);
             answer(reply, done)?;
         }

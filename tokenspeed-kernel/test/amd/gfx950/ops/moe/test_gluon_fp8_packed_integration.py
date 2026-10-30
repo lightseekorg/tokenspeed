@@ -257,7 +257,7 @@ def test_packed_fp8_glm53_wrapper_stays_packed_after_each_update_chunk(
 
     # The exported multimodal wrapper does not enter the inner LM's session:
     # each partial load must return with packed layout ready for inference.
-    with weight_update_session([wrapper]):
+    with weight_update_session([wrapper], require_complete=False):
         gate = _shard(13, (16, 32))
         wrapper.load_weights([(f"{name}.1.gate_proj.weight", gate)])
         expected13[1, :16].copy_(gate)

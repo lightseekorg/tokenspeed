@@ -49,6 +49,8 @@ the block's ids, positions, HC mix and workspace addressing.
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
@@ -1374,7 +1376,9 @@ import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
+
+if importlib.util.find_spec("deep_gemm") is not None:
+    import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
 
 # isort: on
