@@ -26,7 +26,7 @@ done
 # Configuration
 # ============================================================
 CUDA_VERSION=${CUDA_VERSION:-13.0.1}
-SM=${SM:-sm100}
+SM=${SM:-auto}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
@@ -141,12 +141,13 @@ echo "PyTorch CUDA version: ${TORCH_CUDA_VERSION:-unknown}"
 echo "PyTorch wheel index: cu${CUINDEX}"
 
 case "${SM}" in
+    auto)  FI_ARCH="${FLASHINFER_CUDA_ARCH_LIST:-}" ;;
     sm103) FI_ARCH="10.3a" ;;
     sm100) FI_ARCH="10.0a" ;;
     sm90)  FI_ARCH="9.0a" ;;
     *)     echo "Unknown SM: ${SM}" && exit 1 ;;
 esac
-echo "FlashInfer architecture: ${FI_ARCH}"
+echo "CUDA build architectures: ${FI_ARCH:-default supported targets}"
 
 # ============================================================
 # Step 2: Upgrade base tools

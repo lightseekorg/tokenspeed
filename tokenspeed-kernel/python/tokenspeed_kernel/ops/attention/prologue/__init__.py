@@ -56,6 +56,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     HeadNorm,
     KVCacheFormat,
     LatentKVCache,
+    LatentNorm,
     MLAExpandedKV,
     MLAPrologueOutput,
     MRope,
@@ -237,6 +238,7 @@ def mla_prologue(
     cache: LatentKVCache | None,
     solution: str | None,
     override: str | None,
+    norm: LatentNorm | None = None,
 ) -> MLAPrologueOutput:
     """Prepare one MLA layer's attention inputs and write its latent rows.
 
@@ -266,12 +268,15 @@ def mla_prologue(
             writes.
         solution: Optional registered solution to select.
         override: Optional exact kernel name; it must serve the request.
+        norm: Optional latent RMSNorm fused into a packed FlashMLA cache
+            write. When present, latent_cache contains the unnormalized
+            projection output. Omit for already normalized latent rows.
 
     Returns:
         The query, plus the per-head keys and values of expanded attention:
         FP8 e4m3 for an FP8 cache (not per-token-head planes), else in the query dtype.
     """
-    check_mla_request(query, q_pe, latent_cache, expanded, rotary, cache)
+    check_mla_request(query, q_pe, latent_cache, expanded, rotary, cache, norm)
     num_tokens, num_heads, width = query.shape
     rope_dim = q_pe.shape[-1]
     kv_lora_rank = latent_cache.shape[-1] - rope_dim
@@ -328,6 +333,7 @@ def mla_prologue(
             expanded=expanded,
             rotary=rotary,
             cache=cache,
+            norm=norm,
             enable_pdl=pdl_enabled(),
         )
 
@@ -375,6 +381,7 @@ __all__ = [
     "HeadNorm",
     "KVCacheFormat",
     "LatentKVCache",
+    "LatentNorm",
     "MLAExpandedKV",
     "MLAPrologueOutput",
     "MRope",

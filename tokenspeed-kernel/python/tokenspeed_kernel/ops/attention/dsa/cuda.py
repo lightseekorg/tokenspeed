@@ -65,8 +65,6 @@ if platform.is_hopper_plus:
         get_mla_metadata,
     )
 
-_decode_sched_meta_cache: dict[tuple, object] = {}
-
 
 def _flashmla_sparse_prefill_head_multiple() -> int:
     return 128 if platform.is_nvidia and platform.is_blackwell_plus else 64
@@ -138,40 +136,18 @@ def _flatten_regular_kv_cache(kv_cache: torch.Tensor, page_size: int) -> torch.T
 def _paged_sparse_kv_cache(
     sparse_kv_cache: torch.Tensor, page_size: int
 ) -> torch.Tensor:
-    if sparse_kv_cache.dim() == 2:
+    if sparse_kv_cache.dim() in (2, 3):
         return sparse_kv_cache.view(-1, int(page_size), 1, sparse_kv_cache.shape[-1])
     if sparse_kv_cache.dim() == 4:
+        if sparse_kv_cache.shape[1] != int(page_size):
+            raise ValueError(
+                f"sparse KV page size mismatch: got {sparse_kv_cache.shape[1]}, "
+                f"expected {page_size}"
+            )
         return sparse_kv_cache
     raise ValueError(
         f"unsupported sparse_kv_cache shape {tuple(sparse_kv_cache.shape)}"
     )
-
-
-def _get_decode_sched_meta(
-    *,
-    q: torch.Tensor,
-    num_reqs: int,
-    q_len_per_req: int,
-    actual_heads: int,
-    topk: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-) -> object:
-    key = (
-        q.device,
-        q.dtype,
-        int(num_reqs),
-        int(q_len_per_req),
-        int(actual_heads),
-        int(topk),
-        int(kv_lora_rank),
-        int(qk_rope_head_dim),
-    )
-    meta = _decode_sched_meta_cache.get(key)
-    if meta is None:
-        meta = get_mla_metadata()[0]
-        _decode_sched_meta_cache[key] = meta
-    return meta
 
 
 def has_ragged_decode_topk() -> bool:
@@ -227,17 +203,40 @@ def _mask_sparse_slots(
     return slots.masked_fill(columns >= lengths.reshape(-1, 1), -1)
 
 
+def _pad_attention_sink(
+    attn_sink: torch.Tensor | None, padded_heads: int
+) -> torch.Tensor | None:
+    if attn_sink is None or attn_sink.numel() == padded_heads:
+        return attn_sink
+    return torch.nn.functional.pad(
+        attn_sink, (0, padded_heads - attn_sink.numel()), value=-float("inf")
+    )
+
+
+def _pad_sparse_slots(slots: torch.Tensor, *, alignment: int) -> torch.Tensor:
+    padded_topk = (slots.shape[-1] + alignment - 1) // alignment * alignment
+    if padded_topk == slots.shape[-1]:
+        return slots
+    return torch.nn.functional.pad(slots, (0, padded_topk - slots.shape[-1]), value=-1)
+
+
 def _finish_sparse_attention(
     result: torch.Tensor,
     lse: torch.Tensor,
     slots: torch.Tensor,
     out: torch.Tensor | None,
     return_lse: bool,
+    attn_sink: torch.Tensor | None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     # Empty ranks contribute the identity element to the shared DCP reduction.
     empty = ~(slots >= 0).any(dim=-1)
     result.masked_fill_(empty[:, None, None], 0)
     lse = lse.contiguous().masked_fill(empty[:, None], -float("inf"))
+    if return_lse and attn_sink is not None:
+        # FlashMLA normalizes O with the sink before rounding it, but returns
+        # the LSE of KV logits only. The public result describes O's complete
+        # denominator, including empty rows whose only mass is the sink.
+        lse = torch.logaddexp(lse, attn_sink)
     if out is not None:
         out.reshape_as(result).copy_(result)
         result = out
@@ -258,17 +257,18 @@ if platform.is_nvidia and platform.is_hopper_plus:
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
         traits={
             "q_len": frozenset({1, 2, 3, 4, 5, 6}),
-            "qk_nope_head_dim": frozenset({128, 192}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({512}),
-            "qk_rope_head_dim": frozenset({64}),
+            "qk_rope_head_dim": frozenset({0, 64}),
             "page_size": frozenset({64}),
-            "topk": frozenset({512, 1024, 2048}),
+            "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
             "has_kv_cache": frozenset({False, True}),
             "has_sparse_kv_cache": frozenset({True}),
             "topk_layout": frozenset({"global_slots"}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
+        features=frozenset({"attention_sink"}),
         priority=Priority.PERFORMANT,
     )
     def flashmla_dsa_decode(
@@ -290,34 +290,31 @@ if platform.is_nvidia and platform.is_hopper_plus:
         return_lse: bool,
         out: torch.Tensor | None,
         enable_pdl: bool,
+        attn_sink: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         del kv_seq_lens
         if sparse_kv_cache is None:
             raise RuntimeError("FlashMLA sparse decode requires sparse_kv_cache")
         if logit_cap != 0.0:
             raise RuntimeError("FlashMLA sparse decode does not support logit_cap")
+        if qk_rope_head_dim == 0:
+            q = torch.nn.functional.pad(q, (0, 64))
         q_padded, actual_heads = _pad_decode_query(q, q_len_per_req)
         num_reqs = q_padded.shape[0]
         kv_paged = _paged_sparse_kv_cache(sparse_kv_cache, page_size)
-        slots = _mask_sparse_slots(topk_slots, topk_lens)
+        slots = _mask_sparse_slots(topk_slots, topk_lens).to(torch.int32)
+        slots = _pad_sparse_slots(slots, alignment=64)
         result, lse = flash_mla_with_kvcache(
             q=q_padded,
             k_cache=kv_paged,
             block_table=None,
             cache_seqlens=None,
             head_dim_v=int(kv_lora_rank),
-            tile_scheduler_metadata=_get_decode_sched_meta(
-                q=q_padded,
-                num_reqs=num_reqs,
-                q_len_per_req=q_padded.shape[1],
-                actual_heads=actual_heads,
-                topk=topk_slots.shape[-1],
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-            ),
+            tile_scheduler_metadata=get_mla_metadata()[0],
             softmax_scale=float(softmax_scale) * float(k_scale),
             is_fp8_kvcache=True,
             indices=slots.view(num_reqs, q_padded.shape[1], -1),
+            attn_sink=_pad_attention_sink(attn_sink, q_padded.shape[2]),
         )
         if result.dim() == 4:
             result = result[:, :, :actual_heads, :].reshape(
@@ -326,11 +323,108 @@ if platform.is_nvidia and platform.is_hopper_plus:
         else:
             result = result[:, :actual_heads, :]
         lse = lse[:, :actual_heads, :].transpose(1, 2).reshape(-1, actual_heads)
-        return _finish_sparse_attention(result, lse, slots, out, return_lse)
+        return _finish_sparse_attention(result, lse, slots, out, return_lse, attn_sink)
+
+    @register_kernel(
+        "attention",
+        "dsa_prefill",
+        name="flashmla_dsa_fp8_prefill",
+        solution="flashmla",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        traits={
+            "q_len": frozenset({1}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({0, 64}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
+            "has_kv_cache": frozenset({False}),
+            "has_sparse_kv_cache": frozenset({True}),
+            "topk_layout": frozenset({"global_slots"}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+        features=frozenset({"attention_sink"}),
+        priority=Priority.PERFORMANT,
+    )
+    def flashmla_dsa_fp8_prefill(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        sparse_kv_cache: torch.Tensor | None,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+        max_seqlen_k: int,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        softmax_scale: float,
+        page_size: int,
+        q_len_per_req: int,
+        kv_seq_lens: torch.Tensor | None,
+        logit_cap: float,
+        k_scale: float,
+        return_lse: bool,
+        out: torch.Tensor | None,
+        enable_pdl: bool,
+        attn_sink: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Read packed FP8 rows with one query per sparse decode request."""
+        return flashmla_dsa_decode(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=sparse_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            kv_seq_lens=kv_seq_lens,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            out=out,
+            enable_pdl=enable_pdl,
+            attn_sink=attn_sink,
+        )
 
 
 if platform.is_nvidia and platform.is_hopper_plus:
 
+    @register_kernel(
+        "attention",
+        "dsa_decode",
+        name="flashmla_dsa_bf16_decode",
+        solution="flashmla",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "qk_nope_head_dim": frozenset({128, 192}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
+            "has_kv_cache": frozenset({True}),
+            "has_attention_sink": frozenset({True}),
+            "has_sparse_kv_cache": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+        features=frozenset({"attention_sink"}),
+        priority=Priority.PERFORMANT,
+    )
     @register_kernel(
         "attention",
         "dsa_prefill",
@@ -347,13 +441,14 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({64}),
             "page_size": frozenset({64}),
-            "topk": frozenset({512, 1024, 2048}),
+            "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
             "has_kv_cache": frozenset({True}),
             "has_sparse_kv_cache": frozenset({False, True}),
             "topk_layout": frozenset({"global_slots"}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
+        features=frozenset({"attention_sink"}),
         priority=Priority.PERFORMANT,
     )
     def flashmla_dsa_prefill(
@@ -375,6 +470,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         return_lse: bool,
         out: torch.Tensor | None,
         enable_pdl: bool,
+        attn_sink: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if kv_cache is None:
             raise RuntimeError("FlashMLA sparse prefill requires kv_cache")
@@ -382,14 +478,20 @@ if platform.is_nvidia and platform.is_hopper_plus:
             raise RuntimeError("FlashMLA sparse prefill does not support logit_cap")
         q_kernel, actual_heads = _pad_prefill_query(q)
         kv = _flatten_regular_kv_cache(kv_cache, page_size)
-        slots = _mask_sparse_slots(topk_slots, topk_lens)
+        # SM90 sparse prefill consumes pairs of 64-slot tiles, unlike the
+        # packed decode kernel's single-tile alignment. Keep invalid tails
+        # masked while satisfying that native launch contract.
+        slots = _pad_sparse_slots(
+            _mask_sparse_slots(topk_slots, topk_lens), alignment=128
+        )
         result, _, lse = flash_mla_sparse_fwd(
             q=q_kernel,
             kv=kv,
             indices=slots.unsqueeze(1),
             sm_scale=float(softmax_scale) * float(k_scale),
             d_v=int(kv_lora_rank),
+            attn_sink=_pad_attention_sink(attn_sink, q_kernel.shape[1]),
         )
         result = result[:, :actual_heads, :]
         lse = lse[:, :actual_heads]
-        return _finish_sparse_attention(result, lse, slots, out, return_lse)
+        return _finish_sparse_attention(result, lse, slots, out, return_lse, attn_sink)

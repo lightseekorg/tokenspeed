@@ -454,34 +454,34 @@ def apply_rope_mla_set_kv_buffer_triton(
     nope_block = max(_next_power_of_2(nope_dim), 16)
     block_n = select_mla_kv_block_n(num_tokens, num_q_heads)
     grid = (triton.cdiv(num_tokens, block_n), num_q_heads + 1)
-    _mla_rope_set_kv_buffer_kernel[grid](
-        q_rope,
-        k_nope,
-        k_rope,
-        q_rope_out,
-        kv_buffer,
-        loc,
-        cos_sin_cache,
-        positions,
-        q_nope,
-        num_tokens,
-        write_mask,
-        loc.stride(0),
-        q_rope.stride(0),
-        q_rope.stride(1),
-        k_nope.stride(0),
-        k_rope.stride(0),
-        q_rope_out.stride(0),
-        q_rope_out.stride(1),
-        kv_buffer.stride(-2),
-        kv_buffer.stride(0),
-        kv_buffer.shape[1] if kv_buffer.ndim == 3 else 1,
-        0 if cos_sin_cache is None else cos_sin_cache.stride(0),
-        0 if q_nope is None else q_nope.stride(0),
-        0 if q_nope is None else q_nope.stride(1),
-        num_q_heads,
-        nope_dim,
-        rope_dim,
+    launch = dict(
+        q_rope_ptr=q_rope,
+        k_nope_ptr=k_nope,
+        k_rope_ptr=k_rope,
+        q_out_rope_ptr=q_rope_out,
+        kv_buffer_ptr=kv_buffer,
+        loc_ptr=loc,
+        cos_sin_cache_ptr=cos_sin_cache,
+        positions_ptr=positions,
+        q_nope_ptr=q_nope,
+        num_tokens=num_tokens,
+        write_mask_ptr=write_mask,
+        loc_stride=loc.stride(0),
+        q_rope_stride_t=q_rope.stride(0),
+        q_rope_stride_h=q_rope.stride(1),
+        k_nope_stride_t=k_nope.stride(0),
+        k_rope_stride_t=k_rope.stride(0),
+        q_out_rope_stride_t=q_rope_out.stride(0),
+        q_out_rope_stride_h=q_rope_out.stride(1),
+        kv_buffer_stride_t=kv_buffer.stride(-2),
+        kv_buffer_stride_p=kv_buffer.stride(0),
+        PAGE_SIZE=kv_buffer.shape[1] if kv_buffer.ndim == 3 else 1,
+        cos_sin_stride_p=0 if cos_sin_cache is None else cos_sin_cache.stride(0),
+        q_nope_stride_t=0 if q_nope is None else q_nope.stride(0),
+        q_nope_stride_h=0 if q_nope is None else q_nope.stride(1),
+        num_q_heads=num_q_heads,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
         NOPE_BLOCK=nope_block,
         HALF_BLOCK=half_block,
         IS_NEOX=bool(is_neox),
@@ -502,6 +502,22 @@ def apply_rope_mla_set_kv_buffer_triton(
             {"llvm_cl_opts": "vectorize-slp=false"} if current_platform().is_amd else {}
         ),
     )
+    from tokenspeed_kernel.ops.tuning import is_warming_up
+
+    if is_warming_up():
+        # Compile every bounded CTA-width choice and runtime integer class.
+        # Compile-only warmup must not rotate an in-place query more than once.
+        for warm_tokens in (1, 16, 17):
+            for warm_block_n in range(1, 7):
+                _mla_rope_set_kv_buffer_kernel.warmup(
+                    **{
+                        **launch,
+                        "num_tokens": warm_tokens,
+                        "BLOCK_N": warm_block_n,
+                    },
+                    grid=(triton.cdiv(warm_tokens, warm_block_n), num_q_heads + 1),
+                )
+    _mla_rope_set_kv_buffer_kernel[grid](**launch)
 
 
 def apply_rope_triton(

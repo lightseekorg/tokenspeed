@@ -111,6 +111,49 @@ def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
     ), f"CUDA third-party requirements must use ==: {not_exactly_pinned}"
 
 
+@pytest.mark.parametrize(
+    ("nvcc_version", "expected"),
+    [
+        (None, {"90a", "100a", "103a"}),
+        ((12, 9), {"90a", "100a", "103a"}),
+        ((13, 4), {"90a", "100a", "103a", "107a"}),
+    ],
+)
+def test_default_cuda_build_targets_include_hopper(
+    monkeypatch, nvcc_version, expected
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.delenv("TOKENSPEED_CUDA_ARCH", raising=False)
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    namespace = runpy.run_path(str(SETUP_PY))
+    builder = namespace["CudaKernelBuilder"]([], verbose=False)
+    monkeypatch.setattr(builder, "_nvcc_toolkit_version", lambda: nvcc_version)
+
+    assert builder._detect_cuda_archs() == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    [
+        ("FLASHINFER_CUDA_ARCH_LIST", "9.0a 10.0a", {"90a", "100a"}),
+        ("TOKENSPEED_CUDA_ARCH", "100", {"100a"}),
+    ],
+)
+def test_explicit_cuda_build_targets_remain_exact(
+    monkeypatch, name, value, expected
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.delenv("TOKENSPEED_CUDA_ARCH", raising=False)
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    namespace = runpy.run_path(str(SETUP_PY))
+    builder = namespace["CudaKernelBuilder"]([], verbose=False)
+
+    assert builder._detect_cuda_archs() == expected
+
+
 def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
     install_requires = _capture_install_requires(monkeypatch, "rocm")
 

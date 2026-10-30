@@ -469,6 +469,17 @@ cudaError_t launch_persistent_cluster_topk(
   config.attrs = attributes;
   config.numAttrs = 2;
 
+  // Graph capture defers an unsupported cluster error until instantiation,
+  // when the caller can no longer take its portable fallback. Check the
+  // kernel's launch configuration before recording a node in the graph.
+  int max_cluster_size = 0;
+  const cudaError_t occupancy_error =
+      cudaOccupancyMaxPotentialClusterSize(&max_cluster_size, kernel, &config);
+  if (occupancy_error != cudaSuccess) return occupancy_error;
+  if (max_cluster_size < static_cast<int>(cluster_size)) {
+    return cudaErrorInvalidClusterSize;
+  }
+
   return cudaLaunchKernelEx(&config, kernel, params);
 }
 

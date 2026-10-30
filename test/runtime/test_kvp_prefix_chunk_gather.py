@@ -142,6 +142,86 @@ def test_owned_prefix_chunk_rows_refuses_a_hole():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_chunk_metadata_slices_do_not_compile_alignment_variants(monkeypatch):
+    from tokenspeed_kernel.compile_monitor import (
+        compile_stats,
+        install_compile_monitor,
+        uninstall_compile_monitor,
+    )
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    from tokenspeed.runtime.layers.attention.chunk import (
+        create_chunked_cache_kv_indices_paged,
+        get_chunks_paged,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 128)
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", 1)
+
+    pages = [[2, 4, 6], [3, 5, 7]]
+    table = torch.tensor(pages, dtype=torch.int32, device="cuda")
+    starts, lengths, cumulative = [63, 125], [5, 3], [0, 5, 8]
+    expected = torch.tensor(
+        [
+            pages[row][position // 64] * 64 + position % 64
+            for row in range(2)
+            for position in range(starts[row], starts[row] + lengths[row])
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    def view(values, offset):
+        storage = torch.empty(len(values) + 4, dtype=torch.int32, device="cuda")
+        result = storage[offset : offset + len(values)]
+        result.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
+        return result
+
+    def execute(offsets):
+        output = torch.full((8,), -1, dtype=torch.int32, device="cuda")
+        create_chunked_cache_kv_indices_paged[(2,)](
+            table,
+            view(starts, offsets[0]),
+            view(lengths, offsets[1]),
+            view(cumulative, offsets[2]),
+            output,
+            table.stride(0),
+            PAGE_SIZE=64,
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    install_compile_monitor("error")
+    try:
+        with kernel_warmup(enabled=True):
+            _, indices, _ = get_chunks_paged(
+                torch.zeros(2, dtype=torch.int32, device="cuda"),
+                torch.zeros(2, dtype=torch.int32),
+                table,
+                64,
+            )
+        assert not indices
+        before = compile_stats()
+        assert before is not None
+        for offsets in (
+            (0, 0, 0),
+            (1, 0, 0),
+            (0, 1, 0),
+            (0, 0, 1),
+            (1, 2, 3),
+            (3, 3, 3),
+        ):
+            execute(offsets)
+        after = compile_stats()
+        assert after is not None
+        assert after.startup_compiles + after.serving_compiles == (
+            before.startup_compiles + before.serving_compiles
+        )
+    finally:
+        uninstall_compile_monitor()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("prefix_lens,page_size,subpages,chunk_len,degree", CASES)
 def test_every_rank_reads_the_position_order_rows(
     prefix_lens, page_size, subpages, chunk_len, degree

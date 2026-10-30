@@ -52,6 +52,11 @@ same-date `tokenspeed-kernel` nightly. To select a particular date, for example:
 python -m pip install "tokenspeed==0.1.0.post20260930" --extra-index-url https://lightseek.org/whl/nightly
 ```
 
+CUDA wheels include Hopper and Blackwell targets. The release build also checks
+that its pinned FlashMLA wheel contains the legacy Hopper sparse kernels and
+links the selected CUDA runtime. An upstream dependency update that removes
+those kernels fails the release check before the wheel is published.
+
 For ROCm 7.2 on Linux x86_64, first install ROCm PyTorch in a fresh Python
 3.11–3.13 environment, then use the separate ROCm nightly index:
 
@@ -122,7 +127,10 @@ pip install -e "./python" --no-build-isolation
 ```
 
 Install the kernel package. Its Python package metadata installs the selected
-backend dependencies automatically.
+backend dependencies automatically. CUDA source builds include Hopper (`sm90a`)
+and Blackwell (`sm100a`, `sm103a`) by default, adding `sm107a` when the CUDA
+toolkit supports it. Explicit `TOKENSPEED_CUDA_ARCH` or
+`FLASHINFER_CUDA_ARCH_LIST` settings select only the requested targets.
 
 ```bash
 pip install -e tokenspeed-kernel/python/ --no-build-isolation

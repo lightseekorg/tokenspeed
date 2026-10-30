@@ -259,13 +259,14 @@ jobs:
             -f Dockerfile.tokenspeed-kernel-release \
             -t tokenspeed-kernel-release:${{ matrix.cuda.variant }}-${{ matrix.arch.name }} .
 
-      # Include H100 in published wheels; local builds retain their own defaults.
+      # Include Hopper and Blackwell in published wheels and verify FlashMLA too.
       - name: Build wheel
         run: |
           mkdir -p dist
           docker run --rm \
             -e PYTHON_TAG=${{ matrix.python.tag }} \
             -e TORCH_INDEX_URL=${{ matrix.cuda.torch_index_url }} \
+            -e VALIDATE_CUDA_VARIANT=${{ matrix.cuda.variant }} \
             -e TOKENSPEED_KERNEL_BACKEND=cuda \
             -e FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" \
             -e TOKENSPEED_KERNEL_NIGHTLY=${{ needs.metadata.outputs.nightly }} \
@@ -296,6 +297,20 @@ jobs:
               for arch in 90a 100a 103a; do
                 grep -F ".sm_${arch}.cubin" /tmp/rope-architectures.txt
               done
+
+              # A dependency pin must still provide the legacy Hopper kernels.
+              # Check the actual binary for this CUDA variant before publication.
+              flashmla_spec=$(grep "^tokenspeed-flashmla==" requirements/cuda-thirdparty.txt)
+              test -n "$flashmla_spec"
+              case "$VALIDATE_CUDA_VARIANT" in
+                cu129) native_index=https://lightseek.org/whl/cu129/; cuda_major=12 ;;
+                cu130) native_index=https://pypi.org/simple; cuda_major=13 ;;
+                *) echo "Unsupported CUDA variant: $VALIDATE_CUDA_VARIANT" >&2; exit 1 ;;
+              esac
+              "${PYBIN}/python" -m pip install --force-reinstall --no-deps \
+                --index-url "$native_index" "$flashmla_spec"
+              "${PYBIN}/python" /workspace/test/ci_system/verify_flashmla_wheel.py \
+                --cuda-major "$cuda_major" --cuobjdump "$CUDA_HOME/bin/cuobjdump"
 
               python_tag="${PYTHON_TAG%%-*}"
               abi_tag="${PYTHON_TAG#*-}"

@@ -36,6 +36,68 @@ from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
 
+@pytest.mark.parametrize("apply_rope", [False, True])
+def test_mla_write_startup_prepares_widths_without_repeating_rotation(
+    device: str, apply_rope: bool
+) -> None:
+    from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    torch.manual_seed(917)
+    rows, heads, nope_dim, rope_dim = 1024, 6, 512, 64
+    query = torch.randn(rows, heads, rope_dim, dtype=torch.bfloat16, device=device)
+    latent = torch.randn(rows, 1, nope_dim, dtype=torch.bfloat16, device=device)
+    key_rope = torch.randn(rows, 1, rope_dim, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(rows, dtype=torch.int64, device=device) % 97
+    angles = torch.randn(97, rope_dim // 2, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1) if apply_rope else None
+
+    def execute(count: int, *, warming: bool):
+        rotated = query[:count].clone()
+        cache = torch.full(
+            (count + 2, nope_dim + rope_dim), -7.0, dtype=torch.bfloat16, device=device
+        )
+        locations = torch.arange(count, dtype=torch.int32, device=device) + 1
+        with kernel_warmup(enabled=warming):
+            embedding_triton.apply_rope_mla_set_kv_buffer_triton(
+                positions=positions[:count],
+                q_rope=rotated,
+                k_rope=key_rope[:count],
+                cos_sin_cache=table,
+                is_neox=True,
+                fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+                    k_nope=latent[:count],
+                    kv_buffer=cache,
+                    cache_loc=locations,
+                    q_nope=None,
+                    sanitize=False,
+                    write_mask=None,
+                ),
+                q_rope_out=rotated,
+                enable_pdl=False,
+            )
+        return rotated, cache
+
+    reference_query, reference_cache = execute(rows, warming=False)
+    warmed_query, warmed_cache = execute(rows, warming=True)
+    torch.testing.assert_close(warmed_query, reference_query, rtol=0, atol=0)
+    torch.testing.assert_close(warmed_cache, reference_cache, rtol=0, atol=0)
+    with assert_no_triton_compile(embedding_triton._mla_rope_set_kv_buffer_kernel):
+        # These lengths cross every CTA-width choice, including irregular tails.
+        for count in (1, 16, 17, 158, 315, 472, 629, 786, 943):
+            actual_query, actual_cache = execute(count, warming=False)
+            torch.testing.assert_close(
+                actual_query, reference_query[:count], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                actual_cache[1 : count + 1],
+                reference_cache[1 : count + 1],
+                rtol=0,
+                atol=0,
+            )
+            assert bool((actual_cache[[0, -1]] == -7).all())
+
+
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
 def test_rope_neox_full_bf16(
     device: str,

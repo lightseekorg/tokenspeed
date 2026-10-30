@@ -76,6 +76,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
         q=torch.zeros((1, 1), dtype=torch.bfloat16),
         layer=SimpleNamespace(
             logit_cap=0,
+            attn_sink=None,
             tp_q_head_num=1,
             v_head_dim=1,
             head_dim=1,

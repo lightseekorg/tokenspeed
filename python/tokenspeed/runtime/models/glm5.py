@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     local_topk_to_global_slots,
     workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.attention.prologue import LatentNorm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -54,6 +55,7 @@ from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
+from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -100,6 +102,8 @@ class GlmDsaPrefillTopK:
 class GlmDsaDecodeTopK:
     topk_indices: torch.Tensor
     topk_lens: torch.Tensor
+    # Batch token row held by row 0, past the extend rows in a mixed batch.
+    row_offset: int
 
 
 @dataclass(frozen=True)
@@ -340,6 +344,58 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
 
+    def _fuses_latent_norm(self, ctx: ForwardContext) -> bool:
+        cache = ctx.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
+        return (
+            isinstance(cache, torch.Tensor)
+            and cache.dtype == torch.uint8
+            and cache.shape[-1] == 656
+        )
+
+    def _norm_qkv(
+        self, q_a: torch.Tensor, latent_cache: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        q_norm = torch.empty_like(q_a)
+        if q_a.size(0) > 0:
+            if self._fuses_latent_norm(ctx):
+                # Leave KV raw for the prologue's fp32 norm + FP8 cache write.
+                self.q_a_layernorm(q_a, out=q_norm)
+            else:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a,
+                    input_kv_a=latent_cache[..., : self.kv_lora_rank],
+                    output_q_a=q_norm,
+                )
+        return q_norm
+
+    def latent_prologue(
+        self,
+        Q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        slots: torch.Tensor,
+        *,
+        key_rows: QueryShardGather | None,
+    ) -> torch.Tensor:
+        norm = (
+            LatentNorm(self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon)
+            if self._fuses_latent_norm(ctx)
+            else None
+        )
+        return self.attn_mqa.latent_prologue(
+            Q,
+            q_pe,
+            latent_cache,
+            positions,
+            ctx,
+            slots=slots,
+            expanded=None,
+            key_rows=key_rows,
+            norm=norm,
+        ).query
+
     def _get_decode_topk_workspace(
         self,
         rows: int,
@@ -477,6 +533,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         start: int,
         end: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        start -= decode_topk.row_offset
+        end -= decode_topk.row_offset
+        if start < 0 or end < start or end > decode_topk.topk_indices.shape[0]:
+            raise RuntimeError(
+                "GLM DSA decode window is outside the selected top-k rows: "
+                f"rows [{start}, {end}) of {decode_topk.topk_indices.shape[0]}"
+            )
         return decode_topk.topk_indices[start:end], decode_topk.topk_lens[start:end]
 
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
@@ -537,7 +600,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             page_table=page_table,
             q_len_per_req=decode_window.q_len_per_req,
             decode_start=decode_window.start,
-            num_tokens=num_tokens,
             num_decode_tokens=decode_window.num_tokens,
             topk=topk,
         )
@@ -551,7 +613,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         page_table: torch.Tensor,
         q_len_per_req: int,
         decode_start: int,
-        num_tokens: int,
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
@@ -563,21 +624,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
-        # The top-k kernels overwrite the whole workspace when they cover all
-        # rows; the sentinel pre-fills are only needed for mixed prefill,
-        # where leading rows stay unwritten but readable.
-        writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
+        # Prefill selects separately. Keep only decode rows here so a long
+        # mixed prefill cannot grow every layer's graph-retained workspace.
+        # Both top-k kernels overwrite these rows in full.
         topk_indices = self._get_decode_topk_workspace(
-            num_tokens,
-            topk,
-            q.device,
-            fill_value=None if writes_full_workspace else -1,
+            num_decode_tokens, topk, q.device, fill_value=None
         )
-        topk_slice = topk_indices[decode_start : decode_start + num_decode_tokens]
         topk_lens = self._get_decode_topk_lens_workspace(
-            num_tokens, q.device, fill=not writes_full_workspace
+            num_decode_tokens, q.device, fill=False
         )
-        topk_lens_slice = topk_lens[decode_start : decode_start + num_decode_tokens]
 
         metadata = ctx.attn_backend.forward_decode_metadata
         # _dsa_seq_lens_2d is per-token ([bs * q_len_per_req, 1]); skip the extend
@@ -621,8 +676,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 seq_lens=None,
                 q_len_per_req=q_len_per_req,
                 topk_layout="global_slots",
-                out=topk_slice,
-                lens_out=topk_lens_slice,
+                out=topk_indices,
+                lens_out=topk_lens,
             )
         else:
             dsa_decode_topk(
@@ -638,13 +693,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 index_k_cache=index_k_cache,
                 seq_lens_2d=seq_lens_2d,
                 plan=metadata._dsa_plan,
-                out=topk_slice,
-                lens_out=topk_lens_slice,
+                out=topk_indices,
+                lens_out=topk_lens,
                 slot_order=global_server_args_dict["dsa_slot_order"],
             )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
             topk_lens=topk_lens,
+            row_offset=decode_start,
         )
 
     def _compute_prefill_topk_indices(
@@ -703,7 +759,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
         device = indexer_output.query.device
         seq_lens_cpu = prefix_lens_cpu + extend_lens_cpu
-        seq_lens = seq_lens_cpu.to(device=device, dtype=torch.int32)
+        # Host-built metadata must not wait for previously queued GPU work.
+        seq_lens = seq_lens_cpu.to(device=device, dtype=torch.int32, non_blocking=True)
         max_seq_len = int(seq_lens_cpu.max().item())
         page_size = ctx.token_to_kv_pool.arena.kv_page_size
         max_pages = (max_seq_len + page_size - 1) // page_size
@@ -744,11 +801,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             seq_lens=seq_lens,
             page_table=page_table,
             kv_workspace_slots=kv_workspace_slots,
-            row_starts=row_starts_cpu.to(device=device, dtype=torch.int32),
-            row_ends=row_ends_cpu.to(device=device, dtype=torch.int32),
+            row_starts=row_starts_cpu.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ),
+            row_ends=row_ends_cpu.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ),
             candidate_lens_cpu=candidate_lens_cpu,
             kv_seq_lens=candidate_lens_cpu.to(
-                device=device, dtype=torch.int32
+                device=device, dtype=torch.int32, non_blocking=True
             ).contiguous(),
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
@@ -874,10 +935,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
+        q_norm = self._norm_qkv(q_a, latent_cache, ctx)
 
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         num_attn_tokens = int(q_norm.shape[0])

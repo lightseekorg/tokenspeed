@@ -722,3 +722,37 @@ def test_topk_passes_preallocated_buffers_and_forced_window_policy(topk_leaves, 
     call = bf16[mode][0]
     assert call["out"] is out and call["lens_out"] is lens
     assert call["initial_tokens"] == 1 and call["local_tokens"] == 2
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode", "dsa_prefill"])
+@pytest.mark.parametrize("selection", ["normal", "override", "plan"])
+def test_sink_refuses_a_provider_without_the_feature(cores, mode, selection):
+    extra = {}
+    error = NoKernelFoundError
+    if selection == "override":
+        extra["override"] = f"silent_{mode}"
+    elif selection == "plan":
+        extra["planned"] = True
+        error = ValueError
+    with pytest.raises(error):
+        _run_core(
+            mode,
+            slot_order="selection",
+            attn_sink=torch.zeros(8, dtype=torch.float32),
+            **extra,
+        )
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode", "dsa_prefill"])
+@pytest.mark.parametrize(
+    "sink,message",
+    [
+        (torch.zeros(7), "shape"),
+        (torch.zeros(1, 8), "shape"),
+        (torch.zeros(8, dtype=torch.bfloat16), "FP32"),
+        (torch.empty(8, device="meta"), "query device"),
+    ],
+)
+def test_sink_contract_is_checked_before_dispatch(mode, sink, message):
+    with pytest.raises(ValueError, match=message):
+        _run_core(mode, slot_order="selection", attn_sink=sink)

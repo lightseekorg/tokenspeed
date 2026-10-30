@@ -95,6 +95,11 @@ distinct under CUDA fast math. Cluster ranks reduce every refinement histogram
 together before collecting candidates. Equal reduced histograms and counts keep
 every rank's refinement rounds and cluster barriers in sync.
 
+Cluster launches check the kernel's supported cluster size before submission.
+This keeps the cluster-16 to cluster-8 or single-CTA fallback valid during CUDA
+Graph capture, where an unsupported launch otherwise fails only when the graph
+is instantiated. Eager execution and graph replay use the same selection rule.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
@@ -218,13 +223,25 @@ DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 caller-provided scoring scales and forced initial/local candidate policies
 remain unchanged. Kernel traits exclude other head counts.
 
-FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
-also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`
-and normalize empty rows to zero output / negative-infinite LSE for the shared
-DCP reduction. `topk_lens` masks excluded columns before dispatch, and supplied
-output buffers retain their identity. Decode transposes the vendor's
-`[batch, heads, query]` LSE to token-major order. This does not reinterpret
-regular BF16 KV as packed FP8 or change its Triton decode selection.
+FlashMLA sparse prefill and decode support regular BF16 KV and packed FP8 KV.
+Regular BF16 decode with a sink reuses the sparse prefill kernel with one
+selected slot row per query, including multi-token verify rows. Its registration
+requires `has_attention_sink=True`, preserving the existing provider selection
+for no-sink BF16 decode and context-sharded partials. BF16 sparse prefill
+pads slot widths to a pair of 64-slot tiles (128 entries), while packed FP8
+decode keeps its 64-entry alignment; padded entries are always invalid. Packed FP8 prefill retains the
+sparse decode route. Both return natural-log FP32 LSE `[tokens, heads]` and
+normalize empty rows to zero output / negative-infinite LSE for the shared
+DCP merge. Packed decode converts the native `[batch, heads, query]` LSE to
+token-major order.
+
+The optional `attn_sink` is an FP32 vector `[heads]` on the query device and
+requires the provider's `attention_sink` feature, also under a kernel override.
+FlashMLA applies this zero-value term before the output's final BF16 cast;
+the wrapper adds it to native KV-only LSE with `logaddexp` when LSE is requested.
+Empty rows then return zero output and LSE equal to the sink. Head padding uses
+negative-infinity sinks. Context partials must omit the sink; the runtime
+combiner adds it exactly once after gathering every context shard.
 
 ## Runtime backend selection
 

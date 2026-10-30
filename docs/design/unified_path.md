@@ -840,6 +840,16 @@ rows and leaves the per-token rows as the round's refresh published them.
 Neither hook clears the layer-shared sparse selection: the depth loop is
 one forward's worth of top-k reuse.
 
+DSA mixed init and decode refresh publish those per-token rows and their plan
+through the same in-place helper, including the draft's first mixed step.
+The plan excludes leading extend requests, matching the decode indexer's
+query rows. Initial rows own their storage even at width one; they never
+alias caller-owned lengths. A mixed batch's sparse decode TopK workspace
+contains only its decode tokens, with an explicit batch-row offset used by
+attention slicing and MTP gathers. A long prefill therefore cannot grow the
+per-layer workspace retained by decode graphs. KPool keeps its existing
+whole-batch selection layout and records offset zero.
+
 Backends with sharded KV must refresh derived local visibility in the same
 draft length-update hook as the global lengths. While page allocation and
 request order stay unchanged, they reuse the compact tables and ownership
