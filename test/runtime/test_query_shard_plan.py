@@ -20,6 +20,7 @@
 
 """Row layout behavior, independent of distributed execution."""
 
+import dataclasses
 import os
 import sys
 
@@ -134,6 +135,18 @@ def test_equal_segments_balance_causal_visible_key_work_per_request(size):
         )
         per_rank.append(costs[plan.local_row_ids].sum().item())
     assert len(set(per_rank)) == 1
+
+
+def test_direct_construction_rejects_a_truncated_permutation_pair():
+    # Both host permutations name every span row; a wrong-length half of the
+    # pair must fail at construction, not later in split_rows.
+    plan = QueryShardPlan.from_forward(
+        total_tokens=11, input_lengths=[5, 6], size=2, rank=0, device="cpu"
+    )
+    with pytest.raises(ValueError, match="gather_to_span_cpu"):
+        dataclasses.replace(plan, gather_to_span_cpu=plan.gather_to_span_cpu[:-1])
+    with pytest.raises(ValueError, match="span_to_gather_cpu"):
+        dataclasses.replace(plan, span_to_gather_cpu=plan.span_to_gather_cpu[:-1])
 
 
 if __name__ == "__main__":
