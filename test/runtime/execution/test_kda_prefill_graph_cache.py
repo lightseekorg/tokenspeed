@@ -1207,10 +1207,15 @@ def test_a_replay_waits_before_each_segment_only_for_the_layers_it_touches(
     """
     from test.runtime.conftest import MLA_LATENT_DIM, kda_layer_id, mla_layer_id
 
-    from tokenspeed_kernel.ops.kvcache.host_transfer import wait_layer_ready
+    from tokenspeed_kernel.ops.kvcache.host_transfer import (
+        layer_ready_ptx_supported,
+        wait_layer_ready,
+    )
 
     from tokenspeed.runtime.execution.breakable_cuda_graph import break_here
 
+    if released_by == "flags" and not layer_ready_ptx_supported():
+        pytest.skip("layer-ready flags need NVIDIA PTX; other GPUs release by event")
     cache = kimi_host_cache
     pool, owner = cache.pool, cache.owner
     cache.leaf._prefill_graph_enabled = False
