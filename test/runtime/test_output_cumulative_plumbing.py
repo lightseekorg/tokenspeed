@@ -179,6 +179,7 @@ def test_a_backend_that_does_not_declare_aligned_logprobs_is_refused_at_startup(
         return SamplingBackendConfig(
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
+            enable_block_rejection=False,
             sampling_stream="batch",
             logprob_order="torch",
             enable_output_logprobs=True,

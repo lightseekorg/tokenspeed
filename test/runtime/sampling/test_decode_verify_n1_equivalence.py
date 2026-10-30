@@ -54,6 +54,7 @@ MAX_BS = 4
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",

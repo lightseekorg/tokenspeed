@@ -44,6 +44,7 @@ def _args(**overrides) -> ServerArgs:
 def test_default_is_off_and_the_flags_travel_by_config_not_global_dict():
     args = ServerArgs(model="x")
     assert args.enable_speculative_sampling is False
+    assert args.enable_block_rejection is False
     assert args.spec_reject_draft_prob_threshold == 2.0
     # The executor and sampling-backend configs carry the flags explicitly;
     # nothing reads them from the process-global dict.
@@ -84,6 +85,46 @@ def test_refuses_without_speculative_decoding():
 def test_refuses_block_drafters(algorithm):
     with pytest.raises(ValueError, match="whole block greedily"):
         _args(speculative_algorithm=algorithm)
+
+
+def test_dspark_block_verification_requires_both_opt_in_flags():
+    args = _args(speculative_algorithm="DSPARK", enable_block_rejection=True)
+    assert args.enable_block_rejection and args.enable_speculative_sampling
+    with pytest.raises(ValueError, match="enable-block-rejection requires"):
+        _args(
+            speculative_algorithm="DSPARK",
+            enable_block_rejection=True,
+            enable_speculative_sampling=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"speculative_algorithm": "EAGLE3"},
+        {"speculative_algorithm": "DFLASH"},
+        {"sampling_backend": "flashinfer_full"},
+        {"sampling_backend": "greedy"},
+        {"disaggregation_mode": "decode"},
+    ],
+)
+def test_block_verification_refuses_unvalidated_execution_modes(changes):
+    kwargs = {"speculative_algorithm": "DSPARK", "enable_block_rejection": True}
+    kwargs.update(changes)
+    with pytest.raises(ValueError, match="enable-block-rejection requires"):
+        _args(**kwargs)
+
+
+def test_block_verification_refuses_forced_acceptance():
+    with pytest.raises(
+        ValueError,
+        match="synthetic-acceptance-length requires --sampling-backend greedy",
+    ):
+        _args(
+            speculative_algorithm="DSPARK",
+            enable_block_rejection=True,
+            synthetic_acceptance_length=3.36,
+        )
 
 
 def test_refuses_the_greedy_verifier():
@@ -127,12 +168,15 @@ def test_cli_flags_parse():
             "--model",
             "x",
             "--enable-speculative-sampling",
+            "--enable-block-rejection",
             "--spec-reject-draft-prob-threshold",
             "3.5",
         ]
     )
     assert ns.enable_speculative_sampling is True
+    assert ns.enable_block_rejection is True
     assert ns.spec_reject_draft_prob_threshold == 3.5
     ns = parser.parse_args(["--model", "x"])
     assert ns.enable_speculative_sampling is False
+    assert ns.enable_block_rejection is False
     assert ns.spec_reject_draft_prob_threshold == 2.0

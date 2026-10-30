@@ -44,6 +44,7 @@ POOL, VOCAB, MAX_BS, N = 6, 16, 4, 3
 
 def _config(enable: bool) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=enable,
         sampling_stream="batch",

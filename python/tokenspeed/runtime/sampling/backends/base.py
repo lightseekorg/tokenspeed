@@ -77,6 +77,7 @@ class SamplingBackendConfig:
     # instead of the target-only rule. Selects the verify rule, so it is
     # explicit.
     enable_speculative_sampling: bool
+    enable_block_rejection: bool
 
     # Random stream of the FlashInfer backends' sampled rows ("batch" or
     # "per-request", see ServerArgs.sampling_stream). Behaviour-selecting, so
@@ -135,6 +136,7 @@ class SamplingBackendConfig:
 
         return cls(
             synthetic_acceptance_length=server_args.synthetic_acceptance_length,
+            enable_block_rejection=server_args.enable_block_rejection,
             sampling_stream=server_args.sampling_stream,
             logprob_order=server_args.logprob_order,
             enable_nan_detection=server_args.enable_nan_detection,
