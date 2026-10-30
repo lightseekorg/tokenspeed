@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""SIMT causal convolution with register reuse across consecutive tokens."""
+"""SIMT causal convolution: one register window per eight-token tile."""
 
 import math
 
@@ -142,7 +142,7 @@ def _silu(value: Float32, *, loc=None, ip=None):
 
 
 class CausalConv1dPrefill:
-    """Compile one fixed model layout and tactic; all request data stays dynamic."""
+    """Compile one fixed model layout and tile; all request data stays dynamic."""
 
     def __init__(
         self,
@@ -156,7 +156,6 @@ class CausalConv1dPrefill:
         block_m: int,
         block_n: int,
         threads: int,
-        token_parallel: bool,
         min_blocks_per_mp: int,
         use_mixed_add: bool,
         has_bias: bool,
@@ -182,7 +181,6 @@ class CausalConv1dPrefill:
         self.block_n = block_n
         self.threads = threads
         self.vector = block_n // threads
-        self.token_parallel = token_parallel
         self.min_blocks_per_mp = min_blocks_per_mp
         self.use_mixed_add = use_mixed_add
         self.has_bias = has_bias
@@ -212,10 +210,8 @@ class CausalConv1dPrefill:
     ):
         flat = cute.make_layout(9223372036854775807)
         channel_tiles = cute.ceil_div(self.channels, self.block_n)
-        if cutlass.const_expr(self.token_parallel):
-            grid = (channel_tiles, programs, 1)
-        else:
-            grid = (programs, channel_tiles, 1)
+        # Channel tiles vary fastest so neighbouring CTAs share token rows.
+        grid = (channel_tiles, programs, 1)
         self.causal_conv1d_prefill(
             cute.make_tensor(x, flat),
             cute.make_tensor(weight, flat),
@@ -364,102 +360,56 @@ class CausalConv1dPrefill:
                 ):
                     initial[v] = bias[channel + v].to(Float32)
 
-        if cutlass.const_expr(self.token_parallel):
-            # Exactly M+3 input rows cover all four windows in this CTA.
-            window = cute.make_rmem_tensor(
-                cute.make_layout((self.vector, self.block_m + 3)), BFloat16
+        # Exactly M+3 input rows cover all four windows in this CTA.
+        window = cute.make_rmem_tensor(
+            cute.make_layout((self.vector, self.block_m + 3)), BFloat16
+        )
+        for row in cutlass.range_constexpr(self.block_m + 3):
+            window[None, row].store(
+                self._load_row(
+                    x,
+                    state,
+                    start,
+                    token + row - 3,
+                    length,
+                    channel,
+                    slot,
+                    history,
+                    first,
+                    full,
+                )
             )
-            for row in cutlass.range_constexpr(self.block_m + 3):
-                window[None, row].store(
-                    self._load_row(
-                        x,
-                        state,
-                        start,
-                        token + row - 3,
-                        length,
-                        channel,
-                        slot,
-                        history,
-                        first,
-                        full,
-                    )
-                )
-            # Every output reads the immutable register window. Static expansion
-            # keeps output chains independent without retaining every FP32 sum.
-            for row in cutlass.range_constexpr(self.block_m):
-                if cutlass.const_expr(full) or token + row < length:
-                    acc = initial.load()
-                    for tap in cutlass.range_constexpr(4):
-                        value = window[None, row + tap].load()
-                        w = weights[tap, None].load()
-                        product = _multiply_bf16(value, w)
-                        acc = self._add(acc, product)
-                    self._store_row(out, start + token + row, channel, acc)
-        else:
-            window = cute.make_rmem_tensor(cute.make_layout((self.vector, 4)), BFloat16)
-            for row in cutlass.range_constexpr(3):
-                window[None, row].store(
-                    self._load_row(
-                        x,
-                        state,
-                        start,
-                        token + row - 3,
-                        length,
-                        channel,
-                        slot,
-                        history,
-                        first,
-                        full,
-                    )
-                )
-            for row in cutlass.range_constexpr(self.block_m):
-                if cutlass.const_expr(full) or token + row < length:
-                    window[None, 3].store(
-                        self._load_row(
-                            x,
-                            state,
-                            start,
-                            token + row,
-                            length,
-                            channel,
-                            slot,
-                            history,
-                            first,
-                            full,
-                        )
-                    )
-                    acc = initial.load()
-                    for tap in cutlass.range_constexpr(4):
-                        value = window[None, tap].load()
-                        w = weights[tap, None].load()
-                        acc = self._add(acc, _multiply_bf16(value, w))
-                    self._store_row(out, start + token + row, channel, acc)
-                    for tap in cutlass.range_constexpr(3):
-                        window[None, tap].store(window[None, tap + 1].load())
+        # Every output reads the immutable register window. Static expansion
+        # keeps output chains independent without retaining every FP32 sum.
+        for row in cutlass.range_constexpr(self.block_m):
+            if cutlass.const_expr(full) or token + row < length:
+                acc = initial.load()
+                for tap in cutlass.range_constexpr(4):
+                    value = window[None, row + tap].load()
+                    w = weights[tap, None].load()
+                    product = _multiply_bf16(value, w)
+                    acc = self._add(acc, product)
+                self._store_row(out, start + token + row, channel, acc)
 
         if cutlass.const_expr(first):
+            # The request's last three inputs (or old history when it is
+            # shorter) become its new history.
             tail = cute.make_rmem_tensor(cute.make_layout((self.vector, 3)), BFloat16)
-            if cutlass.const_expr(not self.token_parallel) and length <= self.block_m:
-                # The rolling window already holds the final three inputs,
-                # including old history for a request shorter than three tokens.
-                for row in cutlass.range_constexpr(3):
-                    tail[None, row].store(window[None, row].load())
-            else:
-                for row in cutlass.range_constexpr(3):
-                    tail[None, row].store(
-                        self._load_row(
-                            x,
-                            state,
-                            start,
-                            length - 3 + row,
-                            length,
-                            channel,
-                            slot,
-                            history,
-                            True,
-                            False,
-                        )
+            for row in cutlass.range_constexpr(3):
+                tail[None, row].store(
+                    self._load_row(
+                        x,
+                        state,
+                        start,
+                        length - 3 + row,
+                        length,
+                        channel,
+                        slot,
+                        history,
+                        True,
+                        False,
                     )
+                )
             # Each thread owns these channels and has read its old history.
             # Later token tiles read immutable input, never this state.
             for v in cutlass.range_constexpr(self.vector):
@@ -478,11 +428,7 @@ class CausalConv1dPrefill:
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
-        bx, by, _ = cute.arch.block_idx()
-        if cutlass.const_expr(self.token_parallel):
-            channel_tile, program = bx, by
-        else:
-            program, channel_tile = bx, by
+        channel_tile, program, _ = cute.arch.block_idx()
         channel = (
             Int64(channel_tile) * self.block_n + cute.arch.thread_idx()[0] * self.vector
         )

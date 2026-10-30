@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL prefill convolution with fixed tactics and dynamic request maps."""
+"""CuTe DSL prefill convolution with a fixed tile and dynamic request maps."""
 
 import math
 from dataclasses import dataclass
@@ -45,14 +45,16 @@ class PrefillConfig:
     block_m: int
     block_n: int
     threads: int
-    token_parallel: bool
     min_blocks_per_mp: int
 
 
 _COMPILED = {}
 _COMPILE_LOCK = Lock()
-_ROLLING = PrefillConfig(8, 256, 128, False, 1)
-_PARALLEL = PrefillConfig(8, 512, 128, True, 10)
+# One tile per CTA: eight tokens by 512 channels, four channels per thread.
+# Measured faster than a rolling-window variant at every request length of
+# 16 tokens or more and under capacity-metadata graph replay; requests of
+# eight tokens or fewer ran slower than that variant, which was dropped.
+_PARALLEL = PrefillConfig(8, 512, 128, 10)
 
 
 def _prepare_causal_conv1d_prefill(
@@ -70,7 +72,7 @@ def _prepare_causal_conv1d_prefill(
     silu: bool,
     enable_pdl: bool,
 ):
-    """Prepare one tactic without launching it or changing output/history."""
+    """Compile or look up the executor without launching it."""
     import cuda.bindings.driver as cuda
     import cutlass
     from cutlass import cute
@@ -144,7 +146,7 @@ def _prepare_causal_conv1d_prefill(
         for i, t in enumerate(tensors)
     )
     args += (cutlass.Int32(metadata.batch_indices.numel()),)
-    # All entries describe fixed model/tactic layouts. No token count, request
+    # All entries describe fixed model and tile layouts. No token count, request
     # count or boundary value enters this cache key.
     key = (
         x.device.index,
@@ -167,7 +169,7 @@ def _prepare_causal_conv1d_prefill(
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "warm the convolution tactic before CUDA Graph capture"
+                    "warm the convolution kernel before CUDA Graph capture"
                 )
             with _COMPILE_LOCK:
                 compiled = _COMPILED.get(key)
@@ -182,7 +184,6 @@ def _prepare_causal_conv1d_prefill(
                         block_m=config.block_m,
                         block_n=config.block_n,
                         threads=config.threads,
-                        token_parallel=config.token_parallel,
                         min_blocks_per_mp=config.min_blocks_per_mp,
                         use_mixed_add=torch.cuda.get_device_capability(x.device)
                         >= (10, 0),
@@ -237,18 +238,6 @@ def launch_causal_conv1d_prefill(
         if compiled is not None:
             compiled(*args, stream)
     return compiled
-
-
-def _use_parallel_tactic(
-    num_tokens: int, num_requests: int, *, exact_workload: bool
-) -> bool:
-    # Capacity graphs may replay far fewer live tokens than their buffer size.
-    return (
-        exact_workload
-        and num_requests > 0
-        and 2048 <= num_tokens <= 8192
-        and num_tokens >= 128 * num_requests
-    )
 
 
 if _AVAILABLE:
@@ -310,8 +299,8 @@ if _AVAILABLE:
 
         Returns:
             BF16 output with the input shape and packed token rows. Padding
-            rows are untouched. Small and capacity workloads use the rolling
-            tactic in the same kernel; exact large chunks use parallel windows.
+            rows are untouched. Exact and capacity metadata run the same
+            tile; token and request counts are runtime values.
         """
         if pad_slot_id != -1:
             raise ValueError("CuTe convolution requires padding slot -1")
@@ -325,12 +314,6 @@ if _AVAILABLE:
         ):
             raise ValueError("convolution request vectors must have matching lengths")
         out = torch.empty((x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device).T
-        boundaries_cpu = prefill_metadata.cu_seqlens_cpu
-        tokens = int(boundaries_cpu[-1]) if boundaries_cpu is not None else x.shape[1]
-        parallel = _use_parallel_tactic(
-            tokens, cache_indices.numel(), exact_workload=boundaries_cpu is not None
-        )
-        config = _PARALLEL if parallel else _ROLLING
         silu = activation is True or activation in ("silu", "swish")
         enable_pdl = pdl_enabled()
         args = (
@@ -343,21 +326,10 @@ if _AVAILABLE:
             query_start_loc,
             out,
         )
-        from tokenspeed_kernel.ops.tuning import is_warming_up
-
-        if is_warming_up():
-            # Compile the other tactic without updating history a second time.
-            _prepare_causal_conv1d_prefill(
-                *args,
-                metadata=prefill_metadata,
-                config=_ROLLING if parallel else _PARALLEL,
-                silu=silu,
-                enable_pdl=enable_pdl,
-            )
         launch_causal_conv1d_prefill(
             *args,
             metadata=prefill_metadata,
-            config=config,
+            config=_PARALLEL,
             silu=silu,
             enable_pdl=enable_pdl,
         )
