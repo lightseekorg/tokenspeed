@@ -46,7 +46,7 @@ def prepare_ascend_mla_prefill(
     history_null_rows=0,
     workspace=None,
 ):
-    """Reuse the DSA AICPU gather/owner-commit transport with no Index-K plane."""
+    """Reuse the DSA HCCL gather/owner-commit transport with no Index-K plane."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAPrefill
 
     return AscendDSAPrefill(
