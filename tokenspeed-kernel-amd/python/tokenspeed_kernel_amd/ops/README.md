@@ -1403,42 +1403,34 @@ row's causal limit skip masking.
 the causal limit mask the scores and zero the value rows past the key tail.
 
 FP8 inputs stage Q in LDS, split the NoPE QK into two 64-wide WMMAs, and run
-three waves per SIMD. Every FP8 product has a depth of 64, so it uses the
-64-deep FP8 WMMA instruction; the 128-deep one would pad half of each
-operand with zeros. Fully visible tiles run in their own loop without mask
-code, and the boundary tiles mask keys only, since rows past `q_len` are
-never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
-those keys score `-inf`.
+three waves per SIMD. Every FP8 product is 64 deep, so it uses the 64-deep
+FP8 WMMA rather than padding the 128-deep one with zeros. Fully visible tiles
+run in their own loop without mask code, and the boundary tiles mask keys
+only, since rows past `q_len` are never stored. V is not masked: TDM
+zero-fills tile rows past `kv_len`, and those keys score `-inf`.
 
-FP8 launches that would leave resident workgroup slots idle split each query
-block's keys into equal tile ranges, run one workgroup per range, and merge:
+FP8 launches that would leave workgroup slots idle split each query block's
+keys into equal tile ranges, one workgroup per range:
 
-- Non-causal launches of up to 16 sequences split every block that has keys
-  the same way, into as many ranges (at most 8, of at least 16 tiles) as fill
-  three workgroups per CU. Prefix chunks of one short query, or of a batch
-  whose other sequences have no prefix, otherwise run a few dozen workgroups.
-  The device derives the split from `cu_seqlens`; the host bounds it.
-- Causal single-sequence launches cut blocks longer than about 1.5 pieces per
-  resident slot of the total work into pieces of that size, and dispatch the
-  latest, heaviest blocks first, so the triangular tail no longer waits on
-  one workgroup that walks every key.
-- A split block's workgroups each publish their normalized output (BF16) and
-  base-2 LSE, and `gluon_mla_prefill_merge_gfx1250` combines them with the
-  usual max-shifted weights. Blocks that are not split store directly. The
-  merge is a separate launch: any side-effecting operation after the tile
-  loop, such as a completion counter, makes register allocation spill the
-  accumulator inside the loop.
+- Non-causal launches of up to 16 sequences split every block with keys into
+  the same number of ranges (at most 8, of at least 16 tiles), enough for
+  three workgroups per CU. The device derives the split from `cu_seqlens`;
+  the host bounds it.
+- Causal single-sequence launches cut long blocks into pieces of about 1.5
+  per-slot shares of the work and dispatch the heaviest blocks first, so the
+  causal tail does not wait on one workgroup.
+- Split workgroups publish a normalized BF16 output and base-2 LSE, which
+  `gluon_mla_prefill_merge_gfx1250` combines with max-shifted weights. The
+  merge is a separate launch because any side effect after the tile loop,
+  such as a completion counter, spills the accumulator inside the loop.
 
-Sequences are the slowest grid axis, so one sequence's blocks are dispatched
-together. Interleaved with the blocks of sequences that have no keys, as in a
-prefix chunk next to new requests, a long sequence ran about 1.7x slower.
+Sequences are the slowest grid axis, so one sequence's blocks dispatch
+together instead of interleaving with those of sequences that have no keys.
 
-Non-causal FP8 launches whose prefixes are at most 16 tiles compile with
-`amdgpu-sched-strategy=max-memory-clause`. Each block then walks only a few
-tiles, so the launch waits on one block's latency, worst when it shares the
-grid with the output-only blocks of new sequences; clustered memory
-instructions make those launches up to 1.18x faster. Longer prefixes keep the
-default scheduler, which is 3–5% faster there.
+Non-causal FP8 launches with prefixes of at most 16 tiles compile with
+`amdgpu-sched-strategy=max-memory-clause`: each block walks only a few tiles,
+so one block's latency bounds the launch. Longer prefixes keep the default
+scheduler, which is 3–5% faster there.
 
 ### gfx950 GDN decode and MTP verify
 
