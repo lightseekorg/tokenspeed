@@ -111,17 +111,23 @@ def freeze_gc(enable_cudagraph_gc: bool):
 def get_batch_sizes_to_capture(config: ModelExecutorConfig):
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+    effective_max = min(config.max_cudagraph_capture_size, max_bs)
 
     if capture_bs is None:
         if config.disable_cuda_graph_padding:
             capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+            stride = 32
         else:
             capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            stride = 16
+        # The default ladder ends at 160; carry it up to a larger capture cap.
+        if effective_max > capture_bs[-1]:
+            capture_bs += list(range(capture_bs[-1] + stride, effective_max, stride))
+            capture_bs.append(effective_max)
 
     if max(capture_bs) > max_bs:
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
-    effective_max = min(config.max_cudagraph_capture_size, max_bs)
     # Ascending and unique: padding bisects the ladder for a batch's graph.
     return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
