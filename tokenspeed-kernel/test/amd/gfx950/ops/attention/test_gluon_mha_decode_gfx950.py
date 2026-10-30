@@ -703,60 +703,53 @@ def test_balanced_rows_without_keys_merge_to_the_sink() -> None:
     _check_verify(out[1:], reference)
 
 
-def test_balanced_policy_picks_uneven_long_batches() -> None:
-    """The host policy (thresholds measured on MI350X): a few long requests
-    among padding ones balance, about equal lengths keep the split grid, and
-    so does any batch under 512 pages."""
-    shape = dict(
-        num_q_heads=16,
-        num_kv_heads=2,
-        max_seqlen_q=8,
-        max_seqlen_k=1 << 18,
-        page_size=PAGE_SIZE,
-    )
-    prefers = decode.prefers_gluon_mha_decode_balanced_gfx950
-    long_pages = 190_000 // PAGE_SIZE
-    assert prefers([long_pages] * 9 + [1] * 7, **shape)
-    assert prefers([long_pages], **shape)
-    assert not prefers([long_pages] * 16, **shape)
-    assert not prefers([128] * 9 + [1] * 7, **shape)
-    assert decode.supports_gluon_mha_decode_balanced_gfx950(1 << 18, PAGE_SIZE)
-    assert not decode.supports_gluon_mha_decode_balanced_gfx950(8192, PAGE_SIZE)
-
-
 def test_public_ops_select_the_balanced_path_only_with_a_schedule(tmp_path) -> None:
-    """mha_decode_with_kvcache keeps the split grid without a schedule and
-    takes the balanced kernels with one; sliding windows get no schedule,
-    and the policy names when one pays."""
+    """Verify calls take a schedule and plain decode and sliding windows none;
+    mha_decode_with_kvcache keeps the split grid without a schedule and takes
+    the balanced kernels with one."""
     import json
 
     from tokenspeed_kernel.ops.attention.mha import (
         mha_decode_schedule,
-        mha_decode_schedule_policy,
+        mha_decode_takes_schedule,
         mha_decode_with_kvcache,
     )
     from tokenspeed_kernel.profiling import ShapeCapture
 
-    inputs = _verify_inputs(
+    plain = _verify_inputs(
         [900 * PAGE_SIZE + 3, 1, 1, 1], 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, 37
+    )
+    plain_call = dict(q=plain["q"], k_cache=plain["k_cache"], v_cache=plain["v_cache"])
+    assert not mha_decode_takes_schedule(max_seqlen_q=1, **plain_call)
+    assert (
+        mha_decode_schedule(
+            cache_seqlens=plain["cache_seqlens"], max_seqlen_q=1, **plain_call
+        )
+        is None
+    )
+
+    inputs = _verify_inputs(
+        [900 * PAGE_SIZE + 3, VERIFY_TOKENS, VERIFY_TOKENS, VERIFY_TOKENS],
+        VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        64,
+        37,
     )
     call = dict(
         q=inputs["q"],
         k_cache=inputs["k_cache"],
         v_cache=inputs["v_cache"],
-        max_seqlen_q=1,
+        max_seqlen_q=VERIFY_TOKENS,
     )
+    assert mha_decode_takes_schedule(**call)
+    assert not mha_decode_takes_schedule(window_left=511, **call)
     assert (
         mha_decode_schedule(
             cache_seqlens=inputs["cache_seqlens"], window_left=511, **call
         )
         is None
     )
-    policy = mha_decode_schedule_policy(max_seqlen_k=1 << 20, **call)
-    assert policy.prefers([900, 1, 1, 1]) and not policy.prefers([100, 1, 1, 1])
-    # 16 heads over 2 KV heads at one query: two row blocks per request.
-    assert (policy.min_pages, policy.max_requests) == (512, 254)
-    assert mha_decode_schedule_policy(max_seqlen_k=8192, **call) is None
     schedule = mha_decode_schedule(cache_seqlens=inputs["cache_seqlens"], **call)
 
     ShapeCapture.reset()
