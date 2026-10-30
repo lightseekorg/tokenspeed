@@ -37,24 +37,35 @@ from unittest import mock
 import pytest
 import torch
 
-from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.distributed.process_group_manager import (
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
+from tokenspeed.runtime.distributed.process_group_manager import (  # noqa: E402
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.engine.io_struct import (
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
 )
-from tokenspeed.runtime.execution.device import DeviceHandle
-from tokenspeed.runtime.execution.drafter.base import BaseDrafter
-from tokenspeed.runtime.execution.model_runner import ModelRunner
-from tokenspeed.runtime.execution.model_update import (
+from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
+from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
+from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
+from tokenspeed.runtime.execution.model_update import (  # noqa: E402
     ModelUpdateAdapter,
     model_update_adapter_for,
 )
-from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
-from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
+from tokenspeed.runtime.execution.weight_memory import (  # noqa: E402
+    WeightMemoryState,
+)
+from tokenspeed.runtime.models.base import BaseCausalLM  # noqa: E402
+from tokenspeed.runtime.utils.server_args import (  # noqa: E402
+    ServerArgs,
+    prepare_server_args,
+)
 
 # --------------------------------------------------------------------------
 # Device dispatch: which models the SDK updates
@@ -512,10 +523,19 @@ def test_discarded_device_rejects_update_before_kv_release_or_weight_remap(
     assert ("Resume weight storage" if unmapped else "Release KV") in message
     assert sdk.stores == []
     assert sdk.updates == []
-    # The global failure callback must also cover a rank that refused before
-    # entering its local update session.
+    # Every rank refused before loading: the replica-wide failure leaves the
+    # untouched weights retryable rather than poisoned.
     handle.commit_weight_update(False)
-    assert state.failed
+    assert not state.failed
+    if unmapped:
+        state.resume(lambda: None)
+    else:
+        state.mark_kv_released()
+    success, message = handle.update_weights(_mooncake_req(12))
+    assert success, message
+    handle.commit_weight_update(True)
+    handle.before_kv_resume()
+    assert sdk.updates[0][1] == 12
 
 
 def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
@@ -531,7 +551,9 @@ def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
     assert "complete Model Updater SDK update" in message
     assert sdk.updates == []
     handle.commit_weight_update(False)
-    with pytest.raises(RuntimeError, match="restart"):
+    # Refused before loading: still unavailable, but not poisoned.
+    assert not state.failed
+    with pytest.raises(RuntimeError, match="unavailable"):
         handle.before_kv_resume()
 
 

@@ -71,8 +71,12 @@ not suspend NCCL or release its communication buffers.
    any derived state is rebuilt. A stream or coverage failure aborts the session
    on every rank, so peers do not enter post-load collectives without it.
 6. Every rank confirms the final result, including namespace publication. Only
-   this commit makes locally loaded weights usable. A failure poisons all
-   ranks; restart the deployment rather than attempting a partial wake.
+   this commit makes locally loaded weights usable. A failure poisons every
+   rank that started loading, under either policy, including ranks whose own
+   load succeeded; restart the deployment rather than attempting a partial
+   wake. An update refused before any rank loads (weights still released, KV
+   still resident under discard, a refused cache flush, a non-SDK update under
+   discard) leaves the weights untouched and may be retried.
 7. Resume `kv_cache`, then allow new rollouts. Remapped KV pages are cleared
    and re-registered for transfer; old request history is not CPU-backed up.
 

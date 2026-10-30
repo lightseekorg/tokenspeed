@@ -244,10 +244,15 @@ class WeightMemoryState:
     def commit_update(self, success: bool) -> None:
         """The control plane commits only after the replica agrees on success."""
         if not success:
-            # A peer may fail before this rank starts loading. All ranks must
-            # still reject a later wake, including the locally successful ones.
-            self.valid = False
-            self.failed = True
+            # A rank that started loading may hold a partial version, even when
+            # its own load succeeded and a peer failed: reject a later wake.
+            # A rank that refused before loading (weights released, KV still
+            # resident, a refused cache flush) left its weights untouched. The
+            # refusal conditions are the same on every rank, so the whole
+            # replica refused and the update may be retried.
+            if self.updating or self.local_update_success is not None:
+                self.valid = False
+                self.failed = True
             self.updating = False
             self.local_update_success = None
             return

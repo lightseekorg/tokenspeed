@@ -20,11 +20,23 @@
 
 """CPU contracts for weight validity; allocator actions simulate lost pages."""
 
+import os
+import sys
+
 import pytest
 import torch
 from torch import nn
 
-from tokenspeed.runtime.execution.weight_memory import WeightMemoryState, backup_weights
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.execution.weight_memory import (  # noqa: E402
+    WeightMemoryState,
+    backup_weights,
+)
 
 
 class TinyModel(nn.Module):
@@ -226,11 +238,24 @@ def test_replica_failure_invalidates_a_locally_successful_update():
         state.before_kv_resume()
 
 
-def test_replica_failure_can_arrive_without_a_local_session():
-    state = WeightMemoryState(policy="discard", models=[TinyModel()])
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+def test_replica_refusal_without_a_local_load_can_be_retried(policy):
+    # Every rank refused before loading (here: weights still released), so
+    # no rank touched its weights and the replica-wide failure must not poison.
+    model = TinyModel()
+    state = WeightMemoryState(policy=policy, models=[model])
+    state.mark_kv_released()
+    state.release(lambda: None)
+    with pytest.raises(RuntimeError, match="Resume weight storage"):
+        state.begin_update()
     state.commit_update(False)
-    with pytest.raises(RuntimeError, match="restart"):
-        state.require_usable()
+    assert not state.failed
+    state.resume(lambda: None)
+    state.begin_update()
+    state.finish_update(success=True)
+    state.commit_update(True)
+    state.before_kv_resume()
+    state.require_usable()
 
 
 def test_local_completeness_is_required_even_for_a_successful_global_decision():

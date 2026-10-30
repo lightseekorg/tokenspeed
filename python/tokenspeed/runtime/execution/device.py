@@ -993,6 +993,9 @@ class DeviceHandle:
                 state.finish_update(success=bool(result[0]))
             return result
         except Exception as exc:
+            # The reply carries only the message; keep the traceback that
+            # explains a failed (and, under the memory saver, poisoning) load.
+            logger.exception(f"weight operation {type(req).__name__} failed")
             if loads_weights and state is not None and state.updating:
                 state.finish_update(success=False)
             return False, str(exc)

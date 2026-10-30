@@ -582,8 +582,10 @@ replica MIN-reduces its result before the loop publishes the L3 weight
 version or sends the reply. A weight load also commits that final result on
 all forward threads before replying. Under the discard policy, local loading
 success is pending: only the successful replica-wide commit marks parameters
-usable. Failure invalidates every rank, including ranks that loaded locally;
-KV wake and forwarding remain blocked until deployment restart. The same gate carries the online expert
+usable. Failure invalidates every rank that started loading, including ranks
+that loaded locally; KV wake and forwarding remain blocked until deployment
+restart. A refusal before loading (the same on every rank) leaves the weights
+untouched and retryable. The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at
