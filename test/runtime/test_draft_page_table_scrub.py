@@ -56,6 +56,9 @@ class _Leaf:
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         pass
 
+    def use_decode_kernel_variant(self, variant):
+        pass
+
 
 def _draft_router(rows: int = 8) -> CacheGroupRouter:
     router = CacheGroupRouter(
