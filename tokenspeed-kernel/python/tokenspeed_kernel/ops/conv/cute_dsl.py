@@ -255,9 +255,7 @@ if _AVAILABLE:
         traits={
             "width": frozenset({4}),
             "state_layout": frozenset({"channel_major"}),
-            "channels": frozenset({36864}),
             "channel_contiguous": frozenset({True}),
-            "token_stride": frozenset({36864, 49376, 49408}),
             "weight_dtype": frozenset({torch.bfloat16}),
             "bias_dtype": frozenset({None, torch.bfloat16}),
             "state_dtype": frozenset({torch.bfloat16}),
@@ -281,14 +279,15 @@ if _AVAILABLE:
         *,
         prefill_metadata: CausalConv1dPrefillMetadata,
     ) -> torch.Tensor:
-        """Convolve KDA prefill tokens through the common convolution facade.
+        """Convolve prefill tokens through the common convolution facade.
 
         Args:
-            x: BF16 [36864, tokens], with contiguous channels. Token stride
-                is 36864, 49376 or 49408, including fused projection views.
-            weight: BF16 [36864, 4] taps in oldest-to-newest order.
+            x: BF16 [channels, tokens] with contiguous channels and any token
+                stride, including fused projection views. Channel count and
+                stride are static per model and select the compiled executor.
+            weight: BF16 [channels, 4] taps in oldest-to-newest order.
             bias: Optional contiguous BF16 channel vector.
-            conv_states: BF16 [slots, 36864, history], updated in place.
+            conv_states: BF16 [slots, channels, history], updated in place.
             query_start_loc: Packed request boundaries [requests + 1].
             cache_indices: Integer state slots [requests]; -1 marks padding.
             has_initial_state: Boolean history-valid flags [requests].
