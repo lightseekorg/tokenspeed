@@ -27,7 +27,7 @@ precomputed top-k."""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import triton
@@ -1823,22 +1823,6 @@ def _maybe_gluon_package_mxfp4_prefill(
     ):
         return None
 
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
-        gluon_moe_sorting,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
-        invoke_gluon_mxfp4_moe_stage1,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
-        invoke_gluon_mxfp4_moe_stage2_1x2,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
-        quantize_mxfp8_sorted_routes,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
-        gather_package_cdna4_scale,
-    )
-
     config = _select_grouped_moe_config(
         n_tokens,
         hidden_dim=hidden_dim,
@@ -1855,6 +1839,117 @@ def _maybe_gluon_package_mxfp4_prefill(
         swiglu_args=(swiglu_alpha, swiglu_limit, swiglu_beta),
         situ_linear_beta=situ_linear_beta,
     )
+    routes, q_inter, stage2_scale, out = _package_prefill_gate_up(
+        hidden_states,
+        x_quantized,
+        topk_ids,
+        topk_weights,
+        package_w13,
+        package_w13_scale,
+        config,
+        expert_start=expert_start,
+        out_dtype=out_dtype,
+        model_dim=hidden_dim,
+        activation_format=activation_format,
+        swiglu_args=(swiglu_alpha, swiglu_limit, swiglu_beta),
+        situ_linear_beta=situ_linear_beta,
+        intermediate=None,
+        intermediate_scale=None,
+        output_k=int(package_w2.shape[2]) * 2,
+        deterministic_order=False,
+        out=out,
+    )
+    stage2_out = _package_prefill_down(
+        q_inter,
+        stage2_scale,
+        routes,
+        package_w2,
+        package_w2_scale,
+        out,
+        deferred_out=deferred_out,
+        do_finalize=do_finalize,
+        force_reduce=force_reduce,
+        # Deferred E2M1 consumers use expanded_idx to mask nonlocal routes.
+        initialize_unowned_routes=do_finalize or activation_format != "e2m1",
+        activation_format=activation_format,
+        logical_k=inter_dim,
+    )
+    if not do_finalize:
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+            gluon_local_route_map,
+        )
+
+        expanded_idx = gluon_local_route_map(topk_ids, expert_start, n_experts)
+        return stage2_out, None, expanded_idx
+    return out
+
+
+class MXFP4SortedRoutes(NamedTuple):
+    """Sorted route metadata both package prefill GEMMs consume.
+
+    ``sorted_ids`` packs ``(slot << 24) | token`` per sorted row, with padding
+    rows at token ``rows``; ``num_valid_ids[0]`` is the padded row extent on
+    the device. ``block_m`` is the sort's per-expert padding, which both GEMMs
+    tile by.
+    """
+
+    sorted_ids: torch.Tensor
+    sorted_weights: torch.Tensor
+    sorted_expert_ids: torch.Tensor
+    num_valid_ids: torch.Tensor
+    block_m: int
+    rows: int
+    top_k: int
+
+
+def sorted_route_capacity(rows: int, num_experts: int, top_k: int) -> int:
+    """Largest sorted row count a package prefill of ``rows`` tokens can produce."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
+        _max_padded_route_capacity,
+    )
+
+    # Stage 2 accepts sort blocks of at most 128 rows.
+    return _max_padded_route_capacity(rows * top_k, num_experts, 128)
+
+
+def _package_prefill_gate_up(
+    hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    x_quantized: tuple[torch.Tensor, torch.Tensor] | None,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    package_w13: torch.Tensor,
+    package_w13_scale: torch.Tensor,
+    config,
+    *,
+    expert_start: int,
+    out_dtype: torch.dtype,
+    model_dim: int,
+    activation_format: str,
+    swiglu_args: tuple[float, float, float],
+    situ_linear_beta: float | None,
+    intermediate: torch.Tensor | None,
+    intermediate_scale: torch.Tensor | None,
+    output_k: int,
+    deterministic_order: bool,
+    out: torch.Tensor | None,
+) -> tuple[MXFP4SortedRoutes, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sort routes and run the gate/up GEMM into sorted block-scaled rows."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
+        gluon_moe_sorting,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
+        invoke_gluon_mxfp4_moe_stage1,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
+        quantize_mxfp8_sorted_routes,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
+        gather_package_cdna4_scale,
+    )
+
+    n_tokens, hidden_dim, device, _ = _mxfp4_input_metadata(hidden_states)
+    top_k = int(topk_ids.shape[1])
+    n_experts = int(package_w13.shape[0])
     sort_block_m = config.block_m
     # A single route chunk fuses the short-prefill histogram and prefix scan.
     # Larger prefills retain chunk ordering for the stage-1 activation gather.
@@ -1863,12 +1958,12 @@ def _maybe_gluon_package_mxfp4_prefill(
             topk_ids,
             topk_weights,
             n_experts,
-            hidden_dim,
+            model_dim,
             out_dtype,
             sort_block_m,
             use_minimum_route_chunks=config.use_minimum_route_chunks,
             runtime_rows=config.runtime_rows,
-            deterministic_order=False,
+            deterministic_order=deterministic_order,
             expert_start=expert_start,
             out=out,
         )
@@ -1897,24 +1992,37 @@ def _maybe_gluon_package_mxfp4_prefill(
             top_k=top_k,
             flatten_topk=False,
         )
-    stage2_k = int(package_w2.shape[2]) * 2
-    stage2_k_scale = stage2_k // MXFP4_BLOCK
-    stage2_scale_rows = triton.cdiv(int(sorted_ids.shape[0]), 32) * 32
+    output_k_scale = output_k // MXFP4_BLOCK
+    scale_rows = triton.cdiv(int(sorted_ids.shape[0]), 32) * 32
     # Stage 1 writes the activated intermediate directly in the selected
     # sorted block-scaled format, including the zero K-padding required by W2.
-    intermediate_format = activation_format
-    inter_div = 1 if intermediate_format == "e4m3" else 2
-    inter_dtype = torch.float8_e4m3fn if intermediate_format == "e4m3" else torch.uint8
-    q_inter = torch.empty(
-        (sorted_ids.shape[0], stage2_k // inter_div),
-        dtype=inter_dtype,
-        device=device,
-    )
-    stage2_scale = torch.empty(
-        (stage2_scale_rows, stage2_k_scale),
-        dtype=torch.uint8,
-        device=device,
-    )
+    inter_div = 1 if activation_format == "e4m3" else 2
+    inter_dtype = torch.float8_e4m3fn if activation_format == "e4m3" else torch.uint8
+    if intermediate is None:
+        intermediate = torch.empty(
+            (sorted_ids.shape[0], output_k // inter_div),
+            dtype=inter_dtype,
+            device=device,
+        )
+        intermediate_scale = torch.empty(
+            (scale_rows, output_k_scale),
+            dtype=torch.uint8,
+            device=device,
+        )
+    else:
+        # Reject before stage 1 writes a destination that may be shared memory.
+        if (
+            intermediate.shape[0] < sorted_ids.shape[0]
+            or intermediate_scale.shape[0] < scale_rows
+        ):
+            raise ValueError(
+                f"gate/up destination holds {intermediate.shape[0]} rows and "
+                f"{intermediate_scale.shape[0]} scale rows; the sort needs "
+                f"{sorted_ids.shape[0]} and {scale_rows}"
+            )
+        intermediate = intermediate[: sorted_ids.shape[0]]
+        intermediate_scale = intermediate_scale[:scale_rows]
+    swiglu_alpha, swiglu_limit, swiglu_beta = swiglu_args
     invoke_gluon_mxfp4_moe_stage1(
         q_hidden,
         package_w13.view(torch.uint8),
@@ -1922,7 +2030,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        q_inter,
+        intermediate,
         top_k,
         w1_scale=package_w13_scale.view(torch.uint8),
         a1_scale=stage1_scale,
@@ -1936,57 +2044,248 @@ def _maybe_gluon_package_mxfp4_prefill(
         situ_linear_beta=situ_linear_beta,
         output_sorted=True,
         output_quantized=True,
-        out_scale=stage2_scale,
-        output_k=stage2_k,
+        out_scale=intermediate_scale,
+        output_k=output_k,
         a_format=activation_format,
-        output_format=intermediate_format,
+        output_format=activation_format,
         input_sorted=input_sorted,
         source_tokens=n_tokens,
     )
+    routes = MXFP4SortedRoutes(
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        sort_block_m,
+        n_tokens,
+        top_k,
+    )
+    return routes, intermediate, intermediate_scale, out
 
-    # Both stages consume the same route blocking so the lower-padding choice
-    # does not require a second sort or any metadata conversion.
-    stage2_block_m = sort_block_m
-    s2_sorted_ids = sorted_ids
-    s2_sorted_weights = sorted_weights
-    s2_sorted_expert_ids = sorted_expert_ids
-    s2_num_valid_ids = num_valid_ids
 
+def _package_prefill_down(
+    intermediate: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+    routes: MXFP4SortedRoutes,
+    package_w2: torch.Tensor,
+    package_w2_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    deferred_out: torch.Tensor | None,
+    do_finalize: bool,
+    force_reduce: bool,
+    initialize_unowned_routes: bool,
+    activation_format: str,
+    logical_k: int,
+) -> torch.Tensor:
+    """Run the down GEMM over sorted block-scaled rows."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+        invoke_gluon_mxfp4_moe_stage2_1x2,
+    )
+
+    inter_div = 1 if activation_format == "e4m3" else 2
     # Keep the physical A/W/scale buffers; skip only whole padded BK128
     # tiles. Short intermediates still need the two-tile stage2 prologue.
-    stage2_logical_k = max(256, triton.cdiv(inter_dim, 128) * 128)
-    stage2_out = invoke_gluon_mxfp4_moe_stage2_1x2(
-        q_inter[:, : stage2_logical_k // inter_div],
+    stage2_logical_k = max(256, triton.cdiv(logical_k, 128) * 128)
+    # Both stages consume the same route blocking so the lower-padding choice
+    # does not require a second sort or any metadata conversion.
+    return invoke_gluon_mxfp4_moe_stage2_1x2(
+        intermediate[:, : stage2_logical_k // inter_div],
         None,
         package_w2.view(torch.uint8),
-        s2_sorted_ids,
-        s2_sorted_expert_ids,
-        s2_num_valid_ids,
+        routes.sorted_ids,
+        routes.sorted_expert_ids,
+        routes.num_valid_ids,
         out,
-        top_k,
+        routes.top_k,
         do_finalize,
-        # Deferred E2M1 consumers use expanded_idx to mask nonlocal routes.
-        initialize_unowned_routes=do_finalize or activation_format != "e2m1",
+        initialize_unowned_routes=initialize_unowned_routes,
         deferred_out=deferred_out,
         w2_scale=package_w2_scale.view(torch.uint8),
-        a2_scale=stage2_scale,
-        sorted_weights=s2_sorted_weights,
+        a2_scale=intermediate_scale,
+        sorted_weights=routes.sorted_weights,
         b_preshuffled=True,
         b_gdot128=True,
-        block_m=stage2_block_m,
-        sort_block_m=stage2_block_m,
+        block_m=routes.block_m,
+        sort_block_m=routes.block_m,
         force_reduce=force_reduce,
         input_sorted=True,
-        a_format=intermediate_format,
+        a_format=activation_format,
     )
-    if not do_finalize:
-        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
-            gluon_local_route_map,
-        )
 
-        expanded_idx = gluon_local_route_map(topk_ids, expert_start, n_experts)
-        return stage2_out, None, expanded_idx
-    return out
+
+def _package_prefill_weights(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the package-prefill weight and scale aliases attached at load time."""
+    package = getattr(weight, "gluon_package_prefill_weight", None)
+    scale = getattr(weight, "gluon_package_prefill_scale", None)
+    if not isinstance(package, torch.Tensor) or not isinstance(scale, torch.Tensor):
+        raise ValueError("package prefill requires gdot128-preshuffled weights")
+    return package, scale
+
+
+def gluon_mxfp4_sorted_gate_up_gfx950(
+    x_quantized: tuple[torch.Tensor, torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_weight: torch.Tensor,
+    *,
+    intermediate: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+    swiglu_alpha: float,
+    swiglu_limit: float,
+    swiglu_beta: float,
+) -> MXFP4SortedRoutes:
+    """Write sorted E2M1 gate/up rows for an all-local expert range.
+
+    Routes are sorted in a fixed order that depends only on ``topk_ids``, so
+    ranks holding different intermediate column slices of the same experts
+    produce row-aligned outputs that concatenate along K.
+
+    Args:
+        x_quantized: Token-order E2M1 rows ``[tokens, hidden / 2]`` and their
+            CDNA4-swizzled E8M0 scales.
+        topk_weights: FP32 route weights ``[tokens, top_k]``.
+        topk_ids: Expert IDs ``[tokens, top_k]``; every expert is local.
+        w13_weight: Processed gate/up weight with package-prefill aliases.
+        intermediate: uint8 destination with at least
+            ``sorted_route_capacity`` rows of ``I / 2`` bytes, where
+            I is this weight's intermediate width.
+        intermediate_scale: uint8 scale destination of at least the capacity
+            rounded up to 32 rows by ``I / 32`` contiguous columns.
+        swiglu_alpha, swiglu_limit, swiglu_beta: Activation parameters of the
+            expert layer.
+
+    Returns:
+        The sorted route metadata for ``gluon_mxfp4_sorted_down_gfx950``.
+    """
+    package_w13, package_w13_scale = _package_prefill_weights(w13_weight)
+    rows, hidden_dim, _, _ = _mxfp4_input_metadata(x_quantized)
+    experts = int(package_w13.shape[0])
+    inter_dim = int(package_w13.shape[1]) // 2
+    top_k = int(topk_ids.shape[1])
+    capacity = sorted_route_capacity(rows, experts, top_k)
+    if rows < _PACKAGE_PREFILL_MIN_M:
+        raise ValueError(
+            f"sorted gate/up needs at least {_PACKAGE_PREFILL_MIN_M} tokens, got {rows}"
+        )
+    if inter_dim % 256:
+        raise ValueError(
+            f"sorted gate/up needs a whole number of 256-wide scale panels, got "
+            f"intermediate width {inter_dim}"
+        )
+    if (
+        intermediate.dtype != torch.uint8
+        or intermediate.shape[0] < capacity
+        or intermediate.shape[1] * 2 != inter_dim
+        or intermediate_scale.dtype != torch.uint8
+        or intermediate_scale.shape[0] < triton.cdiv(capacity, 32) * 32
+        or intermediate_scale.shape[1] * MXFP4_BLOCK != inter_dim
+        or not intermediate_scale.is_contiguous()
+    ):
+        raise ValueError(
+            f"sorted gate/up needs uint8 [>= {capacity}, {inter_dim // 2}] rows and "
+            f"contiguous [>= {triton.cdiv(capacity, 32) * 32}, "
+            f"{inter_dim // MXFP4_BLOCK}] scales; got {tuple(intermediate.shape)} "
+            f"and {tuple(intermediate_scale.shape)}"
+        )
+    config = _select_grouped_moe_config(
+        rows,
+        hidden_dim=hidden_dim,
+        inter_dim=inter_dim,
+        stage2_k=inter_dim,
+        num_local_experts=experts,
+        num_experts=experts,
+        top_k=top_k,
+        activation_format="e2m1",
+        do_finalize=False,
+        precomputed_routes=True,
+        swiglu_args=(swiglu_alpha, swiglu_limit, swiglu_beta),
+        situ_linear_beta=None,
+    )
+    routes, _, _, _ = _package_prefill_gate_up(
+        x_quantized,
+        None,
+        topk_ids.to(torch.int32).contiguous(),
+        topk_weights.to(torch.float32).contiguous(),
+        package_w13,
+        package_w13_scale,
+        config,
+        expert_start=0,
+        out_dtype=torch.bfloat16,
+        model_dim=hidden_dim,
+        activation_format="e2m1",
+        swiglu_args=(swiglu_alpha, swiglu_limit, swiglu_beta),
+        situ_linear_beta=None,
+        intermediate=intermediate,
+        intermediate_scale=intermediate_scale,
+        output_k=inter_dim,
+        deterministic_order=True,
+        out=None,
+    )
+    return routes
+
+
+def gluon_mxfp4_sorted_down_gfx950(
+    intermediate: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+    routes: MXFP4SortedRoutes,
+    w2_weight: torch.Tensor,
+    *,
+    deferred_out: torch.Tensor,
+) -> torch.Tensor:
+    """Project sorted E2M1 rows through a down weight into unweighted routes.
+
+    Args:
+        intermediate: Sorted uint8 rows covering the weight's full K, at least
+            ``routes.sorted_ids`` rows; the row pitch may exceed K / 2 bytes.
+        intermediate_scale: Contiguous CDNA4 scale panels for those rows,
+            ``K / 32`` columns.
+        routes: Metadata from ``gluon_mxfp4_sorted_gate_up_gfx950``.
+        w2_weight: Processed down weight with package-prefill aliases; its
+            output width N may be any column slice of the layer's output.
+        deferred_out: Contiguous BF16 ``[tokens * top_k, N]`` destination in
+            token/slot order.
+
+    Returns:
+        ``deferred_out`` holding every route's FP32-accumulated output,
+        rounded once to BF16.
+    """
+    package_w2, package_w2_scale = _package_prefill_weights(w2_weight)
+    width = int(package_w2.shape[1])
+    k = int(package_w2.shape[2]) * 2
+    if (
+        intermediate.dtype != torch.uint8
+        or intermediate.shape[0] < routes.sorted_ids.shape[0]
+        or intermediate.shape[1] * 2 < k
+        or intermediate.stride(1) != 1
+        or intermediate_scale.shape[1] * MXFP4_BLOCK != k
+        or deferred_out.shape != (routes.rows * routes.top_k, width)
+        or deferred_out.dtype != torch.bfloat16
+        or not deferred_out.is_contiguous()
+    ):
+        raise ValueError(
+            f"sorted down with weight [*, {width}, {k // 2}] needs uint8 rows of "
+            f">= {k // 2} bytes, {k // MXFP4_BLOCK} scale columns and a contiguous "
+            f"BF16 [{routes.rows * routes.top_k}, {width}] destination; got "
+            f"{tuple(intermediate.shape)}, {tuple(intermediate_scale.shape)} and "
+            f"{tuple(deferred_out.shape)} {deferred_out.dtype}"
+        )
+    # Deferred stage 2 writes only deferred_out; this view carries the token count.
+    out = deferred_out.view(routes.rows, routes.top_k * width)[:, :width]
+    return _package_prefill_down(
+        intermediate[:, : k // 2],
+        intermediate_scale,
+        routes,
+        package_w2,
+        package_w2_scale,
+        out,
+        deferred_out=deferred_out,
+        do_finalize=False,
+        force_reduce=False,
+        initialize_unowned_routes=False,
+        activation_format="e2m1",
+        logical_k=k,
+    )
 
 
 def gluon_mxfp_dynamic_mxfp4_fused_moe(
