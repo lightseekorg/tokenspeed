@@ -2124,20 +2124,6 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
     supports_aux_capture = True
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            config=config,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-
     def post_init(self) -> None:
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
