@@ -29,15 +29,33 @@ use pyo3::{ffi, prelude::*};
 
 fn main() {
     // A failed initialization path must also be safe to exit.
+    interpreter::run_exit_hooks().unwrap();
     interpreter::hold_gil_for_process_exit();
     let executable = std::env::var("PYO3_PYTHON").expect("set PYO3_PYTHON for the exit test");
     interpreter::start(&executable).unwrap();
     Python::attach(|py| {
         // Import the real extension types whose native statics outlive serving.
         py.import("torch").unwrap();
+        py.run(
+            c"import atexit\nexit_markers = []\natexit.register(exit_markers.append, 'cleaned')",
+            None,
+            None,
+        )
+        .unwrap();
     });
     // SAFETY: Python is initialized, and PyGILState_Check reads thread state.
     assert_eq!(unsafe { ffi::PyGILState_Check() }, 0);
+    interpreter::run_exit_hooks().unwrap();
+    Python::attach(|py| {
+        let markers: Vec<String> = py
+            .import("__main__")
+            .unwrap()
+            .getattr("exit_markers")
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert_eq!(markers, ["cleaned"]);
+    });
     interpreter::hold_gil_for_process_exit();
     assert_eq!(unsafe { ffi::PyGILState_Check() }, 1);
     // Process exit runs extension destructors while the host's GIL is held.
