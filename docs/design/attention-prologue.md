@@ -341,6 +341,7 @@ MLA history gathers are temporary, never published as cache storage; their
 allocation and communication scale with the layer's cache capacity.
 
 Weights and communication resources are prepared before graph capture. Native
-communication reuses the existing HCCL window and validates its capacity during
-preparation. Resource owners keep buffers alive until all referencing graphs
+Prefill communication owns an isolated official HCCL process group and a
+dedicated frozen workspace reserved before cache sizing. Resource owners keep
+buffers alive until all referencing graphs
 are destroyed and outstanding work is drained, then release them.

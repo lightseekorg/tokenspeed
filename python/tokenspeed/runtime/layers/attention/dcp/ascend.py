@@ -45,7 +45,7 @@ def _prefill_workspace_sizes(
     history_rows = history_capacity_rows
     width = 576 + index_width
     return (
-        (history_rows + degree * send_rows) * width,
+        (history_rows + degree * send_rows + max_current_rows) * width,
         send_rows * width,
         history_rows * width,
     )
