@@ -1222,6 +1222,22 @@ class MuseSparkMoE(nn.Module):
                 not owned_rows
                 and route_map is None
                 and iris is not None
+                and iris.can_reduce_column_routed_rmsnorm_sum(num_tokens)
+            ):
+                # Each rank completes, normalizes and weights its 512 columns
+                # of every route, then gathers the token sums: one launch
+                # instead of the route all-reduce and two norm passes.
+                return iris.reduce_column_routed_rmsnorm_sum(
+                    routes.reshape(num_tokens * self.topk, width),
+                    route_weights,
+                    norm.weight,
+                    norm.eps,
+                    norm.weight_offset,
+                )
+            if (
+                not owned_rows
+                and route_map is None
+                and iris is not None
                 and iris.can_reduce_scatter_routed_rmsnorm_sum_all_gather(num_tokens)
             ):
                 # Normalize on token owners and gather the 8x smaller sums
@@ -1500,6 +1516,8 @@ class MuseSparkMoE(nn.Module):
                 if iris.owned_route_max_rows
                 else None
             )
+        # The column-owned route completion reads this view as plain local
+        # input; the route all-reduce reduces it from symmetric storage.
         return _acquire_all_reduce_output(
             (num_tokens * self.topk, norm_weight.shape[0]), norm_weight, self.tp_group
         )
