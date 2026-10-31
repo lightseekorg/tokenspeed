@@ -242,6 +242,11 @@ def _entrypoints():
         namespace[builder] = _clone(vars(core)[builder], namespace)
     # Rebind the public dispatch and cached module factory, retaining the
     # upstream operator signatures and fake implementations.
+    # Newer FlashInfer extracts the operator closures into this builder.
+    # Clone it too so the closures resolve our runner and private operators.
+    builder = "_build_trtllm_moe_namespace"
+    if hasattr(core, builder):
+        namespace[builder] = _clone(getattr(core, builder), namespace)
     factory = "_get_trtllm_moe_sm100_module_impl"
     if hasattr(core, factory):
         namespace[factory] = functools.cache(_clone(getattr(core, factory), namespace))

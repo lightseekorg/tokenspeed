@@ -45,6 +45,59 @@ arguments or bucketed, never `constexpr`.
 
 ## FlashInfer adapters (`flashinfer.py`)
 
+### Rubin FlashInfer MegaMoE NVFP4
+
+`flashinfer_megamoe` selects the installed FlashInfer SM107 Generic MegaMoE
+through the normal MoE registry. The optional adapter checks for its upstream
+API before registration; older packages without it skip this solution. Explicit
+selection then reports no eligible kernel. Automatic selection still prefers
+TRT-LLM. When explicitly selected, MegaMoE handles every nonempty call, including
+decode and prefill; there is no token-count cutoff or fallback to another MoE
+implementation. This is an experimental integration, not a performance default.
+
+Set `MEGA_NO_DIST=1` before launching the server with
+`--moe-backend flashinfer_megamoe`. This adapter supports one process/GPU, MoE TP=EP=1,
+BF16 activations, standard SiLU/SwiGLU, and Qwen3.8-Flash-Next geometry
+E=512, H=2560, I=640, K=10. It accepts BF16 router logits with Qwen's normalized
+softmax top-k configuration, or precomputed int32 expert IDs and FP32 route
+weights. Logits use the existing MoE routing op. Explicit IDs and weights take
+precedence and are never recomputed. IDs of -1 pad routes. It rejects unsupported
+routing configurations, unequal gate/up global weight scales and
+`fast_math=False`; per-expert FC2 activation scales are preserved.
+For mixed checkpoints with FP8 draft experts, select the draft backend separately.
+
+Weight preparation replaces the four checkpoint weight/block-scale parameters
+with MegaMoE's transformed tensors. The registered parameters and FlashInfer
+execution state reference the same storage: only one expert layout remains,
+and normal model weight accounting includes it. Preparation does not requantize
+loaded weights or create a TRT-LLM layout. Global scales remain available.
+FC1 uses FP32 accumulation/epilogue into NVFP4, without a BF16 intermediate.
+FC2 produces BF16 route outputs, then late FP32 route weights and a separate
+reduction produce BF16 output. Numerical tests use an independent reference at
+`atol=0.002, rtol=0.02`. The input reference preserves MegaMoE's FP32
+scale/reciprocal operation order before E2M1 rounding. Different backend
+quantizers can choose different codes at a rounding boundary; this does not
+establish elementwise agreement with arbitrary TRT-LLM outputs.
+
+The adapter uses a fixed Generic configuration (256x256x256 tile, preferred
+4-CTA/fallback 2-CTA clusters, phase-interleaved atomic scheduling, bulk FC2,
+deterministic separate reduction). It does not tune per request. Previous
+measurements found slower small-batch execution and no full-model speedup;
+select this backend explicitly for evaluation.
+
+FlashInfer owns and reference-counts scratch shared by identical, stream-ordered
+layers. Each call returns independent output storage. An explicit
+`max_num_tokens_per_gpu` reserves that capacity; otherwise the current input
+row count determines the initial capacity. Capacity grows in power-of-two
+buckets during eager execution and never shrinks. Warm at the maximum expected
+capacity before CUDA graph capture. Capturing without adequate warmup fails
+clearly; an older graph retains its workspace after a larger eager call.
+Live row counts remain runtime inputs. Empty inputs return an empty output
+without allocating scratch. Keep layers alive while their graphs are usable.
+PDL requests produce a warning; MegaMoE uses ordinary stream ordering.
+Concurrent independent streams sharing a workspace are outside this adapter's
+contract.
+
 ### Opt-in SM90 block-FP8 grouped MoE
 
 `prepare_sm90_fp8_moe(mode=...)` prepares a callable before warmup and graph

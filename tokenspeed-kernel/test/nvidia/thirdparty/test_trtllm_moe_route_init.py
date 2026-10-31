@@ -222,6 +222,39 @@ def test_cache_key_hook_preserves_stock_runner_keys():
     assert actual.extras == ("explicit-extra",)
 
 
+def test_loaded_module_retains_decode_tactic_policy():
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM module construction requires CUDA")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("TRT-LLM NVFP4 requires SM100/103/107")
+    core, _, inputs, _, _ = _moe_runner_and_inputs(4, 2560, "E2m1")
+    module = _entrypoints()["get_trtllm_moe_sm100_module"]()
+    if not hasattr(module, "MoERunner"):
+        pytest.skip("This FlashInfer predates the exposed module runner")
+    enums = pytest.importorskip("flashinfer.tllm_enums")
+    runner = module.MoERunner(
+        module.moe_op,
+        top_k=10,
+        num_local_experts=128,
+        dtype_act=enums.DtypeTrtllmGen.E2m1,
+        dtype_weights=enums.DtypeTrtllmGen.E2m1,
+        fp8_quantization_type=enums.Fp8QuantizationType.NoneFp8,
+        hidden_size=2560,
+        intermediate_size=640,
+        num_experts=512,
+        use_shuffled_weight=True,
+    )
+    # Query the real module: an extracted upstream builder must still apply
+    # the policy, not merely expose the private runner in our Python namespace.
+    stock = core.TrtllmMoERunner.get_valid_tactics(runner, inputs, None)
+    expected = _prefer_qwen38_decode_tile_32(stock)
+    actual = runner.get_valid_tactics(inputs, None)
+    assert [tuple(tactic) for tactic in actual] == [
+        tuple(tactic) for tactic in expected
+    ]
+    assert actual
+
+
 def test_tactic_hooks_must_exist_on_upstream_runner():
     class CacheOnly:
         def get_cache_key_extras(self, inputs):
