@@ -964,7 +964,6 @@ def _launch_mxfp4_route_tiles(
         gluon_mxfp4_moe_stage2_route_tiles_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
-        gluon_mxfp4_moe_route_descriptors_gfx950,
         gluon_mxfp4_moe_route_pack_gfx950,
         gluon_mxfp4_moe_route_tiles_gfx950,
     )
@@ -979,30 +978,26 @@ def _launch_mxfp4_route_tiles(
             (n_tokens * top_k, out_dim), dtype=torch.bfloat16, device=device
         )
     expanded_idx = torch.empty((n_tokens * top_k,), dtype=torch.int32, device=device)
-    # Descriptors group one expert's routes; results retain token/slot order.
+    # Routes are grouped by expert (inside the GEMMs up to 16 rows, by the
+    # descriptor kernels above 16 rows); results retain token/slot order.
     num_local_experts = int(w13_runtime.shape[0])
     block_m = 16
-    group_count = torch.empty(1, dtype=torch.int32, device=device)
-    if config.route_capacity == block_m:
-        sorted_routes = torch.empty(block_m * top_k, dtype=torch.int32, device=device)
-        descriptors = torch.empty(
-            (num_local_experts, 3), dtype=torch.int32, device=device
-        )
-        gluon_mxfp4_moe_route_descriptors_gfx950[(1,)](
-            topk_ids,
-            sorted_routes,
-            descriptors,
-            group_count,
-            expanded_idx,
-            n_tokens,
-            EXPERT_START=expert_start,
-            NUM_EXPERTS=num_local_experts,
-            TOPK=top_k,
-            MAX_ROWS=block_m,
-            num_warps=4,
-        )
+    routes_from_ids = config.route_capacity == block_m
+    if routes_from_ids:
+        if n_tokens > block_m:
+            raise ValueError(
+                "gluon_mxfp4_moe_stage1_route_tiles_gfx950: grouping routes from "
+                f"top-k IDs needs at most {block_m} rows, got {n_tokens}"
+            )
+        # Both GEMMs group the routes by expert from the top-k IDs; stage 1
+        # writes the route map into the descriptor argument, and group_count
+        # is an unused placeholder.
+        sorted_routes = topk_ids
+        descriptors = expanded_idx
+        group_count = expanded_idx
     else:
         max_rows = config.route_capacity
+        group_count = torch.empty(1, dtype=torch.int32, device=device)
         sorted_routes = torch.empty(
             num_local_experts * max_rows, dtype=torch.int32, device=device
         )
@@ -1043,6 +1038,7 @@ def _launch_mxfp4_route_tiles(
         group_count,
         q_inter,
         q_inter_scale,
+        n_tokens,
         HIDDEN=hidden_dim,
         INTERMEDIATE=inter_dim,
         TOPK=top_k,
@@ -1058,8 +1054,11 @@ def _launch_mxfp4_route_tiles(
         BLOCK_N=config.stage1.block_n,
         BLOCK_K=config.stage1.block_k,
         BLOCK_M=block_m,
-        PIPELINE_K=config.stage1.pipeline_k,
-        num_warps=4,
+        PREFETCH_TILES=config.stage1.prefetch_tiles,
+        ROUTES_FROM_IDS=routes_from_ids,
+        EXPERT_START=expert_start,
+        NUM_EXPERTS=num_local_experts,
+        num_warps=config.stage1.num_warps,
     )
     gluon_mxfp4_moe_stage2_route_tiles_gfx950[(2048,)](
         q_inter,
@@ -1070,6 +1069,7 @@ def _launch_mxfp4_route_tiles(
         descriptors,
         group_count,
         out,
+        n_tokens,
         INTERMEDIATE=inter_dim,
         OUTPUT=out_dim,
         XS0=q_inter_scale.stride(0),
@@ -1081,8 +1081,12 @@ def _launch_mxfp4_route_tiles(
         BLOCK_N=config.stage2.block_n,
         BLOCK_K=config.stage2.block_k,
         BLOCK_M=block_m,
-        PIPELINE_K=config.stage2.pipeline_k,
-        num_warps=1,
+        PREFETCH_TILES=config.stage2.prefetch_tiles,
+        ROUTES_FROM_IDS=routes_from_ids,
+        TOPK=top_k,
+        EXPERT_START=expert_start,
+        NUM_EXPERTS=num_local_experts,
+        num_warps=config.stage2.num_warps,
     )
     return out, None, expanded_idx
 
