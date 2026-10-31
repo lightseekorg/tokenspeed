@@ -899,8 +899,9 @@ class CacheGroupRouter(AttentionBackend):
     def draft_write_locations_uniform(
         self, out: torch.Tensor, cache_start: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
-        """Scratch-buffer slot resolve over the full-history table (side
-        writes that must not clobber the published step window)."""
+        """Fill caller-owned int64 scratch without changing published step slots."""
+        if out.dtype != torch.int64:
+            raise ValueError("draft write slot output must use int64")
         view = self.draft_history_view()
         if view.table.is_cuda:
             from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -917,7 +918,7 @@ class CacheGroupRouter(AttentionBackend):
             return out
         # CPU reference (unit tests): same slot rule, overflow/holes -> 0.
         bs = cache_start.shape[0]
-        steps = torch.arange(num_tokens, dtype=torch.int64)
+        steps = torch.arange(num_tokens, dtype=torch.int64, device=view.table.device)
         pos = cache_start.to(torch.int64).unsqueeze(1) + steps
         max_num_pages = view.table.shape[1]
         page_idx = (pos // view.page_size).clamp_max(max_num_pages - 1)
@@ -925,7 +926,7 @@ class CacheGroupRouter(AttentionBackend):
         pages = view.table[:bs].to(torch.int64).gather(1, page_idx)
         locs = pages * view.page_size + pos % view.page_size
         locs = torch.where(overflow | (pages <= 0), torch.zeros_like(locs), locs)
-        out[: bs * num_tokens].copy_(locs.reshape(-1).to(out.dtype))
+        out[: bs * num_tokens].copy_(locs.reshape(-1))
         return out
 
     def publish_draft_step_locations(

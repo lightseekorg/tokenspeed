@@ -70,7 +70,7 @@ class TestWriteLocationMathTest:
     def test_plain_decode_writes_the_last_position(self):
         tables, page_sizes = self._tables()
         seq_lens = torch.tensor([9, 4, 1], dtype=torch.int32)
-        out = torch.zeros((2, 8), dtype=torch.int32)
+        out = torch.zeros((2, 8), dtype=torch.int64)
         decode_write_locations(
             tables, page_sizes, seq_lens, out, bs=3, tokens_per_req=1
         )
@@ -83,7 +83,7 @@ class TestWriteLocationMathTest:
     def test_verify_window_is_token_major_and_clamps_padded_requests(self):
         tables, page_sizes = self._tables()
         seq_lens = torch.tensor([9, 1, 1], dtype=torch.int32)
-        out = torch.zeros((2, 12), dtype=torch.int32)
+        out = torch.zeros((2, 12), dtype=torch.int64)
         decode_write_locations(
             tables, page_sizes, seq_lens, out, bs=3, tokens_per_req=3
         )
@@ -100,7 +100,7 @@ class TestWriteLocationMathTest:
         prefix = torch.tensor([4, 0], dtype=torch.int32)
         new = torch.tensor([5, 2], dtype=torch.int32)
         locs = extend_write_locations(
-            tables, page_sizes, prefix, new, 7, torch.empty((2, 7), dtype=torch.int32)
+            tables, page_sizes, prefix, new, 7, torch.empty((2, 7), dtype=torch.int64)
         )
         assert (tuple(locs.shape)) == ((2, 7))
         # request 0, group 0: positions 4..8 -> page 8 slots 0..3, page 9 slot 0.
@@ -111,7 +111,7 @@ class TestWriteLocationMathTest:
     def test_positions_past_the_table_route_to_the_dummy_slot(self):
         tables, page_sizes = self._tables()
         seq_lens = torch.tensor([40], dtype=torch.int32)  # page index 9 >= 6 pages
-        out = torch.zeros((2, 4), dtype=torch.int32)
+        out = torch.zeros((2, 4), dtype=torch.int64)
         decode_write_locations(
             tables, page_sizes, seq_lens, out, bs=1, tokens_per_req=1
         )
@@ -127,9 +127,9 @@ class TestWriteLocationMathTest:
         page_sizes = torch.tensor([1, 4, 16], dtype=torch.int32)
         seq_lens = torch.randint(1, max_num_pages * 4, (bs,), dtype=torch.int32)
         for n in (1, 4):
-            ref = torch.zeros((g, bs * n), dtype=torch.int32)
+            ref = torch.zeros((g, bs * n), dtype=torch.int64)
             decode_write_locations(tables, page_sizes, seq_lens, ref, bs, n)
-            out = torch.zeros((g, bs * n), dtype=torch.int32, device="cuda")
+            out = torch.zeros((g, bs * n), dtype=torch.int64, device="cuda")
             decode_write_locations(
                 tables.cuda(), page_sizes.cuda(), seq_lens.cuda(), out, bs, n
             )
@@ -144,7 +144,7 @@ class TestWriteLocationMathTest:
             prefix,
             new,
             total,
-            torch.empty((groups, total), dtype=torch.int32),
+            torch.empty((groups, total), dtype=torch.int64),
         )
         out = extend_write_locations(
             tables.cuda(),
@@ -152,7 +152,7 @@ class TestWriteLocationMathTest:
             prefix.cuda(),
             new.cuda(),
             total,
-            torch.empty((groups, total), dtype=torch.int32, device="cuda"),
+            torch.empty((groups, total), dtype=torch.int64, device="cuda"),
         )
         torch.testing.assert_close(out.cpu(), ref)
 
@@ -1354,7 +1354,7 @@ class TestCacheGroupRouterTest:
         assert (view.page_size) == (4)  # FULL leaf kernel page
         # FULL leaf: max_num_pages = ceil(context_len 24 / kernel page 4) = 6.
         assert (view.max_tokens) == (6 * 4)
-        out = torch.zeros(4, dtype=torch.int32)
+        out = torch.zeros(4, dtype=torch.int64)
         router.draft_write_locations_uniform(
             out, cache_start=torch.tensor([4, 7], dtype=torch.int32), num_tokens=2
         )
@@ -1814,6 +1814,9 @@ class TestPagedLeafRebindTest:
     @pytest.mark.skipif(
         not (torch.version.hip is None), reason=("FlashInfer wrappers are NVIDIA-only")
     )
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="FlashMLA rebind requires CUDA"
+    )
     def test_flashmla_leaf_forgets_the_previous_forward(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
             FlashMLABackend,
@@ -1851,6 +1854,9 @@ class TestPagedLeafRebindTest:
 
     @pytest.mark.skipif(
         not (torch.version.hip is None), reason=("FlashInfer wrappers are NVIDIA-only")
+    )
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="FlashMLA rebind requires CUDA"
     )
     def test_flashmla_leaf_forgets_the_tile_keepalives(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (

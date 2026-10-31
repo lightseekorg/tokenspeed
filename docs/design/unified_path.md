@@ -174,6 +174,9 @@ additional storage for sanitization/layout conversion, TopK and LSE. At 16K
 rows and 64 heads these are 1.125 GiB for Q and 2 GiB per partial buffer.
 Plan the prefill chunk against this transient peak as well as resident weights
 and cache; the native fused bucket's memory plan does not bound this path.
+The persistent gather workspace also reserves the retained current rows used
+by attention after exchange, and budgets every transport and slot view with
+the workspace pool's 256-byte alignment.
 
 Single-rank decode uses the same preparation with identity page ownership:
 verify still needs one causal length and page-table row per candidate. Its
@@ -437,6 +440,12 @@ by a single per-bs builder shared by capture and refresh, cached per bs. A bs
 never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
+
+Kernel page tables retain int32 IDs. The router computes token write slots in
+int64 and publishes int64 decode, extend, mixed and padded views from the
+first allocation. A valid int32 page ID times its page size may exceed 2^31;
+neither eager refresh nor graph replay may narrow the resulting slot. Scratch
+write-location destinations also require int64.
 
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,

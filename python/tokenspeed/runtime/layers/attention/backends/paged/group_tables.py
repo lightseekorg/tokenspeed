@@ -258,7 +258,7 @@ class GroupTableStacks:
     Attributes:
         tables: ``[G, max_bs, stack_max_num_pages]`` int32 kernel page
             tables, group-major in ``group_ids`` order.
-        decode_locs: ``[G, max_bs * max_tokens_per_req]`` int32 decode write
+        decode_locs: ``[G, max_bs * max_tokens_per_req]`` int64 decode write
             slots (token-major per request) refreshed by
             :meth:`compute_decode_locations`; the router publishes per-bs
             views of it, so it is address-stable for the graph's lifetime.
@@ -296,12 +296,12 @@ class GroupTableStacks:
             (g, self.max_bs, stack_max_num_pages), dtype=torch.int32, device=device
         )
         self.decode_locs = torch.zeros(
-            (g, self.max_bs * self.max_tokens_per_req), dtype=torch.int32, device=device
+            (g, self.max_bs * self.max_tokens_per_req), dtype=torch.int64, device=device
         )
         # Extend spans up to this many tokens live here, tail at the dummy slot 0,
         # so a prefill graph's padded prologue can record and replay the address.
         self.extend_locs = torch.zeros(
-            (g, max(int(max_extend_tokens), 0)), dtype=torch.int32, device=device
+            (g, max(int(max_extend_tokens), 0)), dtype=torch.int64, device=device
         )
         self._extend_total = 0
         self._extend_span: torch.Tensor | None = None
@@ -522,7 +522,7 @@ class GroupTableStacks:
         else:
             out = torch.empty(
                 (len(self.group_ids), total_tokens),
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=self.tables.device,
             )
         locs = extend_write_locations(
@@ -559,7 +559,7 @@ class GroupTableStacks:
         index = self._index[group_id]
         if rows <= self.extend_locs.shape[1]:
             return self.extend_locs[index, :rows]
-        padded = torch.zeros(rows, dtype=torch.int32, device=self.tables.device)
+        padded = torch.zeros(rows, dtype=torch.int64, device=self.tables.device)
         padded[: self._extend_total] = self._extend_span[index]
         if self._decode_tail is not None:
             padded[self._extend_total : total] = self._decode_tail[index]

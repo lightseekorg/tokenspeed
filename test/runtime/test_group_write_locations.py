@@ -54,7 +54,7 @@ class TestWindowWriteLocationsTest:
         devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
         for device in devices:
             for n, slots in expected.items():
-                out = torch.full((2, 24), -7, dtype=torch.int32, device=device)
+                out = torch.full((2, 24), -7, dtype=torch.int64, device=device)
                 window_write_locations(
                     tables.to(device),
                     page_sizes.to(device),
@@ -76,7 +76,7 @@ class TestHoleOverflowRoutingTest:
         # seq_len 5 -> pos 4 -> real page 7 -> 14.
         tables = torch.tensor([[[0, 5, 7, 0]]], dtype=torch.int32)
         page_sizes = torch.tensor([2], dtype=torch.int32)
-        out = torch.zeros((1, 2), dtype=torch.int32)
+        out = torch.zeros((1, 2), dtype=torch.int64)
         decode_write_locations(
             tables, page_sizes, torch.tensor([2], dtype=torch.int32), out, 1, 1
         )
@@ -90,7 +90,7 @@ class TestHoleOverflowRoutingTest:
         # A raw -1 (ragged pad that never went through the fill) is a hole too.
         tables = torch.tensor([[[3, -1]]], dtype=torch.int32)
         page_sizes = torch.tensor([2], dtype=torch.int32)
-        out = torch.zeros((1, 1), dtype=torch.int32)
+        out = torch.zeros((1, 1), dtype=torch.int64)
         decode_write_locations(
             tables, page_sizes, torch.tensor([4], dtype=torch.int32), out, 1, 1
         )
@@ -103,7 +103,7 @@ class TestHoleOverflowRoutingTest:
         prefix = torch.tensor([1], dtype=torch.int32)
         new = torch.tensor([4], dtype=torch.int32)
         locs = extend_write_locations(
-            tables, page_sizes, prefix, new, 4, torch.empty((1, 4), dtype=torch.int32)
+            tables, page_sizes, prefix, new, 4, torch.empty((1, 4), dtype=torch.int64)
         )
         # pos 1 -> page 3 slot 1 = 7; pos 2, 3 -> hole page 0 -> 0; pos 4 ->
         # page index 2 >= width -> 0.
@@ -285,7 +285,7 @@ class TestHostPageSizeMirror:
                 stacks.compute_decode_locations(3, lengths, width)
 
         def check():
-            expected = torch.empty((2, 3 * width), dtype=torch.int32)
+            expected = torch.empty((2, 3 * width), dtype=torch.int64)
             decode_write_locations(
                 tables, torch.tensor([2, 4]), lengths.cpu(), expected, 3, width
             )
@@ -306,7 +306,7 @@ class TestHostPageSizeMirror:
             check()
         with NoScalarReads():
             stacks.compute_window_locations(3, lengths, width)
-        expected = torch.empty((2, 3 * width), dtype=torch.int32)
+        expected = torch.empty((2, 3 * width), dtype=torch.int64)
         window_write_locations(
             tables, torch.tensor([2, 4]), lengths.cpu(), expected, 3, width
         )
@@ -319,8 +319,126 @@ class TestHostPageSizeMirror:
                 torch.ones((2, 1, 2), dtype=torch.int32),
                 torch.tensor([2, 4]),
                 torch.tensor([2]),
-                torch.empty((2, 1), dtype=torch.int32),
+                torch.empty((2, 1), dtype=torch.int64),
                 1,
                 1,
                 page_sizes_cpu=mirror,
             )
+
+
+class TestWideWriteSlots:
+    @pytest.mark.parametrize("device", ["cpu", "npu", "cuda"])
+    @pytest.mark.parametrize("kind", ["decode", "window", "extend"])
+    def test_narrow_destination_is_rejected_without_writing(self, device, kind):
+        if device == "npu":
+            pytest.importorskip("torch_npu")
+            if not torch.npu.is_available():
+                pytest.skip("NPU unavailable")
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        tables = torch.tensor([[[2**25 + 5]]], dtype=torch.int32, device=device)
+        sizes = torch.tensor([128], dtype=torch.int32, device=device)
+        lengths = torch.ones(1, dtype=torch.int32, device=device)
+        out = torch.full((1, 1), -7, dtype=torch.int32, device=device)
+        with pytest.raises(ValueError, match="slot output must use int64"):
+            if kind == "extend":
+                extend_write_locations(
+                    tables, sizes, lengths, lengths, 1, out, page_sizes_cpu=(128,)
+                )
+            else:
+                operation = (
+                    decode_write_locations
+                    if kind == "decode"
+                    else window_write_locations
+                )
+                operation(tables, sizes, lengths, out, 1, 1, page_sizes_cpu=(128,))
+        assert out.tolist() == [[-7]]
+
+    @pytest.mark.parametrize("device", ["cpu", "npu", "cuda"])
+    @pytest.mark.parametrize("page", [2**25 + 5, 2**31 - 1])
+    @pytest.mark.parametrize("size", [64, 128])
+    def test_valid_large_page_ids_keep_full_token_slots(self, device, page, size):
+        if device == "npu":
+            pytest.importorskip("torch_npu")
+            if not torch.npu.is_available():
+                pytest.skip("NPU unavailable")
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        tables = torch.tensor([[[page, 0, page]]], dtype=torch.int32, device=device)
+        sizes = torch.tensor([size], dtype=torch.int32, device=device)
+        starts = torch.tensor([size - 2], dtype=torch.int32, device=device)
+        expected = [page * size + size - 2, page * size + size - 1, 0, 0]
+        out = torch.full((1, 6), -7, dtype=torch.int64, device=device)
+        window_write_locations(tables, sizes, starts, out, 1, 4, page_sizes_cpu=(size,))
+        assert out[0].tolist() == expected + [-7, -7]
+        decode_write_locations(
+            tables, sizes, starts + 4, out, 1, 4, page_sizes_cpu=(size,)
+        )
+        assert out[0].tolist() == expected + [-7, -7]
+        result = extend_write_locations(
+            tables,
+            sizes,
+            starts,
+            torch.tensor([4], dtype=torch.int32, device=device),
+            4,
+            out[:, :4],
+            page_sizes_cpu=(size,),
+        )
+        assert result.data_ptr() == out.data_ptr()
+        assert result.dtype == torch.int64 and result[0].tolist() == expected
+        assert tables.dtype == torch.int32
+
+    @pytest.mark.parametrize("device", ["cpu", "npu"])
+    def test_stacked_slots_keep_dtype_address_and_large_values_on_refresh(self, device):
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            GroupTableSpec,
+            GroupTableStacks,
+        )
+
+        if device == "npu":
+            pytest.importorskip("torch_npu")
+            if not torch.npu.is_available():
+                pytest.skip("NPU unavailable")
+        stacks = GroupTableStacks(
+            [GroupTableSpec("wide", 128, 128, 2)],
+            max_bs=1,
+            max_tokens_per_req=4,
+            max_extend_tokens=4,
+            device=device,
+        )
+        page = 2**25 + 5
+        stacks.fill(
+            1, 1, {"wide": torch.tensor([[page, 0]], dtype=torch.int32, device=device)}
+        )
+        lengths = torch.tensor([2], dtype=torch.int32, device=device)
+        stacks.compute_decode_locations(1, lengths, 1)
+        view = stacks.decode_locations("wide", 1, 1)
+        pointer = view.data_ptr()
+        assert view.dtype == torch.int64 and view.tolist() == [page * 128 + 1]
+        one = torch.ones(1, dtype=torch.int32, device=device)
+        spans = stacks.extend_locations(one, one, 1)
+        stacks.append_decode_rows(0, 1)
+        padded = stacks.padded_extend_span("wide", 4)
+        assert padded.data_ptr() == stacks.extend_locs.data_ptr()
+        assert padded.dtype == torch.int64
+        assert padded.tolist() == [page * 128 + 1, page * 128 + 1, 0, 0]
+        # A span larger than the persistent buffer keeps the same wide contract.
+        fresh = stacks.extend_locations(one, torch.full_like(one, 5), 5)["wide"]
+        assert fresh.dtype == torch.int64
+        assert fresh.tolist() == [page * 128 + offset for offset in range(1, 6)]
+        assert stacks.padded_extend_span("wide", 7).tolist() == fresh.tolist() + [0, 0]
+        if device == "npu":
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                stacks.compute_decode_locations(1, lengths, 1)
+        stacks.tables[0, 0, 0].fill_(2**31 - 1)
+        lengths.fill_(3)
+        if device == "npu":
+            graph.replay()
+            torch.npu.synchronize()
+        else:
+            stacks.compute_decode_locations(1, lengths, 1)
+        assert view.dtype == torch.int64 and view.data_ptr() == pointer
+        assert view.tolist() == [(2**31 - 1) * 128 + 2]
+        assert stacks.tables.dtype == torch.int32
