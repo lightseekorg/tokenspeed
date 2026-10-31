@@ -40,6 +40,9 @@ that stride over the same tile index. A tile's last K step issues the next
 tile's first loads, hiding the epilogue and the next tile lookup behind them.
 Its accumulator holds sums in units of the current K block's scale and is
 rescaled at each step, so one accumulator stays live and two programs fit.
+Those batches can also keep the intermediate and ``route_output`` rows in
+expert order, so stage two loads and stores contiguous tiles instead of
+gathering and scattering rows; ``route_rows`` then maps each route to its row.
 Persistent programs, and the largest batches' gate/up programs, are renumbered
 so each XCD runs a contiguous run of tiles, keeping tiles that share activation
 rows or expert weights on one L2.
@@ -164,8 +167,10 @@ def _locate_xcd_tile(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    SORTED: gl.constexpr,
 ):
-    """Expert, first row, row count, and first column of program ``pid``'s tile.
+    """Expert, first row, row count, first column, and (with ``SORTED``) first
+    expert-sorted row of program ``pid``'s tile.
 
     Only the live tiles are renumbered, so programs past the last tile, which
     exit, do not leave whole XCDs idle. The expert is at least ``NUM_EXPERTS``
@@ -186,11 +191,17 @@ def _locate_xcd_tile(
     selected = experts == expert
     first_tile = gl.sum(gl.where(selected, ends - tiles, 0), 0)
     count = gl.sum(gl.where(selected, counts, 0), 0)
+    count_start = 0
+    if SORTED:
+        count_start = gl.sum(
+            gl.where(selected, gl.associative_scan(counts, 0, _add) - counts, 0), 0
+        )
     return (
         expert,
         (tile_m - first_tile) * BLOCK_M,
         count,
         (tile % NUM_N_TILES) * BLOCK_N,
+        count_start,
     )
 
 
@@ -244,6 +255,38 @@ def _store_rows(
     )
 
 
+@gluon.jit
+def _store_sorted_rows(
+    value,
+    out,
+    route_rows,
+    expert_route_ids,
+    route_base,
+    first_row,
+    rows_left,
+    off_n,
+    ROW_SIZE: gl.constexpr,
+    layout: gl.constexpr,
+):
+    """Store a tile's live rows at their expert-sorted rows ``first_row + r``.
+
+    The tile's first column block also records each route's sorted row.
+    """
+    rows = gl.arange(0, value.shape[0], gl.SliceLayout(1, layout))
+    cols = off_n + gl.arange(0, value.shape[1], gl.SliceLayout(0, layout))
+    live = rows < rows_left
+    dest = first_row + rows
+    gl.amd.cdna5.buffer_store(
+        value.to(out.dtype.element_ty),
+        out,
+        (dest[:, None] * ROW_SIZE + cols[None, :]).to(gl.int32),
+        mask=live[:, None],
+    )
+    if off_n == 0:
+        routes = gl.load(expert_route_ids + route_base + rows, mask=live, other=0)
+        gl.amd.cdna5.buffer_store(dest, route_rows, routes, mask=live)
+
+
 def _gate_up_launch_metadata(grid, kernel, args):
     """Report gate/up work and traffic to Proton.
 
@@ -287,6 +330,7 @@ def _fp8_block_gate_up_gfx1250(
     w13,
     w13_scale,
     intermediate,
+    route_rows,
     expert_route_ids,
     expert_counts,
     num_tokens,
@@ -306,6 +350,7 @@ def _fp8_block_gate_up_gfx1250(
     PREFETCH: gl.constexpr,
     WARP_BASES: gl.constexpr,
     NUM_XCDS: gl.constexpr = 1,
+    SORTED: gl.constexpr = False,
 ):
     """One ``BLOCK_M x BLOCK_N`` SwiGLU tile of an expert's gate/up projection."""
     SCALE_BLOCK: gl.constexpr = 128
@@ -318,8 +363,8 @@ def _fp8_block_gate_up_gfx1250(
     gl.static_assert(NUM_K_TILES >= PREFETCH)
 
     pid = gl.program_id(0)
-    if NUM_XCDS > 1:
-        expert, row_start, count, off_n = _locate_xcd_tile(
+    if NUM_XCDS > 1 or SORTED:
+        expert, row_start, count, off_n, count_start = _locate_xcd_tile(
             expert_counts,
             pid,
             NUM_N_TILES,
@@ -328,6 +373,7 @@ def _fp8_block_gate_up_gfx1250(
             BLOCK_M,
             BLOCK_N,
             NUM_XCDS,
+            SORTED,
         )
     else:
         tile_m = pid // NUM_N_TILES
@@ -335,6 +381,7 @@ def _fp8_block_gate_up_gfx1250(
         expert, row_start, count = _locate_tile(
             expert_counts, tile_m, NUM_EXPERTS, EXPERT_PAD, BLOCK_M
         )
+        count_start = 0
     if expert >= NUM_EXPERTS:
         return
 
@@ -440,16 +487,30 @@ def _fp8_block_gate_up_gfx1250(
         gate_acc = gl.minimum(gate_acc, swiglu_limit)
         up_acc = gl.minimum(gl.maximum(up_acc, -swiglu_limit), swiglu_limit)
     hidden = gate_acc / (1.0 + gl.exp(-gate_acc)) * up_acc
-    _store_rows(
-        hidden,
-        intermediate,
-        expert_route_ids,
-        route_base,
-        rows_left,
-        off_n,
-        INTERMEDIATE,
-        wmma_layout,
-    )
+    if SORTED:
+        _store_sorted_rows(
+            hidden,
+            intermediate,
+            route_rows,
+            expert_route_ids,
+            route_base,
+            count_start + row_start,
+            rows_left,
+            off_n,
+            INTERMEDIATE,
+            wmma_layout,
+        )
+    else:
+        _store_rows(
+            hidden,
+            intermediate,
+            expert_route_ids,
+            route_base,
+            rows_left,
+            off_n,
+            INTERMEDIATE,
+            wmma_layout,
+        )
 
 
 @gluon.jit
@@ -679,16 +740,20 @@ def _issue_down(
     off_n,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    SORTED: gl.constexpr = False,
 ):
     slot = k_tile % NUM_BUFFERS
     k = k_tile * BLOCK_K
-    gl.amd.cdna5.tdm.async_gather(
-        gl.amd.cdna5.tdm.update_tensor_descriptor(
-            a_desc, add_offsets=[0, k], clamp_bounds=True
-        ),
-        gathered,
-        a_smem.index(slot),
-    )
+    if SORTED:
+        gl.amd.cdna5.tdm.async_load(a_desc, [gathered, k], a_smem.index(slot))
+    else:
+        gl.amd.cdna5.tdm.async_gather(
+            gl.amd.cdna5.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, k], clamp_bounds=True
+            ),
+            gathered,
+            a_smem.index(slot),
+        )
     gl.amd.cdna5.tdm.async_load(w_desc, [off_n, k], w_smem.index(slot))
 
 
@@ -787,6 +852,35 @@ def _down_step(
 
 
 @gluon.jit
+def _down_rows(
+    expert_route_ids,
+    experts,
+    count_starts,
+    expert,
+    row_start,
+    rows_left,
+    num_routes,
+    BLOCK_M: gl.constexpr,
+    INDEX_16: gl.constexpr,
+    SORTED: gl.constexpr,
+):
+    """A tile's source rows: its first expert-sorted row, or its gather rows."""
+    if SORTED:
+        source = gl.sum(gl.where(experts == expert, count_starts, 0), 0) + row_start
+    else:
+        source = _gather_rows(
+            expert_route_ids,
+            expert * num_routes + row_start,
+            rows_left,
+            num_routes,
+            1,
+            BLOCK_M,
+            INDEX_16,
+        )
+    return source
+
+
+@gluon.jit
 def _persistent_tile(
     tile,
     experts,
@@ -824,6 +918,7 @@ def _fp8_block_down_persistent_gfx1250(
     BLOCK_N: gl.constexpr,
     WARP_BASES: gl.constexpr,
     NUM_XCDS: gl.constexpr = 1,
+    SORTED: gl.constexpr = False,
 ):
     """Down-projection tiles strided over a fixed grid.
 
@@ -850,6 +945,7 @@ def _fp8_block_down_persistent_gfx1250(
     row_tiles = gl.cdiv(counts, BLOCK_M)
     ends = gl.associative_scan(row_tiles, 0, _add)
     starts = ends - row_tiles
+    count_starts = gl.associative_scan(counts, 0, _add) - counts
     total = gl.sum(row_tiles, 0) * NUM_N_TILES
     pid = gl.program_id(0)
     # Each XCD walks a contiguous run of tiles with its own programs.
@@ -891,14 +987,17 @@ def _fp8_block_down_persistent_gfx1250(
     expert, row_start, rows_left, off_n = _persistent_tile(
         first_tile, experts, counts, starts, ends, NUM_N_TILES, BLOCK_M, BLOCK_N
     )
-    gathered = _gather_rows(
+    gathered = _down_rows(
         expert_route_ids,
-        expert * num_routes + row_start,
+        experts,
+        count_starts,
+        expert,
+        row_start,
         rows_left,
         num_routes,
-        1,
         BLOCK_M,
         INDEX_16,
+        SORTED,
     )
     w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=w2 + expert.to(gl.int64) * (HIDDEN * INTERMEDIATE),
@@ -908,7 +1007,16 @@ def _fp8_block_down_persistent_gfx1250(
         layout=w_layout,
     )
     _issue_down(
-        a_desc, gathered, w_desc, a_smem, w_smem, 0, off_n, BLOCK_K, NUM_BUFFERS
+        a_desc,
+        gathered,
+        w_desc,
+        a_smem,
+        w_smem,
+        0,
+        off_n,
+        BLOCK_K,
+        NUM_BUFFERS,
+        SORTED,
     )
 
     for i in range(num_tiles):
@@ -918,14 +1026,17 @@ def _fp8_block_down_persistent_gfx1250(
         next_expert, next_row_start, next_rows_left, next_off_n = _persistent_tile(
             next_tile, experts, counts, starts, ends, NUM_N_TILES, BLOCK_M, BLOCK_N
         )
-        next_gathered = _gather_rows(
+        next_gathered = _down_rows(
             expert_route_ids,
-            next_expert * num_routes + next_row_start,
+            experts,
+            count_starts,
+            next_expert,
+            next_row_start,
             next_rows_left,
             num_routes,
-            1,
             BLOCK_M,
             INDEX_16,
+            SORTED,
         )
         next_w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=w2 + next_expert.to(gl.int64) * (HIDDEN * INTERMEDIATE),
@@ -936,11 +1047,14 @@ def _fp8_block_down_persistent_gfx1250(
         )
         rows = gl.arange(0, BLOCK_M, gl.SliceLayout(1, wmma_layout))
         live = rows < rows_left
-        routes = gl.load(
-            expert_route_ids + expert * num_routes + row_start + rows,
-            mask=live,
-            other=0,
-        )
+        if SORTED:
+            dest = gathered + rows
+        else:
+            dest = gl.load(
+                expert_route_ids + expert * num_routes + row_start + rows,
+                mask=live,
+                other=0,
+            )
         scale = (
             w2_scale
             + expert * (HIDDEN // SCALE_BLOCK) * SCALE_COLS
@@ -968,6 +1082,7 @@ def _fp8_block_down_persistent_gfx1250(
                     off_n,
                     BLOCK_K,
                     NUM_BUFFERS,
+                    SORTED,
                 )
             else:
                 _issue_down(
@@ -980,6 +1095,7 @@ def _fp8_block_down_persistent_gfx1250(
                     next_off_n,
                     BLOCK_K,
                     NUM_BUFFERS,
+                    SORTED,
                 )
             gl.amd.cdna5.tdm.async_wait(LOADS_PER_TILE)
             acc = _down_step(
@@ -997,7 +1113,7 @@ def _fp8_block_down_persistent_gfx1250(
         gl.amd.cdna5.buffer_store(
             (acc * prev_scale[None, :]).to(route_output.dtype.element_ty),
             route_output,
-            (routes[:, None] * HIDDEN + cols[None, :]).to(gl.int32),
+            (dest[:, None] * HIDDEN + cols[None, :]).to(gl.int32),
             mask=live[:, None],
         )
 
@@ -1018,6 +1134,7 @@ def _launch_down_persistent(
     expert_route_ids: torch.Tensor,
     expert_counts: torch.Tensor,
     route_output: torch.Tensor,
+    sorted_rows: bool = False,
 ) -> None:
     num_routes, inter = intermediate.shape
     num_experts, hidden, _ = w2.shape
@@ -1047,6 +1164,7 @@ def _launch_down_persistent(
         BLOCK_N=cfg.block_n,
         WARP_BASES=cfg.warp_bases,
         NUM_XCDS=num_xcds,
+        SORTED=sorted_rows,
         num_warps=cfg.num_warps,
         num_stages=1,
     )
@@ -1102,6 +1220,7 @@ def _launch_gate_up(
     top_k: int,
     swiglu_limit: float | None,
     intermediate: torch.Tensor,
+    route_rows: torch.Tensor | None = None,
 ) -> None:
     num_tokens, hidden = x.shape
     num_experts = w13.shape[0]
@@ -1114,6 +1233,7 @@ def _launch_gate_up(
         w13,
         w13_scale,
         intermediate,
+        intermediate if route_rows is None else route_rows,
         expert_route_ids,
         expert_counts,
         num_tokens,
@@ -1133,6 +1253,7 @@ def _launch_gate_up(
         PREFETCH=cfg.prefetch,
         WARP_BASES=cfg.warp_bases,
         NUM_XCDS=cfg.num_xcds,
+        SORTED=route_rows is not None,
         num_warps=cfg.num_warps,
         num_stages=1,
     )
@@ -1187,7 +1308,9 @@ def launch_gluon_fp8_block_experts_gfx1250(
     swiglu_limit: float | None,
     intermediate: torch.Tensor,
     route_output: torch.Tensor,
-) -> None:
+    *,
+    route_rows: torch.Tensor | None = None,
+) -> bool:
     """Run the routed expert GEMMs of a block-E4M3 MoE layer.
 
     Args:
@@ -1205,6 +1328,14 @@ def launch_gluon_fp8_block_experts_gfx1250(
         intermediate: BF16 ``[tokens * top_k, intermediate]`` scratch.
         route_output: BF16 ``[tokens * top_k, hidden]`` output, one row per
             route. Rows of routes no expert lists are left untouched.
+        route_rows: Optional int32 ``[tokens * top_k]`` scratch. Batches whose
+            down projection runs persistently then keep the intermediate and
+            ``route_output`` rows in expert order, which turns the down
+            projection's gathers and scattered stores into contiguous tiles,
+            and record route ``r``'s row in ``route_rows[r]``.
+
+    Returns:
+        Whether ``route_output`` rows follow ``route_rows``.
     """
     num_tokens, hidden = x.shape
     num_experts, twice_intermediate, _ = w13.shape
@@ -1215,10 +1346,13 @@ def launch_gluon_fp8_block_experts_gfx1250(
     if num_routes * max(hidden, inter) >= 2**31 or num_experts * num_routes >= 2**31:
         raise ValueError("routed rows exceed 32-bit buffer offsets")
     if num_routes == 0:
-        return
+        return False
 
     num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     gate_up, down = _select_tiles(num_routes, num_experts, inter, num_sms)
+    persistent = isinstance(down, _PersistentTiles)
+    if not persistent:
+        route_rows = None
     _launch_gate_up(
         gate_up,
         x,
@@ -1229,16 +1363,27 @@ def launch_gluon_fp8_block_experts_gfx1250(
         top_k,
         swiglu_limit,
         intermediate,
+        route_rows,
     )
-    launch_down = (
-        _launch_down_persistent if isinstance(down, _PersistentTiles) else _launch_down
-    )
-    launch_down(
-        down,
-        intermediate,
-        w2,
-        w2_scale,
-        expert_route_ids,
-        expert_counts,
-        route_output,
-    )
+    if persistent:
+        _launch_down_persistent(
+            down,
+            intermediate,
+            w2,
+            w2_scale,
+            expert_route_ids,
+            expert_counts,
+            route_output,
+            route_rows is not None,
+        )
+    else:
+        _launch_down(
+            down,
+            intermediate,
+            w2,
+            w2_scale,
+            expert_route_ids,
+            expert_counts,
+            route_output,
+        )
+    return route_rows is not None

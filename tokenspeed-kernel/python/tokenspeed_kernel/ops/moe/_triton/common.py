@@ -89,12 +89,14 @@ def _combine_kernel(
     route_output_ptr,
     topk_weights_ptr,
     topk_ids_ptr,
+    route_rows_ptr,
     output_ptr,
     num_tokens,
     hidden_size,
     num_experts,
     top_k: tl.constexpr,
     SKIP_INVALID_IDS: tl.constexpr,
+    HAS_ROUTE_ROWS: tl.constexpr,
     ROUND_WEIGHTED_ROUTES: tl.constexpr,
     OUTPUT_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -111,10 +113,12 @@ def _combine_kernel(
         if SKIP_INVALID_IDS:
             ids = tl.load(topk_ids_ptr + route_offsets, mask=token_mask, other=-1)
             route_mask &= (ids >= 0) & (ids < num_experts)
+        if HAS_ROUTE_ROWS:
+            rows = tl.load(route_rows_ptr + route_offsets, mask=route_mask, other=0)
+        else:
+            rows = route_offsets
         values = tl.load(
-            route_output_ptr
-            + route_offsets[:, None] * hidden_size
-            + hidden_offsets[None, :],
+            route_output_ptr + rows[:, None] * hidden_size + hidden_offsets[None, :],
             mask=route_mask[:, None] & hidden_mask[None, :],
             other=0.0,
         )
@@ -140,11 +144,13 @@ def _combine(
     num_experts: int,
     round_weighted_routes: bool = False,
     output_scale: float = 1.0,
+    route_rows: torch.Tensor | None = None,
 ) -> None:
     """Sum weighted route rows into ``output``.
 
     With ``topk_ids``, routes whose id is outside ``[0, num_experts)`` are not
-    read, so their ``route_output`` rows may hold anything.
+    read, so their ``route_output`` rows may hold anything. With
+    ``route_rows``, route ``r`` reads row ``route_rows[r]`` instead of row ``r``.
     """
     num_tokens, top_k = topk_weights.shape
     hidden_size = output.shape[1]
@@ -152,12 +158,14 @@ def _combine(
         route_output,
         topk_weights.contiguous(),
         None if topk_ids is None else topk_ids.contiguous(),
+        route_rows,
         output,
         num_tokens,
         hidden_size,
         num_experts,
         top_k=top_k,
         SKIP_INVALID_IDS=topk_ids is not None,
+        HAS_ROUTE_ROWS=route_rows is not None,
         ROUND_WEIGHTED_ROUTES=round_weighted_routes,
         OUTPUT_SCALE=output_scale,
         BLOCK_M=4,
