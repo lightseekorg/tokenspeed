@@ -163,24 +163,42 @@ def test_prefill_adds_a_delta_only_input_to_base_positions():
 def test_prefill_overrides_do_not_synchronize_with_the_device():
     # The forward thread builds these while a step may be in flight: the
     # host-side positions table and delta must reach the device without
-    # waiting for the stream.
-    ib = _FakeInputBuffers(64, device="cuda")
+    # waiting for the stream. The chunk is a strided slice of the table, long
+    # enough that copying it from a strided source, even a pinned one, makes
+    # the driver stage it through pageable memory and wait.
+    chunk = 1 << 17
+    ib = _FakeInputBuffers(chunk + 8, device="cuda")
     rt = MultimodalRuntime(model_is_mrope=True, input_buffers=ib, device="cuda")
-    table = torch.arange(30, dtype=torch.int64).reshape(1, -1).repeat(3, 1)
+    table = torch.arange(chunk + 2, dtype=torch.int64).reshape(1, -1).repeat(3, 1)
     mms = [
         _mm_input(positions=table),
         _mm_input(delta_tensor=torch.tensor([5], dtype=torch.int64)),
     ]
-    op = _FakeForwardOp([4, 3], num_extends=2, extend_prefix_lens=[2])
+    op = _FakeForwardOp([chunk, 3], num_extends=2, extend_prefix_lens=[2])
+    # The first pinned staging buffer of a size is allocated with
+    # cudaHostAlloc, which synchronizes; the host allocator then reuses it.
+    rt.build_positions_override(op, _FakeMmContext(mms), chunk + 3)
     torch.cuda.synchronize()
+    # Hold the stream behind a long kernel: a copy that waits for it (one the
+    # sync-debug mode flags, or a pageable cudaMemcpyAsync it cannot see)
+    # returns only after the kernel finished.
+    torch.cuda._sleep(1 << 30)
+    in_flight = torch.cuda.Event()
+    in_flight.record()
     previous_mode = torch.cuda.get_sync_debug_mode()
     try:
         torch.cuda.set_sync_debug_mode("error")
-        out = rt.build_positions_override(op, _FakeMmContext(mms), 7)
+        out = rt.build_positions_override(op, _FakeMmContext(mms), chunk + 3)
     finally:
         torch.cuda.set_sync_debug_mode(previous_mode)
-    # The second request has no extend prefix entry, so it takes the delta.
-    assert out.tolist() == [[2, 3, 4, 5, 9, 10, 11]] * 3
+    assert not in_flight.query()
+    torch.cuda.synchronize()
+    # The first request reads the table after its 2-token prefix; the second
+    # has no extend prefix entry, so it takes base positions plus the delta.
+    expected = torch.cat(
+        [torch.arange(2, chunk + 2), torch.arange(chunk, chunk + 3) + 5]
+    ).to("cuda")
+    assert torch.equal(out, expected.expand(3, -1))
 
 
 def test_prefill_text_request_falls_back_to_linear():

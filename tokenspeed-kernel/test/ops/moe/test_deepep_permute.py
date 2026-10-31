@@ -173,6 +173,12 @@ def test_scatter_does_not_synchronize_with_the_device():
     # Compile the kernel before checking: the first launch is startup work.
     deepep_scatter(recv_x, recv_scale, topk_ids, counts, expert_alignment=_ALIGNMENT)
     torch.cuda.synchronize()
+    # Hold the stream behind a long kernel: an upload that waits for it (one
+    # the sync-debug mode flags, or a pageable cudaMemcpyAsync it cannot see)
+    # returns only after the kernel finished.
+    torch.cuda._sleep(1 << 30)
+    in_flight = torch.cuda.Event()
+    in_flight.record()
     previous_mode = torch.cuda.get_sync_debug_mode()
     try:
         torch.cuda.set_sync_debug_mode("error")
@@ -181,6 +187,8 @@ def test_scatter_does_not_synchronize_with_the_device():
         )
     finally:
         torch.cuda.set_sync_debug_mode(previous_mode)
+    assert not in_flight.query()
+    torch.cuda.synchronize()
     expected = [expert for expert, count in enumerate(counts) for _ in range(count)]
     assert m_indices.tolist() == expected
 

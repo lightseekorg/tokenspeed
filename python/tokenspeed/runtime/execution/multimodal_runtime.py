@@ -60,6 +60,9 @@ class MultimodalRuntime:
         self.model_is_mrope = model_is_mrope
         self.input_buffers = input_buffers
         self.device = device
+        # Host tables bound for a CUDA device are staged in pinned memory so
+        # their copies do not wait for the step in flight.
+        self._pin_host_staging = torch.device(device).type == "cuda"
 
         if model_is_mrope:
             mrope_decode_capacity = input_buffers.max_num_tokens
@@ -232,14 +235,18 @@ class MultimodalRuntime:
                         "M-RoPE positions table has no rows for prefill chunk "
                         f"[{start}, {end}) of request {forward_op.request_ids[batch_idx]}"
                     )
-                # The table lives on the host: upload it from pinned memory
-                # without blocking, since a pageable copy would wait for the
-                # step in flight.
-                mrope_chunks.append(
-                    positions.to(torch.int64)
-                    .pin_memory()
-                    .to(self.device, non_blocking=True)
+                # The table lives on the host. Gather the chunk into a
+                # contiguous pinned buffer, then copy it without blocking: the
+                # copy from a pageable source waits for the step in flight,
+                # and so can one from a strided source, which the copy first
+                # gathers into a pageable temporary.
+                staged = torch.empty(
+                    positions.shape,
+                    dtype=torch.int64,
+                    pin_memory=self._pin_host_staging,
                 )
+                staged.copy_(positions)
+                mrope_chunks.append(staged.to(self.device, non_blocking=True))
                 continue
 
             # Decode positions need (mrope_delta - 1) + seq_len. positions_buf
