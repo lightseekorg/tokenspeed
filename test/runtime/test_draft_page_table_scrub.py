@@ -57,9 +57,9 @@ class _Leaf:
         pass
 
 
-def _draft_router(rows: int = 8) -> CacheGroupRouter:
+def _draft_router(rows: int = 8, *, device: str) -> CacheGroupRouter:
     router = CacheGroupRouter(
-        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+        None, is_draft=True, spec_num_tokens=4, device=device, consumed_group_ids=None
     )
     router.bind(
         CacheGroupGeometry(
@@ -79,8 +79,8 @@ def _refresh(router, bs, actual_bs, table):
     router.refresh_decode_metadata(
         bs,
         actual_bs,
-        torch.arange(bs, dtype=torch.int32),
-        torch.ones(bs, dtype=torch.int32),
+        torch.arange(bs, dtype=torch.int32, device=router.device),
+        torch.ones(bs, dtype=torch.int32, device=router.device),
         forward_mode=ForwardMode.DECODE,
         block_tables={FULL: table} if table is not None else {},
     )
@@ -88,7 +88,7 @@ def _refresh(router, bs, actual_bs, table):
 
 class TestDraftHistoryScrubTest:
     def test_smaller_batch_clears_prior_rows(self):
-        router = _draft_router()
+        router = _draft_router(device="cpu")
         _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
         _refresh(router, 8, 2, torch.full((2, 4), 3, dtype=torch.int32))
         view = router.draft_history_view()
@@ -98,10 +98,10 @@ class TestDraftHistoryScrubTest:
         assert (view.table[:2] == 3).all()
 
     def test_padded_replay_rows_resolve_to_the_dummy_slot(self):
-        router = _draft_router()
+        router = _draft_router(device="cpu")
         _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
         _refresh(router, 4, 1, torch.full((1, 4), 3, dtype=torch.int32))
-        out = torch.zeros(8, dtype=torch.int32)
+        out = torch.zeros(8, dtype=torch.int64)
         router.draft_write_locations_uniform(
             out, cache_start=torch.zeros(4, dtype=torch.int32), num_tokens=2
         )
@@ -109,10 +109,50 @@ class TestDraftHistoryScrubTest:
         assert (out[2:].tolist()) == ([0] * 6)
 
     def test_idle_refresh_zeroes_every_row(self):
-        router = _draft_router()
+        router = _draft_router(device="cpu")
         _refresh(router, 8, 8, torch.full((8, 4), 9, dtype=torch.int32))
         _refresh(router, 8, 0, None)
         assert (router.draft_history_view().table == 0).all()
+
+
+class TestWideDraftSlots:
+    @pytest.mark.parametrize("device", ["cpu", "npu", "cuda"])
+    @pytest.mark.parametrize("page", [2**25 + 5, 2**31 - 1])
+    def test_uniform_draft_preserves_large_slots_and_published_buffer(
+        self, device, page
+    ):
+        if device == "npu":
+            pytest.importorskip("torch_npu")
+            if not torch.npu.is_available():
+                pytest.skip("NPU unavailable")
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        router = _draft_router(device=device)
+        table = torch.tensor(
+            [[page, 0, page, 0], [0, 0, 0, 0], [page] * 4, [page] * 4],
+            dtype=torch.int32,
+            device=device,
+        )
+        _refresh(router, 4, 4, table)
+        published = router.stacks.decode_locations(FULL, 4, 1)
+        original = published.clone()
+        pointer = published.data_ptr()
+        starts = torch.tensor(
+            [126, 0, 512, 2**31 - 2], dtype=torch.int32, device=device
+        )
+        out = torch.full((18,), -7, dtype=torch.int64, device=device)
+        result = router.draft_write_locations_uniform(out, starts, 4)
+        assert result.data_ptr() == out.data_ptr()
+        assert result.dtype == torch.int64
+        assert (
+            out.tolist() == [page * 128 + 126, page * 128 + 127] + [0] * 14 + [-7] * 2
+        )
+        assert published.data_ptr() == pointer
+        torch.testing.assert_close(published, original)
+        narrow = torch.full((16,), -7, dtype=torch.int32, device=device)
+        with pytest.raises(ValueError, match="draft write slot output must use int64"):
+            router.draft_write_locations_uniform(narrow, starts, 4)
+        assert narrow.tolist() == [-7] * 16
 
 
 class TestIdleReplayScrubTest:
@@ -123,7 +163,7 @@ class TestIdleReplayScrubTest:
     def test_idle_replay_sees_zeroed_rows(self):
         padded_bs = 4
         captured = {}
-        router = _draft_router()
+        router = _draft_router(device="cpu")
         _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
 
         class _Step:

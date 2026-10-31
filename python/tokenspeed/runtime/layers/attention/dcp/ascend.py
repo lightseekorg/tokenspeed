@@ -81,9 +81,9 @@ class AscendPrefillOptions:
         if local_rows < 1 or degree < 1 or index_width not in (0, 128):
             raise ValueError("Invalid native Prefill workspace geometry")
         return (
-            2
-            * sum(
-                _prefill_workspace_sizes(
+            sum(
+                -(-(size * torch.bfloat16.itemsize) // 256) * 256
+                for size in _prefill_workspace_sizes(
                     max_current_rows=self.max_current_rows,
                     history_capacity_rows=self.history_capacity_rows,
                     degree=degree,
