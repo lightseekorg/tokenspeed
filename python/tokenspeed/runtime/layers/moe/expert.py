@@ -62,6 +62,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ class MoELayer(torch.nn.Module):
             self.swiglu_arg = SwigluArg(alpha=activation_alpha, limit=swiglu_limit)
         # Per-model knobs the MoE backend reads in process_weights_after_loading.
         # ``swiglu_beta``: gpt-oss uses silu(α·gate)·(up + 1) and sets 1.0;
-        # standard SwiGLU (e.g. deepseek-v4) leaves it None.
+        # standard SwiGLU (e.g. DeepSeek V4.1) leaves it None.
         # ``w13_input_layout``: "interleaved" for HF gpt-oss-style row layout
         # ([w1_0, w3_0, w1_1, w3_1, ...]); "concatenated" (default) for the
         # shared MoE checkpoint loader's [w1_all | w3_all] block layout.
@@ -617,7 +618,9 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
-        kernel_moe_process_weights(self.plan, module)
+        kernel_moe_process_weights(
+            self.plan, module, communication_initializer=initialize_communication
+        )
         self._weights_processed = True
 
     @property

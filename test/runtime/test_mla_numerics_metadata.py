@@ -128,7 +128,6 @@ def _backend():
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=64,
         context_len=1024,
         max_bs=2,
         components=(spec,),

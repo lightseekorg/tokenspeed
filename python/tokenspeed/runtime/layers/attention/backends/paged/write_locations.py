@@ -33,11 +33,6 @@ router fills (``group_tables.GroupTableStacks``) so all groups' locations
 come from one launch. CUDA tensors run the triton kernels; CPU and NPU
 tensors take the Torch path. An optional immutable host page-size mirror
 avoids reading these static constants back from the device.
-
-The token-shaped sibling — arbitrary positions over one group's raw table,
-failing closed to the ``-1`` sentinel (V4's SWA / compressor-state /
-indexer-state writes) — is ``page_table.group_slot_mapping_from_raw``; both
-spell the same invariant.
 """
 
 from __future__ import annotations

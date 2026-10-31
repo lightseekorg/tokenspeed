@@ -44,13 +44,12 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
-from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
+from tokenspeed.runtime.models.deepseek_v3 import absorb_mla_kv_b_proj
 from tokenspeed.runtime.models.glm5 import (
     GlmMoeDsaDecoderLayer,
     GlmMoeDsaForCausalLM,
@@ -427,26 +426,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
     def post_load_weights(self) -> None:
         self_attn = self.model.decoder.self_attn
         pad_fused_qkv_a_proj_weight_for_fp8_blockscale(self_attn)
-        if (
-            hasattr(self.quant_config, "weight_block_size")
-            and (self.quant_config.weight_block_size is not None)
-            and self_attn.kv_b_proj.weight.dtype
-            in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            )
-        ):
-            weight_block_size = self.quant_config.weight_block_size
-            dtype = torch.get_default_dtype()
-            w = block_dequant(
-                self_attn.kv_b_proj.weight,
-                self_attn.kv_b_proj.weight_scale_inv,
-                weight_block_size,
-            ).to(dtype)
-        else:
-            w = self_attn.kv_b_proj.weight
-
-        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
+        absorb_mla_kv_b_proj(self_attn)
 
 
 EntryClass = [GlmMoeDsaForCausalLMNextN]

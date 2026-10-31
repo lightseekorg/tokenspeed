@@ -164,6 +164,7 @@ from tokenspeed.runtime.execution.types import (
     ModelExecutionResult,
     PlannedForward,
 )
+from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLoadSnapshot,
     get_global_expert_location_metadata,
@@ -391,9 +392,11 @@ class DeviceHandle:
         *,
         host_cache_executor=None,
         kv_transfer=None,
+        weight_memory: WeightMemoryState | None = None,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
+        self._weight_memory = weight_memory
         # Resolved here, on the building thread, whose current device the
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
@@ -490,6 +493,8 @@ class DeviceHandle:
             copy event, or None on rounds that run no batch — DP-idle, an
             empty plan, or a D-role round whose only work was the peer's.
         """
+        if planned is not None and self._weight_memory is not None:
+            self._weight_memory.require_usable()
         cache_ops = tuple(cache_ops)
         for operation in cache_ops:
             if not is_device_cache_op(operation):
@@ -683,6 +688,8 @@ class DeviceHandle:
         Args:
             dp_metadata: The round's CPU-gathered DP metadata.
         """
+        if self._weight_memory is not None:
+            self._weight_memory.require_usable()
         self.settle()
         self._executor.execute_idle_forward(dp_metadata)
 
@@ -740,6 +747,30 @@ class DeviceHandle:
         self._executor.device_module.synchronize()
         if self._kv_transfer is not None:
             self._kv_transfer.release_cache_registration()
+        if self._weight_memory is not None:
+            self._weight_memory.mark_kv_released()
+
+    def before_kv_resume(self) -> None:
+        """Keep KV unmapped while discarded or partially updated weights are invalid."""
+        if self._weight_memory is not None:
+            self._weight_memory.before_kv_resume()
+
+    def release_weights(self, adapter) -> None:
+        """Discard or back up weights only after device and KV work drained."""
+        self.synchronize()
+        operation = lambda: adapter.pause(tag="weights")
+        if self._weight_memory is None:
+            operation()
+        else:
+            self._weight_memory.release(operation)
+
+    def resume_weights(self, adapter) -> None:
+        """Remap storage and restore constants; discarded parameters stay invalid."""
+        operation = lambda: adapter.resume(tag="weights")
+        if self._weight_memory is None:
+            operation()
+        else:
+            self._weight_memory.resume(operation)
 
     def finish_kv_resume(self) -> None:
         """Repair the KV arena after a memory-saver wake re-maps its storage.
@@ -754,6 +785,8 @@ class DeviceHandle:
         self._executor.token_to_kv_pool.clear_kv_buffers()
         if self._kv_transfer is not None:
             self._kv_transfer.restore_cache_registration()
+        if self._weight_memory is not None:
+            self._weight_memory.mark_kv_resumed()
 
     def suspend_nccl(self) -> None:
         """Free the NCCL communicators' buffers; they stay usable after resume."""
@@ -887,6 +920,49 @@ class DeviceHandle:
             with allow_host_sync("expert placement chunk"):
                 executor.execution_stream.synchronize()
 
+    def check_weight_update(self, req) -> tuple[bool, str]:
+        """Check a weight load's local prerequisites without changing anything.
+
+        The control plane MIN-reduces this result over the replica before any
+        rank runs a loader, so a rank that would refuse never strands a ready
+        peer inside a loading collective, and a refusal leaves every rank's
+        weights untouched.
+
+        Args:
+            req: A weight-load request (disk, distributed or Mooncake).
+
+        Returns:
+            ``(ready, message)``; the message explains a refusal.
+
+        Raises:
+            TypeError: Not a weight-load request.
+        """
+        from tokenspeed.runtime.engine.io_struct import (
+            UpdateWeightFromDiskReqInput,
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        )
+
+        if type(req) not in (
+            UpdateWeightFromDiskReqInput,
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        ):
+            raise TypeError(f"unsupported weight-load request {type(req).__name__}")
+        state = self._weight_memory
+        if state is None:
+            return True, "ready for weight update"
+        if (
+            state.policy == "discard"
+            and type(req) is not UpdateWeightsFromMooncakeReqInput
+        ):
+            return False, "Discard policy requires a complete Model Updater SDK update"
+        try:
+            state.check_update()
+        except RuntimeError as exc:
+            return False, str(exc)
+        return True, "ready for weight update"
+
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
@@ -923,7 +999,9 @@ class DeviceHandle:
             ),
             UpdateWeightsFromMooncakeReqInput: (
                 lambda req: runner.update_weights_from_mooncake(
-                    req.version, self._mooncake_update_models()
+                    req.version,
+                    self._mooncake_update_models(),
+                    require_complete=require_complete,
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
@@ -938,10 +1016,35 @@ class DeviceHandle:
             UpdateWeightFromDiskReqInput,
         )
 
-        result = handler(req)
-        if loads_weights and result[0] and self._executor.drafter is not None:
-            self._executor.drafter.on_target_weights_updated()
-        return result
+        state = self._weight_memory
+        require_complete = False
+        if loads_weights:
+            # The control plane already agreed these prerequisites across the
+            # replica; re-checking keeps a direct caller from loading unchecked.
+            ready, message = self.check_weight_update(req)
+            if not ready:
+                return False, message
+            if state is not None:
+                require_complete = state.begin_update()
+        try:
+            result = handler(req)
+            if loads_weights and result[0] and self._executor.drafter is not None:
+                self._executor.drafter.on_target_weights_updated()
+            if loads_weights and state is not None:
+                state.finish_update(success=bool(result[0]))
+            return result
+        except Exception as exc:
+            # The reply carries only the message; keep the traceback that
+            # explains a failed (and, under the memory saver, poisoning) load.
+            logger.exception(f"weight operation {type(req).__name__} failed")
+            if loads_weights and state is not None and state.updating:
+                state.finish_update(success=False)
+            return False, str(exc)
+
+    def commit_weight_update(self, success: bool) -> None:
+        """Apply the replica-wide result before KV wake or another forward."""
+        if self._weight_memory is not None:
+            self._weight_memory.commit_update(success)
 
     def _mooncake_update_models(self) -> list:
         """The modules a Mooncake update streams into, target first.
@@ -1595,6 +1698,18 @@ def build_device_side(
     def encoder_model_facts() -> EncoderModelFacts:
         return EncoderModelFacts.from_model(target.model, device=executor.device)
 
+    weight_memory = None
+    if server_args.enable_memory_saver:
+        update_models = [target.model]
+        if (
+            server_args.model_update_draft_weights == "refresh"
+            and executor.draft_model_runner is not None
+        ):
+            update_models.append(executor.draft_model_runner.model)
+        weight_memory = WeightMemoryState(
+            policy=server_args.weight_memory_policy, models=update_models
+        )
+
     return DeviceBuild(
         host_cache=host_cache,
         specs=specs,
@@ -1604,6 +1719,7 @@ def build_device_side(
             executor,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
+            weight_memory=weight_memory,
         ),
     )
 

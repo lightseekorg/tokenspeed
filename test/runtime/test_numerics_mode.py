@@ -358,7 +358,6 @@ class TestModelVerificationGate:
             cache_family="fixture_family",
             linear_attention=None,
             default_attention_backend=None,
-            default_prefix_granularity=None,
             request_token_history=False,
             is_multimodal=False,
             tokenizer_kwargs={},

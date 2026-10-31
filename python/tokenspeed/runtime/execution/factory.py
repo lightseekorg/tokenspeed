@@ -213,9 +213,7 @@ def configure_draft_target(
         )
     if DrafterImpl.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
-    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS and hasattr(
-        model_runner.model, "set_eagle3_layers_to_capture"
-    ):
+    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
         # capture the layers the draft was trained on, not the default
         aux_layer_ids = server_args.eagle3_layers_to_capture or _eagle_aux_layer_ids(
             draft_model_runner.model_config.hf_config

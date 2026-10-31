@@ -98,10 +98,20 @@ enum Op {
         dp: DpRound,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    /// A weight load's local prerequisites to check, as its msgpack
+    /// control struct; changes nothing.
+    CheckWeightUpdate {
+        payload: Bytes,
+        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
     /// A weight operation or profile request, as its msgpack control struct.
     UpdateWeights {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
+    CommitWeightUpdate {
+        success: bool,
+        reply: mpsc::SyncSender<Result<(), String>>,
     },
     Profile {
         payload: Bytes,
@@ -431,9 +441,21 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::IdleForward { dp, reply })
     }
 
+    fn check_weight_update(
+        &mut self,
+        op: &ControlRequest,
+    ) -> Result<(bool, String), DataPlaneError> {
+        let payload = control_payload(op)?;
+        self.ask(|reply| Op::CheckWeightUpdate { payload, reply })
+    }
+
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         let payload = control_payload(op)?;
         self.ask(|reply| Op::UpdateWeights { payload, reply })
+    }
+
+    fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError> {
+        self.ask(|reply| Op::CommitWeightUpdate { success, reply })
     }
 
     fn profile(&mut self, request: &ProfileReq) -> Result<(bool, String), DataPlaneError> {
@@ -569,12 +591,15 @@ fn forward_loop(
             match op {
                 Op::Barrier { reply }
                 | Op::IdleForward { reply, .. }
+                | Op::CommitWeightUpdate { reply, .. }
                 | Op::ReleaseMemory { reply, .. }
                 | Op::ResumeMemory { reply, .. }
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
-                Op::UpdateWeights { reply, .. } | Op::Profile { reply, .. } => {
+                Op::CheckWeightUpdate { reply, .. }
+                | Op::UpdateWeights { reply, .. }
+                | Op::Profile { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::SnapshotExpertLoad { reply } => {
@@ -723,10 +748,24 @@ fn run(
                 .map_err(python);
             answer(reply, ran)?;
         }
+        Op::CheckWeightUpdate { payload, reply } => {
+            let done = plane
+                .call_method1("check_weight_update", (PyBytes::new(py, &payload),))
+                .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
         Op::UpdateWeights { payload, reply } => {
             let done = plane
                 .call_method1("update_weights", (PyBytes::new(py, &payload),))
                 .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::CommitWeightUpdate { success, reply } => {
+            let done = plane
+                .call_method1("commit_weight_update", (success,))
+                .map(drop)
                 .map_err(python);
             answer(reply, done)?;
         }

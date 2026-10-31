@@ -142,8 +142,10 @@ def _select_split_k(contract: str, m: int, n: int, k: int) -> int:
     The V4 FP32-scale Q/KV projections use four or seven partitions while the
     batch occupies fewer than 16 rows. Their full-row tiles stay direct because
     the extra reduction launch outweighs additional producer workgroups. The
-    V4.1 Q/KV and shared-up projections use five partitions for every supported
-    decode batch. All unlisted shapes use the direct path.
+    V4.1 576-column projection uses five partitions for every supported decode
+    batch. The 1792-column V4.1 Q/KV projection stays direct: its 112 output
+    tiles keep the weight stream busy, so the reduction launch costs more than
+    the extra producers save. All unlisted shapes use the direct path.
     """
     if contract == "fp32":
         if m == _BLOCK_M:
@@ -154,7 +156,7 @@ def _select_split_k(contract: str, m: int, n: int, k: int) -> int:
             return 7
         return 1
     if contract == "ue8m0":
-        if (n, k) in ((576, 5120), (1792, 5120)):
+        if (n, k) == (576, 5120):
             return 5
         return 1
     raise ValueError(f"unknown MXFP8 scale contract: {contract}")
@@ -968,10 +970,10 @@ def launch_gluon_mm_mxfp8_ue8m0_gfx1250(
     """Project E4M3 matrices with row-major `[1,32]` raw UE8M0 scales.
 
     A one-wave producer computes ``16 x 16`` output tiles with 512-wide TDM
-    transfers and native scaled WMMA. The V4.1 ``1792 x 5120`` Q/KV and
-    ``576 x 5120`` shared-up projections use five K partitions; other accepted
-    shapes run directly. Split partials are accumulated in FP32 and reduced to
-    BF16 by a second kernel.
+    transfers and native scaled WMMA. The V4.1 ``576 x 5120`` projection uses
+    five K partitions; other accepted shapes, including the ``1792 x 5120``
+    Q/KV projection, run directly. Split partials are accumulated in FP32 and
+    reduced to BF16 by a second kernel.
 
     Args:
         A: Row-major E4M3 activation matrix `[M,K]`, with `1 <= M <= 16`.

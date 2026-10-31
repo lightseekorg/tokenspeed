@@ -509,7 +509,6 @@ def _qsa_config(*, kernel_page_size: int | None, max_bs: int, spec: int) -> Attn
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=256,
         kernel_page_size=kernel_page_size,
         context_len=1024,
         max_bs=max_bs,
@@ -1823,7 +1822,6 @@ def test_qsa_passes_logical_selection_to_kernel(query_width: int | None) -> None
     config = replace(
         _qsa_config(kernel_page_size=64, max_bs=2, spec=4),
         device="cuda",
-        prefix_granularity=64,
         context_len=512,
         components=(spec,),
     )
@@ -2121,7 +2119,6 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         kv_cache_mxfp8=False,
         context_len=1024,
         max_bs=2,
-        prefix_granularity=64,
         kernel_page_size=64,
         kv_cache_quant_method="none",
         components=(softmax, linear),

@@ -301,6 +301,31 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesStoredBlockAndDrainsItOnce) {
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
+TEST_F(SchedulerKvCacheEventTestSuite, PartialPrefillRetractionUsesItsActualTailParent) {
+    config_.device_allocator.total_pages = 16;
+    config_.cache_groups.front().total_pages = 16;
+    config_.max_scheduled_tokens = 3;
+    config_.debug_force_retraction_interval = -1;
+    SetTestSnapshotPool(config_);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit(RequestSpec{.request_id = "partial", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}});
+    const ExecutionPlan first = PlanOnce();
+    ASSERT_NE(FindForwardBatch(first), nullptr);
+    EXPECT_EQ(FindForwardBatch(first)->input_lengths, std::vector<std::int32_t>{3});
+    SendForwardDone("partial");
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(retraction), nullptr);
+    const std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[1]));
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_EQ(tail.token_ids, std::vector<std::int32_t>{3});
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front());
+}
+
 TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock) {
     Submit(MakeRequestSpec("seed", 1));
     PlanOnce();

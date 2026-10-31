@@ -93,39 +93,6 @@ def _compile(a, b, sa, sb, out, tactic):
     )
 
 
-def prepare(device):
-    """Compile the three fallback configurations before CUDA graph capture."""
-    _prepare(
-        device,
-        (
-            (False, (64, 128), (1, 1)),
-            (False, (128, 128), (1, 1)),
-            (True, (256, 128), (2, 1)),
-        ),
-    )
-
-
-def _prepare(device, tactics):
-    with torch.cuda.device(device), _compile_lock:
-        missing = [
-            tactic for tactic in tactics if (device.index, tactic) not in _compiled
-        ]
-        if not missing:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Prepare TRT-LLM CuTe-DSL before CUDA graph capture")
-        a = torch.empty((256, 128), device=device, dtype=torch.float8_e4m3fn)
-        b = torch.empty((128, 128), device=device, dtype=torch.float8_e4m3fn)
-        sa = torch.empty((1, 256), device=device, dtype=torch.float32)
-        sb = torch.empty((1, 1), device=device, dtype=torch.float32)
-        out = torch.empty((256, 128), device=device, dtype=torch.bfloat16)
-        compiled = {
-            (device.index, tactic): _compile(a, b, sa, sb, out, tactic)
-            for tactic in missing
-        }
-        _compiled.update(compiled)
-
-
 def _run(a, b, a_scales, b_scales, out, tactic):
     """Launch a chosen tactic, or the existing row-count rule for tactic -1."""
     # A scales are logically [M,K/128], but this kernel reads MN-major.
@@ -139,8 +106,6 @@ def _run(a, b, a_scales, b_scales, out, tactic):
         tactic = (tile == 256, (tile, 128), (2 if tile == 256 else 1, 1))
     key = (a.device.index, tactic)
     if key not in _compiled:
-        # One eager launch also warms fixed tiles needed by later graph buckets.
-        prepare(a.device)
         with torch.cuda.device(a.device), _compile_lock:
             if key not in _compiled:
                 if torch.cuda.is_current_stream_capturing():

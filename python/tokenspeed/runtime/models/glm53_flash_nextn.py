@@ -40,12 +40,11 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
+from tokenspeed.runtime.models.deepseek_v3 import absorb_mla_kv_b_proj
 from tokenspeed.runtime.models.glm53_flash import (
     Glm53FlashAttention,
     Glm53FlashDecoderLayer,
@@ -151,6 +150,7 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
         self.config = config.text_config
         self.mapping = mapping
         self.quant_config = quant_config
+        self.index_share_for_mtp_iteration = self.config.index_share_for_mtp_iteration
         self.model = Glm53FlashModelNextN(
             self.config,
             mapping,
@@ -284,24 +284,7 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
         attention = self.model.decoder.self_attn
         if not isinstance(attention, Glm53FlashAttention):
             raise RuntimeError("GLM-5.3-Flash MTP decoder must use sparse MLA")
-        weight = attention.kv_b_proj.weight
-        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
-        if weight_block_size is not None and weight.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            if not hasattr(attention.kv_b_proj, "weight_scale_inv"):
-                raise RuntimeError(
-                    "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
-                )
-            weight = block_dequant(
-                weight,
-                attention.kv_b_proj.weight_scale_inv,
-                weight_block_size,
-            ).to(torch.get_default_dtype())
-        attention.w_kc, attention.w_vc = _prepare_mla_kv_b_proj_weights(
-            weight, attention
-        )
+        absorb_mla_kv_b_proj(attention)
         attention._absorbed_kv_b_version = attention.kv_b_proj.weight._version
         if isinstance(self.model.decoder.mlp, Glm53FlashMoE):
             experts = self.model.decoder.mlp.experts

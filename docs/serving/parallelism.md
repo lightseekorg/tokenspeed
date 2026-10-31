@@ -337,7 +337,7 @@ python -m tokenspeed.cli serve \
   --dist-init-addr HEAD_NODE:29500 \
   --max-num-seqs 256 --max-model-len 4096 \
   --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
-  --prefix-granularity 128 --enable-prefix-caching --disable-kvstore \
+  --enable-prefix-caching --disable-kvstore \
   --max-cudagraph-capture-size 16 --cudagraph-capture-sizes 1 2 4 8 16
 ```
 
@@ -652,7 +652,7 @@ things:
 `--kv-parallel-size N` must divide `--attn-tp-size`; the KVP subgroups are
 aligned runs of `N` consecutive attention-TP ranks. It applies to the
 full-history groups of MLA/DSA models (latent KV and index-K) and to DeepSeek
-V4's compressed KV; groups that every rank reads whole (sliding windows,
+V4.1's global KV; groups that every rank reads whole (sliding windows,
 compressor state) stay replicated. The attention backend decides how it
 attends the sharded pages (DCP decode, chunked or gathered prefill history);
 the scheduler plans the same virtual blocks on every rank and the runtime

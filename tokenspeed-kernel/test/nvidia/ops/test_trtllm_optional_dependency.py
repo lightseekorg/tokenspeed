@@ -18,20 +18,27 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from collections.abc import Callable
-from typing import Any
+"""Other operators remain importable without the optional TRT-LLM extension."""
+
+import importlib.util
+
+import pytest
+import torch
+from tokenspeed_kernel.ops.attention.dsa import deep_gemm  # noqa: F401
+from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
+from tokenspeed_kernel.ops.quantization.trtllm import _per_token_group_quant_8bit
+
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("trtllm_kernel") is not None,
+    reason="requires an environment without the optional TRT-LLM GPU extension",
+)
 
 
-class TypeBasedDispatcher:
-    def __init__(self, mapping: list[tuple[type, Callable]]):
-        self._mapping = mapping
+def test_fused_a_projection_reports_missing_optional_extension():
+    with pytest.raises(RuntimeError, match="compatible trtllm_kernel package"):
+        dsv3_fused_a_gemm(torch.ones(1, 128), torch.ones(128, 128))
 
-    def __iadd__(self, other: "TypeBasedDispatcher"):
-        self._mapping.extend(other._mapping)
-        return self
 
-    def __call__(self, obj: Any):
-        for ty, fn in self._mapping:
-            if isinstance(obj, ty):
-                return fn(obj)
-        raise ValueError(f"Invalid object: {obj}")
+def test_trtllm_quantization_reports_missing_optional_extension():
+    with pytest.raises(RuntimeError, match="compatible trtllm_kernel package"):
+        _per_token_group_quant_8bit(torch.ones(1, 128), 128, False)

@@ -321,10 +321,8 @@ def test_large_route_count_reset_and_graph_replay() -> None:
     )
     weights = torch.ones((num_tokens, top_k), dtype=torch.float32, device="cuda")
     kernels = (
-        moe_align_device._init_kernel,
-        moe_align_device._count_kernel,
-        moe_align_device._offsets_kernel,
-        moe_align_device._scatter_kernel,
+        moe_align_device._chunk_count_kernel,
+        moe_align_device._chunk_scatter_kernel,
     )
 
     # Both views have more than 1,024 routes and share the same capacity bucket.
@@ -353,6 +351,113 @@ def test_large_route_count_reset_and_graph_replay() -> None:
             block_m=block_m,
             expert_start=expert_start,
         )
+
+
+def _top8_routes(
+    num_tokens: int, routing: str, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Distinct top-8 routes over 288 global experts, or eight shared hot ones."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    if routing == "hot":
+        hot = torch.arange(TOPK, device="cuda", dtype=torch.int32) * 37
+        topk_ids = hot.expand(num_tokens, TOPK).contiguous()
+    else:
+        logits = torch.randn(num_tokens, 288, device="cuda", generator=generator)
+        topk_ids = torch.topk(logits, TOPK, dim=1).indices.to(torch.int32)
+    topk_weights = torch.rand(num_tokens, TOPK, device="cuda", generator=generator)
+    return topk_ids, topk_weights
+
+
+@requires_cdna4
+@pytest.mark.parametrize(
+    ("num_tokens", "num_experts", "expert_start", "routing"),
+    [
+        (129, 288, 0, "random"),
+        (848, 288, 0, "random"),
+        (8192, 288, 0, "random"),
+        (8192, 288, 0, "hot"),
+        (848, 72, 216, "random"),
+    ],
+)
+def test_large_route_alignment_contract(
+    num_tokens: int, num_experts: int, expert_start: int, routing: str
+) -> None:
+    """Chunked counting and scatter keep every route for one or many chunks."""
+    topk_ids, topk_weights = _top8_routes(num_tokens, routing, seed=num_tokens)
+    outputs = moe_align_block_size_device(
+        topk_ids, topk_weights, num_experts, 64, expert_start=expert_start
+    )
+    torch.cuda.synchronize()
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=num_experts,
+        block_m=64,
+        expert_start=expert_start,
+    )
+
+
+@requires_cdna4
+@pytest.mark.parametrize("num_tokens", [6, 24, 129, 8192])
+def test_alignment_clears_output_to_zero(num_tokens: int) -> None:
+    """Every alignment path clears the caller's output and nothing past it."""
+    topk_ids, topk_weights = _top8_routes(num_tokens, "random", seed=7)
+    storage = torch.full(
+        (num_tokens + 1, 4096), -7.0, dtype=torch.bfloat16, device="cuda"
+    )
+    output = storage[:num_tokens]
+    block_m = 16 if num_tokens <= 32 else 64
+    # 6 tokens use the fused aligner, 24 the small route path, and 129 and
+    # 8192 the chunked large-route path.
+    align = (
+        moe_align_block_size_fused if num_tokens <= 16 else moe_align_block_size_device
+    )
+    outputs = align(topk_ids, topk_weights, 288, block_m, output_to_zero=output)
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output).item() == 0
+    assert torch.all(storage[num_tokens:] == -7.0)
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=288,
+        block_m=block_m,
+        expert_start=0,
+    )
+
+
+@requires_cdna4
+def test_alignment_rejects_strided_output_to_zero() -> None:
+    topk_ids, topk_weights = _top8_routes(4, "random", seed=3)
+    strided = torch.empty((4, 8192), dtype=torch.bfloat16, device="cuda")[:, :4096]
+    with pytest.raises(ValueError, match="contiguous"):
+        moe_align_block_size_device(
+            topk_ids, topk_weights, 288, 16, output_to_zero=strided
+        )
+
+
+@requires_cdna4
+def test_large_route_chunk_counts_do_not_recompile() -> None:
+    """Route counts that change the chunk count and buckets reuse one compile."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import moe_align_device
+
+    topk_ids, topk_weights = _top8_routes(8192, "random", seed=11)
+    output = torch.empty((8192, 4096), dtype=torch.bfloat16, device="cuda")
+    moe_align_block_size_device(
+        topk_ids[:200], topk_weights[:200], 288, 64, output_to_zero=output[:200]
+    )
+    with assert_no_triton_compile(
+        moe_align_device._chunk_count_kernel, moe_align_device._chunk_scatter_kernel
+    ):
+        for tokens in (300, 848, 4096, 8192):
+            moe_align_block_size_device(
+                topk_ids[:tokens],
+                topk_weights[:tokens],
+                288,
+                64,
+                output_to_zero=output[:tokens],
+            )
 
 
 @requires_cdna4

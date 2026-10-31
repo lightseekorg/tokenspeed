@@ -1341,6 +1341,7 @@ class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
 
 class Qwen3_5ForConditionalGeneration(BaseCausalLM):
     model_cls = Qwen3_5ForCausalLM
+    supports_aux_capture = True
 
     def __init__(
         self,
@@ -1532,6 +1533,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         return self.model.embed_tokens
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.require_aux_capture()
         # DFLASH checkpoints name 0-indexed target layer outputs. A layer
         # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)

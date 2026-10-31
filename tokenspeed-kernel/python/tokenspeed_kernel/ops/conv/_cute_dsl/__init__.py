@@ -17,21 +17,3 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-
-from transformers.configuration_utils import PretrainedConfig
-
-
-class DeepseekV4Config(PretrainedConfig):
-    model_type = "deepseek_v4"
-
-    def __init__(
-        self,
-        max_position_embeddings: int = 1048576,
-        rope_scaling: dict | None = None,
-        **kwargs,
-    ):
-        self.max_position_embeddings = max_position_embeddings
-        self.rope_scaling = rope_scaling
-        self.rope_parameters = rope_scaling or {}
-        super().__init__(rope_scaling=rope_scaling, **kwargs)

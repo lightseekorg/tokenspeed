@@ -32,7 +32,14 @@ from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["argmax", "vocab_parallel_logprobs", "prepare_sampling_offsets"]
+__all__ = [
+    "argmax",
+    "eagle4_candidate_supports",
+    "eagle4_candidate_tail",
+    "eagle4_shard_topk",
+    "vocab_parallel_logprobs",
+    "prepare_sampling_offsets",
+]
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
 _SUPPORTED_OUT_DTYPES = (_torch.int32, _torch.int64)
@@ -124,7 +131,107 @@ def argmax(
         return kernel(logits, out=out)
 
 
+# The CUDA shard top-k's widest launch: 8-CTA clusters of 1024 threads x 32
+# elements.
+_EAGLE4_MAX_SHARD_VOCAB = 8 * 1024 * 32
+
+
+def eagle4_candidate_supports(
+    dtype: _torch.dtype, shard_vocab: int, num_candidates: int, ranks: int
+) -> bool:
+    """Whether the EAGLE-4 candidate head kernels cover a head.
+
+    Args:
+        dtype: The candidate scores' and logits' dtype; bf16 only.
+        shard_vocab: Tokens per vocab shard, ``num_candidates`` to 262144.
+        num_candidates: Candidates per shard and kept after the all-gather
+            (NC): 32, 64, 128 or 256.
+        ranks: Vocab shards (R), with ``ranks * num_candidates <= 1024``.
+
+    Returns:
+        True when both ``eagle4_shard_topk`` and ``eagle4_candidate_tail``
+        take the head. The tail also takes a draft top-k of at most 32.
+    """
+    return (
+        dtype == _torch.bfloat16
+        and num_candidates <= shard_vocab <= _EAGLE4_MAX_SHARD_VOCAB
+        and num_candidates in (32, 64, 128, 256)
+        and ranks * num_candidates <= 1024
+    )
+
+
+def eagle4_shard_topk(
+    scores: _torch.Tensor,
+    k: int,
+    vocab_start: int,
+    global_ids: _torch.Tensor,
+) -> None:
+    """The EAGLE-4 candidate head's per-shard selection, before the all-gather.
+
+    Writes ``torch.topk(scores, k, dim=-1, sorted=False).indices +
+    vocab_start`` in CUDA's order on every platform: the ids of keys above the
+    k-th largest by position, then the first k-th largest ties by position.
+
+    Args:
+        scores: ``[M, N]`` bf16 scores of a vocab shard, unit column stride.
+        k: Ids kept per row.
+        vocab_start: The vocab id of the shard's column 0.
+        global_ids: ``[M, k]`` int64 destination, unit column stride; any row
+            stride.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "eagle4_shard_topk",
+        format_signature(scores=dense_tensor_format(scores.dtype)),
+    )
+    kernel(scores, k, vocab_start, global_ids)
+
+
+def eagle4_candidate_tail(
+    cand_logits: _torch.Tensor,
+    cand_tokens: _torch.Tensor,
+    top_k: int,
+    logits_out: _torch.Tensor,
+    tokens_out: _torch.Tensor,
+    topk_probs: _torch.Tensor | None,
+    topk_tokens: _torch.Tensor | None,
+) -> None:
+    """Everything after the EAGLE-4 candidate all-gather, in one launch.
+
+    The same, bit for bit, as::
+
+        logits, pos = torch.topk(gathered_logits, NC, sorted=False)  # R > 1 only
+        tokens = torch.gather(gathered_tokens, -1, pos)
+        logits = logits.float()
+        top = torch.topk(torch.softmax(logits, -1), top_k, -1)  # top_k > 0 only
+        top_tokens = torch.gather(tokens, -1, top.indices)
+
+    where ``gathered_*`` concatenates the ``R`` rank blocks. The NC-way top-k
+    keeps CUDA's order, as ``eagle4_shard_topk``.
+
+    Args:
+        cand_logits: ``[R, M, NC]`` bf16 view of the gathered rank blocks, any
+            rank and row strides, unit column stride.
+        cand_tokens: ``[R, M, NC]`` int64 ids alike.
+        top_k: Draft top-k, 0 to skip it.
+        logits_out: Contiguous ``[M, NC]`` fp32 candidate logits.
+        tokens_out: Contiguous ``[M, NC]`` int64 candidate ids; not written
+            when R == 1.
+        topk_probs: Contiguous ``[M, top_k]`` fp32, or None when top_k is 0.
+        topk_tokens: Contiguous ``[M, top_k]`` int64, or None when top_k is 0.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "eagle4_candidate_tail",
+        format_signature(cand_logits=dense_tensor_format(cand_logits.dtype)),
+    )
+    kernel(
+        cand_logits, cand_tokens, top_k, logits_out, tokens_out, topk_probs, topk_tokens
+    )
+
+
 # Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401

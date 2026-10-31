@@ -35,10 +35,6 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
-    DEEPSEEK_V4_PAGE_SIZE,
-    TRTLLM_MHA_PAGE_SIZE,
-)
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
@@ -62,13 +58,6 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 logger = get_colorful_logger(__name__)
 
-_DEEPSEEK_V4_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForCausalLMDSpark",
-        "DeepseekV4ForCausalLMNextN",
-    }
-)
 _QWEN4_EXP_ARCHITECTURES = frozenset(
     {
         "Qwen4ExpForConditionalGeneration",
@@ -136,7 +125,6 @@ class _AttentionFamilySpec:
     configure: Callable[[object, ServerArgs], None]
     # A name, or a function of the launch returning one (None: no default).
     default_backend: str | Callable[[ServerArgs], str | None] | None = None
-    default_prefix_granularity: int | None = None
 
 
 def override_model_config(model_config, ext_yaml):
@@ -156,40 +144,11 @@ def override_model_config(model_config, ext_yaml):
             logger.info(f"Override model config: {k!s}={new_v!r}")
 
 
-def is_deepseek_v4(config: PretrainedConfig) -> bool:
-    return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
-
-
 def is_qwen4_exp(config: PretrainedConfig) -> bool:
     return (
         getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
         or resolve_architecture(config) in _QWEN4_EXP_ARCHITECTURES
     )
-
-
-def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
-    return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
-
-
-def configure_deepseek_v4_attention(model_config, server_args: ServerArgs) -> None:
-    """Derive DeepSeek V4's MLA-like dimensions for runtime setup."""
-    del server_args  # the geometry follows the checkpoint alone
-
-    hf_config = model_config.hf_config
-    model_config.head_dim = hf_config.head_dim
-    model_config.attention_arch = AttentionArch.MLA
-    model_config.kv_lora_rank = hf_config.head_dim
-    model_config.qk_rope_head_dim = hf_config.qk_rope_head_dim
-    model_config.qk_nope_head_dim = hf_config.head_dim - hf_config.qk_rope_head_dim
-    model_config.v_head_dim = hf_config.head_dim
-    model_config.index_head_dim = getattr(hf_config, "index_head_dim", None)
-    model_config.scaling = 1 / math.sqrt(model_config.head_dim)
-    rope_scaling = getattr(hf_config, "rope_scaling", None)
-    if rope_scaling:
-        mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-        scaling_factor = rope_scaling["factor"]
-        mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-        model_config.scaling = model_config.scaling * mscale * mscale
 
 
 def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> None:
@@ -300,7 +259,6 @@ def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> Non
         server_args,
         name="dots3-note",
         default_backend="mla" if is_mtp else "dsa",
-        default_prefix_granularity=None,
         is_draft_worker=is_mtp,
     )
     configure = configure_mla_attention if is_mtp else configure_dsa_attention
@@ -341,9 +299,8 @@ def beam_default_attention_backend(server_args: ServerArgs) -> str | None:
     """Beam's ``--attention-backend`` when the launch names none.
 
     The TRT-LLM-gen paged FMHA leaf (``trtllm``) where it was admitted: NVIDIA
-    SM100 to SM103, a BF16 KV cache, a ``--prefix-granularity`` holding whole
-    64-token leaf pages, ``--numerics auto`` (its decode picks the KV split
-    count per batch bucket, which rl-bitwise excludes) and no
+    SM100 to SM103, a BF16 KV cache, ``--numerics auto`` (its decode picks the
+    KV split count per batch bucket, which rl-bitwise excludes) and no
     ``attention.mha_*`` kernel override (the leaf calls FlashInfer directly, so
     such an override would be silently ignored). Otherwise None: the backend
     stays unset, i.e. today's ranked ``mha`` leaf. One INFO line says which, and
@@ -359,13 +316,6 @@ def beam_default_attention_backend(server_args: ServerArgs) -> str | None:
     ):
         # An auto KV cache takes the model dtype (auto: the checkpoint's).
         reason = f"--kv-cache-dtype auto follows --dtype {server_args.dtype}, not BF16"
-    if not reason and server_args.prefix_granularity % TRTLLM_MHA_PAGE_SIZE:
-        # A cache block must hold whole leaf pages (group_tables rejects it at
-        # startup); the unset mha leaf takes the block as its page instead.
-        reason = (
-            f"--prefix-granularity {server_args.prefix_granularity} is not a "
-            f"multiple of the leaf's {TRTLLM_MHA_PAGE_SIZE}-token pages"
-        )
     if not reason and server_args.numerics != "auto":
         reason = (
             f"--numerics {server_args.numerics}: the TRT-LLM decode splits KV "
@@ -517,7 +467,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="dots3-note",
         architectures=frozenset({"Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN"}),
         configure=configure_dots3_note_attention,
-        default_prefix_granularity=128,
     ),
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
@@ -526,15 +475,6 @@ _ATTENTION_FAMILY_SPECS = (
         ),
         configure=configure_deepseek_v41_attention,
         default_backend="deepseek_v41",
-        default_prefix_granularity=256,
-    ),
-    _AttentionFamilySpec(
-        name="DeepSeek V4",
-        architectures=_DEEPSEEK_V4_ARCHITECTURES,
-        configure=configure_deepseek_v4_attention,
-        # V4 kernels need P to be a multiple of their fixed page; default to
-        # exactly one page rather than restating the number.
-        default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
     ),
     _AttentionFamilySpec(
         name="GLM",
@@ -551,7 +491,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="MiniMax MSA",
         architectures=_MSA_ARCHITECTURES,
         configure=configure_minimax_m3_attention,
-        default_prefix_granularity=128,
     ),
     _AttentionFamilySpec(
         name="Beam",
@@ -639,25 +578,13 @@ def _apply_attention_defaults(
     *,
     name: str,
     default_backend: str | Callable[[ServerArgs], str | None] | None,
-    default_prefix_granularity: int | None,
     is_draft_worker: bool,
 ) -> None:
-    """Fill launch arguments the user left at their defaults.
+    """Fill the attention backend the user left at its default.
 
     A callable ``default_backend`` is asked only when the backend field it
     would fill is unset, and may return None to leave it unset.
     """
-    if default_prefix_granularity is not None:
-        granularity_default = ServerArgs.__dataclass_fields__[
-            "prefix_granularity"
-        ].default
-        if server_args.prefix_granularity == granularity_default:
-            logger.info(
-                f"{name!s} default prefix_granularity="
-                f"{default_prefix_granularity:d}; pass --prefix-granularity "
-                f"with a value other than {granularity_default:d} to keep that value.",
-            )
-            server_args.prefix_granularity = default_prefix_granularity
     if callable(default_backend):
         unset = (
             server_args.drafter_attention_backend
@@ -698,8 +625,6 @@ def _derive_num_attention_layers(
         return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
-    if is_deepseek_v4_nextn(hf_config):
-        num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
         num_attention_layers = num_hidden_layers * 2
     if any(arch in _CACHE_LAYER_VIEW_ARCHITECTURES for arch in architectures):
@@ -812,34 +737,16 @@ class ModelConfig:
         if (
             is_draft_worker
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
-            and resolve_architecture(self.hf_config)
-            in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
+            and resolve_architecture(self.hf_config) == "DeepseekV41ForCausalLMDSpark"
         ):
             if self.spec_block_size is None:
                 raise ValueError(
                     "DSPARK same-checkpoint decoding requires the checkpoint to "
                     "declare dspark_block_size."
                 )
-            dspark_window_size = int(
-                getattr(
-                    self.hf_text_config,
-                    "dspark_window_size",
-                    128,
-                )
-            )
-            if dspark_window_size <= 0:
-                raise ValueError(
-                    "DSPARK captured-context window size must be positive; "
-                    f"got {dspark_window_size}."
-                )
             # V4.1 keeps its windows in the SWA cache group, so a prefix hit
-            # already carries them; V4 rebuilds a drafter-private ring instead.
-            self.dspark_prefix_replay_tokens = (
-                0
-                if resolve_architecture(self.hf_config)
-                == "DeepseekV41ForCausalLMDSpark"
-                else dspark_window_size
-            )
+            # already carries them and nothing needs replaying.
+            self.dspark_prefix_replay_tokens = 0
             dspark_num_stages = count_dspark_stages(
                 model_path,
                 revision=revision,
@@ -983,9 +890,6 @@ class ModelConfig:
                 server_args,
                 name=resolve_architecture(self.hf_config),
                 default_backend=self.model_profile.default_attention_backend,
-                default_prefix_granularity=(
-                    self.model_profile.default_prefix_granularity
-                ),
                 is_draft_worker=bool(is_draft_worker),
             )
             self.model_profile.configure_attention(self, server_args)
@@ -994,7 +898,6 @@ class ModelConfig:
                 server_args,
                 name=attention_family.name,
                 default_backend=attention_family.default_backend,
-                default_prefix_granularity=attention_family.default_prefix_granularity,
                 is_draft_worker=bool(is_draft_worker),
             )
             attention_family.configure(self, server_args)

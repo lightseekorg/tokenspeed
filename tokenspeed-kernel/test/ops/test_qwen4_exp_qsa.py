@@ -53,11 +53,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("query_lengths", [4, [3, 4, 5]])
+@pytest.mark.parametrize(
+    "seq_lengths,query_lengths",
+    [((3, 14, 23), 4), ((3, 14, 23), [3, 4, 5]), ((1, 14, 23), 6)],
+)
 def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
-    device: str, query_lengths: int | list[int]
+    device: str, query_lengths: int | list[int], seq_lengths: tuple[int, ...]
 ) -> None:
-    seq_lens = torch.tensor([3, 14, 23], device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(seq_lengths, device=device, dtype=torch.int32)
     if not isinstance(query_lengths, int):
         query_lengths = torch.tensor(query_lengths, device=device, dtype=torch.int64)
     total_tokens = (
@@ -120,7 +123,7 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
     expected_recent = torch.where(
         (expected_positions >= 0) & (recent_pages > 0), expected_recent, 0
     ).to(torch.int32)
-    expected_blocks = ((expected_positions + 1) // ratio).to(torch.int32)
+    expected_blocks = ((expected_positions + 1).clamp_min(0) // ratio).to(torch.int32)
 
     references = (
         expected_positions,
@@ -464,6 +467,84 @@ def test_qwen4_exp_qsa_fused_draft_staging_reads_old_ring_first(
     )
     for actual, expected in zip(actual_scratch, expected_scratch, strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_qwen4_exp_qsa_draft_group_start_cuda_graph(
+    device: str, enable_pdl: bool
+) -> None:
+    torch.manual_seed(29)
+    ratio, head_dim, rotary_dim = 4, 16, 8
+    keys = torch.randn(4, 1, head_dim, device=device, dtype=torch.bfloat16)
+    logical = torch.arange(4, 8, device=device, dtype=torch.int64)
+    requests = torch.zeros(1, device=device, dtype=torch.int64)
+    recent_locs = (64 + logical).to(torch.int32)
+    qsa_locs = (256 + logical).to(torch.int32)
+    positions = logical[:, None].expand(-1, 3).contiguous()
+    raw = torch.randn(2, ratio, 1, head_dim, device=device, dtype=keys.dtype)
+    raw_positions = torch.zeros(2, 3, device=device, dtype=torch.int64)
+    weight = torch.rand(head_dim, device=device) + 0.5
+    rope = torch.randn(32, rotary_dim, device=device)
+    compressed = torch.zeros(2, 64, 1, head_dim, device=device, dtype=keys.dtype)
+    draft_raw = torch.randn(1, ratio, 1, head_dim, device=device, dtype=keys.dtype)
+    tags = torch.empty(1, ratio, device=device, dtype=torch.int64)
+    draft_positions = torch.empty(1, 3, device=device, dtype=torch.int64)
+
+    def reset():
+        # A round starting at position 1 can stage tags 1/2/3 without writing
+        # the group-start header. Position 4 must not use that header for RoPE.
+        tags.copy_(torch.tensor([[-1, 1, 2, 3]], device=device))
+        draft_positions.fill_(1 << 40)
+        compressed.zero_()
+
+    def forward():
+        for step in range(ratio):
+            qwen4_exp_qsa_compress_and_store(
+                keys[step : step + 1],
+                logical[step : step + 1],
+                requests,
+                recent_locs[step : step + 1],
+                raw,
+                positions[step : step + 1],
+                raw_positions,
+                weight,
+                1e-6,
+                rope,
+                qsa_locs[step : step + 1],
+                compressed,
+                64,
+                ratio,
+                256,
+                draft_raw_cache=draft_raw,
+                draft_logical_positions=tags,
+                draft_position_cache=draft_positions,
+                enable_pdl=enable_pdl,
+                stage_verify_buffers=None,
+                stage_draft=True,
+            )
+
+    reset()
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for _ in range(2):
+        keys.normal_()
+        reset()
+        graph.replay()
+        pooled = keys.float().mean(dim=0).squeeze(0)
+        norm = pooled * torch.rsqrt(pooled.square().mean() + 1e-6) * weight
+        half = rotary_dim // 2
+        cos, sin = rope[4, :half], rope[4, half:]
+        rotated = norm.clone()
+        rotated[:half] = norm[:half] * cos - norm[half:rotary_dim] * sin
+        rotated[half:rotary_dim] = norm[half:rotary_dim] * cos + norm[:half] * sin
+        expected = torch.zeros_like(compressed)
+        expected[1, 1, 0] = rotated.to(keys.dtype)
+        torch.testing.assert_close(compressed, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(draft_raw[0], keys, rtol=0, atol=0)
+        torch.testing.assert_close(tags[0], logical, rtol=0, atol=0)
+        torch.testing.assert_close(draft_positions, positions[:1], rtol=0, atol=0)
 
 
 def test_qwen4_exp_qsa_ignores_negative_draft_scratch_tags(device: str) -> None:

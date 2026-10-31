@@ -252,7 +252,6 @@ class TestAttentionBackendChoices:
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.float8_e4m3fn,
             kv_cache_quant_method="none",
-            prefix_granularity=128,
             is_draft=True,
             speculative_num_draft_tokens=4,
             context_len=65536,
@@ -344,6 +343,85 @@ class TestAttentionBackendChoices:
                 prefix_granularity=128,
             )
 
+    def _pin_config(self, spec, *, kernel_page_size=None):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+
+        return AttnConfig(
+            device="cpu",
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            kernel_page_size=kernel_page_size,
+            context_len=256,
+            max_bs=2,
+            kv_cache_quant_method="none",
+            components=(spec,),
+        )
+
+    def test_fixed_page_leaf_pins_its_page_before_planning(self):
+        from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+        from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+            MLA_PAGE_SIZE,
+        )
+
+        mla = MLAConfig(
+            backend_name="mla",
+            num_attention_heads=1,
+            num_kv_heads=1,
+            head_dim=8,
+            attn_tp_size=1,
+            kv_lora_rank=4,
+            qk_nope_head_dim=2,
+            qk_rope_head_dim=2,
+            v_head_dim=4,
+            scaling=1.0,
+            kv_cache_dim=6,
+        )
+        model_config = SimpleNamespace(attention_arch=AttentionArch.MLA)
+        pinned = registry._pin_fixed_kernel_page(
+            self._pin_config(mla), model_config, "mla"
+        )
+        assert pinned.kernel_page_size == MLA_PAGE_SIZE
+        # The leaf resolves the same page from the pinned value.
+        leaf_cls = registry._get_backend_cls("mla", AttentionArch.MLA)
+        assert leaf_cls.resolve_kernel_page_size(pinned, 4096) == MLA_PAGE_SIZE
+        # An explicit page is kept as given.
+        explicit = self._pin_config(mla, kernel_page_size=32)
+        assert (
+            registry._pin_fixed_kernel_page(explicit, model_config, "mla") is explicit
+        )
+
+    def test_flexible_and_msa_leaves_pin_nothing(self):
+        mha = MHAConfig(
+            backend_name="mha",
+            num_attention_heads=2,
+            num_kv_heads=2,
+            head_dim=8,
+            attn_tp_size=1,
+        )
+        config = self._pin_config(mha)
+        mha_model = SimpleNamespace(attention_arch=AttentionArch.MHA)
+        assert registry._pin_fixed_kernel_page(config, mha_model, "mha") is config
+        msa = MSAConfig(
+            backend_name="msa",
+            num_attention_heads=1,
+            num_kv_heads=1,
+            head_dim=2,
+            attn_tp_size=1,
+            compute_layer_types=("full_attention", "sparse_attention"),
+            sparse_layer_ids=frozenset({1}),
+            index_head_dim=4,
+            index_n_heads=1,
+            index_topk_blocks=1,
+            index_init_blocks=1,
+            index_local_blocks=1,
+        )
+        # MSA builds a dense and a sparse leaf; its recipe adds the sparse page.
+        config = self._pin_config(msa)
+        msa_model = SimpleNamespace(attention_arch=AttentionArch.MSA)
+        assert registry._pin_fixed_kernel_page(config, msa_model, "msa") is config
+
     def test_mha_config_propagates_speculative_settings(self):
         # world_size=2 resolves mapping.attn.tp_size=2; spec_context_pad
         # derives from the speculative widths (3 overshoot spans * 4 tokens).
@@ -356,7 +434,6 @@ class TestAttentionBackendChoices:
             kv_cache_dtype="auto",
             max_num_seqs=8,
             data_parallel_size=None,
-            prefix_granularity=64,
             disaggregation_mode="null",
             kv_cache_quant_method="none",
             speculative_algorithm="EAGLE3",
@@ -507,7 +584,6 @@ class TestCacheBackendIdentity:
             max_model_len=512,
             attention_backend=attention_backend,
             drafter_attention_backend=drafter_attention_backend,
-            prefix_granularity=64,
             load_format="auto",
             speculative_algorithm=None,
             world_size=1,
@@ -699,7 +775,6 @@ class TestPagedRouterNameResolution:
             device="cpu",
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
-            prefix_granularity=64,
             kernel_page_size=64,
             context_len=256,
             max_bs=2,

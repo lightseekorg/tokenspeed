@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import torch
@@ -93,6 +94,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -141,6 +143,7 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = get_colorful_logger(__name__)
 
@@ -176,6 +179,33 @@ def _prepare_mla_kv_b_proj_weights(
         bind_or_copy(self_attn.w_kc, w_kc),
         bind_or_copy(self_attn.w_vc, w_vc),
     )
+
+
+def absorb_mla_kv_b_proj(self_attn) -> None:
+    """Derive ``self_attn.w_kc``/``w_vc`` from its ``kv_b_proj``, dequantizing block FP8 first.
+
+    Args:
+        self_attn: An MLA attention module owning ``kv_b_proj`` and the
+            ``qk_nope_head_dim``/``v_head_dim`` split.
+    """
+    kv_b_proj = self_attn.kv_b_proj
+    w = kv_b_proj.weight
+    if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        method = kv_b_proj.quant_method
+        # The absorbed pair carries no scale, so only float block scales are taken.
+        if not (
+            isinstance(method, Fp8LinearMethod)
+            and method.block_quant
+            and kv_b_proj.weight_scale_inv.is_floating_point()
+        ):
+            raise NotImplementedError(
+                f"MLA weight absorption needs a block-FP8 kv_b_proj with float "
+                f"scales, got {type(method).__name__}"
+            )
+        w = block_dequant(
+            w, kv_b_proj.weight_scale_inv, method.quant_config.weight_block_size
+        ).to(kv_b_proj.orig_dtype)
+    self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
 
 
 def _reject_query_shard(ctx: ForwardContext, where: str) -> None:
@@ -697,11 +727,16 @@ class DeepseekV3AttentionMLA(nn.Module):
             if self.o_proj_batch_invariant:
                 widths.append(hidden_size)
             for channels in widths:
-                prepare_shard_exchange(
-                    self.head_tp_group,
-                    channels,
-                    max_rows,
-                    torch.get_default_dtype(),
+                # Peer pointers and Lamport epochs belong to communication,
+                # not model weights. Discarding either breaks captured exchanges.
+                initialize_communication(
+                    partial(
+                        prepare_shard_exchange,
+                        self.head_tp_group,
+                        channels,
+                        max_rows,
+                        torch.get_default_dtype(),
+                    )
                 )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
@@ -2101,6 +2136,7 @@ class DeepseekV3Model(nn.Module):
 
 class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
+    supports_aux_capture = True
 
     def __init__(
         self,
@@ -2148,6 +2184,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         return self._routed_experts_weights_of_layer.value
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+        self.require_aux_capture()
         # layer_ids are 0-indexed from the external API; +1 because a layer
         # captures the residual entering it, so index i captures layer i-1's output.
         if layer_ids is None:
@@ -2157,6 +2194,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.require_aux_capture()
         # DFlash checkpoints name 0-indexed target layer outputs. A layer
         # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
@@ -2346,31 +2384,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
     def post_load_weights(self):
         """Derive the absorbed MLA weights; re-runs write into the same storage."""
         for layer_id in range(self.config.num_hidden_layers):
-            self_attn = self.model.layers[layer_id].self_attn
-            if hasattr(
-                self.quant_config, "weight_block_size"
-            ) and self_attn.kv_b_proj.weight.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
-                weight_block_size = self.quant_config.weight_block_size
-                if weight_block_size is not None:
-                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
-                        raise RuntimeError(
-                            "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
-                        )
-                    dtype = torch.get_default_dtype()
-                    w = block_dequant(
-                        self_attn.kv_b_proj.weight,
-                        self_attn.kv_b_proj.weight_scale_inv,
-                        weight_block_size,
-                    ).to(dtype)
-            else:
-                w = self_attn.kv_b_proj.weight
-
-            self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                w, self_attn
-            )
+            absorb_mla_kv_b_proj(self.model.layers[layer_id].self_attn)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -2841,31 +2855,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         return super().load_weights(remapped)
 
     def post_load_weights(self):
-        self_attn = self.model.midlayer.self_attn
-        if (
-            self.quant_config is not None
-            and hasattr(self.quant_config, "weight_block_size")
-            and self_attn.kv_b_proj.weight.dtype
-            in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-        ):
-            weight_block_size = self.quant_config.weight_block_size
-            if weight_block_size is not None:
-                if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
-                    raise RuntimeError(
-                        "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
-                    )
-                dtype = torch.get_default_dtype()
-                w = block_dequant(
-                    self_attn.kv_b_proj.weight,
-                    self_attn.kv_b_proj.weight_scale_inv,
-                    weight_block_size,
-                ).to(dtype)
-            else:
-                w = self_attn.kv_b_proj.weight
-        else:
-            w = self_attn.kv_b_proj.weight
-
-        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
+        absorb_mla_kv_b_proj(self.model.midlayer.self_attn)
 
     def get_hot_token_id(self):
         return self.hot_token_id

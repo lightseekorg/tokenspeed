@@ -1283,6 +1283,53 @@ def test_qrita_top_k_top_p_row_count():
             run(rows)
 
 
+def test_top_k_top_p_gumbel_request_count_and_top_k():
+    from tokenspeed_kernel.ops.sampling.triton import topk_topp
+
+    # The serving verify layout: four rows per request, 1024-token blocks and
+    # the CUDA-graph pad of 128. Each row's top_k is read from the pool.
+    vocab, n, block_size, top_k_pad, pools = 5000, 4, 1024, 128, 8
+    num_candidates = -(-vocab // block_size) * top_k_pad
+    greedy = torch.ones(pools, dtype=torch.int32, device=DEVICE)
+    mixed = torch.tensor([1, 20, 128, 1, 7, 1, 64, 1], dtype=torch.int32, device=DEVICE)
+
+    def run(requests, top_k_pool):
+        rows = requests * n
+        logits = torch.randn(rows, vocab, device=DEVICE) * 2.0
+        req_pool_indices = torch.arange(requests, dtype=torch.int32, device=DEVICE)
+        req_pool_indices %= pools
+        got = topk_topp.gumbel_sample_top_k_top_p_from_pools(
+            logits,
+            req_pool_indices,
+            torch.ones(pools, device=DEVICE),
+            top_k_pool,
+            torch.ones(pools, device=DEVICE),
+            torch.arange(pools, dtype=torch.int64, device=DEVICE),
+            torch.zeros(pools, dtype=torch.int64, device=DEVICE),
+            torch.empty(rows, num_candidates, dtype=torch.int32, device=DEVICE),
+            torch.empty(rows, num_candidates, dtype=torch.float32, device=DEVICE),
+            torch.empty(rows, dtype=torch.int32, device=DEVICE),
+            block_size=block_size,
+            top_k_pad=top_k_pad,
+            num_tokens_per_req=n,
+        )
+        # Top-k of one leaves only the argmax to sample.
+        greedy_rows = (top_k_pool[req_pool_indices.long()] == 1).repeat_interleave(n)
+        torch.testing.assert_close(
+            got[greedy_rows], logits.argmax(-1).int()[greedy_rows], rtol=0, atol=0
+        )
+
+    for requests in (1, 16, 3):
+        run(requests, greedy)
+    with assert_no_triton_compile(
+        topk_topp._top_k_top_p_candidates_stage1_kernel,
+        topk_topp._top_k_top_p_gumbel_stage2_kernel,
+    ):
+        for requests in (2, 5, 8, 9, 16, 33):
+            for top_k_pool in (greedy, mixed):
+                run(requests, top_k_pool)
+
+
 def test_marlin_deepep_pack_global_token_count():
     import tokenspeed_kernel.ops.moe._deep_ep.layout as deepep_layout
 

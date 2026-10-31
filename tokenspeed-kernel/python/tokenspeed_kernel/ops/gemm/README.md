@@ -1,5 +1,10 @@
 # GEMM weight preparation
 
+The optional `trtllm_kernel` extension is required for TRT-LLM's fused-A
+projection and cuBLASLt NVFP4 GEMM provider. Without it, the NVFP4 leaf is not
+registered and a direct fused-A call reports the missing package; importing
+other GEMM providers does not require the extension.
+
 ## Blackwell block-FP8 automatic selection
 
 For standard FP32-scaled 128x128 block-FP8 GEMM on SM10x, automatic selection
@@ -91,21 +96,6 @@ SM100/103 W4A16, and fused NVFP4 GEMMs cover the shared token budget, including
 larger observed inputs and the enclosing native bucket. Native mappers,
 constraints, and caches are preserved. Explicit buckets and disabled profiling
 retain their semantics; small-M BF16 keeps its existing bound.
-
-## DeepSeek V4 grouped output projection
-
-The grouped-projection plan describes the projection geometry and source formats.
-
-After loading and sharding, the operation selects preprocessing using the source
-formats and operation traits. The layer runs that preprocessing through the
-weight broker, which installs the transformed tensors and records their storage
-layout. When no transformation is needed, the layer enrolls canonical storage.
-
-Execution and warmup select kernels using the supplied tensors' recorded layouts,
-formats, and operation traits. Participating layers require known storage layouts;
-raw canonical callers can explicitly allow unknown storage. This policy is
-independent of kernel overrides. Python validation runs during graph capture,
-not device-side replay.
 
 ## Hopper block-FP8 DeepGEMM
 

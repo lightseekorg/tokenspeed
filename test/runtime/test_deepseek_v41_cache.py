@@ -119,7 +119,6 @@ def _config(device):
         kv_cache_dtype=torch.uint8,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=256,
         kernel_page_size=64,
         context_len=512,
         max_bs=2,
@@ -986,7 +985,6 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         deepseek_v41_attention_query_parallel_size=1,
         deepseek_v41_indexer_query_parallel_size=1,
         data_parallel_size=2,
-        prefix_granularity=128,
         max_num_seqs=4,
         chunked_prefill_size=3,
         max_total_tokens=1024,
@@ -1320,10 +1318,6 @@ def test_owner_topology_and_reject_invalid_recipes():
     recipe.draft_attn_config = recipe.attn_config
     recipe.draft_model_config = SimpleNamespace(num_attention_layers=3)
     with pytest.raises(NotImplementedError, match="target layers only"):
-        recipe.groups()
-    recipe = _recipe("cpu")
-    recipe.attn_config = replace(recipe.attn_config, prefix_granularity=64)
-    with pytest.raises(ValueError, match="128"):
         recipe.groups()
 
 

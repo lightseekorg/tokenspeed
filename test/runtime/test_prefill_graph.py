@@ -526,7 +526,7 @@ class TestDummyGroupTablesTest:
         assert ((8192 - 1) // 128) < (tables["sliding_attention"].shape[1])
 
     def test_width_follows_each_groups_own_geometry(self):
-        # DeepSeek-V4 shape: sibling groups with very different grains. Each
+        # DeepSeek V4.1 shape: sibling groups with very different grains. Each
         # gets ceil(extent / its own granularity) -- one rule, no width flag.
         backend = _backend()
         pool = _fake_pool(

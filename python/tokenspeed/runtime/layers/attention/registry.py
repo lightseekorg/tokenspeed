@@ -643,6 +643,39 @@ def create_paged_router(
     )
 
 
+def _pin_fixed_kernel_page(
+    config: AttnConfig,
+    model_config: ModelConfig,
+    backend_name: str | None,
+) -> AttnConfig:
+    """Pin a fixed-page leaf's kernel page on an ordinary side's config.
+
+    The ordinary recipe makes one block span its prefix granularity and sizes
+    that span to hold whole kernel pages (``OrdinaryRecipe.prefix_granularity``),
+    so the page a leaf fixes must be visible before the plan. The leaf then
+    resolves the same page from the pinned value. A flexible leaf runs at the
+    block span and pins nothing; MSA builds a dense and a sparse leaf, and its
+    recipe adds the sparse page itself.
+    """
+    from tokenspeed.runtime.layers.attention.backends.paged.base import (
+        PagedAttentionBackend,
+    )
+
+    if config.kernel_page_size is not None or isinstance(
+        config.component(SoftmaxAttnConfig), MSAConfig
+    ):
+        return config
+    leaf_cls = _get_backend_cls(backend_name, model_config.attention_arch)
+    if (
+        not issubclass(leaf_cls, PagedAttentionBackend)
+        or leaf_cls.default_kernel_page_size is None
+    ):
+        return config
+    return dataclasses.replace(
+        config, kernel_page_size=int(leaf_cls.default_kernel_page_size)
+    )
+
+
 def _validate_lcm_page_size(
     config: AttnConfig,
     *,
@@ -1307,6 +1340,14 @@ def create_attn_components(
             world_group=server_args.mapping.world_group,
         )
     cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)
+    if cache_family in _ORDINARY_CACHE_FAMILIES:
+        config = _pin_fixed_kernel_page(
+            config, model_config, target_full_attn_backend_name
+        )
+        if draft_attn_config is not None:
+            draft_attn_config = _pin_fixed_kernel_page(
+                draft_attn_config, draft_model_config, draft_full_attn_backend_name
+            )
     recipe = cache_recipe(
         cache_family,
         server_args=server_args,

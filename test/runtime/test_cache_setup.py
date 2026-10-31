@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+    cache_recipe,
     prepare_cache_setup,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -167,7 +168,6 @@ def _model_wide_kwargs(**overrides) -> dict:
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
@@ -258,6 +258,18 @@ def _mla_config() -> AttnConfig:
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
+def _mxfp8_mha_config() -> AttnConfig:
+    config = _mha_config()
+    # MXFP8 scales cover 32 head_dim elements.
+    spec = replace(config.component(MHAConfig), head_dim=32)
+    return replace(
+        config,
+        components=(spec,),
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_mxfp8=True,
+    )
+
+
 def _msa_config() -> AttnConfig:
     spec = MSAConfig(
         backend_name="msa",
@@ -302,7 +314,6 @@ class _SyntheticHybridRecipe(CacheRecipe):
             server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
             model_config=None,
             attn_config=_ns_config(
-                prefix_granularity=4,
                 pd_disaggregation_enabled=False,
                 spec=SimpleNamespace(sliding_window_tokens=windows),
             ),
@@ -318,6 +329,10 @@ class _SyntheticHybridRecipe(CacheRecipe):
         self._group_ids = tuple(group_ids)
         self._num_draft_layers = num_draft_layers
         self._extra_state_group = extra_state_group
+
+    @property
+    def prefix_granularity(self):
+        return 4
 
     @property
     def layer_types(self):
@@ -416,7 +431,6 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     )
     server_args = SimpleNamespace(
         kv_offload_config=None,
-        prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
         speculative_eagle_topk=1,
@@ -436,8 +450,6 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         overlap_schedule_depth=0,
     )
 
-    assert server_args.prefix_granularity == 64
-    assert attn_config.prefix_granularity == 64
     assert attn_config.kernel_page_size == 64
     assert setup.spec.memory_plan.prefix_granularity == 128
     assert setup.num_draft_layers == 0
@@ -773,6 +785,48 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
     pool = _pool_over_new_arena(setup.spec, attn_config, num_layers=2)
     assert type(pool) is MLATokenToKVPool
     assert pool.arena.runtime_contract.token_capacity == setup.spec.token_capacity
+
+
+@pytest.mark.parametrize(
+    ("family", "target_config", "target_overrides", "draft_overrides", "expected"),
+    (
+        # A 64-token fixed page, or a flexible leaf: the 64-token floor.
+        ("mha", _mha_config, {}, None, 64),
+        ("mha", _mha_config, {"kernel_page_size": None}, None, 64),
+        # A wider fixed page pinned on either side widens the grain.
+        ("mla", _mla_config, {"kernel_page_size": 128}, None, 128),
+        ("mla", _mla_config, {}, {"kernel_page_size": 128}, 128),
+        # The MSA sparse page and the MXFP8 scale tile are 128 tokens.
+        ("msa", _msa_config, {}, None, 128),
+        ("mha", _mxfp8_mha_config, {}, None, 128),
+    ),
+)
+def test_ordinary_prefix_granularity_holds_whole_kernel_pages(
+    family, target_config, target_overrides, draft_overrides, expected
+) -> None:
+    draft_attn_config = (
+        None if draft_overrides is None else replace(_mha_config(), **draft_overrides)
+    )
+    recipe = cache_recipe(
+        family,
+        server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
+        model_config=SimpleNamespace(num_attention_layers=2),
+        attn_config=replace(target_config(), **target_overrides),
+        draft_model_config=(
+            None
+            if draft_attn_config is None
+            else SimpleNamespace(num_attention_layers=1)
+        ),
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=65_536,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+    assert recipe.prefix_granularity == expected
+    # One block spans the grain: every history group's span equals it.
+    assert {spec.block_granularity for spec, _ in recipe.groups()} == {expected}
 
 
 @pytest.mark.parametrize(
@@ -1147,9 +1201,7 @@ def _qwen_gdn_setup(
         )
     attn_config = AttnConfig(
         components=components,
-        **_model_wide_kwargs(
-            kv_cache_dtype=target_kv_dtype, prefix_granularity=128, kernel_page_size=128
-        ),
+        **_model_wide_kwargs(kv_cache_dtype=target_kv_dtype, kernel_page_size=128),
     )
     draft_attn_config = None
     if draft_kv_heads is not None:
@@ -1456,6 +1508,7 @@ def _fake_around_the_budget(monkeypatch, free):
     monkeypatch.setattr(
         registry, "_resolve_heterogeneous_draft_family", lambda *a, **k: None
     )
+    monkeypatch.setattr(registry, "_pin_fixed_kernel_page", lambda config, *a: config)
 
     def prepare(family, *, cache_budget_bytes, probe_batch_rows, **kwargs):
         raise _Sized(cache_budget_bytes, probe_batch_rows)

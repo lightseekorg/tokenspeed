@@ -281,11 +281,12 @@ def resolve_dspark_prefix_replay_tokens(
 ) -> int:
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
-    DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``; V4.1 advertises zero because its windows are cache
-    resident. Same-checkpoint DSpark configurations without that capability
-    remain fail-closed. External generic DSpark configurations keep their
-    existing scheduler behavior until they advertise an equivalent contract.
+    A same-checkpoint DSpark draft advertises the requirement through its
+    draft ``ModelConfig``; DeepSeek V4.1 advertises zero because its windows
+    are cache resident. Same-checkpoint DSpark configurations without that
+    capability remain fail-closed. External generic DSpark configurations
+    keep their existing scheduler behavior until they advertise an
+    equivalent contract.
     """
 
     if speculative_algorithm != "DSPARK":

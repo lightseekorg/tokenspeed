@@ -489,13 +489,6 @@ def load_autotune_cache(
         loaded = all(rank_states)
     if loaded:
         logger.info(f"loaded FlashInfer autotune cache from {path}")
-        prefix = "('trtllm_cutedsl_fp8_blockscale', 'BlockwiseGemmRunner', "
-        if any(key.startswith(prefix) for key in tuner._file_configs):
-            from tokenspeed_kernel.thirdparty.trtllm_blockwise.runner import (
-                prepare_cached_tactics,
-            )
-
-            prepare_cached_tactics(tuner)
     else:
         # Partial loads must not let ranks enter different timing collectives.
         tuner.clear_cache()

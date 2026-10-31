@@ -24,11 +24,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import io
 import json
 import logging
 import os
-import pickle
 import random
 import re
 import resource
@@ -38,7 +36,6 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from functools import lru_cache
-from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -49,11 +46,9 @@ from typing import (
 
 import numpy as np
 import psutil
-import pybase64
 import torch
 import torch.distributed
 import torch.distributed as dist
-import zmq
 from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
@@ -345,97 +340,6 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
-def broadcast_pyobj(
-    data: list[Any],
-    rank: int,
-    dist_group: torch.distributed.ProcessGroup | None = None,
-    src: int = 0,
-    force_cpu_device: bool = True,
-):
-    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
-    The `rank` here refer to the source rank on global process group (regardless
-    of dist_group argument).
-    """
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
-    )
-
-    if rank == src:
-        if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-        else:
-            serialized_data = pickle.dumps(data)
-            size = len(serialized_data)
-
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(device)
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
-
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-            dist.broadcast(tensor_data, src=src, group=dist_group)
-        return data
-    else:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
-        size = tensor_size.item()
-
-        if size == 0:
-            return []
-
-        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
-
-        serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
-        return data
-
-
-step_counter = 0
-
-
-def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-) -> zmq.Socket:
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type == zmq.DEALER:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-    if bind:
-        socket.bind(endpoint)
-    else:
-        socket.connect(endpoint)
-
-    return socket
-
-
 # Temporary directory for prometheus multiprocess mode
 # Cleaned up automatically when this object is garbage collected
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -615,48 +519,6 @@ def dataclass_to_string_truncated(
         return str(data)
 
 
-class MultiprocessingSerializer:
-    @staticmethod
-    def serialize(obj, output_str: bool = False):
-        """
-        Serialize a Python object using ForkingPickler.
-
-        Args:
-            obj: The object to serialize.
-            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
-
-        Returns:
-            bytes or str: The serialized object.
-        """
-        buf = io.BytesIO()
-        ForkingPickler(buf).dump(obj)
-        buf.seek(0)
-        output = buf.read()
-
-        if output_str:
-            # Convert bytes to base64-encoded string
-            output = pybase64.b64encode(output).decode("utf-8")
-
-        return output
-
-    @staticmethod
-    def deserialize(data):
-        """
-        Deserialize a previously serialized object.
-
-        Args:
-            data (bytes or str): The serialized data, optionally base64-encoded.
-
-        Returns:
-            The deserialized Python object.
-        """
-        if isinstance(data, str):
-            # Decode base64 string to bytes
-            data = pybase64.b64decode(data, validate=True)
-
-        return ForkingPickler.loads(data)
-
-
 def nullable_str(val: str):
     if not val or val == "None":
         return None
@@ -740,8 +602,6 @@ def add_prefix(name: str, prefix: str) -> str:
 
 
 def log_info_on_rank0(logger, msg):
-    import torch.distributed as dist
-
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(msg)
 
