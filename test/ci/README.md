@@ -49,11 +49,11 @@ each stage run in parallel. The workflow treats a stage with no matching tasks
 as satisfied.
 
 On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
-`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication, and
-CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
-`tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
-once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
-task.
+`tokenspeed-kernel/test/ops/` and `tokenspeed-kernel/test/nvidia/thirdparty/`,
+keeping the numerics suite in a separate process. `ut-tokenspeed-kernel-part-ii`
+runs those two directories, keeping the TRT-LLM communication and CUDA suites in
+separate processes. Together the two tasks cover the kernel suite once. AMD
+runners run the whole suite in the single `ut-tokenspeed-kernel` task.
 
 Conversely, AMD runners split the `runtime-1gpu` suite across
 `ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
