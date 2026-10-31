@@ -125,7 +125,7 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
 
     group = DeviceGroup()
     window = Window(torch.ones(16))
-    resources = DSAResources(window, {}, {}, window.release)
+    resources = DSAResources(window, {}, window.release)
     monkeypatch.setattr(pg, "get_dedicated_device_group", lambda *args: group)
     monkeypatch.setattr(pg, "init_process_group", lambda *args, **kwargs: None)
     monkeypatch.setattr(pg, "get_process_group", lambda *args: group)

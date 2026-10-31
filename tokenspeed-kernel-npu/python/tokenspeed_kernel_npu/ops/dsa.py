@@ -274,7 +274,6 @@ class AscendDSAKernels:
                 "SparseFlashAttentionDecode operators"
             )
         self._full_scan_chunks = {}
-        self._identity_rotary = {}
 
     @staticmethod
     def prepare_prefill(
@@ -453,33 +452,53 @@ class AscendDSAKernels:
         finally:
             torch.npu.config.allow_internal_format = False
 
-    def fused_prolog(self, *args, rotary=None):
-        """Fused projections/store, optionally GPT-J RoPE (MLA=1, Indexer=2).
-
-        ``rotary`` carries int64 positions, an FP32 [P,64] cos/sin table,
-        and the explicit bit mask. Omitting it leaves projections unrotated.
-        """
-        if rotary is None:
-            x = args[0]
-            key = (x.device, x.shape[0])
-            if key not in self._identity_rotary:
-                self._identity_rotary[key] = (
-                    torch.zeros(x.shape[0], dtype=torch.int64, device=x.device),
-                    torch.zeros((1, 64), dtype=torch.float32, device=x.device),
-                    0,
-                )
-            rotary = self._identity_rotary[key]
-        return torch.ops.custom.npu_dsa_prolog_fused(*args, *rotary)
-
-    def initialize_prolog_window(self, rank, rendezvous, *, rank_size):
-        name = "dsa_prolog_fused"
-        torch.ops.custom.initialize_group_first_rdma(
-            name, rank, rank_size, rendezvous, 32 << 20
+    def fused_prolog(
+        self,
+        x,
+        down,
+        gamma_q,
+        gamma_kv,
+        gamma_index,
+        score_weight,
+        qb,
+        uk,
+        window,
+        kv_cache,
+        index_cache,
+        slots,
+        *,
+        eps_q,
+        eps_kv,
+        eps_index,
+        positions,
+        cos_sin,
+        rotary_mode,
+        out,
+    ):
+        """Fused projections and cache writes with operator-owned workspace."""
+        return torch.ops.custom.npu_dsa_prolog_fused.out(
+            x,
+            down,
+            gamma_q,
+            gamma_kv,
+            gamma_index,
+            score_weight,
+            qb,
+            uk,
+            window,
+            kv_cache,
+            index_cache,
+            slots,
+            eps_q,
+            eps_kv,
+            eps_index,
+            positions,
+            cos_sin,
+            rotary_mode,
+            query=out[0],
+            index_query=out[1],
+            score=out[2],
         )
-        return torch.ops.custom.dsa_prolog_window(name)
-
-    def finalize_prolog_window(self):
-        torch.ops.custom.finalize_group_first_rdma("dsa_prolog_fused")
 
     def select_local(self, indices, positions, rank):
         if self._select_local is None:
@@ -502,11 +521,9 @@ class AscendDSAKernels:
             indices, values, group=group, rank_size=rank_size, sorted_input=True
         )
 
-    def merge_lse_direct(
-        self, output, maximum, total, peer_inputs, *, group, rank_size, setup_mode
-    ):
+    def merge_lse_direct(self, output, maximum, total, *, group, rank_size):
         return torch.ops.custom.npu_dsa_merge_lse_direct(
-            output, maximum, total, peer_inputs, group, rank_size, setup_mode
+            output, maximum, total, group, rank_size
         )
 
     def output_projection_partial(self, output, w_vc, w_o):
@@ -538,17 +555,14 @@ class AscendDSAKernels:
         statistics = torch.empty(
             (1, rows, num_heads), dtype=torch.float32, device="meta"
         )
-        peers = torch.empty(rank_size, dtype=torch.int64, device="meta")
         try:
             self.merge_topk_fused(indices, scores, group=group, rank_size=rank_size)
             self.merge_lse_direct(
                 output,
                 statistics,
                 statistics,
-                peers,
                 group=group,
                 rank_size=rank_size,
-                setup_mode=0,
             )
         except NotImplementedError as exc:
             raise RuntimeError(
