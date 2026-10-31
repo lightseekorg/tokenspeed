@@ -27,6 +27,9 @@ import torch
 
 _compiled = {}
 _compile_lock = threading.Lock()
+# (device, CTAs per cluster) -> occupancy. HardwareInfo compiles and launches a
+# probe kernel on every query.
+_max_active_clusters = {}
 
 
 def _compile_arguments(a, b, sa, sb, out):
@@ -83,27 +86,37 @@ def _compile(a, b, sa, sb, out, tactic):
 
     two, tile, cluster = tactic
     kernel = Sm100BlockwiseGemmKernel(cutlass.Float32, two, tile, cluster)
-    active = utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
+    occupancy_key = (a.device.index, cluster[0] * cluster[1])
+    if occupancy_key not in _max_active_clusters:
+        _max_active_clusters[occupancy_key] = (
+            utils.HardwareInfo().get_max_active_clusters(occupancy_key[1])
+        )
     return cute.compile(
         kernel.wrapper,
         *_compile_arguments(a, b, sa, sb, out),
-        active,
+        _max_active_clusters[occupancy_key],
         make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
 
-def _run(a, b, a_scales, b_scales, out, tactic):
-    """Launch a chosen tactic, or the existing row-count rule for tactic -1."""
+def _default_tactic(m):
+    """The row-count rule that tactic -1 launches."""
+    tile = 64 if m <= 64 else (128 if m <= 128 else 256)
+    return (tile == 256, (tile, 128), (2 if tile == 256 else 1, 1))
+
+
+# Every tactic the row-count rule can choose.
+DEFAULT_TACTICS = frozenset(_default_tactic(m) for m in (64, 128, 256))
+
+
+def _scales(a_scales, b_scales):
     # A scales are logically [M,K/128], but this kernel reads MN-major.
-    sa = a_scales.T.contiguous()
-    sb = b_scales.contiguous()
-    m = a.shape[0]
-    if m == 0:
-        return out
-    if tactic == -1:
-        tile = 64 if m <= 64 else (128 if m <= 128 else 256)
-        tactic = (tile == 256, (tile, 128), (2 if tile == 256 else 1, 1))
+    return a_scales.T.contiguous(), b_scales.contiguous()
+
+
+def _compiled_tactic(a, b, sa, sb, out, tactic):
+    """Compile a tactic on first use; M, N and K stay runtime arguments."""
     key = (a.device.index, tactic)
     if key not in _compiled:
         with torch.cuda.device(a.device), _compile_lock:
@@ -113,12 +126,37 @@ def _run(a, b, a_scales, b_scales, out, tactic):
                         "Warm up TRT-LLM CuTe-DSL before CUDA graph capture"
                     )
                 _compiled[key] = _compile(a, b, sa, sb, out, tactic)
+    return _compiled[key]
+
+
+def prepare(a, b, a_scales, b_scales, out, tactics):
+    """Compile tactics without launching them, so serving never compiles one.
+
+    Args:
+        a, b, a_scales, b_scales, out: Inputs of a launch, as for ``_run``;
+            they provide dtypes and layouts. ``M`` must be positive.
+        tactics: Tactics to compile, excluding -1.
+    """
+    sa, sb = _scales(a_scales, b_scales)
+    for tactic in tactics:
+        _compiled_tactic(a, b, sa, sb, out, tactic)
+
+
+def _run(a, b, a_scales, b_scales, out, tactic):
+    """Launch a chosen tactic, or the existing row-count rule for tactic -1."""
+    sa, sb = _scales(a_scales, b_scales)
+    m = a.shape[0]
+    if m == 0:
+        return out
+    if tactic == -1:
+        tactic = _default_tactic(m)
+    compiled = _compiled_tactic(a, b, sa, sb, out, tactic)
     from cuda.bindings.driver import CUstream
 
     # Query the stream at every launch, including capture on an auxiliary
     # stream. Read the raw handle without constructing a temporary Torch Stream.
     # Never bind the stream or pointers used during compilation.
-    _compiled[key](
+    compiled(
         *_arguments(a, b, sa, sb, out),
         CUstream(torch._C._cuda_getCurrentRawStream(a.device.index)),
     )
