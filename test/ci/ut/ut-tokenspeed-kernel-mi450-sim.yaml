@@ -42,13 +42,14 @@ env:
     tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache[q1-gluon-bf16]
     tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache[q1-gluon-fp8-d128]
     # MLA decode: 16-head by 64-KV blocks, projected value against the split
-    # path, and the 12-head split query projection; BF16 extend. Causal query
-    # blocks for verify: 32-row and partial multi-block tiles, one request at
-    # the 128-split cap and the split count per batch, the projected value, and
-    # the support gate.
+    # path, and the 12-head split query projection; BF16 and FP8 extend.
+    # Causal query blocks for verify: 32-row and partial multi-block tiles, one
+    # request at the 128-split cap and the split count per batch, the projected
+    # value, and the support gate.
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-bh16bn64]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache_projected_value_matches_split[1]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[bf16]
+    tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[fp8-e4m3]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_split_output[12]
     tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[rows32]
     tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[partial-block]
@@ -92,10 +93,12 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_select.py::test_select_matches_torch[8-100-512-None]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_select.py::test_select_boundary_ties_pick_an_equivalent_subset
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_select.py::test_select_signed_zero_boundary_ties_keep_lowest_columns
-    # DeepSeek V4.1 fused selected attention, with and without the global cache.
+    # DeepSeek V4.1 fused selected attention, with and without the global cache,
+    # and split decode over padded heads with the output RoPE fused.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_gluon_is_selected_on_supported_amd
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_selected_attention_matches_gather_softmax[True-16]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_selected_attention_matches_gather_softmax[False-7]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_selected_attention_decode_shapes[True-6-16-64]
     # GLM-5.2 DSA: FP8 top-k decode and prefill, rank-128 BF16 dense cache.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_trivial_q2_2048]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_short_512]
@@ -170,11 +173,16 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/test_attn_res_gfx1250.py::test_attn_res_rejects_weights_it_cannot_read_as_pairs[strided]
     # Kimi K3 MoE front end: reduced small-batch and whole-reduction
     # latent-input decode pipelines, sigmoid-bias routing with and without
-    # renormalization, fused softmax top-k.
+    # renormalization in packed Triton and, past 512 rows, the Gluon route
+    # with lowest-id ties, fused softmax top-k.
     tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_small_batch_pipeline[sim]
     tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_nosplit_pipeline[sim]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[1.0-False]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[2.5-True]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_kimi3_rows_past_packed_triton_select_gluon_route
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_kimi3_prefill_route_matches_fp32_reference[True-2.5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_kimi3_prefill_route_matches_fp32_reference[False-1.0]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_kimi3_prefill_route_ties_choose_lowest_ids
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[7-16-3-dtype3-False]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_public_entry_point_is_cuda_graph_capturable
@@ -238,17 +246,24 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_selects_gluon_for_last_dim_128
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/transform.hadamard_transform/gluon_hadamard_transform_128_gfx1250/fp32-strided@mi450]
     # DeepSeek V4.1 BF16 GEMM with FP32 or BF16 output: M=6 decode tiles,
-    # mid-M split-K with BF16 rounding of the reduced sum, graph replay, and
-    # the dsv4_linear_fp32 and single-group grouped projection entries.
+    # mid-M split-K with BF16 rounding of the reduced sum, graph replay, the
+    # dsv4_linear_fp32 and single-group grouped projection entries, two groups
+    # in one grid, and the split-K reduction emitting group-32 FP8 at small
+    # and mid M.
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_fp32_matches_reference[384-6]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_bf16_split_k_rounds_reduced_sum[2]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_fp32_cuda_graph_replay[6]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_dsv4_linear_fp32_dispatches_to_gfx1250_kernel[6]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_grouped_bf16_projection_single_group_uses_gfx1250_kernel[6]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_grouped_bf16_projection_two_groups_match_reference[5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_grouped_bf16_projection_fp8_matches_unfused[5-2]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_grouped_bf16_projection_fp8_matches_unfused[40-2]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/gemm.dsv4_linear_fp32/gluon_dsv4_linear_fp32_gfx1250@mi450]
     # DeepSeek V4.1 FP8 group-32 UE8M0 quantizer, bit-exact against Triton on
     # both sides of the launch-shape switch, edge values and strided rows; mHC
-    # mixes on 64- and 128-wide K tiles.
+    # mixes on 64- and 128-wide K tiles and the RMSNorm apply fused with that
+    # quantizer, with selection of these and the pre-mix, which composes the
+    # mixes kernels.
     tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_quantize_matches_triton[5120-96]
     tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_quantize_matches_triton[576-8192]
     tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_quantize_edge_values_match_triton[dtype0]
@@ -257,6 +272,9 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_mixes_matches_reference[5120-1]
     tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_mixes_matches_reference[5120-320]
     tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_mixes_selects_gfx1250_kernel
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_pre_selects_gfx1250_kernel
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_apply_pre_quantize_fp8_matches_unfused[5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_apply_pre_fp8_selects_gfx1250_kernel
     # MXFP8 and FP8 block-scale decode GEMV: UE8M0 and FP32 scales, split-K,
     # native WMMA pipeline, fused TDM, public mm selection. MXFP8 above 16
     # rows: short-K, split-K small-M with graph replay, split-2 and
