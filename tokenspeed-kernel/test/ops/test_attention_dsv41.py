@@ -1025,8 +1025,14 @@ def test_compressor_pool_token_count_and_capacity_do_not_recompile(device):
     with assert_no_triton_compile(implementation._compressor_pool):
         for count, pages in ((48, 3), (97, 16), (130, 17), (1483, 32), (4096, 33)):
             run(count, pages)
-        # The last page starts at 2**31 FP32 elements, beyond int32 offsets.
-        run(32, (1 << 20) + 1)
+
+    # The last page starts at 2**31 FP32 elements, beyond int32 offsets.
+    pages = (1 << 20) + 1
+    required_bytes = pages * 2 * 2 * 512 * torch.float32.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires 8 GiB of free device memory")
+    with assert_no_triton_compile(implementation._compressor_pool):
+        run(32, pages)
 
 
 def _native_available():
