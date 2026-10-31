@@ -40,6 +40,9 @@ that stride over the same tile index. A tile's last K step issues the next
 tile's first loads, hiding the epilogue and the next tile lookup behind them.
 Its accumulator holds sums in units of the current K block's scale and is
 rescaled at each step, so one accumulator stays live and two programs fit.
+Persistent programs, and the largest batches' gate/up programs, are renumbered
+so each XCD runs a contiguous run of tiles, keeping tiles that share activation
+rows or expert weights on one L2.
 
 A wave keeps at most about ten TDM instructions in flight, so decode streams
 weights in wide K steps: one 3-D load brings a step's gate and up rows, and
@@ -55,6 +58,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 _MIN_SIZE = 512
 _MAX_INDEX_16_ROWS = 2**16 - 1
+_NUM_XCDS = 8
 
 
 class _TileConfig(NamedTuple):
@@ -65,6 +69,7 @@ class _TileConfig(NamedTuple):
     num_warps: int
     warp_bases: tuple[tuple[int, int], ...]
     prefetch: int
+    num_xcds: int = 1
 
 
 class _PersistentTiles(NamedTuple):
@@ -75,6 +80,7 @@ class _PersistentTiles(NamedTuple):
     num_warps: int
     warp_bases: tuple[tuple[int, int], ...]
     programs_per_cu: int
+    num_xcds: int = 1
 
 
 # Warp bases count 16x16 WMMA tiles; tiles the warps leave repeat in registers.
@@ -84,8 +90,8 @@ _FEW_PROGRAMS_GATE_UP = _TileConfig(16, 16, 512, 2, 1, (), 1)
 _DECODE_DOWN = _TileConfig(16, 128, 128, 2, 4, ((0, 1), (0, 2)), 1)
 _MEDIUM_DOWN = _TileConfig(32, 256, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1)
 # Two programs per CU fit only while the single accumulator stays in 512 VGPRs.
-_PERSISTENT_MEDIUM_DOWN = _PersistentTiles(64, 256, 4, ((0, 1), (0, 2)), 2)
-_PERSISTENT_LARGE_DOWN = _PersistentTiles(128, 256, 4, ((0, 1), (1, 0)), 2)
+_PERSISTENT_MEDIUM_DOWN = _PersistentTiles(64, 256, 4, ((0, 1), (0, 2)), 2, _NUM_XCDS)
+_PERSISTENT_LARGE_DOWN = _PersistentTiles(128, 256, 4, ((0, 1), (1, 0)), 2, _NUM_XCDS)
 # (max average routes per expert, gate/up tiles, down tiles)
 _REGIMES = (
     (0.25, _TileConfig(16, 16, 256, 2, 1, (), 1), _DECODE_DOWN),
@@ -101,7 +107,7 @@ _REGIMES = (
     ),
     (
         None,
-        _TileConfig(128, 128, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1),
+        _TileConfig(128, 128, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1, _NUM_XCDS),
         _PERSISTENT_LARGE_DOWN,
     ),
 )
@@ -134,6 +140,58 @@ def _locate_tile(
     first_tile = gl.sum(gl.where(selected, ends - tiles, 0), 0)
     count = gl.sum(gl.where(selected, counts, 0), 0)
     return expert, (tile_m - first_tile) * BLOCK_M, count
+
+
+@gluon.jit
+def _xcd_tile(pid, num_tiles, NUM_XCDS: gl.constexpr):
+    """Renumber round-robin dispatched programs so each XCD runs a contiguous
+    run of tiles, and tiles sharing activation rows or weights share an L2."""
+    xcd = pid % NUM_XCDS
+    return (
+        xcd * (num_tiles // NUM_XCDS)
+        + gl.minimum(xcd, num_tiles % NUM_XCDS)
+        + pid // NUM_XCDS
+    )
+
+
+@gluon.jit
+def _locate_xcd_tile(
+    expert_counts,
+    pid,
+    NUM_N_TILES: gl.constexpr,
+    NUM_EXPERTS: gl.constexpr,
+    EXPERT_PAD: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+):
+    """Expert, first row, row count, and first column of program ``pid``'s tile.
+
+    Only the live tiles are renumbered, so programs past the last tile, which
+    exit, do not leave whole XCDs idle. The expert is at least ``NUM_EXPERTS``
+    for those programs.
+    """
+    num_warps: gl.constexpr = gl.num_warps()
+    layout: gl.constexpr = gl.BlockedLayout(
+        [EXPERT_PAD // (32 * num_warps)], [32], [num_warps], [0]
+    )
+    experts = gl.arange(0, EXPERT_PAD, layout)
+    counts = gl.load(expert_counts + experts, mask=experts < NUM_EXPERTS, other=0)
+    tiles = gl.cdiv(counts, BLOCK_M)
+    ends = gl.associative_scan(tiles, 0, _add)
+    total = gl.sum(tiles, 0) * NUM_N_TILES
+    tile = gl.where(pid < total, _xcd_tile(pid, total, NUM_XCDS), total)
+    tile_m = tile // NUM_N_TILES
+    expert = gl.sum((ends <= tile_m).to(gl.int32), 0)
+    selected = experts == expert
+    first_tile = gl.sum(gl.where(selected, ends - tiles, 0), 0)
+    count = gl.sum(gl.where(selected, counts, 0), 0)
+    return (
+        expert,
+        (tile_m - first_tile) * BLOCK_M,
+        count,
+        (tile % NUM_N_TILES) * BLOCK_N,
+    )
 
 
 @gluon.jit
@@ -247,6 +305,7 @@ def _fp8_block_gate_up_gfx1250(
     NUM_BUFFERS: gl.constexpr,
     PREFETCH: gl.constexpr,
     WARP_BASES: gl.constexpr,
+    NUM_XCDS: gl.constexpr = 1,
 ):
     """One ``BLOCK_M x BLOCK_N`` SwiGLU tile of an expert's gate/up projection."""
     SCALE_BLOCK: gl.constexpr = 128
@@ -259,11 +318,23 @@ def _fp8_block_gate_up_gfx1250(
     gl.static_assert(NUM_K_TILES >= PREFETCH)
 
     pid = gl.program_id(0)
-    tile_m = pid // NUM_N_TILES
-    off_n = (pid % NUM_N_TILES) * BLOCK_N
-    expert, row_start, count = _locate_tile(
-        expert_counts, tile_m, NUM_EXPERTS, EXPERT_PAD, BLOCK_M
-    )
+    if NUM_XCDS > 1:
+        expert, row_start, count, off_n = _locate_xcd_tile(
+            expert_counts,
+            pid,
+            NUM_N_TILES,
+            NUM_EXPERTS,
+            EXPERT_PAD,
+            BLOCK_M,
+            BLOCK_N,
+            NUM_XCDS,
+        )
+    else:
+        tile_m = pid // NUM_N_TILES
+        off_n = (pid % NUM_N_TILES) * BLOCK_N
+        expert, row_start, count = _locate_tile(
+            expert_counts, tile_m, NUM_EXPERTS, EXPERT_PAD, BLOCK_M
+        )
     if expert >= NUM_EXPERTS:
         return
 
@@ -752,6 +823,7 @@ def _fp8_block_down_persistent_gfx1250(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     WARP_BASES: gl.constexpr,
+    NUM_XCDS: gl.constexpr = 1,
 ):
     """Down-projection tiles strided over a fixed grid.
 
@@ -780,8 +852,12 @@ def _fp8_block_down_persistent_gfx1250(
     starts = ends - row_tiles
     total = gl.sum(row_tiles, 0) * NUM_N_TILES
     pid = gl.program_id(0)
-    num_programs = gl.num_programs(0)
-    num_tiles = gl.cdiv(gl.maximum(total - pid, 0), num_programs)
+    # Each XCD walks a contiguous run of tiles with its own programs.
+    xcd = pid % NUM_XCDS
+    xcd_tiles = total // NUM_XCDS + (xcd < total % NUM_XCDS).to(gl.int32)
+    stride = gl.num_programs(0) // NUM_XCDS
+    first_tile = _xcd_tile(pid, total, NUM_XCDS)
+    num_tiles = gl.cdiv(gl.maximum(xcd_tiles - pid // NUM_XCDS, 0), stride)
     if num_tiles == 0:
         return
 
@@ -813,7 +889,7 @@ def _fp8_block_down_persistent_gfx1250(
     )
 
     expert, row_start, rows_left, off_n = _persistent_tile(
-        pid, experts, counts, starts, ends, NUM_N_TILES, BLOCK_M, BLOCK_N
+        first_tile, experts, counts, starts, ends, NUM_N_TILES, BLOCK_M, BLOCK_N
     )
     gathered = _gather_rows(
         expert_route_ids,
@@ -838,9 +914,7 @@ def _fp8_block_down_persistent_gfx1250(
     for i in range(num_tiles):
         # The last tile loads its own first step again so that every step
         # waits on the same count; the final wait drains it.
-        next_tile = gl.where(
-            i + 1 < num_tiles, pid + (i + 1) * num_programs, pid + i * num_programs
-        )
+        next_tile = first_tile + gl.where(i + 1 < num_tiles, i + 1, i) * stride
         next_expert, next_row_start, next_rows_left, next_off_n = _persistent_tile(
             next_tile, experts, counts, starts, ends, NUM_N_TILES, BLOCK_M, BLOCK_N
         )
@@ -954,6 +1028,8 @@ def _launch_down_persistent(
         hidden // cfg.block_n
     )
     grid = min(num_sms * cfg.programs_per_cu, max_tiles)
+    num_xcds = cfg.num_xcds if grid >= cfg.num_xcds else 1
+    grid -= grid % num_xcds
     _fp8_block_down_persistent_gfx1250[(grid,)](
         intermediate,
         w2,
@@ -970,6 +1046,7 @@ def _launch_down_persistent(
         BLOCK_M=cfg.block_m,
         BLOCK_N=cfg.block_n,
         WARP_BASES=cfg.warp_bases,
+        NUM_XCDS=num_xcds,
         num_warps=cfg.num_warps,
         num_stages=1,
     )
@@ -1055,6 +1132,7 @@ def _launch_gate_up(
         NUM_BUFFERS=cfg.num_buffers,
         PREFETCH=cfg.prefetch,
         WARP_BASES=cfg.warp_bases,
+        NUM_XCDS=cfg.num_xcds,
         num_warps=cfg.num_warps,
         num_stages=1,
     )
