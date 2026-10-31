@@ -36,7 +36,10 @@ from tokenspeed_kernel.ops.residual.gluon import (  # noqa: E402
     gluon_mhc_mixes_gfx1250,
     gluon_mhc_pre_gfx1250,
 )
-from tokenspeed_kernel.ops.residual.triton import triton_mhc_apply_pre  # noqa: E402
+from tokenspeed_kernel.ops.residual.triton import (  # noqa: E402
+    triton_mhc_apply_pre,
+    triton_mhc_post,
+)
 from tokenspeed_kernel.selection import select_kernel  # noqa: E402
 from tokenspeed_kernel.signature import (  # noqa: E402
     dense_tensor_format,
@@ -45,7 +48,9 @@ from tokenspeed_kernel.signature import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.mhc import (  # noqa: E402
     gluon_mhc_mixes_project_gfx1250,
     gluon_mhc_mixes_reduce_gfx1250,
+    launch_gluon_mhc_apply_pre_gfx1250,
     launch_gluon_mhc_mixes_project_gfx1250,
+    launch_gluon_mhc_post_gfx1250,
     mhc_mixes_project_splits,
     use_gluon_mhc_mixes_project_gfx1250,
 )
@@ -189,6 +194,81 @@ def test_mhc_apply_pre_quantize_fp8_matches_unfused(tokens: int) -> None:
     )
     assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
     assert torch.equal(scales, expected_scales)
+
+
+@pytest.mark.parametrize("tokens", [1, 6, 96, 848, 8192])
+@pytest.mark.parametrize("hidden", [5120, 4096])
+def test_mhc_post_matches_portable(tokens: int, hidden: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(tokens + hidden)
+    x = torch.randn(tokens, hidden, device="cuda", generator=generator).bfloat16()
+    residual = torch.randn(
+        tokens, 4, hidden, device="cuda", generator=generator
+    ).bfloat16()
+    post = torch.rand(tokens, 4, 1, device="cuda", generator=generator) * 2
+    comb = torch.rand(tokens, 4, 4, device="cuda", generator=generator)
+    assert torch.equal(
+        launch_gluon_mhc_post_gfx1250(x, residual, post, comb),
+        triton_mhc_post(x, residual, post, comb),
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+@pytest.mark.parametrize("norm", [False, True])
+def test_mhc_apply_pre_matches_portable(tokens: int, norm: bool) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(tokens)
+    residual = torch.randn(
+        tokens, 4, 5120, device="cuda", generator=generator
+    ).bfloat16()
+    pre = torch.rand(tokens, 4, device="cuda", generator=generator)
+    weight = torch.rand(5120, device="cuda", generator=generator).bfloat16()
+    kwargs = (
+        {"norm_weight": weight, "norm_eps": _RMS_EPS}
+        if norm
+        else {
+            "norm_weight": None,
+            "norm_eps": None,
+        }
+    )
+    out = launch_gluon_mhc_apply_pre_gfx1250(
+        residual, pre, kwargs["norm_weight"], kwargs["norm_eps"], quantize=False
+    )
+    expected = triton_mhc_apply_pre(residual, pre, **kwargs)
+    if not norm:
+        assert torch.equal(out, expected)
+        return
+    # The RMS reduction order differs, which moves a rare value by one ulp.
+    torch.testing.assert_close(out, expected, atol=0, rtol=2**-7)
+    assert (out != expected).double().mean().item() < 1e-3
+
+
+def test_mhc_post_and_apply_pre_select_gfx1250_kernels() -> None:
+    post = select_kernel(
+        "residual",
+        "mhc_post",
+        format_signature(
+            hidden_states=dense_tensor_format(torch.bfloat16),
+            residual=dense_tensor_format(torch.bfloat16),
+            post=dense_tensor_format(torch.float32),
+            comb=dense_tensor_format(torch.float32),
+        ),
+        traits={
+            "num_tokens": 8192,
+            "buffer_offsets_fit_int32": True,
+            "hc_mult": 4,
+            "hidden_size": 5120,
+        },
+    )
+    assert post.name == "gluon_mhc_post_gfx1250"
+    apply_pre = select_kernel(
+        "residual",
+        "mhc_apply_pre",
+        format_signature(
+            residual=dense_tensor_format(torch.bfloat16),
+            pre=dense_tensor_format(torch.float32),
+        ),
+        traits={"buffer_offsets_fit_int32": True, "fused_norm": True, "hc_mult": 4},
+    )
+    assert apply_pre.name == "gluon_mhc_apply_pre_gfx1250"
 
 
 def test_mhc_apply_pre_fp8_selects_gfx1250_kernel() -> None:

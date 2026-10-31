@@ -2362,7 +2362,8 @@ four branches across waves, so the gate tensor never reaches memory.
 BF16 residual streams in two kernels: the projection `x @ fn.T` with its row
 sums of squares, and the reduction that runs normalization and the Sinkhorn
 iterations. `gluon_mhc_pre_gfx1250` runs the same two kernels for `mhc_pre`
-at every token count, then collapses the streams with the portable kernel.
+at every token count, then collapses the streams with the portable kernel,
+or with the gfx1250 kernel below when RMSNorm is fused.
 
 #### Contract
 
@@ -2400,27 +2401,38 @@ Prefill keeps up to eight splits in registers; more splits also spread over
 lane groups, and decode spreads them over every wave so a single pass loads
 all of them.
 
-### gfx1250 mHC stream collapse with FP8 output
+### gfx1250 mHC stream collapse and post-mapping
 
-`gluon_mhc_apply_pre_fp8_group32_gfx1250` serves `mhc_apply_pre_fp8_group32`
-for DeepSeek V4.1: the gfx950 stream collapse with RMSNorm that also writes
-the group-32 FP8 input of the next projection.
+`gluon_mhc_apply_pre_gfx1250` serves `mhc_apply_pre` with a fused RMSNorm,
+and also `mhc_apply_pre_fp8_group32` for DeepSeek V4.1, where it also writes
+the group-32 FP8 input of the next projection. `gluon_mhc_post_gfx1250`
+serves `mhc_post` above 256 tokens; the portable kernel's smaller tiles are
+faster for decode.
 
 #### Contract
 
-- Contiguous BF16 residual `[T, 4, H]` with `H` divisible by 32 and fewer
-  than 2^31 elements, FP32 pre coefficients `[T, 4]` and a BF16 or FP32 norm
-  weight `[H]`.
-- Returns the BF16 layer input `[T, H]`, numerically the gfx950 normalized
-  collapse, with E4M3 codes `[T, H]` and uint8 UE8M0 scales `[T, H / 32]`
-  bit-identical to `gluon_quantize_fp8_group32_ue8m0_gfx1250` reading it.
+- Contiguous BF16 residual `[T, 4, H]` with fewer than 2^31 elements, FP32
+  pre coefficients `[T, 4]` and a BF16 or FP32 norm weight `[H]` (`H`
+  divisible by 32 to quantize).
+- The collapse returns the BF16 layer input `[T, H]`: the plain collapse
+  rounds each product like the portable kernel; with RMSNorm, the stream sum
+  is rounded to BF16 first and only the RMS reduction order differs (a rare
+  one-ulp difference). E4M3 codes `[T, H]` and uint8 UE8M0 scales
+  `[T, H / 32]` are bit-identical to
+  `gluon_quantize_fp8_group32_ue8m0_gfx1250` reading the BF16 output.
+- Post returns the updated BF16 streams, bit-identical to the portable
+  kernel.
 
 #### Algorithm
 
-One four-wave CTA owns a token, so RMSNorm reduces the row once; each lane
-moves eight contiguous BF16 values, and four lanes hold one quantization
-group. The BF16-rounded result is quantized from registers, which saves the
-quantizer's launch and its re-read of the row.
+Every lane moves eight contiguous BF16 values (16-byte accesses). The
+collapse runs one four-wave CTA per token, so RMSNorm reduces the row once,
+and four lanes hold one quantization group; the BF16-rounded result is
+quantized from registers (the power-of-two scale is applied as an exact
+reciprocal), which saves the quantizer's launch and its re-read of the row.
+Post runs one token per CTA so its twenty coefficients are scalar loads;
+above 2048 tokens adjacent CTAs take adjacent hidden blocks of one token and
+all vector accesses are non-temporal.
 
 ## Quantization
 

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX1250 mHC prenorm projection and reduction for hc=4 mixing coefficients."""
+"""GFX1250 hc=4 mHC: mixing coefficients, stream collapse and post-mapping."""
 
 from __future__ import annotations
 
@@ -26,13 +26,15 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
-    "gluon_mhc_apply_pre_fp8_group32_gfx1250",
+    "gluon_mhc_apply_pre_gfx1250",
     "gluon_mhc_mixes_project_gfx1250",
     "gluon_mhc_mixes_reduce_gfx1250",
-    "launch_gluon_mhc_apply_pre_fp8_group32_gfx1250",
+    "gluon_mhc_post_gfx1250",
+    "launch_gluon_mhc_apply_pre_gfx1250",
     "launch_gluon_mhc_mixes_gfx1250",
     "launch_gluon_mhc_mixes_project_gfx1250",
     "launch_gluon_mhc_mixes_reduce_gfx1250",
+    "launch_gluon_mhc_post_gfx1250",
     "mhc_mixes_project_splits",
     "use_gluon_mhc_mixes_project_gfx1250",
 ]
@@ -43,6 +45,11 @@ _NUM_BUFFERS = 4
 _PROJECT_MIN_CTAS = 512
 _REDUCE_WARPS = 4
 _APPLY_PRE_WARPS = 4
+_POST_BLOCK_H = 1024
+_POST_WARPS = 4
+# Above this many tokens, post streams its data with non-temporal accesses;
+# smaller calls keep caching so the next mixes read the new streams from cache.
+_POST_STREAM_TOKENS = 2048
 
 
 @gluon.jit
@@ -626,24 +633,23 @@ def launch_gluon_mhc_mixes_gfx1250(
     return pre, post, comb
 
 
-def _mhc_apply_pre_fp8_metadata(grid, kernel, args):
-    """Report the four streams read and the BF16 output, codes and scales
-    written per token."""
+def _mhc_apply_pre_metadata(grid, kernel, args):
+    """Report the four streams read and the BF16 output (plus FP8 codes and
+    scales) written per token."""
     tokens = args["num_tokens"]
     hidden = args["HIDDEN_SIZE"]
+    quant = args["QUANT"]
     return {
         "name": kernel.name,
-        "bytes": tokens * hidden * (8 + 2 + 1)
-        + tokens * (16 + hidden // 32)
-        + hidden * args["norm_weight"].element_size(),
-        "flops32": tokens * hidden * 12,
+        "bytes": tokens * hidden * (8 + 2 + (1 if quant else 0))
+        + tokens * (16 + (hidden // 32 if quant else 0))
+        + (hidden * args["norm_weight"].element_size() if args["NORM"] else 0),
+        "flops32": tokens * hidden * (12 if args["NORM"] else 8),
     }
 
 
-@gluon.jit(
-    launch_metadata=_mhc_apply_pre_fp8_metadata, do_not_specialize=("num_tokens",)
-)
-def gluon_mhc_apply_pre_fp8_group32_gfx1250(
+@gluon.jit(launch_metadata=_mhc_apply_pre_metadata, do_not_specialize=("num_tokens",))
+def gluon_mhc_apply_pre_gfx1250(
     pre_mix,
     residual,
     norm_weight,
@@ -653,16 +659,19 @@ def gluon_mhc_apply_pre_fp8_group32_gfx1250(
     num_tokens,
     HIDDEN_SIZE: gl.constexpr,
     BLOCK_H: gl.constexpr,
+    NORM: gl.constexpr,
     EPS: gl.constexpr,
+    QUANT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Collapse four BF16 streams with ``pre_mix``, apply RMSNorm, and store
-    the BF16 result with its group-32 E4M3 codes and UE8M0 scales.
+    """Collapse four BF16 streams with ``pre_mix``, optionally apply RMSNorm,
+    and store the BF16 result (with its group-32 E4M3 codes and UE8M0 scales
+    when QUANT).
 
-    One token per CTA so RMSNorm reduces the row in one pass; every lane moves
-    eight contiguous BF16 values (16-byte accesses), so four lanes hold one
-    quantization group. Rounded like ``gluon_quantize_fp8_group32_ue8m0_gfx1250``
-    reading the BF16 output.
+    One token per CTA so RMSNorm reduces the row in one pass; every lane
+    moves eight contiguous BF16 values (16-byte accesses), so four lanes hold
+    one quantization group. Codes are rounded like
+    ``gluon_quantize_fp8_group32_ue8m0_gfx1250`` reading the BF16 output.
     """
     token = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
@@ -677,58 +686,75 @@ def gluon_mhc_apply_pre_fp8_group32_gfx1250(
         ).to(gl.float32)
     # The weighted stream sum is rounded to BF16 before RMSNorm reads it, as
     # in the unfused path.
-    normed = acc.to(gl.bfloat16).to(gl.float32)
-    variance = gl.sum(normed * normed, axis=0) / HIDDEN_SIZE
-    scale = gl.rsqrt(variance + EPS)
-    weight = gl.amd.cdna5.buffer_load(norm_weight, hidden, mask=mask).to(gl.float32)
-    values = (normed * scale * weight).to(gl.bfloat16)
+    values = acc.to(gl.bfloat16)
+    if NORM:
+        normed = values.to(gl.float32)
+        variance = gl.sum(normed * normed, axis=0) / HIDDEN_SIZE
+        scale = gl.rsqrt(variance + EPS)
+        weight = gl.amd.cdna5.buffer_load(norm_weight, hidden, mask=mask).to(gl.float32)
+        values = (normed * scale * weight).to(gl.bfloat16)
     gl.amd.cdna5.buffer_store(values, out, token * HIDDEN_SIZE + hidden, mask=mask)
-    groups = gl.reshape(values.to(gl.float32), [BLOCK_H // 32, 32])
-    amax = gl.maximum(gl.max(gl.abs(groups), 1), 1.0e-4)
-    bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
-    group_scale = (exponent << 23).to(gl.float32, bitcast=True)
-    quantized = gl.div_rn(groups, group_scale[:, None]).to(gl.float8e4nv)
-    quantized = gl.convert_layout(gl.reshape(quantized, [BLOCK_H]), layout)
-    gl.amd.cdna5.buffer_store(quantized, codes, token * HIDDEN_SIZE + hidden, mask=mask)
-    group = gl.arange(0, BLOCK_H // 32, layout=gl.SliceLayout(1, groups.type.layout))
-    gl.amd.cdna5.buffer_store(
-        exponent.to(gl.uint8),
-        scales,
-        token * (HIDDEN_SIZE // 32) + group,
-        mask=group < HIDDEN_SIZE // 32,
-    )
+    if QUANT:
+        groups = gl.reshape(values.to(gl.float32), [BLOCK_H // 32, 32])
+        amax = gl.maximum(gl.max(gl.abs(groups), 1), 1.0e-4)
+        bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+        # The scale is a power of two, so multiplying by its exact reciprocal
+        # rounds like the division.
+        inverse = ((254 - exponent) << 23).to(gl.float32, bitcast=True)
+        quantized = (groups * inverse[:, None]).to(gl.float8e4nv)
+        quantized = gl.convert_layout(gl.reshape(quantized, [BLOCK_H]), layout)
+        gl.amd.cdna5.buffer_store(
+            quantized, codes, token * HIDDEN_SIZE + hidden, mask=mask
+        )
+        group = gl.arange(
+            0, BLOCK_H // 32, layout=gl.SliceLayout(1, groups.type.layout)
+        )
+        gl.amd.cdna5.buffer_store(
+            exponent.to(gl.uint8),
+            scales,
+            token * (HIDDEN_SIZE // 32) + group,
+            mask=group < HIDDEN_SIZE // 32,
+        )
 
 
-def launch_gluon_mhc_apply_pre_fp8_group32_gfx1250(
+def launch_gluon_mhc_apply_pre_gfx1250(
     residual: torch.Tensor,
     pre_mix: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Mix four BF16 streams with ``pre_mix``, apply RMSNorm and quantize.
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+    quantize: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mix four BF16 streams with ``pre_mix``, optionally apply RMSNorm and
+    quantize.
 
     Args:
-        residual: Contiguous BF16 residual streams ``[..., 4, hidden_size]``,
-            ``hidden_size`` divisible by 32.
+        residual: Contiguous BF16 residual streams ``[..., 4, hidden_size]``.
         pre_mix: Contiguous FP32 coefficients ``[..., 4]``.
-        norm_weight: Contiguous BF16 or FP32 RMSNorm weight ``[hidden_size]``.
-        norm_eps: RMSNorm epsilon.
+        norm_weight: Optional contiguous BF16 or FP32 RMSNorm weight
+            ``[hidden_size]``; required when ``quantize``.
+        norm_eps: RMSNorm epsilon, given together with ``norm_weight``.
+        quantize: Also return group-32 E4M3 codes ``[tokens, hidden_size]``
+            and uint8 UE8M0 scales ``[tokens, hidden_size // 32]`` of the
+            output; needs ``hidden_size % 32 == 0``.
 
     Returns:
-        BF16 layer input ``[..., hidden_size]``, its group-32 E4M3 codes
-        ``[tokens, hidden_size]`` and uint8 UE8M0 scales
-        ``[tokens, hidden_size // 32]``.
+        BF16 layer input ``[..., hidden_size]``, plus codes and scales when
+        ``quantize`` is set.
     """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+    if quantize and norm_weight is None:
+        raise ValueError("GFX1250 mHC apply-pre quantizes only the normed input")
     hidden_size = residual.shape[-1]
     if residual.shape[-2] != 4 or pre_mix.shape[-1] != 4:
         raise ValueError("GFX1250 mHC apply-pre requires four residual streams")
-    if norm_weight.shape != (hidden_size,) or hidden_size % 32:
-        raise ValueError(
-            "GFX1250 mHC apply-pre needs a [hidden_size] norm weight and "
-            "hidden_size % 32 == 0"
-        )
-    if not all(t.is_contiguous() for t in (pre_mix, residual, norm_weight)):
+    if norm_weight is not None and norm_weight.shape != (hidden_size,):
+        raise ValueError("GFX1250 mHC apply-pre needs a [hidden_size] norm weight")
+    if quantize and hidden_size % 32:
+        raise ValueError("GFX1250 mHC apply-pre quantization needs hidden_size % 32")
+    tensors = (pre_mix, residual) + (() if norm_weight is None else (norm_weight,))
+    if not all(t.is_contiguous() for t in tensors):
         raise ValueError("GFX1250 mHC apply-pre tensors must be contiguous")
     if residual.dtype != torch.bfloat16 or pre_mix.dtype != torch.float32:
         raise ValueError("GFX1250 mHC apply-pre needs BF16 streams, FP32 pre_mix")
@@ -736,25 +762,157 @@ def launch_gluon_mhc_apply_pre_fp8_group32_gfx1250(
         raise ValueError("GFX1250 mHC apply-pre exceeds 32-bit buffer offsets")
     out = residual.new_empty((*residual.shape[:-2], hidden_size))
     num_tokens = residual.numel() // (4 * hidden_size)
-    codes = torch.empty(
-        (num_tokens, hidden_size), dtype=torch.float8_e4m3fn, device=out.device
-    )
-    scales = torch.empty(
-        (num_tokens, hidden_size // 32), dtype=torch.uint8, device=out.device
-    )
+    codes = scales = out
+    if quantize:
+        codes = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.float8_e4m3fn, device=out.device
+        )
+        scales = torch.empty(
+            (num_tokens, hidden_size // 32), dtype=torch.uint8, device=out.device
+        )
     if num_tokens:
-        gluon_mhc_apply_pre_fp8_group32_gfx1250[(num_tokens,)](
+        norm = norm_weight is not None
+        gluon_mhc_apply_pre_gfx1250[(num_tokens,)](
             pre_mix,
             residual,
-            norm_weight,
+            norm_weight if norm else out,
             out,
             codes,
             scales,
             num_tokens,
             HIDDEN_SIZE=hidden_size,
             BLOCK_H=triton.next_power_of_2(hidden_size),
-            EPS=norm_eps,
+            NORM=norm,
+            EPS=norm_eps if norm else 0.0,
+            QUANT=quantize,
             NUM_WARPS=_APPLY_PRE_WARPS,
             num_warps=_APPLY_PRE_WARPS,
+            # Match the portable kernels' rounding: the plain collapse rounds
+            # each product (no FMA), the normalized one contracts to FMA.
+            enable_fp_fusion=norm,
         )
-    return out, codes, scales
+    return (out, codes, scales) if quantize else out
+
+
+def _mhc_post_metadata(grid, kernel, args):
+    """Report the layer output and four streams read and the four streams
+    written per token."""
+    tokens = args["num_tokens"]
+    hidden = args["HIDDEN_SIZE"]
+    return {
+        "name": kernel.name,
+        "bytes": tokens * hidden * (2 + 8 + 8) + tokens * 20 * 4,
+        "flops32": tokens * hidden * 4 * 9,
+    }
+
+
+@gluon.jit(launch_metadata=_mhc_post_metadata, do_not_specialize=("num_tokens",))
+def gluon_mhc_post_gfx1250(
+    hidden_states,
+    residual,
+    post,
+    comb,
+    out,
+    num_tokens,
+    HIDDEN_SIZE: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    STREAM: gl.constexpr,
+):
+    """Store ``post * hidden_states + comb^T residual`` for one hidden block of
+    a token, rounded like the portable kernel: ``post * x`` and then one FMA
+    per input stream, in stream order.
+
+    One token per CTA keeps the twenty coefficients scalar loads; each lane
+    moves eight contiguous BF16 values (16-byte accesses). STREAM flattens
+    the grid so consecutive CTAs cover adjacent hidden blocks of one token
+    and makes every vector access non-temporal.
+    """
+    if STREAM:
+        hidden_blocks: gl.constexpr = (HIDDEN_SIZE + BLOCK_H - 1) // BLOCK_H
+        token = gl.program_id(0) // hidden_blocks
+        hidden_block = gl.program_id(0) % hidden_blocks
+    else:
+        token = gl.program_id(0)
+        hidden_block = gl.program_id(1)
+    cache: gl.constexpr = ".cs" if STREAM else ""
+    layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
+    hidden = hidden_block * BLOCK_H + gl.arange(0, BLOCK_H, layout=layout)
+    mask = hidden < HIDDEN_SIZE
+    x = gl.amd.cdna5.buffer_load(
+        hidden_states, token * HIDDEN_SIZE + hidden, mask=mask, cache=cache
+    ).to(gl.float32)
+    base = token * (4 * HIDDEN_SIZE) + hidden
+    r0 = gl.amd.cdna5.buffer_load(residual, base, mask=mask, cache=cache).to(gl.float32)
+    r1 = gl.amd.cdna5.buffer_load(
+        residual, base + HIDDEN_SIZE, mask=mask, cache=cache
+    ).to(gl.float32)
+    r2 = gl.amd.cdna5.buffer_load(
+        residual, base + 2 * HIDDEN_SIZE, mask=mask, cache=cache
+    ).to(gl.float32)
+    r3 = gl.amd.cdna5.buffer_load(
+        residual, base + 3 * HIDDEN_SIZE, mask=mask, cache=cache
+    ).to(gl.float32)
+    for stream in gl.static_range(4):
+        value = gl.load(post + token * 4 + stream) * x
+        value = gl.fma(gl.load(comb + token * 16 + stream), r0, value)
+        value = gl.fma(gl.load(comb + token * 16 + 4 + stream), r1, value)
+        value = gl.fma(gl.load(comb + token * 16 + 8 + stream), r2, value)
+        value = gl.fma(gl.load(comb + token * 16 + 12 + stream), r3, value)
+        gl.amd.cdna5.buffer_store(
+            value.to(gl.bfloat16),
+            out,
+            base + stream * HIDDEN_SIZE,
+            mask=mask,
+            cache=cache,
+        )
+
+
+def launch_gluon_mhc_post_gfx1250(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the hc=4 mHC post-mapping and residual update.
+
+    Args:
+        hidden_states: Contiguous BF16 layer output ``[..., hidden_size]``.
+        residual: Contiguous BF16 residual streams ``[..., 4, hidden_size]``.
+        post: Contiguous FP32 post coefficients ``[..., 4, 1]``.
+        comb: Contiguous FP32 combination ``[..., 4, 4]`` indexed
+            [input, output].
+
+    Returns:
+        BF16 ``post * hidden_states + comb^T residual`` shaped like ``residual``.
+    """
+    hidden_size = residual.shape[-1]
+    if residual.shape[-2] != 4:
+        raise ValueError("GFX1250 mHC post requires four residual streams")
+    tensors = (hidden_states, residual, post, comb)
+    if not all(t.is_contiguous() for t in tensors):
+        raise ValueError("GFX1250 mHC post tensors must be contiguous")
+    if residual.numel() >= 2**31:
+        raise ValueError("GFX1250 mHC post exceeds 32-bit buffer offsets")
+    out = torch.empty_like(residual)
+    num_tokens = residual.numel() // (4 * hidden_size)
+    if num_tokens:
+        hidden_blocks = triton.cdiv(hidden_size, _POST_BLOCK_H)
+        stream = num_tokens > _POST_STREAM_TOKENS
+        # The streaming grid is flat, so the token count is not bounded by
+        # the 65535 limit of the second grid dimension.
+        grid = (num_tokens * hidden_blocks,) if stream else (num_tokens, hidden_blocks)
+        gluon_mhc_post_gfx1250[grid](
+            hidden_states,
+            residual,
+            post,
+            comb,
+            out,
+            num_tokens,
+            HIDDEN_SIZE=hidden_size,
+            BLOCK_H=_POST_BLOCK_H,
+            NUM_WARPS=_POST_WARPS,
+            STREAM=stream,
+            num_warps=_POST_WARPS,
+        )
+    return out
