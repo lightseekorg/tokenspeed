@@ -25,7 +25,11 @@ compile-time kernel parameter that keeps taking new values after startup
 (a per-batch `tl.constexpr` or static CuTe DSL dimension), a call site that
 keeps recompiling specializations a kernel already has, or a direct
 `@cute.jit` call after startup fails the run. The server log names the kernel,
-the cause, and the launching call site.
+the cause, and the launching call site. They also run with
+`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error`, which no task may change
+(validation rejects a task or `runner.env` that sets it): a host
+synchronization on the forward thread's per-round path after startup fails
+the run, and the server log names its Python location.
 
 Currently configured task directories:
 
