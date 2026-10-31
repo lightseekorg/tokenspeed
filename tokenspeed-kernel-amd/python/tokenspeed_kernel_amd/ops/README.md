@@ -1129,7 +1129,10 @@ remain then leaves the other slot's loads in flight.
 `gluon_mla_decode_query_blocks_gfx1250` decodes 2–16 causal queries per
 request, such as an EAGLE3 verify step, reading each KV tile once for all of a
 request's queries. It is selected for `mla_decode_with_kvcache` requests with
-queries blocked on the query axis.
+queries blocked on the query axis. Its projected-value variant,
+`gluon_mla_decode_query_blocks_projected_value_gfx1250`, fuses the value
+projection and optional sigmoid gate into the split merge for up to four FP8
+requests of up to four queries.
 
 #### Contract
 
@@ -1142,7 +1145,9 @@ queries blocked on the query axis.
   least `queries` each, and include every query of the block: query `j` sees
   `cache_seqlens - queries + j + 1` tokens.
 - The output is BF16 `(requests, queries, heads, 512)`, with an optional FP32
-  log-sum-exp `(requests, queries, heads)` in natural-log units.
+  log-sum-exp `(requests, queries, heads)` in natural-log units. The
+  projected-value variant takes BF16 `(heads, 512, 128)` value weights and
+  writes BF16 `(requests * queries, heads * 128)`.
 
 #### Algorithm
 
@@ -1166,6 +1171,14 @@ NaN. The splits store their partials in BF16, halving the partial traffic
 that at 32 or more splits otherwise reaches a fifth of the KV bytes. The
 page-table stride and the request and token counts are runtime arguments, so
 batch sizes that keep the split count reuse one binary.
+
+The projected-value merge runs the latent merge's programs, one per token,
+head and 128 latent columns. Each also multiplies its BF16 latent slice by
+the matching 128 rows of the head's value weight and publishes an FP32
+partial; the last of a row's four programs, found by an arrival counter, adds
+the partials in a fixed order, rounds to BF16, applies the gate and rezeroes
+the counter. Past 16 rows every row reloads its weight slice, and the latent
+merge followed by the batched projection GEMM is faster.
 
 ### gfx950 MLA prefill
 

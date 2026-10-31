@@ -279,3 +279,80 @@ def test_query_block_support_on_cdna5():
     assert not supports_mla_decode_query_blocks(
         q_len=4, sliding_window=False, **{**common, "noncausal_block_size": 4}
     )
+
+
+@pytest.mark.parametrize("use_gate", [False, True], ids=["no-gate", "gate"])
+@pytest.mark.parametrize(
+    "batch_size,cache_length",
+    # Kimi K3 verify at one request and 128 splits over a 50k context, and
+    # four requests at 64 splits.
+    [(1, 50_250), (4, 4097)],
+    ids=["c1-50k", "c4-4k"],
+)
+def test_query_block_projected_value_fuses_merge_and_projection(
+    batch_size: int, cache_length: int, use_gate: bool
+) -> None:
+    from tokenspeed_kernel.workspace import capture_session
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        launch_gluon_mla_decode_query_blocks_projected_value_gfx1250,
+    )
+
+    heads, queries, value_dim = 12, 4, 128
+    q, cache, table, lengths = _make_inputs(
+        [cache_length + 31 * i for i in range(batch_size)], heads, queries
+    )
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    weights = (
+        torch.randn(heads, _KV_LORA_RANK, value_dim, generator=gen, device="cuda")
+        / math.sqrt(_KV_LORA_RANK)
+    ).to(torch.bfloat16)
+    gate = (
+        torch.randn(
+            batch_size * queries, heads * value_dim, generator=gen, device="cuda"
+        ).to(torch.bfloat16)
+        if use_gate
+        else None
+    )
+    common = dict(
+        q=q,
+        kv_cache=cache,
+        page_table=table,
+        cache_seqlens=lengths,
+        max_seqlen_k=65_536,
+        qk_nope_head_dim=128,
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_ROPE_DIM,
+        softmax_scale=_SOFTMAX_SCALE,
+        value_weight=weights,
+        gate=gate,
+    )
+    shape = (batch_size * queries, heads * value_dim)
+    direct = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    launch_gluon_mla_decode_query_blocks_projected_value_gfx1250(**common, out=direct)
+    dispatched = torch.empty_like(direct)
+    mla_decode_with_kvcache(**common, out=dispatched)
+    # A solution pin keeps the unfused latent decode, merge and projection.
+    composed = torch.empty_like(direct)
+    mla_decode_with_kvcache(**common, out=composed, solution="gluon")
+
+    torch.testing.assert_close(dispatched, direct, atol=0, rtol=0)
+    # Only the order of the FP32 projection sum differs from the composition,
+    # which can move a BF16 rounding by one step.
+    torch.testing.assert_close(direct, composed, atol=1e-5, rtol=2**-7)
+    reference, _ = _reference(q, cache, table, lengths)
+    projected = torch.einsum("bqhd,hdv->bqhv", reference, weights.float())
+    expected = projected.reshape(shape)
+    if gate is not None:
+        expected = expected * torch.sigmoid(gate.float())
+    assert _relative_error(direct, expected) < 0.05
+
+    # Replays reuse the arrival counters, which each launch leaves zeroed.
+    graph = torch.cuda.CUDAGraph()
+    replayed = torch.empty_like(direct)
+    with capture_session(graph), torch.cuda.graph(graph):
+        mla_decode_with_kvcache(**common, out=replayed)
+    for _ in range(3):
+        replayed.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, direct, atol=0, rtol=0)
