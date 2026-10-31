@@ -374,9 +374,10 @@ def _internal_dirs() -> tuple[str, ...]:
         for module in (triton, torch, sys.modules["tokenspeed_kernel"])
     ]
     # AMD Gluon kernels launch from tokenspeed_kernel_amd, MLA CuTe DSL kernels
-    # from tokenspeed_mla, and CuTe DSL compiles in cutlass; locate them
-    # without importing them where they are absent or unused.
-    for package in ("tokenspeed_kernel_amd", "tokenspeed_mla", "cutlass"):
+    # from tokenspeed_mla, FlashInfer's autotuner calls back into the kernel
+    # wrappers, and CuTe DSL compiles in cutlass; locate them without
+    # importing them where they are absent or unused.
+    for package in ("tokenspeed_kernel_amd", "tokenspeed_mla", "flashinfer", "cutlass"):
         spec = importlib.util.find_spec(package)
         if spec is not None and spec.submodule_search_locations:
             dirs.extend(path + os.sep for path in spec.submodule_search_locations)

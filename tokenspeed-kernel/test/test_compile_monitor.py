@@ -235,9 +235,9 @@ def test_rejects_unknown_mode():
 
 
 @pytest.mark.parametrize(
-    "package", ["tokenspeed_kernel_amd", "tokenspeed_mla", "cutlass"]
+    "package", ["tokenspeed_kernel_amd", "tokenspeed_mla", "flashinfer", "cutlass"]
 )
-def test_call_sites_skip_kernel_packages_and_cute_dsl(monkeypatch, tmp_path, package):
+def test_call_sites_skip_kernel_libraries(monkeypatch, tmp_path, package):
     package_dir = str(tmp_path / package)
     spec = importlib.machinery.ModuleSpec(package, None)
     spec.submodule_search_locations = [package_dir]

@@ -1,6 +1,6 @@
 # HELP tokenspeed:iteration_tokens_total Tokens scheduled in one scheduler forward step.
-# HELP tokenspeed:jit_serving_compile_seconds_total Wall time spent in Triton kernel compilations after startup.
-# HELP tokenspeed:jit_serving_compiles_total Triton kernel compilations after startup; each one stalls the forward thread.
+# HELP tokenspeed:jit_serving_compile_seconds_total Wall time spent in Triton and CuTe DSL kernel compilations after startup.
+# HELP tokenspeed:jit_serving_compiles_total Triton and CuTe DSL kernel compilations after startup; each one stalls the forward thread.
 # HELP tokenspeed:kv_cache_usage_perc Fraction of device KV pages in use (0-1).
 # HELP tokenspeed:kv_transfer_failures_total KV transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss on the decode node. Timeouts are counted separately.
 # HELP tokenspeed:kv_transfer_latency_seconds Wall time of one KV cache transfer send to a peer.
