@@ -24,7 +24,9 @@ import math
 
 import torch
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
+    _PREFILL_DOWN_TILES,
     PrecisionConfig,
+    decode_tile_config,
 )
 
 _MXFP_BLOCK_SIZE = 32
@@ -215,7 +217,69 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
     torch.cuda.empty_cache()
 
 
+def kplane_mxfp4_weight_gfx1250(weight: torch.Tensor, plane_bytes: int) -> torch.Tensor:
+    """Store a ``(E, K_packed, N)`` N-major MXFP4 weight one K step per plane.
+
+    Each ``plane_bytes`` step of K becomes its own row-major ``[N,
+    plane_bytes]`` slab, so a ``[block_n, plane_bytes]`` weight tile is one
+    contiguous run. A short K (Kimi K3's 384-wide TP8 down projection) would
+    otherwise stream as 64-byte pieces of 192-byte rows, which TDM reads at a
+    fraction of the contiguous bandwidth.
+
+    The returned tensor keeps the ``(E, K_packed, N)`` shape and the expert and
+    N strides kernels read, but its K addressing is only meaningful to kernels
+    honouring the ``kplane_rows``/``kplane_bytes`` attributes it carries.
+    """
+    experts, k_packed, n = weight.shape
+    if k_packed % plane_bytes:
+        raise ValueError(f"K_packed {k_packed} is not a multiple of {plane_bytes}")
+    rows = weight.transpose(1, 2)
+    if not rows.is_contiguous():
+        raise ValueError("expected an N-major (E, K_packed, N) weight")
+    planes = (
+        rows.reshape(experts, n, k_packed // plane_bytes, plane_bytes)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    view = torch.as_strided(
+        planes, (experts, k_packed, n), (k_packed * n, 1, plane_bytes)
+    )
+    view.act_scale = getattr(weight, "act_scale", None)
+    view.kplane_rows = n
+    view.kplane_bytes = plane_bytes
+    return view
+
+
+def preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(
+    plan: dict,
+    w: torch.nn.Module,
+) -> None:
+    """:func:`preprocess_gluon_mxfp4_gfx1250_moe_weights` for the FP8 SiTU MoE.
+
+    That MoE runs its down projection with the decode tiles and
+    ``_PREFILL_DOWN_TILES``. When both step K by the same width and tile N
+    exactly, the down weight is stored in K planes of that width.
+    """
+    preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
+    w2 = w.w2_weight_triton_tensor
+    k = int(w2.shape[1]) * 2
+    n = int(w2.shape[2])
+    decode = decode_tile_config(k)
+    block_k = decode["block_k"]
+    if (
+        block_k == _PREFILL_DOWN_TILES["block_k"]
+        and k % block_k == 0
+        and n % decode["block_n"] == 0
+        and n % _PREFILL_DOWN_TILES["block_n"] == 0
+        and k // block_k > 1
+    ):
+        w.w2_weight_triton_tensor = kplane_mxfp4_weight_gfx1250(w2, block_k // 2)
+        torch.cuda.empty_cache()
+
+
 __all__ = [
+    "kplane_mxfp4_weight_gfx1250",
+    "preprocess_gluon_mxfp4_gfx1250_situ_moe_weights",
     "preprocess_gluon_mxfp4_gfx1250_moe_weights",
     "_make_k_packed_mxfp4_weight",
 ]

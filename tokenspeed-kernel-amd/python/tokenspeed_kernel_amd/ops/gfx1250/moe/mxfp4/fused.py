@@ -821,8 +821,13 @@ def _matmul(
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
     PARTIAL_TDM: gl.constexpr = False,
+    W_KPLANE_ROWS: gl.constexpr = 0,
 ):
     gl.static_assert(RAGGED_DIMENSION is None or RAGGED_DIMENSION == "M")
+    gl.static_assert(
+        not W_KPLANE_ROWS or (SCHEDULE == "baseline" and not PINGPONG),
+        "K-plane weights use the baseline schedule",
+    )
     SPLIT_K: gl.constexpr = 1
 
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
@@ -865,6 +870,7 @@ def _matmul(
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
         NUM_WARPS=NUM_WARPS,
+        W_KPLANE_ROWS=W_KPLANE_ROWS,
     )
 
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // cfg.DIV_FACTOR_W
@@ -1432,6 +1438,8 @@ def matmul(
 
     a_torch = a.storage.data if isinstance(a, Tensor) else a
     b_torch = b.storage.data if isinstance(b, Tensor) else b
+    # Set by kplane_mxfp4_weight_gfx1250 on weights stored one K step per plane.
+    kplane_rows = int(getattr(b_torch, "kplane_rows", 0))
     is_input_batched = a_torch.ndim == 3
     has_scatter = scatter_indx is not None
     is_a_ragged = a_ragged_metadata is not None
@@ -1534,6 +1542,22 @@ def matmul(
         grid_m = a_ragged_metadata.n_blocks(
             a_ragged_metadata.n_slices, M, opt_flags.block_m
         )
+    if kplane_rows:
+        plane_bytes = int(b_torch.kplane_bytes)
+        if (
+            kplane_rows != N
+            or plane_bytes != block_k // (2 if b_torch.dtype == torch.uint8 else 1)
+            or K % block_k
+            or N % block_n
+            or schedule != "baseline"
+            or pingpong
+        ):
+            raise ValueError(
+                f"K-plane weights with {plane_bytes}-byte planes of {kplane_rows} "
+                f"rows need block_k covering one plane, whole K and N tiles and the "
+                f"baseline schedule; got N={N}, K={K}, block_n={block_n}, "
+                f"block_k={block_k}, schedule={schedule}, pingpong={pingpong}"
+            )
     grid_n = triton.cdiv(N, opt_flags.block_n)
     grid = grid_m * grid_n * batch_size
 
@@ -1612,6 +1636,7 @@ def matmul(
         PINGPONG=pingpong,
         NUM_WARPS=num_warps,
         PARTIAL_TDM=partial_tdm,
+        W_KPLANE_ROWS=kplane_rows,
         num_warps=num_warps,
     )
     out_final = c_storage.data

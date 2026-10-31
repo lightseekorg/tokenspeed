@@ -2074,6 +2074,12 @@ that the activation loads and epilogue need. Long reductions (gate/up) load
 load 128-wide steps so three buffers hold all of K in a small LDS footprint,
 and more programs stay resident to hide each one's fixed latency.
 
+The FP8 SiTU experts store the down weight in K planes: each 128-wide K step
+of an expert is its own row-major `(N, 64-byte)` slab, so a weight tile is one
+contiguous run. Kimi K3's 384-wide TP8 reduction otherwise streams as 64-byte
+pieces of 192-byte rows, which TDM reads well below its contiguous bandwidth.
+The decode and prefill down GEMMs both read the planes.
+
 FP8-activation prefill (about 150 routed rows per expert at 8192-token
 chunks) uses 64x256 tiles. Neither GEMM saturates WMMA, TDM or HBM there:
 each program runs its load, LDS and WMMA phases largely back to back, so the

@@ -1372,6 +1372,7 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused as fused_mxfp_gfx1250
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx1250_moe_weights,
+        preprocess_gluon_mxfp4_gfx1250_situ_moe_weights,
     )
 
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
@@ -1392,6 +1393,9 @@ if platform.is_amd:
 
     def gluon_mxfp4_gfx1250_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
+
+    def gluon_mxfp4_gfx1250_situ_moe_weights(plan: dict, w: torch.nn.Module):
+        return preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(plan, w)
 
     def validate_linear_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         del plan
@@ -2084,7 +2088,7 @@ if platform.is_amd:
         "apply",
         name="gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply",
         solution="gluon",
-        weight_preprocessor=gluon_mxfp4_gfx1250_moe_weights,
+        weight_preprocessor=gluon_mxfp4_gfx1250_situ_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"amd"}),
             min_arch_version=ArchVersion(12, 5),
