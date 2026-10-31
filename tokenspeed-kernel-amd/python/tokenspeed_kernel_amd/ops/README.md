@@ -1782,7 +1782,7 @@ Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
 things differ:
 
 - Automatic dispatch selects the decode launcher for 1 to 64 tokens and the
-  prefill kernel from 1025; the range between them retains the Triton kernel.
+  prefill kernel from 129; the range between them retains the Triton kernel.
 - The packed tensor passed alongside the three weights must be their
   consecutive view. The kernels read only it, so the launchers reject a
   packed tensor the weights do not live inside.
@@ -1811,24 +1811,33 @@ columns, so SiTU never needs a second kernel.
   rearms the counter for the next launch or graph replay. Each stream keeps
   its own counter buffer, which the launches ordered on it share.
 
-Prefill is one launch too: a `256 x 256` WMMA tile on eight warps with no
-split, accumulating in FP32 over 128-wide K steps. Like the whole-reduction
-decode kernel, a tile is two 128-row weight slices, so the 4480 router and
-routed columns take 18 tiles (the last one half used) and the shared region
-six gate/up pairs that finish SiTU in the epilogue, with no BF16 gate/up
-buffer or second launch. That epilogue writes `sigmoid(x)` as
-`(1 + tanh(x / 2)) / 2`, so the whole activation runs on the hardware tanh.
+Prefill is one launch too, the clustered warp-pipeline schedule of the
+dense large-M GEMM in `gfx1250/gemm/fp16/mm.py` with no split, accumulating
+in FP32 over 128-wide K steps. Each CTA computes two `256 x 128` half tiles
+on eight warps: 128-row slices of two consecutive panels of the router and
+routed regions, or 128 gate rows with the up rows 768 below them, so the shared
+region finishes SiTU in the epilogue with no BF16 gate/up buffer or second
+launch. CTAs run as 1 x 2 clusters whose TDM loads multicast the activation
+panel to both, with a cluster barrier per K tile. The router region rounds
+up to whole 256-row panels, so no panel holds both router and routed
+columns; the 4480 columns take nine clusters and the shared region three.
+Below 1281 tokens every 256-row tile already fits in one wave, so the
+kernel switches to `128 x 128` half tiles on unclustered CTAs, which
+finish sooner.
+
 Each K tile is consumed in two half-K steps of an LDS-read stage and a WMMA
 stage (`warp_pipeline_stage`), and the two warps that share a SIMD run a
-stage apart, so one reads LDS while the other issues WMMA. The next K tile
-streams into the other of two TDM slots meanwhile, issued by one warp per
-SIMD. Workgroups are renumbered so each of the eight XCDs gets a contiguous
-run of the `GROUP_M`-grouped tile order, which keeps the workgroups that
-share A or B rows on one L2. Before storing, the kernel redistributes each
-half accumulator so neighboring lanes cover adjacent output columns, which
-coalesces the BF16 stores, and masks, rather than the tile index, place each
-column in the router or routed region, so FP32 router logits reach memory
-without a round trip through BF16.
+stage apart, so one reads LDS while the other issues WMMA. Operands sit in
+partitioned LDS layouts that split each panel across the two LDS
+partitions, so paired waves read different partitions in one instruction.
+The next K tile streams into the other of two TDM slots meanwhile, issued
+by one warp per SIMD. Clusters are renumbered so each of the eight XCDs gets
+a contiguous run of the `GROUP_M`-grouped tile order, which keeps the CTAs
+that share A or B rows on one L2. The epilogue writes `sigmoid(x)` as
+`(1 + tanh(x / 2)) / 2`, so the whole activation runs on the hardware tanh.
+Each half tile is staged in the freed operand LDS and written by one TDM
+store, clipped at the last row and at the router width, so FP32 router
+logits reach memory without a round trip through BF16.
 
 All kernels mask partial row tiles, so they accept any token count.
 
