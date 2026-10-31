@@ -169,12 +169,10 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalForwardContext,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -1866,8 +1864,6 @@ class V41RowState:
 
 
 class DeepseekV41Model(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config,
@@ -2916,11 +2912,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 make_warmup_items=self.vision.make_image_warmup_items,
             )
         }
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs

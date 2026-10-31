@@ -57,6 +57,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.utils import get_layer_id
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
@@ -67,7 +68,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3MLP,
     DeepseekV3Model,
     DeepseekV3MoE,
-    get_layer_id,
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -1269,7 +1269,6 @@ class GlmMoeDsaModel(DeepseekV3Model):
     ) -> None:
         nn.Module.__init__(self)
         self.mapping = mapping
-        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -1343,14 +1342,12 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
         self,
         config: PretrainedConfig,
         mapping: Mapping,
-        model: GlmMoeDsaModel | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
             config,
             mapping,
-            model=model,
             quant_config=quant_config,
             prefix=prefix,
         )

@@ -36,10 +36,18 @@ strategy remain in the cache key. Activation scales and output rows follow each
 M bucket.
 Entries from earlier profiling strategies are not reused.
 The normal startup cache save/load path persists the selected configurations;
-loading it does not compile kernels. A cached tactic is compiled on its first
-eager use and reused for later calls. During tuning, FlashInfer's untimed
-per-tactic warmup compiles each candidate before measurement. No separate
-preparation step compiles unused tactics.
+loading it does not compile kernels. During startup kernel warmup
+(`ops.tuning.kernel_warmup`), the first call with each N/K compiles every
+tactic a later call can launch: the cached tactic of every M bucket with that
+N/K, scale contract and device, and the three tiles of the fixed-tile rule.
+A cache loaded from file holds tactics that startup's own token counts never
+launch, and compiling one while serving stalls the forward thread for most of
+a second. Outside warmup, a tactic is compiled on its first eager use and
+reused for later calls. During tuning, FlashInfer's untimed per-tactic warmup
+compiles each candidate before measurement. Tactics that no cache entry or
+rule selects are not compiled. Compilation queries the cluster occupancy once
+per cluster size and device, since CuTe DSL's `HardwareInfo` compiles a probe
+kernel for every query.
 
 Outside the tuning context, calls use FlashInfer's cached choice. If the M bucket
 is missing, the default serving path searches cached buckets for the closest M

@@ -66,7 +66,6 @@ from tokenspeed.runtime.layers.quantization.base_config import (
 from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer as _should_ignore_quant_layer,
 )
-from tokenspeed.runtime.layers.utils import get_layer_id as _get_layer_id
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding as _VocabParallelEmbedding,
 )
@@ -876,8 +875,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
 
 
 class _RuntimeLongcatModel(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: _PretrainedConfig,
@@ -888,7 +885,6 @@ class _RuntimeLongcatModel(nn.Module):
         super().__init__()
         _ensure_longcat_config(config)
         self.mapping = mapping
-        self.padding_id = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = _VocabParallelEmbedding(
@@ -964,33 +960,15 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         self,
         config: _PretrainedConfig,
         mapping: _Mapping,
-        model: _RuntimeLongcatModel | None = None,
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         _ensure_longcat_config(config)
-        self._model_override = model
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
-        )
-
-    def resolve_model(
-        self,
-        config: _PretrainedConfig,
-        mapping: _Mapping,
-        quant_config: _QuantizationConfig | None,
-        prefix: str,
-    ) -> _RuntimeLongcatModel:
-        if self._model_override is not None:
-            return self._model_override
-        return self.model_cls(
-            config,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
         )
 
     def post_init(self) -> None:
@@ -1077,16 +1055,6 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         )
 
         for name, loaded_weight in weights:
-            layer_id = _get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -1220,5 +1188,4 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         )
 
 
-FLASHForCausalLM = LongcatFlashForCausalLM
 EntryClass = LongcatFlashForCausalLM

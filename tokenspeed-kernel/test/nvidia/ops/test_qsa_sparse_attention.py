@@ -1167,12 +1167,13 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
     rows, live_rows = 4 * query_width, 3 * query_width
     q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
     q[live_rows:].fill_(float("nan"))
-    k_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
-        cache_dtype
-    )
-    v_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
-        cache_dtype
-    )
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    k_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    v_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
     # The reserved page starts at zero. Padding writes may poison slot 0,
     # while slot 1 remains a finite read target for invalid sparse entries.
     k_cache[:64].zero_()
@@ -1530,7 +1531,8 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
         pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
     torch.manual_seed(83)
-    seq_len, page_size, num_pages = 65539, 256, 1024
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    seq_len, page_size, num_pages = 3839, 256, 15
     cache_slots = (num_pages + 1) * page_size
     q = torch.randn(rows, q_heads, 256, device=device, dtype=torch.bfloat16)
     k_cache = (
@@ -1539,7 +1541,7 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     ).to(cache_dtype)
     v_cache = (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.25).to(cache_dtype)
     # Scatter 512 four-token groups and the three-token remainder over physical
-    # pages spanning the full 256K capacity, with page zero reserved.
+    # pages spanning the whole cache, with page zero reserved.
     pages = torch.randperm(num_pages, device=device, dtype=torch.int32) + 1
     slots = torch.empty((rows, 2051), device=device, dtype=torch.int32)
     offsets = torch.arange(4, device=device, dtype=torch.int32)

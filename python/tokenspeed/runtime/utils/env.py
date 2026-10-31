@@ -281,12 +281,13 @@ class Envs:
     # synchronization on the data plane stalls the forward thread until the
     # in-flight step drains and defeats overlap scheduling.
     TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("warn")
-    # Triton compilations once serving starts: "warn" logs each one with what
-    # changed and names a compile-time kernel parameter that keeps taking new
-    # values (a per-batch constexpr, one JIT compile on the forward thread per
-    # batch shape), "error" raises on such a parameter, "off" disables the
-    # monitor. CI serves with "error".
     TOKENSPEED_STARTUP_TIMING = EnvBool(False)
+    # Triton and CuTe DSL compilations once serving starts: "warn" logs each
+    # one with what changed and names a compile-time kernel parameter that
+    # keeps taking new values (a per-batch constexpr, one JIT compile on the
+    # forward thread per batch shape), a call site that keeps recompiling known
+    # specializations, and a direct @cute.jit call; "error" raises on those,
+    # "off" disables the monitor. CI serves with "error".
     TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
@@ -356,7 +357,6 @@ class Envs:
     TOKENSPEED_HEALTH_CHECK_TIMEOUT = EnvInt(20)
     TOKENSPEED_HOST_IP = EnvStr("")
     TOKENSPEED_LOGGING_CONFIG_PATH = EnvStr(None)
-    TOKENSPEED_MAMBA_SSM_DTYPE = EnvStr("float32")
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
