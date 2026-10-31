@@ -74,6 +74,41 @@ _STOCK_STATEMENT = (
 _RELAXED = "intermediate_size_alignment = intermediate_size_factor == 2 ? 64 : 128;"
 
 
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("do_finalize", [False, True])
+@pytest.mark.parametrize("with_lora", [False, True])
+def test_quantized_unpack_preserves_route_ownership(
+    owned, dtype, do_finalize, with_lora
+):
+    """CPU contract: a borrowed native slot is empty, an owned slot overrides the carrier."""
+    unpack = adapter._entrypoints(
+        adapter._fp32_quantized_spec, adapter._QUANTIZED_FP32_OPERATORS
+    )["_unpack_trtllm_moe_output"]
+    carrier = torch.full((1, 8), -1.0, dtype=dtype)
+    weights = torch.full((1, 8), 0.3125, dtype=dtype) if owned else carrier
+    output = torch.zeros((1, 16), dtype=torch.bfloat16)
+    expanded = torch.zeros((8, 16), dtype=torch.bfloat16)
+    mapping = torch.arange(8, dtype=torch.int32)
+    lora = torch.ones((8, 16)) if with_lora else None
+    intermediate = (
+        [None, mapping, lora]
+        if do_finalize
+        else [expanded, weights if owned else None, mapping, lora]
+    )
+    result = unpack(intermediate, output, do_finalize, lora, carrier)
+    if do_finalize:
+        assert result[0] is output
+    else:
+        torch.testing.assert_close(result[0], expanded)
+        torch.testing.assert_close(result[1], weights, rtol=0, atol=0)
+        torch.testing.assert_close(result[2], mapping)
+        if not owned:
+            assert result[1] is carrier
+    if with_lora:
+        torch.testing.assert_close(result[-1], lora)
+
+
 def _installed_launcher() -> str:
     jit_env = pytest.importorskip("flashinfer.jit.env")
     path = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu"
@@ -360,16 +395,24 @@ def test_entrypoints_keep_upstream_untouched():
     assert register.keywords == {"prefix": "tokenspeed_flashinfer_bf16_ispp64"}
 
 
-def test_entrypoints_require_private_dispatch(monkeypatch):
+@pytest.mark.parametrize(
+    "name",
+    [
+        "trtllm_bf16_moe",
+        "trtllm_fp4_block_scale_moe",
+        "trtllm_fp8_per_channel_scale_moe",
+    ],
+)
+def test_entrypoints_require_private_dispatch(monkeypatch, name):
     core = pytest.importorskip("flashinfer.fused_moe.core")
 
     def bypasses_factory(*args, **kwargs):
         return None
 
     adapter._entrypoints.cache_clear()
-    monkeypatch.setattr(core, "trtllm_bf16_moe", bypasses_factory)
+    monkeypatch.setattr(core, name, bypasses_factory)
     try:
-        with pytest.raises(RuntimeError, match="trtllm_bf16_moe no longer uses"):
+        with pytest.raises(RuntimeError, match=f"{name} no longer uses"):
             adapter._entrypoints()
     finally:
         monkeypatch.undo()
@@ -768,7 +811,12 @@ def test_fp32_routing_bias_entrypoints_are_private():
     assert vars(core) == before
     assert adapter._entrypoints(*args) is private
     assert private is not adapter._entrypoints()
-    assert private["trtllm_bf16_moe"].__globals__ is private
+    for name in (
+        "trtllm_bf16_moe",
+        "trtllm_fp4_block_scale_moe",
+        "trtllm_fp8_per_channel_scale_moe",
+    ):
+        assert private[name].__globals__ is private
     assert private["gen_trtllm_gen_fused_moe_sm100_module"] is args[0]
     assert private["register_custom_op"].keywords == {"prefix": args[1]}
     factory = private["_get_trtllm_moe_sm100_module_impl"]
@@ -853,7 +901,12 @@ def _plan(platform, weight_dtype, routing_mode=None, **kwargs):
         ),
         # In-kernel routers without the hook plan precomputed top-k.
         ("fp8", None, None, "flashinfer_cutlass_fp8_moe_apply"),
-        ("nvfp4", None, None, "flashinfer_trtllm_nvfp4_routed_moe_apply"),
+        ("nvfp4", None, True, "flashinfer_trtllm_nvfp4_moe_apply"),
+        ("nvfp4", None, False, "flashinfer_trtllm_nvfp4_routed_moe_apply"),
+        ("nvfp4", "kernel_routing", False, ValueError),
+        ("fp8_channel", None, True, "flashinfer_trtllm_fp8_channel_moe_apply"),
+        ("fp8_channel", None, False, "flashinfer_trtllm_fp8_channel_routed_moe_apply"),
+        ("fp8_channel", "kernel_routing", False, ValueError),
         ("mxfp4", None, None, "flashinfer_trtllm_mxfp4_moe_apply"),
     ],
 )
@@ -868,7 +921,8 @@ def test_moe_plan_keeps_in_kernel_routing_only_with_an_fp32_bias(
     calls = []
     # The registered function moe_plan calls; a module reload rebinds only the
     # module's name.
-    kernel = KernelRegistry.get().get_impl("flashinfer_trtllm_unquant_moe_apply")
+    kind = weight_dtype if weight_dtype in ("nvfp4", "fp8_channel") else "unquant"
+    kernel = KernelRegistry.get().get_impl(f"flashinfer_trtllm_{kind}_moe_apply")
     monkeypatch.setattr(
         kernel, "_tokenspeed_fp32_correction_bias", lambda: calls.append(1) or hook
     )
@@ -882,7 +936,7 @@ def test_moe_plan_keeps_in_kernel_routing_only_with_an_fp32_bias(
     plan = _plan(b200_platform, weight_dtype, routing_mode, fp32_correction_bias=True)
     assert plan["apply_kernel_name"] == expected
     assert plan["fp32_correction_bias"] is True
-    kept = expected == "flashinfer_trtllm_unquant_moe_apply"
+    kept = expected == f"flashinfer_trtllm_{kind}_moe_apply"
     assert plan["support_routing"] is kept
     assert plan["supports_precomputed_topk"] is not kept
     assert len(calls) == (hook is not None)
@@ -1095,3 +1149,51 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
         routed, hidden, w, logits, topk_weights=weights, topk_ids=ids.to(torch.int32)
     )
     torch.testing.assert_close(got, want, rtol=2**-6, atol=2**-10)
+
+
+@pytest.mark.parametrize("rows", [1, 8, 64])
+def test_bf16_ungrouped_deferred_routes(rows):
+    w, x = _gpu_bf16_moe_layer(128)
+    w.routing_config = dict(
+        routing_method_type=2,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+        correction_bias=torch.arange(256, device="cuda", dtype=torch.float32) / 256,
+    )
+    plan = kernel_moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        routing_mode="kernel_routing",
+        ep_size=1,
+        ispp=128,
+        hidden=x.shape[1],
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        internal_activation_dtype="input",
+        solution="flashinfer_trtllm",
+        fp32_correction_bias=True,
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+    )
+    kernel_moe_process_weights(plan, w)
+    x = x.expand(rows, -1).contiguous()
+    logits = torch.zeros(rows, 256, device="cuda")
+    expanded, weights, mapping = kernel_moe_apply(plan, x, w, logits, do_finalize=False)
+    assert weights.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        weights, torch.full_like(weights, 0.3125), rtol=0, atol=0
+    )
+    deferred = (
+        (
+            expanded[mapping.long()].reshape(rows, 8, -1).float()
+            * weights.float().unsqueeze(-1)
+        )
+        .sum(dim=1)
+        .bfloat16()
+    )
+    finalized = kernel_moe_apply(plan, x, w, logits)
+    torch.testing.assert_close(deferred, finalized, rtol=2**-6, atol=2**-10)
