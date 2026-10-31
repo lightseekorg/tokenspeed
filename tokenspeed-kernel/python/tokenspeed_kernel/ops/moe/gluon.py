@@ -1097,7 +1097,8 @@ if platform.is_amd:
             device=x.device,
             dtype=x.dtype,
         )
-        launch_gluon_fp8_block_experts_gfx1250(
+        route_rows = torch.empty(num_routes, device=x.device, dtype=torch.int32)
+        sorted_rows = launch_gluon_fp8_block_experts_gfx1250(
             x,
             w.w13_weight,
             w.w2_weight,
@@ -1109,9 +1110,17 @@ if platform.is_amd:
             swiglu_limit,
             intermediate,
             route_output,
+            route_rows=route_rows,
         )
         # Expert programs skip ids outside this rank and leave those rows unset.
-        _combine(route_output, validated_weights, output, validated_ids, num_experts)
+        _combine(
+            route_output,
+            validated_weights,
+            output,
+            validated_ids,
+            num_experts,
+            route_rows=route_rows if sorted_rows else None,
+        )
         return output
 
     _PACKED_FP8_TRAITS = {
