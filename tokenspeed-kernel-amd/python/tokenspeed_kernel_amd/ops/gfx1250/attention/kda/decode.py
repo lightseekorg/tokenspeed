@@ -49,6 +49,15 @@ def _kda_value_splits(batch: int) -> int:
     return max(1, min(8, 16 // triton.next_power_of_2(batch)))
 
 
+def _kda_verify_panel_rows(value_splits: int) -> int:
+    """Value rows a verify program updates per step of its panel loop.
+
+    A program that owns a whole head walks its panels in series, so taller
+    panels mean fewer dependent steps; split programs keep 16-row panels.
+    """
+    return 16 if value_splits > 1 else 64
+
+
 @gluon.jit
 def _kda_conv_step(
     history0, history1, history2, current, weight0, weight1, weight2, weight3
@@ -103,18 +112,16 @@ def _kda_qkvd_indices(head_idx, H: gl.constexpr, D: gl.constexpr):
 
 
 @gluon.jit
-def _kda_value_panels(vectors, D: gl.constexpr, VALUE_LAYOUT: gl.constexpr):
-    """Load the eight 16-wide value panels from a packed Q/K/V/decay row."""
-    return (
-        vectors.slice(2 * D + 0, 16, dim=0).load(VALUE_LAYOUT),
-        vectors.slice(2 * D + 16, 16, dim=0).load(VALUE_LAYOUT),
-        vectors.slice(2 * D + 32, 16, dim=0).load(VALUE_LAYOUT),
-        vectors.slice(2 * D + 48, 16, dim=0).load(VALUE_LAYOUT),
-        vectors.slice(2 * D + 64, 16, dim=0).load(VALUE_LAYOUT),
-        vectors.slice(2 * D + 80, 16, dim=0).load(VALUE_LAYOUT),
-        vectors.slice(2 * D + 96, 16, dim=0).load(VALUE_LAYOUT),
-        vectors.slice(2 * D + 112, 16, dim=0).load(VALUE_LAYOUT),
-    )
+def _kda_value_panels(
+    vectors, D: gl.constexpr, PANEL: gl.constexpr, VALUE_LAYOUT: gl.constexpr
+):
+    """Load the ``PANEL``-wide value panels from a packed Q/K/V/decay row."""
+    panels = ()
+    for panel_idx in gl.static_range(D // PANEL):
+        panels = panels + (
+            vectors.slice(2 * D + panel_idx * PANEL, PANEL, dim=0).load(VALUE_LAYOUT),
+        )
+    return panels
 
 
 @gluon.jit
@@ -461,7 +468,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx1250(
     key_query = raw_key_query * q_scale * k_scale
     write_base = write_page_offset * STATE_PAGE_STRIDE + head_idx * D * D
     output_shared = output_alloc.index(0)
-    value_panels = _kda_value_panels(shared_vectors.index(0), D, value_layout)
+    value_panels = _kda_value_panels(shared_vectors.index(0), D, 16, value_layout)
     output_panels = (
         output_shared.slice(0, 16, dim=0),
         output_shared.slice(16, 16, dim=0),
@@ -563,6 +570,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     TOKENS_PER_SEQUENCE: gl.constexpr,
     TOKEN_WIDTH: gl.constexpr,
     VALUE_SPLITS: gl.constexpr,
+    PANEL: gl.constexpr,
     MIXED_ROW_STRIDE,
     ORIGINAL_QKV_ROW_STRIDE,
     CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
@@ -594,10 +602,11 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
         value_split_idx = 0
     sequence_idx = gl.program_id(1)
 
-    # Physical state tiles are [V, K]; two value rows per wave32 warp keep the
-    # per-panel key reductions inside a wave.
+    # Physical state tiles are [V, K]; whole value rows per wave32 warp keep
+    # the per-panel key reductions inside a wave.
+    NUM_PANELS: gl.constexpr = D // PANEL
     state_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8],
+        [PANEL // 16, 8],
         [2, 16],
         [8, 1],
         [1, 0],
@@ -672,7 +681,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
 
     read_page_offset = read_idx.to(gl.int64)
     read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
-    panel_value_offsets = gl.arange(0, 16, layout=value_layout)
+    panel_value_offsets = gl.arange(0, PANEL, layout=value_layout)
 
     # With one split the same program owns every panel, so a one-deep window
     # carries the next panel's load across iterations. gfx1250 has half the
@@ -687,7 +696,8 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
         raw_pipe = (_raw,)
     else:
         first_offsets = (
-            panel_value_offsets[:, None] + value_split_idx * (8 // VALUE_SPLITS) * 16
+            panel_value_offsets[:, None]
+            + value_split_idx * (NUM_PANELS // VALUE_SPLITS) * PANEL
         ) * D + key_offsets[None, :]
         first_raw = gl.load(state_pool + read_base + first_offsets).to(gl.float32)
 
@@ -851,7 +861,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
             decay = vectors.slice(3 * D, D, dim=0).load(key_layout)
         beta_value = beta_inputs[token_offset].to(gl.float32)
         beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
-        value_panels = _kda_value_panels(vectors, D, value_layout)
+        value_panels = _kda_value_panels(vectors, D, PANEL, value_layout)
         q_values = q_values + (q_value,)
         k_values = k_values + (k_value,)
         decay_values = decay_values + (decay,)
@@ -861,17 +871,17 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
 
     # Assign each panel to one value split. With one split, the same program
     # owns every panel and the pipeline window carries loads between iterations.
-    panels_per_split: gl.constexpr = 8 // VALUE_SPLITS
-    for panel_idx in gl.static_range(8):
+    panels_per_split: gl.constexpr = NUM_PANELS // VALUE_SPLITS
+    for panel_idx in gl.static_range(NUM_PANELS):
         if value_split_idx == panel_idx // panels_per_split:
             if VALUE_SPLITS == 1:
                 panel_offsets = off_pipe[0]
                 running = raw_pipe[0]
                 # Issue the next panel before this panel's stores.
                 next_idx = panel_idx + 1
-                if next_idx < 8:
+                if next_idx < NUM_PANELS:
                     next_offsets = (
-                        panel_value_offsets[:, None] + next_idx * 16
+                        panel_value_offsets[:, None] + next_idx * PANEL
                     ) * D + key_offsets[None, :]
                     next_raw = gl.load(state_pool + read_base + next_offsets).to(
                         gl.float32
@@ -886,7 +896,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
                 running = first_raw
             else:
                 panel_offsets = (
-                    panel_value_offsets[:, None] + panel_idx * 16
+                    panel_value_offsets[:, None] + panel_idx * PANEL
                 ) * D + key_offsets[None, :]
                 running = gl.load(state_pool + read_base + panel_offsets).to(gl.float32)
 
@@ -910,7 +920,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
                     output
                     + output_base
                     + token_offset * H * D
-                    + panel_idx * 16
+                    + panel_idx * PANEL
                     + panel_value_offsets,
                     panel_out.to(output.dtype.element_ty),
                     mask=token_offset < token_count,
@@ -920,7 +930,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
                     + slot * u_slot_stride
                     + head_idx * u_head_stride
                     + ((start + token_offset) % CAPACITY) * u_pos_stride
-                    + panel_idx * 16
+                    + panel_idx * PANEL
                     + panel_value_offsets,
                     delta,
                     mask=token_offset < token_count,
@@ -1528,6 +1538,7 @@ def gluon_kda_fused_verify_gfx1250(
         TOKENS_PER_SEQUENCE=draft_token_num,
         TOKEN_WIDTH=triton.next_power_of_2(draft_token_num),
         VALUE_SPLITS=value_splits,
+        PANEL=_kda_verify_panel_rows(value_splits),
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
         ORIGINAL_QKV_ROW_STRIDE=(0 if original_qkv is None else original_qkv.stride(0)),
         CONV_WEIGHT_ROW_STRIDE=conv_weights.stride(0),

@@ -1545,9 +1545,11 @@ Standard target decode is a one-token verify window. Both standard and
 speculative decode follow verify, acceptance, and commit. Verify retains
 the Gluon fused convolution, LDS vectors and batched value-split selection.
 GFX950 uses 32-row state panels for one-token windows with a bounded gate
-and no value split. Other cases use 16-row panels. Verify preserves committed
-FP32 or BF16 state and widens it to FP32. It saves correction U in FP32,
-and unnormalized K and raw gate in the activation dtype.
+and no value split. GFX1250 uses 64-row panels whenever a program owns a
+whole head (no value split, from 16 requests), which cuts its serial panel
+steps from eight to two. Other cases use 16-row panels. Verify preserves
+committed FP32 or BF16 state and widens it to FP32. It saves correction U
+in FP32, and unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
 the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
