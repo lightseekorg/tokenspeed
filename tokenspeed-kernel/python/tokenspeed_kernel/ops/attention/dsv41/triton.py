@@ -1359,7 +1359,7 @@ def _compressor_pool(
     channels = tl.arange(0, 512)
     live = tl.load(ACTIVE + row * A0)
     previous = tl.load(PREVIOUS + row * P0)
-    slot = tl.load(SLOTS + row * S0)
+    slot = tl.load(SLOTS + row * S0).to(tl.int64)
     in_current = live & (previous >= 0) & (previous < N)
     # Pool capacity changes when startup replaces the probe arena. Widen
     # before multiplying so a runtime int32 page count cannot wrap the bound.

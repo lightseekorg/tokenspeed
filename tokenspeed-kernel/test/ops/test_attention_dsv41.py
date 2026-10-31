@@ -993,24 +993,25 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     assert not torch.any(actual[~active])
 
 
-def test_compressor_pool_token_count_does_not_recompile(device):
-    """Every prefill brings a new token count; the kernel must not key its
-    compile cache on the row count."""
-    tail = torch.randn(5, 2, 2, 512, device=device)
+def test_compressor_pool_token_count_and_capacity_do_not_recompile(device):
+    """Token counts and tail capacities must not key the compile cache."""
 
-    def run(count):
+    def run(count, pages):
+        tail = torch.empty(pages, 2, 2, 512, device=device)
+        tail[-1].normal_()
         projection = torch.randn(count, 1024, device=device)
         content, scores = projection[:, :512], projection[:, 512:]
         previous = torch.arange(count, device=device) - 1
-        slots = torch.full((count,), 2, device=device, dtype=torch.int32)
+        slots = torch.full((count,), pages * 2 - 1, device=device, dtype=torch.int32)
         active = torch.arange(count, device=device) % 2 == 1
+        active[0] = True
         pooled = dsv41.compressor_pool(
             content, scores, previous, tail, slots, active, None, None, 0.0
         )
         # Row 0 pairs with the tail slot; every later active row pairs with
         # its predecessor in this forward.
-        prior_content = torch.cat([tail[1, 0, 0][None], content[:-1]])
-        prior_scores = torch.cat([tail[1, 0, 1][None], scores[:-1]])
+        prior_content = torch.cat([tail[-1, 1, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[-1, 1, 1][None], scores[:-1]])
         maximum = torch.maximum(prior_scores, scores)
         old_exp = torch.exp(prior_scores - maximum)
         new_exp = torch.exp(scores - maximum)
@@ -1018,13 +1019,14 @@ def test_compressor_pool_token_count_does_not_recompile(device):
         expected[~active] = 0
         torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-6)
 
-    # Warm both integer-specialization classes (16-divisible and not); Triton
-    # still keys on those two properties for runtime scalars.
-    run(32)
-    run(33)
+    # Warm at a fixed capacity, then vary both token count and capacity.
+    run(32, 5)
+    run(33, 5)
     with assert_no_triton_compile(implementation._compressor_pool):
-        for count in (48, 97, 130, 1483, 4096):
-            run(count)
+        for count, pages in ((48, 3), (97, 16), (130, 17), (1483, 32), (4096, 33)):
+            run(count, pages)
+        # The last page starts at 2**31 FP32 elements, beyond int32 offsets.
+        run(32, (1 << 20) + 1)
 
 
 def _native_available():
