@@ -18,24 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Full garbage collections of a scheduler process, out of the way of serving.
+"""Full garbage collections of a rank's data plane, out of the way of serving.
 
-Startup leaves millions of long-lived Python objects in a scheduler process:
-imported modules, the model's modules and parameters, captured graphs, kernel
-and compile caches. A full (generation 2) collection walks all of them, which
-takes hundreds of milliseconds, and CPython starts one whenever enough objects
-have survived the young generations -- on each rank at its own moment. Every
-round waits on the whole parallel group, so each rank's pause stalls every
-rank.
+The control plane runs in Rust (``ts-host``); the interpreter it embeds runs
+the data plane, and startup leaves millions of long-lived Python objects
+there: imported modules, the model's modules and parameters, captured graphs,
+kernel and compile caches. A full (generation 2) collection walks all of
+them, which takes hundreds of milliseconds while holding the GIL, so the
+forward thread stops launching and the control thread's completion queries
+wait. CPython starts one whenever enough objects have survived the young
+generations -- on each rank at its own moment. Every round waits on the whole
+parallel group, so each rank's pause stalls every rank.
 
 ``freeze_startup_heap`` runs once, at the end of startup. It moves the startup
 objects into the permanent generation (``gc.freeze``), which no collection
 walks, and raises the generation-2 threshold far enough that CPython does not
-start full collections by itself while the loop runs its own. ``GcHooks``
-runs one every ``FULL_COLLECTION_INTERVAL`` forwarded rounds. That count is
-the same on every rank, so all ranks collect in the same round, and each
-collection walks only the objects serving keeps alive. The young generations
-keep their automatic collections.
+start full collections by itself while the data plane runs its own.
+``GcHooks`` runs one on the forward thread every ``FULL_COLLECTION_INTERVAL``
+forwarded rounds. That count is the same on every rank, so all ranks collect
+in the same round, and each collection walks only the objects serving keeps
+alive. The young generations keep their automatic collections.
 """
 
 from __future__ import annotations
@@ -48,9 +50,11 @@ __all__ = ["FULL_COLLECTION_INTERVAL", "GcHooks", "freeze_startup_heap"]
 logger = logging.getLogger(__name__)
 
 # Forwarded rounds between two full collections: about 15 s of decoding at a
-# 15 ms step. With the startup objects frozen, one collection walks only what
-# serving keeps alive, mostly the requests' token lists: a few milliseconds
-# for 128 requests of 9K tokens.
+# 15 ms step; longer on an EPD encode rank, whose vision-tower batches take
+# longer. With the startup objects frozen, one collection walks only what
+# serving keeps alive in Python: each admitted request's sampling parameters,
+# stop criteria and multimodal inputs. Its tokens live in the Rust control
+# plane, so the walk does not grow with the requests' lengths.
 FULL_COLLECTION_INTERVAL = 1024
 
 # The generation-2 threshold while serving: how many generation-1 collections
@@ -79,10 +83,12 @@ def freeze_startup_heap() -> None:
 class GcHooks:
     """Runs a full garbage collection every N forwarded rounds.
 
-    Self-contained: it depends only on its interval. The loop calls
-    ``note_round`` after it submits each round's forward, with the same
-    rank-identical flag the expert rebalance counts (a real or a DP-idle
-    forward), so every rank collects in the same round.
+    Self-contained: it depends only on its interval. The data plane calls
+    ``note_round`` on the forward thread with a flag that is the same on
+    every rank, so every rank collects in the same round: a language-model
+    rank after it launches each round's forward (a real or a DP-idle one, as
+    the expert rebalance counts), an EPD encode rank after each vision-tower
+    batch, which every rank of its group forms alike.
     """
 
     def __init__(self, *, full_collection_interval: int) -> None:

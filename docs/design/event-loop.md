@@ -356,10 +356,11 @@ JIT mark: it collects once, freezes the survivors (`gc.freeze`: no later
 collection walks them) and raises the generation-2 threshold far enough that
 CPython does not start full collections by itself. The data plane's
 `GcHooks` runs one on the forward thread every `FULL_COLLECTION_INTERVAL`
-forwarded rounds, a count that is the
-same on every rank, so the ranks collect in the same round and each
-collection walks only what serving keeps alive. The young generations still
-collect automatically.
+forwarded rounds, a count that is the same on every rank, so the ranks
+collect in the same round and each collection walks only what serving keeps
+alive. An EPD encode rank does the same and counts its vision-tower batches,
+which every rank of its attention-TP group forms alike. The young
+generations still collect automatically.
 
 ### Profiling the issuing thread
 
