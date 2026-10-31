@@ -40,7 +40,7 @@ SMG_PACKAGES = (
 
 
 def nightly_date(version: Version) -> int | None:
-    """The YYYYMMDD date of a dated nightly version, else None."""
+    """Return the YYYYMMDD date of a dated nightly version, else None."""
     if (
         version.post is None
         or version.pre is not None
@@ -83,7 +83,7 @@ def newest_smg_nightly(releases: dict[str, list[str]], date: str) -> dict[str, s
 
 
 def pypi_releases(json_api: str, package: str) -> list[str]:
-    """Versions of ``package`` with at least one non-yanked file on a PyPI JSON API."""
+    """List versions of ``package`` with any non-yanked file on a PyPI JSON API."""
     with urllib.request.urlopen(f"{json_api}/{package}/json", timeout=60) as response:
         releases = json.load(response)["releases"]
     return [

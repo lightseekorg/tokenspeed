@@ -78,16 +78,20 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
 
 def test_newest_smg_nightly_comes_from_one_build_on_or_before_the_date():
     releases = {
-        # 20261001 lacks the servicer; 20261003 is after the nightly date.
+        # 20261001 lacks the servicer; 20261003 is after the nightly date. The
+        # gateway and protocol were re-released for 20260930 under higher
+        # versions, listed after and before the first build respectively.
         "tokenspeed-smg": [
             "1.12.0",
             "1.12.0.post20260929",
             "1.13.0.post20260930",
+            "1.13.1.post20260930",
             "1.13.0.post20261001",
             "1.13.0.post20261003",
         ],
         "tokenspeed-smg-grpc-proto": [
             "0.4.26.post20260929",
+            "0.4.28.post20260930",
             "0.4.27.post20260930",
             "0.4.27.post20261001",
             "0.4.27.post20261003",
@@ -100,7 +104,11 @@ def test_newest_smg_nightly_comes_from_one_build_on_or_before_the_date():
             "0.14.0.post20261003",
         ],
     }
-    assert NEWEST_SMG(releases, "20261002") == SMG_0930
+    assert NEWEST_SMG(releases, "20261002") == {
+        "tokenspeed-smg": "1.13.1.post20260930",
+        "tokenspeed-smg-grpc-proto": "0.4.28.post20260930",
+        "tokenspeed-smg-grpc-servicer": "0.14.0.post20260930",
+    }
     assert NEWEST_SMG(releases, "20260929") == {
         "tokenspeed-smg": "1.12.0.post20260929",
         "tokenspeed-smg-grpc-proto": "0.4.26.post20260929",
