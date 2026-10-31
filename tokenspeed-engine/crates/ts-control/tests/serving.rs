@@ -3815,11 +3815,55 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
             *engine.ranks[rank].device_ops.lock().unwrap(),
             ["UpdateWeightFromDiskReqInput"]
         );
-        assert_eq!(*engine.ranks[rank].weight_commits.lock().unwrap(), [true]);
     }
+    assert_weight_commits(&engine, &[true]).await;
     // Serving goes on.
     let chunks = run(&engine.client, request("r", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+/// Wait until every rank recorded `expected` weight commits. The reply
+/// comes from one rank once the replica agreed; its peers record their own
+/// commit right after the same agreement, on their own threads.
+async fn assert_weight_commits(engine: &Engine, expected: &[bool]) {
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while !engine
+            .ranks
+            .iter()
+            .all(|rank| *rank.weight_commits.lock().unwrap() == expected)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if settled.is_err() {
+        let commits: Vec<Vec<bool>> = engine
+            .ranks
+            .iter()
+            .map(|rank| rank.weight_commits.lock().unwrap().clone())
+            .collect();
+        panic!("weight commits {commits:?}, expected {expected:?} on every rank");
+    }
+}
+
+/// Flush until every engine accepts: a request that just finished (or a
+/// Host cache op still in flight) refuses a flush for a round or two.
+async fn flush_until_idle(engine: &Engine) {
+    let flush = ControlRequest::FlushCache(FlushCacheReqInput {
+        rid: None,
+        http_worker_ipc: None,
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while control(engine, flush.clone())
+            .await
+            .iter()
+            .any(|(_, ok)| !ok)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the engine did not go idle");
 }
 
 fn disk_load() -> ControlRequest {
@@ -3873,28 +3917,12 @@ async fn a_refused_weight_flush_commits_nothing_and_can_be_retried() {
         for rank in &engine.ranks {
             rank.ack_gate.open();
         }
-        let flush = ControlRequest::FlushCache(FlushCacheReqInput {
-            rid: None,
-            http_worker_ipc: None,
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while control(&engine, flush.clone())
-                .await
-                .iter()
-                .any(|(_, ok)| !ok)
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("Host stores did not drain");
+        flush_until_idle(&engine).await;
         assert!(control(&engine, disk_load())
             .await
             .iter()
             .all(|(_, success)| *success));
-        for rank in &engine.ranks {
-            assert_eq!(*rank.weight_commits.lock().unwrap(), [true]);
-        }
+        assert_weight_commits(&engine, &[true]).await;
         assert_eq!(
             tokens(&run(&engine.client, request("after-retry", 3, budget(2))).await),
             [1000, 1001]
@@ -3938,13 +3966,20 @@ async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
             for rank in &engine.ranks {
                 rank.weight_load_refused.store(false, Ordering::SeqCst);
             }
-            assert!(control(&engine, disk_load())
-                .await
-                .iter()
-                .all(|(_, success)| *success));
-            for rank in &engine.ranks {
-                assert_eq!(*rank.weight_commits.lock().unwrap(), [true]);
-            }
+            // The retry's flush can race the request that just finished; a
+            // refused flush loads and commits nothing, so send it again.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while control(&engine, disk_load())
+                    .await
+                    .iter()
+                    .any(|(_, success)| !success)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the retried load never succeeded");
+            assert_weight_commits(&engine, &[true]).await;
             // An admitted load flushes as asked.
             let chunks = run(&engine.client, request("after-retry", 65, budget(2))).await;
             assert_eq!(tokens(&chunks), [1000, 1001]);
@@ -3971,9 +4006,7 @@ async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
         assert!(replies
             .iter()
             .all(|(tag, success)| { *tag == "UpdateWeightFromDiskReqOutput" && !success }));
-        for rank in &engine.ranks {
-            assert_eq!(*rank.weight_commits.lock().unwrap(), [false]);
-        }
+        assert_weight_commits(&engine, &[false]).await;
     }
 }
 
