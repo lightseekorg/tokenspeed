@@ -18,12 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused block-FP8 DP column and row projections on GB300."""
+"""Fused block-FP8 DP column and row projections and the fused paged-row
+all-gather on GB300."""
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.fabric import multicast_reachable
+from tokenspeed_kernel.ops.communication.multimem import multimem_available
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -34,6 +38,7 @@ from tokenspeed_kernel.signature import (
     ScaleFormat,
     dense_tensor_format,
     format_signature,
+    format_signatures,
     tensor_format,
 )
 
@@ -41,9 +46,18 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection import (
         FusedTPProjectionState,
     )
+    from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
+        PagedRowAllGatherState,
+    )
+
+logger = logging.getLogger(__name__)
 
 cute_dsl_fused_fp8_dp_column_linear = error_fn
 cute_dsl_fused_fp8_dp_row_linear = error_fn
+cute_dsl_paged_row_all_gather = error_fn
+
+# The paged-row all-gather's modes, in the order a mode code numbers them.
+_PAGED_ROW_ALL_GATHER_MODES = ("multicast", "peer")
 
 
 def create_fused_tp_column_projection_state(
@@ -170,6 +184,141 @@ def fused_tp_row_projection_supported(
         and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) == (10, 3)
         and torch.cuda.get_device_properties(device).multi_processor_count == 152
+    )
+
+
+def create_paged_row_all_gather_state(
+    group: dist.ProcessGroup,
+    device: torch.device,
+    *,
+    row_bytes: int,
+    cap_bytes: int,
+    timeout_ns: int,
+    modes: tuple[str, ...],
+    eligible: bool,
+) -> "PagedRowAllGatherState | None":
+    """Collectively build, compile and warm a paged-row all-gather, or agree
+    that the group keeps its existing all-gather.
+
+    Every rank of the group calls this at the same program point, before
+    graph capture and before the KV cache is sized. Every refusal is voted on
+    before any rank returns, so all ranks take the same branch; what is voted
+    on, what is fatal instead, and the contract a caller keeps are in the
+    ``communication`` README.
+
+    Args:
+        group: CPU (gloo) process group over the 2, 4 or 8 gather ranks; the
+            CUDA symmetric-memory backend exchanges handles through its store.
+            Without the fabric map (``gather_fabric_map``, which the server's
+            distributed initializer gathers) the group keeps its all-gather.
+        device: This rank's CUDA device, with its index.
+        row_bytes: Bytes per cache row, a multiple of 16; equal on every rank.
+        cap_bytes: Receive bytes per rank and slot, a whole number of rows;
+            equal on every rank.
+        timeout_ns: Bound of every in-kernel wait; a peer that does not reach
+            the same window within it fails the kernel with a trap.
+        modes: Modes in preference order, from ``multicast`` (one NVLink
+            multicast store reaches every peer) and ``peer`` (a store per
+            peer); equal on every rank.
+        eligible: The caller's own verdict for this rank, voted on with the
+            rest.
+
+    Returns:
+        A state whose first window (epoch 1) has run, or None on every rank.
+    """
+    # Bad arguments are a caller's bug; they are voted on like any refusal and
+    # raised afterwards, so no peer waits in a vote this rank never joins.
+    modes_ok = (
+        bool(modes)
+        and len(set(modes)) == len(modes)
+        and all(mode in _PAGED_ROW_ALL_GATHER_MODES for mode in modes)
+    )
+    degree = group.size()
+    ranks = dist.get_process_group_ranks(group)
+    local_ok = (
+        modes_ok
+        and eligible
+        and current_platform().is_nvidia
+        and device.type == "cuda"
+        and device.index is not None
+        and torch.cuda.get_device_capability(device) == (10, 3)
+        and degree in (2, 4, 8)
+        and row_bytes > 0
+        and row_bytes % 16 == 0
+        and cap_bytes > 0
+        and cap_bytes % row_bytes == 0
+        # Store offsets inside a rank's part of a slot stay int32 in the kernel.
+        and degree * cap_bytes < 2**31
+    )
+    if local_ok:
+        # A rendezvous over hosts the fabric cannot map would hang.
+        local_ok = multicast_reachable(group)
+    multicast = False
+    if local_ok:
+        with torch.cuda.device(device):
+            multicast = multimem_available()
+        # Imported only where the platform can load it, and before the vote:
+        # a rank failing after it would leave its peers waiting in the next.
+        try:
+            from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
+                build_paged_row_all_gather_state,
+            )
+        except Exception as exc:  # noqa: BLE001 - local failure is voted on
+            logger.warning(
+                f"paged_row_all_gather: kernel module import failed: {exc!r}"
+            )
+            local_ok = False
+    mode_code = (
+        sum(
+            (_PAGED_ROW_ALL_GATHER_MODES.index(mode) + 1) * 3**i
+            for i, mode in enumerate(modes)
+        )
+        if modes_ok
+        else -1
+    )
+    # MIN over the group; a negated value gives its MAX, so equal parameters
+    # show as MIN == MAX.
+    votes = torch.tensor(
+        [
+            int(local_ok),
+            int(multicast),
+            row_bytes,
+            -row_bytes,
+            cap_bytes,
+            -cap_bytes,
+            mode_code,
+            -mode_code,
+        ],
+        dtype=torch.int64,
+    )
+    dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
+    ok, all_multicast, *bounds = votes.tolist()
+    if not modes_ok:
+        raise ValueError(
+            f"modes must be distinct, non-empty and drawn from "
+            f"{_PAGED_ROW_ALL_GATHER_MODES}, got {modes}"
+        )
+    if ok and any(low != -high for low, high in zip(bounds[::2], bounds[1::2])):
+        raise ValueError(
+            "paged_row_all_gather: row_bytes, cap_bytes or modes differ across "
+            f"ranks {ranks}"
+        )
+    if not ok:
+        if group.rank() == 0:
+            logger.info(
+                f"paged_row_all_gather: ranks {ranks} keep their all-gather (a rank "
+                "is not eligible, or lacks the GB300 platform, group size, fabric "
+                "or kernel module)"
+            )
+        return None
+    return build_paged_row_all_gather_state(
+        group,
+        device,
+        row_bytes=row_bytes,
+        cap_bytes=cap_bytes,
+        timeout_ns=timeout_ns,
+        modes=modes,
+        multicast=bool(all_multicast),
     )
 
 
@@ -304,3 +453,52 @@ if current_platform().is_nvidia:
         return state.run(
             inputs, weight, weight_scales, owner_rows, out, input_scales=input_scales
         )
+
+    @register_kernel(
+        "communication",
+        "paged_row_all_gather",
+        name="cute_dsl_paged_row_all_gather",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("fetch_slots",), "dense", {torch.int32}),
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_paged_row_all_gather(
+        state: "PagedRowAllGatherState",
+        plane: torch.Tensor,
+        fetch_slots: torch.Tensor,
+        owned: int,
+        send_rows: int,
+        header: int,
+    ) -> tuple[int, torch.cuda.Event]:
+        """All-gather paged cache rows, packed, into the next epoch's slot.
+
+        Every rank stores its ``fetch_slots[:owned]`` rows of ``plane`` into
+        rows ``[rank * send_rows, rank * send_rows + owned)`` of every rank's
+        slot, on ``state.stream`` after the current stream's work so far;
+        rows ``[owned, send_rows)`` of each rank are not written. The
+        caller's contract (the same windows in the same order on every rank,
+        one epoch per slot in use) is in the ``communication`` README.
+
+        Args:
+            state: From ``create_paged_row_all_gather_state``.
+            plane: ``[rows, *row]`` cache rows of any dtype on the state's
+                device, contiguous, ``row_bytes`` per row, 16-byte aligned.
+            fetch_slots: 1-D int32 tensor on the state's device: this rank's
+                plane rows in send order, at least ``max(owned, 1)`` entries.
+            owned: This rank's row count, ``0 <= owned <= send_rows``.
+            send_rows: Rows reserved per rank, equal on every rank, with
+                ``send_rows * row_bytes <= cap_bytes``.
+            header: Window identity, equal on every rank, below 2**63; a
+                mismatch fails the kernel.
+
+        Returns:
+            The window's epoch, whose slot ``state.receive_view(epoch)`` is,
+            and the event recorded after the kernel, which the slot's readers
+            wait for; the launch of ``epoch + 2`` records it again.
+        """
+        return state.launch(plane, fetch_slots, owned, send_rows, header)
