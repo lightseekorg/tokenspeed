@@ -872,15 +872,12 @@ class _CpuFusedDsaKernels:
         total.fill_(1)
         return out
 
-    def merge_lse_direct(
-        self, output, maximum, total, peer_inputs, *, group, rank_size, setup_mode
-    ):
+    def merge_lse_direct(self, output, maximum, total, *, group, rank_size):
         rank = {"fused-dsa": 0}[group]
-        assert setup_mode == 0
-        # Resolve the registered IPC table, then include the original producer.
-        peers = self.peer_outputs[peer_inputs].expand(-1, 64, self.rows, 512).clone()
-        maxima = self.peer_maximum[peer_inputs].expand(-1, self.rows, 64).clone()
-        sums = self.peer_sum[peer_inputs].expand_as(maxima).clone()
+        # Resolve the communicator peers, then include the original producer.
+        peers = self.peer_outputs[:rank_size].expand(-1, 64, self.rows, 512).clone()
+        maxima = self.peer_maximum[:rank_size].expand(-1, self.rows, 64).clone()
+        sums = self.peer_sum[:rank_size].expand_as(maxima).clone()
         peers[rank].copy_(output)
         maxima[rank].copy_(maximum[0])
         sums[rank].copy_(total[0])
@@ -999,8 +996,8 @@ def _collective_dsa_worker(rank, rendezvous):
                 # model has configured native buffers for larger shapes.
                 backend.configure_fused_decode(
                     group="fused-dsa",
+                    ranks=tuple(backend._dcp.ranks),
                     attention_outputs={64: (torch.empty(64, 64, 512),)},
-                    peer_inputs={64: torch.arange(degree)},
                 )
                 query = torch.full((rows, 8, 576), rank, dtype=torch.bfloat16)
                 layer = SimpleNamespace(layer_id=0, scaling=1.0)
@@ -1163,8 +1160,8 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
     )
     backend.configure_fused_decode(
         group="fused-dsa",
+        ranks=tuple(backend._dcp.ranks),
         attention_outputs={rows: outputs},
-        peer_inputs={rows: torch.arange(degree)},
     )
     local_heads = 64 // degree
     packed_query = torch.zeros(degree, rows, local_heads, 576, dtype=torch.bfloat16)
@@ -1216,14 +1213,14 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
     )
 
 
-def test_dsa_rejects_ipc_resources_for_a_different_cp_group(monkeypatch):
+def test_dsa_rejects_resources_for_a_different_cp_group(monkeypatch):
     backend = _fused_backend(monkeypatch, 64, degree=4)
     outputs = (torch.empty(64, 64, 512), torch.empty(1, 64, 64), torch.empty(1, 64, 64))
     with pytest.raises(ValueError, match="cover the CP group"):
         backend.configure_fused_decode(
             group="fused-dsa",
+            ranks=tuple(range(8)),
             attention_outputs={64: outputs},
-            peer_inputs={64: torch.arange(8)},
         )
     assert backend._fused_group is None
 
@@ -1253,8 +1250,8 @@ def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
     outputs = (torch.empty(64, 64, 512), torch.empty(1, 64, 64), torch.empty(1, 64, 64))
     backend.configure_fused_decode(
         group="fused-dsa",
+        ranks=tuple(backend._dcp.ranks),
         attention_outputs={64: outputs},
-        peer_inputs={64: torch.arange(8)},
     )
     selection = dataclasses.replace(selection, query=torch.empty(8, 65, 8, 576))
     with pytest.raises(ValueError, match="prepared"):

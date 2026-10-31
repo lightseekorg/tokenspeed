@@ -162,11 +162,7 @@ class FusedDSADecode:
                 raise ValueError("Fused DSA RoPE requires 64 adjacent-pair channels")
             self.cos_sin = self.rotary_emb.cos_sin_cache.float().contiguous().npu()
         else:
-            self.cos_sin = torch.zeros((1, 64), dtype=torch.float32, device="npu")
-        self.nope_positions = {
-            rows: torch.zeros(rows, dtype=torch.int64, device="npu")
-            for rows in (64, 128, 256, 512)
-        }
+            self.cos_sin = None
         self.window = None
         self.outputs = {
             rows: tuple(
@@ -175,8 +171,6 @@ class FusedDSADecode:
                     (8, rows, 8, 576),
                     (rows, 64, 128),
                     (rows, 64),
-                    (rows, 1536),
-                    (rows, 768),
                 )
             )
             for rows in (64, 128, 256, 512)
@@ -185,10 +179,7 @@ class FusedDSADecode:
     def prolog(self, hidden, positions, ctx):
         if self.window is None:
             raise RuntimeError("Initialize DSA transport before forward/capture")
-        query, index_query, score, all_qnorm, all_aux = self.outputs[hidden.shape[0]]
-        torch.npu.set_stream_limit(
-            torch.npu.current_stream(), cube_num=24, vector_num=48
-        )
+        query, index_query, score = self.outputs[hidden.shape[0]]
         pool = ctx.token_to_kv_pool
         placement = ctx.attn_backend.cache_placement(self.attention_layer)
         locations = ctx.attn_backend.write_locations(
@@ -217,7 +208,7 @@ class FusedDSADecode:
                 )
             positions = positions.to(dtype=torch.int64).contiguous()
         else:
-            positions = self.nope_positions[hidden.shape[0]]
+            positions = None
         self.kernels.fused_prolog(
             hidden.contiguous(),
             self.down,
@@ -228,25 +219,16 @@ class FusedDSADecode:
             self.qb,
             self.uk,
             self.window,
-            query,
-            index_query,
-            score,
             kv,
             index_k,
             slots,
-            all_qnorm,
-            all_aux,
-            "dsa_prolog_fused",
-            self.eps_q,
-            self.eps_kv,
-            self.eps_index,
-            self.rank * 8,
-            24,
-            0,
-            64,
-            0,
-            4,
-            rotary=(positions, self.cos_sin, self.rotary_mode),
+            eps_q=self.eps_q,
+            eps_kv=self.eps_kv,
+            eps_index=self.eps_index,
+            positions=positions,
+            cos_sin=self.cos_sin,
+            rotary_mode=self.rotary_mode,
+            out=(query, index_query, score),
         )
         return query, index_query, score
 
@@ -751,7 +733,6 @@ class AscendDSARuntime:
         self.resources = prepare_dsa_resources(group=name, rank=rank)
         self.window = self.resources.window
         self.outputs = self.resources.outputs
-        self.tables = self.resources.tables
         self.backends = weakref.WeakSet()
         self.runtimes = []
         self.closed = False
@@ -788,8 +769,8 @@ class AscendDSARuntime:
                     raise ValueError("DSA model and cache backend groups differ")
                 node.configure_fused_decode(
                     group=self.group,
+                    ranks=self.ranks,
                     attention_outputs=self.outputs,
-                    peer_inputs=self.tables,
                 )
                 found = True
             pending.extend(node.child_backends())
@@ -810,7 +791,6 @@ class AscendDSARuntime:
         self.resources = None
         self.window = None
         self.outputs.clear()
-        self.tables.clear()
         self.runtimes.clear()
         self.backends.clear()
         self.closed = True

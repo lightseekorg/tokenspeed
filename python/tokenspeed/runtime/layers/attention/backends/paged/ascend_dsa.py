@@ -168,7 +168,6 @@ class AscendDSABackend(DSABackend):
         self._indexer_kernels = ascend_dsa_kernels()
         self._fused_group: str | None = None
         self._fused_attention_outputs: dict[int, tuple] = {}
-        self._fused_peer_inputs: dict[int, torch.Tensor] = {}
         self._collective_context: AscendDCPContext | None = None
         self._ascend_placement: _AscendCachePlacement | None = None
         if dcp.degree > 1:
@@ -412,19 +411,18 @@ class AscendDSABackend(DSABackend):
         self,
         *,
         group: str,
+        ranks: tuple[int, ...],
         attention_outputs: dict[int, tuple],
-        peer_inputs: dict[int, torch.Tensor],
     ) -> None:
         """Bind CP resources and stable producer outputs outside capture."""
         if self._dcp.degree <= 1 or not group:
             raise ValueError("DSA fusion requires a context-parallel communicator")
-        if not attention_outputs or set(attention_outputs) != set(peer_inputs):
-            raise ValueError("Fused DSA requires IPC-registered SFA outputs")
-        if any(table.shape != (self._dcp.degree,) for table in peer_inputs.values()):
-            raise ValueError("Fused DSA IPC tables must cover the CP group")
+        if tuple(ranks) != tuple(self._dcp.ranks):
+            raise ValueError("Fused DSA resources must cover the CP group ranks")
+        if not attention_outputs:
+            raise ValueError("Fused DSA requires prepared SFA producer outputs")
         self._fused_group = group
         self._fused_attention_outputs = attention_outputs
-        self._fused_peer_inputs = peer_inputs
 
     def _context_collectives(self) -> AscendDCPContext:
         """Use the existing device group for shapes without native fusion."""
@@ -742,10 +740,7 @@ class AscendDSABackend(DSABackend):
                 "Initialize fused DSA resources before context-parallel execution"
             )
         rows = selection.query.shape[1]
-        if (
-            rows not in self._fused_attention_outputs
-            or rows not in self._fused_peer_inputs
-        ):
+        if rows not in self._fused_attention_outputs:
             raise ValueError("Fused DSA LSE requires a prepared [64,T,512] SFA shape")
         output, softmax_max, softmax_sum = kernels.attention_partial(
             selection.query,
@@ -765,10 +760,8 @@ class AscendDSABackend(DSABackend):
             output,
             softmax_max,
             softmax_sum,
-            self._fused_peer_inputs[rows],
             group=self._fused_group,
             rank_size=self._dcp.degree,
-            setup_mode=0,
         )
         return (
             result
