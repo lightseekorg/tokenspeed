@@ -140,7 +140,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
 
         def set_cache_pool(self, target, draft):
             self.generation += 1
-            events.append(("rebind", self.generation, target, draft))
+            events.append(("rebind", self.generation, target.name, draft))
 
         def capture_graphs(self, *, entries, observer):
             events.append(("capture", self.generation, entries))
@@ -159,7 +159,10 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         return SimpleNamespace(
             attn_backend=None,
             draft_attn_backend=None,
-            token_to_kv_pool=f"target{pool_generation[0]}",
+            token_to_kv_pool=SimpleNamespace(
+                name=f"target{pool_generation[0]}",
+                arena=SimpleNamespace(runtime_contract=None),
+            ),
             draft_token_to_kv_pool=f"draft{pool_generation[0]}",
             profiled_cache_bytes=4096,
         )
@@ -195,6 +198,12 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         lambda pool: SimpleNamespace(prefix_granularity=1),
     )
     monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", lambda pool: [])
+    # No Host cache: the boot builds its executor, if any, before the capture.
+    monkeypatch.setattr(
+        device,
+        "_retraction_pool_request",
+        lambda *args, **kwargs: SimpleNamespace(disabled=True),
+    )
     args = SimpleNamespace(
         disaggregation_mode="null",
         chunked_prefill_size=8192,
@@ -203,6 +212,8 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         disable_cudagraph_memory_reserve=not reserve,
         enforce_eager=False,
         enable_memory_saver=False,
+        enable_kvstore=False,
+        spec_context_pad=0,
         device="cuda",
         speculative_algorithm=algorithm,
     )
@@ -259,7 +270,11 @@ def _handle(trace, **kwargs):
             execute_forward_op=lambda *a, **k: trace.append("forward"),
             complete_pending_drafting=lambda: None,
             execution_stream="execution-stream",
-            default_stream="default-stream",
+            # Named in the submissions; the handle's own waits on it land in
+            # the trace.
+            default_stream=SimpleNamespace(
+                wait_stream=lambda stream: trace.append(("default waits", stream))
+            ),
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
                 ("candidates", idx, list(ids))
             ),
@@ -553,11 +568,12 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
     """The plan's order is the correctness order for same-round page reuse:
     the write-backs are submitted ahead of the new owner's zeroing (a
     stream-ordered snapshot copy lands its fence on the default stream the
-    zeroing runs on), and the load-backs target zeroed pages. Every stream is
-    named: the copies are told which stream wrote the pages and which one
-    the fence lands on; the loads are told which stream zeroed their
-    destinations. The executor sees the plan's cache ops once, adapted, and
-    the same tuple on both submissions."""
+    zeroing runs on), and the load-backs go behind the zeroing and the
+    forwards in flight (one may still write a block an abort freed). Every
+    stream is named: the copies are told which stream wrote the pages and
+    which one the fence lands on; the loads are told the stream they order
+    after. The executor sees the plan's cache ops once, adapted, and the same
+    tuple on both submissions."""
     trace: list = []
     store, load = _WriteBackOp("store"), _LoadBackOp("load")
     plan = _plan(pages_to_zero=[3, 4], cache=[store, load])
@@ -579,14 +595,16 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
 
     _execute(handle, plan, None)
 
+    default = handle._executor.default_stream
     assert trace == [
-        ("write_backs", (store, load), "execution-stream", "default-stream"),
+        ("write_backs", (store, load), "execution-stream", default),
         ("zero", {"kv": (3, 4)}),
-        ("load_backs", (store, load), "default-stream"),
+        ("default waits", "execution-stream"),
+        ("load_backs", (store, load), default),
     ]
     # Polling only reads the acknowledgments: it submits nothing.
     assert handle.poll_cache_results() == ["done"]
-    assert len(trace) == 3
+    assert len(trace) == 4
 
 
 def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
@@ -625,6 +643,7 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
         ("write_backs", (store,)),
         ("copy", {"kv": [[3, 8], [5, 9]]}),
         ("zero", {"kv": (3,)}),
+        ("default waits", "execution-stream"),
         ("load_backs", (store,)),
     ]
 
@@ -693,11 +712,11 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
     _execute(handle, plan, None)
 
     kinds = [entry[0] for entry in trace]
-    assert kinds == ["write_backs", "zero", "load_backs"]
+    assert kinds == ["write_backs", "zero", "default waits", "load_backs"]
     # Stores precede the zeroing, and the fence they record lands on the
     # stream the zeroing runs on.
     stores = trace[0][1]
-    assert trace[0][2] == "default-stream"
+    assert trace[0][2] is handle._executor.default_stream
     assert [type(op).__name__ for op in stores] == [
         "_WriteBackOp",
         "SnapshotOp",
@@ -710,13 +729,14 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         (8, 5, 1),
     ]
     # The restore is behind the zeroing and names the resumed request's new
-    # slot; it orders after the default stream, where the zeroing ran.
+    # slot; it orders after the default stream, where the zeroing ran and
+    # which waited for the forwards in flight.
     restores = [op for op in trace[-1][1] if isinstance(op, RestoreOp)]
     assert [(op.op_id, op.request_pool_index, op.snapshot_slot) for op in restores] == [
         (9, 4, 2)
     ]
-    assert trace[-1][2] == "default-stream"
-    assert kinds.index("zero") < kinds.index("load_backs")
+    assert trace[-1][2] is handle._executor.default_stream
+    assert trace[2] == ("default waits", "execution-stream")
 
 
 def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
@@ -749,7 +769,13 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
 
     _execute(handle, plan, planned)
 
-    assert trace == [("store", [6]), "zero", "load_backs", ("forward", [6])]
+    assert trace == [
+        ("store", [6]),
+        "zero",
+        ("default waits", "execution-stream"),
+        "load_backs",
+        ("forward", [6]),
+    ]
 
 
 def test_page_zeroing_without_l2_runs_only_zeroing():
@@ -781,7 +807,7 @@ def test_a_plan_with_no_device_work_only_points_the_load_waits_at_no_load():
 
     _execute(handle, _plan(), None)
 
-    assert trace == [("load_backs", (), "default-stream")]
+    assert trace == [("load_backs", (), handle._executor.default_stream)]
 
 
 def test_a_failed_cache_submission_fails_the_plan(wire_ops):

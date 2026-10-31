@@ -178,25 +178,24 @@ class MLATokenToKVPool(CachePool):
         if sanitize is None:
             sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
+        # get_key_buffer waits for the layer's Host load: a tail hit loads the
+        # page these rows land in whole.
         if self.quant_method == "per_token_head":
             if write_mask is not None:
                 raise ValueError("Per-token quantized MLA writes do not support a mask")
             store_latent_per_token_head(
-                *self.kv_buffer[layer_id],
+                *self.get_key_buffer(layer_id),
                 loc,
                 cache_k_nope,
                 cache_k_rope,
                 sanitize=sanitize,
             )
         else:
-            kv_buffer = self.kv_buffer[layer_id]
-            if self.store_dtype != self.dtype:
-                # The arena stores FP8 rows as bytes. Give the scatter kernel an
-                # FP8 view so its stores quantize mixed-dtype sources in place.
-                kv_buffer = kv_buffer.view(self.dtype)
-
+            # The arena stores FP8 rows as bytes. get_key_buffer gives the
+            # scatter kernel an FP8 view so its stores quantize mixed-dtype
+            # sources in place.
             set_mla_kv_buffer_triton(
-                kv_buffer,
+                self.get_key_buffer(layer_id),
                 loc,
                 cache_k_nope,
                 cache_k_rope,
@@ -214,7 +213,7 @@ class MLATokenToKVPool(CachePool):
         dst_dtype = dst_dtype or self.dtype
 
         if self.quant_method == "per_token_head":
-            k_lora_cache, k_scale_cache, k_rope_cache = self.kv_buffer[layer_id]
+            k_lora_cache, k_scale_cache, k_rope_cache = self.get_key_buffer(layer_id)
             k_lora = k_lora_cache[loc].view(self.dtype).float()
             k_scale = k_scale_cache[loc]
             k_rope = k_rope_cache[loc].float()

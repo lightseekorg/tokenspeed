@@ -355,7 +355,10 @@ class KPoolRuntime:
 
         metadata = backend.chunked_prefill_metadata
         index_table = backend.kpool_prefill_page_table(ctx.num_extends)
-        index_cache = ctx.token_to_kv_pool.get_kpool_buffers(layer_id)[0]
+        # Only the index plane's shape: get_kpool_buffers would wait for the
+        # layer's Host load here, before the projections that can overlap it.
+        pool = ctx.token_to_kv_pool
+        index_cache = pool.arena.compute_field(pool.layer_fields[layer_id, "index_k"])
         # The slots come from the backend's per-forward publication, not the
         # prefill metadata: paged leaves' metadata carries no pool indices.
         if self.req_pool_indices is None:

@@ -806,8 +806,8 @@ class TestGroupAwareWireTest:
         log_info.assert_called_once_with(
             "[L2] load started: operations=1 blocks=2",
         )
-        # The load orders after the prerequisite stream the caller named --
-        # the one that zeroed its destinations -- not after the current stream.
+        # The load orders after the prerequisite stream the caller named, not
+        # after the current stream.
         load_events.start_event.record.assert_called_once_with(prerequisite_stream)
         load_events.start_event.wait.assert_called_once_with(executor.load_stream)
 

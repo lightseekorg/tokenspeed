@@ -380,7 +380,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
 
     def views(attention):
         return SimpleNamespace(
-            token_to_kv_pool=None,
+            token_to_kv_pool=SimpleNamespace(
+                arena=SimpleNamespace(runtime_contract=None)
+            ),
             draft_token_to_kv_pool=None,
             cache_geometry=SimpleNamespace(prefix_granularity=1),
             cache_groups=[],
@@ -429,6 +431,12 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     monkeypatch.setattr(device, "probe_arena_floor", lambda *_, **__: 1)
     monkeypatch.setattr(device, "pool_views", views)
     monkeypatch.setattr(device, "_rebind_under_reserve", rebind)
+    # No Host cache: the boot builds its executor, if any, before the capture.
+    monkeypatch.setattr(
+        device,
+        "_retraction_pool_request",
+        lambda *args, **kwargs: SimpleNamespace(disabled=True),
+    )
     server_args = SimpleNamespace(
         disaggregation_mode="null",
         enable_external_encoder=False,
@@ -439,6 +447,8 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         enforce_eager=enforce_eager,
         enable_prefix_caching=False,
         enable_memory_saver=False,
+        enable_kvstore=False,
+        spec_context_pad=0,
         device="cuda",
     )
     with pytest.raises(_ServingCapture):
@@ -507,6 +517,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        "HostCacheExecutor",
         "capture_graphs",
         "set_random_seed",
     }
@@ -514,15 +525,18 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         (n for n in ast.walk(build) if isinstance(n, ast.Call) and _callee(n) in steps),
         key=lambda n: (n.lineno, n.col_offset),
     )
+    # The Host cache executor registers the layerwise load trackers the
+    # prefill graphs' capture notes their segments' waits on.
     assert [_callee(n) for n in calls] == [
         "_cudagraph_probe_refusal",
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        "HostCacheExecutor",
         "capture_graphs",
         "set_random_seed",
     ]
-    refusal, probe_build, _, _, serving, _ = calls
+    refusal, probe_build, _, _, _, serving, _ = calls
     assert [ast.unparse(arg) for arg in refusal.args] == ["server_args"]
     # The target's model: the narrowing floor must not read the draft's.
     (narrowing,) = (

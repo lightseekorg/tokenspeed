@@ -104,6 +104,7 @@ from tokenspeed.runtime.utils.common import (
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
     from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
@@ -502,6 +503,9 @@ class PrefillGraph:
         self._engaged_logged: set[str] = set()
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
+        # The pool's layerwise load tracker when the graphs were captured, on
+        # which their segments wait for the Host loads (see replay).
+        self._captured_load_tracker: LayerwiseLoadTracker | None = None
         # One owner for ordinary and attention-containing captures. None is the
         # batch-independent attention-break variant; integers require exact BS.
         self._captures: dict[
@@ -563,6 +567,7 @@ class PrefillGraph:
         self._captures.clear()
         self._encoders.clear()
         self._decoders.clear()
+        self._captured_load_tracker = self.token_to_kv_pool.layerwise_load_tracker
         self.attn_backend.init_prefill_graph_state(
             max_num_tokens=max(self.capture_buckets),
             max_bs=int(self.config.max_num_seqs)
@@ -654,9 +659,21 @@ class PrefillGraph:
                 if bs is None
             }
             sample = next(iter(ordinary.values()), None)
+            # Segments a replay runs behind the waits for their own layers'
+            # Host loads: none without a Host L2 tier (no load trackers when
+            # capturing), and none on a pool that does not declare
+            # layer_accesses_wait_for_load, whose replays wait for the whole
+            # load instead and skip the noted waits (see replay).
+            waiting = (
+                sum(1 for waits in sample[0].segment_waits if waits)
+                if sample is not None
+                and self.token_to_kv_pool.layer_accesses_wait_for_load
+                else 0
+            )
             logger.info(
                 f"prefill breakable graph: captured buckets {sorted(ordinary)!s} "
                 f"(segments={(sample[0].num_segments if sample is not None else 0):d}, "
+                f"{waiting:d} behind per-layer Host-load waits, "
                 "eager attention breaks)",
             )
             variants = {
@@ -1290,22 +1307,33 @@ class PrefillGraph:
             if ctx.global_num_tokens is not None
             else [num_tokens] * self.config.world_size
         )
-        # The layerwise Host-load waits are made eagerly, and a captured
-        # segment holds none: a prologue writes latent rows into a page a
-        # tail hit loads, and an inline KDA layer reads the State checkpoint
-        # a hit loads, both inside segments. So a replay waits for the
-        # plan's whole Host load (its last layer's event, which the load
-        # stream records after every earlier layer's copy) before its first
-        # segment.
+        # A captured segment waits for the Host loads of the layers it
+        # touches on the tracker the capture noted them on
+        # (BreakableCapture.wait_before_segment). The capture notes only the
+        # accesses made through an accessor that waits, so these waits stand
+        # in for the whole load only on a pool that declares that every access
+        # a replay makes waits (layer_accesses_wait_for_load), and only for
+        # graphs captured against its current tracker: graphs captured
+        # against another tracker, or none, noted no wait on this one. Every
+        # other replay waits for this pool's whole Host load (its tracker's
+        # last layer event, which the load stream records after every earlier
+        # layer's copy for this pool) before its first segment and skips the
+        # segment waits its capture noted, which that wait covers: they are
+        # on this pool's tracker, as a target forward's captured segments
+        # touch no other view's cache.
         tracker = self.token_to_kv_pool.layerwise_load_tracker
-        if tracker is not None:
+        whole_load_waited = tracker is not None and not (
+            self.token_to_kv_pool.layer_accesses_wait_for_load
+            and tracker is self._captured_load_tracker
+        )
+        if whole_load_waited:
             for index in tracker.consumer_indices:
                 torch.cuda.current_stream().wait_event(
                     tracker.event_sets[index].last_layer_done_event
                 )
         if self._narrowing is not None:
             hidden_states, aux_hidden_states = self._replay_narrowed(
-                bucket, ctx, num_tokens
+                bucket, ctx, num_tokens, noted_waits_done=whole_load_waited
             )
         else:
             cap, output = self._captures[bucket, None]
@@ -1325,7 +1353,7 @@ class PrefillGraph:
                         padded_global_num_tokens=[bucket] * self.config.world_size,
                         live_global_num_tokens=live_global_num_tokens,
                     )
-                cap.replay(valid_rows=num_tokens)
+                cap.replay(valid_rows=num_tokens, noted_waits_done=whole_load_waited)
                 if self._expert_load_rows is not None:
                     self._expert_load_rows.clear()
             hidden_states, aux_hidden_states = output.sliced(num_tokens)
@@ -1340,7 +1368,12 @@ class PrefillGraph:
         )
 
     def _replay_narrowed(
-        self, bucket: int, ctx: ForwardContext, num_tokens: int
+        self,
+        bucket: int,
+        ctx: ForwardContext,
+        num_tokens: int,
+        *,
+        noted_waits_done: bool,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """Encoder replay, eager narrowing, decoder replay (or eager decoder).
 
@@ -1371,7 +1404,9 @@ class PrefillGraph:
                 f"rows={rows:d} decoder_bucket={decoder_bucket!s}"
             )
         with self._padded_to(ctx, bucket):
-            encoder.capture.replay(valid_rows=num_tokens)
+            encoder.capture.replay(
+                valid_rows=num_tokens, noted_waits_done=noted_waits_done
+            )
             narrowed = model.narrowing_forward(encoder.state, ctx)
             if narrowed.rows != rows:
                 raise RuntimeError(
@@ -1383,7 +1418,9 @@ class PrefillGraph:
             else:
                 decoder = self._decoders[decoder_bucket]
                 narrowed.land_into(decoder.statics)
-                decoder.capture.replay(valid_rows=rows)
+                decoder.capture.replay(
+                    valid_rows=rows, noted_waits_done=noted_waits_done
+                )
                 hidden, captured = decoder.output.sliced(rows)
         return model.finish_forward(hidden, list(captured), ctx)
 
