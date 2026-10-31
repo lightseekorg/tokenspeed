@@ -92,6 +92,9 @@ class SamplingBackendConfig:
     # start / graph capture time so the fast path has zero extra compute.
     # Enabling any of these enlarges the captured graph footprint.
     enable_output_logprobs: bool = False
+    # Consumed by the common Engine sampling boundary. Backends keep their
+    # existing token and logprob computation and need no diagnostic hooks.
+    enable_output_cumulative_probs: bool = False
 
     # Recorded draft probabilities above this are the "no proposal yet"
     # sentinel; only read under enable_speculative_sampling.
@@ -115,6 +118,11 @@ class SamplingBackendConfig:
     tp_group: tuple[int, ...] | None = None
     enable_tp_sync: bool = True
 
+    def __post_init__(self) -> None:
+        if self.enable_output_cumulative_probs:
+            if not self.enable_output_logprobs:
+                raise ValueError("cumulative probabilities require output logprobs")
+
     @classmethod
     def from_server_args(
         cls,
@@ -135,6 +143,7 @@ class SamplingBackendConfig:
             logprob_order=server_args.logprob_order,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
+            enable_output_cumulative_probs=server_args.enable_output_cumulative_probs,
             # Trees verify against their draft q tables, not recorded draft probs.
             enable_speculative_sampling=(
                 server_args.enable_speculative_sampling

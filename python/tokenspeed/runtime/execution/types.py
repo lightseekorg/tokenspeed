@@ -266,11 +266,12 @@ class PlannedForward:
 
 @dataclass
 class ForwardLogprobs:
-    """The logprobs an eager extend forward returns beside its sampled
-    tokens': the planned prompt rows' (``ForwardContext.input_logprob_rows``),
-    and the top-k alternatives of those rows and of the prefill rows' sampled
-    tokens (``ForwardContext.sampled_top_k``). A forward that asked for none of
-    them -- every captured graph among them -- returns None in its place.
+    """Optional probability metadata returned beside sampled logprobs.
+
+    Prompt rows and top-k alternatives are eager-prefill outputs. The
+    sampled-token cumulative probabilities also run inside decode graphs;
+    their captured tensors are sliced to the live output rows on replay.
+    A forward that produces none of these values returns None instead.
     """
 
     input_token_logprobs: torch.Tensor | None = None
@@ -278,6 +279,7 @@ class ForwardLogprobs:
     input_top_logprobs_idx: torch.Tensor | None = None
     output_top_logprobs_val: torch.Tensor | None = None
     output_top_logprobs_idx: torch.Tensor | None = None
+    output_token_cumulative_probs: torch.Tensor | None = None
 
     @classmethod
     def of(cls, logits_output: Any) -> ForwardLogprobs | None:
@@ -288,11 +290,24 @@ class ForwardLogprobs:
             input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
             output_top_logprobs_val=logits_output.sampled_top_logprobs_val,
             output_top_logprobs_idx=logits_output.sampled_top_logprobs_idx,
+            output_token_cumulative_probs=logits_output.next_token_cumulative_probs,
         )
         return None if logprobs.is_empty() else logprobs
 
     def is_empty(self) -> bool:
         return all(value is None for value in vars(self).values())
+
+    def decode_slice(self, num_rows: int) -> ForwardLogprobs | None:
+        """The live decode rows from captured metadata, retaining its storage.
+
+        Prompt and top-k outputs belong to eager prefills. Only cumulative
+        probabilities can be present in a captured decode's metadata.
+        """
+        if self.output_token_cumulative_probs is None:
+            return None
+        return ForwardLogprobs(
+            output_token_cumulative_probs=self.output_token_cumulative_probs[:num_rows]
+        )
 
     def to_host(self) -> ForwardLogprobs:
         """Non-blocking D2H copies, landed by the result's copy event."""
@@ -324,6 +339,9 @@ class ModelExecutionResult:
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    # Probability mass preceding each sampled token in probability-descending,
+    # token-ID-ascending order; aligned with output_tokens and output_logprobs.
+    output_token_cumulative_probs: torch.Tensor | None = None
     # P role, final chunk only: the sampled rows the commit path folds into
     # the ExtendResult as the bootstrap payload the peer's decode needs.
     next_input_ids: torch.Tensor | None = None

@@ -360,6 +360,7 @@ pub fn output_batch(
         cached_tokens: Vec::with_capacity(n),
         output_token_logprobs_val: Vec::with_capacity(n),
         output_token_logprobs_idx: Vec::with_capacity(n),
+        output_token_cumulative_probs_val: Vec::with_capacity(n),
         engine_index: i64::from(engine_index),
         num_running: load.num_running,
         num_waiting: load.num_waiting,
@@ -393,6 +394,9 @@ pub fn output_batch(
         batch.cached_tokens.push(output.cached_tokens);
         batch.output_token_logprobs_val.push(output.output_logprobs);
         batch.output_token_logprobs_idx.push(logprob_ids);
+        batch
+            .output_token_cumulative_probs_val
+            .push(output.output_token_cumulative_probs);
         batch.finish_reason_details.push(output.finish_details);
         if let Some((verify_ct, accepted)) = output.spec {
             batch.spec_verify_ct.push(verify_ct);
@@ -424,6 +428,7 @@ pub fn output_batch(
     frame_column(&mut batch.input_top_logprobs_idx);
     frame_column(&mut batch.output_top_logprobs_val);
     frame_column(&mut batch.output_top_logprobs_idx);
+    frame_column(&mut batch.output_token_cumulative_probs_val);
     batch
 }
 

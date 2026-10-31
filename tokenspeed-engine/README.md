@@ -46,6 +46,12 @@ and update the `ts-wire` structs to match. Give every new field a distinct,
 non-default value in the generator: a field decoded into the wrong slot still
 re-encodes to the same bytes, so only the value checks catch it.
 
+The optional `output_token_cumulative_probs_val` tail carries each selected
+token's cumulative probability diagnostic alongside its logprob. The control
+plane retains the same token ordering, stop truncation and streaming slices
+for both columns, and emits diagnostics only for requests returning logprobs.
+An older producer defaults this column to empty; older readers skip it.
+
 ## Building
 
 The native crates target Linux and need a C++ compiler, CMake, OpenSSL
