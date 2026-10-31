@@ -469,26 +469,25 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         # This thread is the forward thread: the handle's work runs here.
         handle.bind_forward_thread()
         try:
-            scheduler = ts.Scheduler(
-                make_config(
-                    num_device_pages=scheduler_cache_geometry_from_pool(
-                        pool
-                    ).num_device_pages,
-                    max_scheduled_tokens=256,
-                    max_batch_size=4,
-                    prefix_granularity=self.PAGE,
-                    num_host_pages=executor.num_host_pages,
-                    disable_l2_cache=False,
-                    enable_l3_storage=False,
-                    role="prefill",
-                    num_snapshot_pages=1,
-                    host_group_packing=executor.host_group_packing,
-                    max_retracted_requests=0,
-                    storage_config=None,
-                    host_write_policy="write_back",
-                    cache_groups=pool_to_cache_groups(pool),
-                )
+            scheduler_config = make_config(
+                num_device_pages=scheduler_cache_geometry_from_pool(
+                    pool
+                ).num_device_pages,
+                max_scheduled_tokens=256,
+                max_batch_size=4,
+                prefix_granularity=self.PAGE,
+                num_host_pages=executor.num_host_pages,
+                disable_l2_cache=False,
+                enable_l3_storage=False,
+                role="prefill",
+                num_snapshot_pages=1,
+                host_group_packing=executor.host_group_packing,
+                max_retracted_requests=0,
+                storage_config=None,
+                host_write_policy="write_back",
+                cache_groups=pool_to_cache_groups(pool),
             )
+            scheduler = ts.Scheduler(scheduler_config)
 
             def forwards(plan):
                 return [op for op in plan.forward if op.request_ids]
@@ -547,25 +546,46 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             # A and E: two full pages and a 9-token tail each, cached once
             # the decode peer has them.
             prompts = {"a": list(range(41)), "e": list(range(200, 241))}
-            (prefill,) = forwards(submit(prompts))
-            tables = prefill.block_tables_arrays()[group]
-            tail_a, tail_e = int(tables[0][2]), int(tables[1][2])
-            finish(prompts, 1000)
-            assert scheduler.tail_entries() == 2
 
-            # Warm both store rows, plus copying and zeroing, so the round
-            # below loads no kernel and grows no staging buffer: either can
-            # wait for the device, the store's held-back copy included.
-            arena.copy_blocks({group: np.asarray([[tail_a, tail_e]])})
-            arena.zero_blocks({group: np.asarray([tail_a])})
-            executor._start_writing(  # pylint: disable=protected-access
-                [999],
-                [(0, tail_a, 1), (0, tail_e, 2)],
-                lane=executor._ordered_write_lane,  # pylint: disable=protected-access
-                prerequisite_stream=torch.cuda.current_stream(),
-            )
-            torch.cuda.synchronize()
-            assert [int(ack.op_id) for ack in handle.poll_cache_results()] == [999]
+            def prepare_reuse_plan():
+                (prefill,) = forwards(submit(prompts))
+                tables = prefill.block_tables_arrays()[group]
+                tail_a, tail_e = int(tables[0][2]), int(tables[1][2])
+                finish(prompts, 1000)
+                assert scheduler.tail_entries() == 2
+
+                # C shares E's full pages, but cannot reuse its pending tail.
+                # Its new tail still exercises zeroing a write-back source.
+                plan = submit(
+                    {
+                        "b": prompts["a"] + [7, 8, 9],
+                        "c": prompts["e"][: 2 * self.PAGE] + list(range(400, 412)),
+                    }
+                )
+                hit_b, hit_c = forwards(plan)[0].extend_prefix_lens
+                assert (hit_b, hit_c) == (41, 32)
+                assert plan.remote_decode is None
+                (store,) = cache_ops_from_plan(plan).device
+                assert list(store.source_pinned) == [False]
+                assert [list(rows) for rows in store.src_pages] == [[tail_a, tail_e]]
+                # B copies A's tail into E's; C's new page, A's tail, is zeroed.
+                assert plan.pages_to_copy_arrays()[group].tolist() == [[tail_a, tail_e]]
+                assert list(plan.pages_to_zero[group]) == [tail_a]
+                return plan, store, tail_a, tail_e
+
+            # Warm the complete handle path with a real plan and its ACKs.
+            # Keep first-use staging and stream/event setup outside the
+            # overlap trial.
+            warm_plan, warm_store, _, _ = prepare_reuse_plan()
+            execute(warm_plan)
+            assert land() == list(warm_store.op_ids)
+
+            # Begin the correctness trial with fresh scheduler ownership;
+            # the executor has completed and acknowledged all warmup work.
+            scheduler = ts.Scheduler(scheduler_config)
+            plan, store, tail_a, tail_e = prepare_reuse_plan()
+            host_a, host_e = (int(page) for page in store.dst_pages[0])
+
             # Random bytes stand in for the KV the forwards wrote.
             generator = torch.Generator(device="cpu").manual_seed(29)
             arena.buffer.copy_(
@@ -578,25 +598,6 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 )
             )
             before = arena.buffer.clone()
-
-            # C shares E's full pages, but cannot reuse its pending tail.
-            # Its new tail still exercises zeroing a write-back source.
-            plan = submit(
-                {
-                    "b": prompts["a"] + [7, 8, 9],
-                    "c": prompts["e"][: 2 * self.PAGE] + list(range(400, 412)),
-                }
-            )
-            hit_b, hit_c = forwards(plan)[0].extend_prefix_lens
-            assert (hit_b, hit_c) == (41, 32)
-            assert plan.remote_decode is None
-            (store,) = cache_ops_from_plan(plan).device
-            assert list(store.source_pinned) == [False]
-            assert [list(rows) for rows in store.src_pages] == [[tail_a, tail_e]]
-            host_a, host_e = (int(page) for page in store.dst_pages[0])
-            # B copies A's tail into E's; C's new page, A's tail, is zeroed.
-            assert plan.pages_to_copy_arrays()[group].tolist() == [[tail_a, tail_e]]
-            assert list(plan.pages_to_zero[group]) == [tail_a]
 
             if held != "store":
                 # The round before's forward, held back, writes both tails
