@@ -897,6 +897,8 @@ private:
     // excluding pages a sliding group can force into a Host suffix. Keep the
     // Device facts read during collection for this plan's ranking. Visit in
     // priority order and stop as soon as the callback returns false.
+    // Defined in host_segments.cpp; callers must stay in that translation
+    // unit unless the template definition is moved into a header.
     template <typename Visitor>
     void visitHostKvDuplicateCandidates(Visitor&& visit) const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
