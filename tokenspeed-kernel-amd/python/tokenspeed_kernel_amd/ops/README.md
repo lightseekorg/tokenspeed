@@ -807,7 +807,8 @@ a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_qtile_gfx950` when all
 queries of a tile share one page-table row, otherwise
 `gluon_dsv41_index_topk_gfx950`, then `gluon_dsv41_index_topk_select_gfx950`),
-and gfx1250 does the same (`gluon_dsv41_index_topk_gfx1250`, then
+and gfx1250 does the same (`gluon_dsv41_index_qtile_gfx1250` for Full
+scoring, `gluon_dsv41_index_topk_gfx1250` for candidate rows, then
 `gluon_dsv41_index_topk_select_gfx1250`). gfx950 selects candidate blocks with
 `gluon_dsv41_index_block_max_gfx950` followed by its row selector; gfx1250
 uses the portable Triton radix select (`tokenspeed_kernel`
@@ -820,11 +821,11 @@ Visible lengths are bounded by the block table's row capacity in each consumer,
 before narrowing int64 inputs to int32. The adapter passes dense raw lengths
 without a separate clamp launch. Candidate-block selection uses the same table
 bound, including when compact candidate logits have a smaller width, so forcing
-the newest visible block preserves its logical position. The gfx950 scorers
-write every column the selections read, -inf where no row is scored: each
-query's columns through the end of its last visible 8-row block (block
-selection reads whole blocks), and every candidate column. Their logits are
-therefore not pre-filled; the gfx1250 launcher fills its logits with -inf.
+the newest visible block preserves its logical position. The gfx950 and
+gfx1250 scorers write every column the selections read, -inf where no row is
+scored: each query's columns through the end of its last visible 8-row block
+(block selection reads whole blocks), and every candidate column. Their
+logits are therefore not pre-filled.
 Histogram scratch is zeroed before its atomic sums.
 The gfx950 and gfx1250 row selectors read live-width strides directly, including
 broadcast limits and strided single-row tail tiles. Such tails retain their stride
@@ -858,7 +859,10 @@ model-fixed selection capacities retain the existing launch policy.
   per chunk (64 or fewer queries) or 128; in Full mode the chunk is a
   multiple of 32 or a divisor of 64, so a chunk never straddles a 64-row
   page. Its grid is bounded, and each CTA strides over the chunks of a
-  capacity-wide row.
+  capacity-wide row. The gfx1250 Full scorer rounds the chunk down to whole
+  64-row pages and, with at least 32 CTA rows, scores two chunks per CTA;
+  chunks below one page, and query planes that are not contiguous, use the
+  per-query scorer.
 - Full selection writes finite logits only for each query's visible rows, so
   row selection reads just that prefix of the capacity-wide row (the
   per-query visible length, read on device).
@@ -884,9 +888,20 @@ compiled without FP contraction, so they produce the same bits.
   columns to pages through the candidate ids and page table. Two tiles are in
   flight. A chunk bound that is not a multiple of 32 masks its last tile.
 
-The gfx1250 scorer follows the
-same steps with E2M1 scaled wave32 WMMA: all 32 heads form one WMMA tile, and
-its four warps split each 64-column key tile, so no warp loads another's keys.
+The gfx1250 scorers use E2M1 scaled wave32 WMMA with the 32 heads on the M
+axis. The non-transposed result layout keeps a key column's head partials in
+one lane pair, so the weighted head sum is in-lane plus one cross-lane add,
+and the four warps split each 64-column tile without loading each other's
+keys.
+
+- The Full scorer reads one 64-row page per tile: a CTA loads its chunk's
+  page ids once into registers, so key loads never wait on a table read, and
+  keeps two tiles in flight. Two queries that share a broadcast table row
+  stack on the M axis and share each key tile; per-query tables (decode) use
+  one query per CTA.
+- The candidate scorer maps columns to pages through the candidate ids and
+  page table. It scores its whole chunk as one tile, so the dependent id,
+  page and key loads are issued once per CTA.
 
 The gfx950 selector runs one 16-warp workgroup per query in a single launch
 and reads the row twice:
