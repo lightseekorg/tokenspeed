@@ -29,7 +29,9 @@ Integration contract:
   and the current speculative branch. Refresh pointer-stable input buffers for
   eager and graph forwards alike. Models receive prepared hashes and masks;
   never put request tensors in ForwardContext.
-* Hidden states, hashes and masks must be replicated within mapping.attn.tp_group.
+* Hidden states, hashes and masks share the query row layout. Without QCP they
+  are replicated within mapping.attn.tp_group; QCP lookup gathers hash IDs and
+  reduce-scatters the table contributions back to local query rows.
   GPU-resident tables are row-sharded across attention TP and all-reduced.
   Host tables stay in anonymous or shared host memory and gather through UVA.
   ``shared`` keeps one full copy per node and skips the lookup all-reduce.
@@ -71,7 +73,13 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_ops import all_reduce, prepare_all_reduce_lane
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_reduce,
+    prepare_all_reduce_lane,
+    token_all_gather_rows,
+    token_reduce_scatter,
+)
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -665,14 +673,30 @@ class RowShardedEngramEmbedding(nn.Module):
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, indices: torch.Tensor, *, query_shard: QueryShardPlan | None = None
+    ) -> torch.Tensor:
         """Gather [..., hash columns] IDs into BF16 [..., hash columns, head dim].
 
-        All TP peers must pass identical indices. Shared host tables gather the
+        Without a query shard, TP peers pass identical indices. A query shard
+        gathers IDs and reduce-scatters table contributions to its local rows.
+        Shared host tables gather the
         full copy and skip the all-reduce. GPU and host-sharded tables expand
         only local rows and reduce. Dequantization uses the same FP8/E8M0
         torch casts in both paths.
         """
+        sharded = query_shard is not None and query_shard.size > 1
+        if sharded:
+            if indices.ndim != 2 or indices.shape[0] != query_shard.local_rows:
+                raise ValueError("Engram hashes must match the query shard rows")
+            if len(self.tp_group) != query_shard.size:
+                raise ValueError(
+                    "Engram TP and query shard groups must have equal size"
+                )
+            if self.host_layout != "shared":
+                indices = token_all_gather_rows(
+                    indices, self.tp_group, list(query_shard.row_counts)
+                )
         if indices.is_cuda and not self.host_table:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
@@ -712,6 +736,10 @@ class RowShardedEngramEmbedding(nn.Module):
             # row capacity and drop to NCCL, which costs a ring latency plus a
             # launch stall on every step.
             flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
+            if sharded:
+                return token_reduce_scatter(
+                    flat, self.tp_group, list(query_shard.row_counts)
+                ).reshape(query_shard.local_rows, values.shape[-2], values.shape[-1])
             values = all_reduce(
                 flat,
                 group=self.tp_group,
@@ -852,6 +880,8 @@ class DeepseekV41Engram(nn.Module):
         hidden_states: torch.Tensor,
         hash_ids: torch.Tensor,
         token_mask: torch.Tensor,
+        *,
+        query_shard: QueryShardPlan | None = None,
     ) -> torch.Tensor:
         """Inject Engram into [..., 4, hidden_size], returning the same shape/dtype.
 
@@ -868,9 +898,11 @@ class DeepseekV41Engram(nn.Module):
             raise ValueError("Engram hidden states, hashes and mask shapes disagree")
         if token_mask.dtype != torch.bool:
             raise TypeError("Engram token mask must be bool")
+        if hidden_states.numel() == 0 and query_shard is None:
+            return hidden_states
+        embeddings = self.embed(hash_ids, query_shard=query_shard).flatten(-2)
         if hidden_states.numel() == 0:
             return hidden_states
-        embeddings = self.embed(hash_ids).flatten(-2)
         kv, _ = self.wkv(embeddings, block_scale=None, output_dtype=None)
         if hidden_states.is_cuda:
             from tokenspeed_kernel.ops.residual import normalized_dot_gate

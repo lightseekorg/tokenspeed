@@ -256,7 +256,9 @@ def _tables(device):
     return _tables_with_packing(device, packing)
 
 
-def _extend(backend, tables, lengths, prefixes, replays, prompt_lens):
+def _extend(
+    backend, tables, lengths, prefixes, replays, prompt_lens, *, query_shard=None
+):
     """One EXTEND batch; ``prefixes`` are the extend starts (replay rows
     included), ``replays`` the leading rows re-fed inside a prefix hit and
     ``prompt_lens`` the full prompt lengths deciding which spans complete."""
@@ -270,6 +272,7 @@ def _extend(backend, tables, lengths, prefixes, replays, prompt_lens):
         (counts + prefix).to(device),
         ForwardMode.EXTEND,
         block_tables=tables,
+        block_tables_cpu={gid: table.cpu() for gid, table in tables.items()},
         extend_seq_lens=counts.to(device),
         extend_seq_lens_cpu=counts,
         extend_prefix_lens=prefix.to(device),
@@ -277,7 +280,7 @@ def _extend(backend, tables, lengths, prefixes, replays, prompt_lens):
         extend_replay_lens_cpu=torch.tensor(replays, dtype=torch.int32),
         extend_prompt_lens_cpu=torch.tensor(prompt_lens, dtype=torch.int32),
         extend_with_prefix=any(prefixes),
-        query_shard=None,
+        query_shard=query_shard,
     )
     return backend.query_metadata(ForwardMode.EXTEND)
 
@@ -617,7 +620,7 @@ def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
         for_graph_replay=True,
     )
     assert backend.decoder_view().metadata is view.metadata
-    assert backend.decoder_view()[1:] == (None, (), None, None)
+    assert backend.decoder_view()[1:] == (None, (), None, None, None)
 
 
 @pytest.mark.parametrize("open_count", [1, 17])
@@ -2975,3 +2978,579 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
     record = backend.sparse_topk.prefill
     assert record.positions is meta.positions
     assert record.request_indices is meta.request_indices
+
+
+@pytest.mark.parametrize("size", [1, 4, 8])
+@pytest.mark.parametrize(
+    "lengths,prefixes,replays,prompts",
+    [
+        ([257], [3], [0], [260]),
+        ([129, 7], [3, 7], [0, 0], [132, 512]),
+        ([7, 2], [0, 0], [0, 0], [512, 512]),
+        ([1, 2], [0, 0], [0, 0], [1, 2]),
+        ([128, 128], [64, 0], [64, 0], [192, 128]),
+    ],
+)
+def test_prefill_query_shards_preserve_ced_rows(
+    size, lengths, prefixes, replays, prompts
+):
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    backend = _backend("cpu", 2)
+    meta = _extend(backend, _tables("cpu"), lengths, prefixes, replays, prompts)
+    view = backend.decoder_view()
+    total = sum(lengths)
+    expected_rows = torch.arange(total) if view.keep_rows is None else view.keep_rows
+    ends = torch.tensor(lengths).cumsum(0) - 1
+    completes = torch.tensor(
+        [p + n == end for p, n, end in zip(prefixes, lengths, prompts)]
+    )
+    samples = ends[completes]
+    actual_rows = []
+    actual_positions = []
+    actual_requests = []
+    actual_samples = []
+    counts = None
+    for rank in range(size):
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=size, rank=rank
+        )
+        local = backend.partition_prefill_queries(plan, sampled_rows_cpu=samples)
+        assert local.source_rows == plan.local_slice
+        rows = local.keep_rows + plan.local_start
+        assert ((rows >= plan.local_start) & (rows < plan.local_end)).all()
+        actual_rows.append(rows)
+        positions = meta.positions[local.source_rows][local.keep_rows]
+        requests = meta.request_indices[local.source_rows][local.keep_rows]
+        torch.testing.assert_close(
+            positions, view.metadata.positions[local.decoder_plan.local_slice]
+        )
+        torch.testing.assert_close(
+            requests, view.metadata.request_indices[local.decoder_plan.local_slice]
+        )
+        actual_positions.append(positions)
+        actual_requests.append(requests)
+        sample_indices = torch.searchsorted(expected_rows, samples)
+        local_sample_ids = local.decoder_plan.local_sampled_ids(sample_indices)
+        actual_samples.append(rows[local_sample_ids])
+        assert local.decoder_plan.rows_for_collective(None) == (
+            local.decoder_plan.row_counts
+        )
+        if counts is not None:
+            assert local.decoder_plan.row_counts == counts
+        counts = local.decoder_plan.row_counts
+    torch.testing.assert_close(torch.cat(actual_rows), expected_rows)
+    torch.testing.assert_close(torch.cat(actual_positions), view.metadata.positions)
+    torch.testing.assert_close(
+        torch.cat(actual_requests), view.metadata.request_indices
+    )
+    torch.testing.assert_close(torch.cat(actual_samples), samples)
+
+
+def test_prefill_query_shard_rejects_dropped_output_rows():
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    backend = _backend("cpu", 2)
+    _extend(backend, _tables("cpu"), [257], [0], [0], [257])
+    plan = QueryShardPlan.from_forward(
+        total_tokens=257, input_lengths=[257], size=4, rank=0
+    )
+    with pytest.raises(ValueError, match="survive CED"):
+        backend.partition_prefill_queries(plan, sampled_rows_cpu=torch.tensor([0]))
+    with pytest.raises(ValueError, match="nonnegative"):
+        backend.partition_prefill_queries(plan, sampled_rows_cpu=torch.tensor([-1]))
+    wrong_plan = QueryShardPlan.from_forward(
+        total_tokens=256, input_lengths=[256], size=4, rank=0
+    )
+    with pytest.raises(ValueError, match="size disagrees"):
+        backend.partition_prefill_queries(
+            wrong_plan, sampled_rows_cpu=torch.tensor([255])
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("case", ["prefix", "replay", "empty_rank", "ced"])
+@pytest.mark.parametrize("fused_rope", [False, True])
+def test_gpu_sharded_swa_preserves_output_and_cache(monkeypatch, case, fused_rope):
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.specific import (
+        deepseek_v41 as impl,
+    )
+    from tokenspeed.runtime.layers.paged_attention import QueryShardGather
+
+    torch.manual_seed(833)
+    reference = _backend("cuda", 2)
+    tables = _tables("cuda")
+    sink = torch.zeros(2, device="cuda", dtype=torch.float32)
+    rope = None
+    norm = None
+    if fused_rope:
+        rope = torch.cat((torch.ones(512, 32), torch.zeros(512, 32)), dim=1).cuda()
+        norm = torch.ones(512, device="cuda", dtype=torch.bfloat16)
+
+    def attend(backend, meta, q, swa, key_rows=None):
+        return backend.forward_v41(
+            q,
+            swa,
+            layer_id=0,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=rope,
+            swa_norm_weight=norm,
+            swa_norm_eps=1e-6 if fused_rope else 0.0,
+            key_rows=key_rows,
+        )
+
+    if case in ("prefix", "replay"):
+        warm = _extend(reference, tables, [64], [0], [0], [256])
+        attend(
+            reference,
+            warm,
+            torch.randn(64, 2, 512, device="cuda", dtype=torch.bfloat16),
+            torch.randn(64, 512, device="cuda", dtype=torch.bfloat16),
+        )
+        lengths = [140 if case == "prefix" else 76, 3]
+        prefixes = [64, 0]
+        replays = [64 if case == "replay" else 0, 0]
+    else:
+        lengths = [1, 2] if case == "empty_rank" else [140, 3]
+        prefixes = replays = [0, 0]
+    prompts = [p + n for p, n in zip(prefixes, lengths)]
+
+    def prepare(backend):
+        meta = _extend(backend, tables, lengths, prefixes, replays, prompts)
+        return backend.decoder_view().metadata if case == "ced" else meta
+
+    before = reference.cache_pool.arena.buffer.clone()
+    meta = prepare(reference)
+    query_lengths = [min(n, 128) for n in lengths] if case == "ced" else lengths
+    total = sum(query_lengths)
+    q = torch.randn(total, 2, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(total, 512, device="cuda", dtype=torch.bfloat16)
+    expected = attend(reference, meta, q, swa)
+    pieces = []
+    for rank in range(4):
+        backend = _backend("cuda", 2)
+        backend.cache_pool.arena.buffer.copy_(before)
+        local_meta = prepare(backend)
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=query_lengths, size=4, rank=rank
+        )
+        calls = []
+
+        def gather(value, group, counts):
+            assert group == (0, 1, 2, 3)
+            assert counts == list(plan.row_counts)
+            torch.testing.assert_close(value, swa[plan.local_slice], rtol=0, atol=0)
+            calls.append(value.shape[0])
+            return swa.clone()
+
+        monkeypatch.setattr(impl, "token_all_gather", gather)
+        pieces.append(
+            attend(
+                backend,
+                local_meta,
+                q[plan.local_slice],
+                swa[plan.local_slice],
+                QueryShardGather(plan, (0, 1, 2, 3)),
+            )
+        )
+        assert calls == [plan.local_rows]
+        torch.testing.assert_close(
+            backend.cache_pool.arena.buffer,
+            reference.cache_pool.arena.buffer,
+            rtol=0,
+            atol=0,
+        )
+        assert not bool(backend.cache_pool.swa(0)[0].any())
+    torch.testing.assert_close(torch.cat(pieces), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("ced", [False, True])
+@pytest.mark.parametrize(
+    "lengths,prefixes,complete",
+    [
+        ([140, 3], [64, 0], [True, True]),
+        ([1, 2], [0, 0], [True, True]),
+        ([257, 3], [0, 0], [True, False]),
+        ([7, 2], [0, 0], [False, False]),
+    ],
+)
+def test_gpu_model_qcp_preserves_global_selections(
+    monkeypatch, ced, lengths, prefixes, complete
+):
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.specific import (
+        deepseek_v41 as impl,
+    )
+    from tokenspeed.runtime.layers.paged_attention import QueryShardGather
+
+    torch.manual_seed(834)
+    reference = _backend("cuda", 2)
+    tables = _tables("cuda")
+    ends = [p + n for p, n in zip(prefixes, lengths)]
+    prompts = [end if done else end + 64 for end, done in zip(ends, complete)]
+    samples = torch.tensor(lengths).cumsum(0)[torch.tensor(complete)] - 1
+    meta = _extend(reference, tables, lengths, prefixes, [0, 0], prompts)
+    for owner in OWNERS:
+        ratio = RATIOS[owner]
+        for request, end in enumerate(ends):
+            logical = torch.arange(end // ratio, device="cuda")
+            group = R1 if ratio == 1 else R2
+            slots = tables[group][request, logical // 64].long() * 64 + logical % 64
+            dsv41.cache_scatter(
+                torch.randn(logical.numel(), 128, device="cuda", dtype=torch.bfloat16),
+                reference.cache_pool.index_k(owner),
+                slots,
+                reference.index_format,
+            )
+            dsv41.cache_scatter(
+                torch.randn(logical.numel(), 512, device="cuda", dtype=torch.bfloat16),
+                reference.cache_pool.global_kv(owner),
+                slots,
+                reference.global_format,
+            )
+    before = reference.cache_pool.arena.buffer.clone()
+    total = sum(lengths)
+    heads = 32 if current_platform().is_blackwell else 2
+    q = torch.randn(total, heads, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(total, heads, device="cuda", dtype=torch.bfloat16)
+    layers = (2, 3, 20, 24, 25, 28)
+    attention_q = torch.randn(total, 2, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(total, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.zeros(2, device="cuda", dtype=torch.float32)
+
+    def stage(backend, metadata, layer, plan=None):
+        ids = torch.arange(total, device="cuda")
+        if ced and layer >= backend.spec.candidate_source:
+            view = backend.decoder_view()
+            metadata = view.metadata
+            if view.keep_rows is not None:
+                ids = ids[view.keep_rows]
+            if plan is not None:
+                plan = backend.partition_prefill_queries(
+                    plan, sampled_rows_cpu=samples
+                ).decoder_plan
+        return metadata, ids, plan
+
+    def attend(backend, metadata, layer, ids, plan=None):
+        rows = ids if plan is None else ids[plan.local_slice]
+        source = backend.spec.index_sources[layer] == layer
+        if plan is not None:
+
+            def gather(value, group, counts):
+                assert group == (0, 1, 2, 3)
+                assert counts == list(plan.row_counts)
+                torch.testing.assert_close(value, swa[rows], rtol=0, atol=0)
+                return swa[ids].clone()
+
+            monkeypatch.setattr(impl, "token_all_gather", gather)
+        return backend.forward_v41(
+            attention_q[rows],
+            swa[rows],
+            layer_id=layer,
+            positions=metadata.positions,
+            request_indices=metadata.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=q[rows] if source else None,
+            index_weights=weights[rows] if source else None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            key_rows=None if plan is None else QueryShardGather(plan, (0, 1, 2, 3)),
+        )
+
+    expected = {}
+    attention_outputs = {}
+    for layer in layers:
+        source = reference.spec.index_sources[layer] == layer
+        metadata, ids, _ = stage(reference, meta, layer)
+        result = reference.select_global(
+            layer,
+            q[ids] if source else None,
+            weights[ids] if source else None,
+            metadata.positions,
+            metadata.request_indices,
+            ForwardMode.EXTEND,
+            None,
+        )
+        record = reference.sparse_topk.prefill
+        expected[layer] = (
+            tuple(t.clone() for t in result),
+            record.logical_rows.clone(),
+            (
+                None
+                if record.candidates is None
+                else (
+                    record.candidates.block_ids.clone(),
+                    record.candidates.lengths.clone(),
+                )
+            ),
+        )
+        attention_outputs[layer] = attend(reference, metadata, layer, ids)
+    for rank in range(4):
+        backend = _backend("cuda", 2)
+        backend.cache_pool.arena.buffer.copy_(before)
+        local_meta = _extend(backend, tables, lengths, prefixes, [0, 0], prompts)
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+        )
+        for layer in layers:
+            source = backend.spec.index_sources[layer] == layer
+            metadata, ids, stage_plan = stage(backend, local_meta, layer, plan)
+            local_rows = ids[stage_plan.local_slice]
+            result = backend.select_global(
+                layer,
+                q[local_rows] if source else None,
+                weights[local_rows] if source else None,
+                metadata.positions,
+                metadata.request_indices,
+                ForwardMode.EXTEND,
+                None,
+                query_shard=stage_plan,
+            )
+            want, logical, candidates = expected[layer]
+            for got, full in zip(result, want, strict=True):
+                torch.testing.assert_close(
+                    got, full[stage_plan.local_slice], rtol=0, atol=0
+                )
+            record = backend.sparse_topk.prefill
+            torch.testing.assert_close(
+                record.logical_rows, logical[stage_plan.local_slice], rtol=0, atol=0
+            )
+            if candidates is not None:
+                torch.testing.assert_close(
+                    record.candidates.block_ids,
+                    candidates[0][stage_plan.local_slice],
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    record.candidates.lengths,
+                    candidates[1][stage_plan.local_slice],
+                    rtol=0,
+                    atol=0,
+                )
+            actual = attend(backend, metadata, layer, ids, stage_plan)
+            torch.testing.assert_close(
+                actual, attention_outputs[layer][stage_plan.local_slice], rtol=0, atol=0
+            )
+        torch.testing.assert_close(
+            backend.cache_pool.arena.buffer,
+            reference.cache_pool.arena.buffer,
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_model_qcp_metadata_keeps_full_cache_coordinates(rank):
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    backend = _backend("cpu", 2)
+    lengths = [257, 3]
+    plan = QueryShardPlan.from_forward(
+        total_tokens=sum(lengths), input_lengths=lengths, size=4, rank=rank
+    )
+    meta = _extend(
+        backend,
+        _tables("cpu"),
+        lengths,
+        [0, 0],
+        [0, 0],
+        [257, 99],
+        query_shard=plan,
+    )
+    assert meta.positions.numel() == 260
+    assert meta.positions[:257].tolist() == list(range(257))
+    shard = backend.partition_prefill_queries(
+        plan, sampled_rows_cpu=torch.tensor([256], dtype=torch.int64)
+    )
+    assert shard.keep_rows.numel() == shard.decoder_plan.local_rows
+    with pytest.raises(ValueError, match="full prefill span"):
+        _extend(
+            backend,
+            _tables("cpu"),
+            [1, 1],
+            [0, 0],
+            [0, 0],
+            [1, 1],
+            query_shard=plan,
+        )
+
+
+@pytest.mark.parametrize("kvp_size", [1, 4])
+def test_model_qcp_prefill_config(kvp_size):
+    recipe = _recipe("cpu")
+    hf = recipe.model_config.hf_config
+    hf.index_topk, hf.candidate_topk_blocks, hf.candidate_block_size = 4, 2, 8
+    args = ServerArgs(
+        model="x",
+        device="cuda",
+        attn_tp_size=4,
+        query_context_parallel_size=4,
+        kv_parallel_size=kvp_size,
+        ep_size=4,
+        disaggregation_mode="prefill",
+        disaggregation_layerwise_interval=0,
+        disable_prefill_graph=True,
+        prefix_granularity=128,
+        max_num_seqs=4,
+        chunked_prefill_size=256,
+        max_total_tokens=1024,
+        kv_cache_quant_method="none",
+    )
+    args.mapping.rank = 0
+    model = SimpleNamespace(
+        hf_config=recipe.model_config.hf_config,
+        num_attention_layers=40,
+        num_attention_heads=4,
+        dtype=torch.bfloat16,
+        context_len=512,
+    )
+    config = DeepseekV41Config.generate(args, model, False)
+    assert config.qcp_size == 4
+    assert config.kvp_size == kvp_size
+    assert config.component(DeepseekV41Config).attn_tp_size == 1
+    args.deepseek_v41_indexer_query_parallel_size = 4
+    with pytest.raises(ValueError, match="cannot combine with aggregate QCP"):
+        DeepseekV41Config.generate(args, model, False)
+    args.deepseek_v41_indexer_query_parallel_size = 1
+    args.deepseek_v41_attention_query_parallel_size = 4
+    with pytest.raises(ValueError, match="cannot combine with aggregate QCP"):
+        DeepseekV41Config.generate(args, model, False)
+    args.deepseek_v41_attention_query_parallel_size = 1
+    args.speculative_algorithm = "DSPARK"
+    args.speculative_num_draft_tokens = 5
+    args.speculative_num_steps = 4
+    assert DeepseekV41Config.generate(args, model, False).qcp_size == 4
+    args.disaggregation_mode = "decode"
+    with pytest.raises(ValueError, match="PD prefill role"):
+        DeepseekV41Config.generate(args, model, False)
+
+
+@pytest.mark.parametrize("dspark", [False, True])
+@pytest.mark.parametrize("prefill_kvp", [1, 4])
+def test_pd_prefill_to_sharded_decode_contract(dspark, prefill_kvp):
+    from tokenspeed.runtime.pd.cache_protocol import build_arena_cache_transfer_contract
+    from tokenspeed.runtime.pd.transfer_plan import (
+        CacheTransferPlanner,
+        local_transfer_pages,
+    )
+
+    recipe = _dspark_recipe if dspark else _recipe
+    source_recipe, destination_recipe = recipe("cpu"), recipe("cpu")
+    source_recipe.attn_config = replace(
+        source_recipe.attn_config,
+        pd_disaggregation_enabled=True,
+        kvp_size=prefill_kvp,
+        kvp_rank=0,
+        kvp_group=tuple(range(prefill_kvp)),
+    )
+    destination_recipe.attn_config = replace(
+        destination_recipe.attn_config,
+        pd_disaggregation_enabled=True,
+        kvp_size=4,
+        kvp_rank=0,
+        kvp_group=(0, 1, 2, 3),
+    )
+    source_pool, destination_pool = _pool(source_recipe, "cpu"), _pool(
+        destination_recipe, "cpu"
+    )
+    source, _ = build_arena_cache_transfer_contract(source_pool.arena)
+    destination, _ = build_arena_cache_transfer_contract(destination_pool.arena)
+    planner = CacheTransferPlanner(
+        prefill_tp_size=4,
+        decode_tp_size=4,
+        prefill_layout=source,
+        decode_layout=destination,
+        prefill_field_ids=None,
+    )
+    # Independent allocator IDs: the same logical row can have a different
+    # page number on P and D. Only global KV and Index K are page-sharded.
+    source_ids, destination_ids = tuple(range(1, 9)), tuple(range(8, 0, -1))
+    for group in (SWA, R1, R2, TAIL):
+        seen = []
+        for rank in range(4):
+            route = planner.plan_for_decode_rank(rank)
+            assert len(route.target_prefill_ranks) == prefill_kvp
+            count = destination.shard_count(group)
+            source_count = source.shard_count(group)
+            for source_rank in range(source_count):
+                src, dst = local_transfer_pages(
+                    source_ids,
+                    destination_ids,
+                    group_id=group,
+                    source_layout=source,
+                    destination_layout=destination,
+                    source_owner_rank=source_rank,
+                    destination_owner_rank=rank,
+                )
+                restored_src = ((src - 1) * source_count + source_rank + 1).tolist()
+                restored_dst = (
+                    (dst - 1) * count + (rank if count > 1 else 0) + 1
+                ).tolist()
+                expected = [
+                    (s, d)
+                    for s, d in zip(source_ids, destination_ids)
+                    if (count == 1 or (d - 1) % count == rank)
+                    and (s - 1) % source_count == source_rank
+                ]
+                assert list(zip(restored_src, restored_dst)) == expected
+                seen.extend(restored_src)
+        assert sorted(seen) == sorted(
+            list(source_ids) * (1 if group in (R1, R2) else 4)
+        )
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_pd_kvp_decode_config(size):
+    recipe = _recipe("cpu")
+    hf = recipe.model_config.hf_config
+    hf.index_topk, hf.candidate_topk_blocks, hf.candidate_block_size = 4, 2, 8
+    args = ServerArgs(
+        model="x",
+        device="cuda",
+        attn_tp_size=size,
+        ep_size=size,
+        kv_parallel_size=size,
+        decode_context_parallel_size=size,
+        disaggregation_mode="decode",
+        disaggregation_layerwise_interval=0,
+        disable_prefill_graph=True,
+        enforce_eager=True,
+        prefix_granularity=128,
+        max_num_seqs=4,
+        chunked_prefill_size=256,
+        max_total_tokens=1024,
+        kv_cache_quant_method="none",
+    )
+    args.mapping.rank = 0
+    model = SimpleNamespace(
+        hf_config=hf,
+        num_attention_layers=40,
+        num_attention_heads=64,
+        dtype=torch.bfloat16,
+        context_len=512,
+    )
+    config = DeepseekV41Config.generate(args, model, False)
+    assert config.kvp_size == size and config.pd_disaggregation_enabled
+    assert config.qcp_size == 1
+    args.speculative_algorithm = "DSPARK"
+    args.speculative_num_draft_tokens = 5
+    args.speculative_num_steps = 4
+    config = DeepseekV41Config.generate(args, model, False)
+    assert config.kvp_size == size and config.qcp_size == 1
+    args.speculative_algorithm = "EAGLE"
+    with pytest.raises(ValueError, match="DSpark speculation only"):
+        DeepseekV41Config.generate(args, model, False)

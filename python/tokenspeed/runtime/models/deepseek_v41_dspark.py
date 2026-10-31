@@ -170,7 +170,10 @@ class _WindowAttention:
         swa_norm_weight,
         swa_norm_eps,
         out_rope_cache=None,
+        key_rows=None,
     ):
+        if key_rows is not None:
+            raise ValueError("DSpark window attention does not accept query sharding")
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
         kv = self._workspace(
