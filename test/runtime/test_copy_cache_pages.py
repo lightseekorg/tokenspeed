@@ -353,7 +353,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
     ``DeviceHandle.execute``.
 
     On a full Device two finished prompts, A and E, each hold two full pages
-    and a tail. B resends A and hits inside A's tail; C resends E. B's
+    and a tail. B resends A and hits inside A's tail; C diverges in E's tail. B's
     admission evicts E's tail and takes its page for the private copy of A's
     tail; C's evicts A's tail, the page B's copy reads, and gets it zeroed.
     One stream-ordered store writes both tails back. The handle submits the
@@ -579,8 +579,13 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             )
             before = arena.buffer.clone()
 
+            # C shares E's full pages, but cannot reuse its pending tail.
+            # Its new tail still exercises zeroing a write-back source.
             plan = submit(
-                {"b": prompts["a"] + [7, 8, 9], "c": prompts["e"] + [4, 5, 6]}
+                {
+                    "b": prompts["a"] + [7, 8, 9],
+                    "c": prompts["e"][: 2 * self.PAGE] + list(range(400, 412)),
+                }
             )
             hit_b, hit_c = forwards(plan)[0].extend_prefix_lens
             assert (hit_b, hit_c) == (41, 32)
