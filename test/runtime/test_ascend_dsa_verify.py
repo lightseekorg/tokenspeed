@@ -1775,6 +1775,19 @@ def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(width, page, 
     for _ in range(4):
         assert owner.prepare_write_slots(locations.view(-1), placement) is slots
         assert owner.metadata(start=0, end=3 * width).page_table.data_ptr() == address
+    # New storage with the same geometry must replace the cached slot mapping.
+    replacement = torch.full_like(locations, 2 * block + 5)
+    replaced_slots = owner.prepare_write_slots(replacement, placement)
+    assert replaced_slots is not slots
+    torch.testing.assert_close(
+        replaced_slots, torch.full_like(locations, block + 5), atol=0, rtol=0
+    )
+    replacement.set_(torch.full_like(replacement, 2 * block + 9))
+    rebound_slots = owner.prepare_write_slots(replacement, placement)
+    assert rebound_slots is not replaced_slots
+    torch.testing.assert_close(
+        rebound_slots, torch.full_like(locations, block + 9), atol=0, rtol=0
+    )
     # Next step overwrites the same router/input storage; no stale metadata or
     # ownership mask can escape the step invalidation.
     owner.clear_forward_metadata()
@@ -1788,3 +1801,39 @@ def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(width, page, 
     torch.testing.assert_close(
         slots, torch.full_like(locations, block + 7), atol=0, rtol=0
     )
+
+
+def test_shared_metadata_reuses_alias_views_and_refreshes_replacement_storage():
+    owner = ascend_dcp.AscendDCPMetadata(
+        degree=8, rank=1, ranks=tuple(range(8)), virtual_block_count=19
+    )
+    owner.allocate_decode_buffers(2, 4, "cpu")
+    lengths = torch.tensor([256, 384], dtype=torch.int32)
+    table = torch.tensor([[2, 3, 4, 5], [2, 3, 4, 5]], dtype=torch.int32)
+
+    def prepare(seq_lens, page_table):
+        owner.prepare_metadata(
+            seq_lens=seq_lens,
+            page_table=page_table,
+            page_size=128,
+            block_granularity=128,
+            init_tokens=0,
+            local_tokens=0,
+            query_width=1,
+            query_group_size=1,
+            slots=None,
+        )
+
+    prepare(lengths, table)
+    expected = owner.seq_lens.clone()
+    # The prepared results remain layer-shared until forward invalidation.
+    lengths.zero_()
+    prepare(lengths.view_as(lengths), table.view_as(table))
+    torch.testing.assert_close(owner.seq_lens, expected, atol=0, rtol=0)
+    prepare(lengths.clone(), table.clone())
+    assert torch.count_nonzero(owner.seq_lens) == 0
+    # Rebinding the same Tensor object must also invalidate its old view.
+    prepare(lengths, table)
+    lengths.set_(torch.tensor([256, 384], dtype=torch.int32))
+    prepare(lengths, table)
+    torch.testing.assert_close(owner.seq_lens, expected, atol=0, rtol=0)
