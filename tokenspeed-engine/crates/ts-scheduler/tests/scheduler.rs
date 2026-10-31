@@ -26,9 +26,9 @@ use std::{ffi::CString, sync::Once};
 
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
-    BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind,
-    RequestSpec, Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind, StorageRound,
-    StorageTickView, TransferBatchView,
+    BlockTableView, BucketView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
+    ForwardEventKind, RequestSpec, Scheduler, StorageCancellationView, StorageDoneView,
+    StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -291,6 +291,150 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
     assert!(restored, "the retracted request was never restored");
     let sizes = scheduler.sizes();
     assert_eq!((sizes.decoding, sizes.retracted), (1, 0));
+}
+
+/// Run `id` to its finish, acknowledging every Host store and load the plans
+/// carry, then plan until its stores are acknowledged too.
+fn run_to_finish(scheduler: &mut Scheduler, id: &str, tokens: Vec<i32>) {
+    scheduler.submit_requests(&[spec(id, tokens)]);
+    let mut generated = 0;
+    for _ in 0..8 {
+        let plan = scheduler.next_execution_plan();
+        let acks: Vec<CacheEvent> = plan
+            .cache_ops()
+            .iter()
+            .filter(|op| op.kind == CacheOpKind::WriteBack || op.kind == CacheOpKind::LoadBack)
+            .map(|op| CacheEvent {
+                kind: if op.kind == CacheOpKind::WriteBack {
+                    CacheEventKind::WriteBackDone
+                } else {
+                    CacheEventKind::LoadBackDone
+                },
+                op_id: op.op_id,
+            })
+            .collect();
+        scheduler
+            .advance_head(&StorageRound::default(), &acks)
+            .unwrap();
+        if plan
+            .forward_batches()
+            .iter()
+            .any(|batch| batch.request_ids.iter().any(|request| request == id))
+        {
+            generated += 1;
+            let mut events = vec![event(
+                ForwardEventKind::ExtendResult,
+                id,
+                vec![1000 + generated],
+            )];
+            if generated == 2 {
+                events.push(event(ForwardEventKind::Finish, id, Vec::new()));
+            }
+            scheduler.advance(&events).unwrap();
+        }
+    }
+    assert_eq!(generated, 2, "{id} ran a prefill and a decode step");
+}
+
+#[test]
+fn the_host_cache_view_carries_prefix_hits_and_host_evictions() {
+    interpreter();
+    // Write-through onto a Host of five pages.
+    let code = NEW_SCHEDULER.replace(
+        "result = ts.Scheduler(cfg)",
+        "cfg.num_host_pages = 6\n\
+         cfg.host_group_packing = [1]\n\
+         cfg.disable_l2_cache = False\n\
+         cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough\n\
+         result = ts.Scheduler(cfg)",
+    );
+    let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+    // Three pages each, the last prompt token always computed. r2 hits r1's
+    // first two pages on the Host, the Device having dropped them; r3's
+    // stores evict r1's pages from the Host; r4, over r1's prompt once the
+    // Device dropped everything again, stops at r1's first page, which the
+    // Host evicted. The flush then empties the Host.
+    run_to_finish(&mut scheduler, "r1", (1..=48).collect());
+    assert!(scheduler.clear_l1_cache());
+    run_to_finish(&mut scheduler, "r2", (1..=48).collect());
+    run_to_finish(&mut scheduler, "r3", (101..=148).collect());
+    assert!(scheduler.clear_l1_cache());
+    run_to_finish(&mut scheduler, "r4", (1..=48).collect());
+    assert!(scheduler.clear_cache());
+
+    let stats = scheduler.host_cache_stats();
+    assert_eq!(
+        (
+            stats.prompt_tokens,
+            stats.device_hit_tokens,
+            stats.host_hit_tokens
+        ),
+        (4 * 48, 0, 32)
+    );
+    let reasons: Vec<&str> = stats
+        .host_evictions
+        .iter()
+        .map(|row| row.reason.as_str())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "lru",
+            "duplicate",
+            "superseded",
+            "dead_entry",
+            "tail_cap",
+            "flush",
+            "duplicate_kv"
+        ]
+    );
+    let bounds = ts_scheduler::host_eviction_bucket_bounds();
+    assert_eq!(
+        bounds.idle_ms,
+        [
+            500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000, 1_200_000,
+            1_800_000, 3_600_000
+        ]
+    );
+    assert_eq!(
+        bounds.evicted_then_needed_tokens,
+        [1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576]
+    );
+    let none = |num_bounds: usize| BucketView {
+        counts: vec![0; num_bounds + 1],
+        sums: vec![0; num_bounds + 1],
+    };
+    // r4 alone stopped at a page the Host evicted: its whole prompt.
+    let mut needed = none(bounds.evicted_then_needed_tokens.len());
+    needed.counts[0] = 1;
+    needed.sums[0] = 48;
+    for row in &stats.host_evictions {
+        let reason = row.reason.as_str();
+        // Every entry evicted but by the flush is a KV block whose idle
+        // time was observed.
+        let observed = if reason == "flush" { 0 } else { row.blocks };
+        assert_eq!(
+            row.kv_idle_ms.counts.iter().sum::<u64>(),
+            observed,
+            "{reason}"
+        );
+        assert_eq!(row.kv_idle_ms.counts.len(), bounds.idle_ms.len() + 1);
+        assert_eq!(row.kv_idle_ms.sums.len(), bounds.idle_ms.len() + 1);
+        assert_eq!(row.state_idle_ms, none(bounds.idle_ms.len()), "{reason}");
+        if reason == "lru" {
+            assert_eq!(row.evicted_then_needed_tokens, needed);
+        } else {
+            assert_eq!(
+                row.evicted_then_needed_tokens,
+                none(bounds.evicted_then_needed_tokens.len()),
+                "{reason}"
+            );
+        }
+    }
+    // r1 leaves three pages and a tail on the Host; r3's four stores evict
+    // three of them, r4's four more; the flush takes the five left.
+    let blocks: Vec<u64> = stats.host_evictions.iter().map(|row| row.blocks).collect();
+    assert_eq!(blocks, [7, 0, 0, 0, 0, 5, 0]);
 }
 
 /// A small scheduler with the L3 tier and its storage credits.

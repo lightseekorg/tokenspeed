@@ -342,8 +342,8 @@ impl Metric {
         self.observe_weighted(labels, value, value, 1);
     }
 
-    /// Record a per-token interval: `interval` over `num_tokens` tokens,
-    /// as `num_tokens` observations of their mean that sum to `interval`.
+    /// Record `num_tokens` observations of their mean that sum to
+    /// `interval`, such as a per-token interval over `num_tokens` tokens.
     pub fn observe_batched(&self, labels: &[&str], interval: f64, num_tokens: i64) {
         if num_tokens <= 0 {
             return;
@@ -999,5 +999,209 @@ impl L3Metrics {
         ] {
             self.increment("backup_drops", count, &[reason]);
         }
+    }
+}
+
+/// One cumulative histogram of the scheduler's (`BucketCounts`): per bucket,
+/// the observations and their total, the last bucket above every bound.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketCounts {
+    /// Observations per bucket.
+    pub counts: Vec<u64>,
+    /// Their total per bucket.
+    pub sums: Vec<u64>,
+}
+
+/// The Host L2 entries evicted for one reason (`HostEvictionCounts`),
+/// cumulative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostEvictionSnapshot {
+    /// `lru`, `duplicate`, `superseded`, `dead_entry`, `tail_cap`, `flush` or
+    /// `duplicate_kv`.
+    pub reason: String,
+    /// Entries evicted, over every cache group.
+    pub blocks: u64,
+    /// Their idle times in milliseconds, KV blocks.
+    pub kv_idle_ms: BucketCounts,
+    /// Their idle times in milliseconds, State checkpoints.
+    pub state_idle_ms: BucketCounts,
+    /// The prompt tokens past the hit of first admissions whose hit stopped
+    /// at blocks evicted recently for this reason.
+    pub evicted_then_needed_tokens: BucketCounts,
+}
+
+/// The scheduler's prefix-cache observations (`HostCacheStats`), cumulative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostCacheSnapshot {
+    /// First admissions' prompt tokens.
+    pub prompt_tokens: u64,
+    /// Of them, what the Device's prefix cache served.
+    pub device_hit_tokens: u64,
+    /// Of them, what Host L2 served.
+    pub host_hit_tokens: u64,
+    /// Host L2 evictions, one row per reason.
+    pub host_evictions: Vec<HostEvictionSnapshot>,
+}
+
+/// Milliseconds per second: the scheduler times Host evictions in
+/// milliseconds, and the idle histogram counts seconds.
+const MS_PER_SECOND: f64 = 1000.0;
+
+/// The prefix cache's and Host L2's metrics (`HostCacheMetrics`), on the rank
+/// that reports the engine metrics. Snapshots carry the scheduler's
+/// cumulative counters; each export adds only what grew since the last one.
+#[derive(Debug)]
+pub struct HostCacheMetrics {
+    labels: [String; 3],
+    prompt_tokens: Metric,
+    evicted_blocks: Metric,
+    evicted_then_needed_tokens: Metric,
+    evicted_block_idle: Metric,
+    /// The snapshot last exported.
+    exported: HostCacheSnapshot,
+}
+
+impl HostCacheMetrics {
+    /// The metrics, exported through `exporter`, with the scheduler's bucket
+    /// bounds as it counts them (`+Inf` added): idle times in milliseconds,
+    /// tokens past the hit.
+    pub fn new(
+        exporter: &Arc<Exporter>,
+        labels: &EngineLabels,
+        idle_ms_bounds: &[u64],
+        evicted_then_needed_token_bounds: &[u64],
+    ) -> Self {
+        for bounds in [idle_ms_bounds, evicted_then_needed_token_bounds] {
+            assert!(
+                bounds.first().is_some_and(|&bound| bound > 0)
+                    && bounds.windows(2).all(|pair| pair[0] < pair[1]),
+                "histogram bounds are positive and increasing: {bounds:?}"
+            );
+        }
+        let idle_seconds_bounds: Vec<f64> = idle_ms_bounds
+            .iter()
+            .map(|&bound| bound as f64 / MS_PER_SECOND)
+            .collect();
+        let token_bounds: Vec<f64> = evicted_then_needed_token_bounds
+            .iter()
+            .map(|&bound| bound as f64)
+            .collect();
+        let with = |extra: &[&'static str]| -> Vec<&'static str> {
+            ENGINE_LABELS.iter().chain(extra).copied().collect()
+        };
+        Self {
+            labels: [
+                labels.model_name.clone(),
+                labels.app_key.clone(),
+                labels.dp_rank.to_string(),
+            ],
+            prompt_tokens: Metric::counter(
+                exporter,
+                "tokenspeed:prefix_cache_prompt_tokens",
+                "First admissions' prompt tokens by the cache tier that served them: device and \
+                 host prefix hits, none for the rest.",
+                &with(&["tier"]),
+            ),
+            evicted_blocks: Metric::counter(
+                exporter,
+                "tokenspeed:l2_evicted_blocks",
+                "Host L2 cache entries evicted, over every cache group, by reason.",
+                &with(&["reason"]),
+            ),
+            evicted_then_needed_tokens: Metric::histogram(
+                exporter,
+                "tokenspeed:l2_evicted_then_needed_tokens",
+                "First admissions whose prefix hit stopped at blocks Host L2 evicted recently: \
+                 their prompt tokens past the hit, by the eviction's reason.",
+                &with(&["reason"]),
+                &token_bounds,
+            ),
+            evicted_block_idle: Metric::histogram(
+                exporter,
+                "tokenspeed:l2_evicted_block_idle_seconds",
+                "How long each evicted Host L2 cache entry had gone unused as Host LRU ranks it \
+                 (the age of its access epoch, approximate), by kind and reason.",
+                &with(&["kind", "reason"]),
+                &idle_seconds_bounds,
+            ),
+            exported: HostCacheSnapshot::default(),
+        }
+    }
+
+    /// Export what grew since the last snapshot. A histogram bucket's new
+    /// observations become that many observations of their mean, which lies
+    /// in the bucket, with their exact total: the Prometheus buckets and sum
+    /// are the scheduler's, while an output plugin sees each bucket's growth
+    /// as observations of one value.
+    pub fn record(&mut self, stats: &HostCacheSnapshot) {
+        let [model_name, app_key, dp_rank] =
+            [&self.labels[0], &self.labels[1], &self.labels[2]].map(String::as_str);
+        let before = &self.exported;
+        let uncached = |stats: &HostCacheSnapshot| {
+            stats
+                .prompt_tokens
+                .saturating_sub(stats.device_hit_tokens + stats.host_hit_tokens)
+        };
+        for (tier, now, then) in [
+            ("device", stats.device_hit_tokens, before.device_hit_tokens),
+            ("host", stats.host_hit_tokens, before.host_hit_tokens),
+            ("none", uncached(stats), uncached(before)),
+        ] {
+            if now > then {
+                self.prompt_tokens
+                    .inc(&[model_name, app_key, dp_rank, tier], (now - then) as f64);
+            }
+        }
+        let never = HostEvictionSnapshot::default();
+        for row in &stats.host_evictions {
+            let previous = before
+                .host_evictions
+                .iter()
+                .find(|previous| previous.reason == row.reason)
+                .unwrap_or(&never);
+            let reason = row.reason.as_str();
+            if row.blocks > previous.blocks {
+                self.evicted_blocks.inc(
+                    &[model_name, app_key, dp_rank, reason],
+                    (row.blocks - previous.blocks) as f64,
+                );
+            }
+            for (metric, labels, now, then, divisor) in [
+                (
+                    &self.evicted_then_needed_tokens,
+                    vec![model_name, app_key, dp_rank, reason],
+                    &row.evicted_then_needed_tokens,
+                    &previous.evicted_then_needed_tokens,
+                    1.0,
+                ),
+                (
+                    &self.evicted_block_idle,
+                    vec![model_name, app_key, dp_rank, "kv", reason],
+                    &row.kv_idle_ms,
+                    &previous.kv_idle_ms,
+                    MS_PER_SECOND,
+                ),
+                (
+                    &self.evicted_block_idle,
+                    vec![model_name, app_key, dp_rank, "state", reason],
+                    &row.state_idle_ms,
+                    &previous.state_idle_ms,
+                    MS_PER_SECOND,
+                ),
+            ] {
+                assert!(
+                    now.counts.len() == metric.bounds.len()
+                        && now.sums.len() == metric.bounds.len(),
+                    "a snapshot of {} has a count and a sum per bucket",
+                    metric.name
+                );
+                for (bucket, (&count, &sum)) in now.counts.iter().zip(&now.sums).enumerate() {
+                    let added = count.saturating_sub(then.counts.get(bucket).copied().unwrap_or(0));
+                    let added_sum = sum.saturating_sub(then.sums.get(bucket).copied().unwrap_or(0));
+                    metric.observe_batched(&labels, added_sum as f64 / divisor, added as i64);
+                }
+            }
+        }
+        self.exported = stats.clone();
     }
 }

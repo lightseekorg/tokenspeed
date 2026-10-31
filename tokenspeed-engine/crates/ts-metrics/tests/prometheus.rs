@@ -32,8 +32,9 @@ use std::{
 };
 
 use ts_metrics::{
-    EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3ExecutorSnapshot, L3Labels,
-    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig,
+    BucketCounts, EngineLabels, EngineMetrics, Exporter, HostCacheMetrics, HostCacheSnapshot,
+    HostEvictionSnapshot, KvTransferMetrics, L3ExecutorSnapshot, L3Labels, L3Metrics,
+    L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig,
 };
 
 fn fixtures() -> PathBuf {
@@ -286,6 +287,212 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
         let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
         assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
     }
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn host_cache_snapshots_export_their_growth_once() {
+    let directory = scratch_dir("host-cache");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    // The scheduler's bounds: idle milliseconds, and prompt tokens past the
+    // hit.
+    let idle_bounds = [
+        500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000, 1_200_000,
+        1_800_000, 3_600_000,
+    ];
+    let token_bounds = [1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576];
+    let mut metrics = HostCacheMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+        &idle_bounds,
+        &token_bounds,
+    );
+    // (bucket, observations, their total); the last bucket is past every
+    // bound.
+    let buckets = |num_bounds: usize, filled: &[(usize, u64, u64)]| {
+        let mut out = BucketCounts {
+            counts: vec![0; num_bounds + 1],
+            sums: vec![0; num_bounds + 1],
+        };
+        for &(bucket, count, sum) in filled {
+            out.counts[bucket] = count;
+            out.sums[bucket] = sum;
+        }
+        out
+    };
+    let row = |reason: &str,
+               blocks: u64,
+               kv_idle_ms: &[(usize, u64, u64)],
+               state_idle_ms: &[(usize, u64, u64)],
+               needed: &[(usize, u64, u64)]| HostEvictionSnapshot {
+        reason: reason.to_owned(),
+        blocks,
+        kv_idle_ms: buckets(idle_bounds.len(), kv_idle_ms),
+        state_idle_ms: buckets(idle_bounds.len(), state_idle_ms),
+        evicted_then_needed_tokens: buckets(token_bounds.len(), needed),
+    };
+    let first = HostCacheSnapshot {
+        prompt_tokens: 100,
+        device_hit_tokens: 30,
+        host_hit_tokens: 20,
+        host_evictions: vec![
+            // KV blocks idle 0 ms, 3 s and 4 s, a checkpoint idle 4,000 s;
+            // two admissions stopped 2,000 and 3,000 tokens short.
+            row(
+                "lru",
+                4,
+                &[(0, 1, 0), (3, 2, 7_000)],
+                &[(13, 1, 4_000_000)],
+                &[(1, 2, 5_000)],
+            ),
+            row("tail_cap", 1, &[(1, 1, 750)], &[], &[]),
+            row("flush", 5, &[], &[], &[]),
+        ],
+    };
+    // Snapshots are cumulative: exporting one twice adds nothing.
+    metrics.record(&first);
+    metrics.record(&first);
+    // The next one adds 10 uncached prompt tokens, two LRU victims, a KV
+    // block idle 2.5 s and a checkpoint idle 5,000 s, and an admission
+    // 10,000 tokens short.
+    let mut second = first.clone();
+    second.prompt_tokens += 10;
+    second.host_evictions[0].blocks += 2;
+    second.host_evictions[0].kv_idle_ms.counts[3] += 1;
+    second.host_evictions[0].kv_idle_ms.sums[3] += 2_500;
+    second.host_evictions[0].state_idle_ms.counts[13] += 1;
+    second.host_evictions[0].state_idle_ms.sums[13] += 5_000_000;
+    second.host_evictions[0].evicted_then_needed_tokens.counts[2] += 1;
+    second.host_evictions[0].evicted_then_needed_tokens.sums[2] += 10_000;
+    metrics.record(&second);
+    drop(metrics);
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    let prompt = "tokenspeed:prefix_cache_prompt_tokens_total";
+    let evicted = "tokenspeed:l2_evicted_blocks_total";
+    let idle = "tokenspeed:l2_evicted_block_idle_seconds";
+    let needed = "tokenspeed:l2_evicted_then_needed_tokens";
+    for (metric, labels, value) in [
+        (prompt, r#"model_name="m",tier="device""#, 30.0),
+        (prompt, r#"model_name="m",tier="host""#, 20.0),
+        (prompt, r#"model_name="m",tier="none""#, 60.0),
+        (evicted, r#"model_name="m",reason="lru""#, 6.0),
+        (evicted, r#"model_name="m",reason="tail_cap""#, 1.0),
+        (evicted, r#"model_name="m",reason="flush""#, 5.0),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="kv",le="0.5",model_name="m",reason="lru""#,
+            1.0,
+        ),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="kv",le="2.0",model_name="m",reason="lru""#,
+            1.0,
+        ),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="kv",le="5.0",model_name="m",reason="lru""#,
+            4.0,
+        ),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="kv",le="+Inf",model_name="m",reason="lru""#,
+            4.0,
+        ),
+        (
+            &format!("{idle}_count"),
+            r#"kind="kv",model_name="m",reason="lru""#,
+            4.0,
+        ),
+        (
+            &format!("{idle}_sum"),
+            r#"kind="kv",model_name="m",reason="lru""#,
+            9.5,
+        ),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="state",le="3600.0",model_name="m",reason="lru""#,
+            0.0,
+        ),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="state",le="+Inf",model_name="m",reason="lru""#,
+            2.0,
+        ),
+        (
+            &format!("{idle}_sum"),
+            r#"kind="state",model_name="m",reason="lru""#,
+            9000.0,
+        ),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="kv",le="0.5",model_name="m",reason="tail_cap""#,
+            0.0,
+        ),
+        (
+            &format!("{idle}_bucket"),
+            r#"kind="kv",le="1.0",model_name="m",reason="tail_cap""#,
+            1.0,
+        ),
+        (
+            &format!("{idle}_sum"),
+            r#"kind="kv",model_name="m",reason="tail_cap""#,
+            0.75,
+        ),
+        (
+            &format!("{needed}_bucket"),
+            r#"le="1024.0",model_name="m",reason="lru""#,
+            0.0,
+        ),
+        (
+            &format!("{needed}_bucket"),
+            r#"le="4096.0",model_name="m",reason="lru""#,
+            2.0,
+        ),
+        (
+            &format!("{needed}_bucket"),
+            r#"le="16384.0",model_name="m",reason="lru""#,
+            3.0,
+        ),
+        (
+            &format!("{needed}_bucket"),
+            r#"le="1.048576e+06",model_name="m",reason="lru""#,
+            3.0,
+        ),
+        (
+            &format!("{needed}_count"),
+            r#"model_name="m",reason="lru""#,
+            3.0,
+        ),
+        (
+            &format!("{needed}_sum"),
+            r#"model_name="m",reason="lru""#,
+            15000.0,
+        ),
+    ] {
+        let line = format!(r#"{metric}{{app_key="",dp_rank="0",{labels}}} {value:?}"#);
+        assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
+    }
+    // A reason with nothing observed has no histogram series.
+    assert!(
+        !rendered
+            .lines()
+            .any(|line| line.starts_with(idle) && line.contains(r#"reason="flush""#)),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(r#"kind="state",model_name="m",reason="tail_cap""#),
+        "{rendered}"
+    );
     std::fs::remove_dir_all(&directory).unwrap();
 }
 

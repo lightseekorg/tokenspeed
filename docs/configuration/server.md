@@ -987,6 +987,55 @@ carry the `model_name` and `app_key` labels:
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
+### Prefix cache and Host L2 metrics
+
+With `--enable-metrics`, the rank that reports the scheduler's metrics (the
+first attention-TP rank of each attention-DP rank) also exports how the
+prefix cache served each request's first admission and what Host L2
+evicted. They are the C++ scheduler's cumulative counters, sampled at most
+once a second, with the `model_name`, `app_key` and `dp_rank` labels; a
+series appears once it first grows.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `tokenspeed:prefix_cache_prompt_tokens_total` | Counter | `tier` | Prompt tokens of first admissions by the tier that served them: `device` (GPU prefix-cache hits), `host` (the KV Host L2 loads; a hit that a Host L2 State checkpoint extends over GPU KV counts as `device`) and `none` (computed, the always-recomputed last prompt token included). On a decode node, `none` is what the prefill node sends. |
+| `tokenspeed:l2_evicted_blocks_total` | Counter | `reason` | Host L2 entries evicted, as blocks over every cache group: `lru` (least recently used, to make room), `duplicate`, `duplicate_kv` and `superseded` (`write_back`: a copy of what the GPU resumes from, a KV block the GPU also holds, a prompt-end checkpoint its request continued past on the GPU), `dead_entry` (nothing can resume from it any more), `tail_cap` (the oldest of more than 8 prompt ends cached inside one page), `flush`. |
+| `tokenspeed:l2_evicted_then_needed_tokens` | Histogram | `reason` | First admissions whose hit stopped at blocks Host L2 evicted recently (below). `_count` counts them and `_sum` their prompt tokens past the hit (buckets 1 Ki to 1 Mi tokens), under the reason the first of those blocks was evicted for. Never on a decode node, whose prompt the prefill node computes. |
+| `tokenspeed:l2_evicted_block_idle_seconds` | Histogram | `kind` (`kv`, `state`), `reason` | Per entry evicted (not flushed), how long it had gone unused as Host LRU sees it: the time since its access epoch was issued (buckets 0.5 s to 1 h), by its store on Host L2 or by the last admission that used it on either tier, whichever was later. A copy `write_back` makes when the GPU evicts a page is stored with its GPU entry's epoch, which the request that last used or published it there issued: a page published after a long decode counts from that request's admission. The epoch's time is known to within 0.1 s plus one scheduler step; an entry over an hour old is observed at a lower bound of at least an hour. |
+
+`l2_evicted_then_needed_tokens` looks where the KV stopped: at the page after
+the KV's reach (for a sliding-window group, only its window behind that
+page) or else a prompt end inside that page, and, when the hit stops short
+of the KV's reach for want of a checkpoint, at the State checkpoints there.
+Past the GPU's own KV prefix the KV loads from Host L2 alone, so a KV block
+is missing unless Host L2 holds it, and a checkpoint unless either tier
+does. An admission counts when Host L2 evicted every missing block among its
+last 131,072 evicted blocks, as a fixed-size table recalls them: it loses
+under 1% of them early, for evenly spread keys. A prompt end is found
+through a table of 16,384 entries indexed by the page before it, where
+another page's evicted prompt end replaces it, so prompt ends are missed
+more often. It says where the hit
+stopped, not what keeping those blocks would have saved: a hybrid model may
+also need a checkpoint further on. Nothing past that page is looked at, so a
+sliding-window model's window published further on is missed, as are the
+full-page checkpoints of a model without KV groups and all but the last four
+prompt ends evicted inside one page.
+
+Under `write_through` only `lru`, `tail_cap` and `flush` occur. The prefix
+hit rate, and the share of computed prompt tokens in admissions a recent
+Host eviction stopped:
+
+```promql
+1 - sum(rate(tokenspeed:prefix_cache_prompt_tokens_total{tier="none"}[5m]))
+  / sum(rate(tokenspeed:prefix_cache_prompt_tokens_total[5m]))
+(sum(rate(tokenspeed:l2_evicted_then_needed_tokens_sum[5m])) or vector(0))
+  / sum(rate(tokenspeed:prefix_cache_prompt_tokens_total{tier="none"}[5m]))
+```
+
+The prefill and decode nodes of a disaggregated deployment report their own
+admissions; do not add their prompt tokens up. An output plugin sees the
+histograms' growth per bucket, as that many observations of their mean.
+
 ## TokenSpeed-specific runtime knobs
 
 These parameters are TokenSpeed-specific. They expose runtime

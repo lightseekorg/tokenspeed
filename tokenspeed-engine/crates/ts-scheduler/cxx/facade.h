@@ -46,6 +46,8 @@ struct StorageTickView;
 struct StorageCancellationView;
 struct StorageDoneView;
 struct StorageStatsView;
+struct HostCacheStatsView;
+struct HostEvictionBucketBounds;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler);
@@ -60,6 +62,8 @@ std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::St
 bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool storage_pending(const tokenspeed::Scheduler& scheduler);
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
+HostCacheStatsView host_cache_stats(const tokenspeed::Scheduler& scheduler);
+HostEvictionBucketBounds host_eviction_bucket_bounds();
 bool clear_cache(tokenspeed::Scheduler& scheduler);
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler);
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler);

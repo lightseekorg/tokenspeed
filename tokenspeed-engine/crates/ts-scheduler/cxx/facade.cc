@@ -21,6 +21,7 @@
 #include "ts-scheduler/cxx/facade.h"
 
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -35,11 +36,11 @@ namespace ts_scheduler {
 
 namespace {
 
-template <typename T>
-rust::Vec<T> to_rust(const std::vector<T>& values) {
-    rust::Vec<T> out;
-    out.reserve(values.size());
-    for (const T& value : values) {
+template <std::ranges::sized_range Values>
+rust::Vec<std::ranges::range_value_t<Values>> to_rust(const Values& values) {
+    rust::Vec<std::ranges::range_value_t<Values>> out;
+    out.reserve(std::ranges::size(values));
+    for (const auto& value : values) {
         out.push_back(value);
     }
     return out;
@@ -243,6 +244,45 @@ StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
         .unavailable_dropped_backup_keys = stats.unavailable_dropped_backup_keys,
         .disabled_dropped_backup_keys = stats.disabled_dropped_backup_keys,
         .cleanup_dropped_backup_keys = stats.cleanup_dropped_backup_keys,
+    };
+}
+
+HostCacheStatsView host_cache_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::HostCacheStats stats = scheduler.GetHostCacheStats();
+    HostCacheStatsView view{
+        .prompt_tokens = stats.prefix_hits.prompt_tokens,
+        .device_hit_tokens = stats.prefix_hits.device_hit_tokens,
+        .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
+        .host_evictions = {},
+    };
+    const tokenspeed::CacheCoordinator::HostEvictionStats& evictions = stats.host_evictions;
+    const auto buckets = [](const auto& histogram) {
+        return BucketView{.counts = to_rust(histogram.counts), .sums = to_rust(histogram.sums)};
+    };
+    for (const auto& [reason, counts] : {
+             std::pair{"lru", &evictions.lru},
+             std::pair{"duplicate", &evictions.duplicate},
+             std::pair{"superseded", &evictions.superseded},
+             std::pair{"dead_entry", &evictions.dead_entry},
+             std::pair{"tail_cap", &evictions.tail_cap},
+             std::pair{"flush", &evictions.flush},
+             std::pair{"duplicate_kv", &evictions.duplicate_kv},
+         }) {
+        view.host_evictions.push_back(HostEvictionView{
+            .reason = reason,
+            .blocks = counts->blocks,
+            .kv_idle_ms = buckets(counts->kv_idle_ms),
+            .state_idle_ms = buckets(counts->state_idle_ms),
+            .evicted_then_needed_tokens = buckets(counts->evicted_then_needed_tokens),
+        });
+    }
+    return view;
+}
+
+HostEvictionBucketBounds host_eviction_bucket_bounds() {
+    return HostEvictionBucketBounds{
+        .idle_ms = to_rust(tokenspeed::CacheCoordinator::kHostIdleBoundsMs),
+        .evicted_then_needed_tokens = to_rust(tokenspeed::CacheCoordinator::kEvictedThenNeededTokenBounds),
     };
 }
 

@@ -55,7 +55,7 @@ use std::{
 };
 
 use ts_collective::{Group, Mesh, Reduce};
-use ts_metrics::{EngineMetrics, L3Metrics};
+use ts_metrics::{EngineMetrics, HostCacheMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
@@ -446,6 +446,8 @@ pub struct Subsystems {
     pub embeddings: Option<Box<dyn EmbeddingReceiver + Send>>,
     /// The engine metrics, on the rank that reports them.
     pub metrics: Option<EngineMetrics>,
+    /// The prefix cache's and Host L2's metrics, on the same rank.
+    pub host_cache_metrics: Option<HostCacheMetrics>,
     /// The KV cache event publisher, on the rank that publishes them.
     pub kv_events: Option<KvEventPublisher>,
     /// The online expert rebalance controller (`--enable-eplb`).
@@ -471,6 +473,7 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     transfer: Option<Box<dyn TransferPeer + Send>>,
     embeddings: Option<Box<dyn EmbeddingReceiver + Send>>,
     metrics: Option<EngineMetrics>,
+    host_cache_metrics: Option<HostCacheMetrics>,
     kv_events: Option<KvEventPublisher>,
     eplb: Option<eplb::Controller>,
     grammars: Option<Grammars>,
@@ -501,6 +504,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     last_load_report: Option<Instant>,
     /// Last load sent to the frontend, including rounds with no token output.
     reported_load: Option<Load>,
+    /// Last sample of the prefix cache's metrics.
+    host_cache_sampled: Option<Instant>,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -543,6 +548,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             transfer: subsystems.transfer,
             embeddings: subsystems.embeddings,
             metrics: subsystems.metrics,
+            host_cache_metrics: subsystems.host_cache_metrics,
             kv_events: subsystems.kv_events,
             eplb: subsystems.eplb,
             grammars: subsystems.grammars,
@@ -555,6 +561,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             forward_allowed: true,
             last_load_report: None,
             reported_load: None,
+            host_cache_sampled: None,
         }
     }
 
@@ -633,6 +640,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
         }
         self.record_storage_metrics()?;
+        self.record_host_cache_metrics();
 
         let mut events = Vec::new();
         if self.controls.forward_blocked() {
@@ -1299,6 +1307,42 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             &crate::l3::scheduler_stats(self.scheduler.storage_stats()),
         );
         Ok(())
+    }
+
+    /// Sample the prefix cache's metrics: at most once a second.
+    /// Observations never feed the scheduler.
+    fn record_host_cache_metrics(&mut self) {
+        let Some(metrics) = self.host_cache_metrics.as_mut() else {
+            return;
+        };
+        if self
+            .host_cache_sampled
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.host_cache_sampled = Some(Instant::now());
+        let stats = self.scheduler.host_cache_stats();
+        let buckets = |view: ts_scheduler::BucketView| ts_metrics::BucketCounts {
+            counts: view.counts,
+            sums: view.sums,
+        };
+        metrics.record(&ts_metrics::HostCacheSnapshot {
+            prompt_tokens: stats.prompt_tokens,
+            device_hit_tokens: stats.device_hit_tokens,
+            host_hit_tokens: stats.host_hit_tokens,
+            host_evictions: stats
+                .host_evictions
+                .into_iter()
+                .map(|row| ts_metrics::HostEvictionSnapshot {
+                    reason: row.reason,
+                    blocks: row.blocks,
+                    kv_idle_ms: buckets(row.kv_idle_ms),
+                    state_idle_ms: buckets(row.state_idle_ms),
+                    evicted_then_needed_tokens: buckets(row.evicted_then_needed_tokens),
+                })
+                .collect(),
+        });
     }
 
     /// MIN of `values` over the replica: what every mirrored scheduler can

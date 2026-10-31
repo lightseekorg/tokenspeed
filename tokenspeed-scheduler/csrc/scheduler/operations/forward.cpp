@@ -304,6 +304,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     if (!prepared_keys) {
         prepared_keys = coordinator_.PreparePrefixKeys(hashes);
     }
+    match.max_cacheable_tokens = max_cacheable_tokens;
     // The KV walk stops at the probe bound; the D role also reads the prompt's
     // last page and its final tokens for the prompt-end state check.
     const CacheCoordinator::PromptPrefix prompt{
@@ -543,6 +544,18 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // it adds only a State checkpoint over Device KV).
     const bool host_won = match.probe.host.num_common_tokens > match.probe.device_only_hit_tokens;
     const std::int32_t host_gain_tokens = host_won ? hit_tokens - match.probe.device_only_hit_tokens : 0;
+    // Accounting only, read before Admit, which may evict: whether the hit
+    // stopped at blocks the Host evicted recently. The D role's prompt is the
+    // peer's to compute.
+    const auto evicted_then_needed = source == fsm::PrefillSource::kLocal
+                                         ? coordinator_.EvictedThenNeeded(
+                                               CacheCoordinator::PromptPrefix{
+                                                   .prefix_hashes = match.candidate_prefix_hashes,
+                                                   .tokens = request->TokenSlice(0, request->PrefillSize()),
+                                                   .max_tokens = match.max_cacheable_tokens,
+                                               },
+                                               hit_tokens, kv_tokens)
+                                         : nullptr;
     // First admission has computed nothing to publish or reclaim. A failed
     // admission changes nothing; one that cannot also hold the in-forward
     // checkpoint's block ends the chunk at the boundary instead, so the next
@@ -589,6 +602,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
     prefix_hit_stats_.host_gain_tokens += host_gain_tokens;
     prefix_hit_stats_.unresumable_kv_tokens += junction_tokens > 0 ? junction_tokens - hit_tokens : 0;
+    if (evicted_then_needed != nullptr) {
+        coordinator_.CountEvictedThenNeeded(evicted_then_needed, request->PrefillSize() - hit_tokens);
+    }
 
     if (!match.extension_hashes.empty()) {
         // The Host-warm H2D destinations of full pages are filled on Host

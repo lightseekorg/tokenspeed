@@ -1320,7 +1320,12 @@ Its responsibilities:
   ranking retraction (preemption) victims. Device and Host evictions are
   counted by reason (`DeviceEvictionStats`, `HostEvictionStats` in
   `cache_coordinator.h`); the counts are accounting only and never change
-  what is evicted. Under the write-back policy (`write_back_evictions`) the
+  what is evicted. A Host eviction other than a flush also records the
+  entry's idle time and, in a fixed-size table of recent evictions, its key,
+  so a first admission can count whether its hit stopped at blocks the Host
+  evicted recently
+  ([metrics](../configuration/server.md#prefix-cache-and-host-l2-metrics)).
+  Under the write-back policy (`write_back_evictions`) the
   coordinator also collects *dead prefix entries* on both tiers, entries no
   probe can resume from any more: everything under a page no checkpoint
   boundary is left under on either tier (with State groups), a tail whose
