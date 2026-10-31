@@ -22,7 +22,8 @@
 
 Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
 backends are only selected for node-local groups; groups spanning nodes fall
-back to NCCL. ``AutoBackend.route`` is the one place that decides which
+back to NCCL, except on gfx1250, whose Iris heap maps peers on other hosts in
+one fabric domain. ``AutoBackend.route`` is the one place that decides which
 implementation serves a collective; every public method asks it first.
 """
 
@@ -370,8 +371,8 @@ class AutoBackend(CommBackend):
             tensors = tensor
             if len(tensors) == 0:
                 raise ValueError("all-reduce requires at least one tensor")
-            use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
-                group
+            use_nccl = self._force_deterministic_rsag() or (
+                self._group_spans_nodes(group) and not current_platform().is_cdna5
             )
             if (
                 not use_nccl
@@ -413,7 +414,7 @@ class AutoBackend(CommBackend):
         # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by pattern, payload
         # bytes and the IPC kernel's strategy) inside _ar_fusion_workspace.
         #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
-        #   2. group spans nodes ................... NCCL
+        #   2. group spans nodes, except gfx1250 ... NCCL
         #   3. producer-owned memory or Iris can run Iris
         #   4. otherwise ........................... NCCL
         spans_nodes = self._group_spans_nodes(group)
@@ -424,7 +425,8 @@ class AutoBackend(CommBackend):
         # the workspace is armed and never called.
         if self._trtllm_ar.has_trtllm_ar(group):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
-        if spans_nodes:
+        # The gfx1250 Iris heap maps peers on other hosts in one fabric domain.
+        if spans_nodes and not current_platform().is_cdna5:
             return self._nccl.all_reduce(tensor, group, op=op)
         if self._iris.can_reduce_outputs((tensor,), group, op=op):
             # The producer wrote into acquired Iris symmetric memory, so the
@@ -483,7 +485,7 @@ class AutoBackend(CommBackend):
             or dtype != torch.bfloat16
             or self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or (self._group_spans_nodes(group) and not current_platform().is_cdna5)
             or self._trtllm_ar.has_trtllm_ar(group)
         )
 
