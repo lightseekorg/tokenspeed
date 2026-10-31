@@ -31,7 +31,7 @@ dequantization path.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import MXFP4_BLOCK
 
 
@@ -188,19 +188,70 @@ def _direct_mxfp4_load_tile(
     BLOCK_K_SCALE: gl.constexpr,
 ):
     """Load one direct MXFP4xMXFP4 K tile into MFMA operand layouts."""
-    k_pack_a = kt * BLOCK_K_PACKED + ak
-    k_pack_b = kt * BLOCK_K_PACKED + bk
-    k_scale_a = kt * BLOCK_K_SCALE + ask
-    k_scale_b = kt * BLOCK_K_SCALE + bsk
-    a_off = x_row_off + k_pack_a.to(gl.int64) * stride_xk + am.to(gl.int64) * 0
-    b_off = _gluon_dot_preshuffled_w_offset(w_expert_off, k_pack_b, n_cols, N_PHYS)
-    a_scale_off = _cdna4_swizzled_mxfp4_scale_offset(
-        0,
-        x_scale_row + asm * 0,
-        k_scale_a,
+    a, a_scale = _direct_mxfp4_load_activation_tile(
+        kt,
+        ak,
+        ask,
+        am,
+        asm,
+        x_ptr,
+        x_scale_ptr,
+        x_row_off,
+        x_scale_row,
+        stride_xk,
         stride_xslin,
         stride_xsnb,
+        K_DIM,
+        K_PACKED,
+        BLOCK_K_PACKED,
+        BLOCK_K_SCALE,
     )
+    b, b_scale = _direct_mxfp4_load_weight_tile(
+        kt,
+        bk,
+        bsk,
+        w_ptr,
+        w_scale_ptr,
+        w_expert_off,
+        s_expert_off,
+        n_cols,
+        n_cols_s,
+        stride_slin,
+        stride_snb,
+        N_PHYS,
+        K_DIM,
+        N_DIM,
+        K_PACKED,
+        BLOCK_K_PACKED,
+        BLOCK_K_SCALE,
+    )
+    return a, b, a_scale, b_scale
+
+
+@gluon.jit
+def _direct_mxfp4_load_weight_tile(
+    kt,
+    bk,
+    bsk,
+    w_ptr,
+    w_scale_ptr,
+    w_expert_off,
+    s_expert_off,
+    n_cols,
+    n_cols_s,
+    stride_slin,
+    stride_snb,
+    N_PHYS,
+    K_DIM,
+    N_DIM,
+    K_PACKED: gl.constexpr,
+    BLOCK_K_PACKED: gl.constexpr,
+    BLOCK_K_SCALE: gl.constexpr,
+):
+    """Load one K tile of the gdot128-shuffled weight and its scales."""
+    k_pack_b = kt * BLOCK_K_PACKED + bk
+    k_scale_b = kt * BLOCK_K_SCALE + bsk
+    b_off = _gluon_dot_preshuffled_w_offset(w_expert_off, k_pack_b, n_cols, N_PHYS)
     b_scale_off = _cdna4_swizzled_mxfp4_scale_offset(
         s_expert_off,
         n_cols_s,
@@ -208,16 +259,55 @@ def _direct_mxfp4_load_tile(
         stride_slin,
         stride_snb,
     )
-    a = gl.amd.cdna4.buffer_load(
-        ptr=x_ptr,
-        offsets=a_off.to(gl.int32),
-        mask=k_pack_a < K_PACKED,
-        other=0,
-    )
     b = gl.amd.cdna4.buffer_load(
         ptr=w_ptr,
         offsets=b_off.to(gl.int32),
         mask=(n_cols < N_DIM) & (k_pack_b < K_PACKED),
+        other=0,
+    )
+    b_scale = gl.amd.cdna4.buffer_load(
+        ptr=w_scale_ptr,
+        offsets=b_scale_off.to(gl.int32),
+        mask=(n_cols_s < N_DIM) & (k_scale_b < (K_DIM // 32)),
+        other=127,
+    )
+    return b, b_scale
+
+
+@gluon.jit
+def _direct_mxfp4_load_activation_tile(
+    kt,
+    ak,
+    ask,
+    am,
+    asm,
+    x_ptr,
+    x_scale_ptr,
+    x_row_off,
+    x_scale_row,
+    stride_xk,
+    stride_xslin,
+    stride_xsnb,
+    K_DIM,
+    K_PACKED: gl.constexpr,
+    BLOCK_K_PACKED: gl.constexpr,
+    BLOCK_K_SCALE: gl.constexpr,
+):
+    """Load one K tile of the packed activation rows and their scales."""
+    k_pack_a = kt * BLOCK_K_PACKED + ak
+    k_scale_a = kt * BLOCK_K_SCALE + ask
+    a_off = x_row_off + k_pack_a.to(gl.int64) * stride_xk + am.to(gl.int64) * 0
+    a_scale_off = _cdna4_swizzled_mxfp4_scale_offset(
+        0,
+        x_scale_row + asm * 0,
+        k_scale_a,
+        stride_xslin,
+        stride_xsnb,
+    )
+    a = gl.amd.cdna4.buffer_load(
+        ptr=x_ptr,
+        offsets=a_off.to(gl.int32),
+        mask=k_pack_a < K_PACKED,
         other=0,
     )
     a_scale = gl.amd.cdna4.buffer_load(
@@ -226,13 +316,7 @@ def _direct_mxfp4_load_tile(
         mask=k_scale_a < (K_DIM // 32),
         other=127,
     )
-    b_scale = gl.amd.cdna4.buffer_load(
-        ptr=w_scale_ptr,
-        offsets=b_scale_off.to(gl.int32),
-        mask=(n_cols_s < N_DIM) & (k_scale_b < (K_DIM // 32)),
-        other=127,
-    )
-    return a, b, a_scale, b_scale
+    return a, a_scale
 
 
 @gluon.jit
@@ -278,16 +362,116 @@ def _direct_mxfp4_k_loop(
     K_PACKED: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
-    PIPELINE_K: gl.constexpr,
+    PREFETCH_TILES: gl.constexpr,
 ):
     """Accumulate every K tile in order into ``acc``.
 
-    ``PIPELINE_K`` holds one K tile in VGPRs while the next tile's loads are
-    issued, so the loads of step ``kt + 1`` overlap the MFMA of step ``kt``.
-    The MFMA order is the same either way, so results are bitwise identical.
+    ``PREFETCH_TILES`` is how many K tiles' loads are in flight ahead of the
+    MFMA: 0 loads and multiplies one tile at a time; 1 holds one tile in
+    VGPRs while the next tile's loads are issued; more unrolls the loop and,
+    in the prologue, issues all prefetched weight tiles before the activation
+    tiles, since their addresses never wait on the activation rows. The MFMA
+    order is the same either way, so results are bitwise identical.
     """
     NUM_KT: gl.constexpr = K_PACKED // BLOCK_K_PACKED
-    if PIPELINE_K and NUM_KT > 1:
+    if PREFETCH_TILES > 1 and NUM_KT > 1:
+        DEPTH: gl.constexpr = min(PREFETCH_TILES, NUM_KT - 1)
+        weights = ()
+        for kt in gl.static_range(DEPTH):
+            weights = weights + (
+                _direct_mxfp4_load_weight_tile(
+                    kt,
+                    bk,
+                    bsk,
+                    w_ptr,
+                    w_scale_ptr,
+                    w_expert_off,
+                    s_expert_off,
+                    n_cols,
+                    n_cols_s,
+                    stride_slin,
+                    stride_snb,
+                    N_PHYS,
+                    K_DIM,
+                    N_DIM,
+                    K_PACKED,
+                    BLOCK_K_PACKED,
+                    BLOCK_K_SCALE,
+                ),
+            )
+        activations = ()
+        for kt in gl.static_range(DEPTH):
+            activations = activations + (
+                _direct_mxfp4_load_activation_tile(
+                    kt,
+                    ak,
+                    ask,
+                    am,
+                    asm,
+                    x_ptr,
+                    x_scale_ptr,
+                    x_row_off,
+                    x_scale_row,
+                    stride_xk,
+                    stride_xslin,
+                    stride_xsnb,
+                    K_DIM,
+                    K_PACKED,
+                    BLOCK_K_PACKED,
+                    BLOCK_K_SCALE,
+                ),
+            )
+        for kt in gl.static_range(NUM_KT):
+            if kt + DEPTH < NUM_KT:
+                weights = weights + (
+                    _direct_mxfp4_load_weight_tile(
+                        kt + DEPTH,
+                        bk,
+                        bsk,
+                        w_ptr,
+                        w_scale_ptr,
+                        w_expert_off,
+                        s_expert_off,
+                        n_cols,
+                        n_cols_s,
+                        stride_slin,
+                        stride_snb,
+                        N_PHYS,
+                        K_DIM,
+                        N_DIM,
+                        K_PACKED,
+                        BLOCK_K_PACKED,
+                        BLOCK_K_SCALE,
+                    ),
+                )
+                activations = activations + (
+                    _direct_mxfp4_load_activation_tile(
+                        kt + DEPTH,
+                        ak,
+                        ask,
+                        am,
+                        asm,
+                        x_ptr,
+                        x_scale_ptr,
+                        x_row_off,
+                        x_scale_row,
+                        stride_xk,
+                        stride_xslin,
+                        stride_xsnb,
+                        K_DIM,
+                        K_PACKED,
+                        BLOCK_K_PACKED,
+                        BLOCK_K_SCALE,
+                    ),
+                )
+            acc = _direct_mxfp4_mfma(
+                acc,
+                activations[kt][0],
+                weights[kt][0],
+                activations[kt][1],
+                weights[kt][1],
+            )
+    elif PREFETCH_TILES == 1 and NUM_KT > 1:
         a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
             0,
             ak,
@@ -386,3 +570,72 @@ def _direct_mxfp4_k_loop(
             )
             acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
     return acc
+
+
+@gluon.constexpr_function
+def _route_layout(num_warps):
+    return gl.BlockedLayout([1], [64], [num_warps], [0])
+
+
+@gluon.jit
+def _route_groups_from_ids(
+    ids,
+    rows,
+    EXPERT_START: gl.constexpr,
+    NUM_EXPERTS: gl.constexpr,
+    TOPK: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+):
+    """Group the routes of at most ``MAX_ROWS`` tokens by local expert,
+    straight from their top-k IDs.
+
+    A token lists an expert at most once, so each expert holds at most
+    ``MAX_ROWS`` routes. Groups follow local expert order. Returns each
+    route's local expert (-1 for another rank's routes and past ``rows``),
+    the per-expert route counts, each expert's group index and the number of
+    groups.
+    """
+    ROUTE_BLOCK: gl.constexpr = triton.next_power_of_2(MAX_ROWS * TOPK)
+    EXPERT_PAD: gl.constexpr = triton.next_power_of_2(NUM_EXPERTS)
+    layout: gl.constexpr = _route_layout(gl.num_warps())
+    route = gl.arange(0, ROUTE_BLOCK, layout=layout)
+    expert = gl.load(ids + route, route < rows * TOPK, other=-1) - EXPERT_START
+    valid = (route < rows * TOPK) & (expert >= 0) & (expert < NUM_EXPERTS)
+    counts = gl.histogram(
+        gl.where(valid, expert, 0), EXPERT_PAD, mask=valid, layout=layout
+    )
+    active = (counts > 0).to(gl.int32)
+    group_index = gl.cumsum(active, 0) - active
+    return gl.where(valid, expert, -1), counts, group_index, gl.sum(active, 0)
+
+
+@gluon.jit
+def _group_routes(
+    route_expert,
+    counts,
+    group_index,
+    group,
+    BLOCK_M: gl.constexpr,
+):
+    """Return ``(expert, count, routes)`` of one group: its local expert,
+    its route count and its routes in route order, padded with its first
+    route (``[BLOCK_M]``, at least the group's count)."""
+    EXPERT_PAD: gl.constexpr = counts.shape[0]
+    ROUTE_BLOCK: gl.constexpr = route_expert.shape[0]
+    layout: gl.constexpr = _route_layout(gl.num_warps())
+    member_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
+    )
+    in_group = (group_index == group) & (counts > 0)
+    expert = gl.sum(gl.where(in_group, gl.arange(0, EXPERT_PAD, layout=layout), 0), 0)
+    count = gl.sum(gl.where(in_group, counts, 0), 0)
+    selected = (route_expert == expert).to(gl.int32)
+    # Each selected route's position in the group; the others match no row.
+    rank = gl.where(selected != 0, gl.cumsum(selected, 0) - selected, BLOCK_M)
+    route = gl.arange(0, ROUTE_BLOCK, layout=layout)
+    first = gl.min(gl.where(selected != 0, route, ROUTE_BLOCK), 0)
+    rank = gl.convert_layout(rank, gl.SliceLayout(0, member_layout))[None, :]
+    route = gl.arange(0, ROUTE_BLOCK, layout=gl.SliceLayout(0, member_layout))[None, :]
+    row = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, member_layout))
+    routes = gl.sum(gl.where(rank == row[:, None], route, 0), 1)
+    return expert, count, gl.where(row < count, routes, first)

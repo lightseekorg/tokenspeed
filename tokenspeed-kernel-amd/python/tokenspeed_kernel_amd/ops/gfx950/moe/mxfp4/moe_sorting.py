@@ -597,54 +597,6 @@ def _route_tile_launch_metadata(grid, kernel, args):
 
 
 @gluon.jit(launch_metadata=_route_tile_launch_metadata, do_not_specialize=["rows"])
-def gluon_mxfp4_moe_route_descriptors_gfx950(
-    ids,
-    sorted_routes,
-    descriptors,
-    group_count,
-    mapping,
-    rows,
-    EXPERT_START: gl.constexpr,
-    NUM_EXPERTS: gl.constexpr,
-    TOPK: gl.constexpr,
-    MAX_ROWS: gl.constexpr,
-):
-    """Pack one tile per expert; distinct top-k IDs bound each count by rows."""
-    ROUTE_BLOCK: gl.constexpr = triton.next_power_of_2(MAX_ROWS * TOPK)
-    EXPERT_PAD: gl.constexpr = triton.next_power_of_2(NUM_EXPERTS)
-    routes_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-    expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-    matrix_layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [1, 0])
-    route = gl.arange(0, ROUTE_BLOCK, layout=routes_layout)
-    expert = gl.load(ids + route, route < rows * TOPK, other=-1) - EXPERT_START
-    valid = (route < rows * TOPK) & (expert >= 0) & (expert < NUM_EXPERTS)
-    safe = gl.where(valid, expert, 0)
-    histogram = gl.histogram(safe, EXPERT_PAD, mask=valid, layout=expert_layout)
-    inclusive = gl.cumsum(histogram, 0)
-    starts = inclusive - histogram
-    active = (histogram > 0).to(gl.int32)
-    group = gl.cumsum(active, 0) - active
-    local_expert = gl.arange(0, EXPERT_PAD, layout=expert_layout)
-    gl.store(descriptors + group * 3, starts, active != 0)
-    gl.store(descriptors + group * 3 + 1, histogram, active != 0)
-    gl.store(descriptors + group * 3 + 2, local_expert, active != 0)
-    gl.store(group_count, gl.sum(active, 0))
-    row_expert = gl.convert_layout(safe, gl.SliceLayout(1, matrix_layout))[:, None]
-    col_expert = gl.convert_layout(safe, gl.SliceLayout(0, matrix_layout))[None, :]
-    row_valid = gl.convert_layout(valid, gl.SliceLayout(1, matrix_layout))[:, None]
-    col_valid = gl.convert_layout(valid, gl.SliceLayout(0, matrix_layout))[None, :]
-    row = gl.arange(0, ROUTE_BLOCK, layout=gl.SliceLayout(1, matrix_layout))[:, None]
-    col = gl.arange(0, ROUTE_BLOCK, layout=gl.SliceLayout(0, matrix_layout))[None, :]
-    earlier = ((row_expert == col_expert) & row_valid & col_valid & (col < row)).to(
-        gl.int32
-    )
-    rank = gl.convert_layout(gl.sum(earlier, 1), routes_layout)
-    position = gl.gather(gl.convert_layout(starts, routes_layout), safe, axis=0) + rank
-    gl.store(sorted_routes + position, route, valid)
-    gl.store(mapping + route, gl.where(valid, route, -1), route < rows * TOPK)
-
-
-@gluon.jit(launch_metadata=_route_tile_launch_metadata, do_not_specialize=["rows"])
 def gluon_mxfp4_moe_route_pack_gfx950(
     ids,
     sorted_routes,
