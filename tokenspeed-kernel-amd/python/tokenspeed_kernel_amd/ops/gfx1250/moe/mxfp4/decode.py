@@ -33,6 +33,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     get_blocked_layout,
     get_scaled_dot_format_string,
     get_tdm_gather_scatter_idx_layout,
+    make_kplane_w_descriptor,
     partial_tdm_warp_hint,
     reverse_tdm_warp_used_hint,
 )
@@ -117,13 +118,16 @@ def _create_w_descriptor(
     stride_w_scale_k,
 ):
     gl.static_assert(cfg.W_TRANSPOSE, "decode kernel expects N-major weights")
-    w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-        base=w_ptr + w_offs,
-        shape=(N, K // cfg.DIV_FACTOR_W),
-        strides=(stride_wn, stride_wk),
-        block_shape=(cfg.BLOCK_N, cfg.BLOCK_K // cfg.DIV_FACTOR_W),
-        layout=cfg.shared_layout_w,
-    )
+    if cfg.W_KPLANE_ROWS:
+        w_desc = make_kplane_w_descriptor(cfg, w_ptr + w_offs, N, K)
+    else:
+        w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=w_ptr + w_offs,
+            shape=(N, K // cfg.DIV_FACTOR_W),
+            strides=(stride_wn, stride_wk),
+            block_shape=(cfg.BLOCK_N, cfg.BLOCK_K // cfg.DIV_FACTOR_W),
+            layout=cfg.shared_layout_w,
+        )
     if cfg.WITH_W_MX_SCALE:
         PRESHUFFLE_FACTOR: gl.constexpr = cfg.PRESHUFFLE_FACTOR
         SCALE_BLOCK: gl.constexpr = cfg.SCALE_BLOCK
@@ -257,7 +261,10 @@ def _issue_w_loads(
     cfg: MoEConfig, w_desc, w_scale_desc, w_buffer, w_scale_buffer, load_idx, pred
 ):
     buf = load_idx % cfg.NUM_BUFFERS
-    w_offsets = [0, load_idx * (cfg.BLOCK_K // cfg.DIV_FACTOR_W)]
+    if cfg.W_KPLANE_ROWS:
+        w_offsets = [load_idx * cfg.W_KPLANE_ROWS, 0]
+    else:
+        w_offsets = [0, load_idx * (cfg.BLOCK_K // cfg.DIV_FACTOR_W)]
     w_scale_offsets = [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED]
     # Decode issues the weights before the activation rows are known, so
     # partial TDM pairs each weight load with its scale load: half the warps
@@ -495,6 +502,7 @@ def _matmul_decode(
     PINGPONG: gl.constexpr = False,
     NUM_WARPS: gl.constexpr = 4,
     PARTIAL_TDM: gl.constexpr = False,
+    W_KPLANE_ROWS: gl.constexpr = 0,
 ):
     # Decode is a small-M, M-ragged MoE GEMM with a fixed baseline schedule.
     gl.static_assert(
@@ -553,6 +561,7 @@ def _matmul_decode(
         EVEN_K=EVEN_K,
         USE_GATHER=USE_GATHER,
         NUM_WARPS=NUM_WARPS,
+        W_KPLANE_ROWS=W_KPLANE_ROWS,
     )
 
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N

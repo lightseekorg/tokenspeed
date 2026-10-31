@@ -327,6 +327,36 @@ def test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250() -> None:
     torch.testing.assert_close(captured, expected, atol=0.0, rtol=0.0)
 
 
+def test_kimi_k3_tp_situ_stores_down_weight_in_k_planes_gfx1250() -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
+        preprocess_gluon_mxfp4_gfx1250_moe_weights,
+    )
+
+    module, raw, *_ = _make_case(1)
+    kernel_moe_process_weights(_make_plan(), module)
+    planes = module.w2_weight_triton_tensor
+    assert (planes.kplane_rows, planes.kplane_bytes) == (3584, 64)
+
+    rows_module, _ = _make_mxfp4_module(
+        num_experts=16,
+        hidden_size=3584,
+        intermediate_size=384,
+        top_k=16,
+        generator=torch.Generator(device="cuda").manual_seed(0),
+    )
+    rows_module.w2_weight.data.copy_(raw["w2_weight"])
+    rows_module.w2_weight_scale.data.copy_(raw["w2_scale"])
+    preprocess_gluon_mxfp4_gfx1250_moe_weights({}, rows_module)
+    rows = rows_module.w2_weight_triton_tensor.transpose(1, 2)
+    # Plane k of expert e holds bytes [64k, 64k + 64) of every N row.
+    storage = torch.as_strided(
+        planes, (16, 3, 3584, 64), (3 * 3584 * 64, 3584 * 64, 64, 1)
+    )
+    torch.testing.assert_close(
+        storage, rows.reshape(16, 3584, 3, 64).permute(0, 2, 1, 3), atol=0, rtol=0
+    )
+
+
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
 @pytest.mark.parametrize("num_tokens", [2, 4, 64])
 def test_gfx1250_small_route_fp8_quantize_matches_standalone(
