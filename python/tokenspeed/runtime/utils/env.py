@@ -74,6 +74,7 @@ global_server_args_dict: dict = {
     "moe_backend": ServerArgs.moe_backend,
     "moe_cutlass_fused_finalize": ServerArgs.moe_cutlass_fused_finalize,
     "moe_mxfp4_fp8_activation": ServerArgs.moe_mxfp4_fp8_activation,
+    "moe_prefill_down_column_split": ServerArgs.moe_prefill_down_column_split,
     "dense_gemm_backend": ServerArgs.dense_gemm_backend,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
@@ -137,6 +138,9 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "moe_backend": server_args.moe_backend,
             "moe_cutlass_fused_finalize": server_args.moe_cutlass_fused_finalize,
             "moe_mxfp4_fp8_activation": server_args.moe_mxfp4_fp8_activation,
+            "moe_prefill_down_column_split": (
+                server_args.moe_prefill_down_column_split
+            ),
             "dense_gemm_backend": server_args.dense_gemm_backend,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
