@@ -139,7 +139,9 @@ Later admission attempts skip those entries until the last external block owner
 releases them. A one-shot ownership notification restores each entry to its
 original access epoch, including an epoch changed while it was pinned. This
 keeps the same LRU victim order without repeatedly scanning active requests'
-blocks. Temporary lookups do not update this secondary index. The notification
+blocks. Admission cursors read this available-entry index directly, so a later
+plan also skips epochs whose entries are all known to be pinned. Temporary
+lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
 
 Host duplicate reclamation checks pending stores on a candidate's ancestor
@@ -147,8 +149,39 @@ chain once per scan and reuses that answer for other candidates sharing it.
 The memo and traversal buffers belong to the scan: the next scan rechecks
 store completions and new tree links. This changes traversal cost without
 changing candidate eligibility or eviction order.
+Before opening the ordered duplicate scan, placement walks from the tree's
+roots and prunes whole subtrees covered by a pending store or an incomplete
+Device prefix. It stops at the first possible duplicate. When none is reachable,
+placement skips the ordered scan. Roots share the ordinary sibling links and
+need constant-time maintenance on insertion, linking and removal; publishing or
+settling a page adds no ancestor-count updates. A reachable duplicate still
+needs the ordinary ownership and checkpoint-window checks before reclamation.
 Collection also keeps each candidate's Device ownership and access epoch for
 ranking in the same call, avoiding a second set of key and tree lookups.
+Closed-group indexes maintain a non-owning Device access order for keys
+present in both Device and Host pools. Publishing or evicting either copy
+updates membership; a Device access updates the order. Host duplicate selection
+traverses this intersection directly to read both copies' current metadata and
+ownership, without scanning Device-only keys or doing another Host-key lookup.
+This index records membership, not whether a copy is safe to reclaim; each plan
+still checks prefix coverage, windows, pending stores and pins. Together with
+the available-entry order used for eviction, it supplies the ordered scans;
+no additional recency index over all entries is maintained.
+Duplicate scans expand only prefix-closed groups and reuse key storage across
+boundaries. Victim inspection reads non-owning snapshots, so merely ranking
+entries does not create temporary block owners.
+While visiting pinned Device copies first, the ordered scan retains borrowed
+snapshots of the unpinned entries it skips. If placement still needs them,
+it consumes those snapshots in the same order without traversing the index
+again. Both ownership classes are observed within the same unchanged plan.
+Admission and Host placement keep temporary lookup nodes in a memory
+resource scoped to the plan; Host placement also uses it for snapshots.
+The returned victim list owns its storage;
+no snapshot or allocator survives the call. Every later plan observes fresh
+ownership, access epochs, and tree links.
+The hash tables retain computed key hashes where the standard library supports
+it: walking a bucket or erasing an entry must not repeatedly hash its full
+content digest. Key equality and eviction order remain unchanged.
 
 The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
 empty parents come from the pool, active parents from the live requests' block
@@ -230,6 +263,11 @@ request's table covers tokens
 entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
+Export preserves every logical slot, including holes in a released prefix.
+Export and active-parent accounting skip reading those released references.
+Within one export, adjacent live slots sharing a parent reuse its resolved ID
+base; the owning pool remains part of that check because Host and Device
+packing can differ.
 
 With KVP virtual-block placement, `CacheBatchMetadata` validates exported IDs
 against each group's **virtual** block count. The physical page count bounds
@@ -318,6 +356,10 @@ that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
 the conv and PLE windows are the inputs before it -- which is then published
 like a natural checkpoint
 ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
+Publication also registers every non-replayable sliding window at that
+checkpoint's boundary before the request reclaims expired table blocks. The
+forward's final window may start later and cannot replace this earlier window,
+even when the forward ends on a full page.
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -824,6 +866,16 @@ Its responsibilities:
   State group's hits count from page 0 on both tiers, since a Host
   checkpoint may sit on the Device's last page); when the Device alone
   resumes furthest the Host tier mirrors its boundary and claims nothing.
+  The probe records the longest usable KV boundary even when its State is
+  missing, since admission uses that reach for the junction cut. Once it is
+  known, shorter candidates missing a required State group are rejected
+  before constructing their history hit arrays. This uses the same State
+  predicate, including checkpoint granularity and mixed Device/Host hits;
+  storage hints count only on the Host side of a storage query.
+  The initial Device walk also records its prefix-closed coverage before
+  windows or State shorten the hit. The Host phase and storage queries reuse
+  that bound, capped to their prompt length, instead of rescanning the same
+  Device pages. A new probe always reads the indexes again.
   `AdmissionResult::host_prefix_tokens` is a boundary, not a token count:
   the Host's when a Host suffix carries the hit, the Device's otherwise (0
   without a Host pool and on the D role). Such a hit loads the KV beyond the
@@ -1060,8 +1112,10 @@ Its responsibilities:
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
   Under write-back (`write_back_evictions`), each victim set an admission or
   a restore evicts for the cache is recorded as one *segment* as it leaves
-  the index (`evictCachedBlockAlone`); the request's own released slots are
-  dropped, and so is a block no probe could resume from on the Host
+  the index (`evictCachedBlockAlone`), including a published input released
+  by the request itself. Releasing an input does not invalidate its checkpoint
+  for other requests; a deeper checkpoint cannot restore an earlier boundary.
+  Unpublished slots are dropped, and so is a block no probe could resume from on the Host
   (`DeadEntriesNotWrittenBack`). A record holds its tree node, tail hint and
   Host presence until its segment settles, and a block the Host holds already
   rides as that entry, never copied again. The invariants: eviction keeps the
@@ -1083,30 +1137,40 @@ Its responsibilities:
   write-back policy writes back per segment (`AcquireHostSegments`), and a
   segment arrives whole: every segment's blocks are fitted jointly before
   anything is evicted, a segment is placed whole or not at all, and nothing is
-  evicted for a dropped one. Each row's Host block is fitted and placed in its
+  evicted for a dropped one. Within that plan, ranking and victim expansion
+  share non-owning Host-entry snapshots, including access epochs. Only shadow
+  occupancy changes during planning; the next plan reads fresh snapshots so
+  intervening accesses, pins and releases are visible. Host-only checkpoint
+  ranking reads State first; history is inspected when the victim class or
+  expansion needs it. Each row's Host block is fitted and placed in its
   Device block's bucket, so under KV parallelism every rank copies only the
   rows it owns; a segment one bucket cannot fill is dropped whole, even when
   another bucket has room. After dead and Device-covered segments, before
   taking Host-only cache, placement reclaims
   unpinned prefix-closed KV copies within a contiguous Device KV prefix,
   independently of Host checkpoints. A Host-only checkpoint can still resume
-  on that Device prefix. Nonaligned KV tails stay whole, and sliding-window
-  lookback pages at checkpoint boundaries stay on the Host: a missing Device
-  window can lower the common tier split and require those closed-group pages
-  too. When State groups share the pool, KV still held on the Device has its
-  Host duplicate reclaimed first, newer Device copies first: the request keeps
-  that Device storage alive. Unheld Device KV can be demoted on the next
-  admission. Its duplicate competes with Host-only checkpoints by access epoch
-  (Device KV epoch versus Host State epoch), oldest first, with duplicates
-  winning ties. This lets unused State age out before newer KV is repeatedly
-  copied back. Models without State groups retain duplicate-first reclamation.
+  on that Device prefix. Nonaligned KV tails stay whole. Sliding-window
+  protection follows the actual missing Device blocks behind each checkpoint:
+  they lower the common tier split, so closed-group Host pages in that suffix
+  stay. A window already available on the Device does not protect redundant
+  Host KV. A scan reuses each checkpoint's window split; the next scan checks
+  residency again. Safe KV duplicates leave before Host-only checkpoints,
+  including when the Device KV is no longer held by a request. Held Device
+  copies go first, then unheld copies; within each class newer Device copies
+  go first to reduce repeated write-back. Host-only State retains its own LRU
+  order once the usable duplicate capacity is exhausted.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
   The boundary tree maintains the nodes with settled closed-group duplicates
   as entries arrive and leave. It also propagates complete Device-prefix
   coverage when a page changes, including gaps opened or filled by restores.
-  A placement therefore visits duplicate nodes and their bounded sliding
-  lookback neighborhoods, rather than rescanning every cached prefix.
+  Placement follows the indexes' Device access order, merging one epoch
+  across closed groups and sorting equal-epoch boundary/location ties.
+  It checks duplicate membership, prefix coverage and the bounded sliding
+  lookback neighborhood without rebuilding prefixes from their roots, and
+  stops once the remaining demand fits. Older duplicates need not be
+  enumerated or sorted. Traversal holds no cache blocks and lasts only for
+  this plan, so the next placement sees changed ownership and recency.
   These candidates share the segment plan's shadow and restore pass, so an
   unplaced segment or an unneeded duplicate evicts nothing. Their evictions
   count as `HostEvictionStats::duplicate_kv`. Remaining Host victims are whole,
@@ -1118,8 +1182,16 @@ Its responsibilities:
   when deciding whether Host history is still needed. State groups at one
   boundary may also be split across tiers; an incomplete Host portion is
   still useful when the Device holds the other groups. These entries keep
-  their ordinary eviction rank. `AcquireHostSegments` documents the victim
-  shapes, the ranking and the restore pass.
+  their ordinary eviction rank. Removing Host State leaves Device checkpoints
+  in place, so segment expansion counts checkpoint dependencies on both tiers.
+  A same-boundary or deeper Device checkpoint keeps its Host history out of
+  that State victim; the ancestor climb also stops before another Device
+  checkpoint, including one on a sibling branch. The planner uses the tree's
+  existing per-tier counts, subtracting only the Host checkpoints its victims
+  take. Host history remains eligible as a separate candidate at its own rank
+  when State reclamation alone cannot fund placement. State checkpoints at
+  different boundaries do not depend on one another.
+  `AcquireHostSegments` documents the victim shapes, ranking and restore pass.
   Host-only checkpoint recency follows its State entries, independently of
   the KV entries at that boundary. A longer prefix hit can traverse those KV
   entries while using only a deeper checkpoint; that traversal must not keep
@@ -1141,9 +1213,21 @@ Its responsibilities:
   input tails must not crowd out other sessions after the request advances.
   This is a retention choice, not a claim that deeper State restores the
   shorter boundary; it does not reserve capacity for State.
-  Duplicate-KV planning reads each tier's location, access metadata and pin
-  status together through `PrefixCacheIndex::Inspect`. This snapshot holds no
-  block reference and does not update recency, so collecting candidates neither
+  The continuation check groups Device checkpoints by State access epoch
+  once per Host placement, including pinned and partial checkpoints. It
+  checks ancestry only for checkpoints sharing the tail's epoch, avoiding
+  a scan of unrelated descendant pages for each old tail. The index lasts
+  only for that plan; it changes neither eligibility nor victim priority.
+  Host State snapshots are collected directly from the indexes before any
+  checkpoint is ranked, including its pinned groups. Each State index is
+  visited once without sorting or filtering ownership. Ranking reuses their
+  location, pin status and access epoch without copying keys or looking up
+  the same State again. History entries are inspected only when needed.
+  All snapshots expire with the plan; the next placement observes new pins,
+  releases and accesses.
+  Duplicate-KV planning reads both copies' locations, metadata and pin status
+  from the ordered intersection cursor. These snapshots hold no
+  block reference and do not update recency, so collecting candidates neither
   changes eviction eligibility nor needs a second lookup for Device metadata.
   Its pin status is valid only until ownership changes; a later plan inspects
   the entries again.
@@ -1251,10 +1335,9 @@ Its responsibilities:
   still on its way into it, waits for a later plan. `ClearDeviceCache` writes
   nothing back and empties the queue: a Device-only clear loses what only the
   Device holds and never collects Host L2. Host placement's dead class
-  (`AcquireHostSegments`, above) counts the Host's checkpoint boundaries
-  only: a Host page with checkpoint boundaries under it, but only on the
-  Device, is dead there (ranked first, counted under
-  `HostEvictionStats::dead_entry`), though the collection would keep it.
+  (`AcquireHostSegments`, above) also considers checkpoint boundaries on both
+  tiers: history needed by a Device checkpoint retains its ordinary eviction
+  rank even when no Host checkpoint remains below it.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially, or not
@@ -1286,8 +1369,29 @@ The internal capacity planner behind `Admit`. It runs entirely on shadow
 occupancy — never mutating the real pool — and answers: *which cached blocks
 must be evicted for this admission to fit, while protecting the current
 prefix hits?* The algorithm: first check whether existing local holes plus
-empty parents fit with zero eviction; otherwise select eviction candidates
-until the plan fits. Request-reclaimable candidates are collected and sorted
+empty parents fit with zero eviction. Before selecting victims, a relaxed
+capacity bound may reject an impossible admission. It overestimates removable
+cache entries and credits this step's releasable State input and newly expired
+window slots, never the live history or State output. Expired slots may still
+be shared or null; bucket, cache pin and segment restrictions are relaxed.
+The bound counts the allocator's unreclaimed expired-slot range; the full
+pass filters that same range by ownership. State inputs use the same
+release-eligibility check in both passes, so the bound cannot fall below the
+actual request-reclaim candidates through a separate retention calculation.
+Existing holes in bound parents do not supply another group with parents:
+the bound caps each group's returned parents by its removable slots divided
+by its smallest occupied parent. The pool's existing occupancy order supplies
+that minimum; holes are still optimistically allowed to line up.
+Only failure under that optimistic capacity
+rejects early; otherwise the ordinary planner selects eviction candidates
+until the plan fits. Before inspecting segment trees, a second relaxed check
+releases the actual request-reclaimable slots and available cache entries into
+temporary occupancy, preserving parent and bucket placement while ignoring
+segment restrictions. It stops as soon as placement fits; when even all such
+releases fail, no victim order can make space. It uses the available-entry
+index, not the live cache, and never commits these tentative releases.
+The bounds read current ownership on every attempt, so a
+released pin can fund the next retry. Request-reclaimable candidates are collected and sorted
 once; each cache group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
 request reclaim. The groups' unread epochs are merged by access time before
@@ -1303,8 +1407,11 @@ yielding a minimal eviction plan in `victims`. `Admit` and `Restore` evict set
 by set, oldest first. The admitted request's own released slots (Admit only; a
 restore rebuilds empty tables) and a superseded input, which ranks at epoch 0
 with the uncached blocks, count as `DeviceEvictionStats::request_reclaim`;
-under the write-back policy every other set is recorded as one segment for the
-plan's write-back drain. The shadow occupancy is a class of its own
+under the write-back policy cached members are recorded as one segment for the
+plan's write-back drain, including reusable released inputs. Superseded inputs
+remain excluded. `request_reclaim_for_write_back` counts the reclaimed entries
+considered by that drain, so its outcomes reconcile with eviction counts.
+The shadow occupancy is a class of its own
 (`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
 empty parents, the occupants left in each parent a victim leaves — with the
 pool's own fit formula, so a planner on any pool the coordinator registered
@@ -1342,6 +1449,12 @@ Device room and hits, never correctness. The victim sets:
   subtree passes the whole set over, never a part of it; a branch of the
   subtree without such a block may still leave as a set of its own, and only
   the block-by-block pass below takes part of it.
+  Inspection stops at the first unavailable member. Only candidates at the
+  chosen boundary and the pages climbed above it are marked as that failed
+  set; unread descendants and sibling branches remain eligible. These marks
+  last for the plan alone, so a later owner release permits a new attempt.
+  The walk and failure marking reuse the candidate's and climbed ancestors'
+  entry snapshots; these remain valid throughout the read-only plan.
 
 The climb reads the real checkpoint-boundary counts, not the shadow's, so two
 sibling segments chosen in one plan leave their shared pages on the Device for

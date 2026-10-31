@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -71,6 +72,39 @@ TEST(HostPacking, ABlockIdUsesTheOwningPoolsPacking) {
     EXPECT_EQ(host_blocks.back()->Location().lcm_block_id, 2);
     EXPECT_EQ(host_blocks.back()->Location().slot_index, 1);
     EXPECT_EQ((allocator.ResolveCacheBlockId(*host_blocks.back()) - 1) % 2, 1);
+
+    // Both pools use parent 2, but their first child IDs differ. Holes and
+    // a return to the Device pool must preserve every logical table slot.
+    BlockTable table = BlockTable::FromBlocks(
+        {device_blocks[4], device_blocks[5], {}, host_blocks[6], host_blocks[7], device_blocks[5]}, 0);
+    EXPECT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{5, 6, 0, 7, 8, 6}));
+    allocator.ReclaimExpired(device, table, 2);
+    EXPECT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{0, 0, 0, 7, 8, 6}));
+}
+
+TEST(BlockTableAccounting, ReleasedPrefixesAndSharedParentsCountOnce) {
+    BlockPool device{4, {4}};
+    const std::vector specs{CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                                           .sliding_window = 4,
+                                           .cache_blocks_per_lcm_block = 4,
+                                           .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false);
+    const auto blocks = device.AcquireBlocks(0, 8);
+    ASSERT_EQ(blocks.size(), 8u);
+    std::vector<BlockTable> first{BlockTable::FromBlocks({blocks.begin(), blocks.begin() + 7}, 0)};
+    std::vector<BlockTable> second{BlockTable::FromBlocks({blocks[0], {}, {}, {}, {}, {}, {}, blocks[7]}, 0)};
+    const std::vector<std::span<const BlockTable>> requests{first, second};
+    coordinator.Allocator(0).ReclaimExpired(device, first[0], 6);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 2);
+    coordinator.Allocator(0).ReclaimExpired(device, second[0], 7);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 1);
+    coordinator.Allocator(0).ReclaimExpired(device, first[0], 7);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 1);
+    coordinator.Allocator(0).ReclaimExpired(device, second[0], 8);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 0);
+    EXPECT_EQ(device.NumEmptyLcmBlocks(), 2) << "the retained copies still occupy the pool";
 }
 
 TEST(HostPacking, SnapshotAdmissionCountsTheSnapshotPoolsChildren) {

@@ -255,7 +255,8 @@ def torch_qwen4_exp_qsa_recent_rows(
     A row writes its key to slot ``position % ratio`` of its page (and its
     position value when the slot is 0) unless masked out (``write_mask``,
     default ``recent_locs > 0``), the same request's row ``ratio`` later in
-    the batch supersedes it, or its request is past ``request_limit``.
+    the batch supersedes it in the same physical page, or its request is past
+    ``request_limit``.
 
     Returns:
         Updated copies of ``(raw, position_cache)``.
@@ -264,6 +265,7 @@ def torch_qwen4_exp_qsa_recent_rows(
     position_cache = position_cache.clone()
     rows = logical.shape[0]
     mask = recent_locs > 0 if write_mask is None else write_mask.clone()
+    pages = recent_locs.long().clamp_min(0) // recent_page_size
     if rows:
         row_ids = torch.arange(rows, device=logical.device)
         future = row_ids + ratio
@@ -272,10 +274,10 @@ def torch_qwen4_exp_qsa_recent_rows(
         has_future &= mask[safe_future]
         has_future &= requests[safe_future] == requests
         has_future &= logical[safe_future] == logical + ratio
+        has_future &= pages[safe_future] == pages
         mask = mask & ~has_future
     if request_limit is not None:
         mask &= requests < request_limit
-    pages = recent_locs.long().clamp_min(0) // recent_page_size
     slots = torch.remainder(logical.long(), ratio)
     for row in range(rows):
         if not bool(mask[row]):

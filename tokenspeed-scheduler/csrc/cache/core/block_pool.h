@@ -105,6 +105,20 @@ public:
 
     std::int32_t Packing(std::uint32_t group_id) const noexcept { return placement(group_id).packing; }
 
+    // Minimum occupied slots in a bound parent, or the packing when this
+    // group has no bound parent. Full parents need not appear in the hole
+    // indexes; every partial parent appears in at least one bucket's order.
+    std::int32_t MinimumParentOccupancy(std::uint32_t group_id) const noexcept {
+        const GroupAvailability& group = placement(group_id);
+        std::int32_t minimum = group.packing;
+        for (const auto& parents : group.parents_by_bucket) {
+            if (!parents.empty()) {
+                minimum = std::min(minimum, -parents.rbegin()->first);
+            }
+        }
+        return minimum;
+    }
+
     std::int32_t ResolveCacheBlockId(std::uint32_t group_id, CacheBlockLocation location) const {
         const std::int32_t packing = Packing(group_id);
         _assert(location.lcm_block_id > 0 && location.lcm_block_id <= NumLcmBlocks(),
