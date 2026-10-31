@@ -1369,6 +1369,7 @@ def matmul(
     num_warps: int = 4,
     decode: bool = False,
     partial_tdm: bool,
+    n_tiles: int = 1,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -1542,6 +1543,8 @@ def matmul(
         grid_m = a_ragged_metadata.n_blocks(
             a_ragged_metadata.n_slices, M, opt_flags.block_m
         )
+    if n_tiles != 1 and (not decode or y_mx_scale is not None):
+        raise ValueError("n_tiles > 1 needs the decode kernel without MXFP4 output")
     if kplane_rows:
         plane_bytes = int(b_torch.kplane_bytes)
         if (
@@ -1558,7 +1561,7 @@ def matmul(
                 f"baseline schedule; got N={N}, K={K}, block_n={block_n}, "
                 f"block_k={block_k}, schedule={schedule}, pingpong={pingpong}"
             )
-    grid_n = triton.cdiv(N, opt_flags.block_n)
+    grid_n = triton.cdiv(triton.cdiv(N, opt_flags.block_n), n_tiles)
     grid = grid_m * grid_n * batch_size
 
     n_valid_slices = (
@@ -1636,6 +1639,7 @@ def matmul(
         PINGPONG=pingpong,
         NUM_WARPS=num_warps,
         PARTIAL_TDM=partial_tdm,
+        **({"N_TILES": n_tiles} if decode else {}),
         W_KPLANE_ROWS=kplane_rows,
         num_warps=num_warps,
     )
@@ -1691,6 +1695,7 @@ def gluon_mxfp_combine(
     x_scale_ragged_padded: bool = False,
     decode: bool = False,
     partial_tdm: bool,
+    n_tiles: int = 1,
 ) -> torch.Tensor:
     """Combine GEMM using the gfx1250 Gluon MoE kernel."""
     del use_warp_pipeline, use_slice_mn, use_slice_n
@@ -1730,6 +1735,7 @@ def gluon_mxfp_combine(
         w_transpose=w_transpose,
         decode=decode,
         partial_tdm=partial_tdm,
+        n_tiles=n_tiles,
     )
     if n_expts_act is not None and int(n_expts_act) > 1:
         if n_tokens is None:
@@ -3128,6 +3134,25 @@ _PREFILL_MXFP4_ACTIVATION_TILES = {
     "num_buffers": 3,
 }
 
+# Programs per CU from which a decode down projection pairs its N tiles. Many
+# experts with a row or two each launch tens of 26 KB programs per CU; one
+# program streaming two N tiles through one TDM ring measured 35.0 -> 31.8 us
+# at 16 Kimi K3 requests, while a single request has too few programs to pair.
+_DECODE_PAIR_N_TILES_PROGRAMS_PER_CU = 16
+
+
+def _decode_down_n_tiles(
+    rows: int, num_experts: int, n: int, block_n: int, device: torch.device
+) -> int:
+    block_m = _resolve_block_m(True, rows, num_experts)
+    n_tiles = triton.cdiv(n, block_n)
+    programs = RaggedTensorMetadata.n_blocks(num_experts, rows, block_m) * n_tiles
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    if n_tiles % 2 == 0 and programs >= _DECODE_PAIR_N_TILES_PROGRAMS_PER_CU * cus:
+        return 2
+    return 1
+
+
 # Row pitch in bytes of the scales the decode GEMM epilogue writes. Every
 # N tile stores a few bytes into each row; with packed 18-byte rows those
 # partial writes pile onto the same lines and cost the HBM-bound decode GEMM
@@ -3279,6 +3304,18 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         gate_up_tiles = decode_tile_config(int(hidden_states.shape[-1]))
         # The down projection reduces over the activation's half of W13's N.
         down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
+        if activation_dtype == "fp8":
+            # Pairing is tuned on FP8 activations; MXFP4 keeps one tile.
+            w2_raw = (
+                w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
+            )
+            down_tiles["n_tiles"] = _decode_down_n_tiles(
+                int(topk_ids.numel()),
+                num_experts,
+                int(w2_raw.shape[-1]),
+                down_tiles["block_n"],
+                hidden_states.device,
+            )
     else:
         if activation_dtype == "fp8":
             gate_up_tiles = _PREFILL_GATE_UP_TILES
@@ -3402,6 +3439,7 @@ def gluon_mxfp_ragged_matmul(
         "num_warps",
         "decode",
         "partial_tdm",
+        "n_tiles",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
     launch_kwargs.setdefault("partial_tdm", False)
@@ -3418,6 +3456,7 @@ def gluon_mxfp_ragged_matmul(
             "xcd_swizzle",
             "decode",
             "partial_tdm",
+            "n_tiles",
         }
     }
     unsupported = sorted(extra_kwargs)

@@ -2078,7 +2078,10 @@ The FP8 SiTU experts store the down weight in K planes: each 128-wide K step
 of an expert is its own row-major `(N, 64-byte)` slab, so a weight tile is one
 contiguous run. Kimi K3's 384-wide TP8 reduction otherwise streams as 64-byte
 pieces of 192-byte rows, which TDM reads well below its contiguous bandwidth.
-The decode and prefill down GEMMs both read the planes.
+The decode and prefill down GEMMs both read the planes. When a down
+projection launches at least 16 programs per CU (a dozen or more decode
+requests), each program streams two consecutive N tiles through one TDM ring
+and stores both from registers.
 
 FP8-activation prefill (about 150 routed rows per expert at 8192-token
 chunks) uses 64x256 tiles. Neither GEMM saturates WMMA, TDM or HBM there:
