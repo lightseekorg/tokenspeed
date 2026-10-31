@@ -29,6 +29,7 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
+    moe_finalize_gate_add,
 )
 from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
@@ -435,15 +436,45 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                     router_logits=router_logits,
                 )
 
+            # The shared-expert gate add absorbs the routed finalize: one
+            # latency-bound gather kernel instead of the kernel's finalize and
+            # the gate kernel, bitwise equal. Only plans that hand back
+            # (route outputs, route weights, row map) defer, and only when no
+            # post-kernel routing scale applies to the finalized output. The
+            # fold is limited to NVFP4 experts, the deferred layout it was
+            # checked against; other plans (e.g. the FP8 MTP draft experts)
+            # keep the kernel's own finalize.
+            fuse_finalize = (
+                self.shared_expert is not None
+                and self.shared_expert_gate is not None
+                and hidden_states.shape[0] > 0
+                and hidden_states.dtype == torch.bfloat16
+                and self.experts.supports_deferred_finalize
+                and self.experts.plan.get("weight_dtype") == "nvfp4"
+                and current_platform().is_nvidia
+                and not isinstance(topk_output.output_scale, torch.Tensor)
+                and topk_output.output_scale == 1.0
+            )
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=not fuse_finalize,
             )
 
         if shared_output is not None:
-            if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
+            if fuse_finalize:
+                gemm2_out, expert_weights, expanded_idx = final_hidden_states
+                final_hidden_states = moe_finalize_gate_add(
+                    gemm2_out,
+                    expanded_idx,
+                    expert_weights,
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(0),
+                    shared_output,
+                )
+            elif self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
                     self.shared_expert_gate.weight.squeeze(0),
