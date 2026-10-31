@@ -3919,6 +3919,7 @@ async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
                 },
             )
             .await;
+            run(&engine.client, request("warm", 65, budget(2))).await;
             let replies = control(&engine, disk_load()).await;
             assert_eq!(replies.len(), layout.sizes().2);
             assert!(replies.iter().all(|(_, success)| !success));
@@ -3926,10 +3927,14 @@ async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
                 assert!(rank.device_ops.lock().unwrap().is_empty());
                 assert!(rank.weight_commits.lock().unwrap().is_empty());
             }
-            assert_eq!(
-                tokens(&run(&engine.client, request("after-refusal", 3, budget(2))).await),
-                [1000, 1001]
-            );
+            // The refusal came before the load's flush: the prefix cache
+            // still serves the warm prompt (on the one engine that took it).
+            let one_engine = layout.sizes().2 == 1;
+            let chunks = run(&engine.client, request("after-refusal", 65, budget(2))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001]);
+            if one_engine {
+                assert!(chunks.last().unwrap().cached_tokens > 0, "{layout:?}");
+            }
             for rank in &engine.ranks {
                 rank.weight_load_refused.store(false, Ordering::SeqCst);
             }
@@ -3940,10 +3945,10 @@ async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
             for rank in &engine.ranks {
                 assert_eq!(*rank.weight_commits.lock().unwrap(), [true]);
             }
-            assert_eq!(
-                tokens(&run(&engine.client, request("after-retry", 3, budget(2))).await),
-                [1000, 1001]
-            );
+            // An admitted load flushes as asked.
+            let chunks = run(&engine.client, request("after-retry", 65, budget(2))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001]);
+            assert_eq!(chunks.last().unwrap().cached_tokens, 0, "{layout:?}");
         }
     }
 }

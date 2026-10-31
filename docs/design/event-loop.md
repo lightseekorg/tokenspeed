@@ -578,17 +578,18 @@ operation to every engine in one order). The device call blocks the control
 thread in a collective the trainer drives or an SDK read; a DP peer that had
 not yet dequeued its copy would keep looping and wait for this rank in the
 per-round agreement, a deadlock. One operation completes per round. Before a
-weight load runs, the replica MIN-reduces each rank's device prerequisites
-(weights resident, KV released under discard, an SDK update under discard):
-a refusal on any rank means no rank loads, so a ready rank never enters a
-loading collective its peer skips, and every rank's weights stay untouched
-for a retry. A refused cache flush likewise loads nothing. After the load the
-replica MIN-reduces its result before the loop publishes the L3 weight
-version or sends the reply, and commits that final result on all forward
-threads before replying. Under the discard policy, local loading success is
-pending: only the successful replica-wide commit marks parameters usable. A
-failed load invalidates every rank, including ranks that loaded locally; KV
-wake and forwarding remain blocked until deployment restart. The same gate carries the online expert
+weight load's cache flush and load, the replica MIN-reduces each rank's device
+prerequisites (weights resident, KV released under discard, an SDK update
+under discard): a refusal on any rank means no rank flushes or loads, so a
+ready rank never enters a loading collective its peer skips, and every rank's
+weights and caches stay untouched for a retry. A refused cache flush likewise
+loads nothing. After the load the replica MIN-reduces its result before the
+loop publishes the L3 weight version or sends the reply, and commits that
+final result on all forward threads before replying. Under the discard
+policy, local loading success is pending: only the successful replica-wide
+commit marks parameters usable. A failed load invalidates every rank,
+including ranks that loaded locally; KV wake and forwarding remain blocked
+until deployment restart. The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at

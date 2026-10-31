@@ -1392,6 +1392,20 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             None
         };
+        // A weight load's prerequisites are agreed before its flush: a load
+        // that no rank may run neither drops the caches nor reaches a device.
+        let ready = match ready {
+            Some(op) if control::is_weight_load(&op) => match self.refuse_weight_load(&op)? {
+                Some(refusal) => {
+                    tracing::info!(op = op.tag(), message = refusal, "weight load refused");
+                    self.controls
+                        .reply(control::gated_reply(&op, false, refusal));
+                    None
+                }
+                None => Some(op),
+            },
+            ready => ready,
+        };
         // One blocking device operation per round: a frontend one first.
         let ready_internal = if all_have_internal && ready.is_none() {
             self.controls.pop_internal()
@@ -1457,17 +1471,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// Finish a gated weight operation: its result is agreed across the
-    /// ranks before the reply.
+    /// ranks before the reply. A weight load reaching here passed the
+    /// all-rank admission in [`Self::gate`].
     fn complete_weight_op(&mut self, op: ControlRequest, flushed: bool) -> Result<(), LoopError> {
         let flush_refused = control::wants_flush(&op) && !flushed;
-        if control::is_weight_load(&op) && !flush_refused {
-            if let Some(refusal) = self.refuse_weight_load(&op)? {
-                tracing::info!(op = op.tag(), message = refusal, "weight load refused");
-                self.controls
-                    .reply(control::gated_reply(&op, false, refusal));
-                return Ok(());
-            }
-        }
         let (success, message) = match &op {
             ControlRequest::RebalanceExperts(_) => {
                 // Not a weight operation: the frontend's trigger of the
@@ -1514,8 +1521,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         };
         let success = if control::is_weight_load(&op) && !flush_refused {
-            // Every rank started this load: a refused flush or admission
-            // left the weights untouched and commits nothing. Namespace
+            // Every rank started this load: a refused admission never gets
+            // here, and a refused flush loads and commits nothing. Namespace
             // publication can fail after the load agreement, so no rank
             // commits usability until that final result also converged.
             let agreed = self.converge(success)?;
@@ -1530,11 +1537,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// Agree a weight load's device prerequisites before any rank loads.
-    /// A rank that would refuse must not strand a ready peer inside a
-    /// loading collective; a refusal leaves every rank's weights untouched,
-    /// so serving goes on and the load may be retried. Returns the refusal,
-    /// or `None` when every rank is ready.
+    /// Agree a weight load's device prerequisites before its flush and
+    /// before any rank loads. A rank that would refuse must not strand a
+    /// ready peer inside a loading collective; a refusal leaves every rank's
+    /// weights and caches untouched, so serving goes on and the load may be
+    /// retried. Returns the refusal, or `None` when every rank is ready.
     fn refuse_weight_load(&mut self, op: &ControlRequest) -> Result<Option<String>, LoopError> {
         let (ready, message) = self.data_plane.check_weight_update(op)?;
         if self.converge(ready)? {

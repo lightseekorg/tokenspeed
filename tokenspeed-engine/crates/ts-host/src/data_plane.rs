@@ -98,11 +98,13 @@ enum Op {
         dp: DpRound,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
-    /// A weight operation or profile request, as its msgpack control struct.
+    /// A weight load's local prerequisites to check, as its msgpack
+    /// control struct; changes nothing.
     CheckWeightUpdate {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
     },
+    /// A weight operation or profile request, as its msgpack control struct.
     UpdateWeights {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,

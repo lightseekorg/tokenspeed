@@ -73,11 +73,12 @@ not suspend NCCL or release its communication buffers.
 6. Every rank confirms the final result, including namespace publication. Only
    this commit makes locally loaded weights usable. A failed load poisons every
    rank, under either policy, including ranks whose own load succeeded;
-   restart the deployment rather than attempting a partial wake. Before any
-   rank loads, all ranks agree that the update can start. If any rank refuses
-   (weights still released, KV still resident under discard, a non-SDK update
-   under discard) or the cache flush is refused, no rank loads, the weights
-   stay untouched, and the update may be retried.
+   restart the deployment rather than attempting a partial wake. Before the
+   update's cache flush and before any rank loads, all ranks agree that the
+   update can start. If any rank refuses (weights still released, KV still
+   resident under discard, a non-SDK update under discard), no rank flushes or
+   loads; if the flush is refused, no rank loads. Either way the weights stay
+   untouched and the update may be retried.
 7. Resume `kv_cache`, then allow new rollouts. Remapped KV pages are cleared
    and re-registered for transfer; old request history is not CPU-backed up.
 
