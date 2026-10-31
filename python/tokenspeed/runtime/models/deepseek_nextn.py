@@ -89,7 +89,6 @@ class DeepseekModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -122,7 +121,6 @@ class DeepseekModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if ctx.forward_mode.is_idle():
@@ -133,10 +131,7 @@ class DeepseekModelNextN(nn.Module):
         else:
             if captured_hidden_states is None:
                 raise ValueError("DeepSeek NextN requires captured_hidden_states.")
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+            hidden_states = self.embed_tokens(input_ids)
             fused = torch.cat(
                 (
                     self.enorm(hidden_states),

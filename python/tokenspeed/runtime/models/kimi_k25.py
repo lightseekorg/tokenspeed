@@ -41,12 +41,9 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
 )
 
 try:
@@ -115,15 +112,6 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
         """Expose the shared MoonViT attribute expected by EPD prefill."""
         return self.vision.vision_tower if self.vision is not None else None
 
-    @property
-    def mm_projector(self):
-        return self.vision.mm_projector if self.vision is not None else None
-
-    def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
-        if self.vision is None:
-            raise RuntimeError("Kimi-K2.5 multimodal path is not initialized.")
-        return self.vision.embed_media(items)
-
     def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
         if self.vision is None or self.image_encoder is None:
             return {}
@@ -143,22 +131,6 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
         if self.vision is None:
             return {}
         return {"image_encoder": self.make_encoder_cudagraph_wrapper(mapping)}
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
-
-    @property
-    def start_layer(self) -> int:
-        return self.language_model.start_layer if self.language_model is not None else 0
-
-    @property
-    def end_layer(self) -> int:
-        if self.language_model is not None:
-            return self.language_model.end_layer
-        text_config = getattr(self.config, "text_config", None)
-        return int(getattr(text_config, "num_hidden_layers", 0))
 
     @property
     def routed_experts_weights_of_layer(self):
