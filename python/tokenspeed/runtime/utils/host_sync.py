@@ -73,6 +73,12 @@ def host_to_device(
     if pin and torch.cuda.is_current_stream_capturing():
         raise RuntimeError("host_to_device cannot run under CUDA graph capture")
     if isinstance(values, torch.Tensor):
+        if values.device.type != "cpu":
+            # Copying a device tensor through here would be the blocking
+            # device-to-host read this helper exists to avoid.
+            raise ValueError(
+                f"host_to_device expects host values, got a tensor on {values.device}"
+            )
         staged = torch.empty(values.shape, dtype=dtype, pin_memory=pin)
         staged.copy_(values)
     else:

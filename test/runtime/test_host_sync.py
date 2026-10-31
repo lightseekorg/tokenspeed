@@ -153,6 +153,12 @@ def test_host_to_device_does_not_wait_for_the_stream(sync_debug_off):
 
 
 @requires_cuda
+def test_host_to_device_refuses_device_tensors():
+    with pytest.raises(ValueError, match="host values"):
+        host_to_device(torch.arange(4, device="cuda"), dtype=torch.int64, device="cuda")
+
+
+@requires_cuda
 def test_host_to_device_refuses_graph_capture():
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
