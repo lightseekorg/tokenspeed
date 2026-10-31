@@ -160,11 +160,13 @@ Collection also keeps each candidate's Device ownership and access epoch for
 ranking in the same call, avoiding a second set of key and tree lookups.
 Closed-group indexes maintain a non-owning Device access order for keys
 present in both Device and Host pools. Publishing or evicting either copy
-updates membership; a Device access updates the order. A cursor reads both
-copies' current metadata and ownership directly, skipping Device-only keys
-without another Host-key lookup. This index records membership, not whether
-a copy is safe to reclaim; each plan still checks prefix coverage, windows,
-pending stores and pins.
+updates membership; a Device access updates the order. Host duplicate selection
+traverses this intersection directly to read both copies' current metadata and
+ownership, without scanning Device-only keys or doing another Host-key lookup.
+This index records membership, not whether a copy is safe to reclaim; each plan
+still checks prefix coverage, windows, pending stores and pins. Together with
+the available-entry order used for eviction, it supplies the ordered scans;
+no additional recency index over all entries is maintained.
 Duplicate scans expand only prefix-closed groups and reuse key storage across
 boundaries. Victim inspection reads non-owning snapshots, so merely ranking
 entries does not create temporary block owners.

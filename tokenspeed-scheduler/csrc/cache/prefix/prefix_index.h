@@ -84,16 +84,9 @@ public:
         EvictionOrderMap::const_iterator next_{};
     };
 
-    // The same non-owning lifetime as EvictionCursor, in newest-first order.
-    // A duplicate policy can stop without enumerating older Device entries.
-    class RecentCursor {
-        friend class PrefixCacheIndex;
-        const CacheEntries* cache_index_{nullptr};
-        EvictionOrderMap::const_reverse_iterator next_{};
-    };
-
     // Traverses only keys present in both configured pools, in the source
-    // pool's newest-first order. Its lifetime follows RecentCursor.
+    // pool's newest-first order. Like EvictionCursor, it borrows the index
+    // and pools for one read-only planning pass.
     class CommonCursor {
         friend class PrefixCacheIndex;
         const CacheEntries* cache_index_{nullptr};
@@ -112,11 +105,6 @@ public:
         CacheBlockLocation location;
         CachedBlockMetadata metadata;
         bool pinned;
-    };
-
-    struct RecentEntry {
-        const CacheKey* key;
-        CachedBlockSnapshot block;
     };
 
     struct CommonEntry {
@@ -187,7 +175,6 @@ public:
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
-        cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
         cache_index.available_order.emplace(evictionOrder(*entry_it), entry_it);
         linkCommonEntry(cache_index, entry_it);
         if (newly_cached != nullptr) {
@@ -351,31 +338,8 @@ public:
         return false;
     }
 
-    // Return the next entry with the requested ownership, newest epoch first.
-    // The key is borrowed from the index; neither it nor the snapshot pins a
-    // block or updates recency. Start a fresh cursor after any index or owner
-    // change, and keep the ownership selection fixed throughout a traversal.
-    std::optional<RecentEntry> NextRecentEntry(const BlockPool& pool, RecentCursor& cursor, bool pinned) const {
-        if (cursor.cache_index_ == nullptr) {
-            cursor.cache_index_ = findCacheEntries(pool);
-            if (cursor.cache_index_ == nullptr) {
-                return std::nullopt;
-            }
-            cursor.next_ = cursor.cache_index_->by_eviction_order.rbegin();
-        }
-        while (cursor.next_ != cursor.cache_index_->by_eviction_order.rend()) {
-            const CacheEntry& entry = *(cursor.next_++)->second;
-            const bool entry_is_pinned = !entry.block_ref.unique();
-            if (entry_is_pinned == pinned) {
-                return RecentEntry{
-                    .key = &entry.key,
-                    .block = CachedBlockSnapshot{
-                        .location = entry.block_ref->Location(), .metadata = metadataOf(entry), .pinned = pinned}};
-            }
-        }
-        return std::nullopt;
-    }
-
+    // Borrowed keys and snapshots neither pin blocks nor update recency.
+    // Start a fresh cursor after any index or ownership change.
     std::optional<CommonEntry> NextCommonRecentEntry(const BlockPool& source_pool, CommonCursor& cursor) const {
         if (cursor.cache_index_ == nullptr) {
             cursor.cache_index_ = findCacheEntries(source_pool);
@@ -562,14 +526,12 @@ private:
 
     struct CacheEntries {
         // Owns each CacheEntry once. The maps are non-owning secondary indices
-        // into stable list nodes. by_eviction_order additionally keeps the
-        // entries sorted by age, so a caller reaches the oldest ones without
-        // visiting the rest; AdmissionPlanner still owns the policy that ranks
-        // entries within one access epoch.
+        // into stable list nodes. available_order keeps eviction candidates
+        // sorted by age; common_order keeps shared keys in source age order.
+        // AdmissionPlanner owns the policy that ranks one access epoch.
         CacheEntryList entries;
         std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
         std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
-        EvictionOrderMap by_eviction_order;
         // Entries known to be pinned are removed lazily during traversal.
         // Ownership notifications restore them without changing their age.
         mutable EvictionOrderMap available_order;
@@ -628,14 +590,11 @@ private:
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }
-        auto order_node = cache_index.by_eviction_order.extract(evictionOrder(*entry_it));
         auto available_node = cache_index.available_order.extract(evictionOrder(*entry_it));
         auto common_node = cache_index.common_source && entry_it->common_peer != nullptr
                                ? cache_index.common_order.extract(evictionOrder(*entry_it))
                                : EvictionOrderMap::node_type{};
         entry_it->last_access_epoch = access_epoch;
-        order_node.key() = evictionOrder(*entry_it);
-        cache_index.by_eviction_order.insert(std::move(order_node));
         if (common_node) {
             common_node.key() = evictionOrder(*entry_it);
             cache_index.common_order.insert(std::move(common_node));
@@ -689,7 +648,6 @@ private:
         }
         entry_it->unique_observer.Reset();
         cache_index.available_order.erase(evictionOrder(*entry_it));
-        cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());
         cache_index.entries.erase(entry_it);
