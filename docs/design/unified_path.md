@@ -136,6 +136,12 @@ before capture or task update and maps authoritative router slots once before
 the first Prolog. Its normalized FP32 partials use the same direct LSE merge as
 DSA, with empty-shard masking and layout conversion fused at that boundary.
 
+Layer-shared Ascend metadata compares retained Tensor storage views when reusing
+prepared results. Equivalent views reuse the result; replacement storage or an
+in-place storage rebind invalidates it. The retained views share allocations
+without copying data and are cleared at the forward boundary. Prefill keeps
+the same storage-view contract for each layer's prepared cache planes.
+
 DSA CP prepares its metadata before the first fused Prolog. One device launch
 expands request lengths into causal query rows, compacts owned pages, counts
 visible/initial/window tokens, writes the Indexer's grouped layout, and maps

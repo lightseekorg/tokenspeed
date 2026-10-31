@@ -148,6 +148,10 @@ writes are not ordered with the device's -- and the forward thread checks it
 did. On a Prefill rank streaming layerwise, the forward thread arms the
 forward's chunks when it hands the plan over and counts the producer steps;
 the attention backends only tick the device counter (`StepCounter`).
+Each armed producer step gets one tick, after all of its cache writes have
+been queued on the producer stream. Splitting a layer's DSA index-cache write
+into kernel-sized chunks does not add producer steps: only the final chunk
+publishes cache readiness.
 
 Common MoE weight processing reserves persistent DeepEP communication
 storage, before attention/cache construction profiles available memory. The

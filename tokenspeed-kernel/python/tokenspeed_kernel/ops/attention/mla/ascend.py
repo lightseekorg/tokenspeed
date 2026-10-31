@@ -46,7 +46,7 @@ def prepare_ascend_mla_prefill(
     history_null_rows=0,
     workspace=None,
 ):
-    """Reuse the DSA AICPU gather/owner-commit transport with no Index-K plane."""
+    """Reuse the DSA HCCL gather/owner-commit transport with no Index-K plane."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAPrefill
 
     return AscendDSAPrefill(
@@ -187,16 +187,12 @@ def ascend_mla_attention(query, *, cache, table, lengths, scale, out, lse):
     return output.view(tokens, heads, 512), statistics.view(tokens, heads)
 
 
-def ascend_mla_merge(
-    output, *, lse, visible, active, producer, maximum, total, peers, group
-):
+def ascend_mla_merge(output, *, lse, visible, active, producer, maximum, total, group):
     """Pack normalized FIA partials once, then reuse DSA's direct LSE merge."""
     from tokenspeed_kernel_npu.ops.mla_dcp import prepare_mla_partials
 
     prepare_mla_partials(output, lse, visible, active, producer, maximum)
-    return torch.ops.custom.npu_dsa_merge_lse_direct(
-        producer, maximum, total, peers, group, 8, 0
-    )
+    return torch.ops.custom.npu_dsa_merge_lse_direct(producer, maximum, total, group, 8)
 
 
 def ascend_prepare_mla_resources(*, group, rank, heads, rank_size):
@@ -220,8 +216,7 @@ def ascend_prepare_mla_resources(*, group, rank, heads, rank_size):
         raise
     return DSAResources(
         window,
-        {rows: values[:3] for rows, values in prepared.items()},
-        {rows: values[3] for rows, values in prepared.items()},
+        prepared,
         release=torch.ops.custom.dsa_release_prolog_window,
     )
 

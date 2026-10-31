@@ -58,3 +58,17 @@ def test_resolved_worker_role_reaches_model_initialization(roles):
     finally:
         global_server_args_dict.clear()
         global_server_args_dict.update(original)
+
+
+def test_prefill_kv_limit_reaches_model_initialization_and_can_be_disabled():
+    original = global_server_args_dict.copy()
+    try:
+        for limit in (32768, None, 65536, None):
+            argv = ["--model", "x", "--max-model-len", "16384"]
+            if limit is not None:
+                argv += ["--chunk-prefill-kv-size", str(limit)]
+            global_server_args_dict_update(prepare_server_args(argv))
+            assert global_server_args_dict["chunk_prefill_kv_size"] == limit
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(original)

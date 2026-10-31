@@ -125,7 +125,7 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
 
     group = DeviceGroup()
     window = Window(torch.ones(16))
-    resources = DSAResources(window, {}, {}, window.release)
+    resources = DSAResources(window, {}, window.release)
     monkeypatch.setattr(pg, "get_dedicated_device_group", lambda *args: group)
     monkeypatch.setattr(pg, "init_process_group", lambda *args, **kwargs: None)
     monkeypatch.setattr(pg, "get_process_group", lambda *args: group)
@@ -178,3 +178,129 @@ def test_prefill_weight_preparation_follows_model_opt_in(
             torch.testing.assert_close(actual, expected)
         attention.process_weights_after_loading()
         assert attention._prefill_weights is weights
+
+
+@pytest.mark.parametrize("rows", [1, 1025, 2049])
+def test_model_router_leaves_cache_readiness_to_the_index_writer(monkeypatch, rows):
+    """The prologue's KV write alone cannot release a DSA producer step."""
+    from tokenspeed_kernel.ops.attention.prologue.types import (
+        LatentKVCache,
+        MLAPrologueOutput,
+    )
+
+    from tokenspeed.runtime.layers import paged_attention
+    from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
+        AscendDSABackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
+        CacheGroupGeometry,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
+    )
+    from tokenspeed.runtime.layers.dense import unquant
+    from tokenspeed.runtime.layers.layernorm import RMSNorm
+    from tokenspeed.runtime.pd.utils import StepCounter
+
+    class CpuStepCounter(StepCounter):
+        # Substitute only device/pinned allocation, retaining record_cache's
+        # arithmetic and host publication.
+        def __init__(self):
+            self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64)
+            self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64)
+
+    class CpuIndexWriter(AscendDSABackend):
+        # The device SFA/index kernels are unavailable. This leaf writes a real
+        # index-cache tensor and publishes when its device work would finish.
+        def __init__(self):
+            self._prefill_options = None
+            self.step_counter = None
+            self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
+            self.counter_before_index = None
+
+        def cache_placement(self, layer):
+            return None
+
+        def forward_extend(self, q, k, v, layer, slots, pool, bs, **kwargs):
+            self.counter_before_index = int(self.step_counter.h_ready_cache_step)
+            self.index_cache.index_copy_(0, slots.long(), kwargs["index_key"])
+            self.step_counter.record_cache()
+            return q[..., :4].transpose(0, 1).contiguous()
+
+    @dataclass
+    class Pool:
+        latent: torch.Tensor
+
+        def kv_write_target(self, layer_id, slots, owned):
+            return LatentKVCache(self.latent, False, slots, owned)
+
+    @dataclass
+    class Context:
+        attn_backend: CacheGroupRouter
+        token_to_kv_pool: Pool
+        forward_mode: ForwardMode = ForwardMode.EXTEND
+        bs: int = 1
+
+    def cpu_prologue(query, q_pe, latent, *, cache, **kwargs):
+        cache.kv_cache.index_copy_(0, cache.slots.long(), latent.unsqueeze(1))
+        return MLAPrologueOutput(query=query, key=None, value=None, latent=latent)
+
+    def cpu_rmsnorm(x, weight, eps, **kwargs):
+        return torch.nn.functional.rms_norm(
+            x.float(), (x.shape[-1],), weight.float(), eps
+        ).to(x.dtype)
+
+    monkeypatch.setattr(paged_attention, "mla_prologue", cpu_prologue)
+    monkeypatch.setattr(
+        unquant,
+        "kernel_mm",
+        lambda x, weight, *, bias=None, **kwargs: torch.nn.functional.linear(
+            x, weight, bias
+        ),
+    )
+    attention = make_attention(nope=True, separate=True, independent=True)
+    attention.to(dtype=torch.bfloat16)
+    attention.indexer.weights_proj.to(dtype=torch.float32)
+    with torch.no_grad():
+        for index, parameter in enumerate(attention.parameters()):
+            parameter.copy_(
+                torch.sin(torch.arange(parameter.numel()).float() + index + 1).reshape(
+                    parameter.shape
+                )
+            )
+    for module in attention.modules():
+        if isinstance(module, RMSNorm):
+            monkeypatch.setattr(module, "kernel", cpu_rmsnorm)
+    attention.process_weights_after_loading()
+    group = "full_history"
+    attention.attn_mqa.bind_cache_group(group)
+    leaf = CpuIndexWriter()
+    router = CacheGroupRouter(
+        lambda *args: leaf,
+        is_draft=False,
+        spec_num_tokens=1,
+        device="cpu",
+        consumed_group_ids=None,
+    )
+    router.bind(
+        CacheGroupGeometry(
+            granularities={group: 128},
+            attn_kinds={group: "full_history"},
+            full_history_group_id=group,
+            row_geometry={group: (None, None)},
+            windows={group: None},
+        ),
+        {group: leaf},
+    )
+    router._extend_write_locations = {group: torch.arange(rows)}
+    counter = CpuStepCounter()
+    router.register_step_counter(counter)
+    pool = Pool(torch.zeros(rows, 1, 8, dtype=torch.bfloat16))
+    hidden = torch.sin(torch.arange(rows * 8).float()).reshape(rows, 8).bfloat16()
+    output = attention(torch.arange(rows), hidden, Context(router, pool), None)
+
+    assert leaf.counter_before_index == 0
+    assert int(counter.d_ready_cache_step) == int(counter.h_ready_cache_step) == 1
+    assert torch.isfinite(output).all() and output.shape == hidden.shape
+    assert torch.count_nonzero(pool.latent) > 0
+    assert torch.count_nonzero(leaf.index_cache) > 0

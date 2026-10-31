@@ -326,7 +326,6 @@ class FusedMLADecode:
             producer=producer,
             maximum=maximum,
             total=total,
-            peers=self.owner.tables[rows],
             group=self.owner.group,
         )
         output = torch.empty(
@@ -371,7 +370,6 @@ class AscendMLARuntime:
         )
         self.window = self.resources.window
         self.outputs = self.resources.outputs
-        self.tables = self.resources.tables
         torch.npu.synchronize()
         dist.barrier(group=cpu_group)
         self.runtimes = []
@@ -400,6 +398,5 @@ class AscendMLARuntime:
         self.resources = None
         self.window = None
         self.outputs.clear()
-        self.tables.clear()
         self.runtimes.clear()
         self.closed = True

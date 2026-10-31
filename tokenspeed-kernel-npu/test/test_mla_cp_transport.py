@@ -277,6 +277,272 @@ def bounded_transport(rank, degree, scratch_pool):
     return results
 
 
+def independent_transports(rank, degree):
+    """Closing one live transport must not replace/destroy another's comm."""
+    caches = [
+        torch.empty((256, 576), dtype=torch.bfloat16, device="npu") for _ in range(2)
+    ]
+    transports = [
+        AscendDSAPrefill(
+            cache,
+            None,
+            ranks=tuple(range(degree)),
+            bootstrap_group=dist.group.WORLD,
+            max_current_rows=128,
+            max_history_rows=128 + 256 * degree,
+            history_null_rows=128,
+        )
+        for cache in caches
+    ]
+    checks = 0
+    try:
+        for index in (0, 1):
+            runtime, cache = transports[index], caches[index]
+            for case in range(2):
+                cache.fill_(10 * (index + 1) + case + rank)
+                runtime.prefetch(
+                    case,
+                    cache,
+                    None,
+                    has_history=True,
+                    history_slots=torch.arange(256, device="npu", dtype=torch.int64),
+                    history_counts=(256,) * degree,
+                )
+                current = torch.full(
+                    (1, 576), rank + 1, dtype=torch.bfloat16, device="npu"
+                )
+                runtime.gather_current(case, current, width=576, total_rows=degree)
+                # Wait via the owning stream before reading its history region.
+                runtime.stream.synchronize()
+                expected = torch.cat(
+                    [
+                        torch.full(
+                            (256, 576),
+                            10 * (index + 1) + case + peer,
+                            dtype=torch.bfloat16,
+                        )
+                        for peer in range(degree)
+                    ]
+                )
+                exact(runtime.kv[128 : runtime.history_rows], expected)
+                runtime.finish(case)
+                checks += 1
+            runtime.close()
+    finally:
+        for runtime in transports:
+            runtime.close()
+    return checks
+
+
+def queued_history(rank, degree):
+    """Join internal HCCL work before consuming or reusing either KV plane."""
+    cache = torch.empty((256, 576), dtype=torch.bfloat16, device="npu")
+    index = torch.empty((256, 128), dtype=torch.bfloat16, device="npu")
+    runtime = AscendDSAPrefill(
+        cache,
+        index,
+        ranks=tuple(range(degree)),
+        bootstrap_group=dist.group.WORLD,
+        max_current_rows=128,
+        max_history_rows=128 + 256 * degree,
+        history_null_rows=128,
+    )
+    runtime.allocate_workspace()
+    pointers = (runtime.storage.data_ptr(), runtime.history_send.data_ptr())
+    compute = torch.npu.Stream()
+    compute.wait_stream(torch.npu.current_stream())
+    pending = []
+    try:
+        with torch.npu.stream(compute):
+            for case in range(12):
+                # Rotate empty owners, change uneven counts, and include an
+                # all-empty round between nonempty rounds on the same buffers.
+                counts = tuple(
+                    0 if case % 4 == 0 or (case + peer) % 3 == 0 else 17 + peer
+                    for peer in range(degree)
+                )
+                histories = [
+                    bits(256, 51000 + case * 31 + peer) for peer in range(degree)
+                ]
+                cache.copy_(histories[rank])
+                index.copy_(histories[rank][:, :128])
+                slots = (torch.arange(counts[rank], dtype=torch.int64) * 7 + case) % 256
+                device_slots = slots.npu()
+                runtime.storage.fill_(-99)
+                runtime.prefetch(
+                    0,
+                    cache,
+                    index,
+                    has_history=True,
+                    history_slots=device_slots,
+                    history_counts=counts,
+                )
+                del device_slots
+                expected = torch.cat(
+                    [
+                        history[(torch.arange(count) * 7 + case) % 256]
+                        for history, count in zip(histories, counts, strict=True)
+                    ]
+                )
+                for width, receive, ready in (
+                    (128, runtime.index, runtime.index_ready),
+                    (576, runtime.kv, runtime.kv_ready),
+                ):
+                    compute.wait_event(ready)
+                    pending.append(
+                        (receive[128 : 128 + sum(counts)].clone(), expected[:, :width])
+                    )
+                    # Communication must not touch the null page or the tail.
+                    for gap in (receive[:128], receive[128 + sum(counts) :]):
+                        pending.append(
+                            (
+                                gap.clone(),
+                                torch.full(gap.shape, -99, dtype=torch.bfloat16),
+                            )
+                        )
+                runtime.finish(0)
+                # Poison source slots and the shared packing region after the
+                # finish dependency, without a host synchronization per round.
+                torch.empty_like(slots, device="npu").fill_(-1)
+                runtime.history_send.fill_(-99)
+                assert pointers == (
+                    runtime.storage.data_ptr(),
+                    runtime.history_send.data_ptr(),
+                )
+        compute.synchronize()
+        for actual, expected in pending:
+            exact(actual, expected)
+    finally:
+        runtime.close()
+    return 12
+
+
+def workspace_allocation(rank, degree, scratch_pool):
+    """Fresh default targets and explicit reuse preserve both gather planes."""
+    results = []
+    for bounded in (False, True):
+        for has_index in (False, True):
+            for preallocated in (False, True):
+                local_rows = 256
+                cache = torch.empty(
+                    (local_rows, 576), dtype=torch.bfloat16, device="npu"
+                )
+                index = (
+                    torch.empty((local_rows, 128), dtype=torch.bfloat16, device="npu")
+                    if has_index
+                    else None
+                )
+                runtime = AscendDSAPrefill(
+                    cache,
+                    index,
+                    ranks=tuple(range(degree)),
+                    bootstrap_group=dist.group.WORLD,
+                    max_current_rows=degree * 128,
+                    max_history_rows=128 + local_rows * degree if bounded else 0,
+                    history_null_rows=128 if bounded else 0,
+                )
+                assert runtime.workspace_bytes == 0
+                if preallocated:
+                    workspace = runtime.allocate_workspace()
+                    assert runtime.allocate_workspace() is workspace
+                    assert runtime.workspace_bytes > 0
+                targets, pending = [], []
+                try:
+                    for case, rows in enumerate((1, degree * 128, 17)):
+                        histories = [
+                            bits(local_rows, 62000 + case * 31 + peer)
+                            for peer in range(degree)
+                        ]
+                        cache.copy_(histories[rank])
+                        if has_index:
+                            index.copy_(histories[rank][:, :128])
+                        counts = tuple(
+                            rows // degree + (peer < rows % degree)
+                            for peer in range(degree)
+                        )
+                        values = bits(rows, 63000 + case)
+                        begin = sum(counts[:rank])
+                        local = values[begin : begin + counts[rank]].npu()
+                        runtime.prefetch(
+                            0,
+                            cache,
+                            index,
+                            has_history=True,
+                            history_slots=(
+                                torch.arange(
+                                    local_rows, dtype=torch.int64, device="npu"
+                                )
+                                if bounded
+                                else None
+                            ),
+                            history_counts=(local_rows,) * degree if bounded else None,
+                        )
+                        target = runtime.storage
+                        if targets:
+                            if preallocated:
+                                assert target.data_ptr() == targets[0].data_ptr()
+                            else:
+                                # Keep prior targets alive so allocator address
+                                # recycling cannot hide accidental buffer reuse.
+                                assert all(
+                                    target.data_ptr() != old.data_ptr()
+                                    for old in targets
+                                )
+                        targets.append(target)
+                        slots = torch.full((rows,), -1, dtype=torch.int64, device="npu")
+                        direct = torch.zeros(rows, dtype=torch.uint8, device="npu")
+                        for width in ((128, 576) if has_index else (576,)):
+                            runtime.gather_current(
+                                0,
+                                local[:, :width].contiguous(),
+                                width=width,
+                                total_rows=rows,
+                            )
+                            receive = runtime.patch(
+                                0,
+                                slots,
+                                direct,
+                                slots_workspace=scratch_pool.allocate(
+                                    ((rows,), torch.int64)
+                                )[0],
+                                mapped_slots=slots if bounded else None,
+                                width=width,
+                                block_rows=128,
+                                virtual_blocks=degree + 1,
+                            )
+                            null_rows = 128 if bounded else 0
+                            pending.append(
+                                (
+                                    receive[null_rows : runtime.history_rows].clone(),
+                                    torch.cat(histories)[:, :width],
+                                )
+                            )
+                            for peer, count in enumerate(counts):
+                                start = runtime.history_rows + peer * runtime._send_rows
+                                offset = sum(counts[:peer])
+                                pending.append(
+                                    (
+                                        receive[start : start + count].clone(),
+                                        values[offset : offset + count, :width],
+                                    )
+                                )
+                        runtime.finish(0)
+                    for actual, expected in pending:
+                        exact(actual, expected)
+                    results.append(
+                        dict(
+                            bounded=bounded,
+                            has_index=has_index,
+                            preallocated=preallocated,
+                            rounds=len(targets),
+                            byteexact=True,
+                        )
+                    )
+                finally:
+                    runtime.close()
+    return results
+
+
 def main():
     rank = int(os.environ["RANK"])
     degree = int(os.environ["WORLD_SIZE"])
@@ -293,12 +559,16 @@ def main():
         bootstrap_group=dist.group.WORLD,
         max_current_rows=16384,
     )
+    runtime.allocate_workspace()
     assert runtime.index.numel() == runtime.send_index.numel() == 0
     scratch_pool = workspace_pool(cache.device)
     assert workspace_pool("npu") is scratch_pool
     scratch_pool.allocate(((16384,), torch.int64))
     scratch_pool.freeze()
+    frozen_capacity = scratch_pool.capacity_bytes
+    assert frozen_capacity >= 16384 * 8
     pointer = runtime.kv.data_ptr()
+    send_pointer = runtime.send_kv.data_ptr()
     results = []
     for case, (rows, alias) in enumerate(
         [(n, False) for n in (0, 1, 17, 63, 64, 65, 127, 128, 129, 2048, 16384)]
@@ -315,6 +585,8 @@ def main():
         current = values[begin : begin + count].npu()
         flags = torch.full((rows,), int(alias), dtype=torch.uint8, device="npu")
         runtime.prefetch(case, cache, None, has_history=True)
+        runtime.send_kv.fill_(-99)
+        runtime.kv[runtime.history_rows :].fill_(-99)
         runtime.gather_current(case, current, width=576, total_rows=rows)
         # Ordinary router slots are int32; standalone callers may retain int64.
         slot_dtype = torch.int32 if case % 2 == 0 else torch.int64
@@ -349,12 +621,26 @@ def main():
                 runtime.kv[start : start + peer_count],
                 values[offset : offset + peer_count],
             )
+            # GatherV must leave the aligned receive gaps untouched.
+            exact(
+                runtime.kv[start + peer_count : start + runtime._send_rows],
+                torch.full(
+                    (runtime._send_rows - peer_count, 576),
+                    -99,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        exact(
+            runtime.send_kv[count : runtime._send_rows],
+            torch.full((runtime._send_rows - count, 576), -99, dtype=torch.bfloat16),
+        )
         assert runtime.kv.data_ptr() == pointer
+        assert runtime.send_kv.data_ptr() == send_pointer
         assert (
             runtime.workspace_bytes
             == (runtime.history_rows + (degree + 1) * runtime.send_capacity) * 576 * 2
         )
-        assert scratch_pool.capacity_bytes == 16384 * 8
+        assert scratch_pool.capacity_bytes == frozen_capacity
         results.append(
             {
                 "rows": rows,
@@ -367,10 +653,11 @@ def main():
     # slots and allocator reuse must not change an in-flight native write.
     pending = []
     for case in range(8):
-        rows = degree * page
+        rows = degree * page - case % 2
+        count = rows // degree + (rank < rows % degree)
         cache.zero_()
         current = torch.full(
-            (page, 576),
+            (count, 576),
             case * degree + rank + 1,
             dtype=torch.bfloat16,
             device="npu",
@@ -380,6 +667,11 @@ def main():
         flags = torch.zeros(rows, dtype=torch.uint8, device="npu")
         runtime.prefetch(case, cache, None, has_history=False)
         runtime.gather_current(case, current, width=576, total_rows=rows)
+        del current
+        # Reuse the producer allocation size before waiting for communication.
+        # The persistent send plane must remain valid after this temporary dies.
+        pressure = torch.empty((count, 576), dtype=torch.bfloat16, device="npu")
+        pressure.fill_(-99)
         runtime.patch(
             case,
             slots,
@@ -391,18 +683,25 @@ def main():
         )
         snapshot = cache.clone()
         runtime.finish(case)
-        del slots, flags, current
+        del slots, flags, pressure
         # A later main-stream op may immediately reuse the shared scratch.
         scratch_pool.allocate(((rows,), torch.int64))[0].fill_(-1)
         # Reuse the same allocation size as the native ABI's converted slots.
         torch.empty(rows, dtype=torch.int64, device="npu").fill_(-1)
         pending.append(snapshot)
     for case, actual in enumerate(pending):
+        rows = degree * page - case % 2
+        count = rows // degree + (rank < rows % degree)
         expected = torch.zeros((local_rows, 576), dtype=torch.bfloat16)
-        expected[(case + 1) * page : (case + 2) * page].fill_(case * degree + rank + 1)
+        expected[(case + 1) * page : (case + 1) * page + count].fill_(
+            case * degree + rank + 1
+        )
         exact(actual, expected)
     runtime.close()
+    independent = independent_transports(rank, degree)
+    history_rounds = queued_history(rank, degree)
     bounded = bounded_transport(rank, degree, scratch_pool)
+    allocation_cases = workspace_allocation(rank, degree, scratch_pool)
     from tokenspeed_kernel_npu.ops.mla import mla_prefill
 
     causal_cases = []
@@ -459,6 +758,9 @@ def main():
                 "queued_commits_byteexact": len(pending),
                 "causal_cases": causal_cases,
                 "bounded_cases": bounded,
+                "independent_transport_checks": independent,
+                "queued_history_rounds": history_rounds,
+                "workspace_allocation_cases": allocation_cases,
             },
             indent=2,
         )
