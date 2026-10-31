@@ -64,6 +64,7 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.launcher import (
     interface_for_host,
     set_pinned_allocator_default,
+    set_rocm_tool_registration_default,
 )
 from tokenspeed.runtime.utils.process import (
     kill_process_tree,
@@ -114,6 +115,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     if server_args.device == "cuda":
         set_pinned_allocator_default()
+        set_rocm_tool_registration_default()
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     if server_args.disable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
