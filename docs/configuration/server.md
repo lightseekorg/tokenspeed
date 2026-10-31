@@ -280,9 +280,9 @@ on an older NCCL), push the new
 weights (`UpdateWeightsFromMooncakeReqInput`), resume `["kv_cache"]`. With `discard`,
 KV must be released before the weight update and cannot resume until every rank
 has loaded and committed the complete version. Under either policy, a weight
-load that fails after it started requires a restart; an update refused before
-loading can be retried. A bare resume of all tags immediately after discard is
-therefore invalid. Sparse KV
+load that fails after it started requires a restart; an update that any rank
+refuses before loading runs on no rank and can be retried. A bare resume of all
+tags immediately after discard is therefore invalid. Sparse KV
 offload keeps its pinned Host history mapped across a release and zeroes it on
 resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.

@@ -889,6 +889,14 @@ class HostDataPlane:
             )
         )
 
+    def check_weight_update(self, payload: bytes) -> tuple[bool, str]:
+        """Check a weight load's local prerequisites (a msgpack control
+        struct) for the replica-wide admission before any rank loads."""
+        ok, message = self._device.check_weight_update(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
+
     def update_weights(self, payload: bytes) -> tuple[bool, str]:
         """Apply one weight operation (a msgpack control struct), ordered
         behind the forwards dispatched before it."""
@@ -1417,13 +1425,15 @@ def bootstrap(
     host's encode mode instead (``epd/encode_host.py``)."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
-    # Old host binaries call bootstrap with two arguments. Reject them before
-    # constructing a model or process group: they cannot publish the global
-    # decision that makes locally loaded weights usable again.
-    if server_args.enable_memory_saver and weight_update_commit_protocol < 1:
+    # Reject an older host binary before constructing a model or process
+    # group. Protocol 1 publishes the replica-wide decision that makes locally
+    # loaded weights usable; protocol 2 also agrees the load prerequisites
+    # before any rank starts loading. A binary without protocol 1 calls
+    # bootstrap with two arguments.
+    if server_args.enable_memory_saver and weight_update_commit_protocol < 2:
         raise RuntimeError(
             "Memory saver requires a ts-host binary with weight-update commit "
-            "protocol 1; rebuild tokenspeed-engine together with this runtime"
+            "protocol 2; rebuild tokenspeed-engine together with this runtime"
         )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)

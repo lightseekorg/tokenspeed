@@ -99,6 +99,10 @@ enum Op {
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     /// A weight operation or profile request, as its msgpack control struct.
+    CheckWeightUpdate {
+        payload: Bytes,
+        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
     UpdateWeights {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
@@ -435,6 +439,14 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::IdleForward { dp, reply })
     }
 
+    fn check_weight_update(
+        &mut self,
+        op: &ControlRequest,
+    ) -> Result<(bool, String), DataPlaneError> {
+        let payload = control_payload(op)?;
+        self.ask(|reply| Op::CheckWeightUpdate { payload, reply })
+    }
+
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         let payload = control_payload(op)?;
         self.ask(|reply| Op::UpdateWeights { payload, reply })
@@ -583,7 +595,9 @@ fn forward_loop(
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
-                Op::UpdateWeights { reply, .. } | Op::Profile { reply, .. } => {
+                Op::CheckWeightUpdate { reply, .. }
+                | Op::UpdateWeights { reply, .. }
+                | Op::Profile { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::SnapshotExpertLoad { reply } => {
@@ -731,6 +745,13 @@ fn run(
                 .map(drop)
                 .map_err(python);
             answer(reply, ran)?;
+        }
+        Op::CheckWeightUpdate { payload, reply } => {
+            let done = plane
+                .call_method1("check_weight_update", (PyBytes::new(py, &payload),))
+                .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
         }
         Op::UpdateWeights { payload, reply } => {
             let done = plane
