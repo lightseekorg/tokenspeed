@@ -2831,17 +2831,10 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                     rows = target.shape[0] // 2
                     target = target.narrow(0, half * rows, rows)
                 if moe.down_columns is not None and half is None:
-                    if moe.down_columns.prepared is not None:
-                        raise RuntimeError(
-                            "the column-split down copy cannot take weight updates"
-                        )
-                    columns = (
-                        moe.down_columns.weight
-                        if parameter_name.endswith(".w2_weight")
-                        else moe.down_columns.weight_scale
-                    )
-                    columns.data[local_expert].copy_(
-                        moe.down_columns.shard(loaded_weight)
+                    moe.down_columns.load(
+                        loaded_weight,
+                        scale=not parameter_name.endswith(".w2_weight"),
+                        expert=local_expert,
                     )
                 loaded_weight = shard_expert_projection(
                     loaded_weight,
@@ -2881,16 +2874,11 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 if parameter_name.endswith(("_weight", "_weight_scale")):
                     gate_up = ".w13_" in parameter_name
                     if moe.down_columns is not None and not gate_up:
-                        if moe.down_columns.prepared is not None:
-                            raise RuntimeError(
-                                "the column-split down copy cannot take weight updates"
-                            )
-                        columns = (
-                            moe.down_columns.weight
-                            if parameter_name.endswith("_weight")
-                            else moe.down_columns.weight_scale
+                        moe.down_columns.load(
+                            loaded_weight,
+                            scale=not parameter_name.endswith("_weight"),
+                            expert=None,
                         )
-                        columns.data.copy_(moe.down_columns.shard(loaded_weight))
                     loaded_weight = shard_expert_projection(
                         loaded_weight,
                         parameter,

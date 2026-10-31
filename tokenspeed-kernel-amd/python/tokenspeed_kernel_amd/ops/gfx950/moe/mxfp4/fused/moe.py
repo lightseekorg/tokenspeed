@@ -1718,15 +1718,12 @@ def _maybe_gluon_package_mxfp4_prefill(
         x_quantized is not None or isinstance(hidden_states, tuple)
     ) and activation_format != "e2m1":
         raise ValueError("prequantized package input must use the E2M1 format")
-    package_w13 = getattr(w13_weight, "gluon_package_prefill_weight", None)
-    package_w13_scale = getattr(w13_weight, "gluon_package_prefill_scale", None)
-    package_w2 = getattr(w2_weight, "gluon_package_prefill_weight", None)
-    package_w2_scale = getattr(w2_weight, "gluon_package_prefill_scale", None)
-    if not all(
-        isinstance(t, torch.Tensor)
-        for t in (package_w13, package_w13_scale, package_w2, package_w2_scale)
-    ):
+    w13_package = _package_prefill_weights(w13_weight, required=False)
+    w2_package = _package_prefill_weights(w2_weight, required=False)
+    if w13_package is None or w2_package is None:
         return None
+    package_w13, package_w13_scale = w13_package
+    package_w2, package_w2_scale = w2_package
 
     topk_weights = precomputed_topk_weights
     topk_ids = precomputed_topk_ids
@@ -2118,13 +2115,20 @@ def _package_prefill_down(
     )
 
 
-def _package_prefill_weights(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the package-prefill weight and scale aliases attached at load time."""
+def _package_prefill_weights(
+    weight: torch.Tensor, *, required: bool
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return the package-prefill weight and scale aliases attached at load time.
+
+    Returns None when they are missing, or raises if ``required``.
+    """
     package = getattr(weight, "gluon_package_prefill_weight", None)
     scale = getattr(weight, "gluon_package_prefill_scale", None)
-    if not isinstance(package, torch.Tensor) or not isinstance(scale, torch.Tensor):
+    if isinstance(package, torch.Tensor) and isinstance(scale, torch.Tensor):
+        return package, scale
+    if required:
         raise ValueError("package prefill requires gdot128-preshuffled weights")
-    return package, scale
+    return None
 
 
 def gluon_mxfp4_sorted_gate_up_gfx950(
@@ -2162,7 +2166,7 @@ def gluon_mxfp4_sorted_gate_up_gfx950(
     Returns:
         The sorted route metadata for ``gluon_mxfp4_sorted_down_gfx950``.
     """
-    package_w13, package_w13_scale = _package_prefill_weights(w13_weight)
+    package_w13, package_w13_scale = _package_prefill_weights(w13_weight, required=True)
     rows, hidden_dim, _, _ = _mxfp4_input_metadata(x_quantized)
     experts = int(package_w13.shape[0])
     inter_dim = int(package_w13.shape[1]) // 2
@@ -2254,7 +2258,7 @@ def gluon_mxfp4_sorted_down_gfx950(
         ``deferred_out`` holding every route's FP32-accumulated output,
         rounded once to BF16.
     """
-    package_w2, package_w2_scale = _package_prefill_weights(w2_weight)
+    package_w2, package_w2_scale = _package_prefill_weights(w2_weight, required=True)
     width = int(package_w2.shape[1])
     k = int(package_w2.shape[2]) * 2
     if (

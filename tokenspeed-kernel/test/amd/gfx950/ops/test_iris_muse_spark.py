@@ -3055,13 +3055,15 @@ def _muse_tp_owned_forward_worker(
         moe.experts.w2_weight_scale.random_(118, 124)
         if down_columns:
             # Assemble the full down projection from every rank's K shard.
-            for local, columns in (
-                (moe.experts.w2_weight, moe.down_columns.weight),
-                (moe.experts.w2_weight_scale, moe.down_columns.weight_scale),
+            for local, scale in (
+                (moe.experts.w2_weight, False),
+                (moe.experts.w2_weight_scale, True),
             ):
                 shards = [torch.empty_like(local) for _ in range(world_size)]
                 dist.all_gather(shards, local.data.contiguous())
-                columns.data.copy_(moe.down_columns.shard(torch.cat(shards, dim=-1)))
+                moe.down_columns.load(
+                    torch.cat(shards, dim=-1), scale=scale, expert=None
+                )
             moe.down_columns.process_weights_after_loading(moe.down_columns)
         moe.experts.process_weights_after_loading(moe.experts)
     else:

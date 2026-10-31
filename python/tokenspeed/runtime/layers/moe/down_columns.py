@@ -80,8 +80,24 @@ class MoEDownColumns(nn.Module):
         self.prepared: torch.Tensor | None = None
 
     def shard(self, loaded: torch.Tensor) -> torch.Tensor:
-        """Select this rank's output rows of one expert's full down weight or scales."""
+        """Select this rank's output rows of full-width down weights or scales."""
         return loaded.narrow(-2, self.tp_rank * self.width, self.width)
+
+    def load(self, loaded: torch.Tensor, *, scale: bool, expert: int | None) -> None:
+        """Copy checkpoint down weights or scales into this rank's column slice.
+
+        Args:
+            loaded: Full-width down weights or scales of every local expert, or
+                of one expert when ``expert`` is given.
+            scale: Load the E8M0 scales rather than the packed weights.
+            expert: Local expert index, or None for all local experts at once.
+        """
+        if self.prepared is not None:
+            raise RuntimeError("the column-split down copy cannot take weight updates")
+        target = (self.weight_scale if scale else self.weight).data
+        if expert is not None:
+            target = target[expert]
+        target.copy_(self.shard(loaded))
 
     def process_weights_after_loading(self, module: nn.Module) -> None:
         """Lay out the loaded copy for the kernel and release the checkpoint layout."""
