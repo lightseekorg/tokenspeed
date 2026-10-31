@@ -1517,15 +1517,15 @@ class ServerArgs:
                 raise ValueError(
                     "--synthetic-acceptance-length does not support draft trees"
                 )
-            if self.dp_sampling or self.enable_output_logprobs:
+            if self.dp_sampling:
                 raise ValueError(
-                    "--synthetic-acceptance-length does not support "
-                    "--dp-sampling or --enable-output-logprobs"
+                    "--synthetic-acceptance-length does not support --dp-sampling"
                 )
             logger.warning(
                 f"Synthetic acceptance length {length:.4f} enabled for benchmarking. "
-                "Generated text is synthetic and must not be used for correctness "
-                "or accuracy evaluation."
+                "Generated text is synthetic, not a normal greedy output, and "
+                "must not be used for correctness or accuracy evaluation. "
+                "Forced trajectories may be used for state/trajectory consistency checks."
             )
 
         if self.min_kv_split is not None:
@@ -3467,7 +3467,7 @@ class ServerArgs:
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
             "for correctness evaluation. Requires --sampling-backend greedy without "
-            "--dp-sampling or --enable-output-logprobs. Unset disables it.",
+            "--dp-sampling. Output logprobs score the forced trajectory. Unset disables it.",
         )
         parser.add_argument(
             "--enable-speculative-sampling",
