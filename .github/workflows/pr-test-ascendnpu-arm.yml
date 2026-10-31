@@ -63,7 +63,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          python3 -B -m unittest discover -s test/ci_system/npu -p test_changes.py
+          python3 -B -m unittest discover -s test/ci_system/npu -p 'test_*.py'
           python3 -B test/ci_system/npu/changes.py \
             --repo-root "$GITHUB_WORKSPACE" \
             --manifest test/ci/npu/manifest.json \
