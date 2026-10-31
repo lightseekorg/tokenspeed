@@ -3328,19 +3328,20 @@ TEST(CacheCoordinatorHostReplacement, SingleGroupBatchUsesChildrenWithoutParentC
     HostPut(coordinator, host_pool, "old-1", 0);
     HostPut(coordinator, host_pool, "old-2", 0);
     HostPut(coordinator, host_pool, "old-3", 0);
+    HostHit(coordinator, host_pool, Key("old-3", 0), std::numeric_limits<std::uint64_t>::max());
 
-    const std::array<std::uint32_t, 3> groups{0, 0, 0};
-    const std::array<std::int32_t, 3> buckets{0, 0, 0};
+    const std::array<std::uint32_t, 4> groups{0, 0, 0, 0};
+    const std::array<std::int32_t, 4> buckets{0, 0, 0, 0};
     CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
 
     ASSERT_EQ(batch.blocks.size(), groups.size());
     EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
-    EXPECT_EQ(batch.stats.requested, 3u);
-    EXPECT_EQ(batch.stats.allocated, 3u);
+    EXPECT_EQ(batch.stats.requested, 4u);
+    EXPECT_EQ(batch.stats.allocated, 4u);
     EXPECT_EQ(batch.stats.unallocated, 0u);
     EXPECT_EQ(batch.stats.group_scans, 1u);
     EXPECT_EQ(batch.stats.parent_candidates, 0u);
-    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 4u);
     EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 0u);
 }
 
