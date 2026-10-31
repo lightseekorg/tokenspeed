@@ -64,6 +64,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_fused_lamport_allreduce_routed_rmsnorm_sum,
+    iris_fused_lamport_column_routed_rmsnorm_sum,
     iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
     iris_fused_routed_rmsnorm_sum_lamport_allgather,
     iris_routed_rmsnorm_weighted_sum_write_through,
@@ -165,7 +166,53 @@ class MuseIrisState:
                 intermediate_gather_max_rows, world_size
             ):
                 size += allocation_bytes(shape, dtype)
+        column_rows = MuseIrisState._column_routes_max_rows(
+            max_numel,
+            world_size=world_size,
+            enable_lamport=enable_lamport,
+            owned_route_max_rows=owned_route_max_rows,
+        )
+        if column_rows:
+            size += allocation_bytes(
+                (MuseIrisState._column_routes_words(column_rows, world_size),),
+                torch.uint32,
+            )
         return size
+
+    @staticmethod
+    def _column_routes_max_rows(
+        max_numel: int,
+        *,
+        world_size: int,
+        enable_lamport: bool,
+        owned_route_max_rows: int,
+    ) -> int:
+        """Most tokens the column-owned expert TP8 route completion serves, or 0.
+
+        It replaces the Lamport two-shot all-reduce of the routes, so it
+        covers the same tokens.
+        """
+        two_shot = ProducerAllReduce._lamport_two_shot_capacity(
+            max_numel, world_size=world_size, enable_lamport=enable_lamport
+        )
+        if world_size != 8 or not owned_route_max_rows or not two_shot:
+            return 0
+        return min(two_shot // (_MUSE_TOPK * _MUSE_ROUTE_WIDTH), owned_route_max_rows)
+
+    @staticmethod
+    def _column_routes_words(max_rows: int, world_size: int) -> int:
+        """32-bit words of the column-owned route mailboxes.
+
+        Per stage (of three): peers' partial slices of this rank's columns
+        ``[world_size - 1][max_rows * 8 routes][slice]``, every rank's
+        completed slices ``[world_size][max_rows * 8][slice]``, and FP32 sums
+        of squares ``[max_rows][source][route][column owner]``.
+        """
+        route_words = _MUSE_ROUTE_WIDTH // 2
+        stage = max_rows * (
+            (2 * world_size - 1) * route_words + world_size * world_size * _MUSE_TOPK
+        )
+        return 3 * stage
 
     @staticmethod
     def _intermediate_gather_buffers(
@@ -317,6 +364,38 @@ class MuseIrisState:
             self.intermediate_gather_flags,
             self.column_norm_flags,
         ) = buffers
+        # Expert TP8 decode batches below the reduce-scatter window complete
+        # each route's 512-column slice on its owner rank (see
+        # reduce_column_routed_rmsnorm_sum).
+        self.column_routes_max_rows = self._column_routes_max_rows(
+            all_reduce.producer_direct_max_numel,
+            world_size=self.world_size,
+            enable_lamport=enable_lamport,
+            owned_route_max_rows=owned_route_max_rows,
+        )
+        self.column_routes_region = None
+        self.column_routes_epochs = None
+        self.column_routes_peer_addresses = None
+        if self.column_routes_max_rows:
+            # 0x80000000 (BF16 pair +0, -0; FP32 -0.0) marks an empty word.
+            self.column_routes_region = peers.ctx.empty(
+                (
+                    self._column_routes_words(
+                        self.column_routes_max_rows, self.world_size
+                    ),
+                ),
+                dtype=torch.int32,
+            )
+            self.column_routes_region.fill_(-(2**31))
+            self.column_routes_epochs = torch.zeros(
+                (self.column_routes_max_rows, self.world_size),
+                dtype=torch.int32,
+                device=peers.device,
+            )
+            offset = self.column_routes_region.data_ptr() - peers.addresses[peers.rank]
+            self.column_routes_peer_addresses = tuple(
+                base + offset for base in peers.addresses[: self.world_size]
+            )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy.
@@ -1491,6 +1570,69 @@ class MuseIrisState:
             num_warps=num_warps,
         )
         return self.gather.output[: num_tokens * width].view(num_tokens, width)
+
+    def can_reduce_column_routed_rmsnorm_sum(self, rows: int) -> bool:
+        """Whether expert TP8 completes ``rows`` tokens' routes column-owned.
+
+        Depends only on the row count and prepared capacity, so every rank
+        decides alike.
+        """
+        return 0 < rows <= self.column_routes_max_rows
+
+    def reduce_column_routed_rmsnorm_sum(
+        self,
+        routes: torch.Tensor,
+        route_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+    ) -> torch.Tensor:
+        """Sum expert TP8 partial routes, normalize, weight and sum them, in one launch.
+
+        ``routes`` holds this rank's partial routes, contiguous BF16
+        ``[rows * 8, 4096]`` in token and route order. Rank q completes
+        columns ``[512q, 512q + 512)`` of every route as the Lamport two-shot
+        all-reduce would and publishes them to every rank; every rank then
+        applies the routed RMSNorm (gain first; inverse RMS bitwise equal to
+        the portable kernel's) and the weighted route sum (within one BF16 ULP
+        of the portable kernel's). Returns independent BF16 ``[rows, 4096]``,
+        equal on every rank.
+        """
+        rows = route_weights.shape[0]
+        assert self.can_reduce_column_routed_rmsnorm_sum(rows)
+        assert routes.shape == (rows * _MUSE_TOPK, _MUSE_ROUTE_WIDTH)
+        assert routes.dtype == torch.bfloat16 and routes.is_contiguous()
+        assert route_weights.shape == (rows, _MUSE_TOPK)
+        assert route_weights.dtype == torch.float32 and route_weights.is_contiguous()
+        assert norm_weight.shape == (_MUSE_ROUTE_WIDTH,)
+        assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
+        assert all(
+            value.device == self.all_reduce.device
+            for value in (routes, route_weights, norm_weight)
+        )
+        output = torch.empty(
+            (rows, _MUSE_ROUTE_WIDTH), dtype=torch.bfloat16, device=routes.device
+        )
+        # Per token: a sender per (route, peer), a completer per route and a
+        # finisher per column owner.
+        programs = _MUSE_TOPK * (self.world_size - 1) + _MUSE_TOPK + self.world_size
+        iris_fused_lamport_column_routed_rmsnorm_sum[(rows * programs,)](
+            routes,
+            route_weights,
+            norm_weight,
+            output,
+            self.column_routes_region,
+            self.column_routes_epochs,
+            self.column_routes_peer_addresses,
+            rows,
+            RANK=self.all_reduce.rank_in_group,
+            MAX_ROWS=self.column_routes_max_rows,
+            EPS=eps,
+            WEIGHT_OFFSET=weight_offset,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            num_warps=1,
+        )
+        return output
 
     def can_reduce_scatter_routed_rmsnorm_sum_all_gather(self, rows: int) -> bool:
         """Whether expert TP8 completes ``rows`` tokens' routes on their owners.
