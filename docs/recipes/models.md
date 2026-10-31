@@ -763,6 +763,17 @@ and 4 and was validated with a 16,384-token KV pool. Increase
 together when scaling the deployment. `--disable-autotune` shortens bring-up.
 Remove it after validation when you want startup tuning.
 
+The default sampling backend on an NPU is `ascend_full` only where its operators
+are importable; that backend runs the `npu_sample` operators shipped by
+`flash-npu-kernel` (`flash_ops`), which this repository neither ships nor
+installs, and `test/ci_system/install_triton_ascend.sh` does not install them.
+On a source checkout without that package the default falls back to `greedy`,
+which is the backend the recipe below passes explicitly. Install
+`flash-npu-kernel` built with the `npu_sample` operators and a matching OPP to
+get `ascend_full`, or keep `greedy` and send `temperature=0`. A `serve` command
+that asks for `ascend_full` explicitly without those operators is refused while
+its arguments are validated, naming the package to install.
+
 The current Ascend sampling path is validated with greedy decoding.
 Because `--sampling-backend greedy` always performs argmax, send
 `temperature=0` and do not expect request-level `top_p` or `top_k` to take
