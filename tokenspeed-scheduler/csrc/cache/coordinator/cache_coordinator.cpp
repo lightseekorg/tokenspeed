@@ -1444,7 +1444,9 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             }
             PrefixCacheIndex::EvictionCursor cursor;
             std::vector<PrefixCacheIndex::EvictionCandidate> epoch;
-            while (remaining > 0 && groups_[group_id].Index().NextEvictionEpoch(*host_pool_, cursor, epoch)) {
+            // Any epoch may hold the replacement this allocation needs.
+            while (remaining > 0 && groups_[group_id].Index().NextEvictionEpoch(
+                                        *host_pool_, cursor, std::numeric_limits<std::uint64_t>::max(), epoch)) {
                 batch.stats.block_candidates += epoch.size();
                 for (auto& candidate : epoch) {
                     const std::int32_t bucket = allocator.BucketOf(candidate.location);
