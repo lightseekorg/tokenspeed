@@ -209,6 +209,7 @@ _MLIR_VALUE_FIELDS = (
     "input_token_buffer",
     "input_sf_buffer",
     "topk_idx",
+    "routing_id_scratch",
     "input_topk_weights_buffer",
     "expert_send_count",
     "expert_recv_count",
@@ -220,6 +221,7 @@ _MLIR_VALUE_FIELDS = (
     "fc1_ready_counter",
     "token_src_metadata",
     "combine_output",
+    "reduced_output",
     "combine_sf",
     "fc2_output_workspace",
     "fc2_output_sf",
@@ -256,6 +258,7 @@ class TokenCommArgs:
         input_token_buffer: cute.Tensor,
         input_sf_buffer: cute.Tensor,
         topk_idx: cute.Tensor,
+        routing_id_scratch: cute.Tensor,
         input_topk_weights_buffer: cute.Tensor,
         expert_send_count: cute.Tensor,
         expert_recv_count: cute.Tensor,
@@ -267,6 +270,7 @@ class TokenCommArgs:
         fc1_ready_counter: cute.Tensor,
         token_src_metadata: cute.Tensor,
         combine_output: cute.Tensor,
+        reduced_output: cute.Tensor,
         nvlink_barrier_signal: cute.Tensor,
         nvlink_barrier_counter: cute.Tensor,
         grid_sync_counter: cute.Tensor,
@@ -292,6 +296,7 @@ class TokenCommArgs:
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
         self.topk_idx = topk_idx
+        self.routing_id_scratch = routing_id_scratch
         self.input_topk_weights_buffer = input_topk_weights_buffer
         self.expert_send_count = expert_send_count
         self.expert_recv_count = expert_recv_count
@@ -303,6 +308,7 @@ class TokenCommArgs:
         self.fc1_ready_counter = fc1_ready_counter
         self.token_src_metadata = token_src_metadata
         self.combine_output = combine_output
+        self.reduced_output = reduced_output
         self.combine_sf = combine_sf
         self.fc2_output_workspace = fc2_output_workspace
         self.fc2_output_sf = fc2_output_sf
@@ -392,6 +398,7 @@ class TokenInPullTokenBackPush:
         cluster_shape_mn,
         dispatch_warp_start: int,
         num_other_warps: int,
+        dense_routing: bool,
         combine_format: "CombineFormat" = None,
         token_back_by_dispatch: bool = False,
         fc2_publishes_per_token_cluster_tile: int = 0,
@@ -406,6 +413,9 @@ class TokenInPullTokenBackPush:
         self.num_experts_per_rank = num_experts_per_rank
         self.num_total_experts = num_total_experts
         self.hidden = hidden
+        self.dense_routing = dense_routing
+        if not isinstance(dense_routing, bool):
+            raise ValueError("dense_routing must be bool")
         self.fc1_token_dtype = fc1_token_dtype
         self.hidden_bytes = hidden * int(fc1_token_dtype.width) // 8
         self.sf_uint32_per_token = sf_uint32_per_token
@@ -777,6 +787,204 @@ class TokenInPullTokenBackPush:
             num_sms=num_sms,
             prologue_grid_sync=False,
             epilogue_grid_sync=True,
+        )
+
+    @cute.jit
+    def dispatch_dense_routing(
+        self,
+        token_comm_args,
+        sm_idx,
+        warp_idx,
+        lane_idx,
+        *,
+        num_tokens,
+        num_sms,
+    ):
+        """Build the original routing tables from symmetric capacity-1/2/4 IDs."""
+        tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
+        if sm_idx == Int32(0):
+            self.nvlink_barrier(
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.nvlink_barrier_counter,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                sm_idx,
+                warp_idx,
+                lane_idx,
+                num_sms=num_sms,
+                prologue_grid_sync=False,
+                epilogue_grid_sync=False,
+            )
+            # The NVLink acquire belongs to warp0/lane0. All ID readers must
+            # receive it before they access a peer's new producer input.
+            cute.arch.barrier(
+                barrier_id=self.dispatch_intra_cta_bar_id,
+                number_of_threads=self.num_dispatch_threads,
+            )
+            table_entries: cutlass.Constexpr[int] = self.world_size * 2 * self.num_topk
+            # Peer tables are fetched with 8-byte loads whatever their element
+            # width: one Int64 id per load from generic callers, or two
+            # adjacent Int32 ids (the vendored Kimi-K3 router's layout) per
+            # load, which halves the remote loads. Each word is split into
+            # sign-extended Int64 ids for the scratch table.
+            idx_dtype = token_comm_args.topk_idx.element_type
+            idx_bytes: cutlass.Constexpr[int] = idx_dtype.width // 8
+            # A word never straddles two tokens: the kernel constructor only
+            # enables dense routing for num_topk == 16 (a raise is not allowed
+            # inside this staged dispatch body).
+            ids_per_word: cutlass.Constexpr[int] = 8 // idx_bytes
+            # Row stride of the (T, num_topk) id table in elements. The kernel
+            # entry requires a unit column stride; rows may be padded as long
+            # as each row start stays 8-byte aligned.
+            row_stride = Int32(token_comm_args.topk_idx.stride[0])
+            table_words: cutlass.Constexpr[int] = table_entries // ids_per_word
+            words_per_thread: cutlass.Constexpr[int] = (
+                table_words + self.num_dispatch_threads - 1
+            ) // self.num_dispatch_threads
+            words = cute.make_rmem_tensor((words_per_thread,), Int64)
+            # The scratch table holds two source tokens per group: one group
+            # for capacities 1 and 2, two for capacity 4. Each group loads
+            # every peer's ids for its two tokens into registers, then unpacks
+            # them into the scratch rows. A group whose tokens are absent is
+            # skipped; its stale rows are never read.
+            num_groups: cutlass.Constexpr[int] = (
+                token_comm_args.routing_id_scratch.shape[1] // 2
+            )
+            for group in cutlass.range_constexpr(num_groups):
+                if num_tokens > Int32(group * 2):
+                    for i in cutlass.range_constexpr(words_per_thread):
+                        words[i] = Int64(-1)
+                        word = tid_in_group + Int32(i * self.num_dispatch_threads)
+                        if word < Int32(table_words):
+                            entry = word * Int32(ids_per_word)
+                            src_rank = entry // Int32(2 * self.num_topk)
+                            src_token = (entry // Int32(self.num_topk)) % Int32(
+                                2
+                            ) + Int32(group * 2)
+                            src_topk = entry % Int32(self.num_topk)
+                            if src_token < num_tokens:
+                                # Peers share this rank's (T, num_topk) layout:
+                                # honor its row stride instead of assuming
+                                # packed rows.
+                                source_word = src_token * row_stride + src_topk
+                                peer_addr = token_comm_args.peer_rank_ptr_mapper.map(
+                                    token_comm_args.topk_idx.iterator.toint(),
+                                    src_rank,
+                                    Int64(source_word) * Int64(idx_bytes),
+                                )
+                                words[i] = cute.arch.load(
+                                    cute.make_ptr(
+                                        Int64,
+                                        peer_addr,
+                                        AddressSpace.gmem,
+                                        assumed_align=8,
+                                    ),
+                                    Int64,
+                                    sem="relaxed",
+                                    scope="sys",
+                                )
+                    for i in cutlass.range_constexpr(words_per_thread):
+                        word = tid_in_group + Int32(i * self.num_dispatch_threads)
+                        if word < Int32(table_words):
+                            entry = word * Int32(ids_per_word)
+                            src_rank = entry // Int32(2 * self.num_topk)
+                            src_token = (entry // Int32(self.num_topk)) % Int32(
+                                2
+                            ) + Int32(group * 2)
+                            src_topk = entry % Int32(self.num_topk)
+                            for k in cutlass.range_constexpr(ids_per_word):
+                                if cutlass.const_expr(ids_per_word == 1):
+                                    token_comm_args.routing_id_scratch[
+                                        src_rank, src_token, src_topk
+                                    ] = words[i]
+                                else:
+                                    # Little-endian: id k sits in bits
+                                    # [32k, 32k+32). Shift left then arithmetic
+                                    # right to sign-extend.
+                                    token_comm_args.routing_id_scratch[
+                                        src_rank, src_token, src_topk + Int32(k)
+                                    ] = (
+                                        words[i] << Int64(32 * (ids_per_word - 1 - k))
+                                    ) >> Int64(
+                                        32 * (ids_per_word - 1)
+                                    )
+
+        software_grid_sync(
+            token_comm_args.grid_sync_counter,
+            sm_idx,
+            num_sms,
+            tid_in_group,
+            num_threads=self.num_dispatch_threads,
+        )
+
+        job = sm_idx * Int32(self.num_dispatch_warps) + warp_idx
+        job_stride = Int32(num_sms * self.num_dispatch_warps)
+        while job < Int32(self.num_experts_per_rank * self.world_size):
+            local_expert = job // Int32(self.world_size)
+            src_rank = job % Int32(self.world_size)
+            global_expert = (
+                Int32(token_comm_args.local_rank) * Int32(self.num_experts_per_rank)
+                + local_expert
+            )
+            matches = cutlass.Boolean(False)
+            if lane_idx < num_tokens * Int32(self.num_topk):
+                source_id = token_comm_args.routing_id_scratch[
+                    src_rank,
+                    lane_idx // Int32(self.num_topk),
+                    lane_idx % Int32(self.num_topk),
+                ]
+                matches = source_id == Int64(global_expert)
+            mask = Int32(cute.arch.vote_ballot_sync(matches))
+            count = Int32(cute.arch.popc(mask))
+            if matches:
+                lower_lanes = (Uint32(1) << Uint32(lane_idx)) - Uint32(1)
+                slot = Int32(cute.arch.popc(Int32(Uint32(mask) & lower_lanes)))
+                token_comm_args.src_token_topk_idx[local_expert, src_rank, slot] = (
+                    lane_idx
+                )
+            # Capacity 4 needs one more full-warp ballot. All lanes take this
+            # uniform branch; the first ballot and its metadata stay unchanged.
+            if cutlass.const_expr(token_comm_args.routing_id_scratch.shape[1] > 2):
+                if num_tokens > Int32(2):
+                    word = lane_idx + Int32(32)
+                    matches = cutlass.Boolean(False)
+                    if word < num_tokens * Int32(self.num_topk):
+                        source_id = token_comm_args.routing_id_scratch[
+                            src_rank,
+                            word // Int32(self.num_topk),
+                            word % Int32(self.num_topk),
+                        ]
+                        matches = source_id == Int64(global_expert)
+                    mask = Int32(cute.arch.vote_ballot_sync(matches))
+                    if matches:
+                        lower_lanes = (Uint32(1) << Uint32(lane_idx)) - Uint32(1)
+                        slot = count + Int32(
+                            cute.arch.popc(Int32(Uint32(mask) & lower_lanes))
+                        )
+                        token_comm_args.src_token_topk_idx[
+                            local_expert, src_rank, slot
+                        ] = word
+                    count += Int32(cute.arch.popc(mask))
+            if lane_idx == Int32(0):
+                token_comm_args.expert_recv_count[src_rank, local_expert] = Int64(count)
+                # Keep the original packed high word, including zero-count jobs.
+                delta = (Int64(num_sms) << Int64(32)) | Int64(count)
+                cute.arch.atomic_add(
+                    token_comm_args.expert_recv_count_sum.iterator + local_expert,
+                    delta,
+                    sem="relaxed",
+                    scope="gpu",
+                )
+            job += job_stride
+
+        # This barrier publishes every lane's metadata and the complete counts.
+        # The original scheduler handshake follows it in dispatch_warp_body.
+        software_grid_sync(
+            token_comm_args.grid_sync_counter,
+            sm_idx,
+            num_sms,
+            tid_in_group,
+            num_threads=self.num_dispatch_threads,
         )
 
     @cute.jit
@@ -1539,38 +1747,48 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_push("Dispatch_Prep")
 
-        self.dispatch_prep(
-            token_comm_storage,
-            token_comm_args.topk_idx,
-            token_comm_args.expert_send_count,
-            token_comm_args.src_token_topk_idx,
-            token_comm_args.peer_rank_ptr_mapper,
-            cta_linear_id,
-            local_warp_idx,
-            lane_idx,
-            local_rank=token_comm_args.local_rank,
-            num_tokens=token_comm_args.input_token_buffer.shape[0],
-            num_sms=token_comm_args.sm_count,
-        )
+        if cutlass.const_expr(self.dense_routing):
+            self.dispatch_dense_routing(
+                token_comm_args,
+                cta_linear_id,
+                local_warp_idx,
+                lane_idx,
+                num_tokens=token_comm_args.input_token_buffer.shape[0],
+                num_sms=token_comm_args.sm_count,
+            )
+        else:
+            self.dispatch_prep(
+                token_comm_storage,
+                token_comm_args.topk_idx,
+                token_comm_args.expert_send_count,
+                token_comm_args.src_token_topk_idx,
+                token_comm_args.peer_rank_ptr_mapper,
+                cta_linear_id,
+                local_warp_idx,
+                lane_idx,
+                local_rank=token_comm_args.local_rank,
+                num_tokens=token_comm_args.input_token_buffer.shape[0],
+                num_sms=token_comm_args.sm_count,
+            )
 
-        if iket_active:
-            _iket.range_pop()
-            _iket.range_push("Dispatch_Barrier")
+            if iket_active:
+                _iket.range_pop()
+                _iket.range_push("Dispatch_Barrier")
 
-        self.dispatch_barrier(
-            token_comm_args.expert_send_count,
-            token_comm_args.expert_recv_count,
-            token_comm_args.expert_recv_count_sum,
-            token_comm_args.nvlink_barrier_signal,
-            token_comm_args.grid_sync_counter,
-            token_comm_args.peer_rank_ptr_mapper,
-            cta_linear_id,
-            local_warp_idx,
-            lane_idx,
-            local_rank=token_comm_args.local_rank,
-            num_sms=token_comm_args.sm_count,
-            nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
-        )
+            self.dispatch_barrier(
+                token_comm_args.expert_send_count,
+                token_comm_args.expert_recv_count,
+                token_comm_args.expert_recv_count_sum,
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                cta_linear_id,
+                local_warp_idx,
+                lane_idx,
+                local_rank=token_comm_args.local_rank,
+                num_sms=token_comm_args.sm_count,
+                nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
+            )
 
         nb_dispatch_to_sched = pipeline.NamedBarrier(
             barrier_id=self.dispatch_to_sched_named_barrier_id,
@@ -1718,6 +1936,7 @@ class TokenInPullTokenBackPush:
         cta_linear_id,
         local_warp_idx,
         lane_idx,
+        preserve_grid_sync_counter: cutlass.Constexpr[bool],
     ):
         """Per-lane 4B (Int32) bulk-zero of one accumulating-counter prefix.
 
@@ -1725,15 +1944,15 @@ class TokenInPullTokenBackPush:
         region (megamoe_kernel front-places every counter that must restart at 0
         each launch; data buffers and the phase-flip ``nvlink_barrier_signal`` sit
         after the prefix and are untouched). The zeroing is spread across all
-        dispatch threads grid-wide. kernel_tail calls this twice:
-          * SHARED prefix (expert_recv_count / _sum) BETWEEN the two nvlink
-            barriers, so the final barrier publishes the zeros cross-rank -- needed
-            when the next launch is another MegaMoE reusing the shared workspace
-            with no intervening rank sync;
-          * LOCAL prefix (l1_arrival / expert_send / grid_sync / nvlink_barrier /
-            fc1_done [+ fc2_done / token_back_schedule / load_balance]) AFTER the
-            last barrier -- rank-local (next kernel sees it via stream order) and
-            grid_sync/nvlink barrier counters stay live until that last barrier.
+        dispatch threads grid-wide. kernel_tail uses this for the LOCAL prefix
+        (l1_arrival / expert_send / fc1_done, plus optional fc2_done /
+        token_back_schedule / load_balance) after the final NVLink barrier.
+        It clears the shared counter prefix separately on CTA 0 before that
+        barrier, after every local reader has finished.
+        The grid-sync slot keeps its phase across launches. Clearing it after
+        an odd number of grid barriers could erase the phase change before a
+        slower CTA observes it. Its low arrival count resets in the barrier
+        itself, so it does not need an explicit zero after the first launch.
         Only the FIRST launch relies on a caller-zeroed workspace.
         """
         thread_linear = (
@@ -1742,9 +1961,22 @@ class TokenInPullTokenBackPush:
         stride = Int32(token_comm_args.sm_count * self.num_dispatch_threads)
 
         count = cute.size(target_zero_tensor)
+        protected_index = Int32(-1)
+        if cutlass.const_expr(preserve_grid_sync_counter):
+            protected_index = Int32(
+                (
+                    token_comm_args.grid_sync_counter.iterator.toint()
+                    - target_zero_tensor.iterator.toint()
+                )
+                // Int64(4)
+            )
         i = thread_linear
         while i < Int32(count):
-            target_zero_tensor[i] = Int32(0)
+            if cutlass.const_expr(preserve_grid_sync_counter):
+                if i != protected_index:
+                    target_zero_tensor[i] = Int32(0)
+            else:
+                target_zero_tensor[i] = Int32(0)
             i = i + stride
 
     @cute.jit
@@ -1775,11 +2007,39 @@ class TokenInPullTokenBackPush:
                 * Int32(bidz)
             )
             local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
-            # Per-launch nvlink barrier count is 3: 1 (dispatch_barrier) + 2
-            # below (drain + publish, around the shared reset). The
-            # sense-reversing signal rides the phase counter across launch
-            # boundaries, so the count does not need to self-cancel within a
-            # single launch.
+            # The shared prefix contains only expert_recv_count and its sum.
+            # All peer writes to them finish at dispatch_barrier, before any
+            # scheduler or pull reader runs. Wait for every local CTA to finish
+            # those reads, then clear the prefix. Combine data and barrier
+            # signals are outside this prefix and remain live.
+            software_grid_sync(
+                token_comm_args.grid_sync_counter,
+                cta_linear_id,
+                token_comm_args.sm_count,
+                local_warp_idx * Int32(self.warp_threads) + lane_idx,
+                num_threads=self.num_dispatch_threads,
+            )
+            if cta_linear_id == Int32(0):
+                # The first grid barrier transfers every CTA's completed combine
+                # writes to CTA 0. Only CTA 0 now clears the shared counters, so
+                # another grid barrier is not needed to collect these zero stores.
+                zero_idx = local_warp_idx * Int32(self.warp_threads) + lane_idx
+                zero_count = Int32(cute.size(token_comm_args.shared_zero_prefix))
+                while zero_idx < zero_count:
+                    token_comm_args.shared_zero_prefix[zero_idx] = Int32(0)
+                    zero_idx += Int32(self.num_dispatch_threads)
+                # Make the other dispatch warps' zero stores happen before warp
+                # 0 sends its system-scope release signals. Those signals publish
+                # both the combine writes and counter zeros to every peer rank.
+                cute.arch.barrier(
+                    barrier_id=self.dispatch_intra_cta_bar_id,
+                    number_of_threads=self.num_dispatch_threads,
+                )
+            # CTA 0 has acquired all combine writes and finished all shared
+            # counter zeros. The release/acquire NVLink barrier publishes both
+            # before a later invocation can write new counts. Its epilogue grid
+            # barrier holds the other CTAs until CTA 0 has acquired every peer's
+            # signal. The signal and grid phases persist across launches.
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -1789,28 +2049,7 @@ class TokenInPullTokenBackPush:
                 local_warp_idx,
                 lane_idx,
                 num_sms=token_comm_args.sm_count,
-                prologue_grid_sync=True,
-                epilogue_grid_sync=True,
-            )
-            # Shared counters between the barriers: the slot=0 barrier below
-            # publishes these zeros cross-rank for a back-to-back MegaMoE relaunch.
-            self.tail_reset_counters(
-                token_comm_args,
-                token_comm_args.shared_zero_prefix,
-                cta_linear_id=cta_linear_id,
-                local_warp_idx=local_warp_idx,
-                lane_idx=lane_idx,
-            )
-            self.nvlink_barrier(
-                token_comm_args.nvlink_barrier_signal,
-                token_comm_args.nvlink_barrier_counter,
-                token_comm_args.grid_sync_counter,
-                token_comm_args.peer_rank_ptr_mapper,
-                cta_linear_id,
-                local_warp_idx,
-                lane_idx,
-                num_sms=token_comm_args.sm_count,
-                prologue_grid_sync=True,
+                prologue_grid_sync=False,
                 epilogue_grid_sync=True,
             )
             # Local counters last: rank-local, and grid_sync/nvlink_barrier
@@ -1821,4 +2060,5 @@ class TokenInPullTokenBackPush:
                 cta_linear_id=cta_linear_id,
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
+                preserve_grid_sync_counter=True,
             )
