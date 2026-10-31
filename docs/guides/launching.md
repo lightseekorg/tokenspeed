@@ -12,6 +12,10 @@ tokenspeed serve openai/gpt-oss-20b \
   --tensor-parallel-size 1
 ```
 
+For an IPv6 listener, pass the address directly, for example `--host ::1`.
+Startup probes and printed HTTP URLs bracket IPv6 literals (`http://[::1]:8000`).
+The same URL formatting applies to `--metrics-host` when metrics are enabled.
+
 ## Production launch skeleton
 
 Use explicit parameters in scripts so a deployment is reproducible.
