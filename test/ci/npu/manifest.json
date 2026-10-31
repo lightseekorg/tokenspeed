@@ -35,6 +35,30 @@
       "accuracy_cases": 48,
       "performance_configs": 8,
       "script": "test/ci/npu/tests/virtual_slots_to_local-test.py"
+    },
+    {
+      "name": "rmsnorm",
+      "accuracy_cases": 10,
+      "performance_configs": 6,
+      "script": "test/ci/npu/tests/rmsnorm-test.py"
+    },
+    {
+      "name": "silu_and_mul",
+      "accuracy_cases": 10,
+      "performance_configs": 6,
+      "script": "test/ci/npu/tests/silu_and_mul-test.py"
+    },
+    {
+      "name": "rotary_embedding",
+      "accuracy_cases": 10,
+      "performance_configs": 6,
+      "script": "test/ci/npu/tests/rotary_embedding-test.py"
+    },
+    {
+      "name": "mha",
+      "accuracy_cases": 12,
+      "performance_configs": 6,
+      "script": "test/ci/npu/tests/mha-test.py"
     }
   ]
 }

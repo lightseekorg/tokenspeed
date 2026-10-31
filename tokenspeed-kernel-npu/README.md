@@ -108,6 +108,10 @@ PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kern
     pytest -q tokenspeed-kernel-npu/test
 ```
 
+The ARM NPU CI runner executes a separate accuracy and latency suite under `test/ci/npu/`.
+Besides the index-space kernels, it covers `rmsnorm`, `silu_and_mul`, `rotary_embedding`, and the three paged `mha` entry points, each compared against a CPU reference.
+See [NPU operator CI](../docs/npu-operator-ci.md) for the operator table and how to register a new operator.
+
 For the complete Qwen3-0.6B launch command, ACL Graph capture sizes, serving
 limits, and a request example, see the
 [Ascend model recipe](../docs/recipes/models.md#qwen3-06b-on-ascend-npu).
