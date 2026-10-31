@@ -701,11 +701,13 @@ fn main() -> ExitCode {
         }
         served
     });
-    match served {
+    let status = match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("{error}");
             ExitCode::FAILURE
         }
-    }
+    };
+    interpreter::hold_gil_for_process_exit();
+    status
 }

@@ -34,6 +34,13 @@ every rank stops after the same round; a frontend that is gone (its input
 socket closed, which does not reconnect) stops the engine the same way. One
 rank is the same path with groups of one.
 
+After the forward thread has joined and the Python close callback has run,
+the host's main thread acquires the GIL for the rest of process exit. Native
+extension statics may own Python types and release those references in C++
+static destructors. Returning from the embedded host with the GIL released
+can abort during those destructors even after every request completed. This
+terminal acquisition keeps the interpreter alive and does not finalize it.
+
 The launcher (`entrypoints/engine.py`) starts the ranks through
 `start_rust_host`, whatever the deployment: `ts serve` (SMG's gateway on its
 direct ZMQ lane, which binds the frontend sockets) and `ts serve --headless`
