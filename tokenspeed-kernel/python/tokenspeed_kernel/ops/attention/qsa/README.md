@@ -5,6 +5,44 @@ full-cache slots, and attends to those slots. The block selector takes an
 explicit `auto`, `stream`, or `logits` path. Backend selection and overrides
 preserve the requested path.
 
+## Streaming block selection
+
+The Blackwell CuTe implementation lives under
+`thirdparty/cute_dsl/_qsa_stream_topk/`. It computes BF16 dot products with
+FP32 accumulation, clamps each head score at zero, and selects up to 512
+logical compressed-block IDs. Full candidate scores and logical IDs retain
+FP32 and 32-bit precision. `score.py` shares the positive clamps and paired
+head sums between warp-MMA decode and TMEM prefill; each independent score
+keeps its original left-to-right FP32 addition order.
+
+Long prefill shares K tiles across eight request-owned queries per CTA.
+TMA key copies, MMA accumulators and compacted score queues each have two
+stages. Every row keeps two 1120-entry FP32 score buffers. Integer coarse
+and fine histograms can retain a bounded 528-candidate set, including the
+complete boundary bucket; exact FP32 refinement runs on overflow and final
+output. The retained minimum is a conservative producer cutoff. A stale
+cutoff may retain extra scores but cannot remove a required winner.
+
+Shared storage is allocated once outside request-group branches. Full
+single-owner groups bypass the ownership loop; mixed-owner groups and tails
+process consecutive phases with a reader barrier before storage reuse. The
+score queue's acquire/release protocol protects each stage. Dead coarse
+histograms hold boundary candidates and carry overflow; exact histograms
+reuse a score stage only after its scores have been consumed. Running
+compaction scratch remains separate from live K and score storage.
+
+Small grids use the same warp-MMA score computation with optional bounded
+proposals. Every omitted score contributes to an exact upper bound. Merge
+accepts proposals only when that bound proves a complete top-k; otherwise it
+reads the original FP32 scores. Large ties and clipped histogram boundaries
+also retain exact refinement. Scratch is bounded by the caller's existing
+budget, with the grouped kernel handling zero-budget calls.
+
+Owners, frontiers, row counts and tensor strides remain runtime inputs.
+Only static geometry, explicit algorithm parameters and bucketed capacity
+specialize compilation. Graph replay refreshes the same input buffers as
+eager execution; no backend-private request state is introduced.
+
 ## TMA gather sparse attention
 
 `thirdparty/cute_dsl/qsa_tma_gather.py` provides `TmaGatherSparseAttention`, an explicit,

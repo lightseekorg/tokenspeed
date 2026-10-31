@@ -28,24 +28,13 @@ from typing import Literal
 import torch
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.prefill import PrefillTopK
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.prefill_dense import (
-    DensePrefillTopK,
-)
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.prefill_overlap import (
-    OverlapPrefillTopK,
-)
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.prefill_split import (
-    SplitPrefillTopK,
-)
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.selector import (
-    Merge32,
-    PackedMerge,
-)
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.small import (
-    GuardMerge,
-    GuardScore,
-    WarpScore,
+from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk import (
+    prefill,
+    prefill_dense,
+    prefill_overlap,
+    prefill_split,
+    selector,
+    small,
 )
 
 _QUERY_GROUP = 8
@@ -80,7 +69,10 @@ def _workspace_bytes(rows: int, config: StreamConfig) -> int:
 
 
 def _configuration(
-    rows: int, capacity: int, queries_per_request: int | None, max_partial_bytes: int
+    rows: int,
+    capacity: int,
+    queries_per_request: int | None,
+    max_partial_bytes: int,
 ) -> StreamConfig | None:
     # Request widths only establish ownership. Geometry and power-of-two
     # capacity buckets specialize the JIT; live lengths and row counts do not.
@@ -99,7 +91,15 @@ def _configuration(
     if rows <= 128:
         if grouped and capacity > 8192:
             splits = 1 << (((capacity + 4095) // 4096) - 1).bit_length()
-            config = StreamConfig("split", splits, 0, False, False, 64, group_layout)
+            config = StreamConfig(
+                "split",
+                splits,
+                0,
+                False,
+                False,
+                64,
+                group_layout,
+            )
         else:
             splits = 1 << (((capacity + 63) // 64) - 1).bit_length()
             keep = 0
@@ -108,14 +108,14 @@ def _configuration(
             partition_width = 64
             if capacity == 4096 and 2 <= rows <= 8:
                 linear_bins = True
-            elif capacity == 8192 and rows <= 8:
+            elif capacity == 8192:
                 keep = 16
                 if rows == 1:
                     linear_bins = True
                     partition_width = 32
-            elif capacity > 8192 and rows <= 8:
+            elif capacity > 8192:
                 keep = 8
-                compact_ids = True
+                compact_ids = rows <= 8
             config = StreamConfig(
                 "small",
                 splits,
@@ -158,7 +158,7 @@ def _compile(
     options = "--enable-tvm-ffi --opt-level 3"
     if config.algorithm == "small":
         if config.keep:
-            score_op = GuardScore(
+            score_op = small.GuardScore(
                 config.splits,
                 64,
                 enable_pdl,
@@ -166,7 +166,7 @@ def _compile(
                 config.compact_ids,
                 config.partition_width,
             )
-            merge_op = GuardMerge(
+            merge_op = small.GuardMerge(
                 config.splits,
                 64,
                 enable_pdl,
@@ -176,8 +176,13 @@ def _compile(
                 config.partition_width,
             )
         else:
-            score_op = WarpScore(config.splits, 64, enable_pdl)
-            merge_op = Merge32(config.splits, 64, enable_pdl, config.linear_bins)
+            score_op = small.WarpScore(config.splits, 64, enable_pdl)
+            merge_op = selector.Merge32(
+                config.splits,
+                64,
+                enable_pdl,
+                config.linear_bins,
+            )
         score = cute.compile(
             score_op,
             _meta(query, 2),
@@ -202,15 +207,24 @@ def _compile(
         )
         return score, merge
     if config.algorithm == "split":
-        op = SplitPrefillTopK(enable_pdl, config.splits, config.group_layout)
+        op = prefill_split.SplitPrefillTopK(
+            enable_pdl, config.splits, config.group_layout
+        )
         target = scratch[0]
     else:
         if config.algorithm == "prefill":
-            op = PrefillTopK(enable_pdl, config.group_layout)
+            op = prefill.PrefillTopK(enable_pdl, config.group_layout)
         elif config.algorithm == "dense":
-            op = DensePrefillTopK(enable_pdl, 1, config.group_layout)
+            op = prefill_dense.DensePrefillTopK(
+                enable_pdl,
+                1,
+                config.group_layout,
+            )
         else:
-            op = OverlapPrefillTopK(enable_pdl, config.group_layout)
+            op = prefill_overlap.OverlapPrefillTopK(
+                enable_pdl,
+                config.group_layout,
+            )
         target = selected
     score = cute.compile(
         op,
@@ -229,7 +243,7 @@ def _compile(
     )
     if config.algorithm == "split":
         merge = cute.compile(
-            PackedMerge(config.splits, _TOPK, enable_pdl),
+            selector.PackedMerge(config.splits, _TOPK, enable_pdl),
             _meta(target, 1),
             _meta(complete_blocks, 0),
             _meta(selected, 1),
@@ -271,6 +285,9 @@ def warmup(
     capacity = 64
     while capacity <= max_capacity:
         capacities.add(capacity)
+        if capacity > 64:
+            # Exact-capacity tactics can differ from the bucket interior.
+            capacities.add(capacity - 64)
         capacity *= 2
     configurations = {}
     # Cover _configuration's row policies: singleton, both ends of 2..8,
@@ -280,11 +297,20 @@ def warmup(
     for capacity in sorted(capacities):
         for rows in (1, 2, 8, 9, 128, 135, 136):
             for width in (None, rows):
-                config = _configuration(rows, capacity, width, max_partial_bytes)
+                config = _configuration(
+                    rows,
+                    capacity,
+                    width,
+                    max_partial_bytes,
+                )
                 if config is not None:
                     configurations.setdefault(config, (rows, capacity, width))
     sample = query.new_zeros((136, _HEADS, _HEAD_DIM))
-    table = torch.zeros((1, max_capacity // 64), dtype=torch.int32, device=query.device)
+    table = torch.zeros(
+        (1, max_capacity // 64),
+        dtype=torch.int32,
+        device=query.device,
+    )
     requests = request_indices.new_zeros(136)
     complete = requests.new_zeros(136, dtype=torch.int32)
     for rows, capacity, width in configurations.values():
@@ -342,21 +368,28 @@ def kernel(
     """
 
     if query.ndim != 3 or key_cache.ndim != 3:
-        raise ValueError("CuTe QSA stream kernel expects rank-three Q/K tensors")
+        raise ValueError(
+            "CuTe QSA stream kernel expects rank-three Q/K tensors",
+        )
     if page_table.ndim != 2:
         raise ValueError("CuTe QSA stream kernel expects a rank-two page table")
     rows = query.shape[0]
     if request_indices.shape != (rows,) or complete_blocks.shape != (rows,):
         raise ValueError("CuTe QSA stream metadata must have one entry per row")
     tensors = (query, key_cache, page_table, request_indices, complete_blocks)
-    if not query.is_cuda or any(tensor.device != query.device for tensor in tensors):
+    same_device = all(tensor.device == query.device for tensor in tensors)
+    if not query.is_cuda or not same_device:
         raise ValueError("CuTe QSA stream tensors must share one CUDA device")
     if block_topk != _TOPK or page_size != 64:
-        raise ValueError("CuTe QSA stream kernel requires page_size=64 and topk=512")
+        raise ValueError(
+            "CuTe QSA stream kernel requires page_size=64 and topk=512",
+        )
     if queries_per_request is not None and (
         queries_per_request < 1 or rows % queries_per_request
     ):
-        raise ValueError("QSA queries_per_request must be positive and divide rows")
+        raise ValueError(
+            "QSA queries_per_request must be positive and divide rows",
+        )
     if query.shape[1:] != (_HEADS, _HEAD_DIM):
         raise ValueError("CuTe QSA stream kernel requires H=4 and D=128")
     if (
@@ -364,56 +397,91 @@ def kernel(
         or key_cache.shape[0] % 64
         or key_cache.shape[1:] != (1, _HEAD_DIM)
     ):
-        raise ValueError("CuTe QSA stream kernel requires K shape [slots, 1, 128]")
-    if key_cache.dtype is not torch.bfloat16 or query.dtype is not torch.bfloat16:
+        raise ValueError(
+            "CuTe QSA stream kernel requires K shape [slots, 1, 128]",
+        )
+    bf16_inputs = key_cache.dtype is torch.bfloat16
+    bf16_inputs = bf16_inputs and query.dtype is torch.bfloat16
+    if not bf16_inputs:
         raise TypeError("CuTe QSA stream kernel requires BF16 Q/K")
     if page_table.dtype is not torch.int32:
         raise TypeError("CuTe QSA stream kernel requires an int32 page table")
     if request_indices.dtype not in (torch.int32, torch.int64):
-        raise TypeError("CuTe QSA stream kernel requires int32 or int64 request ids")
+        raise TypeError(
+            "CuTe QSA stream kernel requires int32 or int64 request ids",
+        )
     if complete_blocks.dtype is not torch.int32:
-        raise TypeError("CuTe QSA stream kernel requires int32 complete-block counts")
+        raise TypeError(
+            "CuTe QSA stream kernel requires int32 complete-block counts",
+        )
     if query.stride(2) != 1 or query.stride(0) % 8 or query.stride(1) % 8:
-        raise ValueError("CuTe QSA stream query vectors must be 16-byte aligned")
+        raise ValueError(
+            "CuTe QSA stream query vectors must be 16-byte aligned",
+        )
     if query.data_ptr() % 16:
-        raise ValueError("CuTe QSA stream query storage must be 16-byte aligned")
+        raise ValueError(
+            "CuTe QSA stream query storage must be 16-byte aligned",
+        )
     if not key_cache.is_contiguous() or key_cache.data_ptr() % 16:
-        raise ValueError("CuTe QSA stream key cache must be contiguous and aligned")
+        raise ValueError(
+            "CuTe QSA stream key cache must be contiguous and aligned",
+        )
     if (
         page_table.stride(1) != 1
         or page_table.stride(0) < page_table.shape[1]
         or page_table.data_ptr() % 16
     ):
-        raise ValueError("CuTe QSA page-table columns must be contiguous and aligned")
+        raise ValueError(
+            "CuTe QSA page-table columns must be contiguous and aligned",
+        )
     if not all(
         tensor.is_contiguous() and tensor.data_ptr() % 16 == 0
         for tensor in (request_indices, complete_blocks)
     ):
-        raise ValueError("CuTe QSA stream metadata must be contiguous and aligned")
-    selected = torch.empty((rows, _TOPK), dtype=torch.int32, device=query.device)
+        raise ValueError(
+            "CuTe QSA stream metadata must be contiguous and aligned",
+        )
+    selected = torch.empty(
+        (rows, _TOPK),
+        dtype=torch.int32,
+        device=query.device,
+    )
     if rows == 0:
         return selected
     capacity = page_table.shape[1] * page_size
-    config = _configuration(rows, capacity, queries_per_request, max_partial_bytes)
+    config = _configuration(
+        rows,
+        capacity,
+        queries_per_request,
+        max_partial_bytes,
+    )
     if config is None:
-        raise ValueError("Unsupported CuTe QSA layout or insufficient workspace budget")
+        raise ValueError(
+            "Unsupported CuTe QSA layout or insufficient workspace budget",
+        )
     scratch = []
     if config.algorithm == "split":
         scratch.append(
             torch.empty(
-                (rows, config.splits * _TOPK), dtype=torch.int64, device=query.device
+                (rows, config.splits * _TOPK),
+                dtype=torch.int64,
+                device=query.device,
             )
         )
     elif config.algorithm == "small":
         scratch.append(
             torch.empty(
-                (rows, config.splits * 64), dtype=torch.uint32, device=query.device
+                (rows, config.splits * 64),
+                dtype=torch.uint32,
+                device=query.device,
             )
         )
         if config.keep:
             dtype = torch.uint32 if config.compact_ids else torch.int64
             candidates = torch.empty(
-                (rows, config.splits * config.keep), dtype=dtype, device=query.device
+                (rows, config.splits * config.keep),
+                dtype=dtype,
+                device=query.device,
             )
             # Packed candidates already carry ids; their unused id argument
             # aliases the same tensor and does not require another allocation.
@@ -445,6 +513,8 @@ def kernel(
         )
         _COMPILED[key] = compiled
     target = [selected] if not scratch else scratch
+    group_width = int(queries_per_request or 0)
+    group_args = [] if config.algorithm == "small" else [group_width]
     compiled[0](
         query,
         key_cache,
@@ -454,7 +524,7 @@ def kernel(
         *target,
         int(query.stride(0)),
         int(query.stride(1)),
-        *([] if config.algorithm == "small" else [int(queries_per_request or 0)]),
+        *group_args,
     )
     if len(compiled) > 1:
         compiled[1](*scratch, complete_blocks, selected, int(capacity))
