@@ -34,6 +34,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import (
     make_kernel_repr,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.reduce_project_value import (
+    gluon_mla_query_block_reduce_project_value_gfx1250,
     gluon_mla_reduce_project_value_gfx1250,
 )
 
@@ -1100,9 +1101,17 @@ def _launch_query_block_decode(
     num_warps: int,
     num_buffers: int,
     waves_per_eu: int,
+    value_weight: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+    counters: torch.Tensor | None = None,
 ) -> None:
+    """Run the query-block decode and merge its splits into ``out``.
+
+    With ``value_weight``, ``out`` is the projected ``[tokens, heads * value]``
+    output and the merge also applies the projection and optional gate.
+    """
     batch_size, queries, num_query_heads, _ = q.shape
-    kv_lora_rank = out.shape[-1]
+    kv_lora_rank = out.shape[-1] if value_weight is None else value_weight.shape[1]
     qk_rope_head_dim = q.shape[-1] - kv_lora_rank
     page_size = kv_cache.shape[1]
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -1110,8 +1119,6 @@ def _launch_query_block_decode(
     total_num_q_blocks = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
     num_tokens = batch_size * queries
     q_flat = q.reshape(num_tokens, num_query_heads, q.shape[-1])
-    out_flat = out.view(num_tokens, num_query_heads, kv_lora_rank)
-    lse_flat = lse.view(num_tokens, num_query_heads) if lse is not None else None
 
     # FP32 partials written and merged at 32 or more splits move a fifth of
     # the KV bytes or more. These are unnormalized latent sums, so BF16 keeps
@@ -1166,9 +1173,23 @@ def _launch_query_block_decode(
         waves_per_eu=waves_per_eu,
         num_stages=2,
     )
+    if value_weight is not None:
+        gluon_mla_query_block_reduce_project_value_gfx1250(
+            split_output,
+            split_max,
+            split_expsum,
+            cache_seqlens,
+            value_weight,
+            queries_per_seq=queries,
+            counters=counters,
+            gate=gate,
+            page_size=page_size,
+            out=out,
+        )
+        return
     _launch_split_reduce(
-        out_flat,
-        lse_flat,
+        out.view(num_tokens, num_query_heads, kv_lora_rank),
+        lse.view(num_tokens, num_query_heads) if lse is not None else None,
         split_output,
         split_max,
         split_expsum,
@@ -1179,49 +1200,15 @@ def _launch_query_block_decode(
     )
 
 
-def launch_gluon_mla_decode_query_blocks_gfx1250(
+def _check_query_block_inputs(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    max_seqlen_k: int,
-    qk_nope_head_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    softmax_scale: float,
-    *,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Decode causal query blocks with one page-table row per request.
-
-    Each KV tile is read once for all of a request's queries rather than once
-    per query, which is what a speculative verify step needs.
-
-    Args:
-        q: Queries shaped ``[requests, queries, heads, 576]`` with 2 to 16
-            queries per request, in FP16, BF16 or FP8 matching ``kv_cache``.
-        kv_cache: Contiguous paged cache shaped ``[pages, 64, 1, 576]``.
-        page_table: Int32 physical page indices shaped ``[requests, pages]``.
-        cache_seqlens: Int32 final KV lengths shaped ``[requests]``, at least
-            ``queries`` each. Query ``j`` sees ``cache_seqlens[i] - queries +
-            j + 1`` tokens.
-        max_seqlen_k: KV-length upper bound used to choose the split count.
-        qk_nope_head_dim: Original non-RoPE query width; unused because ``q``
-            is already in the latent space.
-        kv_lora_rank: Latent width; must be 512.
-        qk_rope_head_dim: Positional width; must be 64.
-        softmax_scale: Scale applied to QK logits before softmax.
-        logit_cap: Soft cap on attention logits; only ``0.0`` is supported.
-        return_lse: Whether to also return natural-log log-sum-exp values.
-        out: Optional contiguous BF16 destination shaped
-            ``[requests, queries, heads, 512]``.
-
-    Returns:
-        BF16 latent output shaped ``[requests, queries, heads, 512]``, or
-        ``(output, lse)`` with FP32 LSE shaped ``[requests, queries, heads]``.
-    """
+    logit_cap: float,
+) -> None:
     if logit_cap != 0.0:
         raise NotImplementedError("gluon MLA decode gfx1250 does not support logit_cap")
     if q.ndim != 4 or not 2 <= q.shape[1] <= 16 or q.shape[2] < 1:
@@ -1279,25 +1266,22 @@ def launch_gluon_mla_decode_query_blocks_gfx1250(
             f"got {cache_seqlens.dtype} {tuple(cache_seqlens.shape)}"
         )
 
-    shape = (batch_size, queries, num_query_heads, kv_lora_rank)
-    if out is None:
-        out = torch.empty(shape, dtype=torch.bfloat16, device=q.device)
-    elif (
-        out.shape != shape
-        or out.dtype != torch.bfloat16
-        or out.device != q.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError(
-            f"out must be contiguous BF16 {shape} on {q.device}, got "
-            f"{out.dtype} {tuple(out.shape)}"
-        )
-    lse = (
-        torch.empty(shape[:-1], dtype=torch.float32, device=q.device)
-        if return_lse
-        else None
-    )
 
+def _launch_query_blocks(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    out: torch.Tensor,
+    lse: torch.Tensor | None,
+    *,
+    value_weight: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+    counters: torch.Tensor | None = None,
+) -> None:
+    batch_size, queries, num_query_heads, _ = q.shape
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     block_m, block_q, num_head_blocks = _query_block_shape(num_query_heads, queries)
     num_q_programs = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
@@ -1321,8 +1305,168 @@ def launch_gluon_mla_decode_query_blocks_gfx1250(
         # FP8 programs fit two per CU (see the split selection); 16-bit
         # operands need the whole register file of one.
         waves_per_eu=2 if is_fp8 else 1,
+        value_weight=value_weight,
+        gate=gate,
+        counters=counters,
+    )
+
+
+def launch_gluon_mla_decode_query_blocks_gfx1250(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Decode causal query blocks with one page-table row per request.
+
+    Each KV tile is read once for all of a request's queries rather than once
+    per query, which is what a speculative verify step needs.
+
+    Args:
+        q: Queries shaped ``[requests, queries, heads, 576]`` with 2 to 16
+            queries per request, in FP16, BF16 or FP8 matching ``kv_cache``.
+        kv_cache: Contiguous paged cache shaped ``[pages, 64, 1, 576]``.
+        page_table: Int32 physical page indices shaped ``[requests, pages]``.
+        cache_seqlens: Int32 final KV lengths shaped ``[requests]``, at least
+            ``queries`` each. Query ``j`` sees ``cache_seqlens[i] - queries +
+            j + 1`` tokens.
+        max_seqlen_k: KV-length upper bound used to choose the split count.
+        qk_nope_head_dim: Original non-RoPE query width; unused because ``q``
+            is already in the latent space.
+        kv_lora_rank: Latent width; must be 512.
+        qk_rope_head_dim: Positional width; must be 64.
+        softmax_scale: Scale applied to QK logits before softmax.
+        logit_cap: Soft cap on attention logits; only ``0.0`` is supported.
+        return_lse: Whether to also return natural-log log-sum-exp values.
+        out: Optional contiguous BF16 destination shaped
+            ``[requests, queries, heads, 512]``.
+
+    Returns:
+        BF16 latent output shaped ``[requests, queries, heads, 512]``, or
+        ``(output, lse)`` with FP32 LSE shaped ``[requests, queries, heads]``.
+    """
+    _check_query_block_inputs(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        logit_cap,
+    )
+    batch_size, queries, num_query_heads, _ = q.shape
+    shape = (batch_size, queries, num_query_heads, kv_lora_rank)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.bfloat16, device=q.device)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.bfloat16
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be contiguous BF16 {shape} on {q.device}, got "
+            f"{out.dtype} {tuple(out.shape)}"
+        )
+    lse = (
+        torch.empty(shape[:-1], dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+
+    _launch_query_blocks(
+        q, kv_cache, page_table, cache_seqlens, max_seqlen_k, softmax_scale, out, lse
     )
     return (out, lse) if return_lse else out
+
+
+def launch_gluon_mla_decode_query_blocks_projected_value_gfx1250(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    value_weight: torch.Tensor,
+    gate: torch.Tensor | None = None,
+    out: torch.Tensor,
+    logit_cap: float = 0.0,
+    counters: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode causal query blocks and fuse the split merge with the value
+    projection and optional sigmoid gate.
+
+    Args:
+        q, kv_cache, page_table, cache_seqlens, max_seqlen_k, kv_lora_rank,
+            qk_rope_head_dim, softmax_scale, logit_cap: As for
+            :func:`launch_gluon_mla_decode_query_blocks_gfx1250`.
+        qk_nope_head_dim: Original non-RoPE head width, which must be 128.
+        value_weight: Contiguous BF16 weights shaped ``[heads, 512, 128]``.
+        gate: Optional BF16 raw sigmoid gate shaped
+            ``[requests * queries, heads * 128]``.
+        out: Contiguous BF16 output shaped ``[requests * queries, heads * 128]``.
+        counters: Int32 zeros shaped ``[requests * queries * heads]`` that the
+            merge leaves zeroed; a fresh zeroed buffer when omitted.
+
+    Returns:
+        ``out`` containing the projected and optionally gated values.
+    """
+    _check_query_block_inputs(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        logit_cap,
+    )
+    if qk_nope_head_dim != 128:
+        raise NotImplementedError("projected-value MLA requires qk_nope_head_dim=128")
+    batch_size, queries, heads, _ = q.shape
+    if value_weight.ndim != 3 or tuple(value_weight.shape[:2]) != (heads, kv_lora_rank):
+        raise ValueError(
+            f"value_weight must be [{heads}, {kv_lora_rank}, value], "
+            f"got {tuple(value_weight.shape)}"
+        )
+    expected_out = (batch_size * queries, heads * value_weight.shape[2])
+    if (
+        tuple(out.shape) != expected_out
+        or out.dtype != torch.bfloat16
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(f"out must be contiguous BF16 {expected_out} on {q.device}")
+    if counters is None:
+        counters = torch.zeros(
+            batch_size * queries * heads, dtype=torch.int32, device=q.device
+        )
+    _launch_query_blocks(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        max_seqlen_k,
+        softmax_scale,
+        out,
+        None,
+        value_weight=value_weight,
+        gate=gate,
+        counters=counters,
+    )
+    return out
 
 
 def launch_gluon_mla_decode_projected_value_gfx1250(
@@ -1411,5 +1555,6 @@ def launch_gluon_mla_decode_projected_value_gfx1250(
 __all__ = [
     "launch_gluon_mla_decode_gfx1250",
     "launch_gluon_mla_decode_query_blocks_gfx1250",
+    "launch_gluon_mla_decode_query_blocks_projected_value_gfx1250",
     "launch_gluon_mla_decode_projected_value_gfx1250",
 ]

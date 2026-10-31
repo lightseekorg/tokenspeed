@@ -1244,10 +1244,7 @@ def mla_decode_with_kvcache(
     if plan is not None and projected_value:
         raise ValueError("A latent MLA plan cannot execute fused value projection")
 
-    # The fused projected-value kernel serves only unwindowed single-query
-    # decode. Otherwise compose latent decode with the standalone projection;
-    # kernel choice stays with the sliding_window and q_len traits.
-    if projected_value and (window_left >= 0 or q.shape[1] > 1):
+    def compose_projected_value() -> torch.Tensor:
         attention = mla_decode_with_kvcache(
             q=q,
             kv_cache=kv_cache,
@@ -1270,6 +1267,16 @@ def mla_decode_with_kvcache(
             gate=gate,
             out=out,
         )
+
+    # Fused projected-value kernels serve unwindowed decode, and query blocks
+    # only where one is registered for them. Otherwise compose latent decode
+    # with the standalone projection; kernel choice stays with the
+    # sliding_window and q_len traits.
+    if projected_value and (
+        window_left >= 0
+        or (q.shape[1] > 1 and (override is not None or solution is not None))
+    ):
+        return compose_projected_value()
 
     traits = {
         "batch_size": q.shape[0],
@@ -1333,6 +1340,8 @@ def mla_decode_with_kvcache(
                 override=override,
             )
         except NoKernelFoundError:
+            if projected_value and q.shape[1] > 1:
+                return compose_projected_value()
             if projected_value:
                 if override is not None or solution is not None:
                     raise

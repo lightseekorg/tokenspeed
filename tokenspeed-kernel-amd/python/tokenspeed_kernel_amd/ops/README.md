@@ -1129,7 +1129,10 @@ remain then leaves the other slot's loads in flight.
 `gluon_mla_decode_query_blocks_gfx1250` decodes 2–16 causal queries per
 request, such as an EAGLE3 verify step, reading each KV tile once for all of a
 request's queries. It is selected for `mla_decode_with_kvcache` requests with
-queries blocked on the query axis.
+queries blocked on the query axis. Its projected-value variant,
+`gluon_mla_decode_query_blocks_projected_value_gfx1250`, fuses the value
+projection and optional sigmoid gate into the split merge for up to four FP8
+requests of up to four queries.
 
 #### Contract
 
@@ -1142,7 +1145,9 @@ queries blocked on the query axis.
   least `queries` each, and include every query of the block: query `j` sees
   `cache_seqlens - queries + j + 1` tokens.
 - The output is BF16 `(requests, queries, heads, 512)`, with an optional FP32
-  log-sum-exp `(requests, queries, heads)` in natural-log units.
+  log-sum-exp `(requests, queries, heads)` in natural-log units. The
+  projected-value variant takes BF16 `(heads, 512, 128)` value weights and
+  writes BF16 `(requests * queries, heads * 128)`.
 
 #### Algorithm
 
@@ -1166,6 +1171,14 @@ NaN. The splits store their partials in BF16, halving the partial traffic
 that at 32 or more splits otherwise reaches a fifth of the KV bytes. The
 page-table stride and the request and token counts are runtime arguments, so
 batch sizes that keep the split count reuse one binary.
+
+The projected-value merge runs the latent merge's programs, one per token,
+head and 128 latent columns. Each also multiplies its BF16 latent slice by
+the matching 128 rows of the head's value weight and publishes an FP32
+partial; the last of a row's four programs, found by an arrival counter, adds
+the partials in a fixed order, rounds to BF16, applies the gate and rezeroes
+the counter. Past 16 rows every row reloads its weight slice, and the latent
+merge followed by the batched projection GEMM is faster.
 
 ### gfx950 MLA prefill
 
@@ -1532,9 +1545,11 @@ Standard target decode is a one-token verify window. Both standard and
 speculative decode follow verify, acceptance, and commit. Verify retains
 the Gluon fused convolution, LDS vectors and batched value-split selection.
 GFX950 uses 32-row state panels for one-token windows with a bounded gate
-and no value split. Other cases use 16-row panels. Verify preserves committed
-FP32 or BF16 state and widens it to FP32. It saves correction U in FP32,
-and unnormalized K and raw gate in the activation dtype.
+and no value split. GFX1250 uses 64-row panels whenever a program owns a
+whole head (no value split, from 16 requests), which cuts its serial panel
+steps from eight to two. Other cases use 16-row panels. Verify preserves
+committed FP32 or BF16 state and widens it to FP32. It saves correction U
+in FP32, and unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
 the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
@@ -1769,7 +1784,7 @@ Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
 things differ:
 
 - Automatic dispatch selects the decode launcher for 1 to 64 tokens and the
-  prefill kernel from 1025; the range between them retains the Triton kernel.
+  prefill kernel from 129; the range between them retains the Triton kernel.
 - The packed tensor passed alongside the three weights must be their
   consecutive view. The kernels read only it, so the launchers reject a
   packed tensor the weights do not live inside.
@@ -1798,24 +1813,33 @@ columns, so SiTU never needs a second kernel.
   rearms the counter for the next launch or graph replay. Each stream keeps
   its own counter buffer, which the launches ordered on it share.
 
-Prefill is one launch too: a `256 x 256` WMMA tile on eight warps with no
-split, accumulating in FP32 over 128-wide K steps. Like the whole-reduction
-decode kernel, a tile is two 128-row weight slices, so the 4480 router and
-routed columns take 18 tiles (the last one half used) and the shared region
-six gate/up pairs that finish SiTU in the epilogue, with no BF16 gate/up
-buffer or second launch. That epilogue writes `sigmoid(x)` as
-`(1 + tanh(x / 2)) / 2`, so the whole activation runs on the hardware tanh.
+Prefill is one launch too, the clustered warp-pipeline schedule of the
+dense large-M GEMM in `gfx1250/gemm/fp16/mm.py` with no split, accumulating
+in FP32 over 128-wide K steps. Each CTA computes two `256 x 128` half tiles
+on eight warps: 128-row slices of two consecutive panels of the router and
+routed regions, or 128 gate rows with the up rows 768 below them, so the shared
+region finishes SiTU in the epilogue with no BF16 gate/up buffer or second
+launch. CTAs run as 1 x 2 clusters whose TDM loads multicast the activation
+panel to both, with a cluster barrier per K tile. The router region rounds
+up to whole 256-row panels, so no panel holds both router and routed
+columns; the 4480 columns take nine clusters and the shared region three.
+Below 1281 tokens every 256-row tile already fits in one wave, so the
+kernel switches to `128 x 128` half tiles on unclustered CTAs, which
+finish sooner.
+
 Each K tile is consumed in two half-K steps of an LDS-read stage and a WMMA
 stage (`warp_pipeline_stage`), and the two warps that share a SIMD run a
-stage apart, so one reads LDS while the other issues WMMA. The next K tile
-streams into the other of two TDM slots meanwhile, issued by one warp per
-SIMD. Workgroups are renumbered so each of the eight XCDs gets a contiguous
-run of the `GROUP_M`-grouped tile order, which keeps the workgroups that
-share A or B rows on one L2. Before storing, the kernel redistributes each
-half accumulator so neighboring lanes cover adjacent output columns, which
-coalesces the BF16 stores, and masks, rather than the tile index, place each
-column in the router or routed region, so FP32 router logits reach memory
-without a round trip through BF16.
+stage apart, so one reads LDS while the other issues WMMA. Operands sit in
+partitioned LDS layouts that split each panel across the two LDS
+partitions, so paired waves read different partitions in one instruction.
+The next K tile streams into the other of two TDM slots meanwhile, issued
+by one warp per SIMD. Clusters are renumbered so each of the eight XCDs gets
+a contiguous run of the `GROUP_M`-grouped tile order, which keeps the CTAs
+that share A or B rows on one L2. The epilogue writes `sigmoid(x)` as
+`(1 + tanh(x / 2)) / 2`, so the whole activation runs on the hardware tanh.
+Each half tile is staged in the freed operand LDS and written by one TDM
+store, clipped at the last row and at the router width, so FP32 router
+logits reach memory without a round trip through BF16.
 
 All kernels mask partial row tiles, so they accept any token count.
 
@@ -2046,7 +2070,8 @@ weights:
 1. **Route** the top-k selections into per-expert row slices, producing ragged
    metadata plus gather and scatter indices.
 2. **Quantize inputs** to E4M3 by the gate/up activation scale, in one pass
-   over the layer input.
+   over the layer input. Multi-token batches the one-launch route covers do
+   this in extra programs of the route launch.
 3. **Gate/up GEMM** gathers routed rows, accumulates in FP32, applies bias and
    the fused activation, then divides by the down GEMM's activation scale and
    casts to E4M3 in the same epilogue. The intermediate therefore never lands
@@ -2072,6 +2097,15 @@ that the activation loads and epilogue need. Long reductions (gate/up) load
 512-wide K steps (256-byte MXFP4 row segments). Short reductions (down)
 load 128-wide steps so three buffers hold all of K in a small LDS footprint,
 and more programs stay resident to hide each one's fixed latency.
+
+The FP8 SiTU experts store the down weight in K planes: each 128-wide K step
+of an expert is its own row-major `(N, 64-byte)` slab, so a weight tile is one
+contiguous run. Kimi K3's 384-wide TP8 reduction otherwise streams as 64-byte
+pieces of 192-byte rows, which TDM reads well below its contiguous bandwidth.
+The decode and prefill down GEMMs both read the planes. When a down
+projection launches at least 16 programs per CU (a dozen or more decode
+requests), each program streams two consecutive N tiles through one TDM ring
+and stores both from registers.
 
 FP8-activation prefill (about 150 routed rows per expert at 8192-token
 chunks) uses 64x256 tiles. Neither GEMM saturates WMMA, TDM or HBM there:
