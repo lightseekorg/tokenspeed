@@ -2378,6 +2378,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             encoder_only=getattr(config, "encoder_only", False),
         )
         self.is_multimodal_active = is_multimodal_active
+        self._checkpoint_dir: str | None = None
         self.vision = None
         self.vision_embedder = None
         self.image_encoder = None
@@ -2843,7 +2844,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         ]
         if not pending:
             return
-        checkpoint_dir = getattr(self, "_checkpoint_dir", None)
+        checkpoint_dir = self._checkpoint_dir
         if checkpoint_dir is None:
             return
         from safetensors import safe_open

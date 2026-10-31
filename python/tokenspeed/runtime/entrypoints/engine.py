@@ -121,7 +121,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
-    if getattr(server_args, "_beam_checkpoint", False) is None:
+    if server_args._beam_checkpoint is None:
         # A hub id the local cache does not hold yet (a first launch): fetch
         # its config.json now, before any process starts.
         server_args.resolve_model_defaults(download=True)
@@ -145,7 +145,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
-    if getattr(server_args, "_beam_checkpoint", False):
+    if server_args._beam_checkpoint:
         # Beam serves without TF32 (ServerArgs.resolve_model_defaults): both
         # switches off for the processes started below, whatever the caller
         # exported.

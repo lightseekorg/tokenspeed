@@ -96,7 +96,6 @@ class MLATokenToKVPool(CachePool):
             self.kv_buffer = self._latent_kv
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += _get_tensor_size_bytes(kv_cache)
