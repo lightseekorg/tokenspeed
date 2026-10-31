@@ -2046,7 +2046,8 @@ weights:
 1. **Route** the top-k selections into per-expert row slices, producing ragged
    metadata plus gather and scatter indices.
 2. **Quantize inputs** to E4M3 by the gate/up activation scale, in one pass
-   over the layer input.
+   over the layer input. Multi-token batches the one-launch route covers do
+   this in extra programs of the route launch.
 3. **Gate/up GEMM** gathers routed rows, accumulates in FP32, applies bias and
    the fused activation, then divides by the down GEMM's activation scale and
    casts to E4M3 in the same epilogue. The intermediate therefore never lands
