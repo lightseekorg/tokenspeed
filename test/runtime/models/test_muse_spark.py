@@ -1612,6 +1612,7 @@ def _gathered_mxfp4_workspace_worker(
         state = prepare_muse_communication(
             enable_lamport=enable_lamport,
             owned_route_max_rows=0,
+            intermediate_gather_max_rows=0,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
