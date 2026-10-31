@@ -82,6 +82,13 @@ Compared with `--ep-size 8 --moe-tp-size 1` on the same checkpoint, this
 layout decodes faster at low concurrency but has a higher time-to-first-token;
 prefer EP8 for prefill-heavy traffic.
 
+`--moe-prefill-down-column-split` narrows that prefill gap. Each GPU keeps a
+second copy of its experts' down projections split by output columns (about
+16 GiB more weights, so about 9% fewer KV-cache tokens). Prefill batches of
+192 tokens or more then exchange the MXFP4 expert intermediates instead of
+every route's BF16 partial output, about 3.5x fewer bytes per layer. The flag
+needs this MXFP4 checkpoint at MoE TP8 with EP1 and is rejected elsewhere.
+
 ### Blackwell NVFP4
 
 The NVFP4 checkpoint quantizes the experts of all but the first and last

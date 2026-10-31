@@ -165,12 +165,32 @@ def _initialize_model(
     if model_config.is_multimodal:
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
-    return model_class(
+    model = model_class(
         config=model_config.hf_config,
         mapping=mapping,
         quant_config=quant_config,
         **extra_kwargs,
     )
+    _check_moe_prefill_down_column_split(model)
+    return model
+
+
+def _check_moe_prefill_down_column_split(model: nn.Module) -> None:
+    """Refuse the flag for an MoE model that built no column-split down copy."""
+    from tokenspeed.runtime.layers.moe.down_columns import MoEDownColumns
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    if not global_server_args_dict["moe_prefill_down_column_split"]:
+        return
+    modules = list(model.modules())
+    if any(isinstance(module, MoELayer) for module in modules) and not any(
+        isinstance(module, MoEDownColumns) for module in modules
+    ):
+        raise ValueError(
+            f"{type(model).__name__} does not support "
+            "--moe-prefill-down-column-split in this configuration"
+        )
 
 
 @runtime_checkable
