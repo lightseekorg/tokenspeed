@@ -1076,18 +1076,29 @@ if platform.is_amd:
             validated_ids = (
                 validated_ids - int(getattr(w, "ep_rank", 0)) * num_local_experts
             )
-        # The ids above are already relative to this rank, so experts start at 0.
-        expert_route_ids, expert_counts = _routing(validated_ids, num_experts, 0)
+        num_routes = validated_ids.numel()
+        # Each expert's routing program scans every route; prefill batches
+        # scan in wide blocks. The ids above are already relative to this
+        # rank, so experts start at 0.
+        wide = num_routes > 1024
+        expert_route_ids, expert_counts = _routing(
+            validated_ids,
+            num_experts,
+            0,
+            block_routes=8192 if wide else None,
+            num_warps=8 if wide else 4,
+        )
         route_output = torch.empty(
-            (validated_ids.numel(), x.shape[1]), device=x.device, dtype=x.dtype
+            (num_routes, x.shape[1]), device=x.device, dtype=x.dtype
         )
         output = torch.empty_like(x)
         intermediate = torch.empty(
-            (validated_ids.numel(), w.w13_weight.shape[1] // 2),
+            (num_routes, w.w13_weight.shape[1] // 2),
             device=x.device,
             dtype=x.dtype,
         )
-        launch_gluon_fp8_block_experts_gfx1250(
+        route_rows = torch.empty(num_routes, device=x.device, dtype=torch.int32)
+        sorted_rows = launch_gluon_fp8_block_experts_gfx1250(
             x,
             w.w13_weight,
             w.w2_weight,
@@ -1099,9 +1110,17 @@ if platform.is_amd:
             swiglu_limit,
             intermediate,
             route_output,
+            route_rows=route_rows,
         )
         # Expert programs skip ids outside this rank and leave those rows unset.
-        _combine(route_output, validated_weights, output, validated_ids, num_experts)
+        _combine(
+            route_output,
+            validated_weights,
+            output,
+            validated_ids,
+            num_experts,
+            route_rows=route_rows if sorted_rows else None,
+        )
         return output
 
     _PACKED_FP8_TRAITS = {
