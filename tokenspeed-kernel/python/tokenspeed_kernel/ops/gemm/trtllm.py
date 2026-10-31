@@ -44,6 +44,7 @@ from tokenspeed_kernel.signature import (
 _HAS_TRTLLM_KERNEL = (
     current_platform().is_nvidia
     and importlib.util.find_spec("trtllm_kernel") is not None
+    and importlib.util.find_spec("deep_ep") is not None
 )
 if _HAS_TRTLLM_KERNEL:
     # DeepEP must initialize before TRT-LLM's static CUDA runtime.

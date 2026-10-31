@@ -20,12 +20,14 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 from tokenspeed_kernel.platform import current_platform, prepare_cuda_toolkit_env
 
 _IS_HOPPER_PLUS = current_platform().is_hopper_plus
 
-if _IS_HOPPER_PLUS:
+if _IS_HOPPER_PLUS and importlib.util.find_spec("deep_gemm") is not None:
     prepare_cuda_toolkit_env()
     import deep_gemm
 
