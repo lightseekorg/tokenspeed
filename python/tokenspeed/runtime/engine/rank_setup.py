@@ -268,4 +268,5 @@ def scheduler_config_from_args(
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
+        drop_dead_state_checkpoints=server_args.drops_dead_state_checkpoints,
     )

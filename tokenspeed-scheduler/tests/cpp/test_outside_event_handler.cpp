@@ -1309,6 +1309,80 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeFor
     }
 }
 
+// drop_dead_state_checkpoints leaves the D role's publication as it was: r0
+// still publishes its finish past the prompt end (the KV tail [42] and the
+// state at 9), so r1, whose prompt is exactly those nine tokens, claims that
+// state and the peer omits the state transfer.
+TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesItsFinishWithDropDeadStateCheckpoints) {
+    config_.drop_dead_state_checkpoints = true;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("r0");
+    PlanOnce();
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    PlanOnce();  // first decode
+    SendForwardDone("r0", {43});
+    ExecutionEvent succeeded;
+    succeeded.With(pd::SucceededEvent{"r0"});
+    scheduler_->Advance(succeeded);
+    PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1);
+    r1.tokens.push_back(42);
+    Submit({r1});
+    SendBootstrapped("r1");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindRemoteAdmission(plan);
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
+    EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
+}
+
+// So is a finish at the prompt end, where the fused rule would drop a prompt
+// end its pre-tail checkpoint covers: r0 finishes on its bootstrap token at
+// its prompt end 8 and publishes the state there; r1 adds token 9, resumes at
+// 8 and finishes on its bootstrap token too, at 9, inside the page the cached
+// checkpoint 8 starts. It still publishes the tail [9] and the state at 9,
+// so r2, whose prompt is r1's, claims that state and the peer omits the
+// state transfer.
+TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesACoveredPromptEndWithDropDeadStateCheckpoints) {
+    config_.drop_dead_state_checkpoints = true;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    const RequestSpec r0 = MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1);
+    Submit({r0});
+    SendBootstrapped("r0");
+    PlanOnce();
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    SendFinish("r0");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 0u) << "an aligned prompt end has no tail";
+
+    RequestSpec r1 = r0;
+    r1.request_id = "r1";
+    r1.tokens.push_back(9);
+    Submit({r1});
+    SendBootstrapped("r1");
+    const ExecutionPlan admission = PlanOnce();
+    const ForwardBatch* landing = FindRemoteAdmission(admission);
+    ASSERT_NE(landing, nullptr);
+    EXPECT_EQ(landing->extend_prefix_lens, (std::vector<std::int32_t>{8}));
+    SendRemotePrefillDone("r1", /*bootstrap_token=*/43);
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    RequestSpec r2 = r1;
+    r2.request_id = "r2";
+    Submit({r2});
+    SendBootstrapped("r2");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindRemoteAdmission(plan);
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
+    EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
+}
+
 TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAlignedPromptEndState) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");

@@ -592,6 +592,50 @@ def test_a_decode_server_takes_the_in_forward_state_checkpoint_flag_as_a_no_op()
 
 
 @pytest.mark.parametrize(
+    "flags, enabled",
+    [([], False), (["--drop-dead-state-checkpoints"], True)],
+)
+def test_dead_state_checkpoints_are_published_unless_the_flag_is_given(flags, enabled):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.drop_dead_state_checkpoints is enabled
+
+
+def test_dropping_dead_state_checkpoints_is_refused_without_prefix_caching():
+    # Without prefix caching nothing is published, so the flag would mean
+    # nothing.
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            disable_kvstore=True,
+            enable_prefix_caching=False,
+            drop_dead_state_checkpoints=True,
+        )
+
+
+def test_a_decode_server_takes_drop_dead_state_checkpoints_as_a_no_op():
+    # The decode role publishes its finish as ever, so a PD launcher may pass
+    # the flag to both roles while disabling prefix caching only on decode;
+    # its scheduler does not turn the flag on.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        enable_prefix_caching=False,
+        drop_dead_state_checkpoints=True,
+    )
+    assert not args.drops_dead_state_checkpoints
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
+    assert cfg.disable_prefix_cache
+    assert not cfg.drop_dead_state_checkpoints
+
+
+@pytest.mark.parametrize(
     ("mapping", "title"),
     [
         (Mapping(rank=0, world_size=1), "tokenspeed::scheduler_tp0"),

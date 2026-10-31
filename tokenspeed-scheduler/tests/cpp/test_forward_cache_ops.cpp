@@ -716,6 +716,35 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     }
 }
 
+TEST(SchedulerConfigValidateTest, DropDeadStateCheckpointsRequiresPrefixCaching) {
+    // The flag narrows what the prefix cache publishes; without prefix
+    // caching nothing is published and it would mean nothing.
+    SchedulerConfig config = MakeValidConfig();
+    config.drop_dead_state_checkpoints = true;
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+    config.disable_prefix_cache = true;
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+
+    // The D role publishes its finish as ever, so it takes the flag without
+    // prefix caching (PD launchers share one argument list between the
+    // roles); the P role still refuses it.
+    for (const Role role : {Role::kP, Role::kD}) {
+        SchedulerConfig pd = MakeValidConfig();
+        pd.role = role;
+        for (CacheGroupConfig& group : pd.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(pd);
+        pd.disable_prefix_cache = true;
+        pd.drop_dead_state_checkpoints = true;
+        if (role == Role::kD) {
+            EXPECT_NO_THROW(WithHostPackingFromDevice(pd).Validate());
+        } else {
+            EXPECT_THROW(WithHostPackingFromDevice(pd).Validate(), std::invalid_argument);
+        }
+    }
+}
+
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
     // The pool is explicit on every role: 0 pages says nothing, the null page
     // alone says "never retract" (and takes no blob slots), anything above it
