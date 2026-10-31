@@ -52,16 +52,26 @@ def _routing_kernel(
 
 
 def _routing(
-    topk_ids: torch.Tensor, num_experts: int, expert_start: int
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    expert_start: int,
+    *,
+    block_routes: int | None = None,
+    num_warps: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Group route ids by the local experts ``expert_start + [0, num_experts)``."""
+    """Group route ids by the local experts ``expert_start + [0, num_experts)``.
+
+    Each expert's program scans the routes ``block_routes`` at a time, by
+    default 128 for at most 128 routes and 1024 otherwise.
+    """
     topk_ids = topk_ids.to(torch.int32).contiguous()
     num_routes = topk_ids.numel()
     expert_route_ids = torch.empty(
         (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32
     )
     expert_counts = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
-    block_routes = 128 if num_routes <= 128 else 1024
+    if block_routes is None:
+        block_routes = 128 if num_routes <= 128 else 1024
     _routing_kernel[(num_experts,)](
         topk_ids,
         expert_route_ids,
@@ -69,7 +79,7 @@ def _routing(
         num_routes,
         expert_start,
         BLOCK_ROUTES=block_routes,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return expert_route_ids, expert_counts
 
