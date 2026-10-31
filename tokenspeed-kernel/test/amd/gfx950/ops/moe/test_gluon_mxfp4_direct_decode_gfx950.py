@@ -973,6 +973,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                     torch.bfloat16,
                     32,
                     runtime_rows=True,
+                    deterministic_order=False,
                     use_minimum_route_chunks=False,
                     expert_start=expert_start,
                 )

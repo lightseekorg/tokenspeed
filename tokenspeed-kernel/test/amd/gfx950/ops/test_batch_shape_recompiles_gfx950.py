@@ -426,6 +426,7 @@ def test_mxfp4_moe_sorting_route_count():
                 block,
                 use_minimum_route_chunks=False,
                 runtime_rows=False,
+                deterministic_order=False,
             )
         )
         assert int(valid[1]) == tokens
