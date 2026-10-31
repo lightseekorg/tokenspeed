@@ -357,6 +357,37 @@ def test_kimi_k3_tp_situ_stores_down_weight_in_k_planes_gfx1250() -> None:
     )
 
 
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_kimi_k3_tp_situ_paired_down_tiles_match_gfx1250(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
+        num_tokens
+    )
+    plan = _make_plan()
+    kernel_moe_process_weights(plan, module)
+
+    def apply() -> torch.Tensor:
+        return kernel_moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        ).clone()
+
+    single = apply()
+    monkeypatch.setattr(fused, "_DECODE_PAIR_N_TILES_PROGRAMS_PER_CU", 0)
+    assert (
+        fused._decode_down_n_tiles(num_tokens * 16, 16, 3584, 128, single.device) == 2
+    )
+    paired = apply()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(single).item() > 0
+    torch.testing.assert_close(paired, single, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
 @pytest.mark.parametrize("num_tokens", [2, 4, 64])
 def test_gfx1250_small_route_fp8_quantize_matches_standalone(
