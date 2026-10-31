@@ -304,13 +304,15 @@ the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
 copies and an event the commit waits on. Torch's sync-debug mode enforces this
-rule, and `HostBootstrap.enter_serving` arms it once the rank finished
+rule, and `HostBootstrap.enter_serving` always arms it once the rank finished
 startup and the frontend handshake (weight loading, tuning, capture, the
-transfer and L2 builders all synchronize on purpose):
-`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
-Python location, `error` raises there. CI runs the serving paths with
-`error`; the commit's event wait and the non-blocking copies pass
-unflagged, so a report is always a real stall.
+transfer and L2 builders all synchronize on purpose); there is no switch to
+leave it off. `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` (the default) reports
+each offending site with its Python location, `error` raises there. CI
+serves every `server_smoke`, `eval` and `perf` task with `error`, which a
+task cannot relax; the commit's event wait and the non-blocking copies pass
+unflagged, so a report is always a real stall. A deliberate wait off the
+per-round path is wrapped in `allow_host_sync` (`utils/host_sync.py`).
 
 One named exception: a drafter may leave its round pending after the forward
 (`BaseDrafter.finish_round`) and finish it in the next forward's `settle`,

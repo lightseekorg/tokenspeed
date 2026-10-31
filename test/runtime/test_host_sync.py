@@ -22,12 +22,20 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 import torch
 
-from tokenspeed.runtime.execution import device as device_module
-from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.host_sync import allow_host_sync
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.execution import device as device_module  # noqa: E402
+from tokenspeed.runtime.utils.env import envs  # noqa: E402
+from tokenspeed.runtime.utils.host_sync import allow_host_sync  # noqa: E402
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -84,18 +92,20 @@ def test_allow_host_sync_scopes_the_exemption(sync_debug_off):
 
 
 @requires_cuda
-def test_arming_follows_the_env(monkeypatch, sync_debug_off):
-    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "warn")
+def test_serving_always_arms_the_check(monkeypatch, sync_debug_off):
+    # Unset, it warns.
+    monkeypatch.delenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", raising=False)
     assert envs.TOKENSPEED_DATA_PLANE_SYNC_DEBUG.get() == "warn"
     device_module.arm_data_plane_sync_debug("cuda")
     assert torch.cuda.get_sync_debug_mode() == 1
-    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "default")
     torch.cuda.set_sync_debug_mode(0)
+    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "error")
     device_module.arm_data_plane_sync_debug("cuda")
-    assert torch.cuda.get_sync_debug_mode() == 0
+    assert torch.cuda.get_sync_debug_mode() == 2
 
 
-def test_arming_rejects_unknown_modes(monkeypatch):
-    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "loud")
-    with pytest.raises(ValueError, match="default, warn or error"):
+@pytest.mark.parametrize("mode", ["default", "off", "0", "loud"])
+def test_the_check_cannot_be_disabled(monkeypatch, mode):
+    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", mode)
+    with pytest.raises(ValueError, match="cannot be disabled"):
         device_module.arm_data_plane_sync_debug("cuda")

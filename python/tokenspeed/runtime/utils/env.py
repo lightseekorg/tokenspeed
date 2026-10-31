@@ -274,12 +274,13 @@ class Envs:
     # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
     TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
-    # torch.cuda sync-debug mode armed once serving starts (after capture and
-    # tuning, which synchronize legitimately): "warn" reports every host
-    # synchronization on a serving path with its Python location, "error"
-    # raises. Any such synchronization on the data plane stalls the forward
-    # thread until the in-flight step drains and defeats overlap scheduling.
-    TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
+    # torch.cuda sync-debug mode, always armed once serving starts (after
+    # capture and tuning, which synchronize legitimately): "warn" reports
+    # every host synchronization on a serving path with its Python location,
+    # "error" raises (CI serves with it). There is no off: any such
+    # synchronization on the data plane stalls the forward thread until the
+    # in-flight step drains and defeats overlap scheduling.
+    TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("warn")
     # Triton compilations once serving starts: "warn" logs each one with what
     # changed and names a compile-time kernel parameter that keeps taking new
     # values (a per-batch constexpr, one JIT compile on the forward thread per

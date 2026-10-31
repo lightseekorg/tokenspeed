@@ -24,9 +24,10 @@ The forward thread must not wait for the device on the per-round path: a
 ``.cpu()``, ``.item()``, ``bool(tensor)`` or pageable copy waits for the
 stream, and the stream holds the step in flight, so the next step's launch
 slips behind it and overlap scheduling degrades to depth 0
-(``docs/design/event-loop.md``). ``TOKENSPEED_DATA_PLANE_SYNC_DEBUG`` arms
-torch's sync-debug mode to report or reject every such wait once serving
-starts. The few waits that are deliberate -- validation that only runs on
+(``docs/design/event-loop.md``). Once serving starts, torch's sync-debug
+mode reports every such wait, or rejects it under
+``TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error`` (as CI serves). The few waits
+that are deliberate -- validation that only runs on
 prefill rounds, whose step is long enough to absorb it -- are wrapped in
 ``allow_host_sync`` so they are explicit in the source and pass the check.
 """

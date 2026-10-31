@@ -23,7 +23,11 @@ Task types that start a server (`server_smoke`, `eval`, `perf`) run with
 `TOKENSPEED_JIT_COMPILE_CHECK=error` unless the task's `env` sets it: a
 compile-time kernel parameter that keeps taking new values after startup
 (a per-batch `tl.constexpr`) fails the run. The server log names the kernel,
-the parameter, and the launching call site.
+the parameter, and the launching call site. They also run with
+`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error`, which no task may change
+(validation rejects a task or `runner.env` that sets it): a host
+synchronization on the forward thread's per-round path after startup fails
+the run, and the server log names its Python location.
 
 Currently configured task directories:
 
