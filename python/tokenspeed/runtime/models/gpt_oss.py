@@ -476,6 +476,7 @@ class GptOssModel(BaseTransformerModel):
 
 class GptOssForCausalLM(BaseCausalLM):
     model_cls = GptOssModel
+    supports_aux_capture = True
     fall_back_to_pt_during_load = False
 
     def get_attention_sliding_window_size(self):

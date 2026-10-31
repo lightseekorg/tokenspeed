@@ -42,7 +42,6 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,7 +51,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3DecoderLayer,
     DeepseekV3DraftAttentionMLA,
     DeepseekV3ForCausalLM,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 
 logger = logging.getLogger(__name__)
@@ -451,27 +450,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         super().end_weight_update()
 
     def post_load_weights(self):
-        self_attn = self.model.decoder.self_attn
-        if (
-            hasattr(self.quant_config, "weight_block_size")
-            and (self.quant_config.weight_block_size is not None)
-            and self_attn.kv_b_proj.weight.dtype
-            in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            )
-        ):
-            weight_block_size = self.quant_config.weight_block_size
-            dtype = torch.get_default_dtype()
-            w = block_dequant(
-                self_attn.kv_b_proj.weight,
-                self_attn.kv_b_proj.weight_scale_inv,
-                weight_block_size,
-            ).to(dtype)
-        else:
-            w = self_attn.kv_b_proj.weight
-
-        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
+        absorb_mla_kv_b_proj(self.model.decoder.self_attn)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

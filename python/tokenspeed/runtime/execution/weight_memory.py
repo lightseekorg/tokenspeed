@@ -197,12 +197,16 @@ class WeightMemoryState:
             self.failed = True
             raise
 
-    def begin_update(self) -> bool:
+    def check_update(self) -> None:
+        """Check the local load prerequisites without starting a transition."""
         self.require_healthy()
         if not self.resident or self.updating:
             raise RuntimeError("Resume weight storage before updating")
         if self.policy == "discard" and not self.kv_released:
             raise RuntimeError("Release KV before a discard-policy weight update")
+
+    def begin_update(self) -> bool:
+        self.check_update()
         self.valid = False
         self.updating = True
         self.local_update_success = None
@@ -242,17 +246,16 @@ class WeightMemoryState:
             raise
 
     def commit_update(self, success: bool) -> None:
-        """The control plane commits only after the replica agrees on success."""
+        """Apply the replica-wide result of a load every rank started.
+
+        The control plane commits only after all ranks passed
+        ``check_update`` and attempted the load; a refusal before loading
+        never reaches here. A failure therefore poisons every rank, including
+        one whose own load succeeded: a peer may hold a partial version.
+        """
         if not success:
-            # A rank that started loading may hold a partial version, even when
-            # its own load succeeded and a peer failed: reject a later wake.
-            # A rank that refused before loading (weights released, KV still
-            # resident, a refused cache flush) left its weights untouched. The
-            # refusal conditions are the same on every rank, so the whole
-            # replica refused and the update may be retried.
-            if self.updating or self.local_update_success is not None:
-                self.valid = False
-                self.failed = True
+            self.valid = False
+            self.failed = True
             self.updating = False
             self.local_update_success = None
             return

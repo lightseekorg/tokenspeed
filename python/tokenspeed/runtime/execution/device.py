@@ -917,6 +917,49 @@ class DeviceHandle:
             with allow_host_sync("expert placement chunk"):
                 executor.execution_stream.synchronize()
 
+    def check_weight_update(self, req) -> tuple[bool, str]:
+        """Check a weight load's local prerequisites without changing anything.
+
+        The control plane MIN-reduces this result over the replica before any
+        rank runs a loader, so a rank that would refuse never strands a ready
+        peer inside a loading collective, and a refusal leaves every rank's
+        weights untouched.
+
+        Args:
+            req: A weight-load request (disk, distributed or Mooncake).
+
+        Returns:
+            ``(ready, message)``; the message explains a refusal.
+
+        Raises:
+            TypeError: Not a weight-load request.
+        """
+        from tokenspeed.runtime.engine.io_struct import (
+            UpdateWeightFromDiskReqInput,
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        )
+
+        if type(req) not in (
+            UpdateWeightFromDiskReqInput,
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        ):
+            raise TypeError(f"unsupported weight-load request {type(req).__name__}")
+        state = self._weight_memory
+        if state is None:
+            return True, "ready for weight update"
+        if (
+            state.policy == "discard"
+            and type(req) is not UpdateWeightsFromMooncakeReqInput
+        ):
+            return False, "Discard policy requires a complete Model Updater SDK update"
+        try:
+            state.check_update()
+        except RuntimeError as exc:
+            return False, str(exc)
+        return True, "ready for weight update"
+
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
@@ -972,19 +1015,14 @@ class DeviceHandle:
 
         state = self._weight_memory
         require_complete = False
-        if loads_weights and state is not None:
-            if (
-                state.policy == "discard"
-                and type(req) is not UpdateWeightsFromMooncakeReqInput
-            ):
-                return (
-                    False,
-                    "Discard policy requires a complete Model Updater SDK update",
-                )
-            try:
+        if loads_weights:
+            # The control plane already agreed these prerequisites across the
+            # replica; re-checking keeps a direct caller from loading unchecked.
+            ready, message = self.check_weight_update(req)
+            if not ready:
+                return False, message
+            if state is not None:
                 require_complete = state.begin_update()
-            except RuntimeError as exc:
-                return False, str(exc)
         try:
             result = handler(req)
             if loads_weights and result[0] and self._executor.drafter is not None:

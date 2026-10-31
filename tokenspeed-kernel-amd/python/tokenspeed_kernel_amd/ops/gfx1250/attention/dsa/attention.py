@@ -1089,7 +1089,7 @@ def _select_num_kv_splits(
     # Choose how many full waves of CTAs are needed to occupy the GPU.
     base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), block_h))
     if kv_lora_rank == 512:
-        target_waves = 2 if block_k == 64 else 1
+        target_waves = 2
     elif block_k == 64:
         target_waves = 2
     else:
@@ -1107,6 +1107,36 @@ def _select_num_kv_splits(
     # The reducer maps the full split axis into one BlockedLayout/TDM tile,
     # whose split extent must be a power of two.
     return 1 << (num_kv_splits.bit_length() - 1)
+
+
+def _select_decode_block_h(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk_width: int,
+    max_seqlen_k: int,
+    block_k: int,
+    kv_lora_rank: int,
+) -> int:
+    """Select the dense decode head tile.
+
+    A 16-head tile gathers each selected row once per token rather than once
+    per 8 heads. Keep 8 heads while 16-head workgroups, at the split count they
+    would run with, leave CUs idle.
+    """
+    if num_heads < 16:
+        return 8
+    num_kv_splits = _select_num_kv_splits(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk_width=topk_width,
+        max_seqlen_k=max_seqlen_k,
+        block_h=16,
+        block_k=block_k,
+        kv_lora_rank=kv_lora_rank,
+    )
+    ctas = num_tokens * triton.cdiv(num_heads, 16) * num_kv_splits
+    return 16 if ctas >= _GFX1250_COMPUTE_UNITS else 8
 
 
 def _run_dense(
@@ -1436,6 +1466,15 @@ def launch_gluon_dsa_decode_gfx1250(
             )
         ):
             out_view = out.view(q.shape[0], q.shape[1], kv_lora_rank)
+        is_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
+        block_h = _select_decode_block_h(
+            num_tokens=q.shape[0],
+            num_heads=q.shape[1],
+            topk_width=topk_slots.shape[1],
+            max_seqlen_k=max_seqlen_k,
+            block_k=64 if is_fp8 else 32,
+            kv_lora_rank=kv_lora_rank,
+        )
         result = _run_dense(
             q,
             kv_cache,
@@ -1444,7 +1483,7 @@ def launch_gluon_dsa_decode_gfx1250(
             softmax_scale=scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
-            block_h=8,
+            block_h=block_h,
             max_seqlen_k=max_seqlen_k,
             split_kv=True,
             out=out_view,

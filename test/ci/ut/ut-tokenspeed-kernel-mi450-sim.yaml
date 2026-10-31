@@ -272,7 +272,7 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_gfx1250_gemv_uses_native_pipeline[fp32-128-7168-v_wmma_f32_16x16x128_fp8_fp8]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_fused_tdm_matches_single_wave
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[fp32-15-1536-4096-4]
-    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[ue8m0-16-1792-5120-5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[ue8m0-16-1792-5120-1]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_tdm_fusion_selection[fp32-16-2048-7168-1-0]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-1-gluon_mm_mxfp8_ue8m0_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-1-gluon_mm_fp8_blockscale_gfx1250]

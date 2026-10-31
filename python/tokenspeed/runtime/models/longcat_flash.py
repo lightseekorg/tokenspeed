@@ -63,7 +63,6 @@ from tokenspeed.runtime.layers.moe.utils import (
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig as _QuantizationConfig,
 )
-from tokenspeed.runtime.layers.quantization.utils import block_dequant as _block_dequant
 from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer as _should_ignore_quant_layer,
 )
@@ -83,7 +82,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP as _DeepseekV3MLP
 from tokenspeed.runtime.models.deepseek_v3 import (
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     has_zero_expert as _has_zero_expert,
@@ -956,6 +955,7 @@ class _RuntimeLongcatModel(nn.Module):
 
 class LongcatFlashForCausalLM(_BaseCausalLM):
     model_cls = _RuntimeLongcatModel
+    supports_aux_capture = True
     # The MoE layers size their slots from the placement and route through
     # its tables; load_weights fills every placed replica.
     supports_expert_placement = True
@@ -1018,6 +1018,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         return None
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+        self.require_aux_capture()
         self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
@@ -1184,32 +1185,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
             if not isinstance(layer, _RuntimeLongcatDecoderLayer):
                 continue  # PPMissingLayer: another pipeline stage owns it
             for self_attn in layer.self_attn:
-                if hasattr(
-                    self.quant_config, "weight_block_size"
-                ) and self_attn.kv_b_proj.weight.dtype in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e4m3fnuz,
-                ):
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
-                            raise RuntimeError(
-                                "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
-                            )
-                        dtype = torch.get_default_dtype()
-                        w = _block_dequant(
-                            self_attn.kv_b_proj.weight,
-                            self_attn.kv_b_proj.weight_scale_inv,
-                            weight_block_size,
-                        ).to(dtype)
-                    else:
-                        w = self_attn.kv_b_proj.weight
-                else:
-                    w = self_attn.kv_b_proj.weight
-
-                self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                    w, self_attn
-                )
+                absorb_mla_kv_b_proj(self_attn)
                 if global_server_args_dict["mla_lora_scale"] == "folded":
                     # Under "runtime" the attention multiplies these scales in
                     # its forward and the norm weights stay as loaded (so a

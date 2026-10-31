@@ -4,7 +4,7 @@ Enable memory saving with an explicit `--weight-memory-policy cpu_backup` or
 `--weight-memory-policy discard`. Both use the existing memory tags and control
 routes. Rebuild the Python runtime, native host and kernel package together;
 the memory-saving startup handshake rejects native hosts without the
-replica-wide update-commit protocol.
+replica-wide update-commit protocol (version 2: load admission and commit).
 
 ## Policy and model contract
 
@@ -71,12 +71,14 @@ not suspend NCCL or release its communication buffers.
    any derived state is rebuilt. A stream or coverage failure aborts the session
    on every rank, so peers do not enter post-load collectives without it.
 6. Every rank confirms the final result, including namespace publication. Only
-   this commit makes locally loaded weights usable. A failure poisons every
-   rank that started loading, under either policy, including ranks whose own
-   load succeeded; restart the deployment rather than attempting a partial
-   wake. An update refused before any rank loads (weights still released, KV
-   still resident under discard, a refused cache flush, a non-SDK update under
-   discard) leaves the weights untouched and may be retried.
+   this commit makes locally loaded weights usable. A failed load poisons every
+   rank, under either policy, including ranks whose own load succeeded;
+   restart the deployment rather than attempting a partial wake. Before the
+   update's cache flush and before any rank loads, all ranks agree that the
+   update can start. If any rank refuses (weights still released, KV still
+   resident under discard, a non-SDK update under discard), no rank flushes or
+   loads; if the flush is refused, no rank loads. Either way the weights stay
+   untouched and the update may be retried.
 7. Resume `kv_cache`, then allow new rollouts. Remapped KV pages are cleared
    and re-registered for transfer; old request history is not CPU-backed up.
 

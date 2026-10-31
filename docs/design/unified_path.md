@@ -41,7 +41,7 @@ DECODE call raises. There is deliberately no fresh-allocation decode arm
 anywhere. `init_forward_metadata_replay_cuda_graph` no longer exists.
 
 Its extend inputs are one required, keyword-only bundle on every node —
-runner-facing (`backends/base.py`: router, V4, V4.1, Mamba/KDA, composites)
+runner-facing (`backends/base.py`: router, V4.1, Mamba/KDA, composites)
 and leaf (`backends/paged/base.py`) alike: `extend_seq_lens`,
 `extend_seq_lens_cpu`, `extend_prefix_lens`, `extend_prefix_lens_cpu` are
 plain `torch.Tensor` (`[>= num_extends]` entries; empty, never `None`, when
@@ -218,7 +218,7 @@ from one first bound to that pool:
   node rejects a pool that changes the geometry it owns: the router its
   group geometry (granularities, attention kinds, windows, and the row layout the
   leaves' kernels read), the state backends the state group ids and the
-  state layers' ids and shapes, DeepSeek V4 the group ids and row geometry,
+  state layers' ids and shapes, DeepSeek V4.1 the group ids and row geometry,
   Inkling the ShortConv checkpoint groups and their transfer policy. Page
   counts and, elsewhere, transfer policy may change. Paged leaves own kernel geometry only; the router
   validates group geometry for them.
@@ -811,9 +811,7 @@ NOWHERE else — the same two steps in every round:
   `draft_seq_lens_buf` (freshly seeded from the batch seq_lens);
 * **extend/mixed round**: draft prefill init reading the accepted-prefix
   seq_lens view (never the mutable draft buffer), then the same draft refresh
-  with one token per request — deliberately NOT the packed verify width,
-  which would take V4's packed-decode arm and clobber
-  `forward_prefill_metadata`.
+  with one token per request — deliberately NOT the packed verify width.
 
 Backends' `init_forward_metadata` must NOT double-fill draft decode metadata
 as a side effect (the deleted `is_extend() and self.is_draft` arms); the
@@ -884,18 +882,6 @@ EXTEND depths) leaves the refreshed decode slot unread; a block drafter
 it. A
 backend that lets one call clobber the other slot's metadata is in breach —
 that, not drafter special-casing, is the invariant to fix.
-
-**V4's packed-draft deviation (documented):** a V4 draft's packed verify
-round legitimately writes BOTH slots at its end — the bs*N packed views ride
-the prefill slot (the step-0 shape carrier; `_select_decode_metadata`
-resolves them there through a DECODE-mode-gated fallback), and the
-per-request step views own the decode slot. Capture and replay refresh reach
-that state through the SAME publisher (`_publish_draft_round`), so replay
-reproduces
-capture's slot end state by construction — the pointer guard's capture-end
-snapshot verifies it. Slot writes exist only in the three publishers; the
-`forward_deepseek_v4_*` read paths thread resolved metadata as parameters
-and never write a slot.
 
 ### PD decode nodes
 
@@ -1141,7 +1127,7 @@ TRT-LLM MLA, TokenSpeed MLA, DSA, MSA, QSA); `state/` holds the recurrent consum
 (Mamba/GDN and KDA);
 `hybrid/` the layer-routing composite (`linear.py` is
 `HybridLinearAttnBackend`); and `specific/` the bespoke single-model backends
-(DeepSeek V4, Qwen4-Exp's composite and side-cache consumers, and Inkling's
+(DeepSeek V4.1, Qwen4-Exp's composite and side-cache consumers, and Inkling's
 dense + conv-state wrapper). A new leaf goes under `paged/`, a new recurrent
 family under `state/`. A model-shaped backend earns `specific/` only when the ordinary
 router and ordinary paged or recurrent leaves cannot express it; use by one
@@ -1361,7 +1347,7 @@ vocabulary is fixed, with exactly one conversion point:
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view, and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE state table, input/output state blocks, and verify workspace | Mamba metadata and verify context, persistent cache allocation |
 | paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `page_table_cpu`, the host mirror of its extend rows, for page-owner counts | groups, block tables, contracts, draft/target table provenance |
-| state consumers (Mamba/KDA, Inkling conv, V4) | their own groups' raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
+| state consumers (Mamba/KDA, Inkling conv, V4.1) | their own groups' raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the
 bridge's `block_tables` dict to the top-level backend. Capture / idle /
@@ -1406,7 +1392,7 @@ invariant, so locations computed over the kernel-page stack equal
 raw-table locations bit for bit.
 
 `CacheBatchMetadata` travels no further than the runner; no backend receives
-it (`cache_metadata` / `forward_batch` kwargs are gone). V4 consumes the
+it (`cache_metadata` / `forward_batch` kwargs are gone). V4.1 consumes the
 same `block_tables` dict through its bespoke metadata build.
 
 Deleted, for the record: `decode_buffers.py`, `group_write_locations.py`,
@@ -1486,18 +1472,15 @@ history destinations through `write_locations`.
   windows; DFLASH reads the TARGET router's windows through them to copy
   target-aligned KV into the draft cache (the pools share one page-id
   space).
-* **Writes outside the backend** (the attention prologue, V4 group writes)
-  fetch their slots immediately before the write. An offloaded latent
+* **Writes outside the backend** (the attention prologue) fetch their slots
+  immediately before the write. An offloaded latent
   projection uses the compute slots returned by its sparse prepare. When a draft step-0
   forward over a MIXED round writes the round's full K/V rows, dispatched as
   MIXED or as DECODE (the MLA draft's whole-batch write, a GQA draft's
   narrowed first step), `forward_write_locations` concatenates the EXTEND
   span and the DECODE window — eager-only, MIXED rounds never run under a
   captured graph. Target MIXED decode halves and later draft steps keep their
-  ordinary decode-only windows. V4 composes the shared token-shaped resolve
-  (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
-  degraded mapping fails closed to `-1` (skipped write), never to a raw
-  fallback vector.
+  ordinary decode-only windows.
 
 ## Target capture is configured once during model setup
 
@@ -1507,7 +1490,7 @@ must implement the explicit `TargetCaptureConfigurator` interface; missing
 implementations fail at setup. A method with the same name on an unrelated
 object is not treated as an implementation or as evidence of prior setup.
 DFlash, DFlash2, and generic DSpark use their model's ordinary capture setup;
-K3 owns its trained stream/projection contract; DeepSeek V4/V4.1 DSpark owns
+K3 owns its trained stream/projection contract; DeepSeek V4.1 DSpark owns
 its checkpoint tap selection. `models/target_capture.py` contains only the
 shared interface. DFlash checkpoint parsing and target configuration live in
 `DFlashDraftModel.configure_target`, inherited by DFlash2 and generic DSpark.
@@ -1516,6 +1499,11 @@ Setup calls only the parent interface
 There is no generic DSpark helper probing for a DeepSeek-specific setter, and
 K3 targets need not implement that setter. EAGLE3 selection remains in this same setup
 phase, including its explicit server-argument override.
+The EAGLE3 and DFLASH capture setters run only on a target that opts in with
+`BaseCausalLM.supports_aux_capture`, one whose forward returns the taps
+`layers_to_capture` names. Any other target fails setup instead of handing
+the draft its final hidden state. DeepSeek V4.1 DSpark selects its taps with
+its own `set_dspark_layers_to_capture` and needs no opt-in.
 
 This runs on every PP stage even when that stage has no executing drafter.
 `wire_target` only binds embeddings, heads, and other execution resources; it
@@ -1590,7 +1578,7 @@ refuses it again at executor construction. The MTP shape is:
   draft is built on the last stage alone -- the other stages construct no
   draft runner, load no draft shard, and wire nothing, so `ModelExecutor` and
   `configure_draft_target` see `draft_model_runner=None` there and the in-tree
-  K3 and V4 NextN drafts need no stage-aware shell. The skip is safe because
+  K3 NextN draft needs no stage-aware shell. The skip is safe because
   nothing in draft construction is a world collective the skipping stages
   would have to join: the KV-budget all-reduce runs on every stage with or
   without a draft, the DeepEP/MoE communicators a draft layer reuses are the
@@ -2131,9 +2119,8 @@ attention family (GPU DSA), device, and KV cache (bf16: the gathered write is
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.
 The write-location kernels stay pure functions (`paged/write_locations.py`).
-QSA reuses the shared table fill without expansion; V4's token-shaped slot
-mapping remains a separate consumer of the shared mapping helpers
-(`cache-concepts.md` Principle 5).
+QSA reuses the shared table fill without expansion (`cache-concepts.md`
+Principle 5).
 
 ## Regression gates
 

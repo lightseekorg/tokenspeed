@@ -157,7 +157,6 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import (
     Mxfp4Config,
     preprocess_mxfp4_checkpoint_weights,
 )
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.shared_expert_tp import (
     SharedExpertCommunication,
     initialize_shared_expert_group,
@@ -173,7 +172,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 from tokenspeed.runtime.models.kimi_k3_comm import (
     K3_SHARED_RS_MAX_TOKENS,
@@ -3879,6 +3878,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
     """
 
     model_cls = KimiLinearModel
+    supports_aux_capture = True
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         shared_mlps = [
@@ -3935,6 +3935,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         selected = (
             [2, num_layers // 2, num_layers - 3]
@@ -3961,6 +3962,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         per-layer return has already accumulated the layer output into K3's
         prefix stream, matching vLLM's target-side capture contract.
         """
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
@@ -4267,7 +4269,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         With FP8_PB_WO checkpoints ``kv_b_proj.weight`` stays FP8 for the
         w8a8 prefill GEMM; the absorbed ``w_kc``/``w_vc`` copies follow the
         DeepSeek R1 precedent and block-dequantize to the activation dtype
-        (``DeepseekV3ForCausalLM.post_load_weights``). bf16 checkpoints (e.g.
+        (``absorb_mla_kv_b_proj``). bf16 checkpoints (e.g.
         moonshotai/Kimi-K3, whose MXFP4 config ignores ``self_attn.*``) skip
         the dequant. KDA layers have no ``kv_b_proj`` (not
         ``KimiLinearMLAAttention``) and are skipped.
@@ -4277,24 +4279,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
             if self_attn is None:
                 continue  # PPMissingLayer: another pipeline stage owns it
             if isinstance(self_attn, KimiLinearMLAAttention):
-                w = self_attn.kv_b_proj.weight
-                if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
-                        raise RuntimeError(
-                            "kv_b_proj.weight_scale_inv is required for block "
-                            "FP8 dequant of the absorbed MLA weights."
-                        )
-                    weight_block_size = (
-                        self_attn.kv_b_proj.quant_method.quant_config.weight_block_size
-                    )
-                    w = block_dequant(
-                        w,
-                        self_attn.kv_b_proj.weight_scale_inv,
-                        weight_block_size,
-                    ).to(torch.get_default_dtype())
-                self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                    w, self_attn
-                )
+                absorb_mla_kv_b_proj(self_attn)
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
                 merged = self_attn.qkvgb_proj

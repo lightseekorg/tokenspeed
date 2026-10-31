@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from enum import Enum
-
 from tokenspeed.runtime.layers.quantization.base_config import (  # noqa: F401
     QuantizationConfig,
     QuantizeMethodBase,
@@ -56,10 +54,3 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
     return QUANTIZATION_METHODS[quantization]
-
-
-class FusedMoeWeightScaleSupported(Enum):
-    TENSOR = "tensor"
-    CHANNEL = "channel"
-    GROUP = "group"
-    BLOCK = "block"

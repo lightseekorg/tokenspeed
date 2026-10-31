@@ -1696,6 +1696,54 @@ def test_dsa_glm53_bf16_split_schedule(
     )
 
 
+@pytest.mark.skipif(not is_cdna5(), reason="gfx1250 dense decode head tiling")
+@pytest.mark.parametrize(
+    (
+        "tokens",
+        "num_heads",
+        "topk_width",
+        "max_seqlen_k",
+        "block_k",
+        "kv_lora_rank",
+        "expected_block_h",
+    ),
+    (
+        (64, 8, 2048, 50000, 32, 512, 8),
+        (8, 16, 2048, 50000, 32, 512, 8),
+        (16, 16, 2048, 50000, 32, 512, 16),
+        (64, 16, 2048, 50000, 32, 512, 16),
+        (16, 16, 2048, 50000, 64, 512, 16),
+        # Short contexts and the rank-128 BF16 cap leave 8 splits per tile.
+        (16, 16, 2048, 300, 32, 512, 8),
+        (16, 16, 1024, 50000, 32, 128, 8),
+    ),
+)
+def test_dsa_gfx1250_decode_block_h(
+    tokens: int,
+    num_heads: int,
+    topk_width: int,
+    max_seqlen_k: int,
+    block_k: int,
+    kv_lora_rank: int,
+    expected_block_h: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
+        _select_decode_block_h,
+    )
+
+    assert (
+        _select_decode_block_h(
+            num_tokens=tokens,
+            num_heads=num_heads,
+            topk_width=topk_width,
+            max_seqlen_k=max_seqlen_k,
+            block_k=block_k,
+            kv_lora_rank=kv_lora_rank,
+        )
+        == expected_block_h
+    )
+
+
 @pytest.mark.skipif(
     not (is_cdna4() or is_cdna5()),
     reason="GLM-5.3-Flash BF16 decode requires AMD CDNA4 or CDNA5",
