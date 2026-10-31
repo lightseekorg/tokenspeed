@@ -2128,6 +2128,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
         kv_offload_config=None,
+        mamba_ssm_dtype="float32",
     )
 
     setup = prepare_cache_setup(
