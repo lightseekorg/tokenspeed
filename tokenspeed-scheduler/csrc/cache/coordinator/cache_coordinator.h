@@ -593,13 +593,20 @@ public:
     // shortfall leaves an empty reference. Evicting a State checkpoint takes
     // the other State groups' at its hash along; every block retries free
     // capacity before it picks a victim, so it places in the room such a
-    // cascade freed before another victim goes. Block by block: it serves
+    // cascade freed before another victim goes. access_epochs, unless empty,
+    // are the epochs the blocks' entries will be published at: the blocks are
+    // placed newest first, and each evicts only entries older than its own
+    // (a parent: when its newest child is), so a copy never displaces a newer
+    // entry; a block that finds no such entry and no free capacity is a
+    // shortfall. Empty: any entry may be evicted. Block by block: it serves
     // publication and finish stores and L3 prefetches. A retraction image's
     // Host blocks come from AcquireHostBoundaries, whose per-block plan ranks
-    // victims as this does (change the two together), and the Host blocks of
-    // what an eviction writes back from AcquireHostSegments.
+    // victims as this does without access_epochs (change the two together),
+    // and the Host blocks of what an eviction writes back from
+    // AcquireHostSegments.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
-                                          std::span<const std::int32_t> buckets);
+                                          std::span<const std::int32_t> buckets,
+                                          std::span<const std::uint64_t> access_epochs);
     // One segment of an AcquireHostSegments batch, or one boundary of a
     // retraction image's (NumHostBoundariesThatFit): rows [first_row,
     // past_end_row) of its group_ids and buckets.
@@ -671,6 +678,65 @@ public:
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
+    // A request's final publication (finish, retraction), as the store batch
+    // that dates it sees it: the request's tables and computed frontier
+    // num_tokens, the hashes of its completed prefix pages
+    // (CacheProgress::prefix_hashes), and the in-forward State checkpoint it
+    // published, at the boundary prefix_hashes[state_checkpoint_pages - 1]
+    // (zero pages: none).
+    struct FinalPublication {
+        std::span<const BlockTable> tables;
+        std::int32_t num_tokens{0};
+        std::span<const std::string> prefix_hashes;
+        std::int32_t state_checkpoint_pages{0};
+    };
+    // The access epochs a store batch dates Host entries with. A request's
+    // final publication refreshes the boundary it leaves: every published
+    // History block of its tables below num_tokens -- the pages its forwards
+    // read to the end; a page the tables hold as a private copy (a restore's)
+    // through the page's Device entry -- each State group's live slot, the
+    // checkpoint at num_tokens (slot 0 holds an earlier one and is not part
+    // of it), and the in-forward State checkpoint it published with a
+    // sliding window's blocks behind it (the tables no longer hold them). The
+    // boundary takes one epoch per prefix page, the first page newest so a
+    // prefix leaves Host from its end and every group's blocks of a page
+    // share a date (a checkpoint takes the page its token count ends in);
+    // `base`, older than all of them, dates everything else the batch stores.
+    // A live request's publications have no final publication.
+    struct StoreEpochs {
+        std::uint64_t base{0};
+        bool final_publication{false};
+        // The boundary's blocks Host does not hold, each group's front to
+        // back, with their epochs: the batch stores them, or re-dates the
+        // earlier store still carrying one -- the only way to date one whose
+        // Device entry is gone (device_block empty). The rest were refreshed
+        // when the epochs were taken.
+        struct Uncached {
+            CacheKey key;
+            CacheBlockRef device_block;
+            std::uint64_t access_epoch{0};
+        };
+        std::vector<Uncached> uncached;
+    };
+    // Takes a store batch's epochs and refreshes the boundary's Host entries
+    // already cached, before the batch picks its Host victims.
+    StoreEpochs TakeStoreEpochs(const std::optional<FinalPublication>& publication);
+    // The epoch a batch's copy of an entry outside its boundary is published
+    // at: `base` -- for a final publication no later than the entry's Device
+    // block (at device_location) was last used, since it is not part of what
+    // the request leaves.
+    std::uint64_t StoreEpoch(const StoreEpochs& epochs, std::uint32_t group_id,
+                             CacheBlockLocation device_location) const;
+    // Raises the Host copies of a boundary's own entries -- what a
+    // publication there registers beyond the full pages before it: each State
+    // group's checkpoint, the tail of an unaligned boundary (the page ending
+    // at an aligned one), a sliding window's lookback -- to access_epoch,
+    // never dating them back, and returns the keys of those Host does not
+    // hold, which a store in flight may still carry (none without a Host
+    // tier). prefix_hashes are the boundary's full pages, tail its partial
+    // page.
+    std::vector<CacheKey> RefreshHostBoundary(std::span<const std::string> prefix_hashes,
+                                              const std::optional<TailPublication>& tail, std::uint64_t access_epoch);
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
@@ -681,6 +747,10 @@ public:
     // with no logical block index, at a chunk boundary.
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
                         std::optional<PrefixCacheIndex::CachedBlockMetadata> inherited_metadata);
+    // A store's ACK publishes its entry at the epoch its batch took (the newer
+    // of that and an existing entry's), with no logical block index, at a
+    // chunk boundary.
+    void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch);
     void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
     CacheBlockRef AcquireHostCachedBlock(const CacheKey& key);
     struct StorageReservation {
@@ -914,7 +984,8 @@ private:
     // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
     // carries out; by whole segments first with place_by_segments (the
     // write-back policy), else block by block alone. Its per-block victim
-    // ranking is AcquireHostBlocks'; change the two together.
+    // ranking is AcquireHostBlocks' without access_epochs; change the two
+    // together.
     HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;

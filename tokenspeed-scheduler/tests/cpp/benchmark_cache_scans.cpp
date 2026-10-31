@@ -305,7 +305,8 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
     const std::array<std::int32_t, 1> buckets{0};
     std::uint64_t next_key = static_cast<std::uint64_t>(pool_size);
     Measure("acquire_host_blocks_full_cache", pool_size, 1, iterations, [&] {
-        CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(group_ids, buckets);
+        CacheCoordinator::HostAllocationBatch batch =
+            coordinator.AcquireHostBlocks(group_ids, buckets, /*access_epochs=*/{});
         if (batch.stats.allocated != 1) {
             std::abort();
         }
@@ -370,7 +371,8 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
     const std::array<std::int32_t, 2> buckets{0, 0};
     std::uint64_t next_key = static_cast<std::uint64_t>(pool_size);
     Measure("acquire_host_blocks_multi_group_full_cache", pool_size, 2, iterations, [&] {
-        CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(group_ids, buckets);
+        CacheCoordinator::HostAllocationBatch batch =
+            coordinator.AcquireHostBlocks(group_ids, buckets, /*access_epochs=*/{});
         if (batch.stats.allocated != group_ids.size()) {
             std::abort();
         }

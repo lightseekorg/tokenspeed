@@ -130,6 +130,21 @@ TEST_F(FinishOnlyWriteBackTestSuite, FinishStoresTheTailOfAOneTokenPrompt) {
     EXPECT_EQ(finish_write_back.page_offsets.front(), (std::vector<std::int32_t>{0}));
 }
 
+// Every token but the last counts as computed, so a request finishing before
+// any forward sampled a token has computed nothing: it leaves no boundary and
+// its finish stores nothing.
+TEST_F(FinishOnlyWriteBackTestSuite, AFinishThatComputedNothingStoresNothing) {
+    Submit(RequestSpec{.request_id = "r0", .tokens = {1}});
+    PlanOnce();
+    SendForwardDone("r0", {});
+    EXPECT_NO_THROW(SendFinish("r0"));
+
+    ExecutionPlan plan;
+    EXPECT_NO_THROW(plan = PlanOnce());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(plan).empty());
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+}
+
 TEST_F(FinishOnlyWriteBackTestSuite, AbortEmitsNoStore) {
     Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
     PlanOnce();
@@ -198,6 +213,219 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesAndTheFinal
         << "finish writes the decode MLA page, the MLA tail and each KDA group's final state";
     SendWriteBackDone(finish_write_back.op_ids.front());
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10);
+}
+
+// A Host cache of two entries. Every prompt finishes right after its prefill.
+class FinishHostDatesTestSuite : public FinishOnlyWriteBackTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FinishOnlyWriteBackTestSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 3;
+        return cfg;
+    }
+
+    // Returns the plan carrying the finish's store, not acknowledged.
+    ExecutionPlan FinishAfterPrefill(const std::string& id, std::vector<std::int32_t> tokens) {
+        Submit(RequestSpec{.request_id = id, .tokens = std::move(tokens), .max_new_tokens = 1});
+        PlanOnce();
+        SendForwardDone(id, {900});
+        SendFinish(id);
+        return PlanOnce();
+    }
+
+    // Where a prompt resumes: with the Device cache cleared, the Host hit.
+    std::int32_t HostHitTokens(const std::string& id, std::vector<std::int32_t> tokens) {
+        Submit(RequestSpec{.request_id = id, .tokens = std::move(tokens), .max_new_tokens = 1});
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan.Operations());
+        const std::int32_t index = FindRequestIndex(batch, id);
+        return index < 0 ? -1 : batch->extend_prefix_lens.at(static_cast<std::size_t>(index));
+    }
+};
+
+// A finish dates the prefix it leaves in one order, the first page newest,
+// whether a page's Host copy is already there, still in flight with an
+// earlier store, or stored by this finish. b's first page is a's, stored
+// first; b stores its second page; the next Host victim must be the second
+// page, or the second page would outlive the first it cannot be used without.
+TEST_F(FinishHostDatesTestSuite, APrefixLeavesHostFromItsEnd) {
+    for (const bool first_page_in_flight : {false, true}) {
+        SCOPED_TRACE(first_page_in_flight);
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        const ExecutionPlan a_store = FinishAfterPrefill("a", {1, 2});
+        if (!first_page_in_flight) {
+            AckWriteBacks(a_store);
+        }
+        const ExecutionPlan b_store = FinishAfterPrefill("b", {1, 2, 3, 4});  // resumes at 2 on the Device
+        if (first_page_in_flight) {
+            AckWriteBacks(a_store);  // a's copy of the first page lands before b's second page
+        }
+        AckWriteBacks(b_store);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 2);
+
+        AckWriteBacks(FinishAfterPrefill("c", {100, 101}));  // a third entry evicts one
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        EXPECT_EQ(HostHitTokens("probe", {1, 2, 3, 4, 5}), 2) << "the first page stays, the second left";
+    }
+}
+
+// Requests retracted by the debug knob, over a Host cache of a given size.
+class FinishAfterRetractionTestSuite : public FinishHostDatesTestSuite {
+protected:
+    void Reset(std::int32_t host_entries, std::int32_t retraction_interval) {
+        config_ = MakeConfig();
+        config_.device_allocator.total_pages = 16;
+        config_.cache_groups.front().total_pages = config_.device_allocator.total_pages;
+        config_.host_allocator.total_pages = host_entries + 1;
+        SetTestSnapshotPool(config_);
+        config_.debug_force_retraction_interval = retraction_interval;
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    }
+};
+
+// A published page whose image slot Host L2 cannot take rides the snapshot
+// pool, and the restore rebuilds it as a private copy: the Device block
+// published before the retraction stays the page's entry. r's pages never
+// reached Host -- an earlier store held every Host block when r streamed its
+// prompt and when it was retracted -- so its finish stores them from those
+// entries, dated as the prefix it leaves: one more Host entry evicts its
+// tail [44], not a page.
+TEST_F(FinishAfterRetractionTestSuite, AFinishStoresThePagesItsRestoreCopied) {
+    Reset(/*host_entries=*/4, /*retraction_interval=*/4);
+    Submit(RequestSpec{.request_id = "held", .tokens = MakeTokens(8, 200), .max_new_tokens = 1});
+    Submit(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 4}});
+    PlanOnce();  // plan 1: both prefills
+    SendForwardDone("held", {900});
+    SendFinish("held");  // its store takes every Host block
+    SendForwardDone("r", {42});
+    const ExecutionPlan held_store = PlanOnce();  // plan 2: r's prompt end finds no Host block
+    SendForwardDone("r", {43});
+    PlanOnce();
+    SendForwardDone("r", {44});
+    const ExecutionPlan retraction = PlanOnce();  // plan 4 retracts r = [1 2 3 4 42 43 44]
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(retraction).empty()) << "the L2 leg gets no Host block";
+    AckWriteBacks(held_store);
+    AckImageStores(retraction);
+
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->source_tiers.at(0),
+              std::vector<std::uint8_t>(3, static_cast<std::uint8_t>(HostTier::kSnapshotPool)))
+        << "the pages [1 2] [3 4] [42 43] come back from the snapshot pool";
+    AckRestores(readmit);
+    PlanOnce();
+    SendForwardDone("r", {45});
+    SendFinish("r");
+
+    const std::vector<CacheOperation> finish_stores = ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce());
+    ASSERT_EQ(finish_stores.size(), 1u);
+    const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
+    EXPECT_EQ(finish_write_back.src_pages.at(0).size(), 4u) << "the three pages and the tail [44]";
+    SendWriteBackDone(finish_write_back.op_ids.front());
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    AckWriteBacks(FinishAfterPrefill("e", {300, 301}));
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_EQ(HostHitTokens("probe", {1, 2, 3, 4, 42, 43, 44, 77}), 6);
+}
+
+// A request refreshes the Host copy of the boundary it resumed from at its
+// final publication, retracted or restored: r resumes from the system
+// prompt's tail [3] on the Device and raises its Host copy to r's admission,
+// past an idle prompt stored before r arrived, which is then the next Host
+// victim. Finishing while Retracted, r refreshes the copy at its retraction.
+// Restored, r refreshes it at its finish -- here the only chance, as the
+// system prompt's store lands only after the retraction.
+TEST_F(FinishAfterRetractionTestSuite, ARetractedRequestRefreshesTheBoundaryItResumedFrom) {
+    for (const bool restored : {false, true}) {
+        SCOPED_TRACE(restored);
+        // The restored r also leaves its tail [44]: one more Host entry.
+        Reset(/*host_entries=*/restored ? 6 : 5, /*retraction_interval=*/6);
+        Submit(RequestSpec{.request_id = "system", .tokens = {1, 2, 3}, .max_new_tokens = 1});
+        PlanOnce();
+        SendForwardDone("system", {900});
+        SendFinish("system");  // the page [1 2] and the tail [3]
+        Submit(RequestSpec{.request_id = "idle", .tokens = {100, 101}, .max_new_tokens = 1});
+        const ExecutionPlan system_store = PlanOnce();
+        if (!restored) {
+            AckWriteBacks(system_store);
+        }
+        SendForwardDone("idle", {900});
+        SendFinish("idle");  // the page [100 101]
+        Submit(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 5}});
+        AckWriteBacks(PlanOnce());  // plan 3: r resumes at 3
+        SendForwardDone("r", {42});
+        AckWriteBacks(PlanOnce());  // r's prompt end stores the page [3 5]
+        SendForwardDone("r", {43});
+        PlanOnce();
+        SendForwardDone("r", {44});
+        const ExecutionPlan retraction = PlanOnce();  // plan 6 retracts r, storing the page [42 43]
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+        AckImageStores(retraction);
+        if (restored) {
+            AckWriteBacks(system_store);
+            AckRestores(PlanOnce());
+            PlanOnce();
+            SendForwardDone("r", {45});
+        }
+        SendFinish("r");
+        if (restored) {
+            AckWriteBacks(PlanOnce());
+        }
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), restored ? 6 : 5);
+
+        AckWriteBacks(FinishAfterPrefill("e", {300, 301}));  // one entry evicts one
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        EXPECT_EQ(HostHitTokens("next", {1, 2, 3, 99}), 3) << "the tail r resumed from stayed";
+    }
+}
+
+// The boundary a request resumed from may still be on its way to Host when
+// the request leaves, in the store of the request that published it; the
+// refresh re-dates the copy in flight, so that store's ACK publishes it no
+// older than the request's admission. r resumes from the system prompt's
+// tail [3] on the Device and finishes -- right after its prefill, or while
+// Retracted -- before the system prompt's store lands: the idle prompt
+// stored before r arrived is still the next Host victim.
+TEST_F(FinishAfterRetractionTestSuite, ARequestRedatesTheBoundaryItResumedFromInFlight) {
+    for (const bool retracted : {false, true}) {
+        SCOPED_TRACE(retracted);
+        // r leaves the page [3 5], and retracted the page [42 43] too.
+        Reset(/*host_entries=*/retracted ? 5 : 4, /*retraction_interval=*/retracted ? 6 : 0);
+        Submit(RequestSpec{.request_id = "system", .tokens = {1, 2, 3}, .max_new_tokens = 1});
+        PlanOnce();
+        SendForwardDone("system", {900});
+        SendFinish("system");  // the page [1 2] and the tail [3]
+        Submit(RequestSpec{.request_id = "idle", .tokens = {100, 101}, .max_new_tokens = 1});
+        const ExecutionPlan system_store = PlanOnce();
+        SendForwardDone("idle", {900});
+        SendFinish("idle");  // the page [100 101]
+        Submit(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 5}});
+        AckWriteBacks(PlanOnce());  // plan 3: r resumes at 3
+        SendForwardDone("r", {42});
+        if (retracted) {
+            AckWriteBacks(PlanOnce());  // r's prompt end stores the page [3 5]
+            SendForwardDone("r", {43});
+            PlanOnce();
+            SendForwardDone("r", {44});
+            const ExecutionPlan retraction = PlanOnce();  // plan 6 retracts r, storing the page [42 43]
+            ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+            AckImageStores(retraction);
+            SendFinish("r");
+            AckWriteBacks(system_store);
+        } else {
+            SendFinish("r");
+            const ExecutionPlan r_store = PlanOnce();  // the page [3 5]
+            AckWriteBacks(system_store);
+            AckWriteBacks(r_store);
+        }
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), retracted ? 5 : 4);
+
+        AckWriteBacks(FinishAfterPrefill("e", {300, 301}));  // one entry evicts one
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        EXPECT_EQ(HostHitTokens("next", {1, 2, 3, 99}), 3) << "the tail r resumed from stayed";
+    }
 }
 
 class LoadBackDoneTestSuite : public SchedulerTestSuite {

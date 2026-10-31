@@ -41,36 +41,71 @@ TierTransferManager::TierTransferManager(CacheCoordinator& coordinator) : coordi
     restore_load_stats_.blocks.resize(num_groups);
 }
 
-std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreSourceGuard guard,
-                                                                          HostStoreCause cause) {
+std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(
+    StoreSourceGuard guard, HostStoreCause cause,
+    const std::optional<CacheCoordinator::FinalPublication>& publication) {
     _assert(cause == HostStoreCause::kPublication || cause == HostStoreCause::kFinish,
             "only publication and finish drain the pending-store queue");
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(cause)];
+    std::vector<CacheCoordinator::StoreCandidate> candidates = coordinator_.TakePendingStores();
+    if (candidates.empty() && !publication) {
+        return std::nullopt;
+    }
+    // The boundary's Host copies are refreshed first, so the allocation below
+    // evicts one only for a newer copy.
+    CacheCoordinator::StoreEpochs epochs = coordinator_.TakeStoreEpochs(publication);
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
     std::vector<std::uint32_t> group_ids;
     std::vector<std::int32_t> buckets;
-    // Keys already travelling: every ticket of every in-flight write-back
-    // whose ACK publishes it -- an eviction write-back's key may never be
+    std::vector<std::uint64_t> access_epochs;
+    const auto add = [&](CacheKey key, CacheBlockRef device_block_ref, std::uint64_t access_epoch) {
+        group_ids.push_back(key.group_id);
+        // The Host copy lives in its Device source's bucket (same owner).
+        buckets.push_back(
+            coordinator_.Allocator(static_cast<std::int32_t>(key.group_id)).BucketOf(device_block_ref->Location()));
+        keys.push_back(std::move(key));
+        device_block_refs.push_back(std::move(device_block_ref));
+        access_epochs.push_back(access_epoch);
+    };
+    // Keys already travelling: the ticket of the in-flight write-back whose
+    // ACK publishes each -- an eviction write-back's key may never be
     // published (its segment can be cancelled), so it is stored again.
     // Derived from write_backs_ on demand rather than mirrored in a second
-    // container that would have to be kept in step with it. Candidates join
-    // the same set so a key queued twice in one round is stored once.
-    std::unordered_set<CacheKey, CacheKeyHash> storing_keys;
-    for (const auto& [op_id, write_back] : write_backs_) {
+    // container that would have to be kept in step with it. The batch's own
+    // keys join `storing` so a key queued twice is stored once.
+    std::unordered_map<CacheKey, StoreTicket*, CacheKeyHash> in_flight;
+    for (auto& [op_id, write_back] : write_backs_) {
         if (!write_back.publishes_at_ack) {
             continue;
         }
-        for (const StoreTicket& ticket : write_back.tickets) {
-            storing_keys.insert(ticket.key);
+        for (StoreTicket& ticket : write_back.tickets) {
+            in_flight.emplace(ticket.key, &ticket);
         }
     }
-    for (auto& candidate : coordinator_.TakePendingStores()) {
+    std::unordered_set<CacheKey, CacheKeyHash> storing;
+    // The boundary's blocks Host lacks go first, front to back; one an earlier
+    // store still carries is published no older than this batch's epoch by
+    // that store. The first candidate queued for a block stored here lands
+    // where it does.
+    std::unordered_set<CacheKey, CacheKeyHash> boundary_rows;
+    for (CacheCoordinator::StoreEpochs::Uncached& block : epochs.uncached) {
+        if (const auto it = in_flight.find(block.key); it != in_flight.end()) {
+            it->second->access_epoch = std::max(it->second->access_epoch, block.access_epoch);
+        } else if (block.device_block && storing.insert(block.key).second) {
+            boundary_rows.insert(block.key);
+            add(std::move(block.key), std::move(block.device_block), block.access_epoch);
+        }
+    }
+    for (auto& candidate : candidates) {
         if (coordinator_.ContainsHostCachedBlock(candidate.key)) {
             ++stats.host_cached;
             continue;
         }
-        if (!storing_keys.insert(candidate.key).second) {
+        if (boundary_rows.erase(candidate.key) > 0) {
+            continue;
+        }
+        if (in_flight.contains(candidate.key) || !storing.insert(candidate.key).second) {
             ++stats.in_flight;
             continue;
         }
@@ -80,20 +115,24 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             ++stats.evicted_before_drain;
             continue;
         }
-
-        group_ids.push_back(candidate.key.group_id);
-        // The Host copy lives in its Device source's bucket (same owner).
-        buckets.push_back(coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id))
-                              .BucketOf(device_block_ref->Location()));
-        keys.push_back(std::move(candidate.key));
-        device_block_refs.push_back(std::move(device_block_ref));
+        const std::uint64_t access_epoch =
+            coordinator_.StoreEpoch(epochs, candidate.key.group_id, device_block_ref->Location());
+        add(std::move(candidate.key), std::move(device_block_ref), access_epoch);
     }
 
     if (keys.empty()) {
         return std::nullopt;
     }
 
-    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids, buckets);
+    // A final publication's copies carry different dates -- one per page of
+    // its boundary, while an entry outside it keeps its Device date -- so they
+    // are placed newest first and each evicts only older entries: the batch
+    // never trades an entry for an older copy, which would be the next victim.
+    // A live batch dates every copy `base`, newer than any entry, and
+    // allocates in candidate order.
+    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(
+        group_ids, buckets,
+        epochs.final_publication ? std::span<const std::uint64_t>(access_epochs) : std::span<const std::uint64_t>{});
     _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
     stats.no_placement += host_allocation.stats.unallocated;
 
@@ -124,6 +163,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             std::move(keys[i]),
             pin_source ? std::move(device_block_refs[i]) : CacheBlockRef{},
             std::move(host_block_ref),
+            access_epochs[i],
         });
         ++stats.blocks[group_ids[i]];
     }
@@ -193,7 +233,7 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
     std::vector<HostPublication> published;
     published.reserve(stores.size());
     for (StoreTicket& ticket : stores) {
-        coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key, /*inherited_metadata=*/std::nullopt);
+        coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key, ticket.access_epoch);
         published.push_back(HostPublication{.key = ticket.key, .block = ticket.host_block_ref});
     }
     // A segment publishes at the last ACK it waits for, in drain order,
@@ -380,6 +420,48 @@ TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks(
     return by_key;
 }
 
+void TierTransferManager::redateInFlight(const BoundaryEpochs& boundary) {
+    if (boundary.empty()) {
+        return;
+    }
+    for (auto& [op_id, write_back] : write_backs_) {
+        if (!write_back.publishes_at_ack) {
+            continue;
+        }
+        for (StoreTicket& ticket : write_back.tickets) {
+            if (const auto it = boundary.find(ticket.key); it != boundary.end()) {
+                ticket.access_epoch = std::max(ticket.access_epoch, it->second);
+            }
+        }
+    }
+}
+
+void TierTransferManager::RefreshHostBoundary(std::span<const std::string> prefix_hashes,
+                                              const std::optional<TailPublication>& tail, std::uint64_t access_epoch) {
+    BoundaryEpochs off_host;
+    for (CacheKey& key : coordinator_.RefreshHostBoundary(prefix_hashes, tail, access_epoch)) {
+        off_host.emplace(std::move(key), access_epoch);
+    }
+    redateInFlight(off_host);
+}
+
+CacheCoordinator::StoreEpochs TierTransferManager::TakeRetractionEpochs(
+    const CacheCoordinator::FinalPublication& publication) {
+    if (!coordinator_.HasHostPool()) {
+        return {};
+    }
+    // The image pins its entries until the request is restored or gone; what
+    // the retraction publishes is refreshed like a finish's boundary, so it
+    // is as recent as the retraction once the image lets go.
+    CacheCoordinator::StoreEpochs epochs = coordinator_.TakeStoreEpochs(publication);
+    BoundaryEpochs boundary;
+    for (const CacheCoordinator::StoreEpochs::Uncached& block : epochs.uncached) {
+        boundary.emplace(block.key, block.access_epoch);
+    }
+    redateInFlight(boundary);
+    return epochs;
+}
+
 TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionImage(
     std::span<const BlockTable> tables, std::int32_t num_tokens, std::vector<std::vector<ImageSlot>> published) const {
     const std::int32_t num_groups = coordinator_.NumGroups();
@@ -474,7 +556,8 @@ TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionIm
 
 std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartRetractionStores(
     const std::string& request_id, std::int32_t request_pool_index, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-    std::span<const BlockTable> tables, std::int32_t num_tokens, RetractionImageSplit split) {
+    std::span<const BlockTable> tables, std::int32_t num_tokens, RetractionImageSplit split,
+    CacheCoordinator::StoreEpochs epochs) {
     _assert(blob_slot != nullptr && blob_slot->valid(), "a retraction image needs its blob slot");
     _assert(!split.shortfall, "a retraction takes only an image its split holds");
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kRetraction)];
@@ -492,10 +575,15 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
     std::vector<std::uint32_t> pending_store_ops = std::move(split.pending_store_ops);
 
     // The L2 leg: the rows of the boundaries the split counted get Host
-    // blocks by its plan, copied by this retraction's own write-back.
+    // blocks by its plan, copied by this retraction's own write-back and
+    // dated like a finish's boundary (TakeRetractionEpochs).
     std::vector<StoreTicket> tickets;
     std::vector<BlockTransfer> host_store_pairs;
     if (!split.slots.empty()) {
+        BoundaryEpochs boundary;
+        for (const CacheCoordinator::StoreEpochs::Uncached& block : epochs.uncached) {
+            boundary.emplace(block.key, block.access_epoch);
+        }
         CacheCoordinator::HostAllocationBatch host_blocks =
             coordinator_.AcquireHostBoundaries(split.group_ids, split.buckets, split.boundaries);
         const std::size_t num_host_rows =
@@ -517,7 +605,11 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
             });
             // The ticket's Host pin is dropped at the ACK, which publishes the
             // entry; the image's own pin on the same block outlives it.
-            tickets.push_back(StoreTicket{slot.key, CacheBlockRef{}, host_block});
+            const auto dated = boundary.find(slot.key);
+            tickets.push_back(StoreTicket{
+                slot.key, CacheBlockRef{}, host_block,
+                dated != boundary.end() ? dated->second
+                                        : coordinator_.StoreEpoch(epochs, split.group_ids[i], slot.block->Location())});
             slot.block = std::move(host_block);
             host_slots[split.group_ids[i]].push_back(std::move(slot));
         }
