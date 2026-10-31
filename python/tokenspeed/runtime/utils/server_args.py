@@ -488,6 +488,9 @@ class ServerArgs:
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
+    # Opt-in: MoE TP prefill gathers MXFP4 intermediates and projects a second,
+    # output-column-split copy of the down weights (costs memory).
+    moe_prefill_down_column_split: bool = False
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -1187,6 +1190,13 @@ class ServerArgs:
         )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
+        if self.moe_prefill_down_column_split and (
+            not self.mapping.moe.has_tp or self.mapping.moe.has_ep
+        ):
+            raise ValueError(
+                "--moe-prefill-down-column-split needs MoE tensor parallelism "
+                "without expert parallelism"
+            )
         self._validate_decode_tp_layouts()
 
         if self.mm_encoder_tp_mode == "data":
@@ -3091,6 +3101,18 @@ class ServerArgs:
             "MoE on flashinfer_cutlass, for target and draft models. On by "
             "default; the fused reduction is not run-to-run reproducible. Forced "
             "off by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--moe-prefill-down-column-split",
+            action="store_true",
+            help="For MoE tensor parallelism, keep a second copy of the MXFP4 "
+            "expert down projections split by output columns. Large prefill "
+            "batches then gather each route's MXFP4 intermediate and compute "
+            "complete outputs for this rank's columns instead of "
+            "reduce-scattering every route's BF16 partial sum, exchanging fewer "
+            "bytes for one more down projection of weight memory per GPU. Needs "
+            "MXFP4 experts and activations with expert tensor parallelism on "
+            "AMD gfx950; MoE models that do not implement it reject it.",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",
