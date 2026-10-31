@@ -70,7 +70,7 @@ KV page counts, including each cached prefix. Native Prefill reuses the host
 page table to compact referenced owner pages once per batch and gathers unequal
 contributions with `torch_npu.distributed.all_gather_into_tensor_uneven`;
 no device count readback is needed. Current-row gathers and mapped commits
-still require the library's `DsaCpAllGatherV` and `DsaCpPatchMapped` exports. Reserve
+still require the library's `DsaCpAllGatherV` and unified `DsaCpPatch` export. Reserve
 the bounded history send/receive planes, a null page and aligned current-row capacity
 before sizing the cache arena. Decode and the shared cache writer keep their
 existing contracts.

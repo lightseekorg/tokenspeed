@@ -1290,40 +1290,23 @@ class AscendDSAPrefill:
         )
         # The communication stream already orders history before current.
         stream.wait_event(ready)
-        if self._bounded_history:
-            torch.ops.custom.npu_dsa_cp_patch_mapped(
-                target[self.history_rows :],
-                slots,
-                cache,
-                target,
-                direct,
-                mapped_slots,
-                slots.numel(),
-                self.local_rows,
-                virtual_blocks,
-                self._send_rows,
-                self.history_rows,
-                block_rows,
-                self.degree,
-                self.rank,
-                width,
-            )
-        else:
-            torch.ops.custom.npu_dsa_cp_patch(
-                target[self.history_rows :],
-                slots,
-                cache,
-                target,
-                direct,
-                slots.numel(),
-                self.local_rows,
-                virtual_blocks,
-                self._send_rows,
-                block_rows,
-                self.degree,
-                self.rank,
-                width,
-            )
+        torch.ops.custom.npu_dsa_cp_patch(
+            target[self.history_rows :],
+            slots,
+            cache,
+            target,
+            direct,
+            slots.numel(),
+            self.local_rows,
+            virtual_blocks,
+            self._send_rows,
+            block_rows,
+            self.degree,
+            self.rank,
+            width,
+            mapped_slots=mapped_slots if self._bounded_history else None,
+            gathered_rows=self.history_rows if self._bounded_history else 0,
+        )
         return target
 
     def finish(self, layer_id):
