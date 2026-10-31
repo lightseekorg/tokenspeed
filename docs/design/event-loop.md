@@ -309,7 +309,7 @@ startup and the frontend handshake (weight loading, tuning, capture, the
 transfer and L2 builders all synchronize on purpose); there is no switch to
 leave it off. `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` (the default) reports
 each offending site with its Python location, `error` raises there. CI
-serves every `server_smoke`, `eval` and `perf` task with `error`, which a
+serves every `server_smoke`, `eval`, and `perf` task with `error`, which a
 task cannot relax; the commit's event wait and the non-blocking copies pass
 unflagged, so a report is always a real stall. A deliberate wait off the
 per-round path is wrapped in `allow_host_sync` (`utils/host_sync.py`).

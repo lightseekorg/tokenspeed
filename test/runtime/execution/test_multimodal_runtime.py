@@ -20,18 +20,33 @@
 
 """Tests for MultimodalRuntime (mrope overrides factored out of ModelExecutor)."""
 
+import os
+import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
+# CPU tests, plus one CUDA test, scheduled in runtime-1gpu.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.execution.multimodal_runtime import (  # noqa: E402
+    MultimodalRuntime,
+)
 
 
 class _FakeInputBuffers:
-    def __init__(self, capacity: int = 64):
+    def __init__(self, capacity: int = 64, device: str = "cpu"):
         self.max_num_tokens = capacity
-        self.positions_buf = torch.arange(capacity, dtype=torch.int64)
-        self.mrope_positions_buf = torch.zeros(3, capacity, dtype=torch.int64)
+        self.positions_buf = torch.arange(capacity, dtype=torch.int64, device=device)
+        self.mrope_positions_buf = torch.zeros(
+            3, capacity, dtype=torch.int64, device=device
+        )
 
 
 class _FakeForwardOp:
@@ -133,6 +148,39 @@ def test_prefill_slices_precomputed_positions_by_prefix():
     out = rt.build_positions_override(op, _FakeMmContext([mm]), 4)
     assert out.shape == (3, 4)
     assert out[0].tolist() == [2, 3, 4, 5]
+
+
+def test_prefill_adds_a_delta_only_input_to_base_positions():
+    rt, _ = _runtime()
+    # No positions table, only the transferred delta.
+    mm = _mm_input(delta_tensor=torch.tensor([5], dtype=torch.int64))
+    op = _FakeForwardOp([3], num_extends=1, extend_prefix_lens=[0])
+    out = rt.build_positions_override(op, _FakeMmContext([mm]), 3)
+    assert out.tolist() == [[5, 6, 7]] * 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prefill_overrides_do_not_synchronize_with_the_device():
+    # The forward thread builds these while a step may be in flight: the
+    # host-side positions table and delta must reach the device without
+    # waiting for the stream.
+    ib = _FakeInputBuffers(64, device="cuda")
+    rt = MultimodalRuntime(model_is_mrope=True, input_buffers=ib, device="cuda")
+    table = torch.arange(30, dtype=torch.int64).reshape(1, -1).repeat(3, 1)
+    mms = [
+        _mm_input(positions=table),
+        _mm_input(delta_tensor=torch.tensor([5], dtype=torch.int64)),
+    ]
+    op = _FakeForwardOp([4, 3], num_extends=2, extend_prefix_lens=[2])
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        out = rt.build_positions_override(op, _FakeMmContext(mms), 7)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    # The second request has no extend prefix entry, so it takes the delta.
+    assert out.tolist() == [[2, 3, 4, 5, 9, 10, 11]] * 3
 
 
 def test_prefill_text_request_falls_back_to_linear():
