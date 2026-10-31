@@ -289,6 +289,7 @@ def _muse_state(rank, device, max_rows, enable_lamport):
         producer_direct_max_numel=max_rows * 8192,
         enable_lamport=enable_lamport,
         owned_route_max_rows=0,
+        intermediate_gather_max_rows=0,
         all_reduce=None,
         device=device,
     )
@@ -2321,6 +2322,7 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
         producer_direct_max_numel=capacity * 8192,
         enable_lamport=True,
         owned_route_max_rows=capacity,
+        intermediate_gather_max_rows=0,
         all_reduce=None,
         device=device,
     )
@@ -2481,6 +2483,216 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
             torch.cuda.synchronize()
             check(captured, phase)
         dist.barrier()
+
+
+def _muse_intermediate_exchange_worker(rank, world_size, device):
+    """Expert TP prefill gathers sorted intermediates and returns column-split rows.
+
+    Every rank sorts the same top-k IDs in their fixed order, so the gather
+    must place each rank's slice at its K range of the same sorted row; the
+    routed norm adds the ranks' sums of squares in rank order and must match
+    the portable norm of the assembled routes within BF16 rounding, with zero
+    padding rows and bitwise repeats. Row counts change between calls. One
+    graph replays three back-to-back layers that each rewrite the slot, with a
+    route reduce-scatter between them, while one rank is delayed: this guards
+    the exit waits that keep a rank from overwriting buffers peers still read.
+    """
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.moe import routed_input_scale_rmsnorm_sum
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        MXFP4SortedRoutes,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
+        gluon_moe_sorting,
+    )
+
+    torch.set_grad_enabled(False)
+    capacity = 8192
+    state = prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=capacity * 8192,
+        enable_lamport=True,
+        owned_route_max_rows=2049,
+        intermediate_gather_max_rows=capacity,
+        all_reduce=None,
+        device=device,
+    )
+    assert not state.can_gather_expert_intermediate(191)
+    assert not state.can_gather_expert_intermediate(capacity + 1)
+    slice_bytes = 4096 // world_size // 2
+    width = 4096 // world_size
+    norm = torch.linspace(0.5, 1.5, 4096, device=device).bfloat16()
+
+    def sorted_routes(rows):
+        generator = torch.Generator(device=device).manual_seed(rows)
+        ids = torch.rand(rows, 256, device=device, generator=generator).topk(8).indices
+        weights = torch.rand(rows, 8, device=device, generator=generator)
+        block = 64
+        sorted_ids, sorted_weights, expert_ids, valid, _ = gluon_moe_sorting(
+            ids.to(torch.int32).contiguous(),
+            weights,
+            256,
+            4096,
+            torch.bfloat16,
+            block,
+            use_minimum_route_chunks=False,
+            runtime_rows=False,
+            deterministic_order=True,
+        )
+        routes = MXFP4SortedRoutes(
+            sorted_ids, sorted_weights, expert_ids, valid, block, rows, 8
+        )
+        return routes, weights
+
+    def fill(rows, routes, seed):
+        generator = torch.Generator(device=device).manual_seed(seed)
+        data, scales = state.acquire_expert_intermediate(rows)
+        sorted_rows = routes.sorted_ids.shape[0]
+        panels = (sorted_rows + 31) // 32 * 32
+        data[:sorted_rows].copy_(
+            torch.randint(
+                0, 256, (sorted_rows, slice_bytes), device=device, generator=generator
+            )
+        )
+        scales[:panels].copy_(
+            torch.randint(
+                118,
+                124,
+                (panels, slice_bytes // 16),
+                device=device,
+                generator=generator,
+            )
+        )
+        columns = torch.randn(
+            rows * 8, width, device=device, generator=generator
+        ).bfloat16()
+        return columns
+
+    def expected_gather(rows, routes):
+        data, scales = state.acquire_expert_intermediate(rows)
+        sorted_rows = routes.sorted_ids.shape[0]
+        panels = (sorted_rows + 31) // 32 * 32
+        parts = [torch.empty_like(data[:sorted_rows]) for _ in range(world_size)]
+        dist.all_gather(parts, data[:sorted_rows].contiguous())
+        panel_parts = [torch.empty_like(scales[:panels]) for _ in range(world_size)]
+        dist.all_gather(panel_parts, scales[:panels].contiguous())
+        rows_data = torch.cat(parts, dim=1)
+        rows_scales = torch.cat(
+            [part.view(panels // 32, -1) for part in panel_parts], dim=1
+        )
+        return rows_data, rows_scales
+
+    def check_gather(rows, routes, full, full_scales, expected):
+        valid = int(routes.num_valid_ids[0])
+        real = (routes.sorted_ids[:valid] & 0xFFFFFF) < rows
+        assert torch.equal(full[:valid][real], expected[0][:valid][real])
+        panels = (valid + 31) // 32
+        assert torch.equal(full_scales.view(-1, 4096)[:panels], expected[1][:panels])
+
+    def expected_rows(rows, columns, weights):
+        parts = [torch.empty_like(columns) for _ in range(world_size)]
+        dist.all_gather(parts, columns)
+        complete = torch.cat(parts, dim=1).view(rows, 8, 4096)
+        return routed_input_scale_rmsnorm_sum(
+            complete, weights, norm, 1e-6, 1.0, False, None
+        )
+
+    def check_rows(rows, actual, reference):
+        local_rows = (rows + world_size - 1) // world_size
+        first = rank * local_rows
+        valid = min(local_rows, rows - first)
+        assert actual.shape == (local_rows, 4096)
+        torch.testing.assert_close(
+            actual[:valid], reference[first : first + valid], atol=2**-7, rtol=2**-7
+        )
+        assert not actual[valid:].any()
+
+    for rows in (193, 2049, capacity - 1, 192, capacity):
+        routes, weights = sorted_routes(rows)
+        columns = fill(rows, routes, 1000 * rank + rows)
+        expected = expected_gather(rows, routes)
+        full, full_scales = state.gather_expert_intermediate(routes, rows)
+        check_gather(rows, routes, full, full_scales, expected)
+        actual = state.column_routed_rmsnorm_sum(
+            columns, weights, norm, 1e-6, 1.0, rows
+        )
+        check_rows(rows, actual, expected_rows(rows, columns, weights))
+        again = state.column_routed_rmsnorm_sum(columns, weights, norm, 1e-6, 1.0, rows)
+        assert torch.equal(again, actual)
+
+    # Back-to-back layers in one graph: each overwrites the slot before its
+    # gather, so a missing exit wait lets a fast rank clobber a slow peer's
+    # reads. A route reduce-scatter (as on the BF16 expert layers) sits between.
+    rows = 2049
+    routes, weights = sorted_routes(rows)
+    data, scales = state.acquire_expert_intermediate(rows)
+    sorted_rows = routes.sorted_ids.shape[0]
+    panels = (sorted_rows + 31) // 32 * 32
+    layers = 3
+    sources = [
+        (
+            torch.empty_like(data[:sorted_rows]),
+            torch.empty_like(scales[:panels]),
+            torch.empty((rows * 8, width), device=device, dtype=torch.bfloat16),
+        )
+        for _ in range(layers)
+    ]
+    staged = state.acquire_owned_route_input(rows)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    dist.barrier()
+    outputs = []
+    with torch.cuda.graph(graph):
+        for layer, (source, source_scales, columns) in enumerate(sources):
+            data[:sorted_rows].copy_(source)
+            scales[:panels].copy_(source_scales)
+            full, full_scales = state.gather_expert_intermediate(routes, rows)
+            summed = state.column_routed_rmsnorm_sum(
+                columns, weights, norm, 1e-6, 1.0, rows
+            )
+            outputs.append((full, full_scales, summed))
+            if layer == 1:
+                reduced = state.reduce_scatter_owned_routes(staged, None, rows).clone()
+    for replay in range(3):
+        expected = []
+        for layer, (source, source_scales, columns) in enumerate(sources):
+            columns.copy_(fill(rows, routes, 7 * replay + 3 * layer + rank))
+            source.copy_(data[:sorted_rows])
+            source_scales.copy_(scales[:panels])
+            expected.append(
+                (
+                    expected_gather(rows, routes),
+                    expected_rows(rows, columns, weights),
+                )
+            )
+        staged.copy_(torch.randn(staged.shape, device=device).bfloat16())
+        complete = staged.float()
+        dist.all_reduce(complete)
+        local_rows = (rows + world_size - 1) // world_size
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == replay % world_size:
+            torch.cuda._sleep(2_000_000)
+        graph.replay()
+        torch.cuda.synchronize()
+        for (full, full_scales, summed), (gathered, reference) in zip(
+            outputs, expected
+        ):
+            check_gather(rows, routes, full, full_scales, gathered)
+            check_rows(rows, summed, reference)
+        first = rank * local_rows
+        valid = min(local_rows, rows - first)
+        torch.testing.assert_close(
+            reduced[:valid].float(),
+            complete.view(rows, 8, 4096)[first : first + valid],
+            atol=2**-5,
+            rtol=2**-7,
+        )
+    dist.barrier()
 
 
 def _muse_tp_owned_forward_worker(rank, world_size, device, *, quantized: bool):
@@ -3091,6 +3303,9 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
         ),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
         pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
+        pytest.param(
+            _muse_intermediate_exchange_worker, "nccl", id="intermediate_exchange"
+        ),
         pytest.param(
             partial(_muse_tp_owned_forward_worker, quantized=False),
             "nccl",

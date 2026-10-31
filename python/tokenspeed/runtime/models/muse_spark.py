@@ -2477,6 +2477,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 producer_direct_max_numel=capacity,
                 enable_lamport=True,
                 owned_route_max_rows=owned_route_max_rows,
+                intermediate_gather_max_rows=0,
                 all_reduce=backend.iris.state(group, torch.bfloat16),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )
