@@ -28,6 +28,8 @@ has the complete intermediate rows, each produces complete route values for
 its columns. The copy costs one more down projection of memory per rank.
 """
 
+from typing import Any
+
 import torch
 from tokenspeed_kernel.ops.moe import moe_sorted_down, prepare_moe_sorted_down_weight
 from torch import nn
@@ -95,7 +97,7 @@ class MoEDownColumns(nn.Module):
         self,
         intermediate: torch.Tensor,
         intermediate_scale: torch.Tensor,
-        routes,
+        routes: Any,
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Project complete sorted intermediate rows into this rank's columns.
