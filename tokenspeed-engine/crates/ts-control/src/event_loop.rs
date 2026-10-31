@@ -446,6 +446,8 @@ pub struct LoopConfig {
     pub limits: IngressLimits,
     /// Usable cache pages, reported with the load.
     pub kv_total_pages: i64,
+    /// Tokens one usable cache page holds.
+    pub kv_page_tokens: i64,
     /// Predecessors Engram reads per token; 0 for a model without Engram.
     pub ngram_context_len: usize,
     /// The model reads each request's committed token history, which the
@@ -516,6 +518,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     l3_metrics: Option<L3Metrics>,
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
+    /// The last cumulative prefix-hit counters reported, for deltas.
+    last_prefix_hits: Option<ts_scheduler::PrefixHitView>,
     batch_logger: BatchLogger,
     /// The token-history rows' owners, for a model that reads them.
     history: Option<HistoryRows>,
@@ -578,7 +582,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             scheduler,
             data_plane,
             frontend,
-            outputs,
+            outputs: outputs.with_metrics_enabled(subsystems.metrics.is_some()),
             config,
             ranks,
             transfer: subsystems.transfer,
@@ -588,6 +592,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             eplb: subsystems.eplb,
             grammars: subsystems.grammars,
             grammar_queue: Vec::new(),
+            last_prefix_hits: None,
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
             withheld: Vec::new(),
@@ -830,6 +835,55 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.config.kv_total_pages,
                 iteration_tokens,
             );
+            let total_pages = self.config.kv_total_pages;
+            metrics.record_cache_occupancy(
+                total_pages - i64::from(sizes.empty_lcm_blocks),
+                i64::from(sizes.active_lcm_blocks),
+                total_pages,
+                self.config.kv_page_tokens,
+            );
+            match self.outputs.role() {
+                crate::output::Role::Prefill => metrics.record_prefill_queues(
+                    sizes.bootstrapping as i64,
+                    sizes.pd_transfer as i64,
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Decode => metrics.record_decode_queues(
+                    sizes.bootstrapping as i64,
+                    sizes.pd_transfer as i64,
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Plain => {}
+            }
+            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
+            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
+            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
+            let request = self.outputs.take_request_metrics();
+            for seconds in request.ttft_seconds {
+                metrics.observe_time_to_first_token(seconds);
+            }
+            for seconds in request.request_seconds {
+                metrics.observe_request_time(seconds);
+            }
+            for seconds in request.decode_seconds {
+                metrics.observe_decode_time(seconds);
+            }
+            for seconds in request.tpot_seconds {
+                metrics.observe_time_per_output_token(seconds);
+            }
+            metrics.record_completion_tokens(request.completion_tokens);
+            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
+            let hits = self.scheduler.prefix_hit_stats();
+            if let Some(last) = self.last_prefix_hits {
+                metrics.record_prefix_hits(
+                    hits.prompt_tokens.saturating_sub(last.prompt_tokens),
+                    hits.device_hit_tokens
+                        .saturating_sub(last.device_hit_tokens),
+                    hits.host_hit_tokens.saturating_sub(last.host_hit_tokens),
+                    hits.l3_hit_tokens.saturating_sub(last.l3_hit_tokens),
+                );
+            }
+            self.last_prefix_hits = Some(hits);
         }
 
         let dp = self.dp_round(forward.as_ref(), stop)?;

@@ -238,6 +238,10 @@ pub struct RequestState {
     /// When the frontend received it (wall-clock seconds), 0 if it did not
     /// say.
     pub created_time: f64,
+    /// When its first output token existed (wall-clock seconds), 0 until
+    /// then. Unlike `timings`, this is collected whenever the rank reports
+    /// engine metrics.
+    pub first_token_time: f64,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
     /// The matcher of its grammar, once compiled.
@@ -313,6 +317,7 @@ impl RequestState {
             abort_notify_client: false,
             submitted_at: None,
             created_time: 0.0,
+            first_token_time: 0.0,
             timings: None,
             grammar: None,
             admission: 0,

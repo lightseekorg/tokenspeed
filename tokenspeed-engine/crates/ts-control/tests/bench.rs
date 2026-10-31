@@ -410,8 +410,10 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             },
         },
         kv_total_pages: pages as i64,
+        kv_page_tokens: shape.page as i64,
         ngram_context_len: 0,
         request_token_history: false,
+        request_token_history_lookback: None,
         controls: ControlConfig {
             memory_saver: false,
             memory_regions: Vec::new(),

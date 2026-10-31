@@ -1216,7 +1216,7 @@ TEST_F(AsyncStorageTransactionTest, CancellationBeforeDispatchReleasesReservatio
 // Whoever holds the lease holds the operation: a move hands it on without
 // detaching, and assigning over a live lease detaches the operation it held.
 TEST_F(AsyncStorageTransactionTest, MovingALeaseHandsTheOperationOn) {
-    StorageLease query = storage.StartQuery(std::vector<CacheKey>{key("h0")});
+    StorageLease query = storage.StartQuery(std::vector<CacheKey>{key("h0")}, {2});
     ASSERT_TRUE(query);
     const std::uint64_t query_id = query.OperationId();
     StorageLease held = std::move(query);
@@ -1390,7 +1390,7 @@ TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveOperationCreditsForQueries) 
         transfers.StartBackups();
         transfers.TakeCommands();
     }
-    const StorageLease query = transfers.StartQuery(coordinator.ExpandPrefixKeys(hashes));
+    const StorageLease query = transfers.StartQuery(coordinator.ExpandPrefixKeys(hashes), {2, 2, 2});
     EXPECT_TRUE(query);
     EXPECT_LE(transfers.NumHeldBlocks(), 2u);
 }
@@ -1407,7 +1407,7 @@ TEST_F(AsyncStorageTransactionTest, AOneCreditBudgetStillAllowsReads) {
     EXPECT_EQ(transfers.NumHeldBlocks(), 0u);
     EXPECT_EQ(transfers.NumBackupCandidates(), 0u);
     EXPECT_EQ(transfers.NumDisabledDroppedBackups(), 1u);
-    StorageLease query = transfers.StartQuery(coordinator.ExpandPrefixKeys(hashes));
+    StorageLease query = transfers.StartQuery(coordinator.ExpandPrefixKeys(hashes), {2, 2, 2});
     ASSERT_TRUE(query);
     transfers.Complete(cache::StorageDone{query.OperationId(), {1, 1, 1}, true, {0, 0, 0}});
     query.reset();
@@ -1439,7 +1439,7 @@ TEST_F(AsyncStorageTransactionTest, PressureGateDropsBackupsAndRequiresAllLowWat
     storage.QueueBackups(std::array{key("backup")});
     storage.StartBackups();
     EXPECT_EQ(storage.NumPressureDroppedBackups(), 2u);
-    EXPECT_FALSE(storage.StartQuery(coordinator.ExpandPrefixKeys(hashes)));
+    EXPECT_FALSE(storage.StartQuery(coordinator.ExpandPrefixKeys(hashes), {2, 2, 2}));
     EXPECT_FALSE(storage.StartRead(StoragePrompt(hashes, 2), coordinator.ExpandPrefixKeys(hashes)));
     EXPECT_EQ(storage.NumHeldBlocks(), 0u);
     EXPECT_TRUE(storage.TakeCommands().empty());
@@ -1453,7 +1453,7 @@ TEST_F(AsyncStorageTransactionTest, PressureGateDropsBackupsAndRequiresAllLowWat
     EXPECT_FALSE(storage.PressureGateClosed());
     storage.StartBackups();
     EXPECT_TRUE(storage.TakeCommands().empty()) << "dropped backups must not burst on recovery";
-    EXPECT_TRUE(storage.StartQuery(coordinator.ExpandPrefixKeys(hashes)));
+    EXPECT_TRUE(storage.StartQuery(coordinator.ExpandPrefixKeys(hashes), {2, 2, 2}));
 }
 
 TEST_F(AsyncStorageTransactionTest, QueuedBytesAndStalledNativeWorkCanClosePressureGate) {
@@ -1495,7 +1495,7 @@ TEST_F(AsyncStorageTransactionTest, HostCreditExhaustionRejectsQueryBeforeBacken
     const StorageLease read = storage.StartRead(StoragePrompt(hashes, 2), coordinator.ExpandPrefixKeys(hashes));
     ASSERT_TRUE(read);
     ASSERT_EQ(storage.NumHeldBlocks(), 4u);
-    EXPECT_FALSE(storage.StartQuery(std::vector<CacheKey>{key("new")}));
+    EXPECT_FALSE(storage.StartQuery(std::vector<CacheKey>{key("new")}, {2}));
 }
 
 TEST_F(AsyncStorageTransactionTest, NegativeMetadataRemainsBoundedAfterRetirement) {
@@ -1664,10 +1664,11 @@ TEST_F(AsyncStorageTransactionTest, RejectedReadDoesNotPoisonObjectsAndCanRetry)
     EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 0);
     read.reset();
     EXPECT_EQ(storage.NumHeldBlocks(), 0u);
-    StorageLease query = storage.StartQuery(coordinator.ExpandPrefixKeys(hashes));
+    StorageLease query = storage.StartQuery(coordinator.ExpandPrefixKeys(hashes), {2, 2, 2});
     storage.TakeCommands();
     storage.Complete(cache::StorageDone{query.OperationId(), {1, 1, 1}, true, {0, 0, 0}});
     const auto hits = storage.QueryHits(query.OperationId());
+    EXPECT_EQ(storage.QueryHitTokens(), 6u);
     EXPECT_EQ(hits.size(), 3u);
     query.reset();
     read = storage.StartRead(StoragePrompt(hashes, 2), hits);

@@ -467,6 +467,21 @@ pub struct FinishLog {
     pub request_stats: bool,
 }
 
+/// Per-request latency samples and token totals since the last drain.
+#[derive(Debug, Default)]
+pub struct RequestMetrics {
+    /// Time from request creation to its first output token.
+    pub ttft_seconds: Vec<f64>,
+    /// Time from request creation to its end (role-specific end boundary).
+    pub request_seconds: Vec<f64>,
+    /// Decode phase: first token to request end (plain and decode roles).
+    pub decode_seconds: Vec<f64>,
+    /// Decode seconds per generated token after the first one.
+    pub tpot_seconds: Vec<f64>,
+    /// Output tokens the requests produced, including the bootstrap token.
+    pub completion_tokens: u64,
+}
+
 /// The admitted requests and their outputs.
 pub struct OutputProcessor {
     states: HashMap<String, RequestState>,
@@ -484,6 +499,16 @@ pub struct OutputProcessor {
     last_commit_at: f64,
     /// Requests registered so far, numbering each admission.
     admissions: u64,
+    metrics_enabled: bool,
+    /// Metric deltas since the event loop last drained them.
+    generated_tokens: u64,
+    prompt_tokens: u64,
+    cache_hit_tokens: u64,
+    ttft_seconds: Vec<f64>,
+    request_seconds: Vec<f64>,
+    decode_seconds: Vec<f64>,
+    tpot_seconds: Vec<f64>,
+    completion_tokens: u64,
 }
 
 impl OutputProcessor {
@@ -507,7 +532,46 @@ impl OutputProcessor {
             finish_log,
             last_commit_at: 0.0,
             admissions: 0,
+            metrics_enabled: true,
+            generated_tokens: 0,
+            prompt_tokens: 0,
+            cache_hit_tokens: 0,
+            ttft_seconds: Vec::new(),
+            request_seconds: Vec::new(),
+            decode_seconds: Vec::new(),
+            tpot_seconds: Vec::new(),
+            completion_tokens: 0,
         }
+    }
+
+    pub(crate) fn with_metrics_enabled(mut self, enabled: bool) -> Self {
+        self.metrics_enabled = enabled;
+        self
+    }
+
+    /// Per-request latency samples and token totals since the last drain.
+    pub fn take_request_metrics(&mut self) -> RequestMetrics {
+        RequestMetrics {
+            ttft_seconds: std::mem::take(&mut self.ttft_seconds),
+            request_seconds: std::mem::take(&mut self.request_seconds),
+            decode_seconds: std::mem::take(&mut self.decode_seconds),
+            tpot_seconds: std::mem::take(&mut self.tpot_seconds),
+            completion_tokens: std::mem::take(&mut self.completion_tokens),
+        }
+    }
+
+    /// Generated tokens committed since the last drain.
+    pub fn take_generated_tokens(&mut self) -> u64 {
+        std::mem::take(&mut self.generated_tokens)
+    }
+
+    /// Prompt and prefix-cache tokens of requests that finished since the
+    /// last drain.
+    pub fn take_request_tokens(&mut self) -> (u64, u64) {
+        (
+            std::mem::take(&mut self.prompt_tokens),
+            std::mem::take(&mut self.cache_hit_tokens),
+        )
     }
 
     /// Give `rid` its grammar's matcher.
@@ -531,7 +595,14 @@ impl OutputProcessor {
     }
 
     /// Log a request's stats line as it leaves the processor.
-    fn log_end(&self, rid: &str, state: &RequestState) {
+    fn log_end(&mut self, rid: &str, state: &RequestState) {
+        if self.metrics_enabled {
+            // Cache and prompt totals feed the derived cache metrics.
+            self.prompt_tokens += state.prompt_len.max(0) as u64;
+            self.cache_hit_tokens += state.cached_tokens.max(0) as u64;
+            self.completion_tokens += state.output_ids.len() as u64;
+            self.collect_request_latencies(state);
+        }
         if !self.finish_log.enabled {
             return;
         }
@@ -546,6 +617,35 @@ impl OutputProcessor {
                     self.spec_num_tokens
                 )
             );
+        }
+    }
+
+    /// Record one request's latency samples, with this role's boundaries.
+    ///
+    /// A prefill role's request ends when its KV transfer completes, so its
+    /// request time includes the transfer; a decode role's request ends
+    /// after generation, and its decode time starts when the bootstrap token
+    /// landed. Both report the role-local views fluentllm's P/D servers do.
+    fn collect_request_latencies(&mut self, state: &RequestState) {
+        let created = state.created_time;
+        if created <= 0.0 {
+            return;
+        }
+        let finish = wall_seconds();
+        self.request_seconds.push((finish - created).max(0.0));
+        let first = state.first_token_time;
+        if first <= 0.0 {
+            return;
+        }
+        self.ttft_seconds.push((first - created).max(0.0));
+        if self.role == Role::Prefill {
+            return;
+        }
+        let decode = (finish - first).max(0.0);
+        self.decode_seconds.push(decode);
+        let generated = state.output_ids.len().saturating_sub(1);
+        if generated > 0 {
+            self.tpot_seconds.push(decode / generated as f64);
         }
     }
 
@@ -638,6 +738,11 @@ impl OutputProcessor {
         };
         state.cached_tokens = cached_tokens;
         state.output_ids.push(bootstrap_token);
+        if (self.metrics_enabled || state.timings.is_some()) && state.first_token_time == 0.0 {
+            // The decode node never samples this token; its arrival is the
+            // decode role's first-token boundary.
+            state.first_token_time = wall_seconds();
+        }
         if state.return_logprob {
             match bootstrap_logprob {
                 Some(logprob) => state.output_logprobs.push(logprob),
@@ -1185,6 +1290,7 @@ impl OutputProcessor {
                 (Some(indices), Some(_)) => indices.get(i).copied().unwrap_or(-1),
                 _ => -1,
             };
+            let before = state.output_ids.len();
             for (j, &token) in model_ids.iter().enumerate() {
                 state.output_ids.push(token);
                 if !hostfunc {
@@ -1256,9 +1362,21 @@ impl OutputProcessor {
                     break;
                 }
             }
-            if !state.output_ids.is_empty() {
+            if is_decode && self.metrics_enabled {
+                self.generated_tokens += (state.output_ids.len() - before) as u64;
+            }
+            if (self.metrics_enabled || state.timings.is_some())
+                && state.first_token_time == 0.0
+                && !state.output_ids.is_empty()
+            {
+                let first = if stats_now > 0.0 {
+                    stats_now
+                } else {
+                    wall_seconds()
+                };
+                state.first_token_time = first;
                 if let Some(timings) = state.timings.as_mut() {
-                    timings.mark_first_token(stats_now);
+                    timings.mark_first_token(first);
                 }
             }
             // P role: the final chunk's drafter candidates ride its result,
@@ -1566,6 +1684,62 @@ mod tests {
                 tokens: vec![vec![10, 11, 12, 13, 20], vec![30, 31]],
             })
         );
+    }
+
+    #[test]
+    fn request_latency_samples_use_the_prefill_boundaries() {
+        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Prefill, NO_FINISH_LOG);
+        register(&mut p, "a", 4, 8, &[]);
+        let mut state = p.states.remove("a").expect("registered above");
+        state.created_time = 100.0;
+        state.first_token_time = 100.25;
+        state.output_ids = vec![7];
+        p.log_end("a", &state);
+        let metrics = p.take_request_metrics();
+        assert_eq!(metrics.ttft_seconds, vec![0.25]);
+        assert_eq!(metrics.request_seconds.len(), 1);
+        // A prefill role has no decode phase of its own.
+        assert!(metrics.decode_seconds.is_empty());
+        assert!(metrics.tpot_seconds.is_empty());
+        assert_eq!(metrics.completion_tokens, 1);
+        assert_eq!(p.take_request_metrics().completion_tokens, 0);
+    }
+
+    #[test]
+    fn a_decode_landing_sets_the_first_token_boundary() {
+        let mut p = OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG);
+        register(&mut p, "a", 4, 8, &[]);
+        p.remote_prefill_done("a", 7, 0, None);
+        let state = p.state("a").expect("still registered");
+        assert!(state.first_token_time > 0.0);
+        assert_eq!(state.output_ids, vec![7]);
+    }
+
+    #[test]
+    fn disabled_metrics_do_not_retain_finished_requests() {
+        let mut p = processor(None).with_metrics_enabled(false);
+        let mut state = RequestState::new(vec![1], 4, BTreeSet::new(), true, None, false);
+        state.created_time = 100.0;
+        state.first_token_time = 101.0;
+        state.output_ids = vec![2, 3];
+        p.log_end("done", &state);
+        let samples = p.take_request_metrics();
+        assert!(samples.ttft_seconds.is_empty());
+        assert!(samples.request_seconds.is_empty());
+        assert!(samples.decode_seconds.is_empty());
+        assert!(samples.tpot_seconds.is_empty());
+    }
+
+    #[test]
+    fn finished_requests_feed_prompt_and_cache_totals() {
+        let mut p = processor(None);
+        register(&mut p, "a", 12, 4, &[]);
+        let mut state = p.states.remove("a").expect("registered above");
+        state.cached_tokens = 3;
+        p.log_end("a", &state);
+        assert_eq!(p.take_request_tokens(), (12, 3));
+        // Draining is destructive: the next round must not report it again.
+        assert_eq!(p.take_request_tokens(), (0, 0));
     }
 
     #[test]
@@ -2332,6 +2506,10 @@ mod tests {
             .commit(&batch(&[("r", 3, 0, 1)], 0), None, &verify)
             .unwrap();
         assert_eq!(c.outputs[0].output_ids, [6, 7]);
+        assert_eq!(p.take_generated_tokens(), 2);
+        p.commit(&batch(&[("r", 3, 0, 1)], 0), None, &verify)
+            .unwrap();
+        assert_eq!(p.take_generated_tokens(), 0);
         assert_eq!(c.outputs[0].output_logprobs, [-0.6, -0.7]);
         assert_eq!(c.outputs[0].output_token_cumulative_probs, [0.2, 0.3]);
     }
