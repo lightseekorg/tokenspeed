@@ -620,7 +620,7 @@ class AscendDSAKernels:
         result, _ = self._index(
             query.contiguous(),
             key,
-            weights.to(torch.bfloat16).contiguous(),
+            weights.float().contiguous(),
             actual_seq_lengths_query=q_ends,
             actual_seq_lengths_key=kv_lengths,
             block_table=table,
@@ -657,7 +657,7 @@ class AscendDSAKernels:
         result, values = self._index(
             query.contiguous(),
             key,
-            weights.to(torch.bfloat16).contiguous(),
+            weights.float().contiguous(),
             actual_seq_lengths_query=q_ends,
             actual_seq_lengths_key=kv_lengths,
             block_table=table,
