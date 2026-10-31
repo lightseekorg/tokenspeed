@@ -795,11 +795,18 @@ out must not be retracted — its result would land on pages it no longer owns,
 and the image must know the landed tokens — and one whose pages a PD transfer
 still pins must not be either. Both are checked on the chosen victim; if it is
 not quiescent, retraction waits for it rather than sacrificing a worse-ranked
-request. Two global gates remain. An in-flight load-back: it is writing pages
-its admission owns, and the victim policy cannot see that write. And an
-in-flight *pinned* store: it holds Device capacity the ack returns by itself,
-so retracting anyone for that capacity would be the thrash of §4 — the
-blocked admission retries against the released pins next round instead.
+request. A request the round being built has dispatched work for is not
+offered for an image at all: it cannot quiesce before retraction runs, and the
+next round schedules it again first, so waiting for it would leave every
+request blocked beside it holding idle pages for as long as its reserve lasts.
+The abort tier still considers every resident: when no offered image fits,
+the newest resident is aborted, or waited for while its forward is out, rather
+than an older blocked request. Two global gates remain. An in-flight
+load-back: it is writing pages its admission owns, and the victim policy
+cannot see that write. And an in-flight *pinned* store: it holds Device
+capacity the ack returns by itself, so retracting anyone for that capacity
+would be the thrash of §4 — the blocked admission retries against the
+released pins next round instead.
 Stream-ordered stores — both legs of an image, and eviction write-backs —
 hold nothing and gate nothing, and an in-flight restore gates nothing: its
 request is `Restoring`, invisible to `chooseVictim`.
@@ -1353,7 +1360,8 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   running beside a stalled prefill.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
-  no PD transfer against its pages (§3.1) — and an in-flight load-back or an
+  no PD transfer against its pages (§3.1) — and is imaged only if the same
+  round has dispatched no work for it; an in-flight load-back or an
   in-flight pinned store defers all retraction; stream-ordered stores and
   in-flight restores defer nothing. A victim that would serve nobody is not
   retracted. A victim whose image does not fit is aborted through

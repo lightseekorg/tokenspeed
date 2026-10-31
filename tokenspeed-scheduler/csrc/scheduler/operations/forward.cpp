@@ -863,7 +863,10 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // completes on its own reserve and frees its pages then. Excluded by state:
 // Retracted, Restoring, RemotePrefilling. Transient obstacles (a forward still
 // out, a PD transfer pin) do NOT redirect the choice; the caller waits for the
-// chosen victim to quiesce rather than sacrificing a worse-ranked request.
+// chosen victim to quiesce rather than sacrificing a worse-ranked request. The
+// capacity caller does not offer the requests its own round has dispatched
+// work for to the image tier -- those cannot quiesce before it runs -- but
+// keeps them for the abort tier.
 Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
     const auto retractable = [ignore_exemption](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
@@ -1137,6 +1140,28 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         return;
     }
 
+    // Not a request this round has dispatched work for: its forward is out
+    // until the round runs, and the next round schedules it again before
+    // retraction runs, so a wait for it to quiesce lasts as long as its
+    // reserve does -- while every request blocked beside it keeps its pages
+    // idle. A forced victim sitting the round out (maybeForceRetraction) is
+    // marked scheduled with nothing dispatched; it stays a victim, waited for
+    // as before. Computed once: every path below that schedules work returns
+    // before the next chooseVictim.
+    std::vector<Request*> victims;
+    victims.reserve(candidates.size());
+    std::ranges::copy_if(candidates, std::back_inserter(victims), [this, &build](const Request* request) {
+        return !build.Scheduled(*request) || request->Id() == forced_victim_id_;
+    });
+    // The abort tier keeps every resident: when no image of an offered victim
+    // fits, the choice is the one chooseVictim makes over all residents -- the
+    // newest (the least work lost) is aborted, or waited for while its forward
+    // is out, rather than an older blocked request being aborted.
+    const auto choose_victim = [this, &victims, candidates](bool ignore_exemption) {
+        VictimChoice choice = chooseVictim(victims, ignore_exemption);
+        return choice.shortfall ? chooseVictim(candidates, ignore_exemption) : choice;
+    };
+
     while (true) {
         // No ranked choice can run while every resident is still being
         // written. Avoid hashing and planning images that would all wait.
@@ -1148,7 +1173,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             })) {
             return;
         }
-        VictimChoice choice = chooseVictim(candidates, /*ignore_exemption=*/false);
+        VictimChoice choice = choose_victim(/*ignore_exemption=*/false);
         // A finished request whose last forward is still out frees its pages
         // when that forward lands (settleFinishedRequests), so a round that
         // waits for it is not empty either.
@@ -1160,7 +1185,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (empty_round) {
             // Nothing is retractable under the exemption and the round runs
             // nothing: the empty-round retraction (docs/design/scheduler.md §2).
-            choice = chooseVictim(candidates, /*ignore_exemption=*/true);
+            choice = choose_victim(/*ignore_exemption=*/true);
         }
         Request* victim = choice.victim;
         if (victim == nullptr) {
