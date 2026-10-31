@@ -22,21 +22,24 @@ Both direct decode and E2M1 package prefill accept token-ordered, prequantized
 activations. Package prefill reuses their packed data and gathers the existing
 CDNA4 scales into route order instead of quantizing the BF16 input again.
 
-Route-tiled GEMMs group each expert's routes into small tiles described by
-`(start, count, expert)`. Both GEMMs reuse these descriptors and preserve
-token/slot order for intermediates and outputs. Matrix dimensions, top-k and
-expert counts are explicit kernel parameters. Up to 16 rows one program builds
-the descriptors; above that each expert packs its routes into a fixed-length
-list whose length is a power-of-two capacity no smaller than the row count (a
+Route-tiled GEMMs group each expert's routes into small tiles and preserve
+token/slot order for intermediates and outputs, so each expert's weights are
+read once however many tokens route to it. Matrix dimensions, top-k and expert
+counts are explicit kernel parameters. Up to 16 rows each GEMM program groups
+the routes itself from the top-k IDs (an expert then has at most 16 routes, one
+tile) and stage 1 writes the route map, so no separate launch builds
+descriptors. Above that each expert packs its routes into a fixed-length list
+whose length is a power-of-two capacity no smaller than the row count (a
 token's top-k expert IDs are distinct, so an expert gets at most one route per
-row), so all row counts sharing a capacity reuse one compilation. The GEMMs
-run a fixed persistent grid over the device-side descriptor count and have no
+row), and a second kernel splits the lists into `(start, count, expert)`
+descriptors; all row counts sharing a capacity reuse one compilation. The GEMMs
+run a fixed persistent grid over the device-side group count and have no
 row-dependent compile-time parameters.
 `fused/tuning.py:_ROUTE_TILE_CONFIGS` sets which shapes and rows take this path
-and each GEMM's tile widths, and whether it issues the next K tile's loads
-before the current MFMA (`PIPELINE_K`). Neither changes the K accumulation
-order, so every schedule, and the staged package path that serves the other
-rows, produces bitwise-identical results.
+and each GEMM's tile widths, waves, and how many K tiles' loads it keeps in
+flight ahead of the MFMA (`PREFETCH_TILES`). Neither changes the K
+accumulation order, so every schedule, and the direct decode and staged
+package paths that serve the other rows, produce bitwise-identical results.
 
 The package prefill also runs as two calls split at the intermediate:
 `gluon_mxfp4_sorted_gate_up_gfx950` writes sorted E2M1 rows into a caller
@@ -66,7 +69,7 @@ owns only a sparse subset of the routed experts.
 | `decode_stage1.py` / `decode_stage2.py` | A4W4 direct and route-tiled MFMA GEMMs. Stage 1 fuses SwiGLU and optional quantization; deferred execution preserves individual stage-2 route outputs. |
 | `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`, the K loop (optionally pipelined), and the compact scaled-upcast scale tile `situ_decode.py` reuses. |
 | `routing.py` | Fused dense top-k route kernels (softmax, sigmoid-bias, and a prefill variant); output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
-| `moe_sorting.py` | Block-aligned expert sort for grouped GEMMs and route descriptors for route-tiled GEMMs. |
+| `moe_sorting.py` | Block-aligned expert sort for grouped GEMMs and route descriptors for route-tiled GEMMs above 16 rows. |
 | `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths: route-direct warp decode reads linear or gdot128 weights, while the contiguous-EP grouped GEMM reads linear weights. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
 | `n16_weights.py` | N16 expert bank shared by the N16 pipelines (`mxfp4_gemm.py`, `prefill_mxfp8.py` / `mxfp8_gemm.py`, N16 `situ_decode.py`): lane-ordered 1 KiB blocks of 64-byte K chunks per 16-row group, word-packed scales, checkpoint-update loaders. |
