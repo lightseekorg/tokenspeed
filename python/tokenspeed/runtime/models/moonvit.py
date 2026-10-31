@@ -964,7 +964,10 @@ class MoonViTVisionPath(nn.Module):
         pixel_values = torch.cat(
             [item.feature.to(device, non_blocking=True) for item in items], dim=0
         ).to(dtype=target_dtype)
-        grid_thws = torch.cat([item.grid_thws for item in items], dim=0).to(device)
+        # The grid stays on the host: every consumer (position embedding,
+        # RoPE table, cu_seqlens, patch merger) reads it there, and uploading
+        # it would wait for the step in flight.
+        grid_thws = torch.cat([item.grid_thws for item in items], dim=0)
         hidden_states = self.vision_tower.patch_embed(pixel_values, grid_thws)
         return hidden_states, grid_thws
 

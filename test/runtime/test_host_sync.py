@@ -35,7 +35,10 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution import device as device_module  # noqa: E402
 from tokenspeed.runtime.utils.env import envs  # noqa: E402
-from tokenspeed.runtime.utils.host_sync import allow_host_sync  # noqa: E402
+from tokenspeed.runtime.utils.host_sync import (  # noqa: E402
+    allow_host_sync,
+    host_to_device,
+)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -109,3 +112,51 @@ def test_the_check_cannot_be_disabled(monkeypatch, mode):
     monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", mode)
     with pytest.raises(ValueError, match="cannot be disabled"):
         device_module.arm_data_plane_sync_debug("cuda")
+
+
+def test_host_to_device_copies_lists_and_strided_tensors():
+    assert host_to_device(
+        [[1, 2], [3, 4]], dtype=torch.int32, device="cpu"
+    ).tolist() == [
+        [1, 2],
+        [3, 4],
+    ]
+    table = torch.arange(12).reshape(3, 4)
+    out = host_to_device(table[:, 1:3], dtype=torch.int64, device="cpu")
+    assert out.is_contiguous()
+    assert torch.equal(out, table[:, 1:3])
+    assert host_to_device([], dtype=torch.int64, device="cpu").shape == (0,)
+
+
+@requires_cuda
+def test_host_to_device_does_not_wait_for_the_stream(sync_debug_off):
+    # Long enough that copying it from a strided source, even a pinned one,
+    # makes the driver stage it through pageable memory and wait.
+    table = torch.arange(3 * (1 << 18)).reshape(3, -1)
+    chunk = table[:, 2 : 2 + (1 << 17)]
+    values = list(range(1000))
+    # The first pinned buffer of a size comes from cudaHostAlloc, which waits.
+    host_to_device(chunk, dtype=torch.int64, device="cuda")
+    host_to_device(values, dtype=torch.int32, device="cuda")
+    torch.cuda.synchronize()
+    torch.cuda._sleep(1 << 30)
+    in_flight = torch.cuda.Event()
+    in_flight.record()
+    torch.cuda.set_sync_debug_mode("error")
+    from_tensor = host_to_device(chunk, dtype=torch.int64, device="cuda")
+    from_list = host_to_device(values, dtype=torch.int32, device="cuda")
+    torch.cuda.set_sync_debug_mode(0)
+    assert not in_flight.query()
+    torch.cuda.synchronize()
+    assert torch.equal(from_tensor.cpu(), chunk)
+    assert from_list.tolist() == values
+
+
+@requires_cuda
+def test_host_to_device_refuses_graph_capture():
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        with pytest.raises(RuntimeError, match="graph capture"):
+            with torch.cuda.graph(graph, stream=stream):
+                host_to_device([1, 2], dtype=torch.int32, device="cuda")

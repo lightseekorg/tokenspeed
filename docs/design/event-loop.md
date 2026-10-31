@@ -303,7 +303,9 @@ synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
 the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
-copies and an event the commit waits on. Torch's sync-debug mode enforces this
+copies and an event the commit waits on; host-built metadata goes the other
+way through `host_to_device` (`utils/host_sync.py`), a non-blocking copy from
+contiguous pinned memory. Torch's sync-debug mode enforces this
 rule, and `HostBootstrap.enter_serving` always arms it once the rank finished
 startup and the frontend handshake (weight loading, tuning, capture, the
 transfer and L2 builders all synchronize on purpose); there is no switch to
