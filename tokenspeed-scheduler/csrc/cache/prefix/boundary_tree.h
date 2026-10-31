@@ -58,7 +58,8 @@ public:
         // a publication through its hash links it (FindOrAdd).
         Node* parent{nullptr};
         // The children in insertion order, linked through the siblings:
-        // appending and unlinking take constant time.
+        // appending and unlinking take constant time. Roots use the same
+        // sibling links in the tree's root list.
         Node* first_child{nullptr};
         Node* last_child{nullptr};
         Node* prev_sibling{nullptr};
@@ -137,6 +138,13 @@ public:
             }
             return node;
         }
+        if (!inserted) {
+            // An existing root is about to acquire its known parent.
+            (node.prev_sibling != nullptr ? node.prev_sibling->next_sibling : first_root_) = node.next_sibling;
+            (node.next_sibling != nullptr ? node.next_sibling->prev_sibling : last_root_) = node.prev_sibling;
+            node.prev_sibling = nullptr;
+            node.next_sibling = nullptr;
+        }
         node.hash = &it->first;
         node.parent = parent;
         node.boundary_tokens = boundary_tokens;
@@ -162,6 +170,10 @@ public:
                     updateHostLeafList(*parent, parent_was_host_leaf);
                 }
             }
+        } else {
+            node.prev_sibling = last_root_;
+            (last_root_ != nullptr ? last_root_->next_sibling : first_root_) = &node;
+            last_root_ = &node;
         }
         return node;
     }
@@ -266,6 +278,35 @@ public:
 
     const Node* FirstHostKvDuplicate() const { return first_host_kv_duplicate_; }
 
+    // Only a complete Device prefix without a pending store at or above it
+    // can replace a Host copy. Prune whole blocked subtrees and stop at the
+    // first possible duplicate; pins and checkpoint windows are checked by
+    // the coordinator. This needs no per-page ancestor-count maintenance.
+    bool HasHostKvDuplicateCandidate() const {
+        if (first_host_kv_duplicate_ == nullptr) {
+            return false;
+        }
+        const Node* node = first_root_;
+        while (node != nullptr) {
+            if (node->device_kv_prefix_complete && node->pending_host_stores == 0) {
+                if (node->has_host_kv_duplicate) {
+                    return true;
+                }
+                if (node->first_child != nullptr) {
+                    node = node->first_child;
+                    continue;
+                }
+            }
+            while (node != nullptr && node->next_sibling == nullptr) {
+                node = node->parent;
+            }
+            if (node != nullptr) {
+                node = node->next_sibling;
+            }
+        }
+        return false;
+    }
+
     // Drops a childless node that holds nothing: no checkpoint on either tier,
     // nothing on either tier and no store on its way to the Host.
     void Remove(Node& node) {
@@ -277,6 +318,9 @@ public:
             Node& parent = *node.parent;
             (node.prev_sibling != nullptr ? node.prev_sibling->next_sibling : parent.first_child) = node.next_sibling;
             (node.next_sibling != nullptr ? node.next_sibling->prev_sibling : parent.last_child) = node.prev_sibling;
+        } else {
+            (node.prev_sibling != nullptr ? node.prev_sibling->next_sibling : first_root_) = node.next_sibling;
+            (node.next_sibling != nullptr ? node.next_sibling->prev_sibling : last_root_) = node.prev_sibling;
         }
         // Erase by iterator: the node's own key must not be read after the
         // node is gone.
@@ -285,6 +329,8 @@ public:
 
     void Clear() {
         nodes_.clear();
+        first_root_ = nullptr;
+        last_root_ = nullptr;
         first_host_leaf_ = nullptr;
         last_host_leaf_ = nullptr;
         first_host_kv_duplicate_ = nullptr;
@@ -317,6 +363,8 @@ private:
 
     // Node-based, so nodes and keys keep their addresses across rehashes.
     std::unordered_map<ContentHash, Node> nodes_;
+    Node* first_root_{nullptr};
+    Node* last_root_{nullptr};
     Node* first_host_leaf_{nullptr};
     Node* last_host_leaf_{nullptr};
     Node* first_host_kv_duplicate_{nullptr};

@@ -94,11 +94,31 @@ decode role of a disaggregated deployment never computes prompt rows (the
 prefill node returns the logprobs), so the runtime leaves its bound at the
 default.
 
-The input's full-page chain hashes are prepared once per request. A failed
-first admission reuses those immutable identities and probes the current
-Device and Host contents again; it never reuses a previous residency result.
+The input's full-page chain hashes and their expansion into per-group cache
+keys are prepared once per request. A failed first admission reuses those
+immutable identities and probes the current Device and Host contents again;
+it never reuses a previous residency result. The keys are shared with the
+pending probe, including optional checkpoint retries. The pre-admission state
+owns the request's reference and releases it when the first admission succeeds.
 The pending match views the request-owned hashes. Mutable execution progress
 copies the reused prefix only after admission succeeds.
+
+An eviction write-back releases its Device entries before its Host segment
+becomes visible. If recorded or in-flight segment keys would extend a submitted
+prompt's hit under the ordinary matching rules, first admission waits for
+the copy ACK and probes again. The request holds no pages or request slot
+while waiting and is not a capacity blocker; other prompts and decodes can
+run. Unrelated copies, keys without a complete usable checkpoint, and keys
+beyond the request's cache bound do not delay admission. The pending keys
+are only evidence that waiting may help: no load or hit accounting uses
+them before publication.
+The coordinator maintains their membership from eviction recording through
+segment settlement, including evictions by earlier admissions in the same
+plan, before the transfer manager drains them. Repeated records of one key
+keep it pending until all settle. A segment refused Host placement settles at
+the drain, so its keys cannot keep a later plan waiting. Each probe uses fresh
+cache residency with this maintained key set; it does not rebuild the set or
+reuse a previous reachability result.
 
 Decode consumes an existing reserve in place when no page or pending State
 checkpoint became complete and no sliding-window block needs reclaiming. This
@@ -303,6 +323,19 @@ cache with no spare block): the next chunk's admission publishes its live slot
 there, at the cost of one more round. Multi-turn traffic whose next turn
 re-renders the end of the previous prompt then reuses the common prefix
 immediately.
+
+An active request retains one such aligned input checkpoint and its cached,
+non-replayable sliding windows across both tiers. Its full-history tables
+already hold the remaining dependencies. This matters for restricted State:
+a long decode cannot publish a replacement checkpoint, so releasing the input
+as soon as it leaves slot 0 can lose the next turn's reusable prefix while its
+producer is still running. The hold uses ordinary references in the shared
+cache pools, acquired once when the input checkpoint becomes available; decode
+does not scan or refresh it each step. At finish, its entries become recent
+without counting as a cache hit, then ownership is released. An admission that
+cannot fit drops its own optional hold before retrying, and retraction drops
+it before imaging the request. Neither an incomplete checkpoint nor a partial
+set of sliding-window dependencies is retained.
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to

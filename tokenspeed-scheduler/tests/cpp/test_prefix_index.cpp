@@ -117,6 +117,56 @@ TEST(PrefixCacheIndexInspectionTest, KeepsPoolsSeparateAndDoesNotClaimMissingKey
     EXPECT_FALSE(index.Inspect(device, KeyOf("absent")));
 }
 
+TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinctAfterEviction) {
+    constexpr std::int32_t count = 128;
+    BlockPool pool(count, {1});
+    PrefixCacheIndex index(kGroupId);
+    std::vector<CacheKey> keys;
+    std::vector<CacheBlockLocation> locations;
+    for (std::int32_t i = 0; i < count; ++i) {
+        std::string digest(64, 'a');
+        digest.back() = "0123456789abcdef"[i / 8];
+        keys.push_back(CacheKey{.namespace_id = static_cast<CacheNamespaceId>(i % 2),
+                                .group_id = kGroupId,
+                                .content_hash = std::move(digest),
+                                .page_offset = (i / 2) % 4});
+        CacheBlockRef block = pool.AcquireBlock(kGroupId);
+        ASSERT_TRUE(block);
+        locations.push_back(block->Location());
+        index.Register(pool, block, keys.back(), static_cast<std::uint64_t>(i + 1),
+                       /*logical_block_index=*/i, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+    }
+
+    for (std::int32_t i = 0; i < count; ++i) {
+        const auto entry = index.Inspect(pool, keys[i]);
+        ASSERT_TRUE(entry);
+        EXPECT_EQ(entry->location, locations[i]);
+        EXPECT_EQ(entry->metadata.logical_block_index, i);
+        CacheKey missing = keys[i];
+        missing.namespace_id += 2;
+        EXPECT_FALSE(index.Contains(pool, missing));
+        missing = keys[i];
+        missing.page_offset += 4;
+        EXPECT_FALSE(index.Contains(pool, missing));
+        missing = keys[i];
+        missing.content_hash.front() = 'b';
+        EXPECT_FALSE(index.Contains(pool, missing));
+    }
+
+    std::vector<CacheBlockLocation> remaining;
+    for (std::int32_t i = 0; i < count; ++i) {
+        if (i % 2 == 0) {
+            EXPECT_EQ(index.Evict(pool, locations[i]), keys[i]);
+        } else {
+            remaining.push_back(locations[i]);
+        }
+    }
+    for (std::int32_t i = 0; i < count; ++i) {
+        EXPECT_EQ(index.Contains(pool, keys[i]), i % 2 != 0);
+    }
+    EXPECT_EQ(DrainEvictionOrder(index, pool), remaining);
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, DeliversOneEpochPerBatchSortedByLocation) {
     BlockPool pool(4, {1});
     PrefixCacheIndex index(kGroupId);
@@ -152,6 +202,36 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEntriesWithoutLosingTheRest) 
 
     pinned.reset();
     EXPECT_EQ(DrainEvictionOrder(index, pool).size(), 2u);
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, EvictionCapacityBoundIncludesReleasedAndRepublishedEntries) {
+    BlockPool pool(3, {1});
+    BlockPool other_pool(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    Cache(index, pool, "first", 1);
+    Cache(index, pool, "second", 2);
+    auto held = pool.AcquireBlock(kGroupId);
+    ASSERT_TRUE(held);
+    index.Register(pool, held, KeyOf("held"), 3, 0, CacheBoundaryKind::kEndpoint, nullptr);
+    EXPECT_EQ(index.PotentiallyEvictableEntries(other_pool), 0u);
+    EXPECT_GE(index.PotentiallyEvictableEntries(pool), 2u);
+    EXPECT_EQ(DrainEvictionOrder(index, pool).size(), 2u);
+    EXPECT_GE(index.PotentiallyEvictableEntries(pool), 2u);
+
+    held.reset();
+    EXPECT_GE(index.PotentiallyEvictableEntries(pool), 3u);
+    EXPECT_EQ(DrainEvictionOrder(index, pool).size(), 3u);
+    held = index.Find(pool, KeyOf("held"));
+    EXPECT_EQ(DrainEvictionOrder(index, pool).size(), 2u);
+    index.Register(pool, held, KeyOf("held"), 5, 0, CacheBoundaryKind::kEndpoint, nullptr);
+    held.reset();
+    EXPECT_GE(index.PotentiallyEvictableEntries(pool), 3u);
+
+    for (const CacheBlockLocation location : DrainEvictionOrder(index, pool)) {
+        ASSERT_TRUE(index.Evict(pool, location));
+    }
+    EXPECT_EQ(index.PotentiallyEvictableEntries(pool), 0u);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, ReleasedPinnedEntryUsesItsLatestPublishedEpoch) {
@@ -288,6 +368,211 @@ TEST(PrefixCacheIndexEvictionOrderTest, AZeroEpochAndAnAbsentTierAreDistinct) {
     EXPECT_FALSE(index.PeekEvictionEpoch(empty_pool, empty_cursor));
     EXPECT_FALSE(index.NextEvictionEpoch(empty_pool, empty_cursor, 0, batch));
     EXPECT_EQ(batch.size(), 1u) << "an exhausted tier does not clear prior output";
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, SkipsKnownPinnedEpochsUntilTheirOwnersReleaseThem) {
+    BlockPool pool(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation held = Cache(index, pool, "held", 1);
+    const CacheBlockLocation other = Cache(index, pool, "other", 8);
+    CacheBlockRef owner = index.Find(pool, KeyOf("held"));
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{other}));
+
+    {
+        PrefixCacheIndex::EvictionCursor cursor;
+        EXPECT_EQ(index.PeekEvictionEpoch(pool, cursor), 8u);
+        std::vector<PrefixCacheIndex::EvictionCandidate> batch;
+        EXPECT_FALSE(index.NextEvictionEpoch(pool, cursor, 7, batch));
+        EXPECT_TRUE(batch.empty());
+        ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, 8, batch));
+        ASSERT_EQ(batch.size(), 1u);
+        EXPECT_EQ(batch.front().location, other);
+        EXPECT_FALSE(index.PeekEvictionEpoch(pool, cursor));
+    }
+    index.Register(pool, owner, KeyOf("held"), 3, -1, CacheBoundaryKind::kChunk, nullptr);
+    owner.reset();
+    PrefixCacheIndex::EvictionCursor released;
+    EXPECT_EQ(index.PeekEvictionEpoch(pool, released), 3u);
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{held, other}));
+}
+
+TEST(PrefixCacheIndexRecentOrderTest, SeparatesPinnedEntriesWithoutTouchingOrPinningThem) {
+    BlockPool pool(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation old = Cache(index, pool, "old", 2);
+    const CacheBlockLocation held = Cache(index, pool, "held", 6);
+    const CacheBlockLocation recent = Cache(index, pool, "recent", 9);
+    const CacheBlockRef pin = index.Find(pool, KeyOf("held"));
+    {
+        PrefixCacheIndex::RecentCursor pinned_cursor;
+        const auto entry = index.NextRecentEntry(pool, pinned_cursor, /*pinned=*/true);
+        ASSERT_TRUE(entry);
+        EXPECT_EQ(*entry->key, KeyOf("held"));
+        EXPECT_EQ(entry->block.location, held);
+        EXPECT_EQ(entry->block.metadata.last_access_epoch, 6u);
+        EXPECT_TRUE(entry->block.pinned);
+        EXPECT_FALSE(index.NextRecentEntry(pool, pinned_cursor, /*pinned=*/true));
+
+        PrefixCacheIndex::RecentCursor available_cursor;
+        const auto first = index.NextRecentEntry(pool, available_cursor, /*pinned=*/false);
+        const auto second = index.NextRecentEntry(pool, available_cursor, /*pinned=*/false);
+        ASSERT_TRUE(first);
+        ASSERT_TRUE(second);
+        EXPECT_EQ(first->block.location, recent);
+        EXPECT_EQ(second->block.location, old);
+        EXPECT_FALSE(first->block.pinned);
+        EXPECT_FALSE(second->block.pinned);
+        EXPECT_FALSE(index.NextRecentEntry(pool, available_cursor, /*pinned=*/false));
+        EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{old, recent}));
+    }
+    EXPECT_EQ(index.Evict(pool, recent), KeyOf("recent"));
+    EXPECT_FALSE(index.Evict(pool, held));
+}
+
+TEST(PrefixCacheIndexRecentOrderTest, ANewTraversalObservesRecencyAndOwnershipChanges) {
+    BlockPool pool(2, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation old = Cache(index, pool, "old", 1);
+    const CacheBlockLocation recent = Cache(index, pool, "recent", 7);
+    CacheBlockRef pin = index.Find(pool, KeyOf("recent"));
+    {
+        PrefixCacheIndex::RecentCursor cursor;
+        const auto entry = index.NextRecentEntry(pool, cursor, /*pinned=*/false);
+        ASSERT_TRUE(entry);
+        EXPECT_EQ(entry->block.location, old);
+        EXPECT_FALSE(index.NextRecentEntry(pool, cursor, /*pinned=*/false));
+    }
+    pin = {};
+    {
+        CacheBlockRef block = index.Find(pool, KeyOf("old"));
+        index.Register(pool, block, KeyOf("old"), 8, -1, CacheBoundaryKind::kChunk, nullptr);
+    }
+    PrefixCacheIndex::RecentCursor cursor;
+    const auto first = index.NextRecentEntry(pool, cursor, /*pinned=*/false);
+    const auto second = index.NextRecentEntry(pool, cursor, /*pinned=*/false);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first->block.location, old);
+    EXPECT_EQ(first->block.metadata.last_access_epoch, 8u);
+    EXPECT_EQ(second->block.location, recent);
+    EXPECT_FALSE(index.NextRecentEntry(pool, cursor, /*pinned=*/false));
+}
+
+TEST(PrefixCacheIndexRecentOrderTest, IncludesEpochZeroAndHandlesAnAbsentTier) {
+    BlockPool pool(1, {1});
+    BlockPool absent(1, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation location = Cache(index, pool, "zero", 0);
+    PrefixCacheIndex::RecentCursor cursor;
+    const auto entry = index.NextRecentEntry(pool, cursor, /*pinned=*/false);
+    ASSERT_TRUE(entry);
+    EXPECT_EQ(entry->block.location, location);
+    EXPECT_EQ(entry->block.metadata.last_access_epoch, 0u);
+    EXPECT_FALSE(index.NextRecentEntry(pool, cursor, /*pinned=*/false));
+    PrefixCacheIndex::RecentCursor absent_cursor;
+    EXPECT_FALSE(index.NextRecentEntry(absent, absent_cursor, /*pinned=*/false));
+}
+
+TEST(PrefixCacheIndexCommonOrderTest, TracksBothTiersAndUsesOnlySourceRecency) {
+    BlockPool source(4, {1});
+    BlockPool peer(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto a = Cache(index, source, "a", 10);
+    const auto b = Cache(index, source, "b", 20);
+    Cache(index, source, "source-only", 100);
+    const auto peer_b = Cache(index, peer, "b", 90);
+    index.TrackCommonEntries(source, peer);
+    const auto common_keys = [&] {
+        std::vector<std::string> keys;
+        PrefixCacheIndex::CommonCursor cursor;
+        while (const auto entry = index.NextCommonRecentEntry(source, cursor)) {
+            keys.push_back(entry->key->content_hash);
+        }
+        return keys;
+    };
+    EXPECT_EQ(common_keys(), (std::vector<std::string>{"b"}));
+    const auto peer_a = Cache(index, peer, "a", 200);
+    Cache(index, peer, "peer-only", 300);
+    EXPECT_EQ(common_keys(), (std::vector<std::string>{"b", "a"}));
+
+    CacheBlockRef source_pin = index.Find(source, KeyOf("a"));
+    CacheBlockRef peer_pin = index.Find(peer, KeyOf("b"));
+    index.Register(source, source_pin, KeyOf("a"), 30, -1, CacheBoundaryKind::kChunk, nullptr);
+    EXPECT_EQ(common_keys(), (std::vector<std::string>{"a", "b"}));
+    {
+        PrefixCacheIndex::CommonCursor cursor;
+        const auto first = index.NextCommonRecentEntry(source, cursor);
+        const auto second = index.NextCommonRecentEntry(source, cursor);
+        ASSERT_TRUE(first);
+        ASSERT_TRUE(second);
+        EXPECT_EQ(first->source.location, a);
+        EXPECT_EQ(first->peer.location, peer_a);
+        EXPECT_TRUE(first->source.pinned);
+        EXPECT_FALSE(first->peer.pinned);
+        EXPECT_EQ(second->source.location, b);
+        EXPECT_EQ(second->peer.location, peer_b);
+        EXPECT_FALSE(second->source.pinned);
+        EXPECT_TRUE(second->peer.pinned);
+        // Borrowed snapshots must not prevent removing the peer copy.
+        EXPECT_EQ(index.Evict(peer, peer_a), KeyOf("a"));
+    }
+    EXPECT_EQ(common_keys(), (std::vector<std::string>{"b"}));
+    Cache(index, peer, "a", 500);
+    EXPECT_EQ(common_keys(), (std::vector<std::string>{"a", "b"}));
+    source_pin.reset();
+    peer_pin.reset();
+    EXPECT_EQ(index.Evict(source, b), KeyOf("b"));
+    EXPECT_EQ(common_keys(), (std::vector<std::string>{"a"}));
+    Cache(index, source, "b", 0);
+    EXPECT_EQ(common_keys(), (std::vector<std::string>{"a", "b"}));
+}
+
+TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinningEntries) {
+    BlockPool pool(3, {1});
+    BlockPool absent(1, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto old = Cache(index, pool, "old", 0);
+    const auto held = Cache(index, pool, "held", 6);
+    const auto recent = Cache(index, pool, "recent", 9);
+    CacheBlockRef pin = index.Find(pool, KeyOf("held"));
+    std::vector<std::string> seen;
+    index.ForEachEntry(pool, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
+        seen.push_back(key.content_hash);
+        EXPECT_EQ(entry.pinned, key == KeyOf("held"));
+        EXPECT_FALSE(entry.metadata.was_acquired);
+        if (key == KeyOf("old")) {
+            EXPECT_EQ(entry.location, old);
+            EXPECT_EQ(entry.metadata.last_access_epoch, 0u);
+        } else if (key == KeyOf("held")) {
+            EXPECT_EQ(entry.location, held);
+            EXPECT_EQ(entry.metadata.last_access_epoch, 6u);
+        } else {
+            EXPECT_EQ(key, KeyOf("recent"));
+            EXPECT_EQ(entry.location, recent);
+            EXPECT_EQ(entry.metadata.last_access_epoch, 9u);
+        }
+    });
+    std::ranges::sort(seen);
+    EXPECT_EQ(seen, (std::vector<std::string>{"held", "old", "recent"}));
+    EXPECT_EQ(pin.use_count(), 2u);
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{old, recent}));
+    EXPECT_FALSE(index.Evict(pool, held));
+    pin = {};
+    {
+        CacheBlockRef block = index.Find(pool, KeyOf("held"));
+        index.Register(pool, block, KeyOf("held"), 10, -1, CacheBoundaryKind::kChunk, nullptr);
+    }
+    index.ForEachEntry(pool, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
+        EXPECT_FALSE(entry.pinned);
+        if (key == KeyOf("held")) {
+            EXPECT_EQ(entry.metadata.last_access_epoch, 10u);
+        }
+    });
+    EXPECT_EQ(index.Evict(pool, old), KeyOf("old"));
+    EXPECT_EQ(index.Evict(pool, held), KeyOf("held"));
+    index.ForEachEntry(absent, [&](const CacheKey&, const PrefixCacheIndex::CachedBlockSnapshot&) {
+        ADD_FAILURE() << "an absent tier contains no entries";
+    });
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextEpoch) {

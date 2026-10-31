@@ -399,7 +399,7 @@ struct ClosedLoop {
         }
         if (write_back) {
             // The blocks evicted for the cache (by admission, stranded suffix
-            // or restore) add up to the drain's outcomes: a Host entry
+            // or restore, including reusable released inputs) add up to the drain's outcomes: a Host entry
             // already, carried by a store in flight, without Host room,
             // copied, or dropped as dead; recopied and cancelled blocks are
             // among the copied ones. The counts are cumulative, so the first
@@ -410,9 +410,9 @@ struct ClosedLoop {
             for (const std::uint64_t blocks : eviction.blocks) {
                 outcomes += blocks;
             }
-            const std::uint64_t evicted = stats.device_evictions.admission.blocks +
-                                          stats.device_evictions.stranded_suffix.blocks +
-                                          stats.device_evictions.restore.blocks;
+            const std::uint64_t evicted =
+                stats.device_evictions.admission.blocks + stats.device_evictions.stranded_suffix.blocks +
+                stats.device_evictions.restore.blocks + stats.device_evictions.request_reclaim_for_write_back;
             if (outcomes != evicted) {
                 throw std::logic_error("round " + std::to_string(round) + ": the drain's outcomes add up to " +
                                        std::to_string(outcomes) + " blocks, the evictions for the cache to " +

@@ -2096,9 +2096,9 @@ TEST_P(StateCheckpointPrefillHostShardSuite, NoEvictionRecordCrossesAPlan) {
 // h resumes at s1's checkpoint on the Device and prefills [22, 38) in two
 // chunks. The second chunk's rotation releases that checkpoint, and with no
 // other room in the pool the admission reclaims it -- with its tail's KV
-// block, the request's own copy of which it keeps -- as the request's own:
-// dropped, never written back.
-TEST_P(StateCheckpointPrefillHostShardSuite, RequestReclaimedCheckpointIsDropped) {
+// block, the request's own copy of which it keeps. Its published checkpoint
+// remains reusable and is written back as the request releases it.
+TEST_P(StateCheckpointPrefillHostShardSuite, RequestReclaimedCheckpointIsWrittenBack) {
     device_pages_ = 10;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     std::vector<std::int32_t> tokens = MakeTokens(22);
@@ -2112,10 +2112,11 @@ TEST_P(StateCheckpointPrefillHostShardSuite, RequestReclaimedCheckpointIsDropped
     ASSERT_EQ(chunks.size(), 2u);
     EXPECT_EQ(chunks[0].prefix_tokens, 22);
     const HostCacheStats stats = scheduler_->GetHostCacheStats();
-    EXPECT_EQ(stats.eviction_stores.ops, 0u);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+    EXPECT_EQ(stats.eviction_stores.ops, 1u);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
     // The tail's KV block and its three checkpoints.
     EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, 4u);
+    EXPECT_EQ(stats.device_evictions.request_reclaim_for_write_back, 4u);
     EXPECT_EQ(stats.device_evictions.admission.blocks, 0u);
 }
 
@@ -3717,6 +3718,233 @@ TEST_F(StateCheckpointFusedHostSuite, ARestoresEvictionStoreRunsBeforeTheRestore
         reused = reused || read.contains({restored.group_ids[0][row], restored.dst_pages[0][row]});
     }
     EXPECT_TRUE(reused);
+}
+
+class ActiveInputCheckpointSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 128;
+        cfg.host_allocator.total_pages = 32;
+        cfg.disable_l2_cache = false;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        cfg.state_checkpoint_in_forward = true;
+        cfg.max_scheduled_tokens = 16;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+            if (group.attn_kind == AttnKind::kState) {
+                group.checkpoint_granularity = kP;
+            }
+        }
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "recent",
+            .block_granularity = kP,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kSlidingWindow,
+            .sliding_window_tokens = kP,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(ActiveInputCheckpointSuite, AnInteriorCheckpointPublishesItsOwnRecentWindow) {
+    for (const bool host_cache : {false, true}) {
+        for (const std::int32_t grain : {1, kP, 2 * kP}) {
+            for (const std::int32_t prompt_tokens : {31, 32, 35, 37, 40}) {
+                SCOPED_TRACE(host_cache);
+                SCOPED_TRACE(grain);
+                SCOPED_TRACE(prompt_tokens);
+                config_ = WithHostPackingFromDevice(MakeConfig());
+                config_.disable_l2_cache = !host_cache;
+                config_.host_write_policy = host_cache ? SchedulerConfig::HostWritePolicy::kWriteBack
+                                                       : SchedulerConfig::HostWritePolicy::kWriteThrough;
+                config_.decode_input_tokens = 1;
+                for (CacheGroupConfig& group : config_.cache_groups) {
+                    if (group.attn_kind == AttnKind::kState) {
+                        group.checkpoint_granularity = grain;
+                    }
+                }
+                scheduler_ = std::make_unique<Scheduler>(config_);
+                const std::vector<std::int32_t> prompt = MakeTokens(prompt_tokens);
+                Submit(RequestWithTokens("live", prompt));
+                for (std::int32_t step = 0; step < 8 && scheduler_->DecodingSize() == 0; ++step) {
+                    const ExecutionPlan plan = PlanOnce();
+                    AckWriteBacks(plan);
+                    const ForwardBatch* batch = FindForwardBatch(plan);
+                    ASSERT_NE(batch, nullptr);
+                    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"live"});
+                    const bool prefill_left =
+                        batch->NumExtends() > 0 &&
+                        batch->extend_prefix_lens[0] + batch->input_lengths[0] < batch->prefill_lengths[0];
+                    SendForwardDone("live",
+                                    prefill_left ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{900});
+                }
+                ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+                SendFinish("live");
+                PlanOnce();
+                // Diverging in the last input page needs the interior
+                // checkpoint's window, which can precede the endpoint window.
+                std::vector<std::int32_t> next = prompt;
+                next.back() = 777;
+                next.push_back(778);
+                const std::int32_t boundary_grain = std::max(kP, grain);
+                EXPECT_EQ(Probe("next", std::move(next)).prefix_tokens,
+                          (prompt_tokens - 1) / boundary_grain * boundary_grain);
+                EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
+                EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+                EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+            }
+        }
+    }
+}
+
+TEST_F(ActiveInputCheckpointSuite, ALongDecodeKeepsAnInputCheckpointForTheNextTurn) {
+    // The 31-token prompt writes its checkpoint inside a forward; the
+    // 35-token prompt reaches the boundary at a prefill chunk end instead.
+    for (const std::int32_t prompt_tokens : {31, 32, 35, 36}) {
+        SCOPED_TRACE(prompt_tokens);
+        Reset(/*host_cache=*/true, /*decode_width=*/1);
+        const std::vector<std::int32_t> prompt = MakeTokens(prompt_tokens);
+        Submit(RequestSpec{.request_id = "live", .tokens = prompt, .max_new_tokens = 192});
+        const auto run_step = [&]() {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
+                for (const std::uint32_t id : std::get<LoadBackBatch>(operation).op_ids) {
+                    SendLoadBackDone(id);
+                }
+            }
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            for (std::size_t row = 0; batch != nullptr && row < batch->request_ids.size(); ++row) {
+                const std::string& id = batch->request_ids[row];
+                if (row < batch->NumExtends() &&
+                    batch->extend_prefix_lens[row] + batch->input_lengths[row] < batch->prefill_lengths[row]) {
+                    SendForwardDone(id);
+                } else {
+                    SendForwardDone(id, {900});
+                    if (id != "live") {
+                        SendFinish(id);
+                    }
+                }
+            }
+            EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+        };
+        for (std::int32_t i = 0; i < 4; ++i) {
+            run_step();
+        }
+        ASSERT_GT(scheduler_->RequestTokenSize("live"), prompt_tokens);
+        for (std::int32_t i = 0; i < 80; ++i) {
+            SCOPED_TRACE(i);
+            const std::string id = "pressure-" + std::to_string(i);
+            Submit(RequestWithTokens(id, MakeTokens(12, 1000 + i * 32)));
+            for (std::int32_t step = 0; step < 8 && scheduler_->RequestTokenSize(id) >= 0; ++step) {
+                run_step();
+            }
+            ASSERT_EQ(scheduler_->RequestTokenSize(id), -1);
+        }
+        ASSERT_GT(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
+        ASSERT_GT(scheduler_->RequestTokenSize("live"), prompt_tokens + 20);
+        SendFinish("live");
+        run_step();
+        for (std::int32_t i = 0; i < 2; ++i) {
+            const std::string id = "between-turns-" + std::to_string(i);
+            Submit(RequestWithTokens(id, MakeTokens(12, 10000 + i * 32)));
+            for (std::int32_t step = 0; step < 8 && scheduler_->RequestTokenSize(id) >= 0; ++step) {
+                run_step();
+            }
+            ASSERT_EQ(scheduler_->RequestTokenSize(id), -1);
+        }
+        std::vector<std::int32_t> next = prompt;
+        next.back() = 777;
+        next.push_back(778);
+        EXPECT_EQ(Probe("next", next).prefix_tokens, (prompt_tokens - 1) / kP * kP);
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+        EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+    }
+}
+
+TEST_F(StateCheckpointInForwardRetractionPoolSuite, RetainingAnInputCannotBlockItsOwnersGeneration) {
+    pool_pages_ = 22;
+    prefix_replay_tokens_ = 0;
+    force_retraction_interval_ = 0;
+    for (const bool host_cache : {false, true}) {
+        SCOPED_TRACE(host_cache);
+        Reset(host_cache, /*decode_width=*/1);
+        const Outcome out = DriveOne(RequestWithTokens("r", MakeTokens(22)), /*finish_after=*/32);
+        EXPECT_TRUE(out.finished);
+        EXPECT_FALSE(out.stalled);
+        EXPECT_EQ(out.retractions, 0);
+        ExpectEveryBlockFreeOrCacheOnly();
+    }
+}
+
+TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIncompleteOnes) {
+    // The cached window crosses a prefix boundary. The replayable group has
+    // no cached blocks and must not prevent retaining the complete input.
+    for (const std::int32_t missing : {-1, 0, 4}) {
+        SCOPED_TRACE(missing);
+        BlockPool device(16, {1, 1, 1, 1, 1});
+        BlockPool host(16, {1, 1, 1, 1, 1});
+        const std::vector<CacheGroupSpec> specs{
+            {.attn_kind = AttnKind::kFull, .block_granularity = 4},
+            {.attn_kind = AttnKind::kState},
+            {.attn_kind = AttnKind::kState},
+            {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .block_granularity = 2},
+            {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .replayable = true, .block_granularity = 2},
+        };
+        auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true);
+        const std::vector<std::string> hashes{"first", "second"};
+        const std::vector<CacheKey> keys{
+            {.group_id = 1, .content_hash = hashes[1]},
+            {.group_id = 2, .content_hash = hashes[1]},
+            {.group_id = 3, .content_hash = hashes[0], .page_offset = 1},
+            {.group_id = 3, .content_hash = hashes[1], .page_offset = 0},
+            {.group_id = 3, .content_hash = hashes[1], .page_offset = 1},
+        };
+        std::vector<std::uint64_t> epochs;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<std::int32_t>(i) == missing) {
+                epochs.push_back(0);
+                continue;
+            }
+            BlockPool& pool = i % 2 == 0 ? device : host;
+            auto blocks = pool.AcquireBlocks(keys[i].group_id, 1);
+            ASSERT_EQ(blocks.size(), 1u);
+            if (&pool == &device) {
+                coordinator.CacheDeviceBlock(blocks[0], keys[i], 1, CacheBoundaryKind::kEndpoint, 0);
+            } else {
+                coordinator.CacheHostBlock(blocks[0], keys[i], std::nullopt);
+            }
+            epochs.push_back(
+                coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i])->metadata.last_access_epoch);
+        }
+        auto retained = coordinator.RetainInputCheckpoint(hashes, 8);
+        EXPECT_EQ(retained.size(), missing == -1 ? keys.size() : 0u);
+        coordinator.RefreshRetainedCheckpoint(retained);
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<std::int32_t>(i) == missing) {
+                continue;
+            }
+            const BlockPool& pool = i % 2 == 0 ? device : host;
+            const auto entry = coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i]);
+            ASSERT_TRUE(entry);
+            EXPECT_EQ(entry->pinned, missing == -1);
+            EXPECT_FALSE(entry->metadata.was_acquired) << "retention is not a prefix hit";
+            if (missing == -1) {
+                EXPECT_GT(entry->metadata.last_access_epoch, epochs[i]);
+            } else {
+                EXPECT_EQ(entry->metadata.last_access_epoch, epochs[i]);
+            }
+        }
+        retained.clear();
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<std::int32_t>(i) != missing) {
+                const BlockPool& pool = i % 2 == 0 ? device : host;
+                EXPECT_FALSE(coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i])->pinned);
+            }
+        }
+    }
 }
 
 }  // namespace tokenspeed::test

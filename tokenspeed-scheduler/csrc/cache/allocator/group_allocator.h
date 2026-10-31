@@ -82,8 +82,25 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        for (const CacheBlockRef& block_ref : table.Blocks()) {
-            ids.push_back(block_ref ? ResolveCacheBlockId(*block_ref) : 0);
+        ids.resize(static_cast<std::size_t>(table.ReclaimedPrefixBlocks()), 0);
+        const BlockPool* previous_pool = nullptr;
+        std::int32_t previous_parent = 0;
+        std::int32_t parent_base = 0;
+        for (const CacheBlockRef& block_ref : table.Blocks().subspan(table.ReclaimedPrefixBlocks())) {
+            if (!block_ref) {
+                ids.push_back(0);
+                continue;
+            }
+            const CacheBlock& block = *block_ref;
+            const CacheBlockLocation location = block.Location();
+            // Adjacent slots often share a parent. Its group and packing
+            // cannot change while these references keep it occupied.
+            if (&block.OwnerPool() != previous_pool || location.lcm_block_id != previous_parent) {
+                parent_base = ResolveCacheBlockId(block) - location.slot_index;
+                previous_pool = &block.OwnerPool();
+                previous_parent = location.lcm_block_id;
+            }
+            ids.push_back(parent_base + location.slot_index);
         }
         return ids;
     }
