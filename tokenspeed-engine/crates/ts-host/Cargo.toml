@@ -12,6 +12,11 @@ readme.workspace = true
 name = "ts-host"
 path = "src/main.rs"
 
+[[test]]
+name = "interpreter-exit"
+path = "tests/interpreter_exit.rs"
+harness = false
+
 [dependencies]
 bytes.workspace = true
 pyo3 = "0.30"

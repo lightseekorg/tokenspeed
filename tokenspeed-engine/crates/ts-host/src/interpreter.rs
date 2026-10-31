@@ -83,3 +83,19 @@ pub fn start(executable: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Keep the GIL held through the process's native static destructors.
+///
+/// Call only after serving has stopped and its forward thread has joined.
+/// Imported extensions can own Python types in native statics; their exit
+/// destructors need the same GIL as ordinary Python reference decrements.
+/// The interpreter remains alive, and this terminal acquisition is not released.
+pub fn hold_gil_for_process_exit() {
+    // SAFETY: this is the terminal main-thread operation. Initialization may
+    // have failed before Python started; no C API attachment is made then.
+    unsafe {
+        if ffi::Py_IsInitialized() != 0 {
+            ffi::PyGILState_Ensure();
+        }
+    }
+}
