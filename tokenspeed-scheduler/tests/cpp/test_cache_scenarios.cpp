@@ -1339,6 +1339,135 @@ TEST_F(ConsumedHeadroomRetractionSuite, ConsumedPartialHeadroomDoesNotDisableRet
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 4);
 }
 
+class ScheduledVictimRetractionSuite : public ConsumedHeadroomRetractionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ConsumedHeadroomRetractionSuite::MakeConfig();
+        // Seven usable blocks: three requests hold a prompt block and a
+        // 4096-token headroom block each, and one block is free.
+        cfg.device_allocator.total_pages = 8;
+        cfg.max_scheduled_tokens = 16384;
+        cfg.max_batch_size = 4;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+        };
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(ScheduledVictimRetractionSuite, RequestScheduledThisRoundDoesNotStallTheBlockedDecodes) {
+    std::vector<RequestSpec> specs;
+    for (const auto& [id, start] : {std::pair{"a", 1}, std::pair{"b", 5000}, std::pair{"c", 10000}}) {
+        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/1, start);
+        spec.max_new_tokens = 12000;
+        specs.push_back(spec);
+    }
+    Submit(specs);
+    const ExecutionPlan prefill_plan = PlanOnce();
+    const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
+    ASSERT_NE(prefill, nullptr);
+    ASSERT_EQ(prefill->request_ids.size(), 3u);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 1);
+    for (const char* id : {"a", "b", "c"}) {
+        SendForwardDone(id, {42});
+    }
+
+    const std::vector<std::int32_t> decode_result(1024, 7);
+    for (std::int32_t round = 0; round < 3; ++round) {
+        const ExecutionPlan decode_plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(decode_plan);
+        ASSERT_NE(decode, nullptr) << "decode round " << round;
+        ASSERT_EQ(decode->request_ids.size(), 3u) << "decode round " << round;
+        for (const char* id : {"a", "b", "c"}) {
+            SendForwardDone(id, decode_result);
+        }
+    }
+
+    // All three have spent their headroom block. The oldest takes the free
+    // block and is the largest resident -- the top-ranked victim -- but this
+    // round has just scheduled it. Waiting for it to quiesce would idle b and
+    // c for as long as its new block lasts; instead b gives way to c. b and c
+    // tie on releasable blocks and generated tokens, so the last tie-break of
+    // decode_rank, Id(), picks b; b is also the capacity blocker, so its pages
+    // go to c through the blocker redirect.
+    const ExecutionPlan blocked_plan = PlanOnce();
+    const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
+    ASSERT_NE(blocked, nullptr);
+    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"a", "c"}));
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    const SnapshotStoreBatch* store = FindSnapshotStore(blocked_plan);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"b"});
+}
+
+// No snapshot pool: no image ever fits, so a capacity block always ends in the
+// abort tier.
+class ScheduledVictimNoPoolSuite : public ScheduledVictimRetractionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ScheduledVictimRetractionSuite::MakeConfig();
+        // Nine usable blocks: three requests hold a prompt block and a
+        // headroom block each, a fourth takes two of the three left.
+        cfg.device_allocator.total_pages = 10;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+        };
+        cfg.snapshot_allocator.total_pages = 1;  // the null page only
+        cfg.max_retracted_requests = 0;
+        return cfg;
+    }
+};
+
+TEST_F(ScheduledVictimNoPoolSuite, TheAbortTierWaitsForTheNewestResidentRatherThanAbortingAnOlderOne) {
+    std::vector<RequestSpec> specs;
+    for (const auto& [id, start] : {std::pair{"a", 1}, std::pair{"b", 5000}, std::pair{"d", 15000}}) {
+        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/1, start);
+        spec.max_new_tokens = 12000;
+        specs.push_back(spec);
+    }
+    Submit(specs);
+    const ExecutionPlan prefill_plan = PlanOnce();
+    const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
+    ASSERT_NE(prefill, nullptr);
+    ASSERT_EQ(prefill->request_ids.size(), 3u);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 3);
+    for (const char* id : {"a", "b", "d"}) {
+        SendForwardDone(id, {42});
+    }
+    const std::vector<std::int32_t> decode_result(1024, 7);
+    for (std::int32_t round = 0; round < 3; ++round) {
+        const ExecutionPlan decode_plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(decode_plan);
+        ASSERT_NE(decode, nullptr) << "decode round " << round;
+        ASSERT_EQ(decode->request_ids.size(), 3u) << "decode round " << round;
+        for (const char* id : {"a", "b", "d"}) {
+            SendForwardDone(id, decode_result);
+        }
+    }
+    RequestSpec late = MakeRequestSpec("c", /*num_pages=*/1, /*start=*/10000);
+    late.max_new_tokens = 12000;
+    Submit({late});
+    const ExecutionPlan admit_plan = PlanOnce();
+    const ForwardBatch* admitted = FindForwardBatch(admit_plan);
+    ASSERT_NE(admitted, nullptr);
+    ASSERT_EQ(admitted->request_ids, std::vector<std::string>{"c"});
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 1);
+    SendForwardDone("c", {42});
+
+    // a, b and d have spent their headroom block; c, the newest resident, runs
+    // on its fresh one. a takes the free block, b and d block. No image fits,
+    // so the abort tier picks the newest resident, c, which this round has
+    // scheduled: retraction waits for it rather than aborting d, the newest of
+    // the blocked requests, which has streamed thousands of tokens.
+    const ExecutionPlan blocked_plan = PlanOnce();
+    EXPECT_TRUE(blocked_plan.aborts.empty());
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
+    ASSERT_NE(blocked, nullptr);
+    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"a", "c"}));
+}
+
 class FusedRetractionL2TestSuite : public CapacityBlockSuite {
 protected:
     SchedulerConfig MakeConfig() override {
