@@ -24,7 +24,7 @@ import functools
 
 import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import moe_output_includes_shared_expert, moe_topk
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
@@ -482,8 +482,13 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
+        includes_shared = moe_output_includes_shared_expert(
+            self.experts.plan, self.experts
+        )
         shared = None
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+        with self.stream_fork.scope(
+            enable=not includes_shared and get_is_capture_mode()
+        ) as fork:
             with nvtx_range("moe_mega_experts"):
                 routed = self._forward_routed_experts(
                     hidden_states,
@@ -492,12 +497,13 @@ class DeepseekV4MoE(nn.Module):
                     max_num_tokens_per_gpu,
                     do_finalize=True,
                 )
-            with fork.branch():
-                shared = self._forward_shared_experts(
-                    hidden_states,
-                    ctx=ctx,
-                    comm_manager=comm_manager,
-                )
+            if not includes_shared:
+                with fork.branch():
+                    shared = self._forward_shared_experts(
+                        hidden_states,
+                        ctx=ctx,
+                        comm_manager=comm_manager,
+                    )
         return routed + shared if shared is not None else routed
 
     def forward_normal(
