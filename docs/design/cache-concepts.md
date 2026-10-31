@@ -1740,7 +1740,11 @@ prefill's prefix loops and host page table (`_prepare_prefix_history`), so
 planning the gathers never waits on the device. The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
-before its layer instead of queueing with those collectives. GPU DSA sparse
+before its layer instead of queueing with those collectives. On GB300 a KVP
+group may gather the same raw rows with a fused paged-row all-gather on a
+stream of its own instead (`tokenspeed-kernel`'s
+`ops/communication/README.md`), still one window ahead: each owner reads its
+rows in place and stores them into every rank's receive slot. GPU DSA sparse
 prefill instead combines local sparse-attention partials.
 Ascend's generic MLA prefill gathers each layer's complete cache plane into
 an owner-major temporary view. That view is not published as persistent cache;
@@ -1804,8 +1808,11 @@ because every path keeps three invariants:
    a peer's cache.
 2. Off the execution stream, a read of a page the plan grants again forks
    from it after the forward's prologue, which waits on the default stream
-   and with it on the plan's store fence and zeroing; the history gather's
-   all-gather, for one, reads rows the execution stream copied out. Only the
+   and with it on the plan's store fence and zeroing. The history gather's
+   NCCL all-gather, for one, reads rows the execution stream copied out; its
+   fused all-gather reads the owner's pages in place, from a kernel forked
+   through an event the execution stream records after the prologue and the
+   layer's Host-load wait, and writes only the ranks' receive slots. Only the
    eviction copies, which the fence orders, read such a page earlier: on the
    write stream, behind the forward that wrote it.
 3. A kernel that would read a peer's KV in place (one-sided or
