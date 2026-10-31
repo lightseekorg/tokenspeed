@@ -31,11 +31,12 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAAttention
 
 
-def make_attention(*, nope, separate, independent, native_prefill=False):
+def make_attention(*, nope, separate, independent, native_prefill=False, scale_q=False):
     config = PretrainedConfig(
         rms_norm_eps=1e-6,
         mla_use_nope=nope,
         mla_use_output_gate=False,
+        mla_scale_q_lora=scale_q,
         cli_factor=1,
         index_n_heads=2,
         index_head_dim=4,
@@ -181,7 +182,10 @@ def test_prefill_weight_preparation_follows_model_opt_in(
 
 
 @pytest.mark.parametrize("rows", [1, 1025, 2049])
-def test_model_router_leaves_cache_readiness_to_the_index_writer(monkeypatch, rows):
+@pytest.mark.parametrize("scale_q", [False, True])
+def test_model_router_leaves_cache_readiness_to_the_index_writer(
+    monkeypatch, rows, scale_q
+):
     """The prologue's KV write alone cannot release a DSA producer step."""
     from tokenspeed_kernel.ops.attention.prologue.types import (
         LatentKVCache,
@@ -217,12 +221,18 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(monkeypatch, ro
             self.step_counter = None
             self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
             self.counter_before_index = None
+            self.query = None
+            self.index_query = None
+            self.index_weights = None
 
         def cache_placement(self, layer):
             return None
 
         def forward_extend(self, q, k, v, layer, slots, pool, bs, **kwargs):
             self.counter_before_index = int(self.step_counter.h_ready_cache_step)
+            self.query = q.clone()
+            self.index_query = kwargs["index_query"].clone()
+            self.index_weights = kwargs["index_weights"].clone()
             self.index_cache.index_copy_(0, slots.long(), kwargs["index_key"])
             self.step_counter.record_cache()
             return q[..., :4].transpose(0, 1).contiguous()
@@ -258,7 +268,9 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(monkeypatch, ro
             x, weight, bias
         ),
     )
-    attention = make_attention(nope=True, separate=True, independent=True)
+    attention = make_attention(
+        nope=True, separate=True, independent=True, scale_q=scale_q
+    )
     attention.to(dtype=torch.bfloat16)
     attention.indexer.weights_proj.to(dtype=torch.float32)
     with torch.no_grad():
@@ -271,6 +283,8 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(monkeypatch, ro
     for module in attention.modules():
         if isinstance(module, RMSNorm):
             monkeypatch.setattr(module, "kernel", cpu_rmsnorm)
+    q_gamma = attention.q_a_layernorm.weight.detach().clone()
+    attention.process_weights_after_loading()
     attention.process_weights_after_loading()
     group = "full_history"
     attention.attn_mqa.bind_cache_group(group)
@@ -298,6 +312,31 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(monkeypatch, ro
     pool = Pool(torch.zeros(rows, 1, 8, dtype=torch.bfloat16))
     hidden = torch.sin(torch.arange(rows * 8).float()).reshape(rows, 8).bfloat16()
     output = attention(torch.arange(rows), hidden, Context(router, pool), None)
+
+    latent = torch.nn.functional.linear(hidden, attention.q_a_proj.weight)
+    latent = cpu_rmsnorm(latent, q_gamma, 1e-6)
+    main_q = torch.nn.functional.linear(latent, attention.q_b_proj.weight).view(
+        rows, 2, 8
+    )
+    if scale_q:
+        main_q = main_q * (8 / 4) ** 0.5
+    expected_query = torch.cat(
+        (
+            torch.bmm(main_q[..., :4].transpose(0, 1), attention.w_kc).transpose(0, 1),
+            main_q[..., 4:],
+        ),
+        -1,
+    )
+    expected_index_q = torch.nn.functional.linear(
+        latent, attention.indexer.wq_b.weight
+    ).view(rows, 2, 4)
+    expected_weights = torch.nn.functional.linear(
+        hidden.float(), attention.indexer.weights_proj.weight
+    ) * (4**-0.5 * 2**-0.5)
+    torch.testing.assert_close(leaf.query, expected_query, atol=0, rtol=0)
+    torch.testing.assert_close(leaf.index_query, expected_index_q, atol=0, rtol=0)
+    torch.testing.assert_close(leaf.index_weights, expected_weights, atol=0, rtol=0)
+    assert leaf.index_weights.dtype == torch.float32
 
     assert leaf.counter_before_index == 0
     assert int(counter.d_ready_cache_step) == int(counter.h_ready_cache_step) == 1
