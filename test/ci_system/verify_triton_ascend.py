@@ -98,7 +98,12 @@ def main() -> None:
     decode_positions = torch.empty(12, device="npu", dtype=torch.int64)
     decode_seq_lens = torch.empty(3, device="npu", dtype=torch.int32)
     fused_decode_input_prep(
-        decode_positions, decode_seq_lens, pool_indices, cache_lengths, 4
+        decode_positions,
+        decode_seq_lens,
+        pool_indices,
+        cache_lengths,
+        4,
+        mrope_positions_out=None,
     )
     torch.testing.assert_close(
         decode_positions.cpu(),

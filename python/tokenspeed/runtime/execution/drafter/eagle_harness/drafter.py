@@ -502,7 +502,9 @@ class EagleHarness(Eagle4):
 
         frontier = self._accepted_frontier(bs, draft_input)
         narrowing = AcceptedPrefixPublisher(self.attn_backend, frontier)
-        logits_output, _ = self._run_first_step(bs, draft_input, narrowing)
+        logits_output, _ = self._run_first_step(
+            bs, draft_input, narrowing, gather_ids=None
+        )
 
         # Depth 1: the root's K best children (head softmax, best first).
         top_p, top_tokens = logits_output.draft_topk

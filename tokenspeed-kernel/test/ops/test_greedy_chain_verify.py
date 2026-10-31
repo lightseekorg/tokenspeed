@@ -67,7 +67,7 @@ def _reference(candidates, target):
 
     bs, width = candidates.shape
     out = _outputs(bs, width, candidates.device)
-    _verify_chain_greedy_torch(*out, candidates, target, bs, width)
+    _verify_chain_greedy_torch(*out, candidates, target, bs, width, False)
     return out
 
 
@@ -81,7 +81,12 @@ def test_greedy_chain_full_outputs_match_torch(device, bs, width, pattern):
     expected = _reference(candidates, target)
     actual = _outputs(bs, width, device)
     verify_chain_target_sampled(
-        *actual, candidates, target, write_rejected_targets=True, enable_pdl=False
+        *actual,
+        candidates,
+        target,
+        write_rejected_targets=True,
+        count_bonus=False,
+        enable_pdl=False,
     )
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
@@ -93,7 +98,12 @@ def test_sampled_chain_keeps_rejected_tails(device):
     actual = _outputs(8, 6, device)
     actual[1].fill_(-1)
     verify_chain_target_sampled(
-        *actual, candidates, target, write_rejected_targets=False, enable_pdl=False
+        *actual,
+        candidates,
+        target,
+        write_rejected_targets=False,
+        count_bonus=False,
+        enable_pdl=False,
     )
     torch.testing.assert_close(actual[1], full[1], rtol=0, atol=0)
     torch.testing.assert_close(actual[2], full[2], rtol=0, atol=0)
@@ -106,13 +116,23 @@ def test_greedy_chain_graph_replay_refreshes_full_window(device):
     candidates, target = _inputs(8, 6, "all", device)
     actual = _outputs(8, 6, device)
     verify_chain_target_sampled(
-        *actual, candidates, target, write_rejected_targets=True, enable_pdl=False
+        *actual,
+        candidates,
+        target,
+        write_rejected_targets=True,
+        count_bonus=False,
+        enable_pdl=False,
     )
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         verify_chain_target_sampled(
-            *actual, candidates, target, write_rejected_targets=True, enable_pdl=False
+            *actual,
+            candidates,
+            target,
+            write_rejected_targets=True,
+            count_bonus=False,
+            enable_pdl=False,
         )
     for pattern in ("all", "none", "partial", "invalid_tail"):
         new_candidates, new_target = _inputs(8, 6, pattern, device)
@@ -127,7 +147,12 @@ def test_greedy_chain_no_row_or_stride_specialization(device):
     candidates, target = _inputs(32, 6, "partial", device)
     actual = _outputs(32, 6, device)
     verify_chain_target_sampled(
-        *actual, candidates, target, write_rejected_targets=True, enable_pdl=False
+        *actual,
+        candidates,
+        target,
+        write_rejected_targets=True,
+        count_bonus=False,
+        enable_pdl=False,
     )
     with assert_no_triton_compile(_verify_chain_target_sampled_kernel):
         for bs in range(1, 33):
@@ -138,6 +163,7 @@ def test_greedy_chain_no_row_or_stride_specialization(device):
                 candidates[:bs],
                 target[:bs],
                 write_rejected_targets=True,
+                count_bonus=False,
                 enable_pdl=False,
             )
         for padding in (1, 7, 31):
@@ -153,6 +179,7 @@ def test_greedy_chain_no_row_or_stride_specialization(device):
                 strided_candidates,
                 target[:8],
                 write_rejected_targets=True,
+                count_bonus=False,
                 enable_pdl=False,
             )
             for got, want in zip(out, _reference(strided_candidates, target[:8])):

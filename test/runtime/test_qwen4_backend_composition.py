@@ -302,12 +302,15 @@ def test_draft_hooks_and_sparse_share_reach_the_full_router(attention_root):
     # The router hands each hook to the leaf's hook of the same name (a leaf
     # with per-row metadata re-expands its k-row shape in update_...).
     leaf = SimpleNamespace(
+        # A leaf whose hook is more than a copy: the root keeps the hooks.
+        draft_seq_lens_targets=lambda bs: None,
         advance_draft_forward_metadata=Mock(wraps=seq_lens.copy_),
         update_draft_forward_metadata=Mock(wraps=seq_lens.copy_),
         fill_block_decode_seq_lens=lambda bs, out: out[:bs].copy_(seq_lens[:bs]),
     )
     router.leaves = {FULL_ATTENTION: leaf}
     indexer = SimpleNamespace(
+        draft_seq_lens_targets=lambda bs: None,
         advance_draft_forward_metadata=Mock(),
         update_draft_forward_metadata=Mock(),
         fill_block_decode_seq_lens=Mock(),

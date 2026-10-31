@@ -735,6 +735,7 @@ class TestDummyGroupTablesTest:
             max_num_tokens=4096,
             state_write_padding_pool_index=0,
             device="cpu",
+            writes_mrope_positions=False,
         )
         pg.block_table = torch.zeros(16, 64, dtype=torch.int32)
 

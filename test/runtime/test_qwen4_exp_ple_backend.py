@@ -170,25 +170,21 @@ def test_ple_capture_and_verify_use_own_stable_metadata(backend, monkeypatch):
     assert backend.forward_metadata is captured
     assert captured.input_blocks.tolist() == [1, 4, -1, -1]
     assert captured.output_blocks.tolist() == [-1] * 4
-    rows_calls = []
+    copies = []
     monkeypatch.setattr(
-        ple_module,
-        "state_verify_commit_rows",
-        lambda *a, **k: rows_calls.append((a, k)),
+        ple_module, "copy_state_rows", lambda *a, **k: copies.append((a, k))
     )
-    monkeypatch.setattr(ple_module, "copy_state_rows", lambda *a, **k: None)
     accepted = torch.tensor([0, 9], dtype=torch.int32)
     backend.commit_verified_state(accepted)
+    first = len(copies)
     backend.commit_verified_state(accepted)
-    assert len(rows_calls) == 1
-    steps, pages, _, _ = rows_calls[0][0]
-    assert steps.tolist() == [1, 3]
-    assert pages.tolist() == [2, 5]
-    assert rows_calls[0][1] == {
-        "verify_width": 3,
-        "num_layers": 2,
-        "group_indices": None,
-    }
+    # The second commit has no armed verify: it copies nothing.
+    assert first > 0 and len(copies) == first
+    # 2 layers x 2 requests: scratch row r * 4 + clamp(accepted, 1, 3) and the
+    # live page (slot 1) of each request.
+    src, dst = copies[-1][0][2], copies[-1][0][3]
+    assert src.tolist() == [1, 7, 1, 7]
+    assert dst.tolist() == [2, 5, 2, 5]
     assert backend._verify_commit_ctx is None
 
 
@@ -226,10 +222,30 @@ def test_ple_non_verify_metadata_disarms_previous_round(backend, mode, monkeypat
     assert backend._verify_commit_ctx is None
     monkeypatch.setattr(
         ple_module,
-        "state_verify_commit_rows",
+        "verify_commit_resolve",
         lambda *a, **k: pytest.fail("stale PLE commit"),
     )
     backend.commit_verified_state(torch.tensor([2, 3], dtype=torch.int32))
+
+
+def test_ple_verify_refreshes_keep_padding_and_outputs_null(backend):
+    """A verify writes only its live rows' input pages; whatever refresh ran
+    before, the padding rows' inputs and every output page read -1."""
+    for refresh in ("idle", "verify", "verify"):
+        if refresh == "idle":
+            backend.refresh_decode_metadata(
+                4,
+                0,
+                torch.arange(4),
+                torch.ones(4, dtype=torch.int32),
+                forward_mode=ForwardMode.IDLE,
+                block_tables={},
+            )
+            continue
+        _verify(backend)
+        metadata = backend.forward_metadata
+        assert metadata.input_blocks.tolist() == [1, 4, -1, -1]
+        assert metadata.output_blocks.tolist() == [-1] * 4
 
 
 def test_ple_idle_refresh_and_failed_refresh_disarm_verify(backend):
@@ -261,7 +277,7 @@ def test_ple_idle_refresh_and_failed_refresh_disarm_verify(backend):
 def test_ple_preallocation_preserves_workspace_and_budget(backend):
     scratch = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, 4)
     allocated = backend.preallocate_verify_workspace(4, 3)
-    assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 8
+    assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 4
     assert backend.preallocate_verify_workspace(2, 3) == allocated
     for bs in (1, 2, 4):
         views = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, bs)
@@ -316,6 +332,31 @@ def test_ple_non_spec_decode_uses_checkpoint_blocks_without_workspace():
     assert metadata.query_lengths == [1] * 4
     assert metadata.verify_width is None
     assert backend._verify_commit_ctx is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_ple_cuda_decode_refresh_matches_the_eager_paging():
+    # CUDA int32 tables take the one-launch prep tape; the pages must equal
+    # the eager chain's (checkpoint slot when set, else live; pad -1).
+    backend = _make_backend(1, False, "cuda")
+    for actual_bs, rows in ((2, [[1, 2], [0, 5]]), (1, [[0, 7]])):
+        backend.refresh_decode_metadata(
+            4,
+            actual_bs,
+            torch.arange(4, device="cuda"),
+            torch.tensor([5, 6, 1, 1], dtype=torch.int32, device="cuda"),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={
+                QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
+                    rows, dtype=torch.int32, device="cuda"
+                )
+            },
+        )
+        metadata = backend.forward_metadata
+        want_in = [r[0] if r[0] > 0 else r[1] for r in rows]
+        want_out = [r[1] for r in rows]
+        assert metadata.input_blocks.tolist() == want_in + [-1] * (4 - actual_bs)
+        assert metadata.output_blocks.tolist() == want_out + [-1] * (4 - actual_bs)
 
 
 def test_draft_view_cannot_claim_target_ple_fields():
@@ -388,7 +429,6 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
         )
     _verify(backend)
     context = backend._verify_commit_ctx
-    block_rows, _, _ = context
     accepted = torch.tensor([0, 9], dtype=torch.int32, device="cuda")
     # Compile before profiling or capture, as a warmed serving loop does.
     backend.commit_verified_state(accepted)
@@ -407,10 +447,9 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
         for event in profile.events()
         if event.device_type == torch.autograd.DeviceType.CUDA
     ]
-    assert len(gpu_kernels) == 4
+    assert len(gpu_kernels) == 3
     for kernel, count in (
-        ("_commit_state_pages_kernel", 1),
-        ("_state_verify_commit_rows_kernel", 1),
+        ("_verify_commit_resolve_kernel", 1),
         ("_copy_state_rows_kernel", 2),
     ):
         assert sum(kernel in name for name in gpu_kernels) == count
@@ -425,7 +464,10 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
         ([3, 2], [7, 8], [3, 6]),
     ):
         accepted.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
-        block_rows[:, 1].copy_(torch.tensor(pages, dtype=torch.int32, device="cuda"))
+        # The commit reads the live pages the verify refresh recorded.
+        backend._decode_live_blocks[:2].copy_(
+            torch.tensor(pages, dtype=torch.int32, device="cuda")
+        )
         for field_id in backend._ple_verify_scratch:
             backend.cache_pool.arena.field(field_id).fill_(-77)
         graph.replay()

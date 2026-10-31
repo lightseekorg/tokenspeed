@@ -482,6 +482,7 @@ class TestDrafterAcceptIndexing:
             draft_input,
             bs=3,
             input_num_tokens=12,
+            gather_ids=None,
         )
 
         assert (input_ids) is (output_tokens)
@@ -507,6 +508,7 @@ class TestDrafterAcceptIndexing:
             draft_input,
             bs=3,
             input_num_tokens=10,
+            gather_ids=None,
         )
 
         assert (gather_ids.tolist()) == ([1, 3, 9])

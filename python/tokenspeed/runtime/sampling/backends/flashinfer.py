@@ -144,6 +144,7 @@ def canonical_greedy_verify(
         target_predict=target_predict,
         batch_size=bs,
         num_draft_tokens=n,
+        count_bonus=False,
     )
     greedy_rows = top_ks.view(bs, n)[:, 0] == 1
     predict.copy_(
@@ -935,35 +936,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 path_logits, predict, logprob_order=self.config.logprob_order
             )
         return predict, accept_length
-
-    def get_packed_output_d2h(
-        self,
-        output_tokens: torch.Tensor,
-        output_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """One D2H of the packed predict+accept_length region.
-
-        Applies when both outputs alias into ``_output_pack_buf`` — both
-        ``verify()`` and ``sample()`` land their outputs there. Callers
-        holding outputs from another source fall back to two D2Hs.
-        """
-        if (
-            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
-            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
-        ):
-            return None
-        n_t = output_tokens.numel()
-        n_l = output_lengths.numel()
-        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
-        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
-        # the saved launch beats the wasted bandwidth.
-        size = self._predict_max + n_l
-        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
-        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
-        return (
-            cpu_pack[:n_t].view(output_tokens.shape),
-            cpu_pack[self._predict_max : self._predict_max + n_l],
-        )
 
 
 register_backend("flashinfer", FlashInferSamplingBackend)

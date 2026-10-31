@@ -257,9 +257,21 @@ class Qwen4ExpBackend(AttentionBackend):
     # Drafter length-edit hooks fan out to the attention child (a hybrid
     # composite forwards them to its full-attention router) and the indexer.
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        targets = self.draft_seq_lens_targets(seq_lens.shape[0])
+        if targets is not None:
+            # Every child's hook is a copy: one launch fills them all.
+            torch._foreach_copy_(targets, [seq_lens] * len(targets))
+            return
         self.attention_backend.advance_draft_forward_metadata(seq_lens)
         if self.indexer_backend is not None:
             self.indexer_backend.advance_draft_forward_metadata(seq_lens)
+
+    def draft_seq_lens_targets(self, bs: int) -> list[torch.Tensor] | None:
+        targets = self.attention_backend.draft_seq_lens_targets(bs)
+        if targets is None or self.indexer_backend is None:
+            return targets
+        indexer_targets = self.indexer_backend.draft_seq_lens_targets(bs)
+        return None if indexer_targets is None else targets + indexer_targets
 
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
         self.attention_backend.update_draft_forward_metadata(frontier)

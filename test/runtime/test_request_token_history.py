@@ -108,7 +108,11 @@ def test_runtime_states_reject_bad_seeds_and_disabled_history() -> None:
 
 def _input_buffers() -> InputBuffers:
     return InputBuffers(
-        max_bs=4, max_num_tokens=32, state_write_padding_pool_index=2, device="cpu"
+        max_bs=4,
+        max_num_tokens=32,
+        state_write_padding_pool_index=2,
+        device="cpu",
+        writes_mrope_positions=False,
     )
 
 

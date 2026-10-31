@@ -221,8 +221,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         num_ple_layers = sum(
             field.field_id.endswith(".conv") for field in self._ple_fields()
         )
-        # Source and destination int64 row ids, shared by every batch size.
-        ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 8
+        # Source and destination int32 row ids, shared by every batch size.
+        ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 4
         return super().workspace_bytes() + ple_commit_bytes + self._qsa_staging_bytes()
 
     def _qsa_staging_bytes(self) -> int:

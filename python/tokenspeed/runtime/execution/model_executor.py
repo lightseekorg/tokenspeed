@@ -609,6 +609,7 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
             reads_state_checkpoints=config.state_checkpoint_in_forward,
+            writes_mrope_positions=config.model_is_mrope,
         )
         # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
         # rank's position in the KVP group selects the pages it owns.
@@ -1780,9 +1781,13 @@ class ModelExecutor:
 
         if self.drafter is not None:
             draft_accept_lengths = accept_lengths
-            if ctx.output_layout.num_decodes:
+            decodes = ctx.output_layout.decode_request_slice
+            if ctx.output_layout.num_decodes and decodes == slice(0, ctx.bs):
                 # A stopped request keeps no token; its drafts are discarded,
-                # but the drafter indexes the last accepted position.
+                # but the drafter indexes the last accepted position. All
+                # rows decode: one launch.
+                draft_accept_lengths = accept_lengths.clamp(min=1)
+            elif ctx.output_layout.num_decodes:
                 draft_accept_lengths = accept_lengths.clone()
                 draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
                     draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(

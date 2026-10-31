@@ -28,13 +28,11 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.kda.triton import (
-    commit_state_pages,
+    verify_commit_resolve,
     verify_state_blocks,
 )
-from tokenspeed_kernel.ops.kvcache.triton import (
-    copy_state_rows,
-    state_verify_commit_rows,
-)
+from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -45,6 +43,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+    STATE_TABLE_SLOTS,
     InForwardStateCheckpoints,
     compute_state_block_indices,
     in_forward_state_checkpoints,
@@ -102,10 +101,25 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         self._ple_verify_scratch: dict[str, torch.Tensor] = {}
         self._ple_verify_tables: dict | None = None
         self._ple_commit_rows: torch.Tensor | None = None
-        self._verify_commit_ctx: tuple[torch.Tensor, int, int] | None = None
+        # The commit's steps, the read rows the resolve also writes, and every
+        # layer's state group (all 0: one PLE group).
+        self._ple_commit_steps: torch.Tensor | None = None
+        self._ple_commit_read: torch.Tensor | None = None
+        self._ple_layer_groups: torch.Tensor | None = None
+        # (live requests, verify width) of the verify the next commit serves.
+        self._verify_commit_ctx: tuple[int, int] | None = None
         self._decode_input_blocks: torch.Tensor | None = None
+        # Each request's live page (slot 1), recorded by a verify refresh for
+        # the commit, which then needs no block table of that forward.
+        self._decode_live_blocks: torch.Tensor | None = None
         self._decode_output_blocks: torch.Tensor | None = None
+        # Whether a refresh other than a verify's wrote the decode output
+        # pages since they were last reset to -1 (a verify writes none).
+        self._decode_outputs_written = True
         self._decode_views_by_bs: dict[int, PLEForwardMetadata] = {}
+        # One prep tape per decode batch size: resolves the state pages in
+        # one launch instead of an eager chain of fills, selects and copies.
+        self._decode_tapes: dict[int, PrepTape] = {}
 
     def _cache_fields(
         self, cache_pool: CachePool
@@ -182,6 +196,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             (max_bs,), -1, dtype=torch.int32, device=self.device
         )
         self._decode_output_blocks = torch.full_like(self._decode_input_blocks, -1)
+        self._decode_live_blocks = torch.full_like(self._decode_input_blocks, -1)
 
     def _decode_view(self, bs: int) -> PLEForwardMetadata:
         if (
@@ -296,18 +311,37 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         if not self._conv_field_ids:
             return
         metadata = self._decode_view(bs)
-        metadata.input_blocks.fill_(-1)
-        metadata.output_blocks.fill_(-1)
+        if metadata.verify_width is None and self._refresh_with_tape(
+            metadata, bs, actual_bs, block_tables
+        ):
+            self._decode_outputs_written = True
+            self.forward_metadata = metadata
+            return
+        if metadata.verify_width is not None and actual_bs:
+            # A verify writes the live rows' input pages and no output page:
+            # only the padding rows and outputs a plain decode wrote reset.
+            if actual_bs < bs:
+                metadata.input_blocks[actual_bs:].fill_(-1)
+            if self._decode_outputs_written:
+                self._decode_output_blocks.fill_(-1)
+                self._decode_outputs_written = False
+        else:
+            metadata.input_blocks.fill_(-1)
+            metadata.output_blocks.fill_(-1)
+            self._decode_outputs_written = True
         if actual_bs:
             rows = self._block_rows(block_tables)
             if metadata.verify_width is not None:
                 if self._ple_commit_rows is None:
                     raise RuntimeError("PLE verify workspace was not preallocated")
                 verify_state_blocks(
-                    rows, batch_size=actual_bs, pages_out=metadata.input_blocks
+                    rows,
+                    batch_size=actual_bs,
+                    pages_out=metadata.input_blocks,
+                    live_pages_out=self._decode_live_blocks,
                 )
                 if forward_mode.is_decode():
-                    self._verify_commit_ctx = (rows, actual_bs, metadata.verify_width)
+                    self._verify_commit_ctx = (actual_bs, metadata.verify_width)
             else:
                 input_blocks, output_blocks = compute_state_block_indices(
                     rows,
@@ -318,6 +352,46 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 metadata.input_blocks[:actual_bs].copy_(input_blocks)
                 metadata.output_blocks[:actual_bs].copy_(output_blocks)
         self.forward_metadata = metadata
+
+    def _refresh_with_tape(
+        self,
+        metadata: PLEForwardMetadata,
+        bs: int,
+        actual_bs: int,
+        block_tables: Mapping[str, torch.Tensor],
+    ) -> bool:
+        """Resolve a plain decode's state pages with one prep-tape launch.
+
+        A decode row always has history, so ``state_in`` is the checkpoint
+        slot when set, else the live slot, as ``compute_state_block_indices``
+        gives. Returns False (the caller runs the eager chain) when the tape's
+        preconditions do not hold.
+        """
+        rows = block_tables.get(QWEN4_EXP_PLE_CACHE_GROUP)
+        if (
+            cache_debug_enabled()
+            or rows is None
+            or not rows.is_cuda
+            or rows.dtype != torch.int32
+            or rows.shape[1] < STATE_TABLE_SLOTS
+        ):
+            return False
+        tape = self._decode_tapes.get(bs)
+        if tape is None:
+            tape = PrepTape(self.device)
+            tape.state_pages(
+                metadata.input_blocks,
+                metadata.output_blocks,
+                rows_ptr=Reg.PTR0,
+                bs=Reg.REAL_BS,
+                row_stride=Reg.USER0,
+            )
+            tape.filltail(metadata.input_blocks, live=Reg.REAL_BS, total=bs, value=-1)
+            tape.filltail(metadata.output_blocks, live=Reg.REAL_BS, total=bs, value=-1)
+            tape.finalize()
+            self._decode_tapes[bs] = tape
+        tape.run({Reg.REAL_BS: actual_bs, Reg.PTR0: rows, Reg.USER0: rows.stride(0)})
+        return True
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Allocate rollback rows once and return the recipe-budgeted bytes."""
@@ -335,10 +409,18 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 self._ple_verify_scratch[field_id] = field.new_zeros(
                     (rows, *field.shape[1:])
                 )
+            row_capacity = max_bs * len(self._conv_field_ids)
             self._ple_commit_rows = torch.empty(
-                (2, max_bs * len(self._conv_field_ids)),
-                dtype=torch.int64,
-                device=self.device,
+                (2, row_capacity), dtype=torch.int32, device=self.device
+            )
+            self._ple_commit_steps = torch.empty(
+                max_bs, dtype=torch.int32, device=self.device
+            )
+            self._ple_commit_read = torch.empty(
+                row_capacity, dtype=torch.int32, device=self.device
+            )
+            self._ple_layer_groups = torch.zeros(
+                len(self._conv_field_ids), dtype=torch.int64, device=self.device
             )
             self._ple_verify_tables = self._build_verify_tables()
         return (
@@ -425,7 +507,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         context = self._verify_commit_ctx
         if context is None:
             return
-        rows_table, actual_bs, width = context
+        actual_bs, width = context
         bs = accepted_lengths.shape[0]
         if bs != actual_bs:
             raise ValueError(
@@ -436,27 +518,19 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         row_count = bs * num_layers
         if rows is None or rows.shape[1] < row_count:
             raise RuntimeError("PLE commit rows exceed the preallocated capacity")
-        pages, steps = torch.empty(
-            (2, bs), dtype=torch.int32, device=accepted_lengths.device
-        ).unbind(0)
-        commit_state_pages(
-            accepted_lengths,
-            rows_table,
-            batch_size=bs,
-            draft_tokens=width,
-            pages_out=pages.unsqueeze(0),
-            out_row=0,
-            steps_out=steps,
-        )
         src_rows, dst_rows = rows[0, :row_count], rows[1, :row_count]
-        state_verify_commit_rows(
-            steps,
-            pages,
-            src_rows,
-            dst_rows,
+        live = self._decode_live_blocks.unsqueeze(0)
+        # The steps, each row's scratch row and live page, in one launch.
+        verify_commit_resolve(
+            accepted_lengths,
+            live,
+            live,
+            self._ple_layer_groups,
             verify_width=width,
-            num_layers=num_layers,
-            group_indices=None,
+            steps_out=self._ple_commit_steps[:bs],
+            src_rows=src_rows,
+            dst_rows=dst_rows,
+            read_rows=self._ple_commit_read[:row_count],
         )
         tables = self._ple_verify_tables
         if tables["context_row_bytes"]:

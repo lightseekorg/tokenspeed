@@ -57,6 +57,7 @@ def _verify_chain_target_sampled_kernel(
     target_sampled_stride,
     NUM_DRAFT_TOKENS: tl.constexpr,
     WRITE_REJECTED_TARGETS: tl.constexpr,
+    COUNT_BONUS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
@@ -111,7 +112,10 @@ def _verify_chain_target_sampled_kernel(
     final_id = tl.load(
         target_sampled_ptr + (base + num_accepted) * target_sampled_stride
     )
-    tl.store(accept_token_num_ptr + row * accept_token_num_stride, num_accepted)
+    tl.store(
+        accept_token_num_ptr + row * accept_token_num_stride,
+        num_accepted + COUNT_BONUS,
+    )
     tl.store(predicts_ptr + (base + num_accepted) * predicts_stride, final_id)
 
     if ENABLE_PDL:
@@ -126,6 +130,7 @@ def verify_chain_target_sampled(
     target_sampled: torch.Tensor,
     *,
     write_rejected_targets: bool,
+    count_bonus: bool,
     enable_pdl: bool | None = None,
 ) -> None:
     """Verify a chain against target token ids, with an explicit output policy.
@@ -134,13 +139,14 @@ def verify_chain_target_sampled(
         predicts: Writable int32 [>= batch * width] target-token destination.
         accept_index: Writable int32 [batch,width] flattened accepted row ids.
         accept_token_num: Writable int32 [>= batch] accepted draft counts,
-            excluding the bonus token (callers add one).
+            plus one for the bonus token when count_bonus.
         candidates: Int32 [batch,width] draft chain; column zero is its anchor.
         target_sampled: Int32/int64 target ids with at least batch * width entries.
         write_rejected_targets: True writes every target id as int32, compares
             after the same int32 conversion, and fills rejected indices with -1,
             matching the Torch greedy reference. False preserves rejected token
             and index tails, so accept_index must be -1-filled on entry.
+        count_bonus: True adds the bonus token to accept_token_num.
         enable_pdl: Override the platform PDL setting when supplied.
 
     Returns:
@@ -211,6 +217,7 @@ def verify_chain_target_sampled(
         target_sampled.stride(0),
         NUM_DRAFT_TOKENS=num_draft_tokens,
         WRITE_REJECTED_TARGETS=write_rejected_targets,
+        COUNT_BONUS=int(count_bonus),
         ENABLE_PDL=enable_pdl,
         num_warps=1,
         **extra_kwargs,

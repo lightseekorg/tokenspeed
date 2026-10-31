@@ -456,10 +456,12 @@ class TestTritonRouteSelection:
             target_sampled,
             *,
             write_rejected_targets,
+            count_bonus,
             enable_pdl=False,
         ):
             assert write_rejected_targets is False
-            del accept_index, candidates, target_sampled, enable_pdl
+            assert count_bonus is True
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 
@@ -520,10 +522,12 @@ class TestTritonRouteSelection:
             target_sampled,
             *,
             write_rejected_targets,
+            count_bonus,
             enable_pdl=False,
         ):
             assert write_rejected_targets is False
-            del accept_index, candidates, target_sampled, enable_pdl
+            assert count_bonus is True
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 
@@ -600,10 +604,12 @@ class TestTritonRouteSelection:
             target_sampled,
             *,
             write_rejected_targets,
+            count_bonus,
             enable_pdl=False,
         ):
             assert write_rejected_targets is False
-            del accept_index, candidates, target_sampled, enable_pdl
+            assert count_bonus is True
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 
@@ -687,10 +693,12 @@ class TestTritonRouteSelection:
             target_sampled,
             *,
             write_rejected_targets,
+            count_bonus,
             enable_pdl=False,
         ):
             assert write_rejected_targets is False
-            del accept_index, candidates, target_sampled, enable_pdl
+            assert count_bonus is True
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 

@@ -56,6 +56,7 @@ def _make(device="cuda"):
         max_num_tokens=MAX_TOKENS,
         state_write_padding_pool_index=PAD_POOL,
         device=device,
+        writes_mrope_positions=False,
     )
 
 
@@ -129,8 +130,53 @@ def test_the_scrub_costs_one_launch():
     assert taped_c <= 1, taped_c
 
 
+@pytest.mark.parametrize("device", ["cuda", "cpu"])
+def test_a_step_scrubs_only_tails_an_earlier_step_wrote(device):
+    """The scrub runs while the tails can hold values other than the
+    padding: after a construction, a larger step or an outside writer. A
+    step at the counts of the one before finds them clean."""
+    ib, plain = _make(device=device), _make(device=device)
+    _dirty(ib)
+    _dirty(plain)
+    ib._scrub_tails(17, 3)  # The construction left every tail dirty.
+    _torch_scrub(plain, 17, 3)
+    for name in BUFS:
+        assert torch.equal(getattr(ib, name), getattr(plain, name)), name
+
+    # A value past the rows that only a skipped scrub keeps.
+    ib.positions_buf[20] = -5
+    ib._scrub_tails(17, 3)
+    assert int(ib.positions_buf[20]) == -5
+    ib._scrub_tails(9, 2)  # Fewer rows than the step before: scrub.
+    assert int(ib.positions_buf[20]) == 0 and int(ib.positions_buf[9]) == 0
+    assert int(ib.seq_lens_buf[2]) == 1
+
+    ib.positions_buf[20] = -5
+    ib.mark_tails_dirty()
+    ib._scrub_tails(9, 2)
+    assert int(ib.positions_buf[20]) == 0
+
+
 def test_a_cpu_input_buffer_keeps_the_torch_path():
     """The runtime builds these on CPU in metadata tests; a tape would need a
     GPU there."""
     ib = _make(device="cpu")
     assert ib._pad_tape is None
+
+
+@pytest.mark.parametrize("batch_size", [0, 3, MAX_BS])
+def test_request_slots_upload_writes_live_rows_and_padding(batch_size):
+    """One upload writes the request slots, the state write slots (the sink
+    slot past the batch) and the live input lengths."""
+    ib = _make()
+    _dirty(ib)
+    pool = [7, 2, 4, 1, 0, 6, 3, 5][:batch_size]
+    lengths = [9, 1, 4, 4, 2, 8, 3, 6][:batch_size]
+    ib._upload_request_slots(pool, lengths)
+    torch.cuda.synchronize()
+    pad = MAX_BS - batch_size
+    assert ib.req_pool_indices_buf.tolist() == pool + [0] * pad
+    assert ib.state_write_req_pool_indices_buf.tolist() == pool + [PAD_POOL] * pad
+    assert ib.input_lengths_buf[:batch_size].tolist() == lengths
+    # Lengths past the batch belong to the pad tape.
+    assert ib.input_lengths_buf[batch_size:].eq(-99).all()

@@ -713,8 +713,8 @@ class TritonSamplingBackend(SamplingBackend):
                 candidates=candidates,
                 target_sampled=target_sampled,
                 write_rejected_targets=False,
+                count_bonus=True,
             )
-            accept_length += 1
 
         # Rank 0 remains the source of truth for attention-TP agreement.
         self.broadcast_verify_outputs()
