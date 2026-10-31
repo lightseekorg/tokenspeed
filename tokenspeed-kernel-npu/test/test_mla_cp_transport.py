@@ -335,7 +335,7 @@ def independent_transports(rank, degree):
 
 
 def queued_history(rank, degree):
-    """Join internal HCCL work before consuming or reusing either KV plane."""
+    """Preserve queued KV reads and metadata allocated on another stream."""
     cache = torch.empty((256, 576), dtype=torch.bfloat16, device="npu")
     index = torch.empty((256, 128), dtype=torch.bfloat16, device="npu")
     runtime = AscendDSAPrefill(
@@ -350,6 +350,7 @@ def queued_history(rank, degree):
     runtime.allocate_workspace()
     pointers = (runtime.storage.data_ptr(), runtime.history_send.data_ptr())
     compute = torch.npu.Stream()
+    slot_allocator = torch.npu.Stream()
     compute.wait_stream(torch.npu.current_stream())
     pending = []
     try:
@@ -367,7 +368,12 @@ def queued_history(rank, degree):
                 cache.copy_(histories[rank])
                 index.copy_(histories[rank][:, :128])
                 slots = (torch.arange(counts[rank], dtype=torch.int64) * 7 + case) % 256
-                device_slots = slots.npu()
+                with torch.npu.stream(slot_allocator):
+                    device_slots = (
+                        torch.arange(counts[rank], dtype=torch.int64, device="npu") * 7
+                        + case
+                    ) % 256
+                compute.wait_stream(slot_allocator)
                 runtime.storage.fill_(-99)
                 runtime.prefetch(
                     0,
@@ -401,6 +407,12 @@ def queued_history(rank, degree):
                             )
                         )
                 runtime.finish(0)
+                # The next prefetch drops the previous metadata reference.
+                # Its allocation stream must not recycle those slots while
+                # the communication stream still has a queued index_select.
+                with torch.npu.stream(slot_allocator):
+                    for _ in range(8):
+                        torch.empty(32, dtype=torch.int64, device="npu").fill_(-1)
                 # Poison source slots and the shared packing region after the
                 # finish dependency, without a host synchronization per round.
                 torch.empty_like(slots, device="npu").fill_(-1)
@@ -410,6 +422,7 @@ def queued_history(rank, degree):
                     runtime.history_send.data_ptr(),
                 )
         compute.synchronize()
+        slot_allocator.synchronize()
         for actual, expected in pending:
             exact(actual, expected)
     finally:
@@ -638,7 +651,13 @@ def main():
         assert runtime.send_kv.data_ptr() == send_pointer
         assert (
             runtime.workspace_bytes
-            == (runtime.history_rows + (degree + 1) * runtime.send_capacity) * 576 * 2
+            == (
+                runtime.history_rows
+                + (degree + 1) * runtime.send_capacity
+                + runtime.max_current_rows
+            )
+            * 576
+            * 2
         )
         assert scratch_pool.capacity_bytes == frozen_capacity
         results.append(
