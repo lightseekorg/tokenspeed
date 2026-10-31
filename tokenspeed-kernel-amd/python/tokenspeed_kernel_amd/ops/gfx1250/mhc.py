@@ -43,17 +43,28 @@ _APPLY_PRE_WARPS = 4
 
 
 @gluon.jit
+def _split_weight(w):
+    """Split FP32 ``w`` into three BF16 terms whose sum is exactly ``w``.
+
+    The high and middle terms are 8-bit truncations and the remainder has at
+    most 8 significant bits. Masking the FP32 bits avoids widening BF16 back
+    to FP32, whose VOPD lowering stalls on an SGPR mask per pair.
+    """
+    high = (w.to(gl.int32, bitcast=True) & -65536).to(gl.float32, bitcast=True)
+    rest = w - high
+    middle = (rest.to(gl.int32, bitcast=True) & -65536).to(gl.float32, bitcast=True)
+    low = rest - middle
+    return high.to(gl.bfloat16), middle.to(gl.bfloat16), low.to(gl.bfloat16)
+
+
+@gluon.jit
 def _project_tile(a, b, acc, correction, square_sum):
     """Accumulate one K tile of ``a @ b`` and the row sums of ``a * a``.
 
-    ``b`` is FP32. Its BF16 rounding and two BF16 remainders sum back to it
-    exactly, and BF16 products are exact in FP32, so three BF16 WMMAs give the
-    FP32 product up to accumulation order.
+    ``b`` is FP32; BF16 products are exact in FP32, so the three BF16 WMMAs
+    of its exact split give the FP32 product up to accumulation order.
     """
-    high = b.to(gl.bfloat16)
-    rest = b - high.to(gl.float32)
-    middle = rest.to(gl.bfloat16)
-    low = (rest - middle.to(gl.float32)).to(gl.bfloat16)
+    high, middle, low = _split_weight(b)
     acc = gl.amd.cdna5.wmma(a, high, acc)
     correction = gl.amd.cdna5.wmma(a, middle, correction)
     correction = gl.amd.cdna5.wmma(a, low, correction)

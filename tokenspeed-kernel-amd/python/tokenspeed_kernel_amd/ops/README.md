@@ -2376,12 +2376,16 @@ at every token count, then collapses the streams with the portable kernel.
 
 #### Algorithm
 
-The FP32 weight tile splits into a BF16 rounding and two BF16 remainders that
-sum back to it exactly. BF16 products are exact in FP32, so three BF16 WMMAs
-give the FP32 projection up to accumulation order. Each program covers 64 rows
-and one K partition, pipelines K tiles through three or four TDM buffers, and
-pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
-partition are runtime arguments.
+The FP32 weight tile splits into two 8-bit truncations and a remainder of at
+most 8 significant bits, three BF16 terms that sum back to it exactly. BF16
+products are exact in FP32, so three BF16 WMMAs give the FP32 projection up
+to accumulation order. The split masks the FP32 bits: widening BF16 back to
+FP32 lowers to VOPD pairs that rematerialize their mask in an SGPR, a scalar
+stall per pair that made the VALU-bound tile 20% slower.
+
+Each program covers 64 rows and one K partition, pipelines K tiles through
+three or four TDM buffers, and pads the 24 mixes to two 16-wide WMMA tiles.
+The token count and tiles per partition are runtime arguments.
 
 The reduction is the gfx950 kernel on 32-lane waves: sixteen lanes own a
 token's 4x4 matrix, so a wave covers two tokens when the splits stay in
