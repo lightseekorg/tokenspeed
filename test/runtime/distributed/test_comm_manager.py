@@ -276,8 +276,9 @@ class TestCommManager:
 
 QCP_WORLD = 4
 QCP_HIDDEN = 16
-# Three requests over 10 rows: shard rows [3, 3, 2, 2]; the sampled rows
-# 3, 4 and 9 land on ranks 1, 1 and 3, so rank 0 and rank 2 gather none.
+# Three requests over 10 rows, one row per zigzag segment: shard rows
+# [3, 2, 2, 3]; the sampled rows 3, 4 and 9 land on ranks 3, 0 and 3, so rank 1
+# and rank 2 gather none.
 QCP_LENGTHS = [4, 1, 5]
 
 
@@ -287,6 +288,7 @@ def _qcp_plan(rank: int) -> QueryShardPlan:
         input_lengths=QCP_LENGTHS,
         size=QCP_WORLD,
         rank=rank,
+        device="cpu",
     )
 
 
@@ -369,7 +371,7 @@ def _qcp_main(rank: int, port: int) -> None:
 
     torch.manual_seed(7)
     full = torch.randn(plan.total_rows, QCP_HIDDEN)  # every rank: the same batch
-    mine = full[plan.local_slice].clone()
+    mine = full[plan.local_row_ids].clone()
 
     # The shard is the scattered table; attention needs no collective.
     assert moe.scattered_num_tokens(ctx) == list(plan.row_counts)
@@ -380,18 +382,19 @@ def _qcp_main(rank: int, port: int) -> None:
     assert dense.post_final_norm_comm(mine, mine, ctx) == (mine, mine)
     assert not moe.use_all_reduce_norm_fusion() and not moe.should_fuse(4)
 
-    # MoE: gather the shards to every rank of the EP group, apply this
-    # rank's "experts" (a per-rank scale), reduce-scatter the partials back.
+    # MoE: gather the shards to every rank of the EP group (rank by rank,
+    # the shard's gather order), apply this rank's "experts" (a per-rank
+    # scale), reduce-scatter the partials back.
     gathered = moe.pre_moe_comm(mine, ctx)
-    torch.testing.assert_close(gathered, full, rtol=0, atol=0)
+    torch.testing.assert_close(gathered, plan.to_gather_order(full), rtol=0, atol=0)
     partial = gathered * float(rank + 1)
     out, _ = moe.post_moe_comm(partial, mine, ctx)
-    expected = (full * float(sum(range(1, QCP_WORLD + 1))))[plan.local_slice]
+    expected = (full * float(sum(range(1, QCP_WORLD + 1))))[plan.local_row_ids]
     torch.testing.assert_close(out, expected)
 
     # Dense TP over the same group: the same round trip.
     gathered = dense.pre_dense_comm(mine, ctx)
-    torch.testing.assert_close(gathered, full, rtol=0, atol=0)
+    torch.testing.assert_close(gathered, plan.to_gather_order(full), rtol=0, atol=0)
     out, _ = dense.post_dense_comm(gathered * float(rank + 1), mine, ctx)
     torch.testing.assert_close(out, expected)
 
@@ -405,16 +408,14 @@ def _qcp_main(rank: int, port: int) -> None:
     # gather is byte-preserving, so fp32 rows of an odd width travel too.
     from tokenspeed.runtime.distributed.comm_manager import gather_sampled_rows
 
-    sampled = gather_sampled_rows(
-        mine, plan, ctx.gather_ids, group=mapping.attn.tp_group
-    )
+    sampled = gather_sampled_rows(mine, plan, group=mapping.attn.tp_group)
     torch.testing.assert_close(sampled, full[ctx.gather_ids], rtol=0, atol=0)
     narrow = full[:, :3].contiguous()  # 12-byte fp32 rows
     sampled = gather_sampled_rows(
-        narrow[plan.local_slice], plan, ctx.gather_ids, group=mapping.attn.tp_group
+        narrow[plan.local_row_ids], plan, group=mapping.attn.tp_group
     )
     torch.testing.assert_close(sampled, narrow[ctx.gather_ids], rtol=0, atol=0)
-    if rank in (0, 2):
+    if rank in (1, 2):
         assert plan.local_sampled_rows == 0
 
     # A forward without a shard (the drafter's decode steps) keeps the
@@ -510,11 +511,11 @@ def _qcp_main(rank: int, port: int) -> None:
     torch.manual_seed(11)
     ids = torch.randint(0, 256, (plan.total_rows,))  # the span, every rank
     replicated = embedding(ids)  # the whole span through the all-reduce path
-    sharded = embedding(ids[plan.local_slice], query_shard=plan)
+    sharded = embedding(ids[plan.local_row_ids], query_shard=plan)
     assert sharded.shape == (plan.local_rows, QCP_HIDDEN)
-    torch.testing.assert_close(sharded, replicated[plan.local_slice], rtol=0, atol=0)
+    torch.testing.assert_close(sharded, replicated[plan.local_row_ids], rtol=0, atol=0)
     with pytest.raises(ValueError, match="reduces its rows"):
-        embedding(ids[plan.local_slice], reduce_results=False, query_shard=plan)
+        embedding(ids[plan.local_row_ids], reduce_results=False, query_shard=plan)
     with pytest.raises(ValueError, match="embeds"):
         embedding(ids, query_shard=plan)
 

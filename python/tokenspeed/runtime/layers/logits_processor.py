@@ -818,11 +818,11 @@ class LogitsProcessor(nn.Module):
                     aux_pruned_states = list(aux_hidden_states)
             elif shard is not None:
                 pruned_states = gather_sampled_rows(
-                    hidden_states, shard, gather_ids, group=self.tp_group
+                    hidden_states, shard, group=self.tp_group
                 )
                 if select_aux:
                     aux_pruned_states = [
-                        gather_sampled_rows(h, shard, gather_ids, group=self.tp_group)
+                        gather_sampled_rows(h, shard, group=self.tp_group)
                         for h in aux_hidden_states
                     ]
             else:
@@ -945,7 +945,7 @@ class LogitsProcessor(nn.Module):
         is vocab-sharded over the same group, so a row's full-vocabulary
         logits need every rank's slice *of that row*: the planned rows'
         activations are all-gathered first (one collective with the
-        per-rank counts, rank order being row order) and the chunk loop then
+        per-rank counts, then put back in row order) and the chunk loop then
         runs over the whole plan on every rank, exactly as without a shard.
         Every rank ends with the same fp32 vector -- the unsharded forward's
         bit for bit, since each row meets the same operands -- so no result
@@ -1003,7 +1003,9 @@ class LogitsProcessor(nn.Module):
             )
         if plan.chunk_tokens <= 0:
             raise ValueError("input_logprob_chunk_tokens must be positive")
-        if (plan.rows_per_rank is None) != (shard is None):
+        if (plan.rows_per_rank is None) != (shard is None) or (
+            plan.gathered_to_rows is None
+        ) != (shard is None):
             raise ValueError(
                 "input logprob rows were staged for "
                 f"{'a sharded' if plan.rows_per_rank is not None else 'an unsharded'} "
@@ -1022,7 +1024,7 @@ class LogitsProcessor(nn.Module):
                 )
             source = token_all_gather_rows(
                 hidden_states[plan.rows], self.tp_group, list(plan.rows_per_rank)
-            )
+            ).index_select(0, plan.gathered_to_rows)
             index = None
             staged_rows = source.shape[0]
         num_rows = plan.num_result_rows

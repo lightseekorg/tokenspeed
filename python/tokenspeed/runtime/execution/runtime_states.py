@@ -277,7 +277,6 @@ class RuntimeStates:
         input_start_offsets: torch.Tensor,
         active_request_mask: torch.Tensor,
         committed_lengths: torch.Tensor,
-        row_offset: int,
     ) -> RequestTokenHistoryView:
         """Combine the draft history with one packed-batch layout.
 
@@ -288,8 +287,6 @@ class RuntimeStates:
             active_request_mask: ``[bs]`` False rows are graph padding.
             committed_lengths: ``[pool + 1]`` per-slot write frontier for this
                 draft step; the drafter owns and advances it.
-            row_offset: Batch-global row of the forward's first local input
-                row (a query shard's start; 0 otherwise).
         """
         if self.draft_request_token_history_ids is None:
             raise RuntimeError("draft request token history is not enabled")
@@ -299,7 +296,6 @@ class RuntimeStates:
             req_pool_indices=req_pool_indices,
             input_start_offsets=input_start_offsets,
             active_request_mask=active_request_mask,
-            row_offset=row_offset,
         )
 
     def request_token_history_view(
@@ -308,13 +304,8 @@ class RuntimeStates:
         req_pool_indices: torch.Tensor,
         input_start_offsets: torch.Tensor,
         active_request_mask: torch.Tensor,
-        row_offset: int,
     ) -> RequestTokenHistoryView:
-        """Combine the persistent history with one packed-batch layout.
-
-        ``row_offset`` is the batch-global row of the forward's first local
-        input row (a query shard's start; 0 otherwise).
-        """
+        """Combine the persistent history with one packed-batch layout."""
         if self.request_token_history_ids is None:
             raise RuntimeError("request token history is not enabled")
         return RequestTokenHistoryView(
@@ -323,7 +314,6 @@ class RuntimeStates:
             req_pool_indices=req_pool_indices,
             input_start_offsets=input_start_offsets,
             active_request_mask=active_request_mask,
-            row_offset=row_offset,
         )
 
     def seed_request_token_history(self, seeds: RequestHistorySeeds) -> None:

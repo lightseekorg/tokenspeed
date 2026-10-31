@@ -139,7 +139,7 @@ class _QcpStubCore:
                 latent_cache.contiguous(), key_rows.group, list(plan.row_counts)
             )
             self.gathers += 1
-            latent = gathered[plan.local_slice]
+            latent = plan.to_span_order(gathered)[plan.local_row_ids]
         rotated = query.clone()
         rotated[..., KV_LORA:] = q_pe * (positions.to(query.dtype) + 1.0)[:, None, None]
         self.latent = latent[:, :KV_LORA].clone()
@@ -260,7 +260,11 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
         weights = attention_weights(HIDDEN)
         total = sum(lengths)
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank
+            total_tokens=total,
+            input_lengths=lengths,
+            size=WORLD,
+            rank=rank,
+            device="cpu",
         )
         gen = torch.Generator().manual_seed(4)
         hidden_full = torch.randn(total, HIDDEN, generator=gen)
@@ -294,7 +298,7 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
 
         # --- The sharded extend -------------------------------------------
         ctx = _extend_ctx(plan, lengths)
-        own = plan.local_slice
+        own = plan.local_row_ids
         hidden = hidden_full[own].contiguous()
         positions = positions_full[own].contiguous()
         assert sharded.head_tp_exchanges(ctx)
@@ -400,7 +404,7 @@ def test_head_tp_row_counts_follow_the_layout():
         rank=2, world_size=4, attn_tp_size=4, attn_qcp_size=4, attn_head_tp_size=4
     )
     plan = QueryShardPlan.from_forward(
-        total_tokens=7, input_lengths=[4, 3], size=4, rank=2
+        total_tokens=7, input_lengths=[4, 3], size=4, rank=2, device="cpu"
     )
     sharded = SimpleNamespace(
         global_num_tokens=None,
@@ -411,12 +415,13 @@ def test_head_tp_row_counts_follow_the_layout():
     assert head_tp_row_counts(sharded, qcp, 2, collective=False) == [2, 2, 2, 1]
     assert head_tp_row_counts(sharded, qcp, 2, collective=True) == [2, 2, 2, 1]
     # A narrowing drafter reports the sampled rows; the output legs follow
-    # (the requests' last rows 3 and 6 sit on ranks 1 and 3).
-    assert plan.sampled_rows_per_rank == (0, 1, 0, 1)
+    # (one row per zigzag segment: the requests' last rows 3 and 6 sit on
+    # ranks 3 and 2).
+    assert plan.sampled_rows_per_rank == (0, 0, 1, 1)
     narrowed = SimpleNamespace(**{**vars(sharded), "collective_num_tokens": 2})
-    assert head_tp_row_counts(narrowed, qcp, 0, collective=True) == [0, 1, 0, 1]
-    with pytest.raises(ValueError, match="holds 1 rows"):
-        head_tp_row_counts(narrowed, qcp, 1, collective=True)
+    assert head_tp_row_counts(narrowed, qcp, 1, collective=True) == [0, 0, 1, 1]
+    with pytest.raises(ValueError, match="holds 0 rows"):
+        head_tp_row_counts(narrowed, qcp, 0, collective=True)
     with pytest.raises(ValueError, match="holds 3 rows"):
         head_tp_row_counts(sharded, qcp, 3, collective=False)
     replicated = SimpleNamespace(**{**vars(sharded), "query_shard": None})
