@@ -280,12 +280,13 @@ class Envs:
     # raises. Any such synchronization on the data plane stalls the forward
     # thread until the in-flight step drains and defeats overlap scheduling.
     TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
-    # Triton compilations once serving starts: "warn" logs each one with what
-    # changed and names a compile-time kernel parameter that keeps taking new
-    # values (a per-batch constexpr, one JIT compile on the forward thread per
-    # batch shape), "error" raises on such a parameter, "off" disables the
-    # monitor. CI serves with "error".
     TOKENSPEED_STARTUP_TIMING = EnvBool(False)
+    # Triton and CuTe DSL compilations once serving starts: "warn" logs each
+    # one with what changed and names a compile-time kernel parameter that
+    # keeps taking new values (a per-batch constexpr, one JIT compile on the
+    # forward thread per batch shape), a call site that keeps recompiling known
+    # specializations, and a direct @cute.jit call; "error" raises on those,
+    # "off" disables the monitor. CI serves with "error".
     TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)

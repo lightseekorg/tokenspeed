@@ -22,8 +22,10 @@ Supported task types:
 Task types that start a server (`server_smoke`, `eval`, `perf`) run with
 `TOKENSPEED_JIT_COMPILE_CHECK=error` unless the task's `env` sets it: a
 compile-time kernel parameter that keeps taking new values after startup
-(a per-batch `tl.constexpr`) fails the run. The server log names the kernel,
-the parameter, and the launching call site.
+(a per-batch `tl.constexpr` or static CuTe DSL dimension), a call site that
+keeps recompiling specializations a kernel already has, or a direct
+`@cute.jit` call after startup fails the run. The server log names the kernel,
+the cause, and the launching call site.
 
 Currently configured task directories:
 

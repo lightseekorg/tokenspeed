@@ -330,18 +330,21 @@ compile-cache key. Startup compiles on purpose (graph capture, tuning), so
 the bootstrap installs `tokenspeed_kernel.compile_monitor` before building
 anything and `enter_serving` marks the end of startup right after arming the
 sync-debug mode; an encode rank marks it once it reported ready. From then
-on the monitor logs every Triton compilation with its duration and cause and
-reports by name any compile-time kernel parameter that keeps taking new
-values from one call site -- a per-batch value passed as `tl.constexpr`;
-each commit reports the compilation counts and durations, which the control
-plane exports as `tokenspeed:jit_serving_compiles` /
-`tokenspeed:jit_serving_compile_seconds`. `TOKENSPEED_JIT_COMPILE_CHECK=error`
-raises there instead, and CI serving jobs run with it.
+on the monitor logs every Triton and CuTe DSL compilation with its duration
+and cause and reports by name any compile-time kernel parameter that keeps
+taking new values from one call site (a per-batch value passed as
+`tl.constexpr` or as a static CuTe DSL dimension), a call site that keeps
+recompiling specializations the kernel already has, and a direct `@cute.jit`
+call, which traces the kernel in Python on every call; each commit reports
+the compilation counts and durations, which the control plane exports as
+`tokenspeed:jit_serving_compiles` / `tokenspeed:jit_serving_compile_seconds`.
+`TOKENSPEED_JIT_COMPILE_CHECK=error` raises there instead, and CI serving
+jobs run with it.
 The same mark closes the kernel package's compile switch
 (`compile_monitor.is_serving()`), installed monitor or not. A kernel whose
-library compiles once per batch shape outside Triton -- FlashInfer's joint BF16
-GEMM and the ll_bf16 router's dot-product kernel compile once per exact row
-count -- runs only before it:
+library compiles once per batch shape with no key to bucket -- FlashInfer's
+joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
+exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
 compiles instead of compiling on the forward thread.
 
