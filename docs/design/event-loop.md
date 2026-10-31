@@ -35,7 +35,12 @@ socket closed, which does not reconnect) stops the engine the same way. One
 rank is the same path with groups of one.
 
 After the forward thread has joined and the Python close callback has run,
-the host's main thread acquires the GIL for the rest of process exit. Native
+the host runs Python's registered `atexit` callbacks. Device backends use them
+to synchronize their work and stop process-group watchdogs; returning from
+an embedded host alone does not run Python's exit callbacks. The interpreter
+stays alive for native destructors rather than being finalized.
+
+The host's main thread then acquires the GIL for the rest of process exit. Native
 extension statics may own Python types and release those references in C++
 static destructors. Returning from the embedded host with the GIL released
 can abort during those destructors even after every request completed. This
