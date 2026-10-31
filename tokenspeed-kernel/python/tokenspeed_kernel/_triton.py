@@ -39,6 +39,7 @@ if _IS_NPU:
     # Gluon and tensor descriptors belong to the CUDA/ROCm vendor package.
     # Keep GPU registrations importable without requiring that package.
     aggregate = None
+    GluonTensorDescriptor = None
     TensorDescriptor = None
     gl = None
 
@@ -72,6 +73,9 @@ else:
     import tokenspeed_triton.experimental.gluon.language as gl
     from tokenspeed_triton import language as tl
     from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.experimental.gluon.nvidia.hopper import (
+        TensorDescriptor as GluonTensorDescriptor,
+    )
     from tokenspeed_triton.language.core import _aggregate as aggregate
     from tokenspeed_triton.language.extra import libdevice
     from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
@@ -82,6 +86,7 @@ else:
         proton = None
 
 __all__ = [
+    "GluonTensorDescriptor",
     "TensorDescriptor",
     "aggregate",
     "get_hip_runtime_path",
