@@ -262,7 +262,12 @@ def test_gluon_fp8_moe_gfx1250_token_count() -> None:
         routes = tokens * top_k
         counts = (tokens, routes)
         # Routing and combine still key on the token and route counts.
-        return (*map(int_specialization_class, counts), tile(tokens), routes <= 128)
+        return (
+            *map(int_specialization_class, counts),
+            tile(tokens),
+            routes <= 128,
+            routes <= 1024,
+        )
 
     # Tokens are independent: a shorter batch is a prefix of the longest one
     # that uses the same tiles.
