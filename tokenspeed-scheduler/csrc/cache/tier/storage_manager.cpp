@@ -141,7 +141,7 @@ std::uint64_t StorageTransferManager::StartRead(const CacheCoordinator::PromptPr
     StorageGetOperation op{nextId(), reservation.keys, {}};
     for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
         op.host_blocks.push_back(coordinator_.Allocator(static_cast<std::int32_t>(op.keys[i].group_id))
-                                     .ResolveCacheBlockId(reservation.blocks[i]->Location()));
+                                     .ResolveCacheBlockId(*reservation.blocks[i]));
     }
     const auto id = op.op_id;
     operations_.emplace(id, Ticket{decltype(op)::kKind,
@@ -274,7 +274,7 @@ void StorageTransferManager::StartBackups() {
             continue;
         }
         op.host_blocks.push_back(
-            coordinator_.Allocator(static_cast<std::int32_t>(key.group_id)).ResolveCacheBlockId(ref->Location()));
+            coordinator_.Allocator(static_cast<std::int32_t>(key.group_id)).ResolveCacheBlockId(*ref));
         op.keys.push_back(std::move(key));
         refs.push_back(std::move(ref));
     }

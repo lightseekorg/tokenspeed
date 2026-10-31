@@ -36,6 +36,111 @@
 
 namespace tokenspeed {
 
+std::vector<CacheCoordinator::HostKvDuplicateCandidate> CacheCoordinator::hostKvDuplicateCandidates() const {
+    std::int64_t lookback_tokens = 0;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (!GroupIsReplayable(i) && !GroupIsState(i) && !groups_[i].Matcher().IsPrefixClosed()) {
+            lookback_tokens =
+                std::max(lookback_tokens, static_cast<std::int64_t>(groups_[i].Matcher().BoundaryLookbackPages()) *
+                                              geometry_[i].BlockGranularity());
+        }
+    }
+    std::vector<HostKvDuplicateCandidate> candidates;
+    const std::uint64_t scan_generation = ++host_duplicate_scan_generation_;
+    _assert(scan_generation != 0, "Host duplicate scan generation overflow");
+    std::vector<const BoundaryTree::Node*> ancestors;
+    std::vector<const BoundaryTree::Node*> pending;
+    const auto store_pending_at_or_above = [&](const BoundaryTree::Node& node) {
+        ancestors.clear();
+        const BoundaryTree::Node* ancestor = &node;
+        bool store_pending = false;
+        while (ancestor != nullptr) {
+            if (ancestor->host_store_scan_generation == scan_generation) {
+                store_pending = ancestor->host_store_ancestor_pending;
+                break;
+            }
+            ancestors.push_back(ancestor);
+            if (ancestor->pending_host_stores > 0) {
+                store_pending = true;
+                break;
+            }
+            ancestor = ancestor->parent;
+        }
+        // Candidate chains share ancestors. Cache each answer only within
+        // this scan, while Host stores and tree links cannot change.
+        for (const BoundaryTree::Node* visited : ancestors) {
+            visited->host_store_scan_generation = scan_generation;
+            visited->host_store_ancestor_pending = store_pending;
+        }
+        return store_pending;
+    };
+    // Membership follows cache insertions and removals. Device-prefix coverage
+    // follows page changes, including gaps opened or filled by a restore.
+    for (const BoundaryTree::Node* node = boundary_tree_.FirstHostKvDuplicate(); node != nullptr;
+         node = node->next_host_kv_duplicate) {
+        if (!node->device_kv_prefix_complete) {
+            continue;
+        }
+        if (store_pending_at_or_above(*node)) {
+            continue;
+        }
+        // A checkpoint can need this page only within its lookback distance.
+        // Inspect that bounded subtree, including pinned and pending states,
+        // rather than scanning every checkpoint in the cache for every plan.
+        bool window_needs_page = false;
+        if (lookback_tokens > 0) {
+            const std::int64_t past_end = node->boundary_tokens + lookback_tokens;
+            pending.clear();
+            pending.push_back(node);
+            while (!pending.empty()) {
+                const BoundaryTree::Node& boundary = *pending.back();
+                pending.pop_back();
+                if (num_state_groups_ == 0 || boundary.has_checkpoint[BoundaryTree::kDevice] ||
+                    boundary.has_checkpoint[BoundaryTree::kHost] || boundary.pending_host_stores > 0) {
+                    window_needs_page = true;
+                    break;
+                }
+                for (const BoundaryTree::Node* child = boundary.first_child; child != nullptr;
+                     child = child->next_sibling) {
+                    if (child->boundary_tokens < past_end) {
+                        pending.push_back(child);
+                    }
+                }
+            }
+        }
+        if (window_needs_page) {
+            continue;
+        }
+        ForEachBoundaryKey(CacheKey{.content_hash = *node->hash}, /*tail_tokens=*/0,
+                           [&](std::size_t i, const CacheKey& key) {
+                               if (!groups_[i].Matcher().IsPrefixClosed()) {
+                                   return;
+                               }
+                               const PrefixCacheIndex& index = groups_[i].Index();
+                               const auto host = index.Inspect(*host_pool_, key);
+                               if (host && !host->pinned) {
+                                   const auto device = index.Inspect(pool_, key);
+                                   _assert(device.has_value(), "complete Device prefix lost a KV entry");
+                                   candidates.push_back(HostKvDuplicateCandidate{
+                                       .group_id = groups_[i].Id(),
+                                       .location = host->location,
+                                       .device_epoch = device->metadata.last_access_epoch,
+                                       .boundary_tokens = node->boundary_tokens,
+                                       .device_in_use = device->pinned,
+                                   });
+                               }
+                           });
+    }
+    // Placement keeps this order for Device copies still held by a request.
+    // Unheld copies can instead compete with Host State by access epoch.
+    std::ranges::sort(candidates, [](const HostKvDuplicateCandidate& lhs, const HostKvDuplicateCandidate& rhs) {
+        return std::tuple{~lhs.device_epoch, lhs.boundary_tokens, lhs.group_id, lhs.location.lcm_block_id,
+                          lhs.location.slot_index} < std::tuple{~rhs.device_epoch, rhs.boundary_tokens, rhs.group_id,
+                                                                rhs.location.lcm_block_id, rhs.location.slot_index};
+    });
+    return candidates;
+}
+
 CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
     std::span<const HostSegmentRows> segments) const {
@@ -121,15 +226,46 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         return newest;
     };
 
+    // Keep aligned checkpoints at their State LRU rank: a later prompt can
+    // diverge before the deeper frontier even within the same request cohort.
+    // A continued tail retains its existing priority so old input tails do
+    // not crowd out other sessions after the request has moved on.
+    const auto device_continues_checkpoint = [&](const BoundaryTree::Node& checkpoint) {
+        if (checkpoint.tail_tokens == 0 || checkpoint.latest_state_access_epoch == 0) {
+            return false;
+        }
+        const BoundaryTree::Node* root = checkpoint.parent;
+        if (root == nullptr) {
+            return false;
+        }
+        std::vector<const BoundaryTree::Node*> pending{root};
+        while (!pending.empty()) {
+            const BoundaryTree::Node* node = pending.back();
+            pending.pop_back();
+            if (node->checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] == 0) {
+                continue;
+            }
+            if (node->boundary_tokens > checkpoint.boundary_tokens && node->has_checkpoint[BoundaryTree::kDevice] &&
+                node->latest_state_access_epoch == checkpoint.latest_state_access_epoch) {
+                return true;
+            }
+            for (const BoundaryTree::Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+                pending.push_back(child);
+            }
+        }
+        return false;
+    };
+
     // A candidate victim's node and its rank, the smallest first: by class
     // (VictimClass: a dead entry, a duplicate or a superseded checkpoint
     // boundary, Host-only cache), then by epoch -- a dead entry's and
-    // Host-only cache's newest Host entry, oldest first; a duplicate's or
+    // Host-only checkpoint's newest State entry (a KV-only node's newest
+    // Host entry), oldest first; a duplicate's or
     // superseded checkpoint boundary's Device copy, newest first, since the
     // Device keeps that one longest -- then the shallower boundary, keeping
     // the longer frontier as Device eviction does, then the candidate
     // node's first Host entry.
-    enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kHostOnly };
+    enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kDuplicateKv, kHostOnly };
     struct Candidate {
         const BoundaryTree::Node* candidate_node{nullptr};
         VictimClass victim_class{VictimClass::kDead};
@@ -139,12 +275,20 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         std::int32_t boundary_tokens{0};
         CacheBlockLocation first_entry_location;
         HostEvictionCounts HostEvictionStats::*reason{nullptr};
+        std::optional<std::uint32_t> duplicate_kv_group{std::nullopt};
     };
     const auto ranks_after = [](const Candidate& lhs, const Candidate& rhs) {
-        return std::tuple{lhs.victim_class, lhs.epoch_sort_key, lhs.boundary_tokens,
-                          lhs.first_entry_location.lcm_block_id, lhs.first_entry_location.slot_index} >
-               std::tuple{rhs.victim_class, rhs.epoch_sort_key, rhs.boundary_tokens,
-                          rhs.first_entry_location.lcm_block_id, rhs.first_entry_location.slot_index};
+        return std::tuple{lhs.victim_class,
+                          lhs.epoch_sort_key,
+                          !lhs.duplicate_kv_group.has_value(),
+                          lhs.boundary_tokens,
+                          lhs.first_entry_location.lcm_block_id,
+                          lhs.first_entry_location.slot_index} > std::tuple{rhs.victim_class,
+                                                                            rhs.epoch_sort_key,
+                                                                            !rhs.duplicate_kv_group.has_value(),
+                                                                            rhs.boundary_tokens,
+                                                                            rhs.first_entry_location.lcm_block_id,
+                                                                            rhs.first_entry_location.slot_index};
     };
     std::priority_queue<Candidate, std::vector<Candidate>, decltype(ranks_after)> candidates{ranks_after};
     const auto add_candidate = [&](const BoundaryTree::Node& node) {
@@ -157,25 +301,20 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                             .first_entry_location = entries.front().location};
         const auto num_checkpoint_entries =
             std::ranges::count_if(entries, [&](const NodeEntry& entry) { return GroupIsState(entry.group_id); });
-        // Dead on the Host: a tail no probe enumerates any more; a
-        // checkpoint boundary missing some State group's checkpoint; with
-        // State groups, a node with no remaining Host checkpoint boundary
-        // at or under it. Only the Host's checkpoint boundaries count here:
-        // a Device checkpoint boundary under the node does not keep it out
-        // of this class, as it keeps it from CollectDeadEntries.
-        const bool dead = (node.tail_tokens > 0 && !tails_.Contains(*node.hash)) ||
-                          (num_checkpoint_entries > 0 && num_checkpoint_entries < num_state_groups_) ||
-                          (num_state_groups_ > 0 && num_remaining_checkpoint_boundaries(node) == 0);
-        // Superseded: a Host checkpoint boundary whose page (its parent for
-        // a tail, else the node itself) has a Device checkpoint boundary
-        // under it other than the page's own and this node's; it ranks by
-        // that page's newest Device KV access.
+        // A Device checkpoint can still need this Host history, especially
+        // a window absent on the Device, or other State groups split across
+        // tiers. Incomplete Host State alone does not make these entries
+        // dead; they keep their ordinary eviction ranking.
+        const bool no_device_checkpoint = node.checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] == 0;
+        const bool dead =
+            (node.tail_tokens > 0 && !tails_.Contains(*node.hash)) ||
+            (no_device_checkpoint && ((num_checkpoint_entries > 0 && num_checkpoint_entries < num_state_groups_) ||
+                                      (num_state_groups_ > 0 && num_remaining_checkpoint_boundaries(node) == 0)));
         const BoundaryTree::Node* page = node.tail_tokens > 0 ? node.parent : &node;
         const std::int32_t num_deeper_device_checkpoint_boundaries =
             page == nullptr ? 0
                             : page->checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] -
-                                  (page->has_checkpoint[BoundaryTree::kDevice] ? 1 : 0) -
-                                  (page != &node && node.has_checkpoint[BoundaryTree::kDevice] ? 1 : 0);
+                                  (page->has_checkpoint[BoundaryTree::kDevice] ? 1 : 0);
         if (dead) {
             candidate.victim_class = VictimClass::kDead;
             candidate.epoch_sort_key = *newest_epoch(*host_pool_, node, /*kv_only=*/false);
@@ -186,7 +325,8 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
             candidate.epoch_sort_key = ~*newest_epoch(pool_, node, /*kv_only=*/false);
             candidate.reason = &HostEvictionStats::duplicate;
         } else if (const std::optional<std::uint64_t> superseding_epoch =
-                       num_checkpoint_entries > 0 && num_deeper_device_checkpoint_boundaries >= 1
+                       num_checkpoint_entries > 0 && num_deeper_device_checkpoint_boundaries >= 1 &&
+                               device_continues_checkpoint(node)
                            ? newest_epoch(pool_, *page, /*kv_only=*/true)
                            : std::nullopt) {
             candidate.victim_class = VictimClass::kCoveredByDevice;
@@ -194,7 +334,22 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
             candidate.reason = &HostEvictionStats::superseded;
         } else {
             candidate.victim_class = VictimClass::kHostOnly;
-            candidate.epoch_sort_key = *newest_epoch(*host_pool_, node, /*kv_only=*/false);
+            if (num_checkpoint_entries > 0) {
+                // A longer resume touches this page's KV without using its
+                // checkpoint. Rank the State by its own accesses, so that KV
+                // traversal does not keep an unused checkpoint young.
+                for (const NodeEntry& entry : entries) {
+                    if (GroupIsState(entry.group_id)) {
+                        candidate.epoch_sort_key =
+                            std::max(candidate.epoch_sort_key, groups_[entry.group_id]
+                                                                   .Index()
+                                                                   .MetadataFor(*host_pool_, entry.location)
+                                                                   ->last_access_epoch);
+                    }
+                }
+            } else {
+                candidate.epoch_sort_key = *newest_epoch(*host_pool_, node, /*kv_only=*/false);
+            }
             candidate.reason = &HostEvictionStats::lru;
         }
         candidates.push(candidate);
@@ -240,9 +395,47 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // is taken, so no later walk descends into them again (a chain taken
     // page by page would otherwise be walked once per page).
     std::unordered_set<const BoundaryTree::Node*> walked_by_taken_victims;
-    while (!shadow.Fits(need_by_bucket, no_dense_need) && !candidates.empty()) {
+    bool added_kv_duplicates = false;
+    while (!shadow.Fits(need_by_bucket, no_dense_need)) {
+        // Existing dead and Device-covered segments retain their priority.
+        // A held Device copy cannot be demoted, so its Host duplicate goes
+        // first. An unheld copy can be the next Device victim: compare its
+        // Device access epoch with Host State instead of always recopying KV
+        // to preserve an older checkpoint. Equal epochs prefer the duplicate.
+        if (!added_kv_duplicates && (candidates.empty() || candidates.top().victim_class == VictimClass::kHostOnly)) {
+            const auto duplicates = hostKvDuplicateCandidates();
+            for (std::size_t rank = 0; rank < duplicates.size(); ++rank) {
+                const HostKvDuplicateCandidate& duplicate = duplicates[rank];
+                // Collection and ranking run in one control-plane call: no
+                // owner or access epoch changes between the two.
+                const bool compare_with_state = num_state_groups_ > 0 && !duplicate.device_in_use;
+                candidates.push(
+                    Candidate{.victim_class = compare_with_state ? VictimClass::kHostOnly : VictimClass::kDuplicateKv,
+                              .epoch_sort_key = compare_with_state ? duplicate.device_epoch : rank,
+                              .boundary_tokens = duplicate.boundary_tokens,
+                              .first_entry_location = duplicate.location,
+                              .reason = &HostEvictionStats::duplicate_kv,
+                              .duplicate_kv_group = duplicate.group_id});
+            }
+            added_kv_duplicates = true;
+        }
+        if (candidates.empty()) {
+            break;
+        }
         const Candidate candidate = candidates.top();
         candidates.pop();
+        if (candidate.duplicate_kv_group) {
+            const CacheBlockLocation location = candidate.first_entry_location;
+            if (taken.insert(location).second) {
+                const std::uint32_t group = *candidate.duplicate_kv_group;
+                shadow.Remove(group, location);
+                Victim victim;
+                victim.members.emplace_back(group, location);
+                victim.reason = candidate.reason;
+                victims.push_back(std::move(victim));
+            }
+            continue;
+        }
         const BoundaryTree::Node& candidate_node = *candidate.candidate_node;
         std::vector<NodeEntry> candidate_entries = untaken_entries_of(candidate_node);
         if (candidate_entries.empty()) {
@@ -333,11 +526,22 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                 continue;
             }
         }
-        // One member in use passes the whole victim over.
+        // A KV load does not hold this boundary's State unless it actually
+        // resumes there. If it blocks the segment, reclaim only the unused
+        // checkpoint and leave every history block (and its pins) intact.
         if (std::ranges::any_of(taken_nodes, [](const TakenNode& taken_node) {
                 return std::ranges::any_of(taken_node.entries, &NodeEntry::in_use);
             })) {
-            continue;
+            std::vector<NodeEntry> checkpoint_entries = untaken_entries_of(candidate_node);
+            checkpoint_entries.resize(num_candidate_checkpoint_entries);
+            if (checkpoint_entries.empty() || std::ranges::any_of(checkpoint_entries, &NodeEntry::in_use)) {
+                continue;
+            }
+            taken_nodes.clear();
+            taken_nodes.push_back(
+                TakenNode{.node = &candidate_node, .entries = std::move(checkpoint_entries), .takes_page = false});
+            walked.clear();
+            victim.nearest_untaken_page = &candidate_node;
         }
         walked_by_taken_victims.insert(walked.begin(), walked.end());
         for (const TakenNode& taken_node : taken_nodes) {

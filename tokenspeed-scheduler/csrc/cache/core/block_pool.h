@@ -103,6 +103,19 @@ public:
         return placement(group_id).free_slots_by_bucket;
     }
 
+    std::int32_t Packing(std::uint32_t group_id) const noexcept { return placement(group_id).packing; }
+
+    std::int32_t ResolveCacheBlockId(std::uint32_t group_id, CacheBlockLocation location) const {
+        const std::int32_t packing = Packing(group_id);
+        _assert(location.lcm_block_id > 0 && location.lcm_block_id <= NumLcmBlocks(),
+                "LCM block id is outside the owning pool");
+        _assert(location.slot_index >= 0 && location.slot_index < packing, "cache block slot is out of range");
+        const std::int64_t id =
+            1 + (static_cast<std::int64_t>(location.lcm_block_id) - 1) * packing + location.slot_index;
+        _assert(id <= std::numeric_limits<std::int32_t>::max(), "cache block id exceeds int32 range");
+        return static_cast<std::int32_t>(id);
+    }
+
     // Fix placement geometry before this group allocates any blocks. Repeated
     // registration is allowed only with the same geometry, including after free.
     void RegisterGroup(std::uint32_t group_id, std::int32_t packing, std::int32_t shard_count) {

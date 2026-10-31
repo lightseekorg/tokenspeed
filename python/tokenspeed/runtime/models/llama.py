@@ -261,6 +261,7 @@ class LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLM(BaseCausalLM):
     model_cls = LlamaModel
+    supports_aux_capture = True
 
     def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
         return [

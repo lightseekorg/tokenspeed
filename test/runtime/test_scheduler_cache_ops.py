@@ -24,10 +24,13 @@ rank-sync payload, and the retraction and prefetch fields of ``make_config``."""
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
 from test.l3_test_utils import storage_ops, storage_scheduler
 from types import SimpleNamespace
 
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -201,6 +204,7 @@ def _config(**overrides):
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
         storage_config=None,
@@ -244,6 +248,7 @@ def test_make_config_requires_storage_limits_exactly_with_l3():
         _config(num_host_pages=8, disable_l2_cache=False, enable_l3_storage=True)
     config = _config(
         num_host_pages=8,
+        host_group_packing=(1,),
         disable_l2_cache=False,
         enable_l3_storage=True,
         storage_config=limits,

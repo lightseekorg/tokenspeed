@@ -660,6 +660,12 @@ private:
                 : 0;
         const GroupAllocator& allocator = groups_[group_index].Allocator();
         const auto count_hit = [&](const CacheKey& key) {
+            // A replicated group has only bucket 0, independent of whether
+            // this source is already on Host or is an incoming L3 row.
+            if (allocator.ShardCount() == 1) {
+                ++need[0];
+                return;
+            }
             const CacheBlockRef host_block = groups_[group_index].Index().Find(*host_pool_, key);
             const std::int32_t bucket = host_block ? allocator.BucketOf(host_block->Location()) : 0;
             ++need[static_cast<std::size_t>(bucket)];
@@ -807,62 +813,70 @@ private:
         std::ranges::sort(request_reclaim_candidates_, shouldEvictFirst);
     }
 
-    bool ensureGroupCandidateAvailable(CacheGroupVictimCandidates& group) {
-        if (group.next_candidate_index < group.candidates.size()) {
-            return true;
-        }
+    void loadGroupEpoch(CacheGroupVictimCandidates& group, std::uint64_t epoch) {
         group.candidates.clear();
         group.next_candidate_index = 0;
-        while (!group.index_exhausted) {
-            epoch_scratch_.clear();
-            const bool found_epoch =
-                groups_[group.group_id].Index().NextEvictionEpoch(pool_, group.index_cursor, epoch_scratch_);
-            if (!found_epoch) {
-                group.index_exhausted = true;
-                break;
+        epoch_scratch_.clear();
+        groups_[group.group_id].Index().NextEvictionEpoch(pool_, group.index_cursor, epoch, epoch_scratch_);
+        for (const PrefixCacheIndex::EvictionCandidate& entry : epoch_scratch_) {
+            if (protected_locations_.contains(entry.location) || request_reclaim_locations_.contains(entry.location)) {
+                continue;
             }
-            for (const PrefixCacheIndex::EvictionCandidate& entry : epoch_scratch_) {
-                if (protected_locations_.contains(entry.location) ||
-                    request_reclaim_locations_.contains(entry.location)) {
-                    continue;
-                }
-                group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
-            }
-            // Index order breaks epoch ties by location; eviction policy also
-            // considers boundary tier and logical position, so sort the whole epoch.
-            if (!group.candidates.empty()) {
-                std::ranges::sort(group.candidates, shouldEvictFirst);
-                return true;
-            }
+            group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
         }
-        return false;
+        // The entire epoch participates in boundary and position tie-breaks.
+        std::ranges::sort(group.candidates, shouldEvictFirst);
     }
 
     std::optional<VictimCandidate> nextVictimCandidate() {
-        CacheGroupVictimCandidates* selected_group = nullptr;
-        for (CacheGroupVictimCandidates& group : cache_group_candidates_) {
-            if (!ensureGroupCandidateAvailable(group)) {
+        while (true) {
+            CacheGroupVictimCandidates* selected_group = nullptr;
+            CacheGroupVictimCandidates* next_group = nullptr;
+            std::optional<std::uint64_t> next_epoch;
+            for (CacheGroupVictimCandidates& group : cache_group_candidates_) {
+                if (group.next_candidate_index < group.candidates.size()) {
+                    if (selected_group == nullptr ||
+                        shouldEvictFirst(group.CurrentCandidate(), selected_group->CurrentCandidate())) {
+                        selected_group = &group;
+                    }
+                } else if (!group.index_exhausted) {
+                    const auto epoch = groups_[group.group_id].Index().PeekEvictionEpoch(pool_, group.index_cursor);
+                    if (!epoch) {
+                        group.index_exhausted = true;
+                    } else if (!next_epoch || *epoch < *next_epoch) {
+                        next_epoch = epoch;
+                        next_group = &group;
+                    }
+                }
+            }
+
+            const VictimCandidate* selected = selected_group == nullptr ? nullptr : &selected_group->CurrentCandidate();
+            const bool select_request =
+                next_request_candidate_index_ < request_reclaim_candidates_.size() &&
+                (selected == nullptr ||
+                 shouldEvictFirst(request_reclaim_candidates_[next_request_candidate_index_], *selected));
+            if (select_request) {
+                selected = &request_reclaim_candidates_[next_request_candidate_index_];
+            }
+
+            // Inspect owners only at the globally oldest unread epoch. Even
+            // a fully pinned group's newer entries cannot precede this victim.
+            // Equal epochs must all be read before applying policy tie-breaks.
+            if (next_group != nullptr && (selected == nullptr || *next_epoch <= selected->last_access_epoch)) {
+                loadGroupEpoch(*next_group, *next_epoch);
                 continue;
             }
-            if (selected_group == nullptr ||
-                shouldEvictFirst(group.CurrentCandidate(), selected_group->CurrentCandidate())) {
-                selected_group = &group;
+            if (selected == nullptr) {
+                return std::nullopt;
             }
-        }
-
-        if (next_request_candidate_index_ < request_reclaim_candidates_.size()) {
-            const VictimCandidate& request_candidate = request_reclaim_candidates_[next_request_candidate_index_];
-            if (selected_group == nullptr || shouldEvictFirst(request_candidate, selected_group->CurrentCandidate())) {
+            const VictimCandidate candidate = *selected;
+            if (select_request) {
                 ++next_request_candidate_index_;
-                return request_candidate;
+            } else {
+                ++selected_group->next_candidate_index;
             }
+            return candidate;
         }
-        if (selected_group == nullptr) {
-            return std::nullopt;
-        }
-        const VictimCandidate candidate = selected_group->CurrentCandidate();
-        ++selected_group->next_candidate_index;
-        return candidate;
     }
 
     // The coordinator planned for, read through its public views
@@ -1145,10 +1159,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                                     std::int32_t available_tokens) {
         GroupAllocator& allocator = groups_[i].Allocator();
         const CacheBlockRef replaced = allocator.SwapInFreshBlock(pool_, table, slot, available_tokens);
-        const std::int32_t destination =
-            allocator.ResolveCacheBlockId(table.Blocks()[static_cast<std::size_t>(slot)]->Location());
+        const std::int32_t destination = allocator.ResolveCacheBlockId(*table.Blocks()[static_cast<std::size_t>(slot)]);
         if (replaced) {
-            result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(replaced->Location()), destination);
+            result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*replaced), destination);
         } else {
             result.new_page_ids[i].push_back(destination);
         }
@@ -1288,17 +1301,16 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             // blocks from its first admission on.
             if (step.kind == StateStep::Kind::kRotate && shaped_now[i] && !table.Blocks()[0]) {
                 FatalCheck(allocator.AcquireStateInput(pool_, table), "admission plan no longer fits the block pool");
-                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(table.Blocks()[0]->Location()));
+                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*table.Blocks()[0]));
             }
             if (step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand) {
                 FatalCheck(allocator.AcquireStateLive(pool_, table), "admission plan no longer fits the block pool");
-                const std::int32_t live = allocator.ResolveCacheBlockId(table.Blocks()[1]->Location());
+                const std::int32_t live = allocator.ResolveCacheBlockId(*table.Blocks()[1]);
                 if (step.kind == StateStep::Kind::kLand && state_prefix_cached) {
                     // The peer omits this state transfer. A bootstrap token
                     // can finish the request before any decode writes live.
                     _assert(static_cast<bool>(table.Blocks()[0]), "an exact state hit must have an input checkpoint");
-                    result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(table.Blocks()[0]->Location()),
-                                                         live);
+                    result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*table.Blocks()[0]), live);
                 } else {
                     result.new_page_ids[i].push_back(live);
                 }
@@ -1307,7 +1319,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 _assert(step.kind == StateStep::Kind::kRotate, "an in-forward checkpoint rides a prefill chunk");
                 CacheBlockRef checkpoint = allocator.AcquireStateCheckpoint(pool_, table);
                 FatalCheck(static_cast<bool>(checkpoint), "admission plan no longer fits the block pool");
-                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(checkpoint->Location()));
+                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*checkpoint));
                 result.state_checkpoint_blocks[i] = std::move(checkpoint);
             }
             continue;
@@ -1332,7 +1344,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 continue;
             }
             result.new_page_ids[i].push_back(
-                groups_[i].Allocator().ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
+                groups_[i].Allocator().ResolveCacheBlockId(*blocks[static_cast<std::size_t>(block)]));
         }
     }
     return result;
@@ -1482,8 +1494,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
                    "restore plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         for (std::int32_t block = first_new_block; block < table.NumBlocks(); ++block) {
-            result.new_page_ids[i].push_back(
-                allocator.ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
+            result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*blocks[static_cast<std::size_t>(block)]));
         }
     }
     return result;

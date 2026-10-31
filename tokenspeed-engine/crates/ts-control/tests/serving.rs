@@ -190,6 +190,8 @@ if cfg.role != ts.SchedulerConfig.Role.Fused:
 {tiers}
 if cfg.num_host_pages > 1:
     cfg.num_host_pages = 1024 // {kv_shard_count} + 1
+if cfg.num_host_pages > 1 or cfg.num_snapshot_pages > 1:
+    cfg.host_group_packing = [{kv_shard_count}]
 result = ts.Scheduler(cfg)
 "#
     );
@@ -313,6 +315,9 @@ struct FakeDevice {
     weight_commits: Arc<Mutex<Vec<bool>>>,
     /// Inject a local loading failure while other ranks succeed.
     fail_weight_update: bool,
+    /// The rank's load prerequisites refuse (weights released, KV still
+    /// resident); a test clears it before retrying.
+    weight_load_refused: Arc<AtomicBool>,
     /// EPLB: this rank's EP rank, which skews the load it counts.
     ep_rank: usize,
     /// EPLB: the placement the experts sit in, as the routing tables say.
@@ -786,6 +791,14 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
+    fn check_weight_update(
+        &mut self,
+        _op: &ControlRequest,
+    ) -> Result<(bool, String), DataPlaneError> {
+        let refused = self.weight_load_refused.load(Ordering::SeqCst);
+        Ok((!refused, "local load prerequisite".to_owned()))
+    }
+
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         self.device_ops.lock().unwrap().push(op.tag().to_owned());
         Ok((!self.fail_weight_update, "applied".to_owned()))
@@ -1049,6 +1062,7 @@ struct Rank {
     landed: Arc<Mutex<Vec<Landing>>>,
     device_ops: Arc<Mutex<Vec<String>>>,
     weight_commits: Arc<Mutex<Vec<bool>>>,
+    weight_load_refused: Arc<AtomicBool>,
     applied: Applied,
     epd_admitted: Arc<Mutex<Vec<String>>>,
     epd_released: Arc<Mutex<Vec<usize>>>,
@@ -1220,6 +1234,8 @@ struct Setup {
     held_cache_acks: bool,
     /// A rank whose device refuses a weight load.
     weight_update_failure_rank: Option<usize>,
+    /// The ranks whose load prerequisites refuse until the test clears them.
+    weight_load_refused: Option<fn(usize) -> bool>,
 }
 
 impl Layout {
@@ -1417,6 +1433,11 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         wire: setup.pd.as_ref().map(|pd| pd.wire.clone()),
         ep_rank: rank,
         fail_weight_update: setup.weight_update_failure_rank == Some(rank),
+        weight_load_refused: Arc::new(AtomicBool::new(
+            setup
+                .weight_load_refused
+                .is_some_and(|refused| refused(rank)),
+        )),
         // The trivial initial placement: slot p holds expert p % 4.
         placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
         ..Default::default()
@@ -1494,6 +1515,7 @@ async fn start_ranks_with(
                 landed: device.landed.clone(),
                 device_ops: device.device_ops.clone(),
                 weight_commits: device.weight_commits.clone(),
+                weight_load_refused: device.weight_load_refused.clone(),
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
                 epd_released: device.epd_released.clone(),
@@ -3795,11 +3817,177 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
             *engine.ranks[rank].device_ops.lock().unwrap(),
             ["UpdateWeightFromDiskReqInput"]
         );
-        assert_eq!(*engine.ranks[rank].weight_commits.lock().unwrap(), [true]);
     }
+    assert_weight_commits(&engine, &[true]).await;
     // Serving goes on.
     let chunks = run(&engine.client, request("r", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+/// Wait until every rank recorded `expected` weight commits. The reply
+/// comes from one rank once the replica agreed; its peers record their own
+/// commit right after the same agreement, on their own threads.
+async fn assert_weight_commits(engine: &Engine, expected: &[bool]) {
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while !engine
+            .ranks
+            .iter()
+            .all(|rank| *rank.weight_commits.lock().unwrap() == expected)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if settled.is_err() {
+        let commits: Vec<Vec<bool>> = engine
+            .ranks
+            .iter()
+            .map(|rank| rank.weight_commits.lock().unwrap().clone())
+            .collect();
+        panic!("weight commits {commits:?}, expected {expected:?} on every rank");
+    }
+}
+
+/// Flush until every engine accepts: a request that just finished (or a
+/// Host cache op still in flight) refuses a flush for a round or two.
+async fn flush_until_idle(engine: &Engine) {
+    let flush = ControlRequest::FlushCache(FlushCacheReqInput {
+        rid: None,
+        http_worker_ipc: None,
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while control(engine, flush.clone())
+            .await
+            .iter()
+            .any(|(_, ok)| !ok)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the engine did not go idle");
+}
+
+fn disk_load() -> ControlRequest {
+    ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        model_path: "/checkpoint".to_owned(),
+        load_format: None,
+        weight_version: None,
+        flush_cache: true,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_weight_flush_commits_nothing_and_can_be_retried() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2), Layout::Pp(2)] {
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::HostL2,
+            Setup {
+                held_cache_acks: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            tokens(&run(&engine.client, request("warm", 65, budget(2))).await),
+            [1000, 1001]
+        );
+        for _ in 0..500 {
+            if engine.cache_ops(CacheOpKind::WriteBack) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0);
+        // A write-back in flight refuses the flush, so no rank loads.
+        let refused = control(&engine, disk_load()).await;
+        assert_eq!(refused.len(), layout.sizes().2);
+        assert!(refused.iter().all(|(_, success)| !success));
+        for rank in &engine.ranks {
+            assert!(rank.device_ops.lock().unwrap().is_empty());
+            assert!(rank.weight_commits.lock().unwrap().is_empty());
+        }
+        // The untouched weights keep serving.
+        assert_eq!(
+            tokens(&run(&engine.client, request("after-refusal", 3, budget(2))).await),
+            [1000, 1001]
+        );
+        for rank in &engine.ranks {
+            rank.ack_gate.open();
+        }
+        flush_until_idle(&engine).await;
+        assert!(control(&engine, disk_load())
+            .await
+            .iter()
+            .all(|(_, success)| *success));
+        assert_weight_commits(&engine, &[true]).await;
+        assert_eq!(
+            tokens(&run(&engine.client, request("after-retry", 3, budget(2))).await),
+            [1000, 1001]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2), Layout::Pp(2)] {
+        // Every rank refuses, or only rank zero while its peers are ready:
+        // a ready peer must not start loading without it.
+        let refusals: [fn(usize) -> bool; 2] = [|_| true, |rank| rank == 0];
+        for refused in refusals {
+            let engine = start_ranks_with(
+                layout,
+                1,
+                Tiers::DeviceOnly,
+                Setup {
+                    weight_load_refused: Some(refused),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            run(&engine.client, request("warm", 65, budget(2))).await;
+            let replies = control(&engine, disk_load()).await;
+            assert_eq!(replies.len(), layout.sizes().2);
+            assert!(replies.iter().all(|(_, success)| !success));
+            for rank in &engine.ranks {
+                assert!(rank.device_ops.lock().unwrap().is_empty());
+                assert!(rank.weight_commits.lock().unwrap().is_empty());
+            }
+            // The refusal came before the load's flush: the prefix cache
+            // still serves the warm prompt (on the one engine that took it).
+            let one_engine = layout.sizes().2 == 1;
+            let chunks = run(&engine.client, request("after-refusal", 65, budget(2))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001]);
+            if one_engine {
+                assert!(chunks.last().unwrap().cached_tokens > 0, "{layout:?}");
+            }
+            for rank in &engine.ranks {
+                rank.weight_load_refused.store(false, Ordering::SeqCst);
+            }
+            // The retry's flush can race the request that just finished; a
+            // refused flush loads and commits nothing, so send it again.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while control(&engine, disk_load())
+                    .await
+                    .iter()
+                    .any(|(_, success)| !success)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the retried load never succeeded");
+            assert_weight_commits(&engine, &[true]).await;
+            // An admitted load flushes as asked.
+            let chunks = run(&engine.client, request("after-retry", 65, budget(2))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001]);
+            assert_eq!(chunks.last().unwrap().cached_tokens, 0, "{layout:?}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3815,22 +4003,12 @@ async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
             },
         )
         .await;
-        let load = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
-            rid: None,
-            http_worker_ipc: None,
-            model_path: "/checkpoint".to_owned(),
-            load_format: None,
-            weight_version: None,
-            flush_cache: true,
-        });
-        let replies = control(&engine, load).await;
+        let replies = control(&engine, disk_load()).await;
         assert_eq!(replies.len(), layout.sizes().2);
         assert!(replies
             .iter()
             .all(|(tag, success)| { *tag == "UpdateWeightFromDiskReqOutput" && !success }));
-        for rank in &engine.ranks {
-            assert_eq!(*rank.weight_commits.lock().unwrap(), [false]);
-        }
+        assert_weight_commits(&engine, &[false]).await;
     }
 }
 

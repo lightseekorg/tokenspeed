@@ -148,7 +148,6 @@ ts serve \
     --moe-backend flashinfer_trtllm \
     --enable-prefix-caching \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -167,7 +166,6 @@ ts serve \
     --trust-remote-code \
     --enable-prefix-caching \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -199,7 +197,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -228,7 +225,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 9 \
     --disable-kvstore \
-    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -243,9 +239,9 @@ Notes:
   mismatched launch fails fast instead of drafting a wrong-width block. See
   [Speculative decoding](../configuration/server.md#speculative-decoding)
   for the DSpark and DFlash conventions.
-- `--prefix-granularity 128` matches the target's MSA cache granularity. The draft writes its KV at
-  the target's cache locations and shares the target's page table, so it
-  inherits that granularity. Do not set a separate draft granularity.
+- The draft writes its KV at the target's cache locations and shares the
+  target's page table, so it inherits the target's 128-token MSA prefix
+  granularity.
 - The draft's 1024-token sliding window is an attention mask its own layers
   apply. It is deliberately not a cache-retention policy, because the draft's
   pages are the target's pages.
@@ -287,7 +283,6 @@ tokenspeed serve "$model_dir" \
     --speculative-num-steps 7 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
-    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -744,7 +739,6 @@ python -m tokenspeed.cli serve Qwen/Qwen3-0.6B \
   --max-num-seqs 4 \
   --max-total-tokens 16384 \
   --chunked-prefill-size 4096 \
-  --prefix-granularity 128 \
   --max-cudagraph-capture-size 4 \
   --cudagraph-capture-sizes 1 2 4 \
   --disable-autotune \
@@ -1084,217 +1078,6 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve openai/gpt-oss-120b \
 
 This backend supports at most 1024 prefill or decode tokens per rank.
 
-## DeepSeek V4-Flash / V4-Pro
-
-DeepSeek V4 uses FP8 KV cache.
-`tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
-and `--tool-call-parser deepseek_v4`, and auto-sets `prefix_granularity=256`
-(pass `--prefix-granularity N` with `N != 64` to override).
-
-### NVIDIA
-
-The NVIDIA recipes below require
-`tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
-
-**V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:
-
-```bash
-tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
-  --served-model-name deepseek-v4-flash \
-  --trust-remote-code \
-  --data-parallel-size 4 \
-  --enable-expert-parallel \
-  --kv-cache-dtype fp8_e4m3 \
-  --moe-backend mega_moe \
-  --attention-use-fp4-indexer-cache \
-  --max-model-len 80000 \
-  --max-total-tokens 163840 \
-  --chunked-prefill-size 8192 \
-  --enable-mixed-batch \
-  --disable-kvstore \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-**V4-Pro** — 8× B200, tensor-parallel:
-
-```bash
-tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
-  --served-model-name deepseek-v4-pro \
-  --trust-remote-code \
-  --tensor-parallel-size 8 \
-  --kv-cache-dtype fp8_e4m3 \
-  --moe-backend flashinfer_trtllm \
-  --attention-use-fp4-indexer-cache \
-  --max-model-len 80000 \
-  --max-total-tokens 2560000 \
-  --chunked-prefill-size 8192 \
-  --disable-kvstore \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-For the expert-parallel topology, swap `--tensor-parallel-size 8` for
-`--tensor-parallel-size 8 --enable-expert-parallel --dense-tp-size 1` and
-`--moe-backend flashinfer_trtllm` for `--moe-backend mega_moe`.
-
-### AMD
-
-On eight gfx950 GPUs, DeepSeek V4 with serialized MXFP4 weights can use the
-topology and backend flags in the [Gluon Petit recipe](#gluon-petit-megamoe-on-amd-cdna4),
-alongside the V4 KV cache and indexer options. Petit ignores checkpoint
-activation clamps, which may affect accuracy. Select it explicitly with
-`--moe-backend gluon_petit`.
-
-**V4-Flash** — 2× MI350-series (gfx950), tensor-parallel + MTP:
-
-```bash
-tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
-  --trust-remote-code \
-  --tensor-parallel-size 2 \
-  --kv-cache-dtype fp8_e4m3 \
-  --max-model-len 4096 \
-  --max-total-tokens 16384 \
-  --chunked-prefill-size 8192 \
-  --prefill-graph-max-tokens 8192 \
-  --disable-kvstore \
-  --speculative-algorithm MTP \
-  --speculative-num-steps 3 \
-  --host 127.0.0.1 \
-  --port 8000
-```
-
-**V4-Flash** — 1× MI450-series (gfx1250), Triton + decode/prefill graphs, without MTP:
-
-```bash
-tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
-  --served-model-name deepseek-v4-flash \
-  --trust-remote-code \
-  --tensor-parallel-size 1 \
-  --kv-cache-dtype fp8_e4m3 \
-  --moe-backend triton \
-  --attention-use-fp4-indexer-cache \
-  --max-model-len 4096 \
-  --max-total-tokens 8192 \
-  --max-num-seqs 4 \
-  --chunked-prefill-size 256 \
-  --gpu-memory-utilization 0.8 \
-  --disable-kvstore \
-  --max-cudagraph-capture-size 4 \
-  --cudagraph-capture-sizes 1 2 3 4 \
-  --prefill-graph-max-tokens 256 \
-  --prefill-graph-capture-token-sizes 128 256 \
-  --host 127.0.0.1 \
-  --port 8000
-```
-
-TokenSpeed has not yet validated MTP on MI450.
-
-### MTP speculative decoding
-
-Both variants can drive the checkpoint's NextN/MTP draft layers. Keep the launch
-flags above and add:
-
-```bash
---speculative-algorithm MTP \
---speculative-num-steps 3
-```
-
-With `--speculative-draft-model-path` omitted, V4 uses the same checkpoint as the
-draft source (`DeepseekV4ForCausalLMNextN`), and prefix caching stays on by
-default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
-speculative accept rate from the run summary.
-
-### DSpark speculative decoding with Prefix Replay
-
-A V4-Flash checkpoint that includes complete DSpark draft weights can use
-same-checkpoint DSpark decoding. Prefix Replay keeps prefix caching enabled
-while recomputing the bounded prompt suffix needed to rebuild DSpark's
-request-persistent state:
-
-```bash
-tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
-  --served-model-name deepseek-v4-flash \
-  --trust-remote-code \
-  --tensor-parallel-size 8 \
-  --kv-cache-dtype fp8_e4m3 \
-  --moe-backend flashinfer_trtllm \
-  --attention-use-fp4-indexer-cache \
-  --max-model-len 96000 \
-  --max-num-seqs 80 \
-  --max-total-tokens 2560000 \
-  --max-prefill-tokens 8192 \
-  --chunked-prefill-size 8192 \
-  --enable-mixed-batch \
-  --enable-prefix-caching \
-  --disable-kvstore \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
-  --speculative-eagle-topk 1 \
-  --max-cudagraph-capture-size 80 \
-  --prefill-graph-max-tokens 2048 \
-  --enable-metrics \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-The replay window comes from the checkpoint's DSpark configuration. There is
-no user-tuned replay-length flag. Startup fails closed when same-checkpoint
-DSpark weights are incomplete, the replay capability is missing, KVStore is
-enabled, or the draft checkpoint contains only MTP/NextN weights. External
-DSpark checkpoints that do not advertise this capability keep the generic
-scheduler behavior.
-
-Same-checkpoint DSpark computes its public FP32 base logits straight from the
-target's BF16 LM-head shard: BF16 products are exact in FP32, so a BF16 GEMM
-with an FP32 accumulator reproduces the reference's FP32 head math up to
-summation order without an FP32 copy of the shard. The draft path reads the
-head in place under CUDA Graph replay, so in-place target weight updates need
-no refresh.
-
-The greedy block sampler runs one Triton kernel per block step on each
-tensor-parallel rank: it gathers the previous token's BF16 Markov bigram row
-from a replicated table, adds the bigram bias (a BF16 tensor-core dot against
-the rank's Markov projection shard, sharded like the LM head) to the
-rank's base logits, and packs the best `(logit, token)` of every vocabulary
-tile into one int64 candidate. One all-gather per step shares the candidates.
-The next step's kernel (or the final resolve) reduces them to the
-`torch.argmax` winner over the whole vocabulary, ties broken toward the lowest
-token ID. A five-token block is therefore six kernels and five all-gathers
-instead of a per-step chain of masked embedding lookups, GEMMs, reductions, and
-two all-gathers.
-
-Before each forward, one pinned upload carries every request's Engram history
-snapshot. `prepare_ngram_inputs` resolves the previous-three tokens and validity
-mask, clears padding, and computes table rows for all Engram layers in one
-launch. The model consumes these prepared hashes through stable input buffers.
-Preparation leaves accepted request state unchanged; after sampling,
-`commit_ngram_inputs` advances accepted history and cache lengths together in
-a second launch. Hashes are bit-identical to the eager reference, which remains
-the CPU path. Per-batch token and request counts stay runtime kernel arguments;
-only bounded tile sizes and fixed model/pool geometry specialize compilation.
-Both kernels are checked against the default per-thread stack budget, so first
-use does not reserve extra spill memory on every SM. Retraction snapshots carry
-the accepted frontier; the first restored decode reseeds Engram history from
-its token snapshot, and commits it only after verification.
-
-The CUDA draft path also preserves the checkpoint's UE8M0-scaled FP8 activation
-round-trip with a fused `tokenspeed-kernel` operation. It computes the same
-per-group power-of-two scale and returns dequantized values in the input dtype.
-The fusion removes intermediate reduction and elementwise launches but does not
-change the model's quantization contract.
-
-DSpark attention RMSNorm uses the platform kernel on CUDA while retaining its
-explicit FP32-accumulating PyTorch expression as the CPU reference. The fused
-path preserves the existing output dtype and is safe to capture and replay in
-the target CUDA Graph.
-
-For a two-node TP8 deployment, run one process per node with four local workers
-and the same command on both nodes. See [Multi-node](../serving/parallelism.md#multi-node)
-for explicit topology flags and launcher-derived settings. Before applying
-production load, confirm that every rank reports a nonzero Prefix Replay window,
-then check completion, speculative acceptance, and cache-hit metrics with fixed
-prompts and package/model revisions.
-
 ## DeepSeek V4.1-Flash
 
 The B200 and AMD GSM8K CI jobs, the GB300 Slurm 1P1D GSM8K job, and the
@@ -1388,6 +1171,50 @@ Under prefill/decode disaggregation the prefill node replays on its own
 prefix hits exactly as above and ships each group's retained tail. The
 decode node lands the tail and never re-feeds. Even on one machine, let
 Mooncake pick an RDMA transport rather than forcing the intra-node NVLink one.
+
+Same-checkpoint DSpark computes its public FP32 base logits straight from the
+target's BF16 LM-head shard: BF16 products are exact in FP32, so a BF16 GEMM
+with an FP32 accumulator reproduces the reference's FP32 head math up to
+summation order without an FP32 copy of the shard. The draft path reads the
+head in place under CUDA Graph replay, so in-place target weight updates need
+no refresh.
+
+The greedy block sampler runs one Triton kernel per block step on each
+tensor-parallel rank: it gathers the previous token's BF16 Markov bigram row
+from a replicated table, adds the bigram bias (a BF16 tensor-core dot against
+the rank's Markov projection shard, sharded like the LM head) to the
+rank's base logits, and packs the best `(logit, token)` of every vocabulary
+tile into one int64 candidate. One all-gather per step shares the candidates.
+The next step's kernel (or the final resolve) reduces them to the
+`torch.argmax` winner over the whole vocabulary, ties broken toward the lowest
+token ID. A five-token block is therefore six kernels and five all-gathers
+instead of a per-step chain of masked embedding lookups, GEMMs, reductions, and
+two all-gathers.
+
+Before each forward, one pinned upload carries every request's Engram history
+snapshot. `prepare_ngram_inputs` resolves the previous-three tokens and validity
+mask, clears padding, and computes table rows for all Engram layers in one
+launch. The model consumes these prepared hashes through stable input buffers.
+Preparation leaves accepted request state unchanged; after sampling,
+`commit_ngram_inputs` advances accepted history and cache lengths together in
+a second launch. Hashes are bit-identical to the eager reference, which remains
+the CPU path. Per-batch token and request counts stay runtime kernel arguments;
+only bounded tile sizes and fixed model/pool geometry specialize compilation.
+Both kernels are checked against the default per-thread stack budget, so first
+use does not reserve extra spill memory on every SM. Retraction snapshots carry
+the accepted frontier; the first restored decode reseeds Engram history from
+its token snapshot, and commits it only after verification.
+
+The CUDA draft path also preserves the checkpoint's UE8M0-scaled FP8 activation
+round-trip with a fused `tokenspeed-kernel` operation. It computes the same
+per-group power-of-two scale and returns dequantized values in the input dtype.
+The fusion removes intermediate reduction and elementwise launches but does not
+change the model's quantization contract.
+
+DSpark attention RMSNorm uses the platform kernel on CUDA while retaining its
+explicit FP32-accumulating PyTorch expression as the CPU reference. The fused
+path preserves the existing output dtype and is safe to capture and replay in
+the target CUDA Graph.
 
 ### GB300 Slurm 1P1D CI
 

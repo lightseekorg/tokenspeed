@@ -94,6 +94,19 @@ decode role of a disaggregated deployment never computes prompt rows (the
 prefill node returns the logprobs), so the runtime leaves its bound at the
 default.
 
+The input's full-page chain hashes are prepared once per request. A failed
+first admission reuses those immutable identities and probes the current
+Device and Host contents again; it never reuses a previous residency result.
+The pending match views the request-owned hashes. Mutable execution progress
+copies the reused prefix only after admission succeeds.
+
+Decode consumes an existing reserve in place when no page or pending State
+checkpoint became complete and no sliding-window block needs reclaiming. This
+does not copy the accumulated hash chain. Publication and capacity admission
+still use a progress copy so a failed admission leaves the request unchanged.
+Previously published checkpoint holders are released after the in-place step,
+as they are after a successful admission.
+
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in
 `scheduler/operations/prefill_chunk.h` (`PrefillChunkTokens` is the one
@@ -587,6 +600,12 @@ a stalled prefill exactly as stuck as an empty one. Imaging a victim needs a
 snapshot pool (`SchedulerConfig::HasSnapshotPool()`, §4) and a blob slot; a
 round that finds no victim it can image falls back to the last resort below
 and **aborts** one instead, so a capacity block never waits on a host budget.
+
+When every resident still has an outstanding forward or PD transfer, capacity
+retraction waits before ranking or planning images: no possible choice can
+quiesce in that round. Otherwise the normal rank and Host-fit order applies,
+including waiting for a better-ranked busy victim. Decode release counts are
+computed once per candidate for each ranking pass, before sorting.
 
 **A retracted request loses no work.** It is *suspended*: its block tables are
 imaged to Host byte-for-byte, its Device pages are released, and the restore

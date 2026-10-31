@@ -262,6 +262,17 @@ public:
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
+
+    // Read-only physical availability, before admission can evict anything.
+    // A bit names a group missing blocks at this boundary. The union permits
+    // arbitrary tier mixing; it is an upper bound, not a resumable prefix.
+    struct PrefixBoundaryAvailability {
+        std::int32_t tokens{0};
+        std::uint64_t device_missing{0};
+        std::uint64_t host_missing{0};
+        std::uint64_t union_missing{0};
+    };
+    std::vector<PrefixBoundaryAvailability> InspectPrefixAvailability(const PromptPrefix& prompt) const;
     // Full pages only: a probe that enumerates no tails.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
 
@@ -514,12 +525,12 @@ public:
         // A segment plan took it as a duplicate of a boundary the Device
         // resumes.
         HostEvictionCounts duplicate;
-        // A segment plan took it as a checkpoint boundary a deeper Device one
-        // supersedes.
+        // A segment plan took a nonaligned input checkpoint whose request
+        // continued to a deeper Device checkpoint. Aligned checkpoints keep
+        // their State LRU rank.
         HostEvictionCounts superseded;
-        // A segment plan took it as a dead entry (judged by the Host's
-        // checkpoint boundaries alone, so a Device checkpoint boundary may
-        // still be under it), CollectDeadEntries evicted it, or a settled
+        // A segment plan took it as a dead entry (no checkpoint on either
+        // tier depends on it), CollectDeadEntries evicted it, or a settled
         // write-back cancelled it (a held member).
         HostEvictionCounts dead_entry;
         // The per-prior tail cap dropped its tail, entry by entry after the
@@ -528,6 +539,9 @@ public:
         HostEvictionCounts tail_cap;
         // ClearCache, after the Device clear, so never device_resident.
         HostEvictionCounts flush;
+        // A segment plan reclaimed a prefix-closed KV copy independently of
+        // the boundary's checkpoints, while the Device still held its key.
+        HostEvictionCounts duplicate_kv;
     };
     struct HostAllocationStats {
         std::size_t requested{0};
@@ -584,19 +598,22 @@ public:
     // holds a checkpoint there; one missing another group's is dead) with the
     // Host pages above it that only it depends on, up to one in use, and the
     // Host pages under them, or only its checkpoints while deeper Host
-    // checkpoint boundaries still read its page; a Host page no Host checkpoint
-    // boundary depends on (without State groups: a page no Host page continues,
-    // a Host leaf) goes with the Host pages under it. One member in use passes
-    // the whole victim over, as does a parent page an eviction write-back is
-    // bringing to the Host (it would arrive with nothing under it). Victims go
-    // by class: dead entries (a checkpoint boundary missing a State group's
-    // checkpoint, a tail no probe enumerates, a page no Host checkpoint
-    // boundary depends on -- even one with a Device checkpoint boundary under
-    // it, which CollectDeadEntries, counting both tiers, would keep) first;
-    // then duplicates of a boundary the Device resumes and checkpoint
-    // boundaries a deeper Device checkpoint boundary on their chain
-    // supersedes, the newest Device copy first; then Host-only cache, least
-    // recently used first. Once a victim took every Host page under the page
+    // checkpoint boundaries still read its page, or if a history pin blocks
+    // the segment while every State group at the boundary is unpinned; a Host
+    // page no Host checkpoint boundary depends on (without State groups: a
+    // page no Host page continues, a Host leaf) goes with the Host pages under
+    // it. Chosen victims never contain a member in use. A pending write-back
+    // of the parent page also blocks the victim: the page would otherwise
+    // arrive with nothing under it. Victims go
+    // by class: dead entries (a tail no probe enumerates, or incomplete State
+    // and history with no checkpoint on either tier depending on them) first;
+    // then exact Device duplicates and continued nonaligned input checkpoints
+    // (a shared State access epoch proves the continuation), newest Device
+    // copy first; then Host-only cache, least
+    // recently used first. With State groups, an unheld Device KV copy's Host
+    // duplicate joins that LRU rank at its Device access epoch, winning ties.
+    // A held Device KV copy's duplicate stays ahead of Host-only State.
+    // Once a victim took every Host page under the page
     // above it, that page is a candidate too. The restore pass then returns,
     // newest first, each victim the placed segments can do without and whose
     // parent page stays. A dropped segment's rows hold empty references. A
@@ -833,6 +850,17 @@ private:
         std::size_t num_placed{0};
         std::vector<Victim> victims;
     };
+    struct HostKvDuplicateCandidate {
+        std::uint32_t group_id{0};
+        CacheBlockLocation location;
+        std::uint64_t device_epoch{0};
+        std::int32_t boundary_tokens{0};
+        bool device_in_use{false};
+    };
+    // Unpinned Host KV copies backed by a contiguous Device KV prefix,
+    // excluding pages a sliding group can force into a Host suffix. Keep the
+    // Device facts read during collection for this plan's ranking.
+    std::vector<HostKvDuplicateCandidate> hostKvDuplicateCandidates() const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
@@ -1010,6 +1038,9 @@ private:
     // it), and a node no prefix-closed group holds on either tier and no store
     // is bringing (a gap).
     void syncTreeNode(const ContentHash& hash);
+    // Refresh the closed-group coverage and duplicate membership after a
+    // publication, restore, or link gives an existing hash its parent.
+    void syncKvCoverage(BoundaryTree::Node& node);
     // Whether an imaged slot belongs to the page the computed frontier ends
     // inside: the restored request writes and later republishes those blocks,
     // so they are copied, never claimed. Every slot below is immutable.
@@ -1068,6 +1099,7 @@ private:
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.
     BoundaryTree boundary_tree_;
+    mutable std::uint64_t host_duplicate_scan_generation_{0};
     // Hashes of possibly dead tree nodes, in the order they were queued, for
     // CollectDeadEntries (write_back_evictions only). A node may be gone or
     // alive again by the time it is collected.

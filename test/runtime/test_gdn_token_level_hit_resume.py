@@ -80,6 +80,7 @@ def _scheduler(ts, make_config):
             enable_l3_storage=False,
             role="fused",
             num_snapshot_pages=1,
+            host_group_packing=(),
             max_retracted_requests=0,
             host_write_policy="write_through",
             storage_config=None,

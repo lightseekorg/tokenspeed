@@ -178,9 +178,12 @@ private:
     bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
-        std::vector<std::string> candidate_prefix_hashes;
-        std::vector<std::string> extension_hashes;
-        std::vector<std::string> prefix_hashes;
+        std::string prefix_diagnostic;
+        // Views of the request's immutable prompt hashes. Only an admitted
+        // request copies its reused prefix into mutable execution progress.
+        std::span<const std::string> candidate_prefix_hashes;
+        std::span<const std::string> extension_hashes;
+        std::span<const std::string> prefix_hashes;
     };
 
     struct KvEventHashProgress {

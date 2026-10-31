@@ -28,6 +28,7 @@ namespace tokenspeed {
 
 class BlockPool;
 class CacheBlockRef;
+class CacheBlockUniqueObserver;
 
 // Stable logical placement of one cache block inside an LCM-sized physical
 // block. LCM block 0 remains reserved as the kernel null page.
@@ -54,6 +55,7 @@ public:
     ~CacheBlock() noexcept;
 
     CacheBlockLocation Location() const noexcept { return location_; }
+    const BlockPool& OwnerPool() const noexcept { return *pool_; }
     bool IsOwnedBy(const BlockPool& pool) const noexcept { return pool_ == &pool; }
 
 private:
@@ -77,6 +79,7 @@ public:
 private:
     friend class ::tokenspeed::BlockPool;
     friend class ::tokenspeed::CacheBlockRef;
+    friend class ::tokenspeed::CacheBlockUniqueObserver;
 
     void retain() noexcept;
     void release() noexcept;
@@ -88,6 +91,7 @@ private:
 
     CacheBlock object_;
     std::uint32_t strong_count_{1};
+    CacheBlockUniqueObserver* unique_observers_{nullptr};
 };
 
 }  // namespace internal_cache_block_ref
@@ -116,6 +120,7 @@ public:
 
 private:
     friend class BlockPool;
+    friend class CacheBlockUniqueObserver;
 
     explicit CacheBlockRef(internal_cache_block_ref::CacheBlockControl& control) noexcept : control_{&control} {}
 
@@ -125,5 +130,31 @@ private:
 inline void swap(CacheBlockRef& lhs, CacheBlockRef& rhs) noexcept {
     lhs.swap(rhs);
 }
+
+// One-shot, non-owning notification when a block has only one owner left.
+// Like CacheBlockRef, this is confined to the scheduler's control thread.
+class CacheBlockUniqueObserver {
+public:
+    using Callback = void (*)(void*) noexcept;
+
+    CacheBlockUniqueObserver() noexcept = default;
+    CacheBlockUniqueObserver(const CacheBlockUniqueObserver&) = delete;
+    CacheBlockUniqueObserver& operator=(const CacheBlockUniqueObserver&) = delete;
+    ~CacheBlockUniqueObserver() noexcept { Reset(); }
+
+    // A unique block invokes callback immediately; an empty reference cancels
+    // any previous observation. The observer does not keep the block alive.
+    void Observe(const CacheBlockRef& block, Callback callback, void* context) noexcept;
+    void Reset() noexcept;
+
+private:
+    friend class internal_cache_block_ref::CacheBlockControl;
+
+    CacheBlockUniqueObserver** head_{nullptr};
+    CacheBlockUniqueObserver* previous_{nullptr};
+    CacheBlockUniqueObserver* next_{nullptr};
+    Callback callback_{nullptr};
+    void* context_{nullptr};
+};
 
 }  // namespace tokenspeed

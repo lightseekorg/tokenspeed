@@ -117,31 +117,6 @@ class AscendPrefillOptions:
         pool.freeze()
         return pool, tuple(buffers)
 
-    @classmethod
-    def from_config(cls, *, server_args, attn_config):
-        """Resolve the page limit without allocating or reserving cache memory."""
-        limit = server_args.chunk_prefill_kv_size
-        if limit is None:
-            return None
-        page_size = attn_config.prefix_granularity
-        max_pages = -(-limit // page_size)
-        max_current_rows = min(
-            max_pages * page_size,
-            max(
-                (
-                    server_args.chunked_prefill_size
-                    if server_args.chunked_prefill_size > 0
-                    else server_args.max_prefill_tokens + attn_config.context_len
-                ),
-                attn_config.max_bs * attn_config.speculative_num_draft_tokens,
-            ),
-        )
-        return cls(
-            max_current_rows=max_current_rows,
-            max_kv_page_num=max_pages,
-            kv_page_size=page_size,
-        )
-
 
 class AscendPrefillCache:
     """Opt a model cache view into the native Prefill hooks it implements."""

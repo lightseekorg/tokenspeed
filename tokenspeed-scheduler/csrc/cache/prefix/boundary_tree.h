@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 #include "cache/core/cache_types.h"
 #include "utils.h"
@@ -67,6 +68,10 @@ public:
         // through its hash gives it its boundary (FindOrAdd).
         std::int32_t boundary_tokens{0};
         std::int32_t tail_tokens{0};
+        // One request owns each access epoch. Checkpoints acquired or
+        // published by that request follow the same token history. Keep the
+        // latest State access while either tier still holds this boundary.
+        std::uint64_t latest_state_access_epoch{0};
         // By CacheTier: whether this boundary has a checkpoint on that tier
         // (some State group holds its checkpoint there; on the Host also one on
         // its way there), and how many boundaries in the subtree, this node
@@ -89,10 +94,22 @@ public:
         // is out the node, its tail hint and its Host presence stay.
         std::int32_t pending_host_stores{0};
         std::int32_t pending_host_checkpoint_stores{0};
+        // Scratch for one duplicate-candidate scan. A new scan must recheck
+        // stores and links that may have changed since the previous one.
+        mutable std::uint64_t host_store_scan_generation{0};
+        mutable bool host_store_ancestor_pending{false};
         // Accounting only, bit i for cache group i: an eviction write-back
         // published this hash's blocks of that group on the Host before, so
         // copying one again is a recopy.
         std::uint64_t written_back_group_bits{0};
+        // The coordinator checks the closed groups at this page. The tree
+        // carries that coverage through parents so duplicate reclaim does not
+        // repeatedly prove the same Device prefix from its root.
+        bool device_kv_page_complete{false};
+        bool device_kv_prefix_complete{false};
+        bool has_host_kv_duplicate{false};
+        Node* prev_host_kv_duplicate{nullptr};
+        Node* next_host_kv_duplicate{nullptr};
     };
 
     BoundaryTree() = default;
@@ -196,12 +213,66 @@ public:
     // The oldest Host leaf; next_host_leaf walks the rest.
     const Node* FirstHostLeaf() const { return first_host_leaf_; }
 
+    void SetDeviceKvCoverage(Node& node, bool page_complete, std::int32_t prefix_granularity) {
+        node.device_kv_page_complete = page_complete;
+        const auto prefix_complete = [&](const Node& page) {
+            return page.device_kv_page_complete && page.tail_tokens == 0 &&
+                   page.boundary_tokens ==
+                       (page.parent == nullptr ? 0 : page.parent->boundary_tokens) + prefix_granularity &&
+                   (page.parent == nullptr || page.parent->device_kv_prefix_complete);
+        };
+        if (node.device_kv_prefix_complete == prefix_complete(node)) {
+            return;
+        }
+        std::vector<Node*> pending{&node};
+        while (!pending.empty()) {
+            Node& page = *pending.back();
+            pending.pop_back();
+            const bool complete = prefix_complete(page);
+            if (page.device_kv_prefix_complete == complete) {
+                continue;
+            }
+            page.device_kv_prefix_complete = complete;
+            for (Node* child = page.first_child; child != nullptr; child = child->next_sibling) {
+                if (child->device_kv_page_complete) {
+                    pending.push_back(child);
+                }
+            }
+        }
+    }
+
+    // Nodes with at least one settled closed-group key on both tiers, in
+    // insertion order. Membership does not pin a block or imply a complete
+    // Device prefix; the coordinator checks both when planning reclamation.
+    void SetHostKvDuplicate(Node& node, bool duplicate) {
+        if (node.has_host_kv_duplicate == duplicate) {
+            return;
+        }
+        node.has_host_kv_duplicate = duplicate;
+        if (duplicate) {
+            node.prev_host_kv_duplicate = last_host_kv_duplicate_;
+            (last_host_kv_duplicate_ != nullptr ? last_host_kv_duplicate_->next_host_kv_duplicate
+                                                : first_host_kv_duplicate_) = &node;
+            last_host_kv_duplicate_ = &node;
+            return;
+        }
+        (node.prev_host_kv_duplicate != nullptr ? node.prev_host_kv_duplicate->next_host_kv_duplicate
+                                                : first_host_kv_duplicate_) = node.next_host_kv_duplicate;
+        (node.next_host_kv_duplicate != nullptr ? node.next_host_kv_duplicate->prev_host_kv_duplicate
+                                                : last_host_kv_duplicate_) = node.prev_host_kv_duplicate;
+        node.prev_host_kv_duplicate = nullptr;
+        node.next_host_kv_duplicate = nullptr;
+    }
+
+    const Node* FirstHostKvDuplicate() const { return first_host_kv_duplicate_; }
+
     // Drops a childless node that holds nothing: no checkpoint on either tier,
     // nothing on either tier and no store on its way to the Host.
     void Remove(Node& node) {
         _assert(node.first_child == nullptr && !node.on_device && !node.on_host &&
                     !node.HasCheckpointBoundaryInSubtree() && node.pending_host_stores == 0,
                 "only a childless node that holds nothing leaves the tree");
+        _assert(!node.has_host_kv_duplicate, "a removed boundary cannot retain a Host KV duplicate");
         if (node.parent != nullptr) {
             Node& parent = *node.parent;
             (node.prev_sibling != nullptr ? node.prev_sibling->next_sibling : parent.first_child) = node.next_sibling;
@@ -216,6 +287,8 @@ public:
         nodes_.clear();
         first_host_leaf_ = nullptr;
         last_host_leaf_ = nullptr;
+        first_host_kv_duplicate_ = nullptr;
+        last_host_kv_duplicate_ = nullptr;
     }
 
     std::size_t Size() const { return nodes_.size(); }
@@ -246,6 +319,8 @@ private:
     std::unordered_map<ContentHash, Node> nodes_;
     Node* first_host_leaf_{nullptr};
     Node* last_host_leaf_{nullptr};
+    Node* first_host_kv_duplicate_{nullptr};
+    Node* last_host_kv_duplicate_{nullptr};
 };
 
 }  // namespace tokenspeed

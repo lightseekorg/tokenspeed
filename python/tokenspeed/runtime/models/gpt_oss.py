@@ -463,6 +463,7 @@ class GptOssModel(BaseTransformerModel):
 
 class GptOssForCausalLM(BaseCausalLM):
     model_cls = GptOssModel
+    supports_aux_capture = True
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:

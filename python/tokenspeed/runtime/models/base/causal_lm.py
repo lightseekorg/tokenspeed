@@ -165,6 +165,8 @@ class BaseCausalLM(nn.Module):
     # Opt in only when complete checkpoint loading and non-parameter state
     # restoration are both defined for this model.
     supports_weight_discard: ClassVar[bool] = False
+    # Opt in only when ``self.model`` returns the taps ``layers_to_capture`` names (EAGLE3, DFLASH).
+    supports_aux_capture: ClassVar[bool] = False
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
@@ -316,8 +318,17 @@ class BaseCausalLM(nn.Module):
     def post_init(self) -> None:
         """Hook for subclasses that need derived state after shared modules exist."""
 
+    def require_aux_capture(self) -> None:
+        """Refuse a capture request this model's forward would silently ignore."""
+        if not self.supports_aux_capture:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not return aux hidden states, so "
+                "EAGLE3 and DFLASH drafts cannot attach to it"
+            )
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
 
+        self.require_aux_capture()
         self.capture_aux_hidden_states = True
 
         if layer_ids is None:
@@ -340,6 +351,7 @@ class BaseCausalLM(nn.Module):
         a ``ctx.target_capture_sink``; otherwise they are only collected.
         """
 
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")

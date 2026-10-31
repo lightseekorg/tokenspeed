@@ -277,7 +277,6 @@ def _backend(
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=4096,
         max_bs=8,
         is_draft=False,
@@ -457,7 +456,6 @@ def _super_attn_config(tp: int, kv_dtype: torch.dtype, *, is_draft: bool, device
         kv_cache_dtype=kv_dtype,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=128,
         kernel_page_size=64,
         context_len=16384,
         max_bs=2,
@@ -479,7 +477,6 @@ def _super_cache_recipe(
     return cache_recipe(
         "mamba2",
         server_args=SimpleNamespace(
-            prefix_granularity=128,
             max_total_tokens=None,
             speculative_num_draft_tokens=draft_tokens,
             speculative_eagle_topk=topk,

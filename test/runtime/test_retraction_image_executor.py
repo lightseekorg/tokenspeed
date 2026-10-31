@@ -255,11 +255,28 @@ def _build(
     lanes = {name: Mock(name=f"{name}_lane") for name in lane_names}
     storages = iter(
         [
-            SimpleNamespace(host_buffer="l2-host"),
-            SimpleNamespace(host_buffer="pool-host"),
+            SimpleNamespace(
+                host_buffer="l2-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            ),
+            SimpleNamespace(
+                host_buffer="pool-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            ),
         ]
         if l2_tier
-        else [SimpleNamespace(host_buffer="pool-host")]
+        else [
+            SimpleNamespace(
+                host_buffer="pool-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            )
+        ]
     )
     geometries = iter(
         ["l2-geometry", "pool-geometry"] if l2_tier else ["pool-geometry"]
@@ -431,7 +448,13 @@ def test_sharded_group_keeps_each_ranks_rows_on_both_ends():
     contract = _contract(layout, [2])
     owners = {
         rank: BlockOwnerTranslation.for_host_pool(
-            layout, contract, num_host_lcm_blocks=3, rank=rank
+            layout,
+            contract,
+            num_host_lcm_blocks=3,
+            rank=rank,
+            host_group_packing=tuple(
+                group.cache_blocks_per_lcm_block for group in layout.groups
+            ),
         )
         for rank in (0, 1)
     }
@@ -982,7 +1005,7 @@ def _round_trip_two_ranks(io_backend, executors):
     # Per rank: 2 local LCM blocks x packing 2 = 4 local blocks of 8 B at
     # stride 16 from offset 8. The sharded group has 2 x 2 x 2 = 8 virtual
     # blocks; rank r owns v with (v - 1) % 2 == r at local (v - 1) // 2 + 1.
-    # Both Host pools hold 3 LCM blocks -> 12 virtual blocks each.
+    # Host packing is 1: 3 compact parents hold 6 virtual blocks across 2 owners.
     contract = SimpleNamespace(
         group_specs=(SimpleNamespace(group_id="full", shard_count=2),),
         virtual_block_counts={"full": 1 + 2 * 2 * 2},
@@ -1019,7 +1042,7 @@ def _round_trip_two_ranks(io_backend, executors):
                 l2_tier=True,
                 host_ratio=1.5,  # 3 L2 LCM blocks
                 host_size_gb=0,
-                snapshot_pool=_pool(3 * 16 / 1e9, 2),  # 3 pool LCM blocks of 2 x 8 B
+                snapshot_pool=_pool(3 * 8 / 1e9, 2),  # 3 compact Host parents of 8 B
                 slot_state_exporters=(slot_states[rank],),
                 io_backend=io_backend,
                 attn_tp_rank=0,
@@ -1040,10 +1063,10 @@ def _round_trip_two_ranks(io_backend, executors):
         # The second victim (slot 2) has nothing in the pool: slot state only.
         slot_states[rank].table[2].fill_(200 + rank)
     torch.cuda.synchronize()
-    # Device blocks 1..4 go to L2 blocks 5..8 (stream-ordered), 5..8 to pool
+    # Device blocks 1..4 go to L2 blocks 3..6 (stream-ordered), 5..8 to pool
     # blocks 1..4; every pair keeps its parity, i.e. its owner.
     l2_store = _WriteBackOp(
-        [21], [[0, 0, 0, 0]], [[1, 2, 3, 4]], [[5, 6, 7, 8]], [False]
+        [21], [[0, 0, 0, 0]], [[1, 2, 3, 4]], [[3, 4, 5, 6]], [False]
     )
     pool_store = _snapshot_op(
         1, 1, [_transfer(0, v, v - 4) for v in range(5, 9)], pool_index=1
@@ -1071,7 +1094,7 @@ def _round_trip_two_ranks(io_backend, executors):
     restore = _restore_op(
         2,
         1,
-        [(HostTier.L2, _transfer(0, v + 4, v, key=f"h{v}")) for v in range(1, 5)]
+        [(HostTier.L2, _transfer(0, v + 2, v, key=f"h{v}")) for v in range(1, 5)]
         + [(HostTier.SNAPSHOT_POOL, _transfer(0, v - 4, v)) for v in range(5, 9)],
         pool_index=3,
     )

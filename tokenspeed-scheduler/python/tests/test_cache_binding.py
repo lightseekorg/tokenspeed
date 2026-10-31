@@ -158,6 +158,7 @@ def test_snapshot_pool_is_stated_explicitly():
     cfg.num_snapshot_pages = 9
     cfg.max_retracted_requests = 2
     cfg.debug_force_retraction_interval = 0
+    cfg.host_group_packing = [1]
     scheduler = ts.Scheduler(cfg)
     assert scheduler.snapshot_pool_free_blocks() == 8
     assert scheduler.retracted_size() == 0
@@ -190,6 +191,7 @@ def test_host_write_policy_round_trips():
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
+    cfg.host_group_packing = [1]
     # Unset: what feeds Host L2 is a behavioural choice, not a default.
     assert cfg.host_write_policy == policy.Unspecified
     with pytest.raises(ValueError, match="explicit host_write_policy"):
@@ -235,6 +237,7 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
+    cfg.host_group_packing = [1]
     scheduler = ts.Scheduler(cfg)
 
     def prefill_and_hand_off(rid, tokens):
@@ -325,6 +328,9 @@ def test_host_cache_stats_count_publication_and_finish_stores():
     history = cfg.cache_groups[0]
     history.cache_blocks_per_lcm_block = 2
     history.total_pages = 2 * 32 + 1
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
     scheduler = ts.Scheduler(cfg)
     num_groups = len(K3_GROUP_IDS)
 
@@ -451,6 +457,7 @@ def test_host_cache_stats_count_eviction_write_backs():
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
+    cfg.host_group_packing = [1]
     scheduler = ts.Scheduler(cfg)
     stores = []
     for rid, tokens in (

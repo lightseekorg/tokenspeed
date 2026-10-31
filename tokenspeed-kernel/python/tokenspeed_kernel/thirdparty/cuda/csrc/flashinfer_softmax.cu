@@ -10,6 +10,7 @@
 
 #include <flashinfer/allocator.h>
 #include <flashinfer/math.cuh>
+#include <flashinfer/reduce_ops.cuh>
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/utils.cuh>
 #include <flashinfer/vec_dtypes.cuh>
@@ -21,6 +22,7 @@ using tvm::ffi::Optional;
 namespace tokenspeed {
 
 using flashinfer::AlignedAllocator;
+using flashinfer::MaxReduceOp;
 using flashinfer::ceil_div;
 using flashinfer::round_up;
 using flashinfer::vec_t;

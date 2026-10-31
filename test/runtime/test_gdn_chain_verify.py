@@ -129,7 +129,6 @@ def _backend(state, *, width: int, max_bs: int, cls=GdnAttnBackend):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=64,
         context_len=4096,
         max_bs=max_bs,
         speculative_num_draft_tokens=width,

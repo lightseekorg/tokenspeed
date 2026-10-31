@@ -69,6 +69,7 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
     return SimpleNamespace(
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
+        host_group_packing=(),
         num_host_pages=num_host_pages,
         num_snapshot_pages=num_snapshot_pages,
         max_retracted_requests=max_retracted,
@@ -118,6 +119,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
     )
@@ -465,6 +467,7 @@ def test_write_back_beside_a_sliding_window_group_starts():
         cache_group_config(spec, total_pages=64, cache_blocks_per_lcm_block=1)
         for spec in group_specs
     ]
+    specs.host_group_packing = (1, 1)
 
     def config(policy: str):
         args = prepare_server_args(
@@ -513,6 +516,7 @@ def test_a_kv_parallel_engine_writes_back_its_sharded_group(role_flags, pool):
             cache_blocks_per_lcm_block=2,
         )
     ]
+    specs.host_group_packing = (2,)
     policies = ts.SchedulerConfig.HostWritePolicy
     for flag, policy in (
         ("write_back", policies.WriteBack),

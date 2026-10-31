@@ -34,7 +34,7 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
 
 
 # --------------------------------------------------------------------------
-# DeepSeek V4 prefill window seeding
+# Draft prefill capture gate
 # --------------------------------------------------------------------------
 
 

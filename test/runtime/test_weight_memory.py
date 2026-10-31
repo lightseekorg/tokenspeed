@@ -239,23 +239,31 @@ def test_replica_failure_invalidates_a_locally_successful_update():
 
 
 @pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
-def test_replica_refusal_without_a_local_load_can_be_retried(policy):
-    # Every rank refused before loading (here: weights still released), so
-    # no rank touched its weights and the replica-wide failure must not poison.
+def test_prerequisite_check_refuses_without_starting_a_transition(policy):
     model = TinyModel()
     state = WeightMemoryState(policy=policy, models=[model])
     state.mark_kv_released()
     state.release(lambda: None)
     with pytest.raises(RuntimeError, match="Resume weight storage"):
-        state.begin_update()
-    state.commit_update(False)
-    assert not state.failed
+        state.check_update()
+    assert not state.failed and not state.updating
     state.resume(lambda: None)
+    state.check_update()
+    assert not state.updating
     state.begin_update()
     state.finish_update(success=True)
     state.commit_update(True)
     state.before_kv_resume()
     state.require_usable()
+
+
+def test_replica_failure_poisons_a_rank_without_a_local_session():
+    # The control plane commits only a load every rank started, so a failed
+    # result reaching a rank without a session still means a mixed replica.
+    state = WeightMemoryState(policy="discard", models=[TinyModel()])
+    state.commit_update(False)
+    with pytest.raises(RuntimeError, match="restart"):
+        state.require_usable()
 
 
 def test_local_completeness_is_required_even_for_a_successful_global_decision():

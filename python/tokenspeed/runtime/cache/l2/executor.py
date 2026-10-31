@@ -64,7 +64,9 @@ from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
+    compute_host_group_packing,
     compute_host_lcm_block_bytes,
+    validate_host_group_packing,
 )
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 from tokenspeed.runtime.cache.l2.sizing import (
@@ -230,6 +232,17 @@ class HostCacheExecutor:
             group_ids=scheduler_group_ids or None,
         )
         host_lcm_block_bytes = compute_host_lcm_block_bytes(self.layout)
+        shard_by_id = {
+            spec.group_id: int(spec.shard_count) for spec in contract.group_specs
+        }
+        self.host_group_packing = tuple(
+            packing * shard_by_id[group.group_id]
+            for group, packing in zip(
+                self.layout.groups,
+                compute_host_group_packing(self.layout),
+                strict=True,
+            )
+        )
 
         # --- L2 prefix tier -------------------------------------------------
         host_lcm_blocks = 0
@@ -316,6 +329,10 @@ class HostCacheExecutor:
                     "--retraction-snapshot-ratio rather than "
                     "--retraction-snapshot-host-gb"
                 )
+        validate_host_group_packing(
+            self.host_group_packing,
+            cpu_group=world_cpu_group,
+        )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
         l2_pinned_bytes = pinned_host_bytes(l2_bytes)
@@ -344,6 +361,7 @@ class HostCacheExecutor:
                 self.layout,
                 contract,
                 num_host_lcm_blocks=host_lcm_blocks,
+                host_group_packing=self.host_storage.group_packing,
                 rank=kvp_rank,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its counts;
@@ -363,6 +381,7 @@ class HostCacheExecutor:
                 self.layout,
                 contract,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
+                host_group_packing=self.snapshot_storage.group_packing,
                 rank=kvp_rank,
             )
             # One row per retracted request, indexed by the op's snapshot_slot.

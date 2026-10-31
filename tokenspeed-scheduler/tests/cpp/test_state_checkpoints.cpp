@@ -74,10 +74,10 @@ protected:
     }
 
     void Reset(bool host_cache, std::int32_t decode_width) {
-        config_ = MakeConfig();
+        config_ = WithHostPackingFromDevice(MakeConfig());
         config_.disable_l2_cache = !host_cache;
         config_.decode_input_tokens = decode_width;
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     }
 
     static RequestSpec RequestWithTokens(const std::string& id, std::vector<std::int32_t> tokens) {
@@ -221,7 +221,7 @@ TEST_F(AlignedStateCheckpointSuite, OnlyTheLastSegmentEntranceIsPublishedBeforeT
             group.total_pages = 1025;
         }
         SetTestSnapshotPool(config_);
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
         Submit(RequestWithTokens("seed", MakeTokens(16385)));
         std::int32_t saved_state = -1;
         for (std::int32_t begin = 0; begin < 16385;) {
@@ -254,7 +254,7 @@ TEST_F(AlignedStateCheckpointSuite, OnlyTheLastSegmentEntranceIsPublishedBeforeT
 TEST_F(AlignedStateCheckpointSuite, A4097TokenRequestSavesItsInteriorCheckpointInOneForward) {
     config_ = MakeConfig();
     config_.max_scheduled_tokens = 8192;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestWithTokens("a", MakeTokens(1808)));
     Submit(RequestWithTokens("b", MakeTokens(4097, 100000)));
     const ExecutionPlan first = PlanOnce();
@@ -368,7 +368,7 @@ TEST_F(AlignedStateCheckpointSuite, DecodeRoleDoesNotPublishTheTransferredPrompt
         group.transfer_policy =
             group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
     }
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestWithTokens("seed", MakeTokens(8192)));
     ExecutionEvent bootstrap;
     bootstrap.With(pd::BootstrappedEvent{"seed"});
@@ -402,7 +402,7 @@ TEST_F(AlignedStateCheckpointSuite, DecodeCannotPublishAnAlignedFrontierAtFinish
                 config_.disable_l2_cache = !host_cache;
                 config_.enable_mixed_prefill_decode = true;
                 config_.decode_input_tokens = 1;
-                scheduler_ = std::make_unique<Scheduler>(config_);
+                scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
                 Submit(RequestWithTokens("seed", MakeTokens(prompt)));
                 const ExecutionPlan prefill = PlanOnce();
                 ASSERT_NE(FindForwardBatch(prefill), nullptr);
@@ -431,7 +431,7 @@ TEST_F(AlignedStateCheckpointSuite, RetractedDecodeStateRestoresPrivatelyWithout
     config_.disable_l2_cache = false;
     config_.debug_force_retraction_interval = 3;
     config_.decode_input_tokens = 1;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestWithTokens("seed", MakeTokens(4095)));
     const ExecutionPlan prefill = PlanOnce();  // plan 1: prefill
     ASSERT_NE(FindForwardBatch(prefill), nullptr);
@@ -463,7 +463,7 @@ TEST_F(AlignedStateCheckpointSuite, AFinalTailDoesNotAlignTheNextRequestsPackedO
                 SCOPED_TRACE(::testing::Message() << "resumed=" << resumed << " budget=" << budget << " tail=" << tail);
                 config_ = MakeConfig();
                 config_.max_scheduled_tokens = budget;
-                scheduler_ = std::make_unique<Scheduler>(config_);
+                scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
                 if (resumed) {
                     Submit(RequestWithTokens("seed", MakeTokens(4096)));
                     const ExecutionPlan first = PlanOnce();
@@ -640,6 +640,57 @@ protected:
         return chunks;
     }
 };
+
+class ReservedDecodeCheckpointSuite : public StateCheckpointInForwardSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = StateCheckpointInForwardSuite::MakeConfig();
+        cfg.prefix_granularity = 64;
+        cfg.max_scheduled_tokens = 256;
+        cfg.decode_input_tokens = 4;
+        cfg.overlap_schedule_depth = 1;
+        cfg.disable_l2_cache = false;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        for (auto& group : cfg.cache_groups) {
+            if (group.attn_kind != AttnKind::kState) {
+                group.block_granularity = 64;
+            }
+        }
+        return cfg;
+    }
+};
+
+TEST_F(ReservedDecodeCheckpointSuite, ReservedStepsKeepGeneratedHashesAndTheFinalStateReusable) {
+    std::vector<std::int32_t> tokens = MakeTokens(385);
+    auto owner = RequestWithTokens("owner", tokens);
+    owner.max_new_tokens = 512;
+    Submit(owner);
+    const auto chunks = RunPrefill("owner", 385);
+    ASSERT_EQ(chunks.size(), 2u);
+    EXPECT_EQ(chunks.back().checkpoint_len, 128);
+    tokens.push_back(900);
+
+    std::int32_t live_state = 0;
+    for (std::int32_t round = 0; round < 80; ++round) {
+        const auto row = PlanAndStateRow("owner");
+        ASSERT_EQ(row.size(), 2u);
+        ASSERT_GT(row[1], 0);
+        live_state = row[1];
+        const std::vector<std::int32_t> accepted{1000 + 2 * round, 1001 + 2 * round};
+        SendForwardDone("owner", accepted);
+        tokens.insert(tokens.end(), accepted.begin(), accepted.end());
+    }
+    SendFinish("owner");
+    AckWriteBacks(PlanOnce());
+
+    const auto computed_tokens = static_cast<std::int32_t>(tokens.size()) - 1;
+    tokens.push_back(2000);
+    const auto resumed = Probe("reuse", tokens);
+    EXPECT_EQ(resumed.prefix_tokens, computed_tokens);
+    ASSERT_EQ(resumed.state_row.size(), 2u);
+    EXPECT_EQ(resumed.state_row[0], live_state);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+}
 
 // Under the 8-token budget a 22-token prompt keeps its plain chunks 8, 8 and
 // 6. The last one spans the boundary 20 and writes the state after its first
@@ -1532,7 +1583,7 @@ TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTai
 TEST_F(StateRestoreClaimSuite, ARetractionAtAPageBoundaryRestoresUnderWriteBack) {
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 4});
     AckWriteBacks(PlanOnce());  // plan 1: the prefill
     SendForwardDone("r", {101});
@@ -2651,7 +2702,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         const bool write_back = policy == SchedulerConfig::HostWritePolicy::kWriteBack;
         Reset(host_cache, /*decode_width=*/1);
         config_.max_batch_size = 3;  // x, h and g in flight together
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
         std::vector<std::int32_t> o = MakeTokens(22, 3000);
         CompleteSession("o", o);
         const std::vector<std::int32_t> s1 = MakeTokens(22);
@@ -2718,7 +2769,7 @@ TEST_F(StateCheckpointPrefillHostSuite, ARestoredInputIsStillMarkedByItsOwnFinis
     role_ = Role::kFused;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.debug_force_retraction_interval = -7;  // the oldest Prefilling request, every seventh plan
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::vector<std::int32_t> s1 = MakeTokens(22);
     Submit(RequestWithTokens("s1", s1));
     ASSERT_EQ(RunPrefill("s1", 22).size(), 3u);  // plans 1-3
@@ -3349,7 +3400,7 @@ TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesW
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.enable_mixed_prefill_decode = true;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::vector<std::int32_t> s1 = MakeTokens(22);
     Submit(RequestWithTokens("s1", s1));
     RunPrefill("s1", 22);
@@ -3596,7 +3647,7 @@ TEST_F(StateCheckpointFusedHostSuite, ARestoresEvictionStoreRunsBeforeTheRestore
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.debug_force_retraction_interval = 5;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestWithTokens("r", MakeTokens(14)));
     std::optional<ExecutionPlan> image;
     std::optional<ExecutionPlan> restore;

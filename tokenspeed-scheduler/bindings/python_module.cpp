@@ -163,6 +163,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
+        .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("host_write_policy", &tokenspeed::SchedulerConfig::host_write_policy)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
@@ -276,7 +277,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("superseded", &tokenspeed::CacheCoordinator::HostEvictionStats::superseded)
         .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
-        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush);
+        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush)
+        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv);
     nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
         .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);

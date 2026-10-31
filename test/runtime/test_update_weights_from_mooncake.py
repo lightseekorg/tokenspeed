@@ -518,24 +518,32 @@ def test_discarded_device_rejects_update_before_kv_release_or_weight_remap(
     handle, state, model = _discard_device(monkeypatch)
     if unmapped:
         _lose_weight_pages(state, model)
+    # The control plane's admission check refuses without touching anything.
+    ready, reason = handle.check_weight_update(_mooncake_req(11))
+    assert not ready
+    assert ("Resume weight storage" if unmapped else "Release KV") in reason
+    assert not state.failed and not state.updating
+    # A direct call refuses the same way.
     success, message = handle.update_weights(_mooncake_req(11))
-    assert not success
-    assert ("Resume weight storage" if unmapped else "Release KV") in message
+    assert (success, message) == (False, reason)
     assert sdk.stores == []
     assert sdk.updates == []
-    # Every rank refused before loading: the replica-wide failure leaves the
-    # untouched weights retryable rather than poisoned.
-    handle.commit_weight_update(False)
-    assert not state.failed
+    assert not state.failed and not state.updating
     if unmapped:
         state.resume(lambda: None)
     else:
+        # Never released: the old weights stay usable.
+        state.require_usable()
+        assert (model.a.item(), model.b.item()) == (4, 5)
         state.mark_kv_released()
-    success, message = handle.update_weights(_mooncake_req(12))
+    # Once every rank passes the check, the same request loads and commits.
+    assert handle.check_weight_update(_mooncake_req(11))[0]
+    assert not state.updating
+    success, message = handle.update_weights(_mooncake_req(11))
     assert success, message
     handle.commit_weight_update(True)
     handle.before_kv_resume()
-    assert sdk.updates[0][1] == 12
+    assert (model.a.item(), model.b.item(), model.total.item()) == (1, 1, 2)
 
 
 def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
@@ -550,16 +558,29 @@ def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
     assert not success
     assert "complete Model Updater SDK update" in message
     assert sdk.updates == []
-    handle.commit_weight_update(False)
-    # Refused before loading: still unavailable, but not poisoned.
-    assert not state.failed
-    with pytest.raises(RuntimeError, match="unavailable"):
-        handle.before_kv_resume()
+    assert not state.failed and not state.updating
+    # The refusal touched nothing: a complete SDK update still loads.
+    assert handle.check_weight_update(_mooncake_req(11))[0]
+    success, message = handle.update_weights(_mooncake_req(11))
+    assert success, message
+    handle.commit_weight_update(True)
+    handle.before_kv_resume()
+    assert model.total.item() == 2
+
+
+def test_device_without_memory_saver_admits_every_weight_load():
+    handle = DeviceHandle(_executor(draft_policy="retain", with_draft=False))
+    assert handle.check_weight_update(_mooncake_req(3)) == (
+        True,
+        "ready for weight update",
+    )
+    with pytest.raises(TypeError, match="weight-load request"):
+        handle.check_weight_update(object())
 
 
 @pytest.mark.parametrize(
     "memory_saver,protocol,rejected",
-    [(True, None, True), (False, None, False), (True, 1, False)],
+    [(True, None, True), (False, None, False), (True, 1, True), (True, 2, False)],
 )
 def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
     monkeypatch, memory_saver, protocol, rejected

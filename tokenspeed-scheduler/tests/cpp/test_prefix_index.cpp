@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -56,7 +58,7 @@ std::vector<CacheBlockLocation> DrainEvictionOrder(const PrefixCacheIndex& index
     std::vector<CacheBlockLocation> order;
     PrefixCacheIndex::EvictionCursor cursor;
     std::vector<PrefixCacheIndex::EvictionCandidate> batch;
-    while (index.NextEvictionEpoch(pool, cursor, batch)) {
+    while (index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch)) {
         for (const PrefixCacheIndex::EvictionCandidate& candidate : batch) {
             order.push_back(candidate.location);
         }
@@ -75,6 +77,46 @@ TEST(PrefixCacheIndexEvictionOrderTest, DeliversTheOldestAccessEpochFirst) {
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{oldest, middle, newest}));
 }
 
+TEST(PrefixCacheIndexInspectionTest, ReportsCurrentOwnershipWithoutPinningOrTouchingTheEntry) {
+    BlockPool pool(2, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation location = Cache(index, pool, "entry", /*access_epoch=*/10);
+    const CacheKey key = KeyOf("entry");
+    const auto initial = index.Inspect(pool, key);
+    ASSERT_TRUE(initial);
+    EXPECT_EQ(initial->location, location);
+    EXPECT_EQ(initial->metadata.last_access_epoch, 10);
+    EXPECT_FALSE(initial->metadata.was_acquired);
+    EXPECT_FALSE(initial->pinned);
+
+    auto holder = index.Find(pool, key);
+    ASSERT_TRUE(holder);
+    EXPECT_EQ(holder.use_count(), 2);
+    ASSERT_TRUE(index.Inspect(pool, key));
+    EXPECT_TRUE(index.Inspect(pool, key)->pinned);
+    EXPECT_EQ(holder.use_count(), 2);
+    index.Register(pool, holder, key, /*access_epoch=*/30, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                   /*newly_cached=*/nullptr);
+    EXPECT_EQ(index.Inspect(pool, key)->metadata.last_access_epoch, 30);
+    holder = {};
+    EXPECT_FALSE(index.Inspect(pool, key)->pinned);
+
+    // Keeping a snapshot alive must not prevent actual eviction.
+    EXPECT_EQ(index.Evict(pool, location), key);
+    EXPECT_FALSE(index.Inspect(pool, key));
+}
+
+TEST(PrefixCacheIndexInspectionTest, KeepsPoolsSeparateAndDoesNotClaimMissingKeys) {
+    BlockPool device(1, {1});
+    BlockPool host(1, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto location = Cache(index, device, "entry", /*access_epoch=*/7);
+    ASSERT_TRUE(index.Inspect(device, KeyOf("entry")));
+    EXPECT_EQ(index.Inspect(device, KeyOf("entry"))->location, location);
+    EXPECT_FALSE(index.Inspect(host, KeyOf("entry")));
+    EXPECT_FALSE(index.Inspect(device, KeyOf("absent")));
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, DeliversOneEpochPerBatchSortedByLocation) {
     BlockPool pool(4, {1});
     PrefixCacheIndex index(kGroupId);
@@ -85,7 +127,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, DeliversOneEpochPerBatchSortedByLocation
 
     PrefixCacheIndex::EvictionCursor cursor;
     std::vector<PrefixCacheIndex::EvictionCandidate> batch;
-    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, batch));
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
 
     ASSERT_EQ(batch.size(), 3u);
     EXPECT_EQ(batch[0].location, first);
@@ -112,6 +154,142 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEntriesWithoutLosingTheRest) 
     EXPECT_EQ(DrainEvictionOrder(index, pool).size(), 2u);
 }
 
+TEST(PrefixCacheIndexEvictionOrderTest, ReleasedPinnedEntryUsesItsLatestPublishedEpoch) {
+    BlockPool pool(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto middle = Cache(index, pool, "middle", 20);
+    const auto last = Cache(index, pool, "last", 30);
+    auto pinned = pool.AcquireBlock(kGroupId);
+    const auto location = pinned->Location();
+    index.Register(pool, pinned, KeyOf("pinned"), 40, 0, CacheBoundaryKind::kEndpoint, nullptr);
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{middle, last}));
+    index.Register(pool, pinned, KeyOf("pinned"), 10, 0, CacheBoundaryKind::kEndpoint, nullptr);
+    pinned.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{location, middle, last}));
+    auto repinned = index.Find(pool, KeyOf("pinned"));
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{middle, last}));
+    repinned.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{location, middle, last}));
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, MovingIndexKeepsReleasedEntriesEvictable) {
+    BlockPool pool(2, {1});
+    PrefixCacheIndex source(kGroupId);
+    auto pinned = pool.AcquireBlock(kGroupId);
+    const auto location = pinned->Location();
+    source.Register(pool, pinned, KeyOf("pinned"), 10, 0, CacheBoundaryKind::kEndpoint, nullptr);
+    EXPECT_TRUE(DrainEvictionOrder(source, pool).empty());
+    PrefixCacheIndex moved(std::move(source));
+    PrefixCacheIndex assigned(kGroupId);
+    Cache(assigned, pool, "discarded", 1);
+    assigned = std::move(moved);
+    pinned.reset();
+    EXPECT_EQ(DrainEvictionOrder(assigned, pool), (std::vector<CacheBlockLocation>{location}));
+    EXPECT_TRUE(assigned.Evict(pool, location));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, SharedIndexesRestoreTheRemainingCacheOwner) {
+    BlockPool pool(1, {1});
+    auto first = std::make_unique<PrefixCacheIndex>(kGroupId);
+    PrefixCacheIndex second(kGroupId);
+    auto block = pool.AcquireBlock(kGroupId);
+    const auto location = block->Location();
+    first->Register(pool, block, KeyOf("shared"), 10, 0, CacheBoundaryKind::kEndpoint, nullptr);
+    second.Register(pool, block, KeyOf("shared"), 20, 0, CacheBoundaryKind::kEndpoint, nullptr);
+    block.reset();
+    EXPECT_TRUE(DrainEvictionOrder(*first, pool).empty());
+    EXPECT_TRUE(DrainEvictionOrder(second, pool).empty());
+    first.reset();
+    EXPECT_EQ(DrainEvictionOrder(second, pool), (std::vector<CacheBlockLocation>{location}));
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, RepeatedOwnershipAndEpochChangesMatchFullScan) {
+    BlockPool pool(64, {1});
+    PrefixCacheIndex index(kGroupId);
+    std::vector<CacheBlockRef> pins(64);
+    for (int i = 0; i < 64; ++i) {
+        Cache(index, pool, std::to_string(i), i % 7);
+    }
+    std::mt19937 random(20261030);
+    for (int iteration = 0; iteration < 600; ++iteration) {
+        const auto slot = random() % pins.size();
+        const auto key = KeyOf(std::to_string(slot));
+        if (pins[slot]) {
+            pins[slot].reset();
+        } else {
+            pins[slot] = index.Find(pool, key);
+        }
+        if (iteration % 3 == 0) {
+            auto block = index.Find(pool, key);
+            index.Register(pool, block, key, random() % 13, static_cast<std::int32_t>(slot),
+                           CacheBoundaryKind::kEndpoint, nullptr);
+        }
+        auto expected = index.EvictableCandidates(pool);
+        std::ranges::sort(expected, [](const auto& lhs, const auto& rhs) {
+            if (lhs.metadata.last_access_epoch != rhs.metadata.last_access_epoch) {
+                return lhs.metadata.last_access_epoch < rhs.metadata.last_access_epoch;
+            }
+            if (lhs.location.lcm_block_id != rhs.location.lcm_block_id) {
+                return lhs.location.lcm_block_id < rhs.location.lcm_block_id;
+            }
+            return lhs.location.slot_index < rhs.location.slot_index;
+        });
+        std::vector<CacheBlockLocation> expected_locations;
+        for (const auto& candidate : expected) {
+            expected_locations.push_back(candidate.location);
+        }
+        EXPECT_EQ(DrainEvictionOrder(index, pool), expected_locations) << iteration;
+    }
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, BoundedTraversalLeavesNewerEpochsForTheNextCall) {
+    BlockPool pool(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    CacheBlockRef pinned = pool.AcquireBlock(kGroupId);
+    index.Register(pool, pinned, KeyOf("pinned"), 1, -1, CacheBoundaryKind::kChunk, nullptr);
+    const CacheBlockLocation first = Cache(index, pool, "first", 4);
+    const CacheBlockLocation second = Cache(index, pool, "same-epoch", 4);
+    const CacheBlockLocation later = Cache(index, pool, "later", 9);
+
+    PrefixCacheIndex::EvictionCursor cursor;
+    std::vector<PrefixCacheIndex::EvictionCandidate> batch;
+    EXPECT_EQ(index.PeekEvictionEpoch(pool, cursor), 1u);
+    EXPECT_EQ(index.PeekEvictionEpoch(pool, cursor), 1u);
+    EXPECT_FALSE(index.NextEvictionEpoch(pool, cursor, 3, batch));
+    EXPECT_TRUE(batch.empty());
+    EXPECT_EQ(index.PeekEvictionEpoch(pool, cursor), 4u);
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, 4, batch));
+    ASSERT_EQ(batch.size(), 2u);
+    EXPECT_EQ(batch[0].location, first);
+    EXPECT_EQ(batch[1].location, second);
+    EXPECT_EQ(index.PeekEvictionEpoch(pool, cursor), 9u);
+    batch.clear();
+    EXPECT_FALSE(index.NextEvictionEpoch(pool, cursor, 8, batch));
+    EXPECT_EQ(index.PeekEvictionEpoch(pool, cursor), 9u);
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, 9, batch));
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_EQ(batch[0].location, later);
+    EXPECT_FALSE(index.PeekEvictionEpoch(pool, cursor));
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, AZeroEpochAndAnAbsentTierAreDistinct) {
+    BlockPool pool(1, {1});
+    BlockPool empty_pool(1, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation first = Cache(index, pool, "superseded", 0);
+    PrefixCacheIndex::EvictionCursor cursor;
+    EXPECT_EQ(index.PeekEvictionEpoch(pool, cursor), 0u);
+    std::vector<PrefixCacheIndex::EvictionCandidate> batch;
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, 0, batch));
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_EQ(batch[0].location, first);
+    PrefixCacheIndex::EvictionCursor empty_cursor;
+    EXPECT_FALSE(index.PeekEvictionEpoch(empty_pool, empty_cursor));
+    EXPECT_FALSE(index.NextEvictionEpoch(empty_pool, empty_cursor, 0, batch));
+    EXPECT_EQ(batch.size(), 1u) << "an exhausted tier does not clear prior output";
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextEpoch) {
     BlockPool pool(5, {1});
     PrefixCacheIndex index(kGroupId);
@@ -126,12 +304,12 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextE
     const CacheBlockLocation second = Cache(index, pool, "second", /*access_epoch=*/3);
     PrefixCacheIndex::EvictionCursor cursor;
     std::vector<PrefixCacheIndex::EvictionCandidate> batch;
-    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, batch));
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
     ASSERT_EQ(batch.size(), 2u);
     EXPECT_EQ(batch[0].location, first);
     EXPECT_EQ(batch[1].location, second);
     batch.clear();
-    EXPECT_FALSE(index.NextEvictionEpoch(pool, cursor, batch));
+    EXPECT_FALSE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
     EXPECT_TRUE(batch.empty());
 }
 
@@ -141,10 +319,10 @@ TEST(PrefixCacheIndexEvictionOrderTest, ExhaustsTheMaximumEpochWithoutWrapping) 
     Cache(index, pool, "last", std::numeric_limits<std::uint64_t>::max());
     PrefixCacheIndex::EvictionCursor cursor;
     std::vector<PrefixCacheIndex::EvictionCandidate> batch;
-    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, batch));
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
     ASSERT_EQ(batch.size(), 1u);
     batch.clear();
-    EXPECT_FALSE(index.NextEvictionEpoch(pool, cursor, batch));
+    EXPECT_FALSE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
     EXPECT_TRUE(batch.empty());
 }
 

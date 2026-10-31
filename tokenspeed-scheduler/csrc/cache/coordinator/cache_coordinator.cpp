@@ -83,12 +83,12 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         }
         pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         if (host_pool_ != nullptr) {
-            host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+            host_pool_->RegisterGroup(groups_[i].Id(), host_pool_->Packing(groups_[i].Id()), spec.shard_count);
         }
-        // The same packing and shard count as the Device pool, so a snapshot
-        // block's virtual id has the same owner as the Device block it images.
+        // Packing belongs to the pool. Cyclic owner count stays the same on
+        // both tiers, so a snapshot keeps the Device block's owner bucket.
         if (snapshot_pool_ != nullptr) {
-            snapshot_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+            snapshot_pool_->RegisterGroup(groups_[i].Id(), snapshot_pool_->Packing(groups_[i].Id()), spec.shard_count);
         }
         geometry_.emplace_back(group_block_granularity);
         if (spec.replayable) {
@@ -415,15 +415,23 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         const std::int32_t floor_pages = GroupIsState(i) ? 0 : floor_tokens / geometry_[i].BlockGranularity();
         out.per_group[i] =
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
-        if (!probe.tail || probe.tail->group_keys[i].empty()) {
-            continue;
+        if (probe.tail && !probe.tail->group_keys[i].empty()) {
+            // The tail's blocks follow the full pages in the same table.
+            PrefixMatch tail_match = groups_[i].Index().AcquireMatched(
+                pool, probe.tail->group_keys[i], /*begin_blocks=*/0, probe.tail->per_group[i], access_epoch);
+            out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
+                                           std::make_move_iterator(tail_match.blocks.begin()),
+                                           std::make_move_iterator(tail_match.blocks.end()));
         }
-        // The tail's blocks follow the full pages in the same table.
-        PrefixMatch tail_match = groups_[i].Index().AcquireMatched(pool, probe.tail->group_keys[i], /*begin_blocks=*/0,
-                                                                   probe.tail->per_group[i], access_epoch);
-        out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
-                                       std::make_move_iterator(tail_match.blocks.begin()),
-                                       std::make_move_iterator(tail_match.blocks.end()));
+        if (GroupIsState(i)) {
+            for (const CacheBlockRef& block : out.per_group[i].blocks) {
+                if (const std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool, block)) {
+                    if (BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash)) {
+                        node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
+                    }
+                }
+            }
+        }
     }
     return out;
 }
@@ -719,8 +727,17 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
         }
     }
     const bool has_kv = std::ranges::any_of(match_order, [&](std::size_t i) { return !GroupIsState(i); });
-    const std::int32_t device_kv_tokens =
-        std::min(device.kv_tokens - device.kv_tokens % prefix_granularity_, num_prefix_pages * prefix_granularity_);
+    // A Host window may complete Device Full KV even when no window on the
+    // Device can resume there. Start from the closed groups' coverage; each
+    // candidate below lowers the split for its missing Device window blocks.
+    const std::int32_t closed_device_tokens =
+        closed_order.empty()
+            ? device.kv_tokens
+            : probeTierWithKeys<CacheTier::kDevice>(group_keys, closed_order, num_prefix_pages, /*floor_tokens=*/0,
+                                                    /*extra_hits=*/nullptr)
+                  .num_common_tokens;
+    const std::int32_t device_kv_tokens = std::min(closed_device_tokens - closed_device_tokens % prefix_granularity_,
+                                                   num_prefix_pages * prefix_granularity_);
     const std::int32_t host_kv_end_tokens =
         probeTierWithKeys<CacheTier::kHost>(group_keys, closed_order, num_prefix_pages, device_kv_tokens, extra_hits)
             .num_common_tokens;
@@ -897,6 +914,83 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPr
     return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
+std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::InspectPrefixAvailability(
+    const PromptPrefix& prompt) const {
+    _assert(groups_.size() <= 64, "prefix availability uses one bit per cache group");
+    const auto keys = buildGroupKeys(prompt.prefix_hashes);
+    const auto contains = [&](std::size_t i, const CacheKey& key, std::size_t tier) {
+        const PrefixCacheIndex& index = groups_[i].Index();
+        const bool device = tier != 1 && index.Contains(pool_, key);
+        const bool host = tier != 0 && host_pool_ != nullptr && index.Contains(*host_pool_, key);
+        return device || host;
+    };
+    // A closed group's first hole bounds every later boundary. Compute it
+    // once; rescanning the entire prefix per boundary would be quadratic.
+    std::vector<std::array<std::int32_t, 3>> first_missing(groups_.size());
+    for (const std::size_t i : match_order_) {
+        if (!groups_[i].Matcher().IsPrefixClosed()) {
+            continue;
+        }
+        for (std::size_t tier = 0; tier < 3; ++tier) {
+            std::int32_t block = 0;
+            while (static_cast<std::size_t>(block) < keys[i].size() &&
+                   contains(i, keys[i][static_cast<std::size_t>(block)], tier)) {
+                ++block;
+            }
+            first_missing[i][tier] = block;
+        }
+    }
+    std::vector<PrefixBoundaryAvailability> out;
+    forEachCandidateBoundary(
+        prompt, /*floor_tokens=*/0, prompt.max_tokens,
+        [&](std::int32_t page_tokens, std::int32_t tail_tokens, const ContentHash& hash) {
+            std::array<std::uint64_t, 3> missing{};
+            const std::int32_t boundary = page_tokens + tail_tokens;
+            for (const std::size_t i : match_order_) {
+                const auto tail_keys =
+                    tail_tokens > 0 ? tailKeysForGroup(i, hash, tail_tokens) : std::vector<CacheKey>{};
+                for (std::size_t tier = 0; tier < 3; ++tier) {
+                    bool available = true;
+                    if (GroupIsState(i)) {
+                        const CacheKey key =
+                            tail_tokens > 0 ? tail_keys[0]
+                                            : CacheKey{.group_id = groups_[i].Id(),
+                                                       .content_hash = prompt.prefix_hashes[static_cast<std::size_t>(
+                                                           page_tokens / prefix_granularity_ - 1)],
+                                                       .page_offset = 0};
+                        available = contains(i, key, tier);
+                    } else {
+                        const std::int32_t granularity = geometry_[i].BlockGranularity();
+                        const std::int32_t full_blocks = page_tokens / granularity;
+                        if (groups_[i].Matcher().IsPrefixClosed()) {
+                            available = first_missing[i][tier] >= full_blocks;
+                            for (const CacheKey& key : tail_keys) {
+                                available = available && contains(i, key, tier);
+                            }
+                        } else {
+                            const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
+                            for (std::int32_t block = window.first; available && block < window.past_end; ++block) {
+                                const CacheKey& key = block < full_blocks
+                                                          ? keys[i][static_cast<std::size_t>(block)]
+                                                          : tail_keys[static_cast<std::size_t>(block - full_blocks)];
+                                available = contains(i, key, tier);
+                            }
+                        }
+                    }
+                    if (!available) {
+                        missing[tier] |= std::uint64_t{1} << i;
+                    }
+                }
+            }
+            out.push_back({.tokens = boundary,
+                           .device_missing = missing[0],
+                           .host_missing = missing[1],
+                           .union_missing = missing[2]});
+            return true;
+        });
+    return out;
+}
+
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
     return ProbePromptPrefix(PromptPrefix{
         .prefix_hashes = content_hashes,
@@ -992,6 +1086,9 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
                 pool_, probe.state_at_prompt_end->group_keys[i],
                 /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i], access_epoch);
             out.state_at_prompt_end[i] = std::move(match.blocks.front());
+            if (BoundaryTree::Node* node = boundary_tree_.Find(probe.state_at_prompt_end->hash)) {
+                node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
+            }
         }
     }
     return out;
@@ -1190,6 +1287,7 @@ void CacheCoordinator::linkPublication(const CompletedPages& completed) {
         parent = &boundary_tree_.FindOrAdd(page_hashes[page], parent,
                                            static_cast<std::int32_t>(page + 1) * prefix_granularity_,
                                            /*tail_tokens=*/0);
+        syncKvCoverage(*parent);
     }
     if (completed.tail) {
         boundary_tree_.FindOrAdd(
@@ -1235,6 +1333,9 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
         BoundaryTree::Node& node =
             boundary_tree_.FindOrAdd(key.content_hash, /*parent=*/nullptr, /*boundary_tokens=*/0, /*tail_tokens=*/0);
         node.on_device = true;
+        if (groups_[group_index].Matcher().IsPrefixClosed()) {
+            syncKvCoverage(node);
+        }
         if (GroupIsState(group_index)) {
             boundary_tree_.SetCheckpoint(node, CacheTier::kDevice, true);
         }
@@ -1247,6 +1348,15 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
         pending_stores_.push_back(StoreCandidate{
             .key = std::move(key),
         });
+    }
+    if (GroupIsState(group_index)) {
+        for (std::size_t j = 0; j < keys.size(); ++j) {
+            if (blocks[j]) {
+                BoundaryTree::Node* node = boundary_tree_.Find(keys[j].content_hash);
+                _assert(node != nullptr, "a published State checkpoint has a boundary");
+                node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
+            }
+        }
     }
 }
 
@@ -1446,7 +1556,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                 discard_parent();
                 const std::uint32_t bound_group = std::get<1>(parent_value);
                 _assert(host_pool_->BoundGroup(victim_parent) == bound_group, "selected Host parent changed groups");
-                const std::int32_t victim_packing = groups_[bound_group].Allocator().CacheBlocksPerLcmBlock();
+                const std::int32_t victim_packing = host_pool_->Packing(bound_group);
                 for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
                     const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};
                     if (host_pool_->IsOccupied(location)) {
@@ -1656,9 +1766,8 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostBoundaries(std::sp
                         // they need its free slots: with those filled as
                         // well, they would not fit.
                         const GroupAllocator& allocator = groups_[bound_group].Allocator();
-                        std::vector<std::int64_t> free_slots(
-                            static_cast<std::size_t>(allocator.ShardCount()),
-                            allocator.CacheBlocksPerLcmBlock() / allocator.ShardCount());
+                        std::vector<std::int64_t> free_slots(static_cast<std::size_t>(allocator.ShardCount()),
+                                                             host_pool_->Packing(bound_group) / allocator.ShardCount());
                         for (const CacheBlockLocation& location : host_pool_->OccupiedLocations(parent_id)) {
                             if (!taken.contains(location)) {
                                 --free_slots[static_cast<std::size_t>(allocator.BucketOf(location))];
@@ -1886,6 +1995,22 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
     });
 }
 
+void CacheCoordinator::syncKvCoverage(BoundaryTree::Node& node) {
+    bool complete = has_prefix_closed_groups_ && node.tail_tokens == 0;
+    bool duplicate = false;
+    ForEachBoundaryKey(CacheKey{.content_hash = *node.hash}, node.tail_tokens, [&](std::size_t i, const CacheKey& key) {
+        if (!groups_[i].Matcher().IsPrefixClosed()) {
+            return;
+        }
+        const PrefixCacheIndex& index = groups_[i].Index();
+        const bool device = index.Contains(pool_, key);
+        complete = complete && device;
+        duplicate = duplicate || (device && host_pool_ != nullptr && index.Contains(*host_pool_, key));
+    });
+    boundary_tree_.SetDeviceKvCoverage(node, complete, prefix_granularity_);
+    boundary_tree_.SetHostKvDuplicate(node, duplicate);
+}
+
 void CacheCoordinator::syncTreeNode(const ContentHash& hash) {
     // Every registration starts a node, and the last entry to leave takes it
     // and its tail hint along: a hash without a node has nothing left.
@@ -1902,19 +2027,28 @@ void CacheCoordinator::syncTreeNode(const ContentHash& hash) {
     std::array<bool, 2> held{};
     std::array<bool, 2> state_held{};
     std::array<bool, 2> closed_held{};
-    ForEachBoundaryKey(CacheKey{.content_hash = *node->hash}, node->tail_tokens,
-                       [&](std::size_t i, const CacheKey& key) {
-                           const bool closed = groups_[i].Matcher().IsPrefixClosed();
-                           const std::array<bool, 2> entry{
-                               groups_[i].Index().Contains(pool_, key),
-                               host_pool_ != nullptr && groups_[i].Index().Contains(*host_pool_, key),
-                           };
-                           for (std::size_t tier = 0; tier < entry.size(); ++tier) {
-                               held[tier] = held[tier] || entry[tier];
-                               state_held[tier] = state_held[tier] || (entry[tier] && GroupIsState(i));
-                               closed_held[tier] = closed_held[tier] || (entry[tier] && closed);
-                           }
-                       });
+    bool device_kv_page_complete = has_prefix_closed_groups_ && node->tail_tokens == 0;
+    bool has_host_kv_duplicate = false;
+    ForEachBoundaryKey(
+        CacheKey{.content_hash = *node->hash}, node->tail_tokens, [&](std::size_t i, const CacheKey& key) {
+            const bool closed = groups_[i].Matcher().IsPrefixClosed();
+            const std::array<bool, 2> entry{
+                groups_[i].Index().Contains(pool_, key),
+                host_pool_ != nullptr && groups_[i].Index().Contains(*host_pool_, key),
+            };
+            if (closed) {
+                device_kv_page_complete = device_kv_page_complete && entry[BoundaryTree::kDevice];
+                has_host_kv_duplicate =
+                    has_host_kv_duplicate || (entry[BoundaryTree::kDevice] && entry[BoundaryTree::kHost]);
+            }
+            for (std::size_t tier = 0; tier < entry.size(); ++tier) {
+                held[tier] = held[tier] || entry[tier];
+                state_held[tier] = state_held[tier] || (entry[tier] && GroupIsState(i));
+                closed_held[tier] = closed_held[tier] || (entry[tier] && closed);
+            }
+        });
+    boundary_tree_.SetDeviceKvCoverage(*node, device_kv_page_complete, prefix_granularity_);
+    boundary_tree_.SetHostKvDuplicate(*node, has_host_kv_duplicate);
     // A store on its way to the Host counts there: a checkpoint's as a
     // checkpoint there, any as Host presence.
     state_held[BoundaryTree::kHost] = state_held[BoundaryTree::kHost] || node->pending_host_checkpoint_stores > 0;
@@ -2472,7 +2606,7 @@ std::optional<CacheCoordinator::SnapshotPoolPlan> CacheCoordinator::planSnapshot
             ++need[static_cast<std::size_t>(bucket)];
         }
         parents_needed += ParentsNeededForBuckets(need, snapshot_pool_->FreeSlotsByBucket(groups_[i].Id()),
-                                                  /*dense_need=*/0, allocator.CacheBlocksPerLcmBlock());
+                                                  /*dense_need=*/0, snapshot_pool_->Packing(groups_[i].Id()));
     }
     if (parents_needed > snapshot_pool_->NumEmptyLcmBlocks()) {
         return std::nullopt;
@@ -2638,8 +2772,13 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     BoundaryTree::Node& node =
         boundary_tree_.FindOrAdd(key.content_hash, /*parent=*/nullptr, /*boundary_tokens=*/0, /*tail_tokens=*/0);
     boundary_tree_.SetOnHost(node, true);
+    if (groups_[key.group_id].Matcher().IsPrefixClosed()) {
+        syncKvCoverage(node);
+    }
     if (GroupIsState(key.group_id)) {
         boundary_tree_.SetCheckpoint(node, CacheTier::kHost, true);
+        node.latest_state_access_epoch =
+            std::max({node.latest_state_access_epoch, metadata.last_access_epoch, metadata.max_access_epoch});
     }
 }
 
@@ -2669,8 +2808,12 @@ void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey
     BoundaryTree::Node& node =
         boundary_tree_.FindOrAdd(key.content_hash, /*parent=*/nullptr, /*boundary_tokens=*/0, /*tail_tokens=*/0);
     node.on_device = true;
+    if (groups_[key.group_id].Matcher().IsPrefixClosed()) {
+        syncKvCoverage(node);
+    }
     if (GroupIsState(key.group_id)) {
         boundary_tree_.SetCheckpoint(node, CacheTier::kDevice, true);
+        node.latest_state_access_epoch = std::max(node.latest_state_access_epoch, access_epoch);
     }
     if (!cache_mutation_sink_) {
         return;
