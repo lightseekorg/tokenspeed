@@ -602,9 +602,9 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 attnres_partial_dual(*attnres_partial_args)
             if dp_or_empty or self._fused_qkv_a_pad_rows:
                 qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
-            # DP Linear already restores complete local rows. Empty owners
-            # likewise skip the ordinary attention communication.
-            if not dp_or_empty:
+            # DP Linear already restores complete local rows. Ordinary TP
+            # must gather even on ranks whose scattered input has zero rows.
+            if self.qkv_parallel is None:
                 qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
         elif attnres_partial_args is not None:
@@ -719,26 +719,25 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         *,
         projection_out: torch.Tensor | None,
     ) -> torch.Tensor:
-        has_tokens = hidden_states.shape[0] > 0
-        # Empty owners need QKV only when peers share its projection weights.
-        if has_tokens or self.qkv_parallel is not None:
-            if self.use_output_gate:
-                q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
-                    hidden_states,
-                    ctx,
-                    comm_manager,
-                    block_scale,
-                    attnres_partial_args,
-                )
-            else:
-                if attnres_partial_args is not None:
-                    attnres_partial_dual(*attnres_partial_args)
-                q, latent_cache = self._project_q_latent(
-                    hidden_states, ctx, comm_manager, block_scale
-                )
-                gate = None
-                absorbed_query = None
-        if not has_tokens:
+        # Project/gather before checking emptiness: a zero-row TP shard may
+        # receive peer rows and still owns attention heads for those tokens.
+        if self.use_output_gate:
+            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
+                hidden_states,
+                ctx,
+                comm_manager,
+                block_scale,
+                attnres_partial_args,
+            )
+        else:
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            q, latent_cache = self._project_q_latent(
+                hidden_states, ctx, comm_manager, block_scale
+            )
+            gate = None
+            absorbed_query = None
+        if q.shape[0] == 0:
             # Finish any O collective after QKV, without local attention work.
             if self.output_parallel is None:
                 return hidden_states
