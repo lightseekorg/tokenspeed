@@ -460,7 +460,7 @@ commit), 1 (one forward ahead of its commit: the overlap schedule on a
 decoding role), or `pp_size` (the prefill chunk pipeline);
 `scheduler_utils.resolve_in_flight_depth` picks it. At PP=1 the prefill role
 runs at 1 too, the chunk pipeline's one-stage case: a round's planning,
-commit and transfer polling overlap the chunk on the GPU. It still takes no
+commit, and transfer polling overlap the chunk on the GPU. It still takes no
 overlap schedule, whose decode KV reservation (`overlap_schedule_depth`) it
 never needs. `--disable-overlap-schedule` sets the depth to 0 at PP=1.
 Dispatched forwards await commit in the `in_flight` queue. The round commits
