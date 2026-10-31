@@ -423,3 +423,41 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
         mxfp4.attach_prefill_aliases(w, w13_scale, w2_scale)
 
     torch.cuda.empty_cache()
+
+
+def preprocess_sorted_down_weight(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Lay out MXFP4 expert down weights for the package-prefill down GEMM only.
+
+    Args:
+        weight: Packed E2M1 weights ``[experts, N, K / 2]``; N must be a
+            multiple of 128 and K of 256.
+        scale: E8M0 block scales ``[experts, N, K / 32]``.
+
+    Returns:
+        The gdot128-preshuffled weight carrying the same package-prefill
+        weight and scale aliases as a processed MoE layer's down projection.
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.preprocess import (
+        _make_gdot128_scale_alias,
+        _make_gdot128_weight_alias,
+    )
+
+    experts, width, k_packed = map(int, weight.shape)
+    if (
+        weight.dtype != torch.uint8
+        or scale.dtype != torch.uint8
+        or scale.shape != (experts, width, k_packed * 2 // _MXFP_BLOCK_SIZE)
+        or width % _GLUON_COMBINE_BLOCK_N
+        or (k_packed * 2) % 256
+    ):
+        raise ValueError("package prefill down weights must be aligned MXFP4")
+    shuffled = shuffle_weight_for_gluon_dot_layout(_make_k_packed_mxfp4_weight(weight))
+    shuffled.gluon_package_prefill_weight = _make_gdot128_weight_alias(
+        shuffled, preserve_logical_k=False
+    )
+    shuffled.gluon_package_prefill_scale = _make_gdot128_scale_alias(
+        _swizzle_cdna4_mxfp4_scale(scale), logical_k_packed=None
+    )
+    return shuffled
