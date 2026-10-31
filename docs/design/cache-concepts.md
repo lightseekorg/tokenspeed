@@ -1374,6 +1374,10 @@ capacity bound may reject an impossible admission. It overestimates removable
 cache entries and credits this step's releasable State input and newly expired
 window slots, never the live history or State output. Expired slots may still
 be shared or null; bucket, cache pin and segment restrictions are relaxed.
+The bound counts the allocator's unreclaimed expired-slot range; the full
+pass filters that same range by ownership. State inputs use the same
+release-eligibility check in both passes, so the bound cannot fall below the
+actual request-reclaim candidates through a separate retention calculation.
 Existing holes in bound parents do not supply another group with parents:
 the bound caps each group's returned parents by its removable slots divided
 by its smallest occupied parent. The pool's existing occupancy order supplies
@@ -1449,6 +1453,8 @@ Device room and hits, never correctness. The victim sets:
   chosen boundary and the pages climbed above it are marked as that failed
   set; unread descendants and sibling branches remain eligible. These marks
   last for the plan alone, so a later owner release permits a new attempt.
+  The walk and failure marking reuse the candidate's and climbed ancestors'
+  entry snapshots; these remain valid throughout the read-only plan.
 
 The climb reads the real checkpoint-boundary counts, not the shadow's, so two
 sibling segments chosen in one plan leave their shared pages on the Device for

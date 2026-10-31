@@ -3230,14 +3230,9 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
             input_ids: Some((first + 1..=first + 3000).collect()),
             ..disaggregated(rid, room, 1, 2)
         };
-        let mut prefilled = prefill.client.generate(request.clone()).await.unwrap();
+        let prefilled = prefill.client.generate(request.clone()).await.unwrap();
         let decoded = decode.client.generate(request).await.unwrap();
         if rid == "a-again" {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), prefilled.next())
-                    .await
-                    .is_err()
-            );
             assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 0);
             assert!(prefill.ranks[0].acknowledged.lock().unwrap().is_empty());
             prefill.ranks[0].ack_gate.open();

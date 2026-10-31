@@ -897,7 +897,8 @@ private:
     // excluding pages a sliding group can force into a Host suffix. Keep the
     // Device facts read during collection for this plan's ranking. Visit in
     // priority order and stop as soon as the callback returns false.
-    void visitHostKvDuplicateCandidates(const std::function<bool(const HostKvDuplicateCandidate&)>& visit) const;
+    template <typename Visitor>
+    void visitHostKvDuplicateCandidates(Visitor&& visit) const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,

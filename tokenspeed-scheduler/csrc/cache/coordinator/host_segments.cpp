@@ -38,8 +38,8 @@
 
 namespace tokenspeed {
 
-void CacheCoordinator::visitHostKvDuplicateCandidates(
-    const std::function<bool(const HostKvDuplicateCandidate&)>& visit) const {
+template <typename Visitor>
+void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
     if (!boundary_tree_.HasHostKvDuplicateCandidate()) {
         return;
     }

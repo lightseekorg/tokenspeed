@@ -710,8 +710,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         cache_progress.state_checkpoint_tokens = state_checkpoint;
         cache_progress.state_checkpoint_blocks = std::move(admission->state_checkpoint_blocks);
     }
-    if (ends_at_state_checkpoint ||
-        (progress.completed_pages && progress.completed_pages->state_checkpoint_pages > 0)) {
+    if (state_checkpoint > 0 && (ends_at_state_checkpoint ||
+                                 (progress.completed_pages && progress.completed_pages->state_checkpoint_pages > 0))) {
         cache_progress.retained_input_checkpoint =
             coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }

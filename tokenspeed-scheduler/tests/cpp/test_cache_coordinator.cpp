@@ -1579,6 +1579,40 @@ TEST(CacheCoordinatorAdmissionTest, OnlyNewlyExpiredWindowSlotsCanFundGrowth) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
 }
 
+TEST(CacheCoordinatorAdmissionTest, ExpiredWindowPinsAndHolesDoNotFundGrowthUntilAnOwnerReleases) {
+    BlockPool pool(4, {1});
+    const std::vector<CacheGroupSpec> specs = {{.attn_kind = AttnKind::kSlidingWindow,
+                                                .sliding_window = 5,
+                                                .cache_blocks_per_lcm_block = 1,
+                                                .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 16));
+    tables[0].EvictToNull(0).reset();
+    const CacheBlockRef unrelated = pool.AcquireBlock(0);
+    CacheBlockRef retained = tables[0].Blocks()[1];
+    coordinator.CacheDeviceBlock(retained, CacheKey{.content_hash = "expired-window"}, /*access_epoch=*/1,
+                                 CacheBoundaryKind::kChunk, /*logical_block_index=*/1);
+    const auto before = BlockTableLcmBlockIds(tables[0]);
+    const std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{8}}};
+    const RequestProgress progress{.num_computed_tokens = 16};
+    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false));
+    EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), before);
+    EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 0);
+
+    // The cached block and the uncached expired block now fund two new
+    // slots. Neither the hole nor the still-live window supplies capacity.
+    retained.reset();
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false));
+    EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 3);
+    ASSERT_EQ(tables[0].NumBlocks(), 6);
+    for (std::int32_t slot = 0; slot < 6; ++slot) {
+        EXPECT_EQ(static_cast<bool>(tables[0].Blocks()[slot]), slot >= 3);
+    }
+    EXPECT_EQ(tables[0].Blocks()[3]->Location().lcm_block_id, before[3]);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+}
+
 TEST(CacheCoordinatorAdmissionTest, SkipsProtectedOldestEpochAndEvictsLaterEpochs) {
     BlockPool pool(3, {1});
     const std::vector<CacheGroupSpec> specs = {

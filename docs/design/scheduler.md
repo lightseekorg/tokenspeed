@@ -331,8 +331,10 @@ a long decode cannot publish a replacement checkpoint, so releasing the input
 as soon as it leaves slot 0 can lose the next turn's reusable prefix while its
 producer is still running. The hold uses ordinary references in the shared
 cache pools, acquired once when the input checkpoint becomes available; decode
-does not scan or refresh it each step. At finish, its entries become recent
-without counting as a cache hit, then ownership is released. An admission that
+does not scan or refresh it each step. Retention requires a nonzero input
+checkpoint boundary, including when publishing completed pages from a prior
+chunk. At finish, its entries become recent without counting as a cache hit,
+then ownership is released. An admission that
 cannot fit drops its own optional hold before retrying, and retraction drops
 it before imaging the request. Neither an incomplete checkpoint nor a partial
 set of sliding-window dependencies is retained.

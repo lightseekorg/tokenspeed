@@ -341,13 +341,20 @@ public:
         table.reclaimed_prefix_blocks_ = std::max(table.reclaimed_prefix_blocks_, expired);
     }
 
+    // Unreclaimed slots below the retention frontier, including null holes
+    // and shared blocks. The size is an optimistic reclaim bound; the actual
+    // candidates must come from this same range and pass the ownership check.
+    std::span<const CacheBlockRef> ExpiredBlockSlotsAt(const BlockTable& table, std::int32_t num_expired_blocks) const {
+        const std::int32_t first = table.ReclaimedPrefixBlocks();
+        const std::int32_t count = std::max(std::min(num_expired_blocks, table.NumBlocks()) - first, 0);
+        return table.Blocks().subspan(first, count);
+    }
+
     // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
     std::int32_t BlocksReclaimableAt(const PrefixCacheIndex& index, const BlockTable& table,
                                      std::int32_t num_expired_blocks, bool count_uncached) const {
-        const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::int32_t freed = 0;
-        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
-            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+        for (const CacheBlockRef& block : ExpiredBlockSlotsAt(table, num_expired_blocks)) {
             if (!block) {
                 continue;
             }
@@ -362,10 +369,8 @@ public:
 
     std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const PrefixCacheIndex& index, const BlockTable& table,
                                                                 std::int32_t num_expired_blocks) const {
-        const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::vector<CacheBlockLocation> locations;
-        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
-            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+        for (const CacheBlockRef& block : ExpiredBlockSlotsAt(table, num_expired_blocks)) {
             if (!block) {
                 continue;
             }

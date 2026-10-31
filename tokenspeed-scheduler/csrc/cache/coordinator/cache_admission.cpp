@@ -280,6 +280,7 @@ public:
                 // by block, a page leaves with its boundary's blocks not in use
                 // and everything under it, climbing nowhere.
                 const BoundaryTree::Node* top = candidate_node;
+                const std::vector<NodeEntry> candidate_entries = coordinator_.NodeEntries(pool_, *candidate_node);
                 std::vector<std::pair<const BoundaryTree::Node*, std::vector<NodeEntry>>> climbed;
                 if (!blocks_alone && num_staying_checkpoint_boundaries(*candidate_node) == 1) {
                     while (top->parent != nullptr && top->parent->on_device &&
@@ -332,8 +333,16 @@ public:
                     }
                     const bool climbed_node =
                         next_climbed < climbed.size() && climbed[next_climbed].first == frame.node;
-                    const std::vector<NodeEntry> entries = climbed_node ? std::move(climbed[next_climbed++].second)
-                                                                        : coordinator_.NodeEntries(pool_, *frame.node);
+                    std::vector<NodeEntry> subtree_entries;
+                    std::span<const NodeEntry> entries;
+                    if (climbed_node) {
+                        entries = climbed[next_climbed++].second;
+                    } else if (frame.node == candidate_node) {
+                        entries = candidate_entries;
+                    } else {
+                        subtree_entries = coordinator_.NodeEntries(pool_, *frame.node);
+                        entries = subtree_entries;
+                    }
                     for (const NodeEntry& entry : entries) {
                         if (blocks_alone && frame.node == candidate_node && !is_evictable(entry)) {
                             continue;
@@ -359,8 +368,9 @@ public:
                     // no need to inspect the rest of its subtree. Remember
                     // only candidates that would expand to the same set. A
                     // descendant or sibling can still leave independently.
-                    const auto remember_same_set = [&](const BoundaryTree::Node& node) {
-                        for (const NodeEntry& entry : coordinator_.NodeEntries(pool_, node)) {
+                    const auto remember_same_set = [&](const BoundaryTree::Node& node,
+                                                       std::span<const NodeEntry> entries) {
+                        for (const NodeEntry& entry : entries) {
                             if (blocks_alone && &node == candidate_node && !is_evictable(entry)) {
                                 continue;
                             }
@@ -371,10 +381,9 @@ public:
                             }
                         }
                     };
-                    remember_same_set(*candidate_node);
+                    remember_same_set(*candidate_node, candidate_entries);
                     for (const auto& [node, entries] : climbed) {
-                        (void)entries;
-                        remember_same_set(*node);
+                        remember_same_set(*node, entries);
                     }
                     continue;
                 }
@@ -763,9 +772,8 @@ private:
                     request_reclaim =
                         groups_[i].Allocator().ReleasableStateInput(groups_[i].Index(), table, *step) ? 1 : 0;
                 } else {
-                    const std::int32_t expired = std::min(
-                        geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *num_computed_tokens_), table.NumBlocks());
-                    request_reclaim = std::max(expired - table.ReclaimedPrefixBlocks(), 0);
+                    const std::int32_t expired = geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *num_computed_tokens_);
+                    request_reclaim = groups_[i].Allocator().ExpiredBlockSlotsAt(table, expired).size();
                 }
             }
             // Still relax cache pins, prefix protection, bucket placement,

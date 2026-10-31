@@ -3751,7 +3751,7 @@ protected:
 TEST_F(ActiveInputCheckpointSuite, AnInteriorCheckpointPublishesItsOwnRecentWindow) {
     for (const bool host_cache : {false, true}) {
         for (const std::int32_t grain : {1, kP, 2 * kP}) {
-            for (const std::int32_t prompt_tokens : {31, 32, 35, 37, 40}) {
+            for (const std::int32_t prompt_tokens : {1, 4, 5, 8, 31, 32, 35, 37, 40}) {
                 SCOPED_TRACE(host_cache);
                 SCOPED_TRACE(grain);
                 SCOPED_TRACE(prompt_tokens);
@@ -3789,8 +3789,12 @@ TEST_F(ActiveInputCheckpointSuite, AnInteriorCheckpointPublishesItsOwnRecentWind
                 next.back() = 777;
                 next.push_back(778);
                 const std::int32_t boundary_grain = std::max(kP, grain);
-                EXPECT_EQ(Probe("next", std::move(next)).prefix_tokens,
-                          (prompt_tokens - 1) / boundary_grain * boundary_grain);
+                // Unrestricted State only saves an interior checkpoint for
+                // prompts longer than one chunk's budget.
+                const std::int32_t expected = grain == 1 && prompt_tokens <= config_.max_scheduled_tokens
+                                                  ? 0
+                                                  : (prompt_tokens - 1) / boundary_grain * boundary_grain;
+                EXPECT_EQ(Probe("next", std::move(next)).prefix_tokens, expected);
                 EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
                 EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
                 EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
