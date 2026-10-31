@@ -194,6 +194,21 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
     assert getattr(module, kernel_name).launch_metadata is module._index_launch_metadata
 
 
+def test_gfx1250_page_scorer_launch_metadata():
+    module = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer"
+    )
+    args = {"logits": torch.empty((3, 512), dtype=torch.float32)}
+    metadata = module._page_launch_metadata(
+        (2, 1, 1), SimpleNamespace(name="index_score"), args
+    )
+    assert metadata["name"] == "index_score"
+    assert metadata["flops8"] == 2 * 3 * 32 * 512 * 128
+    assert metadata["bytes"] > args["logits"].numel() * 4
+    kernel = module.gluon_dsv41_index_qtile_gfx1250
+    assert kernel.launch_metadata is module._page_launch_metadata
+
+
 @pytest.mark.parametrize(
     ("arch", "entry_name", "kernel_name", "tile_n"),
     [
@@ -224,13 +239,21 @@ def test_indexer_score_chunk_bound(
     launches = []
 
     class FakeKernel:
+        def __init__(self, name):
+            self.name = name
+
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
-                launches.append((grid, kwargs["SCORE_CHUNK"], kwargs["CHUNK_N"]))
+                launches.append(
+                    (self.name, grid, kwargs.get("SCORE_CHUNK"), kwargs["CHUNK_N"])
+                )
 
             return launch
 
-    monkeypatch.setattr(module, kernel_name, FakeKernel())
+    monkeypatch.setattr(module, kernel_name, FakeKernel(kernel_name))
+    page_kernel = "gluon_dsv41_index_qtile_gfx1250"
+    if arch == "gfx1250":
+        monkeypatch.setattr(module, page_kernel, FakeKernel(page_kernel))
     tokens, width = 2, 257
     weights = torch.empty((tokens, 32), dtype=torch.float32)
     cache = torch.empty((5, 64 * 68), dtype=torch.uint8)
@@ -249,8 +272,15 @@ def test_indexer_score_chunk_bound(
         requested_chunk,
     )
 
+    if arch == "gfx1250" and score_chunk >= tile_n:
+        # Full scoring takes whole pages; two query rows keep one chunk per CTA.
+        page_chunk = score_chunk // tile_n * tile_n
+        expected = (page_kernel, (tokens, (width + page_chunk - 1) // page_chunk))
+        assert launches == [(*expected, None, page_chunk)]
+        return
     assert launches == [
         (
+            kernel_name,
             (tokens, (width + score_chunk - 1) // score_chunk),
             score_chunk,
             hardware_chunk,
@@ -258,7 +288,7 @@ def test_indexer_score_chunk_bound(
     ]
 
 
-def _check_index_logits(device, reindex, score_chunk, index_logits):
+def _check_index_logits(device, reindex, score_chunk, index_logits, init=-torch.inf):
     g = torch.Generator(device=device).manual_seed(251)
     keys = torch.randn(512, 128, device=device, dtype=torch.bfloat16, generator=g)
     keys *= 0.1
@@ -282,7 +312,7 @@ def _check_index_logits(device, reindex, score_chunk, index_logits):
         else None
     )
     width = 40 if reindex else 256
-    out = torch.full((2, width), -torch.inf, device=device)
+    out = torch.full((2, width), init, device=device)
     values, scales, packed_weights = gluon_indexer._pack_index_q(q, weights)
     index_logits(
         values,
@@ -323,7 +353,83 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
         dsv41_index_logits_gfx1250,
     )
 
-    _check_index_logits(device, reindex, score_chunk, dsv41_index_logits_gfx1250)
+    # Candidate logits need no pre-fill: every candidate column is written.
+    _check_index_logits(
+        device,
+        reindex,
+        score_chunk,
+        dsv41_index_logits_gfx1250,
+        float("nan") if reindex else -torch.inf,
+    )
+
+
+@pytest.mark.parametrize("queries", [1, 5, 8])
+@pytest.mark.parametrize("score_chunk", [64, 256])
+@pytest.mark.parametrize("lengths_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_gfx1250_page_tile_index_logits_match_reference(
+    device, queries, score_chunk, lengths_dtype, broadcast
+):
+    """Whole-page scorer: written columns, skipped pages and untouched tails."""
+    if not current_platform().is_cdna5:
+        pytest.skip("GFX1250 indexer logits")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
+        dsv41_index_logits_gfx1250,
+    )
+
+    g = torch.Generator(device=device).manual_seed(253)
+    pages = 9
+    keys = torch.randn(pages * 64, 128, device=device, generator=g).to(torch.bfloat16)
+    keys *= 0.1
+    _, key_reference = torch_dsv41_cache_quantize(keys, "index")
+    storage = torch.zeros(pages, 64 * 68 + 16, device=device, dtype=torch.uint8)
+    cache = storage[:, : 64 * 68].view(pages, 64, 68)
+    dsv41.cache_scatter(keys, cache, torch.arange(pages * 64, device=device), "index")
+    # A null page, a page past the cache, and a reused page.
+    row = torch.tensor([3, 1, -1, 2, 9, 0, 5, 3], device=device, dtype=torch.int32)
+    table = (
+        row[None].expand(queries, -1)
+        if broadcast
+        else torch.stack([row.roll(i) for i in range(queries)])
+    )
+    width = row.numel() * 64
+    visible = torch.tensor(
+        [600, 0, 61, 300, 129, 448, 7, 512][:queries],
+        device=device,
+        dtype=lengths_dtype,
+    )
+    q = torch.randn(queries, 32, 128, device=device, generator=g).to(torch.bfloat16)
+    q *= 0.1
+    weights = torch.randn(queries, 32, device=device, generator=g)
+    values, scales, packed_weights = gluon_indexer._pack_index_q(q, weights)
+    out = torch.full((queries, width), float("nan"), device=device)
+    dsv41_index_logits_gfx1250(
+        values,
+        scales,
+        packed_weights,
+        cache.flatten(1),
+        table,
+        visible,
+        None,
+        out,
+        score_chunk,
+    )
+
+    _, q_reference = torch_dsv41_cache_quantize(q.reshape(-1, 128), "index")
+    q_reference = q_reference.reshape(queries, 32, 128)
+    logical = torch.arange(width)
+    for query in range(queries):
+        visible_rows = min(int(visible[query]), width)
+        written = (visible_rows + 7) // 8 * 8
+        physical = table[query].cpu()[logical // 64].long()
+        valid = (logical < visible_rows) & (physical >= 0) & (physical < pages)
+        expected = torch.full((written,), -torch.inf)
+        slots = physical[valid] * 64 + logical[valid] % 64
+        dots = q_reference[query] @ key_reference[slots].float().T
+        expected[valid[:written]] = (dots.relu() * weights[query].cpu()[:, None]).sum(0)
+        got = out[query].cpu()
+        torch.testing.assert_close(got[:written], expected, atol=2e-4, rtol=2e-4)
+        assert got[written:].isnan().all()
 
 
 @pytest.mark.parametrize("reindex", [False, True])
