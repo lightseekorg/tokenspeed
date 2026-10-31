@@ -1078,7 +1078,7 @@ class AscendDSAPrefill:
             raise RuntimeError("DSA Prefill must reuse its original compute stream")
         sources = self._cache_sources.get(layer_id)
         if sources is not None and any(
-            old.data_ptr() != new.data_ptr()
+            not old.view(-1).is_set_to(new.view(-1))
             for old, new in zip(sources, (kv_cache, index_cache), strict=True)
             if old is not None
         ):
@@ -1089,7 +1089,10 @@ class AscendDSAPrefill:
             # side-stream use before the next prefetch replaces these refs.
             self._bind_workspace(self._new_workspace())
         if sources is None:
-            sources = self._cache_sources[layer_id] = (kv_cache, index_cache)
+            sources = self._cache_sources[layer_id] = (
+                kv_cache.detach(),
+                None if index_cache is None else index_cache.detach(),
+            )
         self.layer_id = layer_id
         self._sources = sources
         # finish joins all side-stream reads on this same producer stream.
