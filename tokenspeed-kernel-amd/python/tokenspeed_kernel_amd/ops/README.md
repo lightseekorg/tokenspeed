@@ -2359,9 +2359,8 @@ four branches across waves, so the gate tensor never reaches memory.
 ### gfx1250 mHC mixes projection
 
 `gluon_mhc_mixes_gfx1250` computes the hc=4 prenorm mixing coefficients for
-BF16 residual streams. It shares split selection with `triton_mhc_mixes` and
-replaces both of its kernels: the projection `x @ fn.T` with its row sums of
-squares, and the reduction that runs normalization and the Sinkhorn
+BF16 residual streams in two kernels: the projection `x @ fn.T` with its row
+sums of squares, and the reduction that runs normalization and the Sinkhorn
 iterations. `gluon_mhc_pre_gfx1250` runs the same two kernels for `mhc_pre`
 at every token count, then collapses the streams with the portable kernel.
 
@@ -2370,9 +2369,9 @@ at every token count, then collapses the streams with the portable kernel.
 - `x` is contiguous BF16 `[T, K]` (the four flattened streams) and `fn` is
   contiguous FP32 `[24, K]`. The projection writes FP32 partials
   `[splits, T, 24]` and `[splits, T]`.
-- The WMMA projection runs when `K` splits into whole 128- or 64-wide K tiles
-  that fill the TDM pipeline in every partition; other `K` uses the portable
-  Triton projection.
+- The WMMA projection runs when `K` splits into at least four 64-wide K
+  tiles; other `K` uses the portable Triton projection.
+- Results are deterministic; the split partials are summed in split order.
 
 #### Algorithm
 
@@ -2383,13 +2382,23 @@ to accumulation order. The split masks the FP32 bits: widening BF16 back to
 FP32 lowers to VOPD pairs that rematerialize their mask in an SGPR, a scalar
 stall per pair that made the VALU-bound tile 20% slower.
 
-Each program covers 64 rows and one K partition, pipelines K tiles through
-three or four TDM buffers, and pads the 24 mixes to two 16-wide WMMA tiles.
-The token count and tiles per partition are runtime arguments.
+Each program covers a row tile and a K partition and pipelines 64-wide K
+tiles through four TDM buffers. Decode (up to 128 tokens) uses 16-row tiles
+with one wave per 16-wide mix tile, so no wave splits weights for rows that
+do not exist. Larger batches use 64-row (up to 2048 tokens) or 128-row tiles
+with four waves over the rows; each wave splits a quarter of the weight tile
+and the BF16 terms are shared through LDS. The partition count is the
+smallest divisor of the K tiles that gives 512 programs, capped at four
+tiles per partition (80 for DeepSeek V4.1 and 64 for GLM-5.3 decode, 8 for
+8192-token prefill chunks). The token count and tiles per partition are
+runtime arguments.
 
-The reduction is the gfx950 kernel on 32-lane waves: sixteen lanes own a
-token's 4x4 matrix, so a wave covers two tokens when the splits stay in
-registers and one when they also spread over lanes.
+The reduction gives four lanes a token's 4x4 matrix, one row of four
+contiguous FP32 per lane, so each split is one 16-byte load and the Sinkhorn
+row sums stay in registers (column sums are two-step lane reductions).
+Prefill keeps up to eight splits in registers; more splits also spread over
+lane groups, and decode spreads them over every wave so a single pass loads
+all of them.
 
 ### gfx1250 mHC stream collapse with FP8 output
 
