@@ -12,10 +12,6 @@ tokenspeed serve openai/gpt-oss-20b \
   --tensor-parallel-size 1
 ```
 
-For an IPv6 listener, pass the address directly, for example `--host ::1`.
-Startup probes and printed HTTP URLs bracket IPv6 literals (`http://[::1]:8000`).
-The same URL formatting applies to `--metrics-host` when metrics are enabled.
-
 ## Production launch skeleton
 
 Use explicit parameters in scripts so a deployment is reproducible.
@@ -43,6 +39,7 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
 
 - Put the model path directly after `tokenspeed serve`.
 - Set `--host`, `--port`, and `--served-model-name` for the API surface.
+- Pass IPv6 host arguments as bare addresses, for example `--host ::1`. The launcher brackets IPv6 literals in HTTP URLs (`http://[::1]:8000`), including URLs printed for `--metrics-host`.
 - Set `--max-model-len`, `--kv-cache-dtype`, and `--gpu-memory-utilization` before tuning concurrency.
 - Set `--tensor-parallel-size`, `--data-parallel-size`, and `--enable-expert-parallel` to match the hardware topology.
 - Set model-family parsers such as `--reasoning-parser` and `--tool-call-parser` when the chat format needs them.
