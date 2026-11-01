@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsa import (
+    torch_dsa_sparse_attention,
+)
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
 from tokenspeed_kernel.registry import KernelRegistry
 
@@ -71,13 +74,7 @@ def _reference(
     slots: torch.Tensor,
     lengths: torch.Tensor,
 ) -> torch.Tensor:
-    output = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    scale = LATENT_DIM**-0.5
-    for row, length in enumerate(lengths.tolist()):
-        selected = kv.index_select(0, slots[row, :length].long()).float()
-        scores = q[row].float() @ selected.T * scale
-        output[row] = torch.softmax(scores, dim=-1) @ selected
-    return output
+    return torch_dsa_sparse_attention(q, kv, None, slots, lengths, LATENT_DIM**-0.5)
 
 
 def _inputs(

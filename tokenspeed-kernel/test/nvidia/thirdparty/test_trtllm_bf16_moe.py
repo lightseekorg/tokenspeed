@@ -27,6 +27,7 @@ import logging
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_grouped_sigmoid_topk
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -292,6 +293,7 @@ def test_unbuildable_private_module_keeps_trtllm_at_128(
             internal_activation_dtype="input",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
             **kwargs,
         )["solution"]
 
@@ -414,6 +416,7 @@ def test_trtllm_unquant_admits_gated_sizes_the_launcher_accepts(
             internal_activation_dtype="input",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -515,6 +518,7 @@ def test_64_aligned_outputs_match_128_padded(
             solution="flashinfer_trtllm",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
         # Zero-pad each half of w13 and the columns of w2 like the loader.
         pad = torch.zeros(num_experts, ispp - inter, hidden, device="cuda")
@@ -826,6 +830,7 @@ def _plan(platform, weight_dtype, routing_mode=None, **kwargs):
             internal_activation_dtype="input",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
             **kwargs,
         )
     finally:
@@ -881,20 +886,6 @@ def test_moe_plan_keeps_in_kernel_routing_only_with_an_fp32_bias(
     assert plan["support_routing"] is kept
     assert plan["supports_precomputed_topk"] is not kept
     assert len(calls) == (hook is not None)
-
-
-def _deepseek_v3_routing(logits, bias, top_k, n_group, topk_group, scale):
-    """DeepSeek-V3's reference router: FP32 sigmoid scores plus an FP32 bias."""
-    scores = torch.sigmoid(logits.float())
-    biased = scores + bias.float()
-    tokens, experts = logits.shape
-    groups = biased.view(tokens, n_group, -1).topk(2, dim=-1).values.sum(dim=-1)
-    kept = torch.zeros_like(groups, dtype=torch.bool)
-    kept.scatter_(1, groups.topk(topk_group, dim=-1).indices, True)
-    kept = kept.repeat_interleave(experts // n_group, dim=1)
-    ids = biased.masked_fill(~kept, float("-inf")).topk(top_k, dim=-1).indices
-    weights = scores.gather(1, ids)
-    return ids, weights / weights.sum(dim=-1, keepdim=True) * scale
 
 
 def _gpu_bf16_moe_layer(
@@ -973,8 +964,8 @@ def test_dsv3_sized_bias_cases_need_an_fp32_bias(n_group, topk_group):
         logits, bias = _routing_case(case, 4, device="cpu")
         assert 2.0 <= bias.float().min() and bias.float().max() <= 8.0
         assert bias.float().unique().numel() == 256
-        ids, _ = _deepseek_v3_routing(logits, bias, 8, n_group, topk_group, 2.5)
-        bf16_ids, _ = _deepseek_v3_routing(
+        ids, _ = torch_grouped_sigmoid_topk(logits, bias, 8, n_group, topk_group, 2.5)
+        bf16_ids, _ = torch_grouped_sigmoid_topk(
             logits, bias.to(torch.bfloat16), 8, n_group, topk_group, 2.5
         )
         same = torch.equal(ids.sort(dim=1).values, bf16_ids.sort(dim=1).values)
@@ -1025,7 +1016,9 @@ def test_fp32_bias_routing_matches_the_fp32_reference(
     )
     if weights.dtype == torch.float32:
         weights = weights.view(torch.bfloat16).view(-1, 8)[:num_tokens]
-    ids, expected = _deepseek_v3_routing(logits, bias, 8, n_group, topk_group, 2.5)
+    ids, expected = torch_grouped_sigmoid_topk(
+        logits, bias, 8, n_group, topk_group, 2.5
+    )
     order = replay.long().argsort(dim=1)
     assert torch.equal(replay.long().gather(1, order), ids.sort(dim=1).values)
     got = weights.float().gather(1, order)
@@ -1085,6 +1078,7 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
             solution="flashinfer_trtllm",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
             **kwargs,
         )
 
@@ -1094,7 +1088,7 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
     kernel_moe_process_weights(in_kernel, w)
     hidden = torch.randn((37, x.shape[1]), device="cuda", generator=generator)
     hidden = hidden.to(torch.bfloat16)
-    ids, weights = _deepseek_v3_routing(logits, bias, 8, n_group, topk_group, 2.5)
+    ids, weights = torch_grouped_sigmoid_topk(logits, bias, 8, n_group, topk_group, 2.5)
     got = kernel_moe_apply(in_kernel, hidden, w, logits)
     assert reached or adapter.stock_routing_keeps_fp32_bias()
     want = kernel_moe_apply(

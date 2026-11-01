@@ -26,6 +26,27 @@
 
 namespace tokenspeed {
 
+std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
+                                          std::int32_t chunk_budget, std::int32_t prefix_replay_tokens) {
+    _assert(prompt_tokens >= 0 && chunk_budget > 0 && prefix_replay_tokens >= 0,
+            "prefill checkpoint inputs must be non-negative with a positive budget");
+    const std::int32_t grain = coordinator.CheckpointGranularity();
+    if (grain > 1) {
+        return prompt_tokens > 0 ? (prompt_tokens - 1) / grain * grain : 0;
+    }
+    const std::int32_t tail = std::max({1, coordinator.ReplayWindowTokens(), prefix_replay_tokens});
+    if (prompt_tokens <= chunk_budget || prompt_tokens <= tail) {
+        return 0;
+    }
+    for (std::int32_t group = 0; group < coordinator.NumGroups(); ++group) {
+        if (coordinator.GroupIsState(group)) {
+            const std::int32_t page = coordinator.PrefixGranularity();
+            return (prompt_tokens - tail) / page * page;
+        }
+    }
+    return 0;
+}
+
 std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t unscheduled,
                                      std::int32_t replay_window) {
     _assert(0 <= prefill_tokens && prefill_tokens <= unscheduled, "a chunk cannot exceed the unscheduled prompt");
@@ -45,6 +66,11 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
     const std::int32_t budget = token_budget - (resumes_hit ? coordinator.ReplayTokens(first_pos) : 0);
     if (budget <= 0) {
         return 0;
+    }
+    const std::int32_t grain = coordinator.CheckpointGranularity();
+    if (grain > 1) {
+        _assert(first_pos % grain == 0, "prefill must resume an aligned checkpoint");
+        return budget >= unscheduled ? unscheduled : budget / grain * grain;
     }
     const std::int32_t plain = std::min(budget, unscheduled);
     std::int32_t prefill_tokens = plain;
@@ -68,7 +94,8 @@ std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator) {
     // to carry the prompt's final window whole, or at least a prefix page of
     // new tokens when the window is smaller than a page.
     const std::int32_t window = coordinator.ReplayWindowTokens();
-    return window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0;
+    return std::max(coordinator.CheckpointGranularity() > 1 ? coordinator.CheckpointGranularity() : 0,
+                    window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0);
 }
 
 }  // namespace tokenspeed

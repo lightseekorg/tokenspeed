@@ -86,6 +86,7 @@ if current_platform().is_amd:
             }
         ),
         priority=Priority.SPECIALIZED,
+        features=frozenset({"logits"}),
     )
     def gluon_qsa_block_scores_gfx950(
         query: torch.Tensor,
@@ -124,17 +125,17 @@ if current_platform().is_amd:
             {format_signature(logits=dense_tensor_format(torch.float32))}
         ),
         priority=Priority.SPECIALIZED,
+        features=frozenset({"logits"}),
     )
     def gluon_qsa_block_topk_select_gfx950(
         logits: torch.Tensor,
         topk: int,
         *,
         lengths: torch.Tensor,
-        persistent_workspace: torch.Tensor | None,
         enable_pdl: bool,
     ) -> torch.Tensor:
         # GFX950 selection uses per-CTA scratch and has no PDL dependency wait.
-        del persistent_workspace, enable_pdl
+        del enable_pdl
         return launch_gluon_qsa_block_topk_select_gfx950(logits, topk, lengths=lengths)
 
     __all__ = [

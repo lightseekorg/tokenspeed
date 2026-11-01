@@ -7,12 +7,13 @@ from lib.gemm.rocm.intrinsics import (
     amdgcn_cvt_pk_bf16_f32,
     amdgcn_pk_add_f32,
     amdgcn_readfirstlane,
+    lds_load,
 )
 from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
 from lib.moe.rocm.ops.op_stages import TwoStageStage2Epilogue
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.tensor_ops import load_words, store_vector4
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
 
 
 class Context(NamedTuple):
@@ -51,7 +52,7 @@ class MegaMoETwoStage2Epilogue(TwoStageStage2Epilogue):
 
     @device_method
     def WriteBack(self, context, shm, tile_col, wid, wtid):
-        output = shm.to(l.pointer_type(l.uint32, 3))
+        output = shm.to(l.pointer_type(l.uint32))
         row_bytes: l.constexpr = self.Config.kHiddenSize * 2
         for row_group in l.static_range(self.kTileRows // self.kNumWarps):
             row = wid + row_group * self.kNumWarps
@@ -78,7 +79,7 @@ class MegaMoETwoStage2Epilogue(TwoStageStage2Epilogue):
             )
             for col_half in l.static_range(2):
                 pair_col = col_half * 64 + wtid
-                value = l.load(output + row * (self.kTileCols // 2) + pair_col)
+                value = lds_load(output + row * (self.kTileCols // 2) + pair_col)
                 col = tile_col + pair_col * 2
                 BufferResource.StoreU32(
                     output_row, col * 2, 0, value, BufferResource.kNTBit

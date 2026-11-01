@@ -22,12 +22,19 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.conv import (
+    torch_block_grouped_conv,
+    torch_short_conv,
+)
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
     dflash2_grouped_conv,
+    inkling_commit_tables,
+    inkling_ring_commit,
     inkling_ring_sconv,
     seq_idx_from_cu_seqlens,
 )
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="sconv tests require a CUDA GPU."
@@ -46,10 +53,7 @@ def ref_sconv(
     prefix: torch.Tensor,
     use_residual: bool = True,
 ) -> torch.Tensor:
-    """Torch reference: causal FIR over [prefix ++ x] with optional residual."""
-    xp = torch.cat([prefix, x]).float()
-    y = sum(xp[w : w + len(x)] * weight[:, w].float() for w in range(weight.shape[1]))
-    return (y + x.float() if use_residual else y).to(x.dtype)
+    return torch_short_conv(x, weight, prefix, use_residual)
 
 
 def seed_ring_prefix(ring, slot, pre_len, prefix):
@@ -832,6 +836,102 @@ def test_decode_publish_window_and_split(device: str) -> None:
     torch.testing.assert_close(ckpt_b[6], window1[:, wa:], atol=0, rtol=0)
 
 
+def ref_ring_commit(ring, streams, live_pages, cache_indices, seq_lens, accepted, k):
+    """Per-stream torch publication of each request's accepted window."""
+    bs = accepted.shape[0]
+    frontier = seq_lens.long() - k + accepted.long().clamp(1, k)
+    slots = cache_indices.long()
+    for layer, offset, group, fields in streams:
+        pages = live_pages[group, :bs].long()
+        dim = sum(field.shape[-1] for field in fields)
+        state = ring[layer][:, :, offset : offset + dim]
+        rows = fields[0].shape[1]
+        pos = frontier.view(bs, 1) - rows + torch.arange(rows, device=ring.device)
+        window = state[slots.clamp_min(0).view(bs, 1), pos.remainder(state.shape[1])]
+        window = torch.where((pos >= 0).unsqueeze(-1), window, torch.zeros_like(window))
+        parts = window.split([field.shape[-1] for field in fields], dim=-1)
+        for field, values in zip(fields, parts):
+            for b in range(bs):
+                if slots[b] >= 0 and pages[b] > 0:
+                    field[pages[b]] = values[b].to(field.dtype)
+
+
+def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> None:
+    """One commit writes the accepted window of every layer's streams: fields
+    split a stream's channels, a second field dtype takes its own table, ring
+    rows wrap, positions before 0 are zeros, and padded rows and hole live
+    blocks write nothing."""
+    from tokenspeed_kernel.ops.conv.triton import _inkling_ring_commit_kernel
+
+    torch.manual_seed(9)
+    layers, k, pages = 3, 4, 10
+    ring = torch.randn(layers, 6, R, 24, device=device, dtype=DTYPE)
+    # Page-strided per-layer views, as the cache arena lays fields out.
+    k_planes = torch.full((pages, layers, W - 1, 5), 7.0, device=device, dtype=DTYPE)
+    v_planes = torch.full((pages, layers, W - 1, 3), 7.0, device=device, dtype=DTYPE)
+    hidden = torch.full((pages, layers, W - 1, 16), 7.0, device=device).to(
+        torch.float8_e5m2
+    )
+    expected = [t.clone() for t in (k_planes, v_planes, hidden)]
+
+    def streams(k_planes, v_planes, hidden):
+        return [
+            entry
+            for layer in range(layers)
+            for entry in (
+                (layer, 0, 0, (k_planes[:, layer], v_planes[:, layer])),
+                (layer, 8, 1, (hidden[:, layer],)),
+            )
+        ]
+
+    cache_indices = torch.tensor(
+        [1, PAD_SLOT_ID, 3, 4, 5], device=device, dtype=torch.int32
+    )
+    seq_lens = torch.tensor([130, 50, 6, 2, 263], device=device, dtype=torch.int32)
+    accepted = torch.tensor([2, 4, 0, 4, 9], device=device, dtype=torch.int32)
+    live_pages = torch.tensor(
+        [[7, 3, 0, 2, 9], [6, 8, 5, 0, 4]], device=device, dtype=torch.int32
+    )
+
+    tables = inkling_commit_tables(ring, streams(k_planes, v_planes, hidden))
+    assert [table.dtype for table in tables] == [DTYPE, torch.float8_e5m2]
+    inkling_ring_commit(
+        ring, tables, live_pages, cache_indices, seq_lens, accepted, verify_width=k
+    )
+    ref_ring_commit(
+        ring, streams(*expected), live_pages, cache_indices, seq_lens, accepted, k
+    )
+    assert torch.equal(k_planes, expected[0])
+    assert torch.equal(v_planes, expected[1])
+    assert torch.equal(hidden.view(torch.uint8), expected[2].view(torch.uint8))
+    # Every written page changed; the others kept the sentinel.
+    assert not torch.equal(k_planes[7], torch.full_like(k_planes[7], 7.0))
+    assert torch.equal(k_planes[3], torch.full_like(k_planes[3], 7.0))
+    # The kernel indexes request vectors by row, so a strided one is refused.
+    with pytest.raises(ValueError, match="contiguous"):
+        inkling_ring_commit(
+            ring,
+            tables,
+            live_pages,
+            cache_indices,
+            seq_lens,
+            accepted.repeat_interleave(2)[::2],
+            verify_width=k,
+        )
+
+    with assert_no_triton_compile(_inkling_ring_commit_kernel):
+        for bs in (1, 2, 16):
+            inkling_ring_commit(
+                ring,
+                tables,
+                torch.zeros(2, bs, device=device, dtype=torch.int32),
+                torch.zeros(bs, device=device, dtype=torch.int32),
+                torch.full((bs,), 40, device=device, dtype=torch.int32),
+                torch.ones(bs, device=device, dtype=torch.int32),
+                verify_width=k,
+            )
+
+
 def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
     """Cross-kernel consistency: a short warm extend served by the prefill
     kernel (checkpoint taps) must produce the same output as the decode
@@ -892,20 +992,6 @@ def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
     torch.testing.assert_close(y_prefill, y_decode, atol=0, rtol=0)
 
 
-def ref_grouped_conv(x, delta, base, block_size, group_size):
-    """Torch reference: block-local grouped conv with per-row coefficients."""
-    taps, num_groups = base.shape[0], delta.shape[2]
-    blocks = x.float().unflatten(-1, (num_groups, group_size))
-    coefficients = base.float().view(
-        1, taps, num_groups, group_size
-    ) + delta.float().unsqueeze(-1)
-    y = torch.zeros_like(blocks)
-    for row in range(x.shape[0]):
-        for tap in range(min(row % block_size + 1, taps)):
-            y[row] += coefficients[row, tap] * blocks[row - tap]
-    return y.flatten(-2).to(x.dtype)
-
-
 @pytest.mark.parametrize("block_size,taps", [(8, 2), (6, 3), (8, 1)])
 def test_dflash2_grouped_conv_matches_reference(
     block_size: int, taps: int, device: str
@@ -922,7 +1008,7 @@ def test_dflash2_grouped_conv_matches_reference(
         y = dflash2_grouped_conv(
             x, projection[:, side], base[side], block_size, group_size
         )
-        expected = ref_grouped_conv(
+        expected = torch_block_grouped_conv(
             x, projection[:, side], base[side], block_size, group_size
         )
         torch.testing.assert_close(y, expected, atol=ATOL, rtol=RTOL)

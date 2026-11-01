@@ -109,7 +109,7 @@ from tokenspeed_kernel.plugins import discover_plugins
 discover_plugins()
 ```
 
-For ad-hoc use (notebooks, scripts, tests), you don't need entry
+For ad hoc use (notebooks, scripts, tests), you don't need entry
 points at all — call `register_kernel(...)` directly:
 
 ```python
@@ -171,7 +171,7 @@ for info in list_plugins():
   a value strictly higher than the built-in they replace.
 - `discover_plugins()` walks entry points in alphabetical order by
   entry-point name. When two registrations land at the same priority for
-  the same `(family, mode)`, discovery emits the warning and selection becomes
+  the same `(family, mode)`, discovery emits a warning and selection becomes
   load-order-dependent — set explicit, distinct priorities to avoid this.
 - A plugin whose `register()` raises does not crash discovery; discovery
   emits a `UserWarning` and other plugins continue loading.

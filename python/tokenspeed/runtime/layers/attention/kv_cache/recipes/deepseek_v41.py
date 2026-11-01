@@ -60,6 +60,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     apply_pd_transfer_policies,
 )
 
+# A multiple of every FlatKV group's span (128 and 64 tokens): one prefix page
+# holds whole pages of all four groups.
+_V41_PREFIX_GRANULARITY = 256
+
 
 class DeepseekV41Recipe(CacheRecipe):
     """Target Flash FlatKV for decode/verify, plus checkpoint-local DSpark windows.
@@ -79,6 +83,11 @@ class DeepseekV41Recipe(CacheRecipe):
 
     @property
     @override
+    def prefix_granularity(self) -> int:
+        return _V41_PREFIX_GRANULARITY
+
+    @property
+    @override
     def layer_types(self) -> tuple[str, ...]:
         return ("sliding_attention",) * self.num_target_layers
 
@@ -90,7 +99,7 @@ class DeepseekV41Recipe(CacheRecipe):
     def dspark_stages(self) -> int:
         """Number of same-checkpoint DSpark draft stages, 0 without DSpark."""
         if (
-            getattr(self.server_args, "speculative_algorithm", None) != "DSPARK"
+            self.server_args.speculative_algorithm != "DSPARK"
             or self.draft_model_config is None
             or self.draft_attn_config is not None
         ):
@@ -147,10 +156,18 @@ class DeepseekV41Recipe(CacheRecipe):
         fields: dict[str, list[CacheFieldSpec]] = {
             gid: [] for gid in V41_GROUP_GEOMETRY
         }
+        rows = self._row_layout()
 
         def add(
             gid: str, layer: int, name: str, shape: tuple[int, ...], dtype: str
         ) -> None:
+            # Native sparse scoring reads FP4 index pages in place and requires
+            # a 512-byte page stride, including when DSpark shares the arena.
+            stride_alignment = 256
+            if name == "swa" or (
+                name == "index_k" and rows.index_kernel_format == "index"
+            ):
+                stride_alignment = 512
             fields[gid].append(
                 CacheFieldSpec(
                     field_id=f"layer.{layer}.{name}",
@@ -158,11 +175,10 @@ class DeepseekV41Recipe(CacheRecipe):
                     shape=shape,
                     dtype=dtype,
                     exact_page_stride=False,
-                    page_stride_alignment_bytes=512 if name == "swa" else 256,
+                    page_stride_alignment_bytes=stride_alignment,
                 )
             )
 
-        rows = self._row_layout()
         for layer in range(self.num_target_layers):
             add(V41_SWA_GROUP_ID, layer, "swa", (64, rows.swa_row_bytes), "uint8")
         # The draft reads each stage's window with the target's SWA slots, so
@@ -214,6 +230,7 @@ class DeepseekV41Recipe(CacheRecipe):
         specs = [
             CacheGroupSpec(
                 group_id=gid,
+                shard_count=self.attn_config.kvp_size if windows[gid] is None else 1,
                 attn_kind=(
                     "full_history" if windows[gid] is None else "sliding_window"
                 ),
@@ -255,11 +272,8 @@ class DeepseekV41Recipe(CacheRecipe):
             )
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
-        )
-        return self.parents_needed(layout, self.token_capacity(layout, budgeted))
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
+        return self.parents_needed(layout, self.token_capacity(layout, max_lcm_blocks))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
@@ -269,7 +283,10 @@ class DeepseekV41Recipe(CacheRecipe):
             upper_bound=(
                 self.token_limit
                 if self.token_limit is not None
-                else num_lcm_blocks * self._group_packing()[V41_GLOBAL_R1_GROUP_ID] * 64
+                else num_lcm_blocks
+                * self._group_packing()[V41_GLOBAL_R1_GROUP_ID]
+                * 64
+                * self.attn_config.kvp_size
             ),
         )
 
@@ -329,8 +346,17 @@ class DeepseekV41Recipe(CacheRecipe):
         )
         # Ratio-2 pooling returns T FP32 rows, including inactive (-1) positions.
         compressor_output = queries * V41_HEAD_DIM * 4
+        # One request at a time: send/receive/ordered packed history plus
+        # owner/order/slot scratch. Keep this outside the persistent cache budget.
+        kvp_history = 0
+        if self.attn_config.kvp_size > 1:
+            history_rows = ((self.attn_config.context_len + 63) // 64 + 1) * 64
+            kvp_history = history_rows * (
+                4 * max(rows.global_row_bytes, rows.index_row_bytes) + 64
+            )
         return (
-            metadata
+            kvp_history
+            + metadata
             + selections
             + compressor_output
             + native_attention

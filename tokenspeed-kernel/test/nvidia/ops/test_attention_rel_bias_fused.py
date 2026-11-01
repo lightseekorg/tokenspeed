@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from rel_mha_reference import (
+from rel_mha_helpers import (
     DTYPE,
     HEAD_DIM,
     NUM_KV_HEADS,
@@ -39,9 +39,9 @@ from rel_mha_reference import (
     PAGE,
     build_paged,
     cu_seqlens,
-    ref_rel_attn,
     require_fa4,
 )
+from tokenspeed_kernel.numerics.torch.attention.rmha import torch_rel_attention
 from tokenspeed_kernel.ops.attention.rmha import cuda as fa_mod
 from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_decode_with_kvcache,
@@ -104,7 +104,7 @@ def test_rel_mha_prefill_fused_matches_reference_and_scoremod(
 
     off = 0
     for length in seq_lens:
-        ref = ref_rel_attn(
+        ref = torch_rel_attention(
             q[off : off + length],
             k[off : off + length],
             v[off : off + length],
@@ -112,7 +112,7 @@ def test_rel_mha_prefill_fused_matches_reference_and_scoremod(
             rel_extent,
             window_left,
             scale,
-        )
+        )[0].to(DTYPE)
         torch.testing.assert_close(
             out_fused[off : off + length], ref, atol=TOL, rtol=TOL
         )
@@ -164,7 +164,7 @@ def test_rel_mha_decode_fused_matches_reference_and_scoremod(
     torch.testing.assert_close(out_fused, out_scoremod, atol=TOL, rtol=TOL)
 
     for i in range(batch):
-        ref = ref_rel_attn(
+        ref = torch_rel_attention(
             q[i : i + 1],
             ks[i],
             vs[i],
@@ -172,7 +172,7 @@ def test_rel_mha_decode_fused_matches_reference_and_scoremod(
             rel_extent,
             window_left,
             scale,
-        )
+        )[0].to(DTYPE)
         torch.testing.assert_close(out_fused[i : i + 1], ref, atol=TOL, rtol=TOL)
 
 

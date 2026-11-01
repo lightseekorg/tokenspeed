@@ -138,8 +138,10 @@ def _qsa(rows, solution):
             block_topk=512,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            algorithm=solution,
-            persistent_topk_workspace=None,
+            path=solution,
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             enable_pdl=pdl_enabled(),
         )
         slots = qwen4_exp_qsa_selected_slots(
@@ -164,6 +166,7 @@ def _qsa(rows, solution):
             v_scale=None,
             override=None,
             solution="cute_dsl",
+            sparse_metadata=None,
         )
 
     return forward

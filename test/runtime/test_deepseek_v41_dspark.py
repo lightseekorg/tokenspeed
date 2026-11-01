@@ -25,6 +25,7 @@ DEEPSEEK_V41_REFERENCE_DIR enables JSON-only local checkpoint coverage.
 
 import json
 import os
+import sys
 from pathlib import Path
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import (
@@ -77,6 +78,11 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
 
 @pytest.mark.parametrize(
     "capture_mode",
@@ -105,12 +111,31 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
-        def forward(self, hidden, pre_mix, positions, image_mask, ctx):
+        def forward(
+            self,
+            hidden,
+            pre_mix,
+            positions,
+            image_mask,
+            ctx,
+            *,
+            pending_post,
+            allow_ffn_reduce_fusion,
+            capture_input,
+        ):
             events.append(("layer", self.layer_id))
+            assert allow_ffn_reduce_fusion == (
+                self.layer_id not in (19, 20) and self.layer_id < 36
+            )
             rows = v41._row_plan(self.layer_id, 20, ctx)
             assert rows.keep_rows is None and rows.source is rows.query
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
-            return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
+            return (
+                embeddings[:, None, :] + streams + 10 * self.layer_id,
+                pre_mix,
+                SimpleNamespace(finish=lambda residual: residual),
+                hidden.mean(dim=1) if capture_input else None,
+            )
 
     target = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(target)
@@ -127,7 +152,6 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
-    target.model.engram_hash = Mock(return_value=torch.tensor([[0, 1, 2], [0, 1, 2]]))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
     assert target.model.dspark_capture_layers == (37, 38, 39)
@@ -308,6 +332,71 @@ def _window_backend(positions, cache, history, block, rows_per_page):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_window_workspace_preserves_deferred_norm():
+    device = "cuda"
+    torch.manual_seed(418)
+    config = _config()
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.max_position_embeddings = 512
+    positions = torch.tensor([4, 5, 6, 7], device=device)
+    history = torch.tensor([[64, 65, -1, -1]], device=device)
+    cache = torch.randn(3, 64, 512, dtype=torch.bfloat16, device=device)
+    backend = _window_backend(positions, cache, history, 4, 64)
+    norm = v41.RMSNorm(512, eps=config.rms_norm_eps).to(
+        device=device, dtype=torch.bfloat16
+    )
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+    rotary = v41.DeepseekV41RotaryEmbedding(config, 0)
+    rotary._prepare_cache(torch.device(device))
+    rope_cache = rotary.cos_sin_cache
+    swa = torch.randn(4, 512, dtype=torch.bfloat16, device=device)
+    original = swa.clone()
+    expected = backend._workspace(
+        v41._norm(swa, norm),
+        positions,
+        rope_cache,
+        None,
+        norm.variance_epsilon,
+    )
+    actual = backend._workspace(
+        swa,
+        positions,
+        rope_cache,
+        norm.weight,
+        norm.variance_epsilon,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(swa, original, rtol=0, atol=0)
+
+
+def test_window_workspace_refuses_deferred_norm_off_the_fused_path():
+    # The model defers the SWA norm only to the fused 512-wide CUDA rows; any
+    # other path must not drop it.
+    history = torch.tensor([[-1, -1]])
+    backend = _WindowAttention(
+        torch.tensor([0, 1]),
+        torch.zeros(1, 64, 64, dtype=torch.bfloat16),
+        history,
+        2,
+        _WindowSelection(
+            torch.zeros_like(history),
+            torch.zeros_like(history),
+            torch.full((2, 4), -1, dtype=torch.int32),
+        ),
+        torch.zeros(2, dtype=torch.int64),
+    )
+    with pytest.raises(ValueError, match="requires 512-wide CUDA rows"):
+        backend._workspace(
+            torch.randn(2, 64, dtype=torch.bfloat16),
+            torch.tensor([0, 1]),
+            None,
+            torch.ones(64, dtype=torch.bfloat16),
+            1e-6,
+        )
+
+
 def test_window_attention_matches_dense_reference():
     torch.manual_seed(41)
     batch, block, heads, dim, window, rows = 2, 5, 2, 64, 8, 4
@@ -332,6 +421,8 @@ def test_window_attention_matches_dense_reference():
         softmax_scale=dim**-0.5,
         index_process_group=None,
         swa_rope_cache=None,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -407,13 +498,40 @@ def test_window_attention_kernel_matches_reference():
         softmax_scale=dim**-0.5,
         index_process_group=None,
         swa_rope_cache=rotary.cos_sin_cache,
+        swa_norm_weight=None,
+        swa_norm_eps=config.rms_norm_eps,
     )
     actual = backend.forward_v41(q, swa, **kwargs)
-    kv = backend._workspace(swa, positions, rotary.cos_sin_cache)
+    kv = backend._workspace(
+        swa, positions, rotary.cos_sin_cache, None, config.rms_norm_eps
+    )
+    current = dsv41.dspark_rows(
+        swa,
+        None,
+        None,
+        positions,
+        rotary.cos_sin_cache,
+        None,
+        None,
+        torch.empty_like(swa),
+    )
+    separate = torch.cat(
+        (
+            field[backend.selection.page, backend.selection.row],
+            current.reshape(batch, block, dim),
+        ),
+        dim=1,
+    )
+    torch.testing.assert_close(kv, separate, rtol=0, atol=0)
     expected = backend._reference_forward(q, kv, sink, dim**-0.5)
     # Both branches feed the kernel the very same quantized block rows.
     torch.testing.assert_close(
-        backend._workspace(swa, positions, rotary.cos_sin_cache), kv, rtol=0, atol=0
+        backend._workspace(
+            swa, positions, rotary.cos_sin_cache, None, config.rms_norm_eps
+        ),
+        kv,
+        rtol=0,
+        atol=0,
     )
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(
@@ -574,7 +692,10 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         spec_num_tokens=width,
         spec_num_steps=block,
         draft_model_runner=SimpleNamespace(
-            model=adapter, mapping=adapter.mapping, device="cuda:0"
+            model=adapter,
+            mapping=adapter.mapping,
+            device="cuda:0",
+            server_args=ServerArgs(model="unused", disaggregation_mode="null"),
         ),
         attn_backend=None,
         token_to_kv_pool=None,
@@ -646,6 +767,11 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
     # The requests differ, so identical drafts would mean the rows collapsed.
     assert not torch.equal(forward[0], forward[1])
     assert not torch.equal(forward[1], forward[2])
+    # A target head whose local vocabulary diverges from the Markov
+    # projection's must fail instead of drafting with wrong shard offsets.
+    drafter.lm_head = SimpleNamespace(weight=adapter.lm_head.weight[:-1])
+    with pytest.raises(ValueError, match="local vocabulary"):
+        run([0, 1, 2])
 
 
 def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
@@ -658,7 +784,10 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
         spec_num_tokens=width,
         spec_num_steps=block,
         draft_model_runner=SimpleNamespace(
-            model=adapter, mapping=adapter.mapping, device="cuda:0"
+            model=adapter,
+            mapping=adapter.mapping,
+            device="cuda:0",
+            server_args=ServerArgs(model="unused", disaggregation_mode="null"),
         ),
         attn_backend=None,
         token_to_kv_pool=None,
@@ -811,9 +940,9 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         _speculative_widths_explicit=False,
         attention_backend=None,
         drafter_attention_backend=None,
-        prefix_granularity=64,
         load_format="auto",
         disaggregation_mode="null",
+        validate_tp_batch_invariant_weights=Mock(),
     )
     configs = [
         ModelConfig(
@@ -951,3 +1080,73 @@ class TestDSparkBaseLogits:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(logits, hidden.float() @ head.float().T)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("mode", ["prefill", "decode", "null"])
+def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
+    from test.runtime.test_deepseek_v41_model import _mock_loader_hardware
+
+    from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_runner import ModelRunner
+
+    mapping = Mapping(
+        rank=rank,
+        world_size=2,
+        attn_tp_size=1,
+        attn_dp_size=2,
+        dense_tp_size=1,
+        dense_dp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+        moe_dp_size=1,
+        vision_tp_size=1,
+        vision_dp_size=1,
+        linear_attn_tp_size=1,
+        nprocs_per_node=2,
+        nnodes=1,
+    )
+    _mock_loader_hardware(monkeypatch, mapping)
+    monkeypatch.delitem(global_server_args_dict, "disaggregation_mode", raising=False)
+    adapter = DeepseekV41ForCausalLMDSpark(
+        DeepseekV41Config(text_config=vars(_draft_config())), mapping, _quant()
+    )
+    adapter.load_weights(_draft_checkpoint(adapter.model).items())
+    # The runner's GPU initialization is outside this CPU checkpoint test.
+    runner = Mock(spec=ModelRunner)
+    runner.model, runner.mapping, runner.device = adapter, mapping, "cpu"
+    runner.server_args = ServerArgs(model="unused", disaggregation_mode=mode)
+    kwargs = dict(
+        spec_num_tokens=6,
+        spec_num_steps=5,
+        draft_model_runner=runner,
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=None,
+        input_buffers=InputBuffers(3, 1024, 8, device="cpu"),
+        vocab_size=adapter.model.config.vocab_size,
+    )
+    drafter = DeepseekV41DSpark(**kwargs)
+    # Idle and active ranks must perform the same number of block forwards.
+    assert drafter.idle_forward_global_num_tokens(
+        [0, 18], [0, 3], global_num_decodes=[0, 3]
+    ) == [[0, 15]]
+    assert drafter.idle_forward_global_num_tokens(
+        [128, 18], [1, 3], global_num_decodes=[0, 3]
+    ) == [[0, 15]]
+    assert drafter.idle_forward_global_num_tokens(
+        [140, 18], [3, 3], global_num_decodes=[2, 3]
+    ) == [[10, 15]]
+    assert (
+        drafter.idle_forward_global_num_tokens(
+            [128, 128], [1, 1], global_num_decodes=[0, 0]
+        )
+        == []
+    )
+    assert (
+        adapter.lm_head.weight.shape[0]
+        == adapter.model.markov_projection.weight.shape[0]
+    )
+    assert adapter.checkpoint_load_report["loaded"] > 0

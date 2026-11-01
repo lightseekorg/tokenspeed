@@ -41,7 +41,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
-from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
 from tokenspeed_kernel.ops.communication.deep_ep import DeepEPBuffer
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
@@ -104,7 +104,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
 
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -155,6 +155,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "marlin_mxfp4_deepep_moe_apply"
     kernel_moe_process_weights(plan, module)

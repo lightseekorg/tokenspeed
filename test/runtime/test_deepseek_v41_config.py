@@ -181,7 +181,6 @@ def runtime_config(config_dir):
         revision=None,
         max_model_len=512,
         attention_backend=None,
-        prefix_granularity=64,
         load_format="auto",
         speculative_algorithm=None,
         world_size=1,
@@ -363,7 +362,6 @@ def test_model_config_uses_nested_mla_dims_without_yarn_scale(runtime_config):
     assert model.is_multimodal and model.is_multimodal_active
     assert model.attention_arch is AttentionArch.MLA
     assert args.attention_backend == "deepseek_v41"
-    assert args.prefix_granularity == 256
     assert model.num_hidden_layers == model.num_attention_layers == 40
     assert len(model.hf_text_config.compress_ratios) == 43
     assert model.hidden_size == 5120
@@ -421,6 +419,7 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         decode_input_tokens=1,
         overlap_schedule_depth=overlap_depth,
     )
+    assert recipe.prefix_granularity == 256
     groups = recipe.groups()
     layout = pack(
         groups,

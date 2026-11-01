@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.kpool import (
 )
 
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.host_sync import host_to_device
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -160,8 +161,8 @@ def build_kpool_write_plan(
             tail_write_counts.append(tail_count)
 
     device = index_block_table.device
-    pool_req_ids_tensor = torch.tensor(pool_req_ids, dtype=torch.int32, device=device)
-    pool_ids_tensor = torch.tensor(pool_ids, dtype=torch.int64, device=device)
+    pool_req_ids_tensor = host_to_device(pool_req_ids, dtype=torch.int32, device=device)
+    pool_ids_tensor = host_to_device(pool_ids, dtype=torch.int64, device=device)
     if pool_ids_tensor.numel() > 0:
         table_columns = torch.div(
             pool_ids_tensor,
@@ -178,20 +179,20 @@ def build_kpool_write_plan(
         pool_write_slots = torch.empty(0, dtype=torch.int64, device=device)
     return KPoolWritePlan(
         pool_req_ids=pool_req_ids_tensor,
-        pool_n_from_tail=torch.tensor(
+        pool_n_from_tail=host_to_device(
             pool_n_from_tail, dtype=torch.int32, device=device
         ),
-        pool_chunk_src=torch.tensor(pool_chunk_src, dtype=torch.int64, device=device),
-        pool_tail_logical_base=torch.tensor(
+        pool_chunk_src=host_to_device(pool_chunk_src, dtype=torch.int64, device=device),
+        pool_tail_logical_base=host_to_device(
             pool_tail_logical_base, dtype=torch.int64, device=device
         ),
         pool_write_slots=pool_write_slots,
-        tail_req_ids=torch.tensor(tail_req_ids, dtype=torch.int32, device=device),
-        tail_chunk_src=torch.tensor(tail_chunk_src, dtype=torch.int64, device=device),
-        tail_dst_positions=torch.tensor(
+        tail_req_ids=host_to_device(tail_req_ids, dtype=torch.int32, device=device),
+        tail_chunk_src=host_to_device(tail_chunk_src, dtype=torch.int64, device=device),
+        tail_dst_positions=host_to_device(
             tail_dst_positions, dtype=torch.int64, device=device
         ),
-        tail_write_counts=torch.tensor(
+        tail_write_counts=host_to_device(
             tail_write_counts, dtype=torch.int32, device=device
         ),
         request_slots=request_slots.to(device=device, dtype=torch.int64),
@@ -284,10 +285,10 @@ def build_kpool_prefill_plan(
         row_ends.extend([0] * num_padding_tokens)
 
     device = index_block_table.device
-    workspace_req_ids_tensor = torch.tensor(
+    workspace_req_ids_tensor = host_to_device(
         workspace_req_ids, dtype=torch.int64, device=device
     )
-    workspace_pool_ids_tensor = torch.tensor(
+    workspace_pool_ids_tensor = host_to_device(
         workspace_pool_ids, dtype=torch.int64, device=device
     )
     if workspace_pool_ids_tensor.numel() > 0:
@@ -317,13 +318,15 @@ def build_kpool_prefill_plan(
     return KPoolPrefillPlan(
         write=write,
         num_prefill_tokens=num_prefill_tokens,
-        positions=torch.tensor(positions, dtype=torch.int32, device=device),
-        query_start_loc=query_start_loc_cpu.to(device=device, dtype=torch.int32),
-        req_ids=torch.tensor(req_ids, dtype=torch.int32, device=device),
-        causal_lens=torch.tensor(causal_lens, dtype=torch.int32, device=device),
+        positions=host_to_device(positions, dtype=torch.int32, device=device),
+        query_start_loc=host_to_device(
+            query_start_loc_cpu, dtype=torch.int32, device=device
+        ),
+        req_ids=host_to_device(req_ids, dtype=torch.int32, device=device),
+        causal_lens=host_to_device(causal_lens, dtype=torch.int32, device=device),
         pool_workspace_slots=pool_workspace_slots.contiguous(),
-        row_starts=torch.tensor(row_starts, dtype=torch.int32, device=device),
-        row_ends=torch.tensor(row_ends, dtype=torch.int32, device=device),
+        row_starts=host_to_device(row_starts, dtype=torch.int32, device=device),
+        row_ends=host_to_device(row_ends, dtype=torch.int32, device=device),
         max_num_pools=max_num_pools,
     )
 

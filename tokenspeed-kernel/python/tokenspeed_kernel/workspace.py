@@ -50,8 +50,8 @@ from weakref import WeakKeyDictionary
 import torch
 
 _eager_buffers: dict[tuple[int, int, torch.dtype, int], torch.Tensor] = {}
-# Arenas captured graphs use, kept alive by their owners.
-_owned_arenas: WeakKeyDictionary[object, list[torch.Tensor]] = WeakKeyDictionary()
+# Allocations and prepared plans captured graphs use, kept alive by their owners.
+_owned_resources: WeakKeyDictionary[object, dict[int, object]] = WeakKeyDictionary()
 
 # Slices start on this many bytes.
 _ALIGN = 256
@@ -86,10 +86,23 @@ class _Sessions(threading.local):
     def __init__(self) -> None:
         # The arena of each open session, innermost last.
         self.arenas: list[_Arena] = []
+        self.owners: list[object] = []
         self.peak_bytes = 0
 
 
 _sessions = _Sessions()
+
+
+def retain_for_capture(resource: object) -> None:
+    """Keep a prepared kernel resource alive until its graph owner is released.
+
+    Args:
+        resource: Plan or allocation used by captured launches. Call inside
+            ``capture_session(owner)``; the resource must not retain the owner.
+    """
+    if not _sessions.owners:
+        raise RuntimeError("capture kernel plans inside capture_session(owner)")
+    _owned_resources.setdefault(_sessions.owners[-1], {})[id(resource)] = resource
 
 
 def zeroed_state(
@@ -131,7 +144,7 @@ def zeroed_state(
 
 @contextlib.contextmanager
 def capture_session(owner: object) -> Iterator[None]:
-    """Give the launches captured in this scope pre-zeroed state.
+    """Supply zeroed state and own prepared plans for captured launches.
 
     Enter it before the capture starts: it allocates and zeroes the arena the
     captured launches carve their :func:`zeroed_state` from, on the current
@@ -148,10 +161,12 @@ def capture_session(owner: object) -> Iterator[None]:
     num_bytes = max(_MIN_ARENA_BYTES, 2 * _sessions.peak_bytes)
     arena = _Arena(num_bytes, torch.device("cuda", torch.cuda.current_device()))
     _sessions.arenas.append(arena)
+    _sessions.owners.append(owner)
     try:
         yield
     finally:
         _sessions.arenas.pop()
+        _sessions.owners.pop()
     _sessions.peak_bytes = max(_sessions.peak_bytes, arena.wanted)
     if arena.wanted > num_bytes:
         warnings.warn(
@@ -160,7 +175,7 @@ def capture_session(owner: object) -> Iterator[None]:
             stacklevel=3,
         )
     if arena.used:
-        _owned_arenas.setdefault(owner, []).append(arena.storage)
+        _owned_resources.setdefault(owner, {})[id(arena.storage)] = arena.storage
 
 
-__all__ = ["capture_session", "zeroed_state"]
+__all__ = ["capture_session", "retain_for_capture", "zeroed_state"]

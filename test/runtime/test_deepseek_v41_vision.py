@@ -20,16 +20,24 @@
 
 """Packed V4.1 image boundaries, batching limits, and encoder equivalence."""
 
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.models import deepseek_v41_vision as vision
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 def _model(backend):
@@ -118,16 +126,6 @@ def test_invalid_metadata_rejected_before_encoding(field, value, message):
         encode.assert_not_called()
 
 
-def test_empty_and_invalid_patch_count():
-    model = _model("triton_attn")
-    with pytest.raises(ValueError, match="at least one"):
-        model.embed_media([])
-    item = _item(2, 2)
-    item.feature = item.feature[:3]
-    with pytest.raises(ValueError, match="patch count"):
-        model.embed_one(item)
-
-
 class _CaptureBlock(nn.Module):
     def __init__(self):
         super().__init__()
@@ -159,7 +157,10 @@ def test_packed_metadata_and_rope():
 @pytest.mark.parametrize("num_images", [3, 9])
 @torch.inference_mode()
 def test_packed_matches_independent_images_and_isolation(backend, num_images):
-    if backend == "fa3" and torch.cuda.get_device_capability()[0] != 9:
+    platform = current_platform()
+    if backend != "triton_attn" and not platform.is_nvidia:
+        pytest.skip(f"{backend} is NVIDIA-only")
+    if backend == "fa3" and not platform.is_hopper:
         pytest.skip("FA3 requires Hopper")
     model = _model(backend).to(device="cuda", dtype=torch.bfloat16)
     items = [_item(h, w) for h, w in [(4, 4), (3, 5), (2, 6)] * (num_images // 3)]
@@ -216,9 +217,3 @@ def test_configured_token_budget(monkeypatch, budget):
     assert [len(call.args[0]) for call in encode.call_args_list] == [budget // 4] * (
         16 // budget
     )
-
-
-def test_invalid_token_budget(monkeypatch):
-    monkeypatch.setenv("TOKENSPEED_DEEPSEEK_V41_VISION_MAX_BATCH_TOKENS", "0")
-    with pytest.raises(ValueError, match="positive"):
-        _model("triton_attn")

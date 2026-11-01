@@ -82,6 +82,7 @@ def _stage2_mxfp4_direct_mfma_gluon(
     M_DUP: gl.constexpr,
     PIPELINE_K: gl.constexpr,
     DEFER_FINALIZE: gl.constexpr,
+    SLOT_PARALLEL: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -128,7 +129,82 @@ def _stage2_mxfp4_direct_mfma_gluon(
     TOTAL_KT: gl.constexpr = gl.cdiv(I_PACKED, BLOCK_K_PACKED)
     acc_total = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
-    if token < M:
+    if SLOT_PARALLEL and not DEFER_FINALIZE and token < M:
+        # Short-K decode is bound by the dependent load -> MFMA chain, not by
+        # bandwidth.  Issue every slot's K tile together into per-slot
+        # accumulators; the epilogue keeps the sequential slot order below.
+        owned_slots = ()
+        gates = ()
+        w_offs = ()
+        s_offs = ()
+        accs = ()
+        for slot in gl.static_range(TOPK):
+            expert = (
+                gl.load(topk_ids_ptr + token * stride_tit + slot * stride_tis)
+                - expert_start
+            )
+            owned = (expert >= 0) & (expert < num_local_experts)
+            expert = gl.where(owned, expert, 0)
+            owned_slots = owned_slots + (owned,)
+            gates = gates + (
+                gl.load(topk_weights_ptr + token * stride_twt + slot * stride_tws).to(
+                    gl.float32
+                ),
+            )
+            w_offs = w_offs + (expert.to(gl.int64) * stride_we,)
+            s_offs = s_offs + (expert.to(gl.int64) * stride_se,)
+            accs = accs + (
+                gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout),
+            )
+        for kt in gl.static_range(TOTAL_KT):
+            tiles = ()
+            for slot in gl.static_range(TOPK):
+                row = token * TOPK + slot
+                tiles = tiles + (
+                    _direct_mxfp4_load_tile(
+                        kt,
+                        ak,
+                        bk,
+                        ask,
+                        bsk,
+                        am,
+                        asm,
+                        inter_ptr,
+                        inter_scale_ptr,
+                        w2_ptr,
+                        w2s_ptr,
+                        row.to(gl.int64) * stride_im,
+                        w_offs[slot],
+                        s_offs[slot],
+                        n_cols,
+                        n_cols_s,
+                        row,
+                        stride_ik,
+                        stride_xslin,
+                        stride_xsnb,
+                        stride_slin,
+                        stride_snb,
+                        N_PHYS,
+                        I_DIM,
+                        D,
+                        I_PACKED,
+                        BLOCK_K_PACKED,
+                        BLOCK_K_SCALE,
+                    ),
+                )
+            updated = ()
+            for slot in gl.static_range(TOPK):
+                tile = tiles[slot]
+                updated = updated + (
+                    _direct_mxfp4_mfma(accs[slot], tile[0], tile[1], tile[2], tile[3]),
+                )
+            accs = updated
+        for slot in gl.static_range(TOPK):
+            partial = gl.where(owned_slots[slot], accs[slot], 0.0).to(
+                out_ptr.dtype.element_ty
+            )
+            acc_total += (partial * gates[slot].to(partial.dtype)).to(gl.float32)
+    elif token < M:
         for slot_offset in gl.static_range(0, ROUTES_PER_PROGRAM):
             slot = route_slot + slot_offset
             global_expert = gl.load(
@@ -322,6 +398,7 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
     BLOCK_K: int = 128,
     M_DUP: int = 4,
     PIPELINE_K: bool = True,
+    SLOT_PARALLEL: bool = False,
 ):
     assert inter_states_mxfp4.dtype == torch.uint8
     assert inter_scale.dtype == torch.uint8
@@ -388,6 +465,7 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         M_DUP=M_DUP,
         PIPELINE_K=PIPELINE_K,
         DEFER_FINALIZE=not do_finalize,
+        SLOT_PARALLEL=SLOT_PARALLEL,
         num_warps=1,
     )
     return out

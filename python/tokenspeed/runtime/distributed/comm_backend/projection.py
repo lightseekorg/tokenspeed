@@ -41,8 +41,11 @@ if TYPE_CHECKING:
 
 # Minimum physical subgroup maximum for automatic fusion, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
-_FUSED_TP_SIZES = (2, 4)
-_FUSED_MIN_ROWS = 64
+_FUSED_COL_TP_SIZES = (2, 4)
+_FUSED_COL_MIN_ROWS = 64
+# Smaller output projections retain the ordinary path.
+_FUSED_ROW_TP_SIZES = (2, 4)
+_FUSED_ROW_MIN_ROWS = 64
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +132,7 @@ class ProjectionWorkspace:
         self.a2a = None
         self.reduction = None
         self.fused_column = None
+        self.fused_row = None
 
     def close(self) -> None:
         """Collectively release native resources and owned scratch references.
@@ -146,6 +150,9 @@ class ProjectionWorkspace:
         if self.fused_column is not None:
             self.fused_column.close()
             self.fused_column = None
+        if self.fused_row is not None:
+            self.fused_row.close()
+            self.fused_row = None
         self.a2a = None
         if self.gather is not None:
             self.gather.close()
@@ -186,6 +193,30 @@ def _warmup_projection(workspace: ProjectionWorkspace) -> None:
     else:
         backend.projection_all_to_all(probe, 1, False, False, None, workspace)
         backend.projection_all_to_all(probe, 1, False, True, None, workspace)
+        if (
+            spec.dtype == torch.bfloat16
+            and spec.input_size % (128 * len(spec.group)) == 0
+        ):
+            # Warm empty-owner FP8 exchange, including the ordinary fallback
+            # used beyond native capacity. Both mask padding at capacity one.
+            empty = probe[:0].to(torch.float8_e4m3fn)
+            empty_scales = torch.ones(
+                (0, spec.input_size // 128), dtype=torch.float32, device=spec.device
+            )
+            backend.projection_all_to_all(
+                empty, 1, False, False, None, workspace, input_scales=empty_scales
+            )
+            if workspace.a2a is not None:
+                projection_all_to_all(
+                    empty,
+                    1,
+                    False,
+                    False,
+                    None,
+                    workspace,
+                    backend,
+                    input_scales=empty_scales,
+                )
         partial = backend.acquire_projection_output(1, workspace)
         partial.zero_()
         backend.projection_reduce_scatter(partial, 1, workspace)
@@ -246,10 +277,13 @@ def projection_all_to_all(
     out: torch.Tensor | None,
     workspace: ProjectionWorkspace,
     backend: "CommBackend",
-) -> tuple[torch.Tensor, None]:
+    *,
+    input_scales: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Exchange token/channel axes using backend's ordinary AllToAll.
 
-    Forward returns borrowed padded channel shards without fused quantization.
+    Forward returns borrowed padded channel shards, preserving prequantized
+    values and their per-128 scales when supplied. No quantization is repeated.
     Inverse restores complete owner rows into the caller-provided out tensor.
     """
     from tokenspeed_kernel.ops.communication.triton import (
@@ -262,25 +296,81 @@ def projection_all_to_all(
     size = len(spec.group)
     width = spec.output_size if inverse else spec.input_size
     shard = width // size
-    received = workspace.received[: rows * width].view(size * rows, shard)
-    if inverse:
-        sent = inputs.contiguous()
-    else:
-        scratch = workspace.send[: rows * width].view(size, rows, shard)
-        sent = triton_pack_channel_shards_for_a2a(inputs, scratch)
-    backend.all_to_all_single(
-        received,
-        sent,
-        spec.group,
-        output_split_sizes=None,
-        input_split_sizes=None,
-    )
-    if inverse:
-        out.view(rows, size, shard).copy_(
-            received.view(size, rows, shard).transpose(0, 1)
+    if input_scales is not None:
+        # FP8 row-input workload: exchange prequantized values and their scales.
+        if (
+            inverse
+            or quantize
+            or spec.kind != "row"
+            or spec.dtype != torch.bfloat16
+            or shard % 128
+            or inputs.dtype != torch.float8_e4m3fn
+            or input_scales.shape != (inputs.shape[0], width // 128)
+            or input_scales.dtype != torch.float32
+            or input_scales.device != inputs.device
+        ):
+            raise ValueError(
+                "Prequantized A2A requires FP8 row inputs and per-128 scales"
+            )
+        # FP8 values plus FP32 per-128 scales fit in the prepared BF16 storage.
+        # Keep both alive until GEMM consumes them, without growing the workspace.
+        count = rows * width
+        scale_bytes = count // 128 * 4
+        send_bytes = workspace.send.view(torch.uint8)
+        receive_bytes = workspace.received.view(torch.uint8)
+        # Pack raw bytes so padding never converts integers to FP8.
+        sent = triton_pack_channel_shards_for_a2a(
+            inputs.view(torch.uint8), send_bytes[:count].view(size, rows, shard)
         )
-        return out, None
-    return received, None
+        received = receive_bytes[:count].view(inputs.dtype).view(size * rows, shard)
+        backend.all_to_all_single(
+            received.view(torch.uint8),
+            sent.view(torch.uint8),
+            spec.group,
+            output_split_sizes=None,
+            input_split_sizes=None,
+        )
+        sent_scales = triton_pack_channel_shards_for_a2a(
+            input_scales,
+            send_bytes[count : count + scale_bytes]
+            .view(torch.float32)
+            .view(size, rows, shard // 128),
+        )
+        scales = (
+            receive_bytes[count : count + scale_bytes]
+            .view(torch.float32)
+            .view(size * rows, shard // 128)
+        )
+        backend.all_to_all_single(
+            scales,
+            sent_scales,
+            spec.group,
+            output_split_sizes=None,
+            input_split_sizes=None,
+        )
+    else:
+        # Unquantized workload: shard row-projection inputs before GEMM, or
+        # return column-projection outputs to their token owners after GEMM.
+        scales = None
+        received = workspace.received[: rows * width].view(size * rows, shard)
+        if inverse:
+            sent = inputs.contiguous()
+        else:
+            scratch = workspace.send[: rows * width].view(size, rows, shard)
+            sent = triton_pack_channel_shards_for_a2a(inputs, scratch)
+        backend.all_to_all_single(
+            received,
+            sent,
+            spec.group,
+            output_split_sizes=None,
+            input_split_sizes=None,
+        )
+        if inverse:
+            out.view(rows, size, shard).copy_(
+                received.view(size, rows, shard).transpose(0, 1)
+            )
+            received = out
+    return received, scales
 
 
 def acquire_projection_output(
@@ -332,23 +422,33 @@ class ProjectionBackend:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.
             from tokenspeed_kernel.ops.communication.cute_dsl import (
-                fused_tp_projection_supported,
+                fused_tp_column_projection_supported,
+                fused_tp_row_projection_supported,
             )
 
-            if spec.kind != "column":
-                fused_disabled_reason = "only column projections support fusion"
-            elif batch_invariant:
+            supported = (
+                fused_tp_row_projection_supported
+                if spec.kind == "row"
+                else fused_tp_column_projection_supported
+            )
+            fused_tp_sizes = (
+                _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_COL_TP_SIZES
+            )
+            min_fused_rows = (
+                _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
+            )
+            if batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
-            elif len(spec.group) not in _FUSED_TP_SIZES:
+            elif len(spec.group) not in fused_tp_sizes:
                 fused_disabled_reason = (
                     f"automatic TP{len(spec.group)} fusion is disabled"
                 )
-            elif spec.max_tokens < _FUSED_MIN_ROWS:
+            elif spec.max_tokens < min_fused_rows:
                 fused_disabled_reason = (
                     f"prepared capacity {spec.max_tokens} is below the "
-                    f"TP{len(spec.group)} minimum of {_FUSED_MIN_ROWS} rows"
+                    f"TP{len(spec.group)} minimum of {min_fused_rows} rows"
                 )
-            elif not fused_tp_projection_supported(
+            elif not supported(
                 len(spec.group),
                 spec.input_size,
                 spec.output_size,
@@ -379,24 +479,39 @@ class ProjectionBackend:
                 self._prepare_lamport(workspace, use_lamport_reduction)
                 if all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
-                        create_fused_tp_projection_state,
+                        create_fused_tp_column_projection_state,
                     )
 
-                    workspace.fused_column = create_fused_tp_projection_state(
-                        pg_manager.get_device_process_group(spec.group),
-                        spec.device,
-                        spec.max_tokens,
-                        spec.input_size,
-                        spec.output_size,
-                    )
+                    if spec.kind == "row":
+                        from tokenspeed_kernel.ops.communication.cute_dsl import (
+                            create_fused_tp_row_projection_state,
+                        )
+
+                        workspace.fused_row = create_fused_tp_row_projection_state(
+                            pg_manager.get_device_process_group(spec.group),
+                            spec.device,
+                            spec.max_tokens,
+                            spec.input_size,
+                            spec.output_size,
+                        )
+                    else:
+                        workspace.fused_column = (
+                            create_fused_tp_column_projection_state(
+                                pg_manager.get_device_process_group(spec.group),
+                                spec.device,
+                                spec.max_tokens,
+                                spec.input_size,
+                                spec.output_size,
+                            )
+                        )
                 elif fused_disabled_reason is None:
                     fused_disabled_reason = "one or more peers cannot prepare fusion"
             else:
                 fused_disabled_reason = "the projection group spans multiple nodes"
 
         if (
-            spec.kind == "column"
-            and workspace.fused_column is None
+            workspace.fused_column is None
+            and workspace.fused_row is None
             and dist.get_rank() == spec.group[0]
         ):
             logger.info(
@@ -420,11 +535,11 @@ class ProjectionBackend:
         # Use the subgroup maximum so unequal or empty owners take the same
         # collective path. TP2 and TP4 share one cutoff across all row buckets.
         rows = max(owner_rows)
-        if len(owner_rows) not in _FUSED_TP_SIZES:
+        if len(owner_rows) not in _FUSED_COL_TP_SIZES:
             return False
         if (
             workspace.fused_column is None
-            or rows < _FUSED_MIN_ROWS
+            or rows < _FUSED_COL_MIN_ROWS
             or weight_scales is None
             or weight.dtype != torch.float8_e4m3fn
             or weight_scales.dtype != torch.float32
@@ -444,6 +559,50 @@ class ProjectionBackend:
             weight_scales,
             owner_rows,
             out[: inputs.shape[0]],
+        )
+        return True
+
+    def try_fused_dp_row_linear(
+        self,
+        inputs: torch.Tensor,
+        input_scales: torch.Tensor | None,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        """Run fused DP row-linear, or leave out untouched and return False."""
+        # Use the subgroup maximum so unequal or empty owners take the same
+        # collective path. Smaller owners still pad to the common row bucket.
+        rows = max(owner_rows)
+        if len(owner_rows) not in _FUSED_ROW_TP_SIZES:
+            return False
+        if (
+            workspace.fused_row is None
+            or rows < _FUSED_ROW_MIN_ROWS
+            or weight_scales is None
+            or weight.dtype != torch.float8_e4m3fn
+            or weight_scales.dtype != torch.float32
+            or not weight.is_contiguous()
+            or not weight_scales.is_contiguous()
+        ):
+            return False
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_fused_fp8_dp_row_linear,
+        )
+
+        _check_workspace(rows, workspace, self._fallback)
+        cute_dsl_fused_fp8_dp_row_linear(
+            workspace.fused_row,
+            inputs.contiguous(),
+            weight,
+            weight_scales,
+            owner_rows,
+            out[: inputs.shape[0]],
+            input_scales=(
+                input_scales.contiguous() if input_scales is not None else None
+            ),
         )
         return True
 
@@ -525,29 +684,57 @@ class ProjectionBackend:
         quantize: bool,
         out: torch.Tensor | None,
         workspace: ProjectionWorkspace,
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if workspace.a2a is None or rows > workspace.a2a.max_rows:
             return projection_all_to_all(
-                inputs, rows, inverse, quantize, out, workspace, self._fallback
+                inputs,
+                rows,
+                inverse,
+                quantize,
+                out,
+                workspace,
+                self._fallback,
+                input_scales=input_scales,
             )
         from tokenspeed_kernel.ops.communication.cuda import (
             tokenspeed_a2a_lamport,
+            tokenspeed_a2a_lamport_fp8,
             tokenspeed_a2a_lamport_fp8_quantize,
         )
 
         _check_workspace(rows, workspace, self._fallback)
         _check_a2a_options(inverse, quantize, out)
-        sent = (
-            inputs.contiguous()
-            if inverse
-            else prepare_padded_rows(inputs, rows, workspace.send, alignment_bytes=16)
-        )
-        if quantize and workspace.a2a.fp8_output is not None:
-            return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
-        return (
-            tokenspeed_a2a_lamport(workspace.a2a, sent, inverse=inverse, out=out),
-            None,
-        )
+        if input_scales is not None:
+            # FP8 row inputs carry their existing scales through one exchange.
+            if inverse or quantize or workspace.spec.kind != "row":
+                raise ValueError(
+                    "Prequantized A2A requires FP8 row inputs and per-128 scales"
+                )
+            # Local layout differences must not change the collective chosen
+            # by the subgroup. Normalize only ranks that need a copy.
+            values = inputs.contiguous()
+            if values.data_ptr() % 4:
+                values = values.clone()
+            return tokenspeed_a2a_lamport_fp8(
+                workspace.a2a, values, input_scales.contiguous(), rows
+            )
+        else:
+            # BF16 exchange, optionally quantizing received shards before GEMM.
+            sent = (
+                inputs.contiguous()
+                if inverse
+                else prepare_padded_rows(
+                    inputs, rows, workspace.send, alignment_bytes=16
+                )
+            )
+            if quantize and workspace.a2a.fp8_output is not None:
+                return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
+            return (
+                tokenspeed_a2a_lamport(workspace.a2a, sent, inverse=inverse, out=out),
+                None,
+            )
 
     def acquire_output(self, rows: int, workspace: ProjectionWorkspace) -> torch.Tensor:
         if workspace.reduction is None or rows > workspace.reduction.max_rows:

@@ -1,0 +1,221 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "muse_spark.gemm.mv/tp8-qkv_gate-n2304-k8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            1,
+            16
+          ],
+          "N": 2304,
+          "K": 8192,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5701
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.mv/tp8-o_proj-n8192-k1024-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            1,
+            16
+          ],
+          "N": 8192,
+          "K": 1024,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5702
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.mv/tp8-pre_expert-n512-k8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            1,
+            16
+          ],
+          "N": 512,
+          "K": 8192,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5703
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.mv/tp8-post_expert-n8192-k4096-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            1,
+            16
+          ],
+          "N": 8192,
+          "K": 4096,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5704
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.mm/tp8-lm_head-decode-n25256-k8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [
+            1,
+            16
+          ],
+          "N": 25256,
+          "K": 8192,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5705
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.mm/tp8-qkv_gate-prefill-n2304-k8192-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [
+            1024
+          ],
+          "N": 2304,
+          "K": 8192,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5706
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.mm/tp8-o_proj-prefill-n8192-k1024-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [
+            1024,
+            8192
+          ],
+          "N": 8192,
+          "K": 1024,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5707
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.prepared_fp32_router_gemv/router-decode-n256-k8192-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "prepared_fp32_router_gemv",
+        "parameters": {
+          "M": [
+            1,
+            16
+          ],
+          "N": 256,
+          "K": 8192,
+          "multiplier": 1.0,
+          "dtype": "float32"
+        },
+        "cold_cache": true,
+        "seed": 5708
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.gemm.prepared_fp32_router_gemv/router-prefill-n256-k8192-float32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "prepared_fp32_router_gemv",
+        "parameters": {
+          "M": [
+            1024
+          ],
+          "N": 256,
+          "K": 8192,
+          "multiplier": 1.0,
+          "dtype": "float32"
+        },
+        "cold_cache": true,
+        "seed": 5709
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3.0
+      }
+    }
+  ]
+}

@@ -74,6 +74,24 @@ class CommBackend(ABC):
         """Broadcast in place when prepared; otherwise let the caller fall back."""
         return False
 
+    def prepare_shard_exchange(
+        self, group: Group, channels: int, max_rows: int, dtype: torch.dtype
+    ) -> bool:
+        """Collectively prepare an even token/channel-shard exchange of
+        ``channels`` full width and up to ``max_rows`` rows per rank (see
+        ``try_shard_exchange``); False keeps the generic all-to-all."""
+        return False
+
+    def try_shard_exchange(
+        self, tensor: torch.Tensor, group: Group, inverse: bool
+    ) -> torch.Tensor | None:
+        """Run a prepared even shard exchange, or return None for the caller's
+        generic all-to-all. Forward: ``[M, K]`` (every channel shard of this
+        rank's rows) to ``[W * M, K / W]`` (this rank's shard of every rank's
+        rows, rank-major); inverse: back. Must decide identically on every
+        rank of ``group``."""
+        return None
+
     def prepare_projection(
         self, spec: "ProjectionSpec", scratch_pool: "WorkspacePool | None" = None
     ) -> "ProjectionWorkspace":
@@ -94,6 +112,19 @@ class CommBackend(ABC):
         workspace: "ProjectionWorkspace",
     ) -> bool:
         """Run fused DP column-linear, or leave out untouched and return False."""
+        return False
+
+    def try_fused_dp_row_linear(
+        self,
+        tensor: torch.Tensor,
+        input_scales: torch.Tensor | None,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> bool:
+        """Run fused DP row-linear, or leave out untouched and return False."""
         return False
 
     def projection_all_gather(
@@ -118,6 +149,8 @@ class CommBackend(ABC):
         quantize: bool,
         out: torch.Tensor | None,
         workspace: "ProjectionWorkspace",
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Exchange token/channel axes using prepared layout and fusion resources."""
         from tokenspeed.runtime.distributed.comm_backend.projection import (
@@ -125,7 +158,14 @@ class CommBackend(ABC):
         )
 
         return projection_all_to_all(
-            tensor, rows, inverse, quantize, out, workspace, self
+            tensor,
+            rows,
+            inverse,
+            quantize,
+            out,
+            workspace,
+            self,
+            input_scales=input_scales,
         )
 
     def acquire_projection_output(
@@ -162,6 +202,20 @@ class CommBackend(ABC):
         if len(tensors) == 0:
             raise ValueError("all-reduce requires at least one tensor")
         return tuple(self.all_reduce(value, group, op=op) for value in tensors)
+
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        """Whether the prepared group can fuse the anticipated output spec of x."""
+        return False
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute admitted fusion; return residual/norm outputs or raise."""
+        raise NotImplementedError(
+            "This backend does not support mHC communication fusion"
+        )
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""
@@ -202,6 +256,32 @@ class CommBackend(ABC):
         """
 
         return False
+
+    def all_reduce_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        group: Group,
+    ) -> torch.Tensor | None:
+        """Sum ``tensor`` over ``group`` and apply the hc=4 mHC post in one step.
+
+        Args:
+            tensor: BF16 [T, H] partial, normally from
+                ``acquire_all_reduce_outputs``.
+            residual: BF16 residual streams [T, 4, H].
+            post: FP32 post coefficients [T, 4].
+            comb: FP32 combination [T, 4 input, 4 output].
+            group: Global ranks participating in the reduction.
+
+        Returns:
+            The new BF16 residual streams [T, 4, H], or None when the backend
+            has no fused path for these operands (nothing has run then; the
+            caller reduces and applies the post itself). The answer must agree
+            on every rank of ``group``.
+        """
+        return None
 
     def acquire_all_reduce_outputs(
         self,

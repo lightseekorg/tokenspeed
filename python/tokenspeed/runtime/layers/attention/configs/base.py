@@ -173,11 +173,11 @@ class AttnConfig:
     kv_cache_quant_method: str
     # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
     kv_cache_mxfp8: bool = False
-    # Scheduler prefix granularity (CLI --block-size): the identity axis.
-    prefix_granularity: int
     # Tokens covered by one attention-kernel page. None picks the backend's
-    # per-kernel default (flexible kernels use the prefix granularity;
-    # fixed-page kernels use their own constant).
+    # per-kernel default (flexible kernels use their group's block
+    # granularity; fixed-page kernels use their own constant). For the
+    # ordinary families the registry pins a fixed-page leaf's constant here
+    # before planning, so the recipe sizes its block span to hold whole pages.
     kernel_page_size: int | None = None
     # Physical per-request KV extent: the model's logical context_len plus
     # ServerArgs.spec_context_pad (spec verify overshoot for a finished request
@@ -218,6 +218,8 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.kv_cache_dtype == torch.int8:
+            raise ValueError("INT8 KV cache is not supported by the runtime")
         if self.qcp_size > 1:
             softmax = softmax_components[0]
             # The gathered-history extend arm exists on the GPU DSA leaf only;
@@ -262,6 +264,9 @@ class AttnConfig:
                 # composing the hybrid components, and validates it before
                 # cache allocation. The composite name is not a capability.
                 pass
+            elif softmax.backend_name == "deepseek_v41":
+                if self.is_draft:
+                    raise ValueError("V4.1 KVP requires the target attention backend")
             else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
@@ -305,7 +310,6 @@ def model_wide_kwargs(
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_mxfp8=kv_cache_mxfp8,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
-        prefix_granularity=server_args.prefix_granularity,
         context_len=model_config.context_len + server_args.spec_context_pad,
         max_bs=server_args.max_num_seqs
         // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),

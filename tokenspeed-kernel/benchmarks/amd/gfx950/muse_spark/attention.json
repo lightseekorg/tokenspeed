@@ -1,0 +1,252 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "num_q_heads": 16,
+    "num_kv_heads": 2,
+    "head_dim": 64,
+    "dtype": "bfloat16"
+  },
+  "cases": [
+    {
+      "id": "muse_spark.attention.mha_decode_with_kvcache/tp8-sliding-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mha_decode_with_kvcache",
+        "parameters": {
+          "batch": [
+            1,
+            16
+          ],
+          "q_len": 1,
+          "context_tokens": 8192,
+          "max_seqlen_k": 65536,
+          "page_size": 64,
+          "window_left": 2047
+        },
+        "cold_cache": true,
+        "seed": 5710
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.mha_decode_with_kvcache/tp8-full-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mha_decode_with_kvcache",
+        "parameters": {
+          "batch": [
+            1,
+            16
+          ],
+          "q_len": 1,
+          "context_tokens": [
+            8192,
+            32768
+          ],
+          "max_seqlen_k": 65536,
+          "page_size": 64,
+          "window_left": -1
+        },
+        "cold_cache": true,
+        "seed": 5711
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.mha_prefill/tp8-8k-sliding-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "mha_prefill",
+        "parameters": {
+          "sequences": 1,
+          "tokens_per_sequence": 8192,
+          "window_left": 2047
+        },
+        "cold_cache": true,
+        "seed": 5712
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.mha_prefill/tp8-8k-full-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "mha_prefill",
+        "parameters": {
+          "sequences": 1,
+          "tokens_per_sequence": 8192,
+          "window_left": -1
+        },
+        "cold_cache": true,
+        "seed": 5713
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.mha_extend_with_kvcache/tp8-8k-after-8k-sliding-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "mha_extend_with_kvcache",
+        "parameters": {
+          "sequences": 1,
+          "extend_tokens": 8192,
+          "prefix_tokens": 8192,
+          "max_seqlen_k": 65536,
+          "page_size": 64,
+          "window_left": 2047
+        },
+        "cold_cache": true,
+        "seed": 5714
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.mha_extend_with_kvcache/tp8-8k-after-8k-full-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "mha_extend_with_kvcache",
+        "parameters": {
+          "sequences": 1,
+          "extend_tokens": 8192,
+          "prefix_tokens": 8192,
+          "max_seqlen_k": 65536,
+          "page_size": 64,
+          "window_left": -1
+        },
+        "cold_cache": true,
+        "seed": 5715
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.gqa_prologue/tp8-decode-norm-rope-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "gqa_prologue",
+        "parameters": {
+          "qkv_row_stride": 2304,
+          "cache_slots": 1048576,
+          "max_position": 65536,
+          "tokens": [
+            1,
+            16
+          ],
+          "has_norm": true,
+          "rope": "gptj",
+          "return_kv": false
+        },
+        "cold_cache": true,
+        "seed": 5716
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.gqa_prologue/tp8-decode-norm-nope-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "gqa_prologue",
+        "parameters": {
+          "qkv_row_stride": 2304,
+          "cache_slots": 1048576,
+          "max_position": 65536,
+          "tokens": [
+            1,
+            16
+          ],
+          "has_norm": true,
+          "rope": "none",
+          "return_kv": false
+        },
+        "cold_cache": true,
+        "seed": 5717
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.gqa_prologue/tp8-prefill-norm-rope-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "gqa_prologue",
+        "parameters": {
+          "qkv_row_stride": 2304,
+          "cache_slots": 1048576,
+          "max_position": 65536,
+          "tokens": [
+            1024
+          ],
+          "has_norm": true,
+          "rope": "gptj",
+          "return_kv": true
+        },
+        "cold_cache": true,
+        "seed": 5718
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "muse_spark.attention.gqa_prologue/tp8-prefill-kv-store-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "gqa_prologue",
+        "parameters": {
+          "qkv_row_stride": 2304,
+          "cache_slots": 1048576,
+          "max_position": 65536,
+          "tokens": [
+            8192
+          ],
+          "has_norm": false,
+          "rope": "none",
+          "return_kv": true
+        },
+        "cold_cache": true,
+        "seed": 5719
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    }
+  ]
+}

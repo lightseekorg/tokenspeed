@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from typing import Any
@@ -110,6 +111,53 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
         )
 
 
+@contextmanager
+def assert_no_cute_compile() -> Iterator[None]:
+    """Fail if any CuTe DSL kernel is traced or compiled in the block.
+
+    ``cute.compile`` traces and compiles on every call, and calling a
+    ``@cute.jit`` function directly traces it on every call, so launches must
+    reuse the compiled functions their caller cached. Warm the caller's cache
+    before entering, then launch with shapes that vary the way serving does; a
+    trace means the cache keys on a per-batch value or the launch bypasses it.
+    """
+    from cutlass.base_dsl.dsl import BaseDSL
+
+    with patch.object(
+        BaseDSL, "generate_mlir", autospec=True, side_effect=BaseDSL.generate_mlir
+    ) as traces:
+        yield
+    # generate_mlir(dsl, funcBody, ...): the traced @cute.jit function.
+    kernels = sorted({call.args[1].__qualname__ for call in traces.call_args_list})
+    assert not kernels, (
+        f"traced CuTe DSL kernel(s) {', '.join(kernels)} {traces.call_count} "
+        "time(s); a per-batch value likely keys the compile cache"
+    )
+
+
+def move_pages_past_int32(
+    caches: tuple[torch.Tensor, ...], page_table: torch.Tensor
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Copy paged caches to the far end of pools larger than 2**31 elements.
+
+    Every cache is ``[pages, ...]`` with the same page count. Each returned
+    pool places those pages after more than ``2**31`` elements of unwritten
+    pages, sized by the smallest page so it holds for every cache, and the
+    returned page table points at them, so every page base a kernel computes
+    exceeds the int32 range while only the used pages are written.
+    """
+    pages = caches[0].shape[0]
+    first = 2**31 // min(cache[0].numel() for cache in caches) + 1
+    pools = []
+    for cache in caches:
+        pool = torch.empty(
+            (first + pages, *cache.shape[1:]), dtype=cache.dtype, device=cache.device
+        )
+        pool[first:].copy_(cache)
+        pools.append(pool)
+    return tuple(pools), page_table + first
+
+
 def compiled_kernels(kernel: Any) -> list[Any]:
     """Every binary this process has compiled for a Triton ``kernel``, from its JIT cache."""
     return [
@@ -117,6 +165,62 @@ def compiled_kernels(kernel: Any) -> list[Any]:
         for cache in kernel.device_caches.values()
         for binary in cache[0].values()
     ]
+
+
+def assert_fp8_same_or_adjacent_at_midpoint(
+    x: torch.Tensor,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    """Bound FP8 changes from reciprocal normalization to rounding boundaries."""
+    assert x.shape == actual.shape == reference.shape
+    assert actual.dtype == reference.dtype == torch.float8_e4m3fn
+    actual_bits = actual.view(torch.uint8)
+    reference_bits = reference.view(torch.uint8)
+    differs = actual_bits != reference_bits
+    assert torch.equal(actual_bits >> 7, reference_bits >> 7)
+    code_delta = (actual_bits & 0x7F).to(torch.int16) - (reference_bits & 0x7F).to(
+        torch.int16
+    )
+    assert (code_delta.abs() <= 1).all()
+    if differs.any():
+        midpoint = (actual.float()[differs] + reference.float()[differs]) * 0.5
+        expanded_scales = scales.repeat_interleave(group_size, dim=-1)
+        quotient = x.float()[differs] / expanded_scales[differs]
+        # Allow a few FP32 rounding steps, not an arbitrary neighboring code.
+        tolerance = 8 * torch.finfo(torch.float32).eps * midpoint.abs().clamp_min(1)
+        assert ((quotient - midpoint).abs() <= tolerance).all()
+
+
+def polling_cycles(assembly: str) -> list[list[str]]:
+    """Return each loop of ``assembly`` from its target label to its back branch."""
+    lines = assembly.splitlines()
+    labels = {
+        match[1]: index
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(\.LBB\w+):", line))
+    }
+    cycles = []
+    for index, line in enumerate(lines):
+        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
+        if match and labels[match[1]] < index:
+            cycles.append(lines[labels[match[1]] : index + 1])
+    return cycles
+
+
+def votes_with_subgroup_mask(cycle: list[str]) -> bool:
+    """Return whether a polling cycle exits on one v_cmp lane mask.
+
+    A cross-lane reduction (DPP steps and a lane read) or a workgroup
+    exchange (LDS and s_barrier) on every retry would delay noticing data.
+    """
+    text = "\n".join(cycle)
+    return (
+        len(re.findall(r"v_cmp_ne_u32_e64 s\[\d+:\d+\], 0, v\d+", text)) == 1
+        and re.search(r"_dpp|v_readlane|v_readfirstlane|s_barrier|\bds_", text) is None
+    )
 
 
 def int_specialization_class(value: int) -> str:
@@ -290,11 +394,11 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             ),
             priority=16,
         ),
-        "reference_decode": _sample_registration(
-            "reference_decode",
+        "torch_decode": _sample_registration(
+            "torch_decode",
             "attention",
             "decode",
-            "reference",
+            "torch",
             format_signatures(
                 ("q", "k_cache", "v_cache"),
                 "dense",

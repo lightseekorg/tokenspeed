@@ -20,12 +20,20 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.gdn import (
+    gdn_gate,
+    gdn_l2norm,
+    gdn_l2norm_clamped,
+    torch_gdn_recurrence,
+)
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GDN_TREE_VERIFY_CHUNKED_MIN_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    GdnStateCheckpoints,
     _qkv_rows_strided,
+    gdn_chain_verify,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -139,10 +147,7 @@ def _make_inputs(
 
 
 def _torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    x_float = x.float()
-    return (
-        x_float * torch.rsqrt(x_float.square().sum(dim=-1, keepdim=True).clamp_min(eps))
-    ).to(x.dtype)
+    return gdn_l2norm_clamped(x, eps)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GDN L2 norm requires CUDA")
@@ -178,54 +183,32 @@ def _torch_gdn_chunk_prefill_reference(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Independent token-by-token recurrence, used as an oracle.
+    """Token-by-token recurrence of each ``cu_seqlens`` sequence (batch 1).
 
     ``initial_state``/the returned final state follow ``gdn_chunk_prefill``'s
-    public K-last ``[N, Hv, V, K]`` contract (matches the runtime's SSM state
-    pool); this reference's own math is plain ``[N, Hv, K, V]`` (K row, V
-    col), so it transposes in/out at its boundary, mirroring the production
-    Triton wrapper (``triton_gdn_chunk_prefill``).
+    public K-last ``[N, Hv, V, K]`` contract.
     """
-    q_f = q.float()
-    k_f = k.float()
-    v_f = v.float()
-    g_f = g.float()
-    beta_f = beta.float()
-    initial_state_kv = initial_state.transpose(-2, -1)
-
-    batch, total_tokens, num_q_heads, _ = q.shape
-    assert batch == 1
-    num_v_heads = v.shape[2]
-    head_v_dim = v.shape[-1]
-    group_size = num_v_heads // num_q_heads
-
-    out = torch.empty(
-        (1, total_tokens, num_v_heads, head_v_dim),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    assert q.shape[0] == 1
+    out = torch.empty(*v.shape, device=q.device, dtype=torch.float32)
     final_states = []
-    starts = cu_seqlens[:-1].to(torch.int64).tolist()
-    ends = cu_seqlens[1:].to(torch.int64).tolist()
-
-    for seq_idx, (start, end) in enumerate(zip(starts, ends, strict=True)):
-        state = initial_state_kv[seq_idx].float().clone()
-        for token_idx in range(start, end):
-            for value_head in range(num_v_heads):
-                qk_head = value_head // group_size
-                q_t = q_f[0, token_idx, qk_head]
-                k_t = k_f[0, token_idx, qk_head]
-                v_t = v_f[0, token_idx, value_head]
-                state_h = torch.exp(g_f[0, token_idx, value_head]) * state[value_head]
-                delta = beta_f[0, token_idx, value_head] * (v_t - k_t @ state_h)
-                state_h = state_h + k_t[:, None] * delta[None, :]
-
-                out[0, token_idx, value_head] = scale * (q_t @ state_h)
-                state[value_head] = state_h
-        final_states.append(state)
-
-    final_state_kv = torch.stack(final_states, dim=0).to(initial_state.dtype)
-    return out.to(q.dtype), final_state_kv.transpose(-2, -1)
+    bounds = cu_seqlens.to(torch.int64).tolist()
+    for seq_idx, (start, end) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+        tokens = slice(start, end)
+        out[:, tokens], states = torch_gdn_recurrence(
+            q[:, tokens],
+            k[:, tokens],
+            v[:, tokens],
+            g[:, tokens],
+            beta[:, tokens],
+            initial_state[seq_idx, None],
+            scale=scale,
+            parents=None,
+            compute_dtype=torch.float32,
+        )
+        final_states.append(
+            states[0, -1] if end > start else initial_state[seq_idx].float()
+        )
+    return out.to(q.dtype), torch.stack(final_states).to(initial_state.dtype)
 
 
 def test_gdn_chunk_prefill_triton_matches_torch_reference(device: str, require):
@@ -494,26 +477,106 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
     assert result.final_state.shape == initial_state.shape
 
 
+def test_gdn_chunk_prefill_state_checkpoints_are_the_truncated_final_states(
+    device: str, require
+):
+    # A caller-owned checkpoint buffer at a 128-token interval: sequence i's
+    # j-th state is the final state of the same scan cut after (j + 1) * 128
+    # of its tokens, bit for bit.
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    lengths = (300, 520)
+    interval = 128
+    q, k, v, g, beta, initial_state, _ = _make_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        seq_len=sum(lengths),
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.float32,
+        nonzero_state=True,
+    )
+    initial_state = initial_state.repeat(len(lengths), 1, 1, 1)
+    initial_state[1] *= -1
+    starts = (0, lengths[0])
+    cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+    counts = [length // interval for length in lengths]
+    cu_starts = torch.tensor([0, counts[0], counts[0] + counts[1]], dtype=torch.int32)
+    states = torch.full(
+        (sum(counts), *initial_state.shape[1:]), float("nan"), device=device
+    )
+    scale = q.shape[-1] ** -0.5
+    gdn_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens.to(device=device, dtype=torch.int32),
+        qk_l2norm=True,
+        output_final_state=True,
+        state_checkpoints=GdnStateCheckpoints(
+            every_n_tokens=interval, states=states, cu_starts=cu_starts.to(device)
+        ),
+    )
+    for i, (start, count) in enumerate(zip(starts, counts)):
+        for j in range(count):
+            end = start + (j + 1) * interval
+            truncated = gdn_chunk_prefill(
+                q[:, start:end],
+                k[:, start:end],
+                v[:, start:end],
+                g[:, start:end],
+                beta[:, start:end],
+                scale=scale,
+                initial_state=initial_state[i : i + 1],
+                cu_seqlens=torch.tensor(
+                    [0, end - start], device=device, dtype=torch.int32
+                ),
+                qk_l2norm=True,
+                output_final_state=True,
+            )
+            assert torch.equal(
+                states[int(cu_starts[i]) + j], truncated.final_state[0]
+            ), (i, j)
+
+
+def test_gdn_chunk_prefill_state_checkpoints_exclude_output_h(device: str, require):
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        seq_len=128,
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.float32,
+        nonzero_state=False,
+    )
+    checkpoints = GdnStateCheckpoints(
+        every_n_tokens=64,
+        states=torch.empty((2, *initial_state.shape[1:]), device=device),
+        cu_starts=torch.tensor([0, 2], device=device, dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="exclusive"):
+        gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=None,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=True,
+            output_h=True,
+            state_checkpoints=checkpoints,
+        )
+
+
 # ===-----------------------------------------------------------------------===#
 # GDN decode / MTP (K-last, gdn_decode_step / gdn_decode_mtp)
 # ===-----------------------------------------------------------------------===#
-
-
-def _torch_softplus_gate(
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    A_log: torch.Tensor,
-    softplus_beta: float = 1.0,
-    softplus_threshold: float = 20.0,
-) -> torch.Tensor:
-    x = a + dt_bias
-    beta_x = softplus_beta * x
-    softplus_x = torch.where(
-        beta_x <= softplus_threshold,
-        (1.0 / softplus_beta) * torch.log1p(torch.exp(beta_x)),
-        x,
-    )
-    return -torch.exp(A_log) * softplus_x
 
 
 def _torch_gdn_decode_reference(
@@ -527,41 +590,24 @@ def _torch_gdn_decode_reference(
     state_klast: torch.Tensor,
     scale: float,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Independent token-by-token oracle for gdn_decode_step/gdn_decode_mtp.
+    """Token-by-token oracle for gdn_decode_step/gdn_decode_mtp.
 
     q, k: [B, T, H, K]; v, a, b: [B, T, HV, V] / [B, T, HV]; state_klast is
-    K-last ``[B, HV, V, K]`` -- the same public contract the kernels use, so
-    callers don't need to transpose anything at this reference's boundary.
-
-    Returns ``(out [B, T, HV, V], per_step_states)`` where ``per_step_states``
-    is a length-T list of K-last ``[B, HV, V, K]`` snapshots, one per
-    processed step (post-update).
+    K-last ``[B, HV, V, K]``. Returns ``(out [B, T, HV, V], per_step_states)``,
+    the K-last ``[B, HV, V, K]`` state after each step.
     """
-    B, T, H, K = q.shape
-    HV = v.shape[2]
-    group = HV // H
-    q_f, k_f, v_f, a_f, b_f = (x.float() for x in (q, k, v, a, b))
-    A_log_f, dt_bias_f = A_log.float(), dt_bias.float()
-    state = state_klast.float().transpose(-2, -1).clone()  # -> [B, HV, K, V]
-    out = torch.zeros(B, T, HV, v.shape[-1], dtype=torch.float32, device=q.device)
-    per_step_states = []
-    for t in range(T):
-        g = _torch_softplus_gate(a_f[:, t], dt_bias_f, A_log_f)
-        beta = torch.sigmoid(b_f[:, t])
-        for bi in range(B):
-            for hv in range(HV):
-                qh = hv // group
-                q_t = q_f[bi, t, qh]
-                k_t = k_f[bi, t, qh]
-                qn = q_t / torch.sqrt((q_t * q_t).sum() + 1e-6)
-                kn = k_t / torch.sqrt((k_t * k_t).sum() + 1e-6)
-                st = state[bi, hv] * torch.exp(g[bi, hv])
-                delta = beta[bi, hv] * (v_f[bi, t, hv] - kn @ st)
-                st = st + kn[:, None] * delta[None, :]
-                out[bi, t, hv] = scale * (qn @ st)
-                state[bi, hv] = st
-        per_step_states.append(state.transpose(-2, -1).clone())
-    return out, per_step_states
+    out, states = torch_gdn_recurrence(
+        gdn_l2norm(q.float(), 1e-6),
+        gdn_l2norm(k.float(), 1e-6),
+        v,
+        gdn_gate(a.float(), dt_bias.float(), A_log.float()),
+        torch.sigmoid(b.float()),
+        state_klast,
+        scale=scale,
+        parents=None,
+        compute_dtype=torch.float32,
+    )
+    return out, list(states.unbind(1))
 
 
 def _make_decode_inputs(
@@ -1633,30 +1679,20 @@ def _torch_gdn_tree_reference(
     q, k, v, a, b, A_log, dt_bias, state_klast, scale, parents, *, use_qk_l2norm
 ):
     """Float64 per-node recurrence from each node's parent: outputs and K-last states."""
-    B, T, H, K = q.shape
-    HV = v.shape[2]
-    q, k = (x.double().repeat_interleave(HV // H, dim=2) for x in (q, k))
+    q, k = q.double(), k.double()
     if use_qk_l2norm:
-        q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)
-        k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-    q = q * scale
-    v = v.double()
-    g = -torch.exp(A_log.double()) * F.softplus(a.double() + dt_bias.double())
-    beta = torch.sigmoid(b.double())
-    start = state_klast.double().transpose(-2, -1)  # [B, HV, K, V]
-    out = torch.empty(B, T, HV, v.shape[-1], dtype=torch.float64, device=q.device)
-    states = torch.empty(B, T, *start.shape[1:], dtype=torch.float64, device=q.device)
-    for bi in range(B):
-        for t in range(T):
-            p = parents[bi][t]
-            h = start[bi] if p < 0 else states[bi, p]
-            h = h * torch.exp(g[bi, t])[:, None, None]
-            delta = beta[bi, t][:, None] * (
-                v[bi, t] - torch.einsum("hk,hkv->hv", k[bi, t], h)
-            )
-            states[bi, t] = h + k[bi, t][:, :, None] * delta[:, None, :]
-            out[bi, t] = torch.einsum("hk,hkv->hv", q[bi, t], states[bi, t])
-    return out, states.transpose(-2, -1)
+        q, k = gdn_l2norm(q, 1e-6), gdn_l2norm(k, 1e-6)
+    return torch_gdn_recurrence(
+        q,
+        k,
+        v,
+        gdn_gate(a.double(), dt_bias.double(), A_log.double()),
+        torch.sigmoid(b.double()),
+        state_klast,
+        scale=scale,
+        parents=parents,
+        compute_dtype=torch.float64,
+    )
 
 
 def _tree_verify(q, k, v, pool, parents, *, rows: bool, **common):
@@ -2053,3 +2089,244 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
         ):
             for batch in (1, 2, 3, 5, 8, 17, 33):
                 run(batch, T, rows, payload)
+
+
+def _chain_verify(q, k, v, pool, read_idx, **common):
+    """The chunked chain verify, checking it leaves the pool untouched."""
+    before = pool.clone()
+    out = gdn_chain_verify(
+        q, k, v, initial_state=pool, initial_state_indices=read_idx, **common
+    )
+    assert torch.equal(pool, before)
+    return out
+
+
+@pytest.mark.parametrize("T", [1, 3, 4, 5, 8, 9, 13, 16])
+@pytest.mark.parametrize(
+    ("dtype", "num_v_heads", "batch"),
+    [
+        (torch.bfloat16, 12, 2),
+        (torch.bfloat16, 12, 8),
+        (torch.bfloat16, 12, 20),
+        (torch.bfloat16, 12, 40),
+        (torch.float16, 8, 4),
+    ],
+)
+def test_gdn_chain_verify_matches_float64_reference(
+    device: str, T: int, dtype: torch.dtype, num_v_heads: int, batch: int, require
+):
+    """Every row bucket and launch tier against float64, with a zero-output padding request."""
+    require("attention", "gdn_chain_verify", "triton", dtype, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=dtype,
+        T=T,
+        batch=batch,
+        num_v_heads=num_v_heads,
+        pool_size=batch + 1,
+    )
+    a, b = a.to(dtype), b.to(dtype)
+    read_idx = torch.randperm(batch, device=device).to(torch.int32) + 1
+    read_idx[1] = -1
+    scale = q.shape[-1] ** -0.5
+    common = dict(
+        A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True
+    )
+    out = _chain_verify(q, k, v, pool, read_idx, **common)
+    start = torch.where(
+        read_idx[:, None, None, None] >= 0, pool[read_idx.clamp(min=0).long()], 0.0
+    )
+    want, _ = _torch_gdn_tree_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        start,
+        scale,
+        [[t - 1 for t in range(T)]] * batch,
+        use_qk_l2norm=True,
+    )
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+    live = read_idx >= 0
+    # The products round q and the normalized key (with its residual) to the state dtype.
+    torch.testing.assert_close(out[live].double(), want[live], rtol=2**-7, atol=2e-4)
+
+
+@pytest.mark.parametrize("T", [4, 16])
+@pytest.mark.parametrize(
+    ("A_log_value", "state_value", "one_row"),
+    [(88.0, None, False), (89.0, None, False), (10.0, 3e38, False), (None, None, True)],
+)
+def test_gdn_chain_verify_keeps_extreme_gates_finite(
+    device: str,
+    T: int,
+    A_log_value: float | None,
+    state_value: float | None,
+    one_row: bool,
+    require,
+):
+    """Overflowing or infinite gates decay to zero, not NaN; later decays stay exact."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device, dtype=torch.bfloat16, T=T, pool_size=4
+    )
+    a, b = a.bfloat16(), b.bfloat16()
+    if A_log_value is not None:
+        A_log = torch.full_like(A_log, A_log_value)
+    if one_row:
+        a[:, T // 2] = 3e38
+    if state_value is not None:
+        pool.fill_(state_value)
+    read_idx = torch.arange(4, device=device, dtype=torch.int32)
+    scale = q.shape[-1] ** -0.5
+    common = dict(
+        A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True
+    )
+    out = _chain_verify(q, k, v, pool, read_idx, **common)
+    want, _ = _torch_gdn_tree_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[read_idx.long()],
+        scale,
+        [[t - 1 for t in range(T)]] * 4,
+        use_qk_l2norm=True,
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double(), want, rtol=2**-7, atol=2e-4)
+
+
+@pytest.mark.parametrize("T", [3, 13])
+def test_gdn_chain_verify_reads_strided_rows_and_gates(device: str, T: int, require):
+    """Strided q/k/v rows and unaligned gate views give bitwise the dense inputs' outputs."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    batch, num_v_heads = 5, 12
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        batch=batch,
+        num_v_heads=num_v_heads,
+        pool_size=batch,
+    )
+    a, b = a.bfloat16(), b.bfloat16()
+    rows = batch * T
+    common = dict(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=pool,
+        initial_state_indices=torch.arange(batch, device=device, dtype=torch.int32),
+        scale=None,
+        use_qk_l2norm=True,
+    )
+    dense = gdn_chain_verify(q, k, v, a=a, b=b, **common)
+    # [q | k | v] rows padded to a wider stride, gates at an odd column offset.
+    widths = [q[0, 0].numel(), k[0, 0].numel(), v[0, 0].numel()]
+    packed = torch.zeros(rows, sum(widths) + 64, device=device, dtype=torch.bfloat16)
+    projection = torch.zeros(
+        rows, 3 + 2 * num_v_heads, device=device, dtype=torch.bfloat16
+    )
+    views = []
+    start = 0
+    for tensor, width in zip((q, k, v), widths):
+        view = packed[:, start : start + width]
+        view.copy_(tensor.reshape(rows, width))
+        views.append(view.view(batch, T, -1, tensor.shape[-1]))
+        start += width
+    gates = []
+    for offset, tensor in ((3, a), (3 + num_v_heads, b)):
+        view = projection[:, offset : offset + num_v_heads]
+        view.copy_(tensor.reshape(rows, num_v_heads))
+        gates.append(view.view(batch, T, num_v_heads))
+    strided = gdn_chain_verify(*views, a=gates[0], b=gates[1], **common)
+    assert torch.equal(strided, dense)
+
+
+def test_gdn_chain_verify_without_qk_l2norm(device: str, require):
+    """Callers that normalize q and k themselves pass an explicit scale."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    T, batch = 4, 3
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device, dtype=torch.bfloat16, T=T, batch=batch, pool_size=batch
+    )
+    q, k = (F.normalize(x.float(), dim=-1).bfloat16() for x in (q, k))
+    a, b = a.bfloat16(), b.bfloat16()
+    read_idx = torch.arange(batch, device=device, dtype=torch.int32)
+    out = _chain_verify(
+        q,
+        k,
+        v,
+        pool,
+        read_idx,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=0.5,
+        use_qk_l2norm=False,
+    )
+    want, _ = _torch_gdn_tree_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[read_idx.long()],
+        0.5,
+        [[t - 1 for t in range(T)]] * batch,
+        use_qk_l2norm=False,
+    )
+    torch.testing.assert_close(out.double(), want, rtol=2**-7, atol=2e-4)
+
+
+def test_gdn_chain_verify_compiles_once_per_launch_tier(device: str, require):
+    """Launches at ``gdn_chain_verify_warm_batch_sizes`` compile every batch and row count."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.gdn._triton.chain_verify import (
+        gdn_chain_verify_kernel,
+    )
+    from tokenspeed_kernel.ops.attention.gdn.triton import (
+        gdn_chain_verify_warm_batch_sizes,
+    )
+
+    num_v_heads = 12
+
+    def run(batch: int, T: int) -> None:
+        q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+            device=device,
+            dtype=torch.bfloat16,
+            T=T,
+            batch=batch,
+            num_v_heads=num_v_heads,
+            pool_size=batch,
+        )
+        gdn_chain_verify(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a.bfloat16(),
+            dt_bias=dt_bias,
+            b=b.bfloat16(),
+            initial_state=pool,
+            initial_state_indices=torch.arange(batch, device=device, dtype=torch.int32),
+            scale=None,
+            use_qk_l2norm=True,
+        )
+
+    for T in (3, 8, 16):
+        for batch in gdn_chain_verify_warm_batch_sizes(range(1, 129), num_v_heads, T):
+            run(batch, T)
+    with assert_no_triton_compile(gdn_chain_verify_kernel):
+        for T in (3, 4, 5, 8, 13, 16):
+            for batch in (1, 5, 9, 20, 32, 40, 65, 90, 128):
+                run(batch, T)

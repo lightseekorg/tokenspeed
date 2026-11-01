@@ -268,21 +268,17 @@ def _mla_decode_fwd_kernel(
     split_max_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
     split_expsum_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
-    query_scales_ptr,  # unused by the BF16 kernel
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
-    out_scale_ptr,  # float32 (only set when NUM_KV_SPLITS == 1)
     num_query_heads: gl.constexpr,  # int
     num_kv_heads: gl.constexpr,  # int
     block_tables_stride: gl.int64,  # int
     query_stride_0: gl.int64,  # int
     query_stride_1: gl.int64,  # int, should be equal to head_size
-    query_scales_stride_0: gl.int64,  # int
-    query_scales_stride_1: gl.int64,  # int
     KV_LORA_RANK: gl.constexpr,  # int
     QK_ROPE_HEAD_DIM: gl.constexpr,  # int
     stride_kv_buffer_0: gl.int64,  # int
@@ -291,7 +287,6 @@ def _mla_decode_fwd_kernel(
     stride_kv_buffer_3: gl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
     num_tokens_per_seq: gl.int32,
-    num_blocks: gl.int32,
     TILE_SIZE: gl.constexpr,  # int
     BLOCK_Q: gl.constexpr,  # int
     BLOCK_M: gl.constexpr,  # int
@@ -304,10 +299,7 @@ def _mla_decode_fwd_kernel(
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     ALL_DECODE: gl.constexpr = False,  # bool
     K_WIDTH: gl.constexpr = 0,  # int
-    SCALE_K_WIDTH_LORA: gl.constexpr = 16,  # int
-    SCALE_K_WIDTH_ROPE: gl.constexpr = 16,  # int
     IS_FP8: gl.constexpr = False,
-    BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
 ):
     assert not SHUFFLED_KV_CACHE
     assert NUM_BUFFERS == 1 or NUM_BUFFERS == 2
@@ -982,21 +974,17 @@ def launch_gluon_mla_decode_gfx1250(
         split_max_ptr=split_max,
         split_expsum_ptr=split_expsum,
         query_ptr=q_flat,
-        query_scales_ptr=None,
         kv_buffer_ptr=kv_cache,
         block_tables_ptr=page_table,
         seq_lens_ptr=cache_seqlens,
         SCALE=softmax_scale,
         q_scale_ptr=None,
         kv_scale_ptr=None,
-        out_scale_ptr=None,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
         block_tables_stride=page_table.stride(0),
         query_stride_0=q_flat.stride(0),
         query_stride_1=q_flat.stride(1),
-        query_scales_stride_0=0,
-        query_scales_stride_1=0,
         KV_LORA_RANK=kv_lora_rank,
         QK_ROPE_HEAD_DIM=qk_rope_head_dim,
         stride_kv_buffer_0=kv_cache.stride(0),
@@ -1007,7 +995,6 @@ def launch_gluon_mla_decode_gfx1250(
         # pointer is intentionally unused.
         query_start_len_ptr=cache_seqlens,
         num_tokens_per_seq=1,
-        num_blocks=kv_cache.shape[0],
         TILE_SIZE=page_size,
         BLOCK_Q=block_q,
         BLOCK_M=block_m,
@@ -1017,10 +1004,7 @@ def launch_gluon_mla_decode_gfx1250(
         SHUFFLED_KV_CACHE=False,
         ALL_DECODE=True,
         K_WIDTH=16 if is_fp8 else 8,
-        SCALE_K_WIDTH_LORA=0,
-        SCALE_K_WIDTH_ROPE=0,
         IS_FP8=is_fp8,
-        BLOCK_SCALES_SIZE=16,
         # Two FP8 tiles fit in LDS beside a second resident wave; 16-bit
         # tiles are twice the size, so they keep one slot and one wave.
         NUM_BUFFERS=2 if is_fp8 else 1,
@@ -1148,21 +1132,17 @@ def _launch_query_block_decode(
         split_max_ptr=split_max,
         split_expsum_ptr=split_expsum,
         query_ptr=q_flat,
-        query_scales_ptr=None,
         kv_buffer_ptr=kv_cache,
         block_tables_ptr=page_table,
         seq_lens_ptr=cache_seqlens,
         SCALE=softmax_scale,
         q_scale_ptr=None,
         kv_scale_ptr=None,
-        out_scale_ptr=None,
         num_query_heads=num_query_heads,
         num_kv_heads=1,
         block_tables_stride=page_table.stride(0),
         query_stride_0=q_flat.stride(0),
         query_stride_1=q_flat.stride(1),
-        query_scales_stride_0=0,
-        query_scales_stride_1=0,
         KV_LORA_RANK=kv_lora_rank,
         QK_ROPE_HEAD_DIM=qk_rope_head_dim,
         stride_kv_buffer_0=kv_cache.stride(0),
@@ -1171,7 +1151,6 @@ def _launch_query_block_decode(
         stride_kv_buffer_3=kv_cache.stride(3),
         query_start_len_ptr=None,
         num_tokens_per_seq=queries,
-        num_blocks=kv_cache.shape[0],
         TILE_SIZE=page_size,
         BLOCK_Q=block_q,
         BLOCK_M=block_m,
@@ -1181,10 +1160,7 @@ def _launch_query_block_decode(
         SHUFFLED_KV_CACHE=False,
         ALL_DECODE=False,
         K_WIDTH=16 if is_fp8 else 8,
-        SCALE_K_WIDTH_LORA=0,
-        SCALE_K_WIDTH_ROPE=0,
         IS_FP8=is_fp8,
-        BLOCK_SCALES_SIZE=16,
         NUM_BUFFERS=num_buffers,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,

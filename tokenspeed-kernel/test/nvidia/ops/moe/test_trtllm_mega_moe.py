@@ -36,6 +36,12 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.numerics.torch.activation import torch_situ_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import (
+    dequantize_nvfp4_blocks,
+    fake_quantize_nvfp4,
+)
 from utils import is_nvidia
 
 if not is_nvidia():
@@ -59,36 +65,6 @@ HIDDEN = 3584
 INTERMEDIATE = 192
 LOCAL_EXPERTS = 56
 TOP_K = 16
-
-
-def _dequant(data, scales):
-    values = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        device=data.device,
-        dtype=torch.float32,
-    )
-    codes = torch.stack((data & 15, data >> 4), dim=-1).long()
-    return values[codes].flatten(-2) * scales.float().repeat_interleave(16, dim=-1)
-
-
-def _requant(x, scale):
-    values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=x.device)
-    blocks = x.reshape(*x.shape[:-1], -1, 16)
-    sf = (blocks.abs().amax(-1) / (6 * scale)).to(torch.float8_e4m3fn).float()
-    normalized = blocks / (sf.unsqueeze(-1) * scale).clamp_min(1e-30)
-    # Ties select an even E2M1 code, matching round-to-nearest-even.
-    distances = (normalized.abs().unsqueeze(-1) - values).abs()
-    nearest = distances.argmin(-1)
-    tie = (nearest % 2 == 1) & (nearest < 7)
-    next_distance = distances.gather(
-        -1, (nearest + 1).clamp_max(7).unsqueeze(-1)
-    ).squeeze(-1)
-    nearest = torch.where(
-        tie & (next_distance == distances.amin(-1)), nearest + 1, nearest
-    )
-    return (values[nearest] * normalized.sign() * sf.unsqueeze(-1) * scale).reshape_as(
-        x
-    )
 
 
 def _weights(plan):
@@ -129,7 +105,7 @@ def _weights(plan):
                 torch.full(s2_shape, global_scale, device="cuda"), requires_grad=False
             ),
         )
-        reference.append(_dequant(data, scales) * global_scale)
+        reference.append(dequantize_nvfp4_blocks(data, scales) * global_scale)
     w.w13_input_scale = torch.nn.Parameter(
         torch.tensor([0.75], device="cuda"), requires_grad=False
     )
@@ -176,28 +152,21 @@ def _reference(x, ids, weights, reference, capacity):
         dist.all_gather_single(global_tensor, local.contiguous())
         gathered.append(global_tensor)
     q, sf, routes, scores = gathered
-    hidden = _dequant(q, sf.view(torch.float8_e4m3fn)) * 0.75
-    output = torch.zeros(hidden.shape, dtype=torch.float32, device="cuda")
-    for local_expert in range(LOCAL_EXPERTS):
-        rows, choices = torch.where(
-            (routes == local_expert + dist.get_rank() * LOCAL_EXPERTS) & (scores != 0)
-        )
-        if rows.numel() == 0:
-            continue
-        gate, up = (hidden[rows] @ reference[0][local_expert].T).split(
-            INTERMEDIATE, dim=-1
-        )
-        activated = (
-            (4 * torch.tanh(gate / 4))
-            * torch.sigmoid(gate)
-            * (25 * torch.tanh(up / 25))
-        )
-        partial = (
-            (_requant(activated, 1.25) @ reference[1][local_expert].T)
-            .bfloat16()
-            .float()
-        )
-        output.index_add_(0, rows, partial * scores[rows, choices].float()[:, None])
+    hidden = dequantize_nvfp4_blocks(q, sf.view(torch.float8_e4m3fn)) * 0.75
+    output = torch_moe_experts(
+        hidden,
+        reference[0],
+        reference[1],
+        torch.where(scores != 0, routes, -1),
+        scores.float(),
+        activation=lambda gate_up: torch_situ_and_mul(gate_up, 4.0, 25.0),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=lambda t: fake_quantize_nvfp4(t, 1.25),
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=dist.get_rank() * LOCAL_EXPERTS,
+    )
     dist.all_reduce(output)
     rank = dist.get_rank()
     return output[rank * capacity : rank * capacity + x[0].shape[0]].bfloat16()
@@ -242,6 +211,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     w, ref = _weights(plan)
     tokens = live_tokens if dist.get_rank() == 0 else max(1, live_tokens - 2)
@@ -328,9 +298,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
 
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
 
-    runner = get_runner(
-        dist.group.WORLD, w.num_experts, HIDDEN, INTERMEDIATE, TOP_K, 4.0, 25.0
-    )
+    runner = get_runner(plan, w)
     arena = runner.workspace
     pointers = (
         arena.storage.data_ptr(),

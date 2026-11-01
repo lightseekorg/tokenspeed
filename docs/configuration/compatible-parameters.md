@@ -12,7 +12,6 @@ TokenSpeed-specific behavior explicitly.
 | `--model` | Equivalent to positional `model`. |
 | `--tokenizer` | Tokenizer path. |
 | `--tokenizer-mode` | Tokenizer implementation mode. |
-| `--skip-tokenizer-init` | Skip tokenizer initialization. |
 | `--load-format` | Weight loading format. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--dtype` | Weight and activation dtype. |
@@ -30,7 +29,6 @@ TokenSpeed-specific behavior explicitly.
 | `--chat-template` | Chat template name or path. |
 | `--gpu-memory-utilization` | GPU memory fraction used for weights and KV cache. |
 | `--max-num-seqs` | Maximum concurrent sequences. |
-| `--block-size` | KV cache block size (deprecated alias of `--prefix-granularity`). |
 | `--enable-prefix-caching` | Enable prefix cache reuse. |
 | `--disable-prefix-caching` | Disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
@@ -55,6 +53,7 @@ TokenSpeed-specific behavior explicitly.
 | `--attention-backend` | `--attention-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 | `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 | `--quantization-param-path` | `--quantization-param-path` | KV caches run unscaled: under an FP8 KV cache the file is accepted only when every factor is 1.0 (other KV dtypes do not read it), and checkpoint KV-cache scales other than 1.0 are rejected at load. |
+| `--mamba-ssm-cache-dtype` | `--mamba-ssm-dtype` | Accepts `float32` (default) or `bfloat16`; there is no `auto` that follows the checkpoint. |
 
 ## Recipe translation notes
 

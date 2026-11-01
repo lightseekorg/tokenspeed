@@ -261,6 +261,25 @@ class IrisBackend(CommBackend):
             max_bytes=max_bytes,
         )
 
+    def all_reduce_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        group: Group,
+    ) -> torch.Tensor | None:
+        """Fuse CDNA4 all-reduce and mHC post when prepared Iris state permits.
+
+        Return None on other platforms, without state, or for ineligible operands.
+        """
+        if not current_platform().is_cdna4:
+            return None
+        state = self.state(group, tensor.dtype)
+        if state is None or not state.can_reduce_mhc_post(tensor, residual, post, comb):
+            return None
+        return state.all_reduce_symmetric_mhc_post(tensor, residual, post, comb)
+
     def can_reduce_outputs(
         self,
         tensors: tuple[torch.Tensor, ...],

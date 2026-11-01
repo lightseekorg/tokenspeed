@@ -57,6 +57,11 @@ static inline void launchKernel(bool enable_pdl, KernelFunc kernel, dim3 grid, d
     cudaLaunchKernelEx(&config, kernel, args...);
 }
 
+// In-place skip mode leaves greedy rows and rows that cut nothing as they are.
+__device__ __forceinline__ bool isSkippedRow(int32_t k, float p, int32_t max_topk) {
+    return k == 1 || (k > max_topk && p >= 1.0f);
+}
+
 // Per-row init: mark `counter.skip = 1` for rows whose top_k exceeds the
 // MAX_K bound (mode 3.2). The radix kernels in air_topk_stable.cuh check this
 // flag at the top and return immediately, so the entire stage 1 pipeline does
@@ -88,12 +93,14 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
     T const* __restrict__ probs,
     float const* __restrict__ top_p_arr,
     int32_t const* __restrict__ top_k_arr,
-    int32_t max_topk) {
+    int32_t max_topk,
+    bool in_place_skip) {
     int const b = blockIdx.x;
     if (b >= batch_size) return;
     int32_t const k = top_k_arr[b];
     float const p = top_p_arr[b];
-    bool const topp_active = (k > max_topk);
+    bool const skipped = in_place_skip && isSkippedRow(k, p, max_topk);
+    bool const topp_active = (k > max_topk) && !skipped;
 
     // Set topk counter fields (thread 0). The radix kernels reset most fields
     // themselves between passes — only `skip` matters for short-circuiting.
@@ -103,7 +110,7 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
         tkc->len = 0;
         tkc->previous_len = 0;
         tkc->kth_value_bits = 0;
-        tkc->skip = topp_active ? 1 : 0;
+        tkc->skip = (topp_active || skipped) ? 1 : 0;
         tkc->filter_cnt = 0;
         tkc->out_cnt = 0;
         tkc->out_back_cnt = 0;
@@ -115,7 +122,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
         auto* tpc = topp_counters + b;
         tpc->in = probs + static_cast<size_t>(b) * vocab_size;
         tpc->oriLen = vocab_size;
-        tpc->len = topp_active ? vocab_size : 0;
+        // Apply uses threshold zero for P >= 1 and still renormalizes the row.
+        // Skip only the unused top-p radix work; retain the top-k skip routing.
+        tpc->len = (topp_active && p < 1.0f) ? vocab_size : 0;
         tpc->previousLen = vocab_size;
         tpc->p = topp_active ? p : 0.0f;
         tpc->totalSum = 0.0f;
@@ -124,6 +133,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
         tpc->finishedBlockCnt = 0;
         tpc->filterCnt = 0;
     }
+
+    // Neither radix reads a skipped row's histograms.
+    if (skipped) return;
 
     // Zero topk histograms (per row).
     IdxT* tk_hist = topk_histograms + static_cast<size_t>(b) * TOPK_NUM_BUCKETS;
@@ -333,7 +345,8 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize) {
 // 16B-aligned (both bases 16B-aligned and vocab_size % 4 == 0), so the top-p
 // V-scan can use float4 loads/stores with no peel. Decided host-side in
 // invokeFusedTopKTopP; see the mode 3.2 branch.
-template <int BLOCK_SIZE, int ITEMS_PER_THREAD, bool ROWS_ALIGNED>
+// IN_PLACE: probs is unused (__restrict__ holds); cut rows write their zeros, skipped rows exit.
+template <int BLOCK_SIZE, int ITEMS_PER_THREAD, bool ROWS_ALIGNED, bool IN_PLACE>
 __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     float const* __restrict__ probs,
     float const* __restrict__ top_k_vals,
@@ -354,6 +367,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     const int b = blockIdx.x;
     const int32_t k_raw = top_ks[b];
     const float p = top_ps[b];
+    if constexpr (IN_PLACE) {
+        if (isSkippedRow(k_raw, p, max_k)) return;
+    }
 
     // Packed (val ↓, idx ↑) uint64 sort. Upper 32 bits = twiddle_in(val, false)
     // so ascending uint order == descending val order; lower 32 bits = idx so
@@ -383,6 +399,24 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
         __shared__ float s_cumsum[MAX_K];
         __shared__ int s_cutoff_j;
         __shared__ float s_inv_factor;
+
+        if constexpr (IN_PLACE) {
+            // In place: clear the row (the sort's barriers order the scatter after it).
+            float* row = out_probs + static_cast<size_t>(b) * vocab_size;
+            const int head = min(
+                static_cast<int>(((16u - (reinterpret_cast<uintptr_t>(row) & 15u)) & 15u) >> 2),
+                vocab_size);
+            const int vec_count = (vocab_size - head) >> 2;
+            const int tail_start = head + vec_count * 4;
+            if (static_cast<int>(threadIdx.x) < head) row[threadIdx.x] = 0.0f;
+            float4* row_v = reinterpret_cast<float4*>(row + head);
+            for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
+                row_v[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            if (tail_start + static_cast<int>(threadIdx.x) < vocab_size) {
+                row[tail_start + threadIdx.x] = 0.0f;
+            }
+        }
 
         // Build packed keys, sort ascending → descending val, ascending idx on ties.
         uint64_t t_keys[ITEMS_PER_THREAD];
@@ -463,7 +497,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
 
         const int cutoff = s_cutoff_j;
         const float inv = s_inv_factor;
-        float* out_row = out_probs + b * vocab_size;
+        float* out_row = out_probs + static_cast<size_t>(b) * vocab_size;
         for (int i = threadIdx.x; i <= cutoff; i += BLOCK_SIZE) {
             const int idx = s_idx[i];
             if (static_cast<unsigned>(idx) < static_cast<unsigned>(vocab_size)) {
@@ -496,8 +530,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 ? 0.0f
                 : air_top_p::twiddleOut<float>(topp_counters[b].kthValueBits, false);
 
-        float const* in_row = probs + b * vocab_size;
-        float* out_row = out_probs + b * vocab_size;
+        float const* in_row = (IN_PLACE ? out_probs : probs) + static_cast<size_t>(b) * vocab_size;
+        float* out_row = out_probs + static_cast<size_t>(b) * vocab_size;
 
         if constexpr (ROWS_ALIGNED) {
             // Every row base is 16B-aligned and in phase: no peel, no tail.
@@ -533,7 +567,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 o4.y = (v4.y >= threshold) ? v4.y * inv : 0.0f;
                 o4.z = (v4.z >= threshold) ? v4.z * inv : 0.0f;
                 o4.w = (v4.w >= threshold) ? v4.w * inv : 0.0f;
-                if (o4.x != 0.0f || o4.y != 0.0f || o4.z != 0.0f || o4.w != 0.0f) {
+                if (IN_PLACE || o4.x != 0.0f || o4.y != 0.0f || o4.z != 0.0f || o4.w != 0.0f) {
                     out_row_v[i] = o4;
                 }
             }
@@ -593,7 +627,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
 
             for (int i = threadIdx.x; i < head_end; i += BLOCK_SIZE) {
                 float v = in_row[i];
-                if (v >= threshold) out_row[i] = v * inv;
+                if (IN_PLACE || v >= threshold) out_row[i] = (v >= threshold) ? v * inv : 0.0f;
             }
             for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
                 float4 v4 = in_row_v[i];
@@ -602,10 +636,11 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 o4.y = (v4.y >= threshold) ? v4.y * inv : 0.0f;
                 o4.z = (v4.z >= threshold) ? v4.z * inv : 0.0f;
                 o4.w = (v4.w >= threshold) ? v4.w * inv : 0.0f;
-                if (o4.x != 0.0f || o4.y != 0.0f || o4.z != 0.0f || o4.w != 0.0f) {
+                if (IN_PLACE || o4.x != 0.0f || o4.y != 0.0f || o4.z != 0.0f || o4.w != 0.0f) {
                     if (store_vec) {
                         out_row_v[i] = o4;
                     } else {
+                        // Out of place only: in place, in_row == out_row (store_vec).
                         float* o = out_row + head_end + i * 4;
                         if (o4.x != 0.0f) o[0] = o4.x;
                         if (o4.y != 0.0f) o[1] = o4.y;
@@ -616,7 +651,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
             }
             for (int i = tail_start + threadIdx.x; i < vocab_size; i += BLOCK_SIZE) {
                 float v = in_row[i];
-                if (v >= threshold) out_row[i] = v * inv;
+                if (IN_PLACE || v >= threshold) out_row[i] = (v >= threshold) ? v * inv : 0.0f;
             }
         }
     }
@@ -625,7 +660,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
 void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float const* topPs,
                         float* outProbs, void* workspace, SizeType32 batchSize,
                         SizeType32 vocabSize, cudaStream_t mainStream,
-                        cudaStream_t memsetStream, bool enable_pdl) {
+                        cudaStream_t memsetStream, bool enable_pdl, bool inPlaceSkip) {
     // ── Workspace partitioning ──────────────────────────────────────────────
     size_t airTopkWS = airTopKWorkspaceBytes(batchSize, vocabSize);
     std::vector<size_t> sizes = {
@@ -662,8 +697,10 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     }
 
     // ── Stage 0b: zero-fill outProbs on side stream (overlaps with stage 1) ─
-    cudaMemsetAsync(outProbs, 0,
-                    sizeof(float) * static_cast<size_t>(batchSize) * vocabSize, msStream);
+    if (!inPlaceSkip) {  // In place, the apply kernel writes the zeros instead.
+        cudaMemsetAsync(outProbs, 0,
+                        sizeof(float) * static_cast<size_t>(batchSize) * vocabSize, msStream);
+    }
 
     // ── Stage 1a: unified init kernel — sets up topk skip flags, topp counter
     //              fields, and zeros both stages' histograms in one launch.
@@ -691,7 +728,7 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
                  unifiedInitKernel<float, int32_t, air_top_p::NUM_BUCKETS, TOPK_NUM_BUCKETS>,
                  dim3(batchSize), dim3(256), 0, mainStream, topkCounters, topkHistograms,
                  toppCounters, toppHistograms, toppCountHistograms, batchSize, vocabSize, probs,
-                 topPs, topKs, K_TOPK_MAX);
+                 topPs, topKs, K_TOPK_MAX, inPlaceSkip);
 
     // ── Stage 2 on side stream (parallel with stage 1 on main) ──────────────
     // Run the topp radix on the side stream so it overlaps with the topk
@@ -742,7 +779,11 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     const bool rowsAligned = (reinterpret_cast<uintptr_t>(probs) & 0xFu) == 0 &&
                              (reinterpret_cast<uintptr_t>(outProbs) & 0xFu) == 0 &&
                              (vocabSize % 4 == 0);
-    auto applyFn = rowsAligned ? applyKernel<128, 1, true> : applyKernel<128, 1, false>;
+    auto applyFn = inPlaceSkip
+                       ? (rowsAligned ? applyKernel<128, 1, true, true>
+                                      : applyKernel<128, 1, false, true>)
+                       : (rowsAligned ? applyKernel<128, 1, true, false>
+                                      : applyKernel<128, 1, false, false>);
     launchKernel(enable_pdl, applyFn, dim3(batchSize), dim3(128), 0, mainStream,
                  probs, topKVals, topKIdx, topKs, topPs, toppCounters, outProbs, vocabSize,
                  K_TOPK_MAX, enable_pdl);

@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_grouped_sigmoid_topk
 from tokenspeed_kernel.ops.moe import flashinfer as module
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (
@@ -172,10 +173,10 @@ def _logits(generator: torch.Generator, tokens: int) -> torch.Tensor:
 
 def _routing(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """The route weights and ids the fused kernel selects for these logits."""
-    scores = torch.sigmoid(logits)
-    ids = scores.topk(TOPK, dim=-1).indices.to(torch.int32)
-    weights = scores.gather(1, ids.long())
-    return weights / weights.sum(dim=-1, keepdim=True), ids
+    ids, weights = torch_grouped_sigmoid_topk(
+        logits, torch.zeros(logits.shape[1], device=logits.device), TOPK, 1, 1, 1.0
+    )
+    return weights, ids.to(torch.int32)
 
 
 def _quantized(
@@ -254,27 +255,30 @@ def test_prepared_routing_reproduces_the_fused_launch_bitwise(
     assert torch.equal(split[1], fused_weights)
 
 
-def test_prepared_routing_replays_new_top_k_under_a_graph() -> None:
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_prepared_routing_replays_new_top_k_under_a_graph(enable_pdl: bool) -> None:
     tokens = 2
     generator = torch.Generator(device="cuda").manual_seed(7)
     w = _weights(generator)
     x_quantized = _quantized(generator, tokens)
     logits = _logits(generator, tokens)
     weights, ids = _routing(logits)
-    prepared = module.prepare_nvfp4_routing(w, x_quantized, ids, weights, None, False)
+    prepared = module.prepare_nvfp4_routing(
+        w, x_quantized, ids, weights, None, enable_pdl
+    )
     _populate(prepared, logits)
-    _apply(w, x_quantized, weights, ids, False, prepared)
+    _apply(w, x_quantized, weights, ids, enable_pdl, prepared)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         weights, ids = _populate(prepared, logits)
-        split = _apply(w, x_quantized, weights, ids, False, prepared)
+        split = _apply(w, x_quantized, weights, ids, enable_pdl, prepared)
     for seed in (11, 12):
         logits.copy_(_logits(torch.Generator(device="cuda").manual_seed(seed), tokens))
         graph.replay()
         replayed = _rows(split, tokens).clone()
         torch.cuda.synchronize()
-        fused = _apply(w, x_quantized, *_routing(logits), False, None)
+        fused = _apply(w, x_quantized, *_routing(logits), enable_pdl, None)
         assert torch.equal(replayed, _rows(fused, tokens))
 
 

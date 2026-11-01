@@ -36,35 +36,16 @@ from tokenspeed.runtime.models.qwen3_audio import Qwen3AudioEncoder
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
 
 
 class Qwen3ASRForConditionalGeneration(nn.Module):
     """Qwen3 dense language model plus the shared Qwen audio tower."""
-
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
 
     def __init__(
         self,
@@ -136,25 +117,6 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 make_warmup_items=self.audio_tower.make_warmup_items,
             )
         }
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
-
-    @property
-    def start_layer(self) -> int:
-        return int(getattr(self.language_model.model, "start_layer", 0))
-
-    @property
-    def end_layer(self) -> int:
-        return int(
-            getattr(
-                self.language_model.model,
-                "end_layer",
-                self.thinker_config.text_config.num_hidden_layers,
-            )
-        )
 
     @property
     def lm_head(self):

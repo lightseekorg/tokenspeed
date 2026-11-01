@@ -50,7 +50,7 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3DraftAttentionMLA,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
@@ -236,7 +236,6 @@ class KimiK3ModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        self.vocab_size = config.vocab_size
 
         from tokenspeed.runtime.layers.vocab_parallel_embedding import (
             VocabParallelEmbedding,
@@ -275,15 +274,11 @@ class KimiK3ModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if captured_hidden_states is None:
             raise ValueError("Kimi-K3 NextN requires captured_hidden_states.")
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids)
 
         hidden_states = self.eh_proj(
             torch.cat(
@@ -521,10 +516,7 @@ class KimiK3NextNForCausalLM(nn.Module):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        attn = self.model.decoder.self_attn
-        attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(
-            attn.kv_b_proj.weight, attn
-        )
+        absorb_mla_kv_b_proj(self.model.decoder.self_attn)
 
 
 class KimiK3ForConditionalGenerationNextN(nn.Module):

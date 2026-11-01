@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -10,15 +11,10 @@ from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize
 from tokenspeed_kernel.platform import current_platform
 
 # E2M1 code points, in the packed nibble order.
-_MXFP4_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
 
 
 def _dequantize(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    table = torch.tensor(_MXFP4_VALUES, device=packed.device, dtype=torch.float32)
-    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
-    values = table[codes.long()]
-    scales = torch.exp2(scale.float() - 127).repeat_interleave(32, dim=-1)
-    return (values * scales).to(torch.bfloat16)
+    return dequantize_mxfp4(packed, scale).to(torch.bfloat16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -87,7 +83,10 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
+    plan["precision_policy"] = "default"
+    plan["output_scale"] = 1.0
     kernel_moe_process_weights(plan, weights)
     actual = kernel_moe_apply(
         plan,
@@ -125,11 +124,8 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_output = F.linear(intermediate_dequant, w2_dequant[expert_id]).to(
             torch.bfloat16
         )
-        expected.index_add_(
-            0,
-            token_ids,
-            expert_output.float() * topk_weights[token_ids, slots, None],
-        )
+        weighted = expert_output.float() * topk_weights[token_ids, slots, None]
+        expected.index_add_(0, token_ids, weighted)
 
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
 
@@ -190,6 +186,7 @@ def test_triton_mxfp4_moe_defers_local_ep_routes() -> None:
         persistent_max_num_tokens_per_gpu=None,
         fast_math=False,
         combine_order="rank",
+        features=frozenset(),
         solution="triton",
     )
     assert plan["supports_deferred_finalize"] is True

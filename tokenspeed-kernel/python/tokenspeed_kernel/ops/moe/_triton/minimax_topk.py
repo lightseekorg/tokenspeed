@@ -193,6 +193,7 @@ def minimax_biased_grouped_topk(
     num_token_non_padded: Optional[torch.Tensor] = None,
     logical_to_physical_map: Optional[torch.Tensor] = None,
     weights_dtype: torch.dtype = torch.float32,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     if (
         gating_output.ndim != 2
@@ -207,6 +208,8 @@ def minimax_biased_grouped_topk(
         or routed_scaling_factor is None
         or num_token_non_padded is not None
     ):
+        if out is not None:
+            raise ValueError("Routing output buffers require fused single-group top-k")
         ref_w, ref_i = _biased_grouped_topk_reference(
             hidden_states,
             gating_output,
@@ -223,12 +226,15 @@ def minimax_biased_grouped_topk(
         return ref_w.to(weights_dtype), ref_i
 
     num_tokens, num_experts = gating_output.shape
-    topk_weights = torch.empty(
-        (num_tokens, topk), dtype=weights_dtype, device=gating_output.device
-    )
-    topk_ids = torch.empty(
-        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
+    if out is None:
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=weights_dtype, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+    else:
+        topk_weights, topk_ids = out
     if num_tokens == 0:
         return topk_weights, topk_ids
 

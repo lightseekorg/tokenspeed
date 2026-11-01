@@ -135,8 +135,46 @@ public:
     }
 
     template <typename State>
+    State* GetIf() {
+        return std::get_if<State>(&state_);
+    }
+
+    template <typename State>
     const State* GetIf() const {
         return std::get_if<State>(&state_);
+    }
+
+    fsm::AdmissionResources* AdmissionResourcesPtr() {
+        return std::visit(
+            [](auto& state) -> fsm::AdmissionResources* {
+                using State = std::remove_cvref_t<decltype(state)>;
+                if constexpr (std::same_as<State, fsm::Prefetching>) {
+                    return &state.Admission();
+                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping>) {
+                    return &state.admission;
+                }
+                return nullptr;
+            },
+            state_);
+    }
+
+    const fsm::AdmissionResources* AdmissionResourcesPtr() const {
+        return std::visit(
+            [](const auto& state) -> const fsm::AdmissionResources* {
+                using State = std::remove_cvref_t<decltype(state)>;
+                if constexpr (std::same_as<State, fsm::Prefetching>) {
+                    return &state.Admission();
+                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping>) {
+                    return &state.admission;
+                }
+                return nullptr;
+            },
+            state_);
+    }
+
+    bool AwaitsBootstrap() const {
+        const auto* prefetch = GetIf<fsm::Prefetching>();
+        return Is<fsm::Bootstrapping>() || (prefetch != nullptr && prefetch->AwaitsBootstrap());
     }
 
     // True in every state that carries ForwardResources; Bootstrapping,
@@ -180,6 +218,9 @@ public:
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
+    // Immutable input-page identities, owned by this request. Admission may
+    // retry against changing cache contents without hashing the input again.
+    std::span<const std::string> PromptPrefixHashes();
     std::span<const std::int32_t> TokenSlice(std::int32_t begin, std::int32_t size) const {
         return token_container_.TokenSlice(TokenContainer::Window{.begin = begin, .size = size});
     }
@@ -285,6 +326,7 @@ private:
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
+    std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
     fsm::State state_;
 };
 

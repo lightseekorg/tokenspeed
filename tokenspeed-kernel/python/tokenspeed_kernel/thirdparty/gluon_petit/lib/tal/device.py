@@ -17,8 +17,8 @@ from functools import cache
 from hashlib import sha256
 from pathlib import Path
 
-import triton.experimental.gluon as g
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 @cache

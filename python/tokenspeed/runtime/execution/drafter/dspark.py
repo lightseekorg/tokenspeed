@@ -87,7 +87,7 @@ class DSpark(DFlash):
         Returns ``[positions, rows, org_vocab_shard]``, or None when the head
         has no shard metadata and the caller must take its own path.
         """
-        head = getattr(self, "lm_head", None)
+        head = self.lm_head
         if head is None:
             return None
         if not hasattr(head, "weight") or not hasattr(head, "shard_indices"):

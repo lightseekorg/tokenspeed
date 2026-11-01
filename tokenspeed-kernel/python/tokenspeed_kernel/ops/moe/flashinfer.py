@@ -90,6 +90,7 @@ if platform.is_nvidia:
         ep_size: int,
         ep_rank: int,
         device: torch.device,
+        use_fused_finalize: bool,
     ) -> torch.Tensor:
         """The device's persistent workspace, grown (and re-zeroed) on demand.
 
@@ -107,6 +108,8 @@ if platform.is_nvidia:
             ep_size: Expert-parallel width.
             ep_rank: This rank's expert-parallel coordinate.
             device: CUDA device the call runs on.
+            use_fused_finalize: Whether GEMM2 atomically reduces expert outputs
+                in its epilogue. Must match the actual MoE call.
 
         Returns:
             A 1-D ``uint8`` CUDA tensor of at least the bytes
@@ -128,6 +131,7 @@ if platform.is_nvidia:
             ep_size=ep_size,
             ep_rank=ep_rank,
             device=device,
+            use_fused_finalize=use_fused_finalize,
         )
         workspace = _workspaces.get(device)
         if workspace is None or workspace.numel() < needed:
@@ -190,6 +194,7 @@ if platform.is_nvidia:
         ep_rank = getattr(w, "ep_rank", 0)
         tp_size = getattr(w, "tp_size", 1)
         tp_rank = getattr(w, "tp_rank", 0)
+        use_fused_finalize = plan["cutlass_fused_finalize"]
         workspace = cutlass_unquant_moe_workspace(
             num_tokens=x.shape[0],
             hidden_size=w.w2_weight.shape[1],
@@ -203,6 +208,7 @@ if platform.is_nvidia:
             ep_size=ep_size,
             ep_rank=ep_rank,
             device=x.device,
+            use_fused_finalize=use_fused_finalize,
         )
         return cutlass_fused_moe(
             input=x,
@@ -223,6 +229,9 @@ if platform.is_nvidia:
             # identical call is clean). Keep the chain fully serialized until
             # the flashinfer kernels are fixed.
             enable_pdl=False,
+            # Fused GEMM2 finalize uses floating-point atomics; changing their
+            # arrival order changes the reduction's rounding across calls.
+            use_fused_finalize=use_fused_finalize,
             workspace_buffer=workspace,
         )[0]
 
@@ -1386,6 +1395,7 @@ if platform.is_nvidia:
             None,
             spec.top_k,
             enable_pdl=enable_pdl,
+            hidden_dim=gemm2_out.shape[1],
         )
 
     _FP8_CHANNEL_TRAITS = {
@@ -1968,6 +1978,7 @@ if platform.is_nvidia:
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
+    from flashinfer.cute_dsl import is_cute_dsl_available
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
@@ -2239,12 +2250,13 @@ if platform.is_nvidia:
         router_logits: torch.Tensor,
         x_quant: torch.Tensor,
         x_scale: torch.Tensor | None,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
         enable_pdl: bool,
-    ) -> torch.Tensor:
+        do_finalize: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         routing_logits = router_logits.to(torch.float32)
         num_experts, local_experts, local_expert_offset = _local_expert_range(w)
-        return trtllm_fp4_block_scale_moe(
+        result = trtllm_fp4_block_scale_moe(
             routing_logits=routing_logits,
             routing_bias=None,
             hidden_states=x_quant,
@@ -2272,11 +2284,16 @@ if platform.is_nvidia:
             local_num_experts=local_experts,
             routed_scaling_factor=None,
             routing_method_type=1,
-            do_finalize=True,
+            do_finalize=do_finalize,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output,
             enable_pdl=enable_pdl,
-        )[0]
+        )
+        return (
+            result[0]
+            if do_finalize
+            else _normalize_kernel_routing_deferred_result(result)
+        )
 
     def _call_mxfp4_routed_moe(
         w: torch.nn.Module,
@@ -2330,6 +2347,33 @@ if platform.is_nvidia:
         )
         return output if do_finalize else result
 
+    # FP16 shared-expert output cannot use the BF16-only common finalizer.
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_mxfp4_fp16_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_mxfp4_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures("x", "dense", {torch.float16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
+            "topk_weights_dtype": frozenset({torch.bfloat16}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
     @register_kernel(
         "moe",
         "apply",
@@ -2341,16 +2385,13 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
         ),
-        signatures=format_signatures(
-            "x",
-            "dense",
-            {torch.float16, torch.bfloat16},
-        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
+            "topk_weights_dtype": frozenset({torch.bfloat16}),
+            "supports_deferred_finalize": frozenset({True, False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
@@ -2374,7 +2415,13 @@ if platform.is_nvidia:
         hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
         hidden_original = getattr(w, "hidden_size_original", hidden_padded)
         if x.shape[0] == 0:
-            return x.new_empty(0, hidden_original)
+            if do_finalize:
+                return x.new_empty(0, hidden_original)
+            return (
+                x.new_empty((0, hidden_padded), dtype=torch.bfloat16),
+                x.new_empty((0, w.top_k), dtype=torch.bfloat16),
+                x.new_empty((0,), dtype=torch.int32),
+            )
 
         precision = plan.get(
             "flashinfer_trtllm_moe_precision",
@@ -2393,11 +2440,21 @@ if platform.is_nvidia:
                     value=0.0,
                 )
         elif precision == "default":
+            # Use CuTe across batch sizes. Its padding path adds a zero-fill
+            # and copy, so keep native padding.
+            quant_backend = (
+                "cute-dsl"
+                if x.shape[-1] == hidden_padded
+                and x.is_contiguous()
+                and is_cute_dsl_available()
+                else "cuda"
+            )
             x_quant, x_scale = mxfp8_quantize(
                 x,
                 False,
                 enable_pdl=enable_pdl,
                 alignment=hidden_padded,
+                backend=quant_backend,
             )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
         else:
@@ -2413,8 +2470,12 @@ if platform.is_nvidia:
         h_dim = (
             x_quant.shape[-1] * 2 if x_quant.dtype == torch.uint8 else x_quant.shape[-1]
         )
-        output = torch.empty(
-            x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
+        output = (
+            torch.empty(
+                x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
+            )
+            if do_finalize
+            else None
         )
 
         if (topk_weights is None) != (topk_ids is None):
@@ -2428,13 +2489,15 @@ if platform.is_nvidia:
                 output,
                 enable_pdl,
                 x_scale,
-                True,
+                do_finalize,
                 ActivationType.Swiglu,
             )
         else:
             result = _call_mxfp4_moe(
-                w, router_logits, x_quant, x_scale, output, enable_pdl
+                w, router_logits, x_quant, x_scale, output, enable_pdl, do_finalize
             )
+        if not do_finalize:
+            return result
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()
         return result
@@ -2443,8 +2506,8 @@ if platform.is_nvidia:
         gemm2_output, expert_weights, expanded_idx = result
         if expert_weights.dtype == torch.float32:
             # FlashInfer allocates this buffer using routing_logits.dtype, but
-            # TRT-LLM's DeepSeekV3 router writes packed BF16 values into its
-            # live prefix. Recover the BF16 view expected by the latent tail.
+            # TRT-LLM's in-kernel routers write packed BF16 values into its
+            # live prefix. Recover the BF16 view deferred consumers expect.
             num_tokens, top_k = expert_weights.shape
             expert_weights = expert_weights.view(torch.bfloat16).view(-1, top_k)[
                 :num_tokens
@@ -2590,6 +2653,7 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"mxfp4"}),
             "activation": frozenset({"situ"}),
             "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
+            "topk_weights_dtype": frozenset({torch.bfloat16}),
             "supports_deferred_finalize": frozenset({True, False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
@@ -3196,6 +3260,7 @@ if platform.is_nvidia:
     )
     from flashinfer.fused_moe.da_moe import DABody
     from flashinfer.tllm_enums import ActivationType
+    from flashinfer.utils import device_support_pdl
     from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
         trtllm_fp4_block_scale_moe as tokenspeed_trtllm_fp4_block_scale_moe,
     )
@@ -3502,8 +3567,7 @@ if platform.is_nvidia:
             local_expert_offset=spec.ep_rank * spec.num_local_experts,
             routed_scaling_factor=None,
             routing_method_type=0,
-            enable_pdl=enable_pdl
-            and _fi_core._device_support_moe_pdl(w.g1_alphas.device),
+            enable_pdl=enable_pdl and device_support_pdl(w.g1_alphas.device),
             do_finalize=False,
             activation_type=activation_type,
             num_fused_shared_experts=0,
@@ -3878,7 +3942,7 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
         ),
         signatures=format_signatures(
             "x",
@@ -3934,7 +3998,7 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
         ),
         signatures=format_signatures(
             "x",

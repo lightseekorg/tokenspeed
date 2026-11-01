@@ -46,6 +46,7 @@ import torch
 from tokenspeed_kernel.ops.attention.gdn import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    GdnStateCheckpoints,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import l2norm_fwd
 from tokenspeed_kernel.platform import (
@@ -81,8 +82,11 @@ if platform.is_hopper_plus:
 def is_available() -> bool:
     """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    # FlashInfer provides separate SM90 and Blackwell prefill kernels.
-    return (platform.is_hopper or platform.is_blackwell) and cuda_major >= 13
+    # Older FlashInfer wheels lack the separate Rubin implementation.
+    supported_arch = platform.is_hopper or platform.is_blackwell
+    if platform.arch_version == ArchVersion(10, 7):
+        supported_arch = _flashinfer_gdn.is_rubin_prefill_available()
+    return supported_arch and cuda_major >= 13
 
 
 def is_supported(
@@ -118,7 +122,7 @@ if is_available():
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
@@ -129,6 +133,7 @@ if is_available():
             "num_v_gte_num_q": frozenset({True}),
             "output_h": frozenset({False, True}),
             "qk_l2norm": frozenset({False, True}),
+            "state_checkpoints": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_chunk_prefill(
@@ -144,8 +149,9 @@ if is_available():
         qk_l2norm: bool = False,
         output_final_state: bool = True,
         output_h: bool = False,
+        state_checkpoints: GdnStateCheckpoints | None = None,
     ):
-        """Run one chunked GDN prefill on Hopper or Blackwell.
+        """Run one chunked GDN prefill on Hopper, Blackwell or Rubin.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
         g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the
@@ -167,6 +173,10 @@ if is_available():
 
         The caller indexes directly with flashinfer-native offsets rather than
         rebuilding the FLA h tensor.
+
+        ``state_checkpoints`` hands the kernel a caller-owned float32 buffer
+        and its cumulative counts instead (``GdnStateCheckpoints``): no host
+        synchronization, any interval that is a multiple of 64.
         """
         batched = q.dim() == 4
         q3 = q.squeeze(0) if batched else q
@@ -187,8 +197,25 @@ if is_available():
         # only a dtype cast + contiguity are needed, no transpose.
         fi_initial_state = initial_state.float().contiguous()
 
-        state_checkpoints = None
+        checkpoint_every_n_tokens = CHUNK_SIZE if output_h else 0
+        checkpoint_states = None
         checkpoint_cu_starts = None
+        if state_checkpoints is not None:
+            if output_h:
+                raise ValueError("output_h and state_checkpoints are exclusive")
+            if (
+                state_checkpoints.every_n_tokens <= 0
+                or state_checkpoints.every_n_tokens % CHUNK_SIZE
+            ):
+                raise ValueError(
+                    "state checkpoint interval must be a positive multiple of "
+                    f"{CHUNK_SIZE}, got {state_checkpoints.every_n_tokens}"
+                )
+            if state_checkpoints.states.dtype != torch.float32:
+                raise ValueError("state checkpoints are stored as float32")
+            checkpoint_every_n_tokens = state_checkpoints.every_n_tokens
+            checkpoint_states = state_checkpoints.states
+            checkpoint_cu_starts = state_checkpoints.cu_starts
         if output_h:
             per_seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
             # flashinfer-native checkpoint count: only full chunks emit a checkpoint.
@@ -197,7 +224,7 @@ if is_available():
             H_state = fi_initial_state.shape[1]
             V_state = fi_initial_state.shape[-2]
             K_state = fi_initial_state.shape[-1]
-            state_checkpoints = torch.empty(
+            checkpoint_states = torch.empty(
                 total_h_ckpts,
                 H_state,
                 V_state,
@@ -222,9 +249,9 @@ if is_available():
             initial_state=fi_initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            state_checkpoints=state_checkpoints,
+            state_checkpoints=checkpoint_states,
             checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             # WORKAROUND: FlashInfer 0.6.18's CP cache uses the stale
             # cute.compile[...] syntax, which CUTLASS DSL 4.7.1 no longer
             # supports. Remove this when custom_compile_cache is fixed
@@ -250,7 +277,7 @@ if is_available():
         return GdnChunkPrefillResult(
             out=out,
             final_state=final_state,
-            h=state_checkpoints,
+            h=checkpoint_states,
             h_cu_starts=checkpoint_cu_starts,
             h_layout=GdnCheckpointLayout.FLASHINFER,
         )
@@ -280,6 +307,9 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            # Automatic selection must preserve the arena's null state. The
+            # legacy BF16 implementation redirects negative indices to row 0.
+            "state_dtype": frozenset({torch.float32}),
             "strided_qkv": frozenset({False}),
         },
     )
@@ -350,6 +380,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "state_dtype": frozenset({torch.float32}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False}),
         },
@@ -473,3 +504,96 @@ if is_decode_available():
             use_qk_l2norm=use_qk_l2norm,
         )
         return out.to(q.dtype)
+
+
+_rubin = None
+if current_platform().arch_version == ArchVersion(10, 7):
+    from tokenspeed_kernel.thirdparty.flashinfer import gdn_rubin as _rubin
+
+
+def is_rubin_decode_available() -> bool:
+    """Whether PR6604 is installed on an SM107 GPU."""
+    return _rubin is not None and _rubin.is_available()
+
+
+flashinfer_rubin_gdn_decode_step = error_fn
+
+if is_rubin_decode_available():
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_step",
+        name="flashinfer_rubin_gdn_decode_step",
+        solution="flashinfer_rubin",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({128}),
+            "value_head_dim": frozenset({128}),
+            "state_dtype": frozenset({torch.bfloat16}),
+            "strided_qkv": frozenset({False, True}),
+        },
+    )
+    def flashinfer_rubin_gdn_decode_step(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        dt_bias: torch.Tensor,
+        b: torch.Tensor,
+        initial_state: torch.Tensor,
+        initial_state_indices: torch.Tensor,
+        scale: float | None,
+        output_state_indices: torch.Tensor | None,
+        use_qk_l2norm: bool,
+    ) -> torch.Tensor:
+        """Update a K-last BF16 state pool and return ``[B, 1, HV, 128]``.
+
+        Q/K are ``[B, 1, H, 128]``; V is ``[B, 1, HV, 128]``. Gates a/b are
+        ``[B, 1, HV]`` and A_log/dt_bias are ``[HV]``. Strided projection rows
+        and page-strided pools are supported. Negative read or write indices
+        skip the row entirely, preserving the cache arena's null page.
+        ``output_state_indices=None`` writes to the read rows. ``scale=None``
+        means ``128**-0.5``; ``use_qk_l2norm`` selects normalization in kernel.
+        """
+        if q.shape[1] != 1 or q.shape[-1] != 128 or v.shape[-1] != 128:
+            raise ValueError("FlashInfer Rubin GDN requires T=1 and K=V=128")
+        if initial_state.dtype != torch.bfloat16 or q.dtype != torch.bfloat16:
+            raise ValueError("FlashInfer Rubin GDN requires BF16 inputs and state")
+        if v.shape[2] < q.shape[2] or v.shape[2] % q.shape[2]:
+            raise ValueError("FlashInfer Rubin GDN requires HV to be a multiple of H")
+        A_log, dt_bias = A_log.detach().float(), dt_bias.detach().float()
+        # Upstream's DLPack boundary requires 32-byte base alignment, including
+        # scalar gates. TP shards with 12 value heads can start a/b at +24 bytes.
+        # Keep aligned strided views; contiguous() alone cannot fix an unaligned
+        # view that PyTorch already considers contiguous (notably B=1).
+        q, k, v, a, b, A_log, dt_bias = (
+            (
+                tensor
+                if tensor.data_ptr() % 32 == 0
+                else tensor.clone(memory_format=torch.contiguous_format)
+            )
+            for tensor in (q, k, v, a, b, A_log, dt_bias)
+        )
+        return _rubin.gated_delta_rule_t1_rubin(
+            enable_pdl=pdl_enabled(),
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state_source=initial_state,
+            initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            scale=scale,
+        )

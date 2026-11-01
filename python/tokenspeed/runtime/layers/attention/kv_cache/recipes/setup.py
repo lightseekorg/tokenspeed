@@ -137,7 +137,7 @@ class CacheSetup:
     """One big model, one spec: target and draft layers share everything.
 
     Draft layers are continuation layers of the one merged model (global
-    layer ids ``num_target_layers..``, the DeepSeek-V4 MTP convention
+    layer ids ``num_target_layers..``, the DeepSeek MTP convention
     generalized): one plan, one arena, one contract, one pool.
     ``num_draft_layers`` is the only draft-specific fact, consumed at
     model-runner wiring time (a draft model's local layer ``i`` maps to
@@ -149,6 +149,8 @@ class CacheSetup:
     num_draft_layers: int
     cache_budget_bytes: int
     fixed_workspace_bytes: int
+    local_parent_limit: int
+    agreed_parent_limit: int
     # The linear backend verifies from paged state and owns the planned
     # ``fixed_workspace_bytes`` of verify staging.
     uses_paged_state_verify: bool

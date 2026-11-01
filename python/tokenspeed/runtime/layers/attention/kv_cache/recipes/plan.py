@@ -671,9 +671,12 @@ def _solve_packing(fields):
 
 def _packing_by_group_ratio(raw_by_group):
     largest_payload = max(raw_by_group.values())
+    # Parent bytes must be divisible by every packing count. Powers of two
+    # keep unconstrained byte ratios from inflating that alignment via LCM;
+    # exact page strides and recipe pins are applied by the caller afterward.
     return {
-        group_id: max(1, largest_payload // raw_by_group[group_id])
-        for group_id in raw_by_group
+        group_id: 1 << ((largest_payload // payload).bit_length() - 1)
+        for group_id, payload in raw_by_group.items()
     }
 
 

@@ -184,7 +184,6 @@ def _attn_config(layer_types, window) -> AttnConfig:
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=262144,
         max_bs=64,
@@ -312,12 +311,6 @@ def _resolve(path, caplog, platform_case=None, override_args="{}", **launch):
             "--kv-cache-dtype fp8_e4m3 is not BF16",
         ),
         (
-            {"prefix_granularity": 32},
-            None,
-            None,
-            "--prefix-granularity 32 is not a multiple of the leaf's 64-token pages",
-        ),
-        (
             {"numerics": "rl-bitwise"},
             None,
             None,
@@ -335,7 +328,6 @@ def _resolve(path, caplog, platform_case=None, override_args="{}", **launch):
         "default",
         "sm103",
         "fp8-kv",
-        "granularity-32",
         "rl-bitwise",
         "sm90",
         "mha-override",
@@ -345,9 +337,8 @@ def test_the_attention_default(
     checkpoints, caplog, monkeypatch, sm100, launch, platform_case, env, reason
 ):
     """An unset --attention-backend becomes the TRT-LLM leaf on NVIDIA SM100 to
-    SM103 for a BF16 KV cache of whole 64-token pages, --numerics auto and no
-    attention.mha_* override; elsewhere it stays unset, with one line naming
-    why."""
+    SM103 for a BF16 KV cache, --numerics auto and no attention.mha_* override;
+    elsewhere it stays unset, with one line naming why."""
     if env is not None:
         monkeypatch.setenv(kernel_override_env_key(*env), f"triton_{env[1]}")
     args = _resolve(checkpoints["beam"], caplog, platform_case, **launch)
@@ -438,14 +429,14 @@ def test_a_128_aligned_launcher_keeps_the_triton_moe_at_tp8(
 
 def test_explicit_backends_and_rl_bitwise_keep_their_choice(checkpoints, caplog, sm100):
     """An explicit backend is never replaced, and --numerics rl-bitwise folds
-    auto to aok before the MoE default is asked."""
+    auto available for capability-based expert planning."""
     args = _resolve(
         checkpoints["beam"], caplog, attention_backend="triton", moe_backend="triton"
     )
     assert (args.attention_backend, args.moe_backend) == ("triton", "triton")
     assert _lines(caplog, "attention") == _lines(caplog, "moe") == []
     args = _resolve(checkpoints["beam"], caplog, numerics="rl-bitwise")
-    assert args.moe_backend == "aok" and _lines(caplog, "moe") == []
+    assert args.moe_backend == "auto" and _lines(caplog, "moe") == []
 
 
 def test_other_models_and_the_drafter_are_not_asked(checkpoints, caplog, sm100):
@@ -664,8 +655,8 @@ def test_the_registered_tokenizer_loads_local_canonical_metadata(tmp_path):
 
 
 # ---------------------------------------------------------------- DFlash2 drafter
-def _drafter_config():
-    """Beam's drafter config (RoPE, window, block) on one small layer."""
+def _drafter_config(max_position_embeddings):
+    """Drafter config (RoPE, window, block) on one small layer."""
     return Qwen3Config(
         vocab_size=64,
         hidden_size=256,
@@ -674,7 +665,7 @@ def _drafter_config():
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=128,
-        max_position_embeddings=262144,
+        max_position_embeddings=max_position_embeddings,
         rope_theta=10000.0,
         use_sliding_window=True,
         sliding_window=4096,
@@ -688,6 +679,31 @@ def _drafter_config():
             "target_layer_ids": [0],
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("positions", "allow_override"),
+    [(262144, False), (262144, True), (1048576, False)],
+    ids=["synthetic-mismatch", "synthetic-override", "released-no-override"],
+)
+def test_the_drafter_context_limit_at_launch(
+    monkeypatch, tmp_path, positions, allow_override
+):
+    """Validate 1M serving from metadata without allocating RoPE tables."""
+    monkeypatch.delenv("TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", raising=False)
+    if allow_override:
+        monkeypatch.setenv("TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", "1")
+    config = _drafter_config(positions)
+    config.architectures = ["DFlash2BeamDraftModel"]
+    config.save_pretrained(tmp_path)
+    args = _server_args(tmp_path, max_model_len=1048576)
+    if positions < args.max_model_len and not allow_override:
+        with pytest.raises(ValueError, match="context_length.*1048576.*262144"):
+            _model_config(args, is_draft_worker=True)
+    else:
+        loaded = _model_config(args, is_draft_worker=True)
+        assert loaded.context_len == 1048576
+        assert loaded.hf_config.max_position_embeddings == positions
 
 
 def _beam(monkeypatch, max_model_len, draft_tokens=None, device="cpu"):
@@ -716,7 +732,7 @@ def test_the_draft_rope_table_covers_speculation_past_the_context(monkeypatch):
     blocks past the context: the table covers them and one more block, and
     keeps the checkpoint's rows bit for bit (built on one CPU thread, as the
     vectorized cos/sin round by the thread split)."""
-    monkeypatch.setitem(global_server_args_dict, "max_model_len", 262144)
+    monkeypatch.setitem(global_server_args_dict, "max_model_len", 128)
     import tokenspeed.runtime.layers.rotary_embedding as rotary_module
 
     # get_rope caches a table by its length only: build both tables here.
@@ -725,57 +741,54 @@ def test_the_draft_rope_table_covers_speculation_past_the_context(monkeypatch):
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        checkpoint = DFlash2DraftModel(_drafter_config(), mapping)
-        draft = DFlash2BeamDraftModel(_drafter_config(), mapping)
+        checkpoint = DFlash2DraftModel(_drafter_config(128), mapping)
+        draft = DFlash2BeamDraftModel(_drafter_config(128), mapping)
     finally:
         torch.set_num_threads(threads)
     attention = draft.layers[0].self_attn
     table = attention.rotary_emb.cos_sin_cache
-    assert table.shape[0] == 262144 + 4 * 16
+    assert table.shape[0] == 128 + 4 * 16
     assert attention.attn.rotary_emb is attention.rotary_emb
     reference = checkpoint.layers[0].self_attn.rotary_emb.cos_sin_cache
-    assert torch.equal(table[:262144], reference)
-    assert draft.config.max_position_embeddings == 262144
+    assert torch.equal(table[:128], reference)
+    assert draft.config.max_position_embeddings == 128
 
 
 def test_without_max_model_len_the_drafter_refuses_a_longer_target_context(
     monkeypatch,
 ):
-    """The server then takes the target's own context (Beam's 1M), past the
-    drafter's table: refused; a context the table covers is served."""
+    """A synthetic shorter drafter refuses the target context; a covered
+    context is served. Small tables exercise the same bounds as 1M serving."""
     monkeypatch.setitem(global_server_args_dict, "max_model_len", None)
-    draft = DFlash2BeamDraftModel(_drafter_config(), Mapping(rank=0, world_size=1))
+    draft = DFlash2BeamDraftModel(_drafter_config(128), Mapping(rank=0, world_size=1))
     target = _beam(monkeypatch, None)
     raw = tiny_config().to_dict()
     with pytest.raises(
         ValueError,
-        match="up to 262144 tokens of context.*--max-model-len 262144 or less",
+        match="up to 128 tokens of context.*--max-model-len 128 or less",
     ):
         draft.configure_target(
-            target, BeamConfig.from_dict(raw | {"max_position_embeddings": 1048576})
+            target, BeamConfig.from_dict(raw | {"max_position_embeddings": 256})
         )
     assert target.model.layers_to_capture == []
     draft.configure_target(
-        target, BeamConfig.from_dict(raw | {"max_position_embeddings": 262144})
+        target, BeamConfig.from_dict(raw | {"max_position_embeddings": 128})
     )
     assert target.model.layers_to_capture == [1]
 
 
-# --max-model-len past the checkpoint's 262144 needs
-# TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN; the table grows with it.
-@pytest.mark.parametrize(
-    ("max_model_len", "rows"), [(262144, 262208), (300000, 300064)]
-)
+# Small synthetic tables cover the native limit and an accepted override.
+@pytest.mark.parametrize(("max_model_len", "rows"), [(128, 192), (160, 224)])
 def test_the_drafter_serves_the_max_model_len_its_table_covers(
     monkeypatch, max_model_len, rows
 ):
     target = _beam(monkeypatch, max_model_len)
-    draft = DFlash2BeamDraftModel(_drafter_config(), Mapping(rank=0, world_size=1))
+    draft = DFlash2BeamDraftModel(_drafter_config(128), Mapping(rank=0, world_size=1))
     assert draft.layers[0].self_attn.rotary_emb.cos_sin_cache.shape[0] == rows
     draft.configure_target(
         target,
         BeamConfig.from_dict(
-            tiny_config().to_dict() | {"max_position_embeddings": 1048576}
+            tiny_config().to_dict() | {"max_position_embeddings": 256}
         ),
     )
     assert target.model.layers_to_capture == [1]

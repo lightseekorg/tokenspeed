@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_relu2
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 HIDDEN = 256
@@ -75,13 +77,20 @@ def _make_weights(generator: torch.Generator, num_experts: int):
 
 
 def _reference_moe(x, w13, w2, topk_ids, topk_weights):
-    x = x.float()
-    out = torch.zeros_like(x)
-    for e in topk_ids.unique().tolist():
-        act = torch.relu(x @ w13[e].float().t()).square().bfloat16().float()
-        weight = torch.where(topk_ids == e, topk_weights.float(), 0.0).sum(dim=-1)
-        out += weight[:, None] * (act @ w2[e].float().t())
-    return out
+    return torch_moe_experts(
+        x,
+        w13,
+        w2,
+        topk_ids,
+        topk_weights,
+        activation=torch_relu2,
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=torch.Tensor.bfloat16,
+        round_expert_output=None,
+        first_expert=0,
+    )
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -178,6 +187,7 @@ def test_moe_plan_selects_the_bf16_relu2_kernels(routing_mode):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     expected = {
         None: "flashinfer_trtllm_unquant_relu2_moe_apply",

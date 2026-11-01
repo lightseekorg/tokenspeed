@@ -28,6 +28,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 
 
 class _RuntimeStates:
@@ -158,6 +159,9 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         def prepare_target_forward(self, ctx):
             events.append("prepare-target")
 
+        def rewrite_verify_outputs(self, ctx, output_tokens, accept_lengths):
+            pass
+
         def run(self, **_kwargs):
             events.extend(("draft-write-0", "draft-write-1", "draft-return"))
             return torch.tensor([7], dtype=torch.int32)
@@ -189,13 +193,8 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         audit_logits=lambda *_args: None,
         merge_oov=lambda *_args: None,
     )
-    executor._run_target_forward = lambda *_args: SimpleNamespace(
-        next_token_logprobs=None,
-        input_token_logprobs=None,
-        input_top_logprobs_val=None,
-        input_top_logprobs_idx=None,
-        sampled_top_logprobs_val=None,
-        sampled_top_logprobs_idx=None,
+    executor._run_target_forward = lambda *_args: LogitsProcessorOutput(
+        next_token_logits=torch.zeros((1, 32)),
     )
     executor._run_sampling = lambda *_args: (
         torch.tensor([3], dtype=torch.int32),
@@ -350,8 +349,13 @@ def test_input_allocation_covers_decode(
         pass
 
     def check_allocation(
-        max_bs, max_num_tokens, state_write_padding_pool_index, device
+        max_bs,
+        max_num_tokens,
+        state_write_padding_pool_index,
+        device,
+        reads_state_checkpoints,
     ):
+        assert not reads_state_checkpoints
         assert max_bs == 160 // dp_size
         assert max_num_tokens == capacity
         raise AllocationChecked
@@ -370,6 +374,7 @@ def test_input_allocation_covers_decode(
         max_req_pool_size=161,
         spec_algo="EAGLE" if width > 1 else None,
         spec_num_tokens=width,
+        state_checkpoint_in_forward=False,
     )
     with pytest.raises(AllocationChecked):
         ModelExecutor(

@@ -68,6 +68,9 @@ from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.mxfp8_nvfp4 import (
+    preprocess_mxfp8_nvfp4_weights,
+)
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -79,12 +82,10 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -264,7 +265,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                     router_logits=router_logits,
                 )
 
-            deferred_finalize = self.experts.supports_deferred_finalize
+            deferred_finalize = self.experts.supports_deferred_cuda_finalize
             routed_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
@@ -286,6 +287,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
+                hidden_dim=hidden_states.shape[-1],
             )
         else:
             output = (
@@ -682,6 +684,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.layer_id = layer_id
+        self.is_final_layer = layer_id == config.num_hidden_layers - 1
         self.is_moe_layer = config.mlp_layer_types[layer_id] == "sparse"
         previous_is_moe_layer = (
             layer_id > 0 and config.mlp_layer_types[layer_id - 1] == "sparse"
@@ -763,9 +766,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
+        # In all-reduce mode the model's FinalNormOp reduces the last layer's
+        # MLP output, fused with the norm or not, so this layer must not reduce
+        # it as well. Idle forwards skip the final norm and keep this collective.
+        defer_to_final_norm = (
+            self.is_final_layer
+            and not ctx.forward_mode.is_idle()
+            and self.comm_manager.use_all_reduce(self.is_moe_layer)
         )
+        if not defer_to_final_norm:
+            hidden_states, residual = self.comm_manager.post_mlp_fused(
+                hidden_states, residual, ctx
+            )
         return hidden_states, residual
 
 
@@ -831,7 +843,7 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
     """MiniMax-M3 text model with checkpoint-compatible weight loading."""
 
     model_cls = MiniMaxM3Model
-    fall_back_to_pt_during_load = False
+    supports_aux_capture = True
 
     # Ordered checkpoint->parameter-dict renames applied by load_weights.
     checkpoint_name_replacements = (
@@ -860,6 +872,7 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
         weights: Iterable[tuple[str, torch.Tensor]],
         **kwargs,
     ) -> set[str]:
+        weights = preprocess_mxfp8_nvfp4_weights(weights, self.quant_config)
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
@@ -1514,15 +1527,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
         self.image_encoder = self.get_image_feature
         self.video_encoder = self.get_video_feature
 
-    def pad_input_ids(
-        self,
-        input_ids: list[int],
-        mm_inputs: MultimodalInputs,
-    ) -> list[int]:
-        """Replace media placeholders with content-derived prefix-cache IDs."""
-
-        return pad_input_tokens(input_ids, mm_inputs)
-
     def _get_vision_feature(
         self,
         items: list[MultimodalDataItem],
@@ -1681,7 +1685,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             ctx=multimodal_context,
             encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         hidden_states, aux_hidden_states = self.model(
             input_ids,

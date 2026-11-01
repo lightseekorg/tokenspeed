@@ -124,7 +124,7 @@ class _WindowAttention:
     def query_metadata(self, mode):
         return self.meta
 
-    def _workspace(self, swa, positions, swa_rope_cache):
+    def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
 
         History rows are gathered straight from the strided paged field; the
@@ -132,22 +132,24 @@ class _WindowAttention:
         the target writes its own SWA rows.
         """
         batch, block = self.history_slots.shape[0], self.block_size
-        history = self.window[self.selection.page, self.selection.row]
         if swa.is_cuda and swa.shape[-1] == 512:
-            rows = dsv41.dspark_rows(
+            return dsv41.dspark_workspace(
                 swa,
-                None,
-                None,
+                swa_norm_weight,
+                swa_norm_eps if swa_norm_weight is not None else None,
                 positions if swa_rope_cache is not None else None,
                 swa_rope_cache,
-                None,
-                None,
-                torch.empty_like(swa),
+                self.window,
+                self.selection.page,
+                self.selection.row,
+                block,
             )
-        else:
-            if swa_rope_cache is not None:
-                swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
-            rows = _quantized_kv(swa)
+        if swa_norm_weight is not None:
+            raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
+        history = self.window[self.selection.page, self.selection.row]
+        if swa_rope_cache is not None:
+            swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
+        rows = _quantized_kv(swa)
         return torch.cat((history, rows.reshape(batch, block, -1)), dim=1)
 
     def forward_v41(
@@ -165,13 +167,22 @@ class _WindowAttention:
         softmax_scale,
         index_process_group,
         swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
+        out_rope_cache=None,
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
-        kv = self._workspace(swa, positions, swa_rope_cache)
+        kv = self._workspace(
+            swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
+        )
         if q.is_cuda and q.shape[-1] == 512:
-            return self._kernel_forward(q, kv, attn_sink, softmax_scale)
-        return self._reference_forward(q, kv, attn_sink, softmax_scale)
+            out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
+        else:
+            out = self._reference_forward(q, kv, attn_sink, softmax_scale)
+        if out_rope_cache is not None:
+            rope_inplace(out, positions, out_rope_cache, None)
+        return out
 
     def _kernel_forward(self, q, kv, attn_sink, softmax_scale):
         """The target's prefill workspace kernel over ``[history, block]`` rows.
@@ -195,6 +206,7 @@ class _WindowAttention:
             None,
             kv.view(-1, 1, kv.shape[-1]),
             self.selection.indices,
+            lse=None,
         )
 
     def _reference_forward(self, q, kv, attn_sink, softmax_scale):
@@ -239,8 +251,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
     def __init__(self, config, mapping, quant_config, prefix):
-        if mapping.attn.dp_size != 1 or mapping.pp_size != 1:
-            raise NotImplementedError("V4.1 DSpark requires attention DP=PP=1")
+        if mapping.pp_size != 1:
+            raise NotImplementedError("V4.1 DSpark requires PP=1")
         stages = int(config.dspark_num_stages)
         block_size = int(config.dspark_block_size)
         taps = tuple(config.dspark_target_layer_ids)
@@ -274,7 +286,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         self.target_layer_ids = taps
         self.hidden_size = config.hidden_size
         self.noise_token_id = config.dspark_noise_token_id
-        self.window_size = config.sliding_window
         self.attention_params = {"head_dim": config.head_dim}
         self.main_proj = _replicated(
             len(taps) * config.hidden_size,
@@ -407,6 +418,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         selection = _WindowSelection(page, row, indices)
         h = self.embed_tokens(ids)
         h = h[:, None, :].repeat(1, self.config.hc_mult, 1)
+        pending_post = None
         for stage, layer in enumerate(self.layers):
             backend = _WindowAttention(
                 positions,
@@ -416,13 +428,18 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 selection,
                 request_indices,
             )
-            h, pre_mix = layer(
+            h, pre_mix, pending_post, _ = layer(
                 h,
                 pre_mix,
                 positions,
                 image_mask=None,
                 ctx=replace(ctx, attn_backend=backend),
+                pending_post=pending_post,
+                allow_ffn_reduce_fusion=stage + 1 < len(self.layers),
+                capture_input=False,
             )
+        if pending_post is not None:
+            h = pending_post.finish(h)
         return _norm(v41_hc_pre(h, pre_mix), self.norm).reshape(
             batch, self.block_size, -1
         )

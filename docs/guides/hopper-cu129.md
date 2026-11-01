@@ -61,8 +61,7 @@ has no cu129 wheels. Its Python CUDA runtime packages use CUDA 12.6.3, while
 Native TokenSpeed wheels still come from the LightSeek cu129 index.
 It uses the existing checkout's kernel versions, switches the CuTe runtime
 to cu12, and omits the CUDA-13-only CuteDSL KDA AOT package.
-`requirements/nvidia-cu129-constraints.txt` contains the additional version
-constraints. Each installation step selects its package index explicitly. The
+The installer adds its own version constraints. Each installation step selects its package index explicitly. The
 installer excludes global pip configuration, environment-supplied requirements
 files, and extra package indexes, so pip cannot choose native wheels with
 identical public versions from a cu130 source.
@@ -74,7 +73,7 @@ The normal checkout pins remain authoritative, including the updated
 The kernel build uses that adjusted dependency metadata, skips its default
 build-time pip install, and rebuilds the in-tree CUDA kernels for `sm90a`.
 Each kernel group records its successful build's CUDA toolkit, compiler paths,
-architecture/compile flags and library search paths. Returning to a CUDA 13
+architecture/compile flags, and library search paths. Returning to a CUDA 13
 build invalidates CUDA 12 artifacts even when their timestamps are newer than
 the sources. Missing or invalid identities also trigger a rebuild. The kernel
 build removes the old identity before rebuilding and publishes a new one only

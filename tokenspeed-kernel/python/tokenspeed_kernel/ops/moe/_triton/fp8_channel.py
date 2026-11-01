@@ -445,7 +445,7 @@ def _triton_fp8_channel_moe_impl(
         num_warps=config["fc2_warps"],
         num_stages=config["fc2_stages"],
     )
-    _combine(route_output, topk_weights, output)
+    _combine(route_output, topk_weights, output, None, 0)
     return output
 
 
@@ -457,6 +457,11 @@ def _validate_fp8_channel_moe(
     topk_ids: torch.Tensor | None,
     do_finalize: bool,
 ) -> int:
+    precision_policy = plan.get("precision_policy", "default")
+    if precision_policy != "default":
+        raise ValueError(
+            f"Unsupported FP8 channel MoE precision policy: {precision_policy!r}"
+        )
     if not do_finalize:
         raise ValueError("Triton FP8 MoE does not support deferred finalization")
     if any(

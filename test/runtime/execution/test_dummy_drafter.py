@@ -61,7 +61,9 @@ def test_dummy_drafter_mixed_window_and_determinism() -> None:
     drafter.runtime_states.valid_cache_lengths[2] += 1
     changed = drafter.run(ctx, None, output, accepts)
     assert not torch.equal(result[0, 1:], changed[0, 1:])
-    assert drafter.idle_forward_global_num_tokens([9], [3]) == []
+    assert (
+        drafter.idle_forward_global_num_tokens([9], [3], global_num_decodes=[3]) == []
+    )
 
 
 def test_dummy_is_registered_without_a_draft_model() -> None:

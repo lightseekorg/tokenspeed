@@ -229,3 +229,34 @@ def test_qwen35_invalid_offsets_fall_back_to_generic_positions():
 
     assert torch.equal(positions, expected_positions.squeeze(1))
     assert torch.equal(delta, expected_delta)
+
+
+def test_mrope_facts_read_the_rope_config_and_the_layout():
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.multimodal.mrope_facts import mrope_facts
+
+    qwen35 = PretrainedConfig(
+        text_config={
+            "rope_parameters": {"rope_type": "default", "mrope_section": [11, 11, 10]}
+        },
+        vision_config={"spatial_merge_size": 2},
+        image_token_id=248056,
+        video_token_id=248057,
+    )
+    assert mrope_facts(qwen35) == {
+        "mrope_positions": True,
+        "spatial_merge_size": 2,
+        "image_token_id": 248056,
+        "video_token_id": 248057,
+    }
+    # A plain rope config: the grid only lays out the patches.
+    plain = PretrainedConfig(rope_scaling={"rope_type": "default"})
+    assert mrope_facts(plain)["mrope_positions"] is False
+    # No rope config at all: the facts do not say.
+    assert mrope_facts(PretrainedConfig()) == {
+        "mrope_positions": None,
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
+    }

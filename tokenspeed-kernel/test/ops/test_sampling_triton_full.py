@@ -20,6 +20,10 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+import tokenspeed_kernel.ops.sampling.triton.penalties as penalties
 import torch
 from tokenspeed_kernel.ops.sampling.triton import (
     accumulate_counts_inplace,
@@ -59,6 +63,7 @@ def test_verify_chain_target_sampled_prefix_compare(device: str) -> None:
         accept_length,
         candidates,
         target_sampled,
+        write_rejected_targets=False,
     )
 
     torch.testing.assert_close(
@@ -152,6 +157,84 @@ def test_accumulate_counts_inplace_matches_index_put_reference(device: str) -> N
     accumulate_counts_inplace(counts, pool_idx, tokens, weights)
 
     torch.testing.assert_close(counts, ref)
+
+
+def _strided_count_case(device: str, bs: int, strided: bool):
+    width, vocab = 16, 64
+    storage = torch.zeros(
+        (4, vocab * (2 if strided else 1)), dtype=torch.int32, device=device
+    )
+    counts = storage[:, ::2] if strided else storage
+    # A valid-but-wrong pool tail makes the old contiguous-pointer bug fail
+    # deterministically without intentionally causing a device fault.
+    pool_storage = torch.full((16,), 3, dtype=torch.int32, device=device)
+    pool_storage[:bs] = torch.arange(1, bs + 1, dtype=torch.int32, device=device)
+    pool = pool_storage[:bs].unsqueeze(-1).expand(-1, width).reshape(-1)
+    step = 2 if strided else 1
+    token_storage = torch.full(
+        (bs * width * step,), 63, dtype=torch.int64, device=device
+    )
+    weight_storage = torch.full(
+        (bs * width * step,), 7, dtype=torch.int32, device=device
+    )
+    tokens, weights = token_storage[::step], weight_storage[::step]
+    tokens.copy_(torch.arange(bs * width, device=device) % vocab)
+    weights.fill_(1)
+    tokens[0], tokens[-1] = -1, vocab
+    weights[1] = 0
+    return storage, counts, pool, tokens, weights
+
+
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("strided", [False, True])
+def test_accumulate_counts_broadcast_and_strided_views(
+    device: str, bs: int, strided: bool
+) -> None:
+    storage, counts, pool, tokens, weights = _strided_count_case(device, bs, strided)
+    assert pool.stride(0) == (0 if bs == 1 else 1)
+    expected = counts.cpu().clone()
+    pool_cpu, token_cpu, weight_cpu = pool.cpu(), tokens.cpu(), weights.cpu()
+    valid = (token_cpu >= 0) & (token_cpu < expected.shape[1]) & (weight_cpu != 0)
+    expected.index_put_(
+        (pool_cpu[valid].long(), token_cpu[valid]), weight_cpu[valid], accumulate=True
+    )
+    accumulate_counts_inplace(counts, pool, tokens, weights)
+    torch.testing.assert_close(counts.cpu(), expected, rtol=0, atol=0)
+    if strided:
+        assert torch.count_nonzero(storage[:, 1::2]).item() == 0
+
+
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("strided", [False, True])
+def test_accumulate_counts_wrapper_forwards_actual_strides(
+    monkeypatch, bs: int, strided: bool
+) -> None:
+    _, counts, pool, tokens, weights = _strided_count_case("cpu", bs, strided)
+    launches = []
+
+    class CaptureKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((args, kwargs))
+
+            return launch
+
+    fake_counts = SimpleNamespace(
+        ndim=2,
+        device=SimpleNamespace(type="cuda"),
+        dtype=counts.dtype,
+        shape=counts.shape,
+        stride=counts.stride,
+    )
+    monkeypatch.setattr(penalties, "_accumulate_counts_inplace_kernel", CaptureKernel())
+    accumulate_counts_inplace(fake_counts, pool, tokens, weights)
+    assert len(launches) == 1
+    args, kwargs = launches[0]
+    assert kwargs["counts_row_stride"] == counts.stride(0)
+    assert kwargs["counts_col_stride"] == counts.stride(1)
+    for name, tensor in zip(("pool_idx", "tokens", "weights"), args[1:]):
+        assert kwargs[f"{name}_stride"] == tensor.stride(0)
+    assert kwargs["pool_idx_stride"] == (0 if bs == 1 else 1)
 
 
 def test_selected_token_logprobs_matches_torch_reference(device: str) -> None:

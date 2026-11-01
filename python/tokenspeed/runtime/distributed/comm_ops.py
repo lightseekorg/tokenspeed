@@ -182,6 +182,44 @@ def try_fused_dp_column_linear(
     )
 
 
+def try_fused_dp_row_linear(
+    tensor: torch.Tensor,
+    input_scales: torch.Tensor | None,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor | None,
+    owner_rows: tuple[int, ...],
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> bool:
+    """Attempt a fused DP row-parallel linear operation on locally owned rows.
+
+    Fuses input all-to-all, quantization, GEMM, and reduce-scatter so each
+    owner receives all output channels for its own input rows.
+
+    Args:
+        tensor: Full input channels for this owner's physical token rows.
+        input_scales: FP32 per-128 scales for E4M3 input, or None for BF16.
+        weight: Local input-channel shard of the linear weight.
+        weight_scales: Block-FP8 weight scales, or None for unsupported formats.
+        owner_rows: Physical counts in subgroup order, including graph padding.
+        out: Caller-owned destination for this owner's complete output channels.
+        workspace: Collectively prepared scratch for this linear operation.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        True when the fused operation wrote out. False leaves out untouched so
+        the caller can run the ordinary all-to-all, GEMM, and reduce-scatter path.
+        Invalid inputs and execution failures remain visible.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.try_fused_dp_row_linear(
+        tensor, input_scales, weight, weight_scales, owner_rows, out, workspace
+    )
+
+
 def projection_all_gather(
     tensor: torch.Tensor,
     rows: int,
@@ -208,6 +246,8 @@ def projection_all_to_all(
     out: torch.Tensor | None,
     workspace: ProjectionWorkspace,
     backend: CommBackend | None,
+    *,
+    input_scales: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Exchange token/channel axes, optionally fusing forward FP8 quantization.
 
@@ -215,12 +255,14 @@ def projection_all_to_all(
     It requires out=None and returns borrowed output, optionally quantized to
     FP8 with 1x128 MN-major scales. Inverse maps [TP*rows,N/TP] to [rows,N],
     requires quantize=False and writes into caller-owned out; callers may
-    retain it across later communication calls.
+    retain it across later communication calls. For prequantized forward input,
+    input_scales supplies FP32 per-128 scales; both are exchanged unchanged
+    with inverse=False and quantize=False.
     """
     if backend is None:
         backend = get_global_backend()
     return backend.projection_all_to_all(
-        tensor, rows, inverse, quantize, out, workspace
+        tensor, rows, inverse, quantize, out, workspace, input_scales=input_scales
     )
 
 
@@ -257,6 +299,57 @@ def all_reduce(
     return backend.all_reduce(tensor, group, op=op)
 
 
+def supports_all_reduce_mhc_norm(
+    x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+) -> bool:
+    """Select fusion before scheduling the producer's ordinary all-reduce.
+
+    x describes the producer's anticipated output shape, dtype, device and
+    layout, including CED narrowing and graph padding. The producer must honor
+    that spec; HC residual/coefficient formats follow all_reduce_mhc_norm's
+    contract. Backend configuration and the prepared workspace remain fixed
+    between this query and execution. Only the shape, dtype, device and
+    contiguity of norm_weight are inspected. It may be a producer norm with
+    equivalent storage; execution uses the consumer's own weight and epsilon.
+    This query does not read tensor values, retain tensors or launch GPU work.
+    """
+    return get_global_backend().supports_all_reduce_mhc_norm(x, norm_weight, group)
+
+
+def all_reduce_mhc_norm(
+    x, residual, post, comb, pre, weight, eps, group: Group
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute fusion selected by supports_all_reduce_mhc_norm.
+
+    x is BF16 [T,H], residual BF16 [T,4,H], post/pre FP32 [T,4], comb
+    FP32 [T,4,4], and weight BF16 [H]. All tensors are contiguous and on the
+    same CUDA device; eps is positive and group is the admitted prepared group.
+    Returns updated residual and normalized input. Contract violations and
+    execution errors propagate; this operation never requests a fallback.
+    """
+    return get_global_backend().all_reduce_mhc_norm(
+        x, residual, post, comb, pre, weight, eps, group
+    )
+
+
+def all_reduce_mhc_post(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor | None:
+    """Fused all-reduce + hc=4 mHC post, or None if the backend has none.
+
+    See ``CommBackend.all_reduce_mhc_post``. On None nothing has run, and the
+    caller reduces ``tensor`` and applies the post itself.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_reduce_mhc_post(tensor, residual, post, comb, group)
+
+
 def prepare_all_reduce_lane(
     group: Group,
     hidden_dim: int,
@@ -271,6 +364,35 @@ def prepare_all_reduce_lane(
     # on one rank while peers succeed would leave the group disagreeing on
     # the lane width. Let real failures propagate loudly.
     return backend.prepare_all_reduce_lane(group, hidden_dim)
+
+
+def prepare_shard_exchange(
+    group: Group,
+    channels: int,
+    max_rows: int,
+    dtype: torch.dtype,
+    backend: CommBackend | None = None,
+) -> bool:
+    """Prepare a backend-owned exchange for even ``all_to_all_transpose`` /
+    ``all_to_all_head_scatter`` calls before graph capture.
+
+    Collective: every rank of ``group`` calls in the same order with the same
+    arguments (layers do it at build time, like ``prepare_all_reduce_lane``).
+
+    Args:
+        group: Global ranks of the exchange.
+        channels: The full feature width ``W * F_local`` of the exchanged rows.
+        max_rows: Rows per rank the prepared exchange serves; larger calls
+            and uneven row counts take the generic all-to-all.
+        dtype: Element type of the exchanged rows.
+        backend: Backend to prepare, or ``None`` for the global backend.
+
+    Returns:
+        Whether the backend prepared a dedicated exchange.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_shard_exchange(group, channels, max_rows, dtype)
 
 
 def prepare_all_reduce_buffers(
@@ -483,6 +605,12 @@ def all_to_all_transpose(
         # Nothing to move for the whole group (every rank reads the same
         # counts, so every rank skips the collective together).
         return x.new_empty(0, world_size * width)
+    if backend is None:
+        backend = get_global_backend()
+    if all(count == rows for count in input_split_sizes):
+        exchanged = backend.try_shard_exchange(x, group, inverse=True)
+        if exchanged is not None:
+            return exchanged
     received = x.new_empty(world_size * rows, width)
     all_to_all_single(
         received,
@@ -539,6 +667,14 @@ def all_to_all_head_scatter(
     if rows_full == 0:
         # Nothing to move for the whole group; every rank skips together.
         return x.new_empty(0, heads_local, dim)
+    if backend is None:
+        backend = get_global_backend()
+    if all(count == rows_own for count in output_split_sizes):
+        exchanged = backend.try_shard_exchange(
+            x.reshape(rows_own, heads * dim), group, inverse=False
+        )
+        if exchanged is not None:
+            return exchanged.view(rows_full, heads_local, dim)
     # Head block i (destined for rank i) becomes send chunk i.
     sent = (
         x.view(rows_own, world_size, heads_local * dim)

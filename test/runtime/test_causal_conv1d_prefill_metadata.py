@@ -143,7 +143,10 @@ def test_conv_metadata_and_consumer_cuda_graph():
         assert torch.equal(state, reference_state)
 
 
-def test_conv_compiles_once_across_prefill_shapes():
+# The second shape is Kimi-K3 KDA on one rank: q|k|v (3 * 12288 channels) of
+# the merged projection rows (4 * 12288 + 128 + 96, padded to the 128 grid).
+@pytest.mark.parametrize("channels,width", [(16, 48), (36864, 49408)])
+def test_conv_compiles_once_across_prefill_shapes(channels, width):
     """Token totals, chunk-map offsets and output strides vary per prefill; none keys a binary."""
     from unittest.mock import patch
 
@@ -151,7 +154,6 @@ def test_conv_compiles_once_across_prefill_shapes():
         _causal_conv1d_fwd_kernel,
     )
 
-    channels, width = 16, 48
     weight = torch.randn(channels, 4, dtype=torch.bfloat16, device="cuda") * 0.1
 
     def run(lengths):
@@ -164,19 +166,30 @@ def test_conv_compiles_once_across_prefill_shapes():
         )
         indices = torch.arange(1, len(lengths) + 1, dtype=torch.int32, device="cuda")
         history = indices % 2 == 0
-        # A slice of a wider projection; one token keeps its stride in the output.
+        # A slice of a wider projection, as the model hands it over; the
+        # reference reads its compact copy. One token keeps its stride in the
+        # output either way.
         x = torch.randn(sum(lengths), width, dtype=torch.bfloat16, device="cuda")
-        x = x[:, :channels].T
+        x = x[:, :channels]
         # The state pool keeps one size for the server's lifetime.
         state = torch.randn(8, channels, 3, dtype=torch.bfloat16, device="cuda")
         reference_state = state.clone()
         reference = _reference_metadata(lengths, "cuda")
         expected = _conv(
-            x, weight, reference_state, bounds, indices, history, reference
+            x.contiguous().T,
+            weight,
+            reference_state,
+            bounds,
+            indices,
+            history,
+            reference,
         )
-        actual = _conv(x, weight, state, bounds, indices, history, metadata)
-        assert torch.equal(actual, expected)
-        assert torch.equal(state, reference_state)
+        actual = _conv(x.T, weight, state, bounds, indices, history, metadata)
+        # Same layout and bytes, so every downstream reader is unchanged.
+        assert actual.stride() == expected.stride()
+        assert actual.dtype == expected.dtype == torch.bfloat16
+        assert torch.equal(actual.T.view(torch.uint8), expected.T.view(torch.uint8))
+        assert torch.equal(state.view(torch.uint8), reference_state.view(torch.uint8))
 
     run([9, 7])
     with patch.object(
@@ -208,8 +221,10 @@ def test_conv_reads_a_wide_view_past_int32_offsets():
         state = torch.zeros(2, channels, 3, dtype=torch.bfloat16, device="cuda")
         out = _conv(x, weight, state, bounds, indices, history, metadata)
         results.append((out, state))
-    assert torch.equal(results[0][0], results[1][0])
-    assert torch.equal(results[0][1], results[1][1])
+    (out, state), (expected, expected_state) = results
+    assert out.stride() == expected.stride() and out.dtype == expected.dtype
+    assert torch.equal(out.T.view(torch.uint8), expected.T.view(torch.uint8))
+    assert torch.equal(state.view(torch.uint8), expected_state.view(torch.uint8))
 
 
 if __name__ == "__main__":

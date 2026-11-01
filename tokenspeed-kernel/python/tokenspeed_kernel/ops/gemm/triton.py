@@ -95,7 +95,10 @@ _MXFP8_FORMAT_SIGNATURES = (
         vendors=frozenset({"amd", "nvidia"}),
     ),
     signatures=_MXFP8_FORMAT_SIGNATURES,
-    traits={},
+    traits={
+        "a_contiguous": frozenset({True}),
+        "b_contiguous": frozenset({True}),
+    },
     priority=Priority.PERFORMANT + 3,
 )
 def triton_mm_fp8_blockscale(
@@ -139,80 +142,6 @@ register_kernel(
     },
     priority=Priority.PERFORMANT + 3,
 )(triton_bmm_fp8_blockscale)
-
-
-_TRITON_GROUPED_OUTPUT_SIGNATURES = frozenset(
-    format_signature(
-        attention=dense_tensor_format(input_dtype),
-        weight=dense_tensor_format(_fp8_dtype),
-    )
-    for input_dtype in (torch.float16, torch.bfloat16)
-)
-
-
-@register_kernel(
-    "gemm",
-    "dsv4_grouped_output_projection",
-    name="triton_dsv4_grouped_output_projection",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=_TRITON_GROUPED_OUTPUT_SIGNATURES,
-    traits={},
-    priority=Priority.PERFORMANT + 3,
-)
-def triton_dsv4_grouped_output_projection(
-    *,
-    attention: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    heads_per_group: int,
-    output_dim: int,
-    nope_dim: int,
-    rope_dim: int,
-    block_size: tuple[int, int],
-) -> torch.Tensor:
-    """Run V4's grouped output projection with canonical scales and Triton BMM."""
-    from tokenspeed_kernel.ops.attention.dsv4.triton import (
-        dsv4_fused_inv_rope_fp8_quant,
-    )
-
-    values, scales = dsv4_fused_inv_rope_fp8_quant(
-        attention,
-        positions,
-        cos_sin_cache,
-        n_groups=num_groups,
-        heads_per_group=heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-        quant_group_size=block_size[1],
-        tma_aligned_scales=False,
-    )
-    input_dim = heads_per_group * attention.shape[-1]
-    grouped_weight = weight.view(num_groups, output_dim, input_dim)
-    block_n, block_k = block_size
-    grouped_scales = weight_scale.view(
-        num_groups,
-        output_dim // block_n,
-        input_dim // block_k,
-    )
-    output = torch.empty(
-        (attention.shape[0], num_groups, output_dim),
-        dtype=torch.bfloat16,
-        device=attention.device,
-    )
-    triton_bmm_fp8_blockscale(
-        values.transpose(0, 1),
-        grouped_weight,
-        scales.transpose(0, 1),
-        grouped_scales,
-        output.dtype,
-        block_size=list(block_size),
-        out=output.transpose(0, 1),
-    )
-    return output
 
 
 # ===-----------------------------------------------------------------------===#
@@ -360,14 +289,16 @@ def triton_mm_fp8_scaled(
         A_scales: FP32 ``[M, 1]`` per-token or ``[1, 1]`` per-tensor scales.
         B_scales: FP32 ``[N, 1]`` per-channel or ``[1, 1]`` per-tensor scales.
         out_dtype: Output dtype.
-        alpha: Unused; accepted for the ``gemm.mm`` calling convention.
-        block_size: Unused; accepted for the ``gemm.mm`` calling convention.
+        alpha: Must be None; dequantization uses the operand scales.
+        block_size: Must be None; scales are per token/channel or per tensor.
         bias: Optional ``[N]`` bias added in the epilogue.
         out: Optional ``[M, N]`` output buffer.
 
     Returns:
         ``[M, N]`` tensor ``(A * A_scales) @ (B * B_scales^T)`` in ``out_dtype``.
     """
+    if alpha is not None or block_size is not None:
+        raise ValueError("row-wise scaled FP8 GEMM takes no alpha or block_size")
     return triton_scaled_mm(
         A,
         B,

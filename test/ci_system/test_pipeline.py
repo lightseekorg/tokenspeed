@@ -50,7 +50,7 @@ def test_stale_process_patterns_match_smg_router_proctitle():
     survive between runs and the next run hits port-bind conflicts."""
     sample_cmdlines = [
         "smg::router",
-        "smg::router --worker-urls grpc://127.0.0.1:1234",
+        "smg::router --worker-urls ipc:///tmp/smg-zmq/ts0.ipc",
     ]
     for cmdline in sample_cmdlines:
         assert any(
@@ -61,8 +61,8 @@ def test_stale_process_patterns_match_smg_router_proctitle():
 def test_stale_process_patterns_match_existing_targets():
     cmdlines = [
         "/usr/bin/python /usr/local/bin/ts serve --model foo",
-        "/usr/bin/python -m smg launch --worker-urls grpc://127.0.0.1:1234",
-        "/usr/bin/python -m smg_grpc_servicer.tokenspeed --host 127.0.0.1",
+        "/usr/bin/python -m smg launch --worker-urls ipc:///tmp/smg-zmq/ts-serve-1234",
+        "/usr/bin/python -m tokenspeed.runtime.entrypoints.engine --host 127.0.0.1",
         "/usr/bin/python /repo/test/runtime/run_ci_suite.py --device cuda",
     ]
     for cmdline in cmdlines:
@@ -749,6 +749,13 @@ def test_b200v2_tasks_set_cache_and_jit_check_defaults(
         "env": task_env,
         "ut": {"commands": ["run test"]},
     }
+    env = _task_run_env(monkeypatch, tmp_path, task)
+    assert env.get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+    assert env[cache_env] == str(cache_root / "tokenspeed" / "flashinfer-autotune")
+
+
+def _task_run_env(monkeypatch, tmp_path, task):
+    """The environment ``execute_task`` sets up for ``task`` on a b200v2 runner."""
     captured = {}
 
     class FakeProcessGroupManager:
@@ -776,10 +783,62 @@ def test_b200v2_tasks_set_cache_and_jit_check_defaults(
         result_json=None,
         setup_mode="ci",
     )
-    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
-    assert captured["env"][cache_env] == str(
-        cache_root / "tokenspeed" / "flashinfer-autotune"
+    return captured["env"]
+
+
+@pytest.mark.parametrize(
+    ("task_type", "inherited", "expected"),
+    [
+        ("eval", None, "error"),
+        ("perf", None, "error"),
+        ("server_smoke", None, "error"),
+        ("eval", "warn", "error"),
+        ("ut", None, None),
+        ("ut", "warn", "warn"),
+    ],
+)
+def test_serving_tasks_raise_on_data_plane_syncs(
+    monkeypatch, tmp_path, task_type, inherited, expected
+):
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", inherited)
+    task = {
+        "name": "sync-check",
+        "type": task_type,
+        "runner": {"labels": ["b200v2-1gpu"]},
+        "env": {},
+        "ut": {"commands": ["run test"]},
+    }
+    env = _task_run_env(monkeypatch, tmp_path, task)
+    assert env.get("TOKENSPEED_DATA_PLANE_SYNC_DEBUG") == expected
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "env:\n  TOKENSPEED_DATA_PLANE_SYNC_DEBUG: warn\n",
+        "env:\n  TOKENSPEED_DATA_PLANE_SYNC_DEBUG: error\n",
+    ],
+)
+def test_validate_task_rejects_a_task_setting_the_sync_check(tmp_path, extra):
+    import yaml as _yaml
+
+    path = _write_task_yaml(
+        tmp_path, "task.yaml", _default_body("ut-a", ["b300-1gpu"], extra=extra)
     )
+    with pytest.raises(ValueError, match="TOKENSPEED_DATA_PLANE_SYNC_DEBUG"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_a_runner_env_setting_the_sync_check():
+    import yaml as _yaml
+
+    task = _yaml.safe_load(_default_body("ut-a", ["b300-1gpu"]))
+    task["runner"]["env"] = {"b300-1gpu": {"TOKENSPEED_DATA_PLANE_SYNC_DEBUG": "warn"}}
+    with pytest.raises(ValueError, match=r"runner\.env\['b300-1gpu'\]"):
+        validate_task(task, Path("task.yaml"))
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
@@ -1441,6 +1500,45 @@ def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
     assert result_json.exists()
 
 
+@pytest.mark.parametrize(
+    ("group", "expected"),
+    [
+        ("npu", ["tokenspeed-npu-arm64"]),
+        ("amd-mi350", ["amd-mi35x-1gpu-test"]),
+        ("amd-mi450", ["amd-mi450-1gpu", "amd-mi45x-cpu-test"]),
+        ("amd", ["amd-mi35x-1gpu-test", "amd-mi450-1gpu", "amd-mi45x-cpu-test"]),
+        ("nvidia", ["h100-1gpu", "gb300-1gpu"]),
+        ("nvidia-arm", ["gb300-1gpu"]),
+        ("nvidia-x86", ["h100-1gpu"]),
+    ],
+)
+def test_build_matrix_keeps_npu_separate_from_gpu_groups(
+    tmp_path, monkeypatch, group, expected
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    _write_task_yaml(
+        tmp_path,
+        "vendors.yaml",
+        _default_body(
+            "ut-vendors",
+            [
+                "tokenspeed-npu-arm64",
+                "amd-mi35x-1gpu-test",
+                "amd-mi450-1gpu",
+                "amd-mi45x-cpu-test",
+                "h100-1gpu",
+                "gb300-1gpu",
+            ],
+        ),
+    )
+    args = parse_args(["scan", "--runner-group", group])
+    matrix = build_matrix(
+        tmp_path, tmp_path, trigger="per-commit", runner_group=args.runner_group
+    )
+
+    assert [entry["runner"] for entry in matrix["include"]] == expected
+
+
 def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     # Two tasks; both omit `priority`. Order must match the existing
     # behaviour: alphabetical by file path, then label order from the yaml.
@@ -1516,7 +1614,7 @@ def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
         tmp_path,
         tmp_path,
         trigger="per-commit",
-        runner_group="amd",
+        runner_group="amd-mi350",
         workflow_stage="kernel-benchmark",
     )
 
@@ -1587,7 +1685,7 @@ def test_build_matrix_can_select_or_exclude_multi_node_tasks(tmp_path):
         tmp_path,
         tmp_path,
         trigger="per-commit",
-        runner_group="amd",
+        runner_group="amd-mi350",
     ) == {"include": []}
 
 

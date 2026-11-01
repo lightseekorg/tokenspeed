@@ -64,8 +64,8 @@ def test_nested_failure_preserves_exception_and_metadata(monkeypatch):
         assert end["error_type"] == "ValueError"
         assert end["duration_s"] >= 0
         assert isinstance(end["wall_time_ns"], int)
-        assert end["triton_compiles"] is None
-        assert end["triton_compile_s"] is None
+        assert end["jit_compiles"] is None
+        assert end["jit_compile_s"] is None
 
 
 def test_compile_deltas_and_decorator_reuse(monkeypatch):
@@ -85,9 +85,9 @@ def test_compile_deltas_and_decorator_reuse(monkeypatch):
     assert load(7) == 7
     assert load(8) == 8
     events = [json.loads(line.split("startup_timing ", 1)[1]) for line in lines]
-    assert events[1]["triton_compiles"] == 2
-    assert events[1]["triton_compile_s"] == 0.5
-    assert events[3]["triton_compiles"] == 0
+    assert events[1]["jit_compiles"] == 2
+    assert events[1]["jit_compile_s"] == 0.5
+    assert events[3]["jit_compiles"] == 0
     assert events[1]["status"] == events[3]["status"] == "ok"
     assert events[0]["span_id"] != events[2]["span_id"]
     assert events[2]["parent_id"] is None

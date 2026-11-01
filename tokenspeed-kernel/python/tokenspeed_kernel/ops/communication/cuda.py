@@ -21,21 +21,24 @@
 """NVIDIA CUDA communication kernels with caller-managed persistent state.
 
 The Lamport A2A APIs exchange TP2/4/8 BF16 channel shards directly, optionally
-quantizing received 128-element groups for a prepared FP8 GEMM. Callers must
-construct the state collectively before CUDA-graph capture, serialize calls
-and consumers on one stream, pad empty owners so every peer participates, and
-select any fallback outside this module. Returned buffers are borrowed until
+quantizing received 128-element groups for a prepared FP8 GEMM. Prequantized
+E4M3 inputs and per-128 scales can be exchanged together with in-kernel padding.
+Callers must construct the state collectively before CUDA-graph capture,
+serialize calls and consumers on one stream, and select any fallback outside
+this module. BF16 inputs require caller padding for unequal or empty owners. Returned buffers are borrowed until
 the next call unless an explicit destination is supplied.
 """
 
 from tokenspeed_kernel.ops.communication._cuda.lamport_a2a import (
     TokenSpeedA2ALamportState,
     tokenspeed_a2a_lamport,
+    tokenspeed_a2a_lamport_fp8,
     tokenspeed_a2a_lamport_fp8_quantize,
 )
 
 __all__ = [
     "TokenSpeedA2ALamportState",
     "tokenspeed_a2a_lamport",
+    "tokenspeed_a2a_lamport_fp8",
     "tokenspeed_a2a_lamport_fp8_quantize",
 ]

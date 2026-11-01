@@ -1,6 +1,6 @@
 # TokenSpeed Lamport A2A
 
-`tokenspeed_a2a_lamport` is a BF16, intra-node NVLink exchange for TP2, TP4 and
+`tokenspeed_a2a_lamport` is a BF16, intra-node NVLink exchange for TP2, TP4, and
 TP8. For a group of `P` GPUs, it exchanges channel shards directly between
 `[M, K]` and `[P*M, K/P]`, including the inverse
 mapping, without a separate pack or output-restoration kernel. Runtime backend
@@ -13,7 +13,7 @@ TRT-LLM one-shot AllGather/ReduceScatter, but does not copy their sentinel
 protocol. Each aligned 64-bit packet holds 32 payload bits and a 32-bit
 generation. The receiver polls local packets until their generation matches,
 then writes the unmodified payload to its output. Signed zero, infinities,
-subnormals and NaN payloads are preserved. The protocol needs no separate
+subnormals, and NaN payloads are preserved. The protocol needs no separate
 cross-GPU barrier kernel; waiting still happens inside the packet-polling loop.
 
 Three scratch generations prevent a fast sender from overwriting a slow
@@ -32,7 +32,7 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 ## Contract and limits
 
 - The public Python entry point lives in `cuda.py`; its private implementation
-  lives under `_cuda/`. Both packet and chunk exchange require **2, 4 or 8
+  lives under `_cuda/`. Both packet and chunk exchange require **2, 4, or 8
   peer-accessible GPUs per process group on one host**, independently of the
   total job size. Peer indexing specializes for `P`; token counts and channel
   widths remain runtime arguments. The entry point rejects other group sizes.
@@ -45,7 +45,7 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 - Serialize this communicator and its consumers on one CUDA stream. Pass
   `out=None` to borrow persistent **local output**, valid until the next call.
   Alternatively, supply a contiguous BF16 output with the exact result shape,
-  matching device and a 16-byte-aligned address. The kernel writes directly into
+  matching device, and a 16-byte-aligned address. The kernel writes directly into
   that tensor and returns it; later exchanges do not overwrite it. Supplied output
   must not share storage with inputs or state buffers. Inputs must not alias
   persistent output or communication scratch. Retain the state and destinations
@@ -62,7 +62,7 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
   NVLink-connected GB300 GPUs; they do not establish performance for other
   group sizes.
 - The kernel itself has no implicit NCCL fallback. Its runtime caller owns
-  admission, padding and fallback selection.
+  admission, padding, and fallback selection.
 
 ## Optional large-message chunk exchange
 
@@ -73,9 +73,9 @@ state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
 ```
 
 The `tokenspeed_a2a_lamport(state, inputs, inverse, out)` entry point then chooses
-packet exchange below the threshold and chunk exchange at/above it. Both use
+packet exchange below the threshold and chunk exchange at or above it. Both use
 the same layout contract and write the selected local output buffer. Peers must
-agree on physical shapes, direction and threshold. Chunk exchange additionally
+agree on physical shapes, direction, and threshold. Chunk exchange additionally
 requires eight-BF16-aligned channel shards (`K % (8*P) == 0`). Packet-only behavior remains
 available by not preparing chunk exchange.
 
@@ -103,7 +103,7 @@ uses chunk exchange above it. An explicitly supplied threshold still takes
 precedence; supplying 8 MiB selects chunk exchange at exactly 8 MiB.
 Choose the threshold for your hardware and workload.
 Correctness tests exercise both directions, transitions between packet/chunk
-sizes, arbitrary payload bits and changing-input graph replay.
+sizes, arbitrary payload bits, and changing-input graph replay.
 
 ### Medium-message packet tuning
 
@@ -145,6 +145,21 @@ materialization and a quantization launch, not link bytes. Persistent FP8 and
 scale outputs add `R*(K/P) + 4*R*K/(128*P)` bytes at the configured maximum `M`.
 The existing BF16 output remains available, and inverse exchange is unchanged.
 
+## Prequantized FP8 exchange
+
+`tokenspeed_a2a_lamport_fp8(state, inputs, input_scales, rows)` exchanges E4M3
+values and FP32 per-128 scales together through the existing tagged-packet
+protocol. Both payloads are preserved bit for bit; the kernel performs no
+quantization. Each channel shard must contain complete 128-element groups.
+The common physical `rows` is explicit. Local inputs may have fewer rows or be
+empty; the kernel publishes zero padding for both values and scales.
+
+The result is borrowed E4M3 `[TP*rows,K/TP]` and row-major FP32 scales
+`[TP*rows,K/(128*TP)]`. Both fit in the existing BF16 output allocation.
+The packet ring and generation counter are shared with BF16 exchange, so
+interleaved formats follow the same serialized-stream lifetime. This entry
+point uses packet exchange; it does not select the BF16 chunk path.
+
 ## Validation and measurement methodology
 
 From the repository root, with optional CUDA/FlashInfer dependencies installed:
@@ -154,13 +169,13 @@ python -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py
 ```
 
-The test spawns its own workers; do not launch pytest with torchrun. TP2, TP4
+The test spawns its own workers; do not launch pytest with torchrun. TP2, TP4,
 and TP8 cases skip when the required GPU count is unavailable. Use a host with
 full peer access and the optional CUDA/FlashInfer dependencies. At `K=16384`, the
 test checks exact BF16 payloads in both directions and fused FP8 values/scales
 against independently gathered inputs followed by the prepared quantizer.
-Rows 1, 128 and 257 cover small packets, the medium packet launch, chunk
-exchange and TP2 padding, in eager execution and CUDA Graph replay.
+Rows 1, 128, and 257 cover small packets, the medium packet launch, chunk
+exchange, and TP2 padding, in eager execution and CUDA Graph replay.
 
 The runtime integration test additionally covers uneven and empty owners,
 independent TP2 subgroups, sharded weights, and BF16/FP8 Linear outputs:

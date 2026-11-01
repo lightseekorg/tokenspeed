@@ -615,6 +615,15 @@ class CommManager:
         )
         return hidden_states, residual
 
+    def moe_output_all_reduced(self, ctx: ForwardContext) -> bool:
+        """Whether post_moe_comm sums the MoE output with a plain all-reduce."""
+        return (
+            self.mapping.moe.has_tp_ep
+            and self.moe_combine_order != "slot"
+            and self._shard(ctx) is None
+            and self.use_all_reduce(is_moe=True)
+        )
+
     def post_moe_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):

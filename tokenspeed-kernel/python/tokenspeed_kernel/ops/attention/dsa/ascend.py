@@ -32,10 +32,26 @@ from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["ascend_dsa_kernels"]
+__all__ = ["ascend_dsa_kernels", "ascend_dsa_cp_metadata"]
 
 platform = current_platform()
 _kernels = None
+
+
+def ascend_dsa_cp_metadata(table, lengths, **kwargs):
+    """Write DSA query/group metadata and slots into caller-provided buffers.
+
+    INT32 ``table[B,P]`` and ``lengths[B]`` expand to R=B*query_width causal
+    query rows. ``out[R,P]`` and the per-query vectors receive local metadata;
+    ``index_*`` buffers have R/query_group_size grouped rows. Optional global
+    ``slots`` map to matching INT64 ``local_slots``, with -1 for skipped writes.
+    Returns None; buffers are updated in place and retained through graph use.
+    See :func:`tokenspeed_kernel_npu.ops.dsa.dsa_cp_metadata` for all keyword
+    arguments, output shapes and ownership semantics.
+    """
+    from tokenspeed_kernel_npu.ops.dsa import dsa_cp_metadata
+
+    dsa_cp_metadata(table, lengths, **kwargs)
 
 
 def ascend_dsa_kernels():
@@ -50,7 +66,45 @@ def ascend_dsa_kernels():
     return _kernels
 
 
+def ascend_prefill_cache_metadata(*args, **kwargs):
+    """Map owner pages and current receives without loading Indexer operators."""
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    return AscendDSAKernels.prefill_metadata(*args, **kwargs)
+
+
+def ascend_prepare_dsa_resources(*, group, rank):
+    """Bind operator-owned views of the existing HCCL windows before capture."""
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+
+    ascend_dsa_kernels()
+    window = torch.ops.custom.dsa_prepare_prolog_window(group, rank)
+    try:
+        prepared = {
+            rows: torch.ops.custom.dsa_prepare_lse_buffers(group, rows, rank)
+            for rows in (64, 128, 256, 512)
+        }
+    except BaseException:
+        torch.ops.custom.dsa_release_prolog_window(window)
+        raise
+    return DSAResources(
+        window,
+        {rows: values[:3] for rows, values in prepared.items()},
+        {rows: values[3] for rows, values in prepared.items()},
+        release=torch.ops.custom.dsa_release_prolog_window,
+    )
+
+
 if platform.is_npu:
+    register_kernel(
+        "attention",
+        "dsa_prepare_resources",
+        name="ascend_prepare_dsa_resources",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature()],
+        priority=Priority.PERFORMANT,
+    )(ascend_prepare_dsa_resources)
 
     @register_kernel(
         "attention",

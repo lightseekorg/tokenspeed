@@ -130,7 +130,6 @@ def _make_flashmla_backend(
         device=pool.arena.device,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        prefix_granularity=_KERNEL_PAGE,
         kernel_page_size=_KERNEL_PAGE,
         context_len=8 * pool.arena.prefix_granularity,
         max_bs=8,

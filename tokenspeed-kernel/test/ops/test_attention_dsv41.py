@@ -26,6 +26,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
+    torch_dsv41_cache_quantize,
+    torch_dsv41_compressor_pairs,
+)
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
 from utils import assert_no_triton_compile
@@ -42,43 +46,6 @@ def device():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA/ROCm")
     return torch.device("cuda:0")
-
-
-def _reference_quantize(x, fmt):
-    """Independent nearest-value oracle; reference inference/kernel.py semantics."""
-    dim, group, _, _ = _LAYOUTS[fmt]
-    x = x.detach().cpu().float().reshape(-1, dim // group, group)
-    amax = x.abs().amax(dim=-1)
-    if fmt == "global":
-        scale = (amax.clamp_min(6 * 2.0**-9) / 6).to(torch.float8_e4m3fn)
-        scale_bytes = scale.view(torch.uint8)
-        scale = scale.float()
-    else:
-        scaled = amax.clamp_min(1e-4 if fmt == "swa" else 6 * 2.0**-126)
-        scaled = scaled * (1 / (448 if fmt == "swa" else 6))
-        bits = scaled.view(torch.int32)
-        exponent = ((bits >> 23) & 255) - 127 + ((bits & 0x7FFFFF) != 0).int()
-        scale = torch.exp2(exponent.float())
-        scale_bytes = (exponent + 127).to(torch.uint8)
-    normalized = x / scale.unsqueeze(-1)
-    if fmt == "swa":
-        quant = normalized.clamp(-448, 448).to(torch.float8_e4m3fn)
-        values = quant.view(torch.uint8).flatten(1)
-        decoded = quant.float()
-    else:
-        levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32)
-        # Searching even codes first implements ties-to-even independently of
-        # the kernel's seven threshold comparisons.
-        order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7])
-        distance = (normalized.abs().unsqueeze(-1) - levels[order]).abs()
-        code = order[distance.argmin(dim=-1)]
-        decoded = levels[code] * torch.where(torch.signbit(normalized), -1.0, 1.0)
-        code = (
-            (code | (torch.signbit(normalized).int() << 3)).to(torch.uint8).flatten(1)
-        )
-        values = code[:, ::2] | (code[:, 1::2] << 4)
-    packed = torch.cat((values, scale_bytes.flatten(1)), dim=1)
-    return packed, (decoded * scale.unsqueeze(-1)).reshape(-1, dim)
 
 
 def _make_cache(x, fmt):
@@ -122,11 +89,14 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
     dsv41.compressor_tail_scatter(content[:0], scores[:0], tail, slots[:0])
 
 
-def test_public_arguments_are_explicit():
+def test_public_argument_defaults():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
         assert fn.__doc__, name
         for parameter in inspect.signature(fn).parameters.values():
+            if name == "index_topk" and parameter.name == "index_metadata":
+                assert parameter.default is None
+                continue
             assert (
                 parameter.default is inspect.Parameter.empty
             ), f"{name}.{parameter.name} must be explicit"
@@ -147,7 +117,7 @@ def test_cache_quantization_bytes_and_scales(device, fmt, dtype):
     rows[6].fill_(2.0**-127)
     rows[7].fill_(-(2.0**-127))
     rows = rows.to(dtype)
-    expected_bytes, expected = _reference_quantize(rows, fmt)
+    expected_bytes, expected = torch_dsv41_cache_quantize(rows, fmt)
     packed = dsv41.cache_pack(rows.to(device), fmt, None)
     assert packed.shape == (37, width)
     torch.testing.assert_close(packed.cpu(), expected_bytes, rtol=0, atol=0)
@@ -171,7 +141,7 @@ def test_fp4_midpoints_signed_zero_and_saturation(device, fmt):
         )
         rows[i, :16] = shifted
         rows[i].reshape(-1, group)[:, -1] = 6
-    expected_bytes, expected = _reference_quantize(rows, fmt)
+    expected_bytes, expected = torch_dsv41_cache_quantize(rows, fmt)
     packed = dsv41.cache_pack(rows.to(device), fmt, None)
     torch.testing.assert_close(packed.cpu(), expected_bytes, rtol=0, atol=0)
     out = torch.empty_like(rows, device=device)
@@ -196,7 +166,7 @@ def test_paged_field_strides_padding_and_invalid_slots(device, fmt):
     )
     slots = slot_storage[::2]
     dsv41.cache_scatter(rows, cache, slots, fmt)
-    packed, decoded = _reference_quantize(rows, fmt)
+    packed, decoded = torch_dsv41_cache_quantize(rows, fmt)
     expected_backing = torch.full_like(backing.cpu(), 173)
     for i, slot in enumerate(slots.cpu().tolist()):
         if 0 <= slot < 256:
@@ -285,6 +255,7 @@ def test_selected_attention_joint_sink_masking_and_chunking(device, heads, with_
             None,
             None,
             None,
+            lse=None,
         )
         assert result is out
         torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
@@ -316,9 +287,10 @@ def test_selected_attention_full_width_online_stability(device):
         None,
         None,
         None,
+        lse=None,
     )
-    _, swa_ref = _reference_quantize(swa_x, "swa")
-    _, global_ref = _reference_quantize(global_x, "global")
+    _, swa_ref = torch_dsv41_cache_quantize(swa_x, "swa")
+    _, global_ref = torch_dsv41_cache_quantize(global_x, "global")
     kv = (
         torch.cat((swa_ref, global_ref)).to(device=device, dtype=torch.bfloat16).float()
     )
@@ -353,6 +325,7 @@ def test_sink_counted_once_and_representations_not_deduplicated(device):
         None,
         None,
         None,
+        lse=None,
     )
     values = (
         dsv41.cache_gather(swa, slots, "swa", None).float()
@@ -377,8 +350,8 @@ def test_index_scores_reference_rounding_per_head_relu_and_weights(
         dtype=weight_dtype,
         device=device,
     )
-    _, q_ref = _reference_quantize(q, "index")
-    _, k_ref = _reference_quantize(k, "index")
+    _, q_ref = torch_dsv41_cache_quantize(q, "index")
+    _, k_ref = torch_dsv41_cache_quantize(k, "index")
     q_ref = q_ref.to(device=device, dtype=torch.bfloat16).reshape(q.shape)
     keys = k_ref.to(device=device, dtype=torch.bfloat16)[slots.clamp(0, 69)]
     dots = torch.einsum("thd,tkd->thk", q_ref, keys)
@@ -850,6 +823,7 @@ def test_empty_cache_and_zero_width_attention(device):
         None,
         None,
         None,
+        lse=None,
     )
     assert not result.any()
 
@@ -894,7 +868,8 @@ def test_optional_snapshot_quantization_oracle(device):
 
 
 @pytest.mark.parametrize("fmt", ["swa", "swa_v4"])
-def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt):
+@pytest.mark.parametrize("normalize", [False, True])
+def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt, normalize):
     from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 
     torch.manual_seed(419)
@@ -912,13 +887,30 @@ def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt):
     storage = torch.zeros((6, 64 * width + 512), device=device, dtype=torch.uint8)
     cache = storage[:, : 64 * width].view(6, 64, width)
     expected = storage.clone()[:, : 64 * width].view(6, 64, width)
-    rotated = rope_inplace(values.clone(), positions, rope, None)
+    weight = (
+        torch.randn(512, device=device, dtype=torch.bfloat16) if normalize else None
+    )
+    normalized = values
+    if normalize:
+        from tokenspeed_kernel.ops.layernorm import rmsnorm
+
+        normalized = rmsnorm(values, weight, eps=1e-6, residual=None, out=None)
+    rotated = rope_inplace(normalized.clone(), positions, rope, None)
     dsv41.cache_scatter(rotated, expected, slots, fmt)
     out = torch.empty_like(values)
-    dsv41.swa_rope_scatter(values, positions, rope, cache, slots, fmt, out)
+    dsv41.swa_rope_scatter(
+        values, positions, rope, cache, slots, fmt, out, weight, 1e-6
+    )
     reference = dsv41.cache_unpack(dsv41.cache_pack(rotated, fmt, None), fmt, None)
-    torch.testing.assert_close(out, reference, rtol=0, atol=0)
-    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+    if normalize:
+        error = (out.float() - reference.float()).square().mean().sqrt()
+        assert error < 1e-3 * reference.float().square().mean().sqrt()
+        stored = dsv41.cache_gather(cache, slots[1:], fmt, None)
+        torch.testing.assert_close(stored, out[1:], rtol=0, atol=0)
+        assert not cache[0].any()
+    else:
+        torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("fmt", ["swa_v4", "global_v4"])
@@ -1001,24 +993,25 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     assert not torch.any(actual[~active])
 
 
-def test_compressor_pool_token_count_does_not_recompile(device):
-    """Every prefill brings a new token count; the kernel must not key its
-    compile cache on the row count."""
-    tail = torch.randn(5, 2, 2, 512, device=device)
+def test_compressor_pool_token_count_and_capacity_do_not_recompile(device):
+    """Token counts and tail capacities must not key the compile cache."""
 
-    def run(count):
+    def run(count, pages):
+        tail = torch.empty(pages, 2, 2, 512, device=device)
+        tail[-1].normal_()
         projection = torch.randn(count, 1024, device=device)
         content, scores = projection[:, :512], projection[:, 512:]
         previous = torch.arange(count, device=device) - 1
-        slots = torch.full((count,), 2, device=device, dtype=torch.int32)
+        slots = torch.full((count,), pages * 2 - 1, device=device, dtype=torch.int32)
         active = torch.arange(count, device=device) % 2 == 1
+        active[0] = True
         pooled = dsv41.compressor_pool(
             content, scores, previous, tail, slots, active, None, None, 0.0
         )
         # Row 0 pairs with the tail slot; every later active row pairs with
         # its predecessor in this forward.
-        prior_content = torch.cat([tail[1, 0, 0][None], content[:-1]])
-        prior_scores = torch.cat([tail[1, 0, 1][None], scores[:-1]])
+        prior_content = torch.cat([tail[-1, 1, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[-1, 1, 1][None], scores[:-1]])
         maximum = torch.maximum(prior_scores, scores)
         old_exp = torch.exp(prior_scores - maximum)
         new_exp = torch.exp(scores - maximum)
@@ -1026,13 +1019,20 @@ def test_compressor_pool_token_count_does_not_recompile(device):
         expected[~active] = 0
         torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-6)
 
-    # Warm both integer-specialization classes (16-divisible and not); Triton
-    # still keys on those two properties for runtime scalars.
-    run(32)
-    run(33)
+    # Warm at a fixed capacity, then vary both token count and capacity.
+    run(32, 5)
+    run(33, 5)
     with assert_no_triton_compile(implementation._compressor_pool):
-        for count in (48, 97, 130, 1483, 4096):
-            run(count)
+        for count, pages in ((48, 3), (97, 16), (130, 17), (1483, 32), (4096, 33)):
+            run(count, pages)
+
+    # The last page starts at 2**31 FP32 elements, beyond int32 offsets.
+    pages = (1 << 20) + 1
+    required_bytes = pages * 2 * 2 * 512 * torch.float32.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires 8 GiB of free device memory")
+    # AMD may compile a separate variant for buffers larger than 2 GiB.
+    run(32, pages)
 
 
 def _native_available():
@@ -1113,6 +1113,7 @@ def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
             schedule,
             None,
             None,
+            lse=None,
         )
 
     stream = torch.cuda.Stream()
@@ -1180,6 +1181,7 @@ def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
         None,
         kv,
         indices,
+        lse=None,
     )
     selected = kv[indices.clamp_min(0).long(), 0].float()
     logits = torch.bmm(q.float(), selected.transpose(1, 2)) * 512**-0.5
@@ -1189,37 +1191,6 @@ def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
     ]
     expected = torch.bmm(probs, selected).bfloat16()
     torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
-
-
-def _compressor_metadata_reference(positions, requests, table, pages):
-    positions, requests, table = positions.cpu(), requests.cpu(), table.cpu()
-    sources = {(int(r), int(p)): i for i, (p, r) in enumerate(zip(positions, requests))}
-
-    def slot(p, r):
-        if p < 0 or not 0 <= r < table.shape[0] or p // 2 >= table.shape[1]:
-            return -1
-        page = int(table[r, p // 2])
-        return page * 2 + p % 2 if 0 < page < pages else -1
-
-    rows = []
-    for p, r in zip(positions.tolist(), requests.tolist(), strict=True):
-        active = p >= 0 and p % 2 == 1
-        pair, request = (p - 1, r) if active else (-1, -1)
-        previous = sources.get((request, pair), -1) if active and r >= 0 else -1
-        rows.append((active, pair, request, previous, slot(pair, request), slot(p, r)))
-    return tuple(
-        torch.tensor([row[i] for row in rows], dtype=dtype)
-        for i, dtype in enumerate(
-            (
-                torch.bool,
-                positions.dtype,
-                requests.dtype,
-                torch.int64,
-                torch.int64,
-                torch.int64,
-            )
-        )
-    )
 
 
 @pytest.mark.parametrize("n", [0, 1, 16, 128, 129, 257, 8192, 32768])
@@ -1261,7 +1232,7 @@ def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
 
     prepare()
     for got, want in zip(
-        out, _compressor_metadata_reference(p, r, table, 4), strict=True
+        out, torch_dsv41_compressor_pairs(p, r, table, 4), strict=True
     ):
         torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
     if target == "cuda":
@@ -1280,7 +1251,7 @@ def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
         else:
             prepare()
         for got, want in zip(
-            out, _compressor_metadata_reference(p, r, table, 4), strict=True
+            out, torch_dsv41_compressor_pairs(p, r, table, 4), strict=True
         ):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
 
@@ -1309,7 +1280,7 @@ def test_compressor_metadata_table_width_does_not_recompile():
         )
         implementation.compressor_metadata(p, r, table, 4, *out)
         for got, want in zip(
-            out, _compressor_metadata_reference(p, r, table, 4), strict=True
+            out, torch_dsv41_compressor_pairs(p, r, table, 4), strict=True
         ):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
 
@@ -1682,3 +1653,89 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
     with assert_no_triton_compile(implementation._dspark_anchors_kernel):
         run(0)
         run(2)
+
+
+@pytest.mark.parametrize(
+    "heads,rows",
+    [(32, rows) for rows in (0, 6, 12, 24, 48, 96, 128, 129, 192, 257)]
+    + [(heads, 257) for heads in (4, 8, 16)],
+)
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_indexer_rope_weights_match_separate_operations(
+    device, heads, rows, strided, dtype
+):
+    torch.manual_seed(731)
+    dim = 128
+    query_storage = torch.randn(rows, heads * 2, dim, dtype=dtype, device=device)
+    weight_storage = torch.randn(rows, heads * 2, dtype=dtype, device=device)
+    queries = (
+        query_storage[:, ::2] if strided else query_storage[:, :heads].contiguous()
+    )
+    weights = (
+        weight_storage[:, ::2] if strided else weight_storage[:, :heads].contiguous()
+    )
+    original_q, original_w = queries.clone(), weights.clone()
+    query_gaps, weight_gaps = (
+        query_storage[:, 1::2].clone(),
+        weight_storage[:, 1::2].clone(),
+    )
+    angles = torch.randn(512, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    positions = torch.arange(rows, device=device, dtype=torch.int64) - 1
+    scale = dim**-0.5 * heads**-0.5
+    expected_q = dsv41.rope_inplace(original_q.clone(), positions, table, "triton")
+    expected_w = original_w * scale
+    q, w = dsv41.rope_weights_inplace(
+        queries, positions, table, weights, scale, "triton"
+    )
+    assert q is queries and w is weights
+    torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(w, expected_w, rtol=0, atol=0)
+    if strided:
+        torch.testing.assert_close(query_storage[:, 1::2], query_gaps, rtol=0, atol=0)
+        torch.testing.assert_close(weight_storage[:, 1::2], weight_gaps, rtol=0, atol=0)
+    # Changing batch rows must reuse the compiled scalar parameters.
+    if rows >= 12:
+        dsv41.rope_weights_inplace(
+            queries[:6], positions[:6], table, weights[:6], scale, "triton"
+        )
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
+            dsv41.rope_weights_inplace(
+                queries[:12], positions[:12], table, weights[:12], scale, "triton"
+            )
+
+    if heads == 32 and rows >= 192:
+        # Both grid sizes use separate scaling and share the ordinary RoPE JIT.
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
+            dsv41.rope_weights_inplace(
+                queries[:129], positions[:129], table, weights[:129], scale, "triton"
+            )
+
+
+@pytest.mark.parametrize("rows", [128, 129])
+def test_indexer_rope_weight_dispatch_graph_replay(device, rows):
+    torch.manual_seed(4096)
+    queries = torch.randn(rows, 32, 128, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(rows, 32, dtype=torch.bfloat16, device=device)
+    initial_q, initial_w = queries.clone(), weights.clone()
+    positions = torch.zeros(rows, dtype=torch.int64, device=device)
+    angles = torch.randn(64, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    scale = 128**-0.5 * 32**-0.5
+    dsv41.rope_weights_inplace(queries, positions, table, weights, scale, "triton")
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_q, actual_w = dsv41.rope_weights_inplace(
+            queries, positions, table, weights, scale, "triton"
+        )
+    for position in (-1, 0, 17):
+        queries.copy_(initial_q)
+        weights.copy_(initial_w)
+        positions.fill_(position)
+        expected_q = dsv41.rope_inplace(initial_q.clone(), positions, table, "triton")
+        graph.replay()
+        assert actual_q is queries and actual_w is weights
+        torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(actual_w, initial_w * scale, rtol=0, atol=0)

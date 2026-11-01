@@ -52,16 +52,29 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   missing implementation fails at startup
 │                                   instead of silently falling back
 ├── collectives.deterministic       one association order per reduction
-│   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
-│   │                               kernels make no bitwise claim)
+│   ├── no fused AR+norm            enable_allreduce_fusion=False and
+│   │                               comm_fusion_max_num_tokens=-1, also set
+│   │                               by batch_invariant_collectives or
+│   │                               layer_boundary_norm=unfused alone (the
+│   │                               fused kernels make no bitwise claim)
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   ├── batch_invariant_collectives AutoBackend.route, one decision for every
-│   │                               collective: every reduction is NCCL data
+│   │                               collective: every reduction is data
 │   │                               movement plus a fixed-rank-order fp32
 │   │                               fold (all-reduce = all-gather + fold at
-│   │                               world_size x traffic, reduce-scatter =
-│   │                               all-to-all + fold at no extra traffic).
+│   │                               world_size x traffic, its gather on the
+│   │                               multicast kernels where they reach, or
+│   │                               trtllm workspace kernels with fp32
+│   │                               accumulation where a workspace is armed
+│   │                               (one call, or chunks of the rows it
+│   │                               holds; armed through a prefill chunk
+│   │                               up to 2048 rows): they fold ranks
+│   │                               0..W-1 the same way on one-shot and
+│   │                               two-shot, bit for bit, -0.0 sums
+│   │                               included as +0.0;
+│   │                               reduce-scatter = all-to-all + fold at no
+│   │                               extra traffic).
 │   │                               A ring reduction chunks by message size,
 │   │                               so its per-element order is run-stable
 │   │                               but not batch-size-invariant; the NVLS
@@ -73,7 +86,14 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               kernels. The route reads only static
 │   │                               properties of the call site, never the
 │   │                               row count, so a site cannot change route
-│   │                               with the batch
+│   │                               with the batch. Inside the all-reduce
+│   │                               fold the row count does pick the kernel
+│   │                               (workspace one-shot or two-shot, or the
+│   │                               gather where no armed workspace serves
+│   │                               the shape); all give the same bits,
+│   │                               except values below 1.2e-38, which the
+│   │                               workspace kernels (built with fast
+│   │                               math) flush to zero
 │   ├── data movement               all-gather, token all-gather, all-to-all
 │   │                               (even or uneven, the transposes of the
 │   │                               decode TP layouts) move bytes without
@@ -141,7 +161,7 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               sparse core keeps it (dsa_decode /
 │   │                               dsa_prefill slot_order trait); silent
 │   │                               kernels are refused rather than assumed
-│   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
+│   └── per-row GEMMs               fixed-order GEMM leaves (see plans below)
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
 │                                   log-softmax of alignment.trainer
@@ -162,6 +182,11 @@ Every selection point that pins a batch-invariant leaf tests `numerics in
 BITWISE_ENVELOPES`, never the one name, so an envelope added above
 rl-bitwise would inherit every pin.
 
+Unquantized FP16/BF16 MoE on `flashinfer_cutlass` defaults to GEMM2 atomic
+expert combine. `--no-moe-cutlass-fused-finalize` selects a separate finalize
+reduction for both target and draft; `rl-bitwise` forces fusion off. The
+setting is fixed in each expert plan before warmup and CUDA graph capture.
+
 ## alignment.trainer
 
 The invariance layers make a deployment agree with itself. Trainer alignment
@@ -181,7 +206,7 @@ and only the reported log-probabilities change.
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
 | `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
-| `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 and no DeepEP all-to-all (both refused by `resolve_numerics`) and a kernel declaring `combine_order` with `slot`. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
+| `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 (refused by `resolve_numerics` otherwise) and a kernel declaring `combine_order` with `slot`; under `--all2all-backend deepep` that kernel must also own the exchange (`supports_all_to_all_ep`) and returns the complete output of the rows this rank owns. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
 
 These are the switches the host can mirror with no new vendor dependency.
 The rest of the trainer's form lives in kernel leaves and model code the host
@@ -270,7 +295,7 @@ the contract tightens, and `rl-bitwise` neither selects nor refuses one.
 Within one deployment they keep the contract as follows.
 
 - Run and batch invariance hold under every layout. The head, dense and
-  LM-head GEMMs take the same `aok` pins as their replicated forms; the
+  LM-head GEMMs take the same batch-invariant plans as their replicated forms; the
   exchanges (token all-gather, all-gather of a reduction dimension, the
   even and uneven all-to-all transposes) are permutations of bytes and need
   no fold; the remaining reductions (`o_proj` and `down_proj` reduce-scatter
@@ -351,19 +376,103 @@ The registry's two matching mechanisms split the work:
   a leaf that affirmatively declares `features={"batch_invariant"}` is the
   only kind a batch-invariant request can be served by.
 
-Deterministic leaves live where any other vendor solution lives: registered
-under `solution="aok"` (the fixed-reduction-order operator kit: GEMM family
-including grouped MoE and BMM, lightning-indexer scoring, stable top-k with
-native forced initial/local windows, no-split sparse MLA attention) with the
-`batch_invariant` feature, at reference priority so `--numerics auto` never
-selects them. Under rl-bitwise each selection point on the served path pins
-that solution: the DSA backend's sparse decode and prefill, the MLA
-absorption and value projections, the dense and LM-head GEMMs, and the MoE
-plan (the envelope folds `--moe-backend auto` to `"aok"`, so the
-routed-expert apply plans through the ordinary `moe_plan(solution=...)`
-path). A pinned solution with no registered leaf fails selection at startup
-or at the first call instead of falling back — the FluentLLM discipline
-("no silent fallback") expressed through the existing registry.
+Batch-invariant leaves register the `batch_invariant` feature at the ordinary
+kernel boundary. The numerical envelope requires capabilities, not a provider
+name. Dense/LM-head and router projections, MLA absorption, sparse attention
+and expert execution bind their eligible implementations during initialization.
+MoE leaves additionally declare the requested routing and combine order;
+`--moe-backend auto` leaves provider selection to that constrained plan, while
+an explicit backend restricts its candidates without bypassing the capability
+check. Weight preparation and execution share the selected implementation.
+Missing capabilities fail planning instead of silently falling back. A capability
+declaration does not promise identical bits between different providers or
+agreement with a trainer; those comparisons need numerical acceptance for the
+chosen implementation and operation order.
+
+### Initialization-time kernel plans
+
+A numerical requirement is independent of its provider. Dense projections and
+absorbed MLA request the `batch_invariant` feature through a `KernelPlan`.
+Initialization filters by formats, hardware and static model geometry, then
+ranks once, with the kernel name breaking equal-score ties. No representative
+batch is used. Candidates constraining a variable dimension are excluded:
+its exact values or the registry's `_min`, `_max`, and `_align` bounds.
+Static semantic traits such as `topk_layout` remain independent of a variable
+`topk` dimension. Planning a bounded deployment domain is not currently supported.
+
+Execution validates the same formats and static traits and calls the saved
+implementation. It does not consult the registry, retune, or use an unplanned
+GEMV/fused fallback. A missing provider or an incompatible input fails. The
+provider's declaration covers its internal choices across the varying rows.
+`plan_dsa_topk` and `plan_mla_project_value` offer the same contract for the
+DSA indexer top-k and the MLA value projection: the index-key format, head
+geometry and slot order are static, while request counts and history lengths
+vary without provider selection. These operators run inside the model, so the
+model builds their plans and passes them in (`kernel_plan=` on
+`dsa_prefill_topk` / `dsa_decode_topk`, `plan=` on `mla_project_value`). No
+in-tree model plans them yet, since none is verified under `rl-bitwise` (see
+the per-model verification below); out-of-tree models that are verified are
+the current callers.
+Plans for different operators or phases still require cross-phase numerical
+acceptance; an individual capability declaration does not establish that.
+
+A planned attention leaf that can be recorded into a CUDA graph also declares
+the `cuda_graph` feature. `MLAAttnBackend` and `DSABackend` derive their graph
+support from the leaves they planned (`CudaGraphSupport.from_plans`), so a
+leaf without the feature runs eagerly instead of being captured; startup logs
+which backend disabled which graph.
+
+### Absorbed MLA
+
+Under a bitwise envelope, `MLAAttnBackend` plans the standard
+`mla_extend_with_kvcache` and `mla_decode_with_kvcache` operators with the
+`batch_invariant` requirement. Initial prefill and cached extend both prepare
+absorbed paged metadata, independent of the prefix length or query-length
+heuristic used in auto mode. The model supplies absorbed queries and writes
+the latent cache through its prepared-input path.
+
+The current absorbed extend interface cannot express a sliding window, so
+this path rejects windowed configurations rather than widening their mask.
+Value projection stays separate to preserve its explicit rounding boundary.
+Provider registration owns dtype, head geometry and hardware constraints.
+The ordinary auto envelope retains its existing dynamic selection policy.
+
+### Explicit projection plans
+
+A model may bind an existing unquantized Linear or LM-head method to a dense
+GEMM plan without changing its weight owner or storage. The logits processor
+uses that method for a registered bitwise envelope, preserving its normal
+input dtype cast and vocabulary communication.
+
+Plugins may call `register_numerics_envelope` from the runtime registration
+surface. A policy supplies its name, bitwise classification, launch resolver
+and checkpoint validator. Plugin discovery precedes CLI choices and launch
+validation; registrations update shared containers and roll back together if
+plugin loading fails. Every policy still passes the model profile gate.
+Only `rl-bitwise` inherits the RL switches and unquantized/vocab-block limits;
+a plugin owns its own policy without changing individual execution entry points.
+
+The existing `gemm/mm` plan also accepts already quantized FP8 operands and
+canonical scales. Quantization stays in the caller's existing quantization
+hook; an online quantizer is not selected by a frozen GEMM plan. The ordinary
+FP8 linear method retains its original dynamic selection and has no new plan
+field or forwarding path.
+
+The original RMSNorm module may accept a preselected callable through `kernel`.
+The caller uses the existing registry selection during initialization; forward
+invokes that callable with the ordinary weight, epsilon, residual and output
+arguments. No plan or forward-scoped override is required. The default remains
+the original platform facade, and empty inputs keep the original early return.
+A custom callable rejects fused collective/norm entry points so its arithmetic
+cannot be bypassed. Kernel-specific input validation stays in the selected leaf.
+
+`MoELayer` retains the usual `moe/apply` selection and its existing scoped
+`kernel_override` mechanism; no model-specific solution or feature arguments
+are added. An optional input dtype describes the actual activation for that
+selection without changing the global default dtype. A live-row mask is
+forwarded only to a kernel declaring that capability; unsupported masks fail
+rather than being ignored. Weight allocation and checkpoint loading stay on
+the original MoE layer for both precomputed and in-kernel routing.
 
 ## Logprobs: one arithmetic for prompt and output
 
@@ -373,7 +482,7 @@ consumers call: `log_softmax(logits, -1, dtype=float32)` gathered at the token
 under `torch`, Megatron's vocab-parallel cross-entropy order under `megatron`
 (alignment.trainer above) -- with the logits produced by the same LM-head
 route the sampler takes (`LogitsProcessor._get_logits`: quantized or dense
-GEMM, the `aok` GEMM under rl-bitwise, the TP gather, softcap). The sampler's
+GEMM, the planned batch-invariant GEMM under rl-bitwise, the TP gather, softcap). The sampler's
 output logprobs and the prompt (input) logprobs of the SGLang dialect
 (`LogitsProcessor.compute_input_token_logprobs`, requested through
 `return_logprob` + `logprob_start_len`) share that function, so the logprob of
@@ -383,6 +492,18 @@ a rollout. The `dtype=float32` form widens bf16 logits inside the kernel (an
 exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
+
+Vocabulary-parallel argmax packs the shard maximum and its global index into
+an int64 key, reduced with MAX over the vocabulary group. This portable Triton
+kernel runs on CUDA, ROCm and Ascend; signed zeros have one canonical key so
+ties select the lowest global index. Ascend prepares this state before graph
+capture and uses HCCL for the reduction. Full-vocabulary callers retain the
+ordinary gather, dtype and sampling arithmetic above.
+
+Accepted stop tokens and length limits are applied on the device before
+recurrent-state commit and accepted-frontier updates. Ascend uses the same
+Triton stop-condition kernel during eager and NPUGraph execution; the scalar
+reference is kept off captured device streams.
 
 Top-k alternatives (`top_logprobs_num`, `torch` order only) follow the same
 rule: `top_token_logprobs`, beside it, takes a row's `top_k` largest entries
@@ -403,7 +524,7 @@ Prompt logprobs are gathered in position chunks of
 `--input-logprob-chunk-tokens` rows so the transient `[rows, vocab]` logits
 stay bounded. The chunk size is a sizing knob, not a numerics one: the
 reductions involved are row-local (the GEMM's row is independent of its
-neighbours under the per-row GEMM leaves of `invariance.batch`, and
+neighbors under the per-row GEMM leaves of `invariance.batch`, and
 log-softmax reduces within a row), so no value depends on which chunk, or how
 large a chunk, a position landed in. The same holds across prefill chunks:
 positions are scored by the chunk that feeds them and assembled per request
@@ -562,3 +683,20 @@ quantized GEMM leaf exists, so their linears would select shape-dependent
 ones) and a vocabulary that is not a multiple of `MEGATRON_VOCAB_BLOCK`
 (the envelope's logprob order folds fixed blocks of it; MoE TP other than 1
 is refused by `resolve_numerics` for the same reason on the MoE side).
+
+### Shared torch-order correction-bias routing
+
+`torch_router_topk` in the runtime re-exports the kernel package's
+`torch_softmax_bias_topk`. Its arithmetic is unchanged: FP32 softmax, sorted
+PyTorch top-k on probabilities plus correction bias, gathering unbiased
+probabilities, scaling, then mapping identity candidates to -1. Exact ties
+retain PyTorch's order, not an independently imposed expert-ID order.
+
+Callers needing a frozen choice use `plan_softmax_bias_topk` and execute
+`softmax_bias_topk` with that plan. The registered batch-invariant domain is
+NVIDIA SM90+ with at most 2048 candidates; larger widths fail planning rather
+than inheriting an unvalidated claim. The direct torch entry keeps the existing
+runtime behavior on other platforms and widths. Tests preserve the old formula
+independently and compare weights/IDs byte-for-byte on ties, cutoff ties, bias,
+identity candidates, near ties, batch packing/reordering and CUDA graph replay.
+This does not promise cross-version PyTorch tie compatibility.

@@ -1,6 +1,6 @@
 # General agent guidelines
 
-> If a `AGENTS.local.md` file exists alongside this file, read and respect it--
+> If an `AGENTS.local.md` file exists alongside this file, read and respect it;
 > it contains developer-specific overrides that supplement this shared guidance.
 
 ## Collaboration principle
@@ -27,11 +27,11 @@ people and average people is more than tenfold.
   unless definitely required; mock only what the test environment genuinely
   lacks: GPUs, process groups, network, model weights.
 * Update docs for the changed code. Use concise comments to explain code
-  where it might be tricky for humans to understand. Leave project/component
-  level (design) docs focusing on high-level picture. Put suitable docs at
-  the suitable place and avoid duplicating the same across a lot of places.
+  where it might be tricky for humans to understand. Keep project- and
+  component-level (design) docs focused on the high-level picture. Put docs in
+  the right place and avoid duplicating the same content across many places.
 * For code comments, use common/existing terms for easy human understanding;
-  avoid obsecure terms or coining unnecessary new concepts.
+  avoid obscure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
   behavior must be explicit and have no defaults. This includes execution modes,
   backend selection, and flags that switch between implementations.
@@ -56,7 +56,7 @@ people and average people is more than tenfold.
 * Do not substitute a narrower lint command for the repository hook before
   committing. Always run the exact `pre-commit run --all-files` command and
   commit any formatter changes it makes.
-* When creating commits, perform sign off on behalf of the author.
+* When creating commits, sign off on behalf of the author.
 
 ## Design principles
 
@@ -67,7 +67,7 @@ path cover the case instead of adding a mode-specific branch.
 
 When attention needs new per-request state, first ask whether the LCM cache
 subsystem and the C++ scheduler can own it — as a cache group with its own
-block granularity, allocated, prefix-matched, transferred and freed with the
+block granularity, allocated, prefix-matched, transferred, and freed with the
 request's other blocks — before adding state maintenance inside a particular
 model or attention backend. Backend-private state is the exception, not the
 default; when it exists and is keyed by the request slot, it must implement
@@ -91,14 +91,14 @@ change.
   plane / data plane split and what the loop is allowed to hold, centralized
   scheduler feedback, in-flight depth, the hooks pattern.
 * `docs/design/cache-concepts.md` — KV cache vocabulary and the layering
-  between prefix matching, allocation and page geometry.
+  between prefix matching, allocation, and page geometry.
 * `docs/design/scheduler.md` — the C++ scheduler's admission granularity,
   what triggers retraction in each engine role, and the recovery protocol.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
 * `docs/design/attention-prologue.md` — the one entry between projections
-  and core attention: QK norm, RoPE, quantization and the KV write, the
+  and core attention: QK norm, RoPE, quantization, and the KV write, the
   numerics contract every solution meets, and who writes the cache.
 * `docs/design/tree-speculation.md` — draft-tree speculation: the tree as a
   parameter of the chain path (compaction), position vs slot, one tree
@@ -123,6 +123,12 @@ change.
   boundary.
 * Third-party kernel libraries belong under `tokenspeed-kernel`; avoid direct
   runtime dependencies or imports that bypass it.
+* Runtime code (`python/tokenspeed/`) should dispatch kernels across hardware
+  platforms through the `tokenspeed-kernel` registry (`select_kernel`,
+  `KernelPlan.select()`, or the family-level ops built on them) rather than
+  importing a specific solution or branching on the platform at the call site.
+  When a call site must bypass the registry, add a comment there explaining
+  why.
 * If a dependency repeatedly breaks during version upgrades or slows project
   progress, consider removing it entirely or at least making it optional.
 
@@ -158,7 +164,7 @@ Follow this sequence:
 Inside the root `tokenspeed-kernel/` directory:
 
 * All direct tokenspeed-triton imports should happen in `_triton.py` and then
-  re-import to other places.
+  be re-imported elsewhere.
 * Avoid using `triton` directly; use `tokenspeed_triton` instead.
 * Avoid using `torch.compile`; prefer writing the fused kernel directly in
   Triton.
@@ -168,25 +174,25 @@ Inside the root `tokenspeed-kernel/` directory:
   Use Triton for portable solutions across vendors. Vendor libraries should
   stay optional. Other solutions may be used as temporary transitions, but
   new work should consolidate toward these backend choices.
-* Files under `ops/` should follow `<family>/<solution>` structure, like
+* Files under `ops/` should follow the `<family>/<solution>` structure, such as
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
-* For op traits, use existing ones if there are. If needing to create new ones,
-  name it consistently with existing ones.
-* Top-level `README.md` should only contain high-level kernel system designs
+* For op traits, use existing ones if any exist. If you need to create new ones,
+  name them consistently with existing ones.
+* The top-level `README.md` should only contain high-level kernel system designs
   geared for human understanding. For per-op details, use `README.md` files
-  under corresponding `ops/` directory.
-* Prefer to `@register_kernel` with the name as the Python `def` function
-  attached to, prefixed with its solution (such as `triton_mha_prefill`).
-* When defining new public APIs, explain arguments and returns in docstring.
+  under the corresponding `ops/` directory.
+* Prefer to `@register_kernel` with the name of the Python `def` function it
+  is attached to, prefixed with its solution (such as `triton_mha_prefill`).
+* When defining new public APIs, explain arguments and returns in the docstring.
 * Keep vendor-only code in files or private directories named after its
   vendor-specific solution (`cute_dsl`, `gluon`, ...). CI skips the other
   vendor's GPU jobs based on these names. Code that serves both vendors belongs
   in a shared solution (`triton`).
 * Place vendor-specific tests under a `test/<vendor>/` subdirectory.
-  Tests for common infra and covering multi-vendors reside under `test/`
-  directly.
+  Tests for common infrastructure and tests covering multiple vendors reside
+  directly under `test/`.
 * Use tight atol/rtol in correctness comparison tests.
 * Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`,
   `cutlass.Constexpr`) are part of the JIT cache key: a new value triggers a
@@ -199,31 +205,59 @@ Inside the root `tokenspeed-kernel/` directory:
   widths, split counts computed from the batch size), must be runtime
   arguments, or be bucketed first (such as `next_power_of_2`) when the kernel
   needs a compile-time bound. The same holds for template arguments of other
-  JITs such as DeepGEMM. Reviews should check every new or changed kernel
-  signature and launch site for this. Kernels should have tests to guard
-  against excessive scalar parameter specialization with
-  `assert_no_triton_compile` from `test/utils.py`. Tensor parameters need no
-  such test. At runtime `tokenspeed_kernel.compile_monitor` logs every
-  Triton compilation after startup and names a parameter that keeps taking
-  new values. CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
-  parameter fails the model tests.
+  JITs such as DeepGEMM, for static CuTe DSL tensor dimensions, and for the
+  key under which a caller caches a `cute.compile` result, which must hold
+  only what the kernel specializes on. Call CuTe DSL kernels through their
+  compiled functions; a direct `@cute.jit` call traces on every call. Reviews
+  should check every new or changed kernel signature and launch site for this.
+  Kernels should have tests to guard against excessive scalar parameter
+  specialization with `assert_no_triton_compile` or `assert_no_cute_compile`
+  from `test/utils.py`. Triton tensor parameters need no such test. At runtime,
+  `tokenspeed_kernel.compile_monitor` logs every Triton and CuTe DSL
+  compilation after startup and names a parameter that keeps taking new
+  values, a call site that keeps recompiling known specializations, and a
+  direct `@cute.jit` call. CI serves with
+  `TOKENSPEED_JIT_COMPILE_CHECK=error`, so any of these fails the model tests.
+* Integer offsets into global memory must not overflow int32. Compute in
+  int64 every offset whose bound grows with a runtime count: a token,
+  request, page, slot, or expert index times a stride, or a product of sizes
+  such as `num_tokens * vocab_size`. Cast a factor before multiplying
+  (`pid.to(tl.int64) * stride`, `Int64(page) * stride`); casting the product
+  is too late. Byte and bit counts reach 2^31 sooner than element counts.
+  Do not rely on argument types: Triton passes an integer argument as i32
+  while its value fits, so the product of two fitting values still wraps;
+  `tl.program_id`, `tl.arange`, CuTe DSL `Int32` values, and layout sizes
+  such as `cute.cosize` are 32-bit as well. Offsets bounded by model
+  dimensions, such as those inside a tile or row, stay int32: advance the
+  base pointer once per program in int64, then add int32 tile offsets. This
+  keeps 64-bit integer math out of inner loops and matches AMD buffer loads,
+  which take 32-bit offsets from a 64-bit base. A kernel that keeps a
+  runtime-scaled offset in int32 for speed must assert the bound on the host
+  where the tensor is sized, with a comment saying why. Kernels indexed by
+  runtime counts should have a test whose largest offset exceeds 2^31 in the
+  unit the kernel computes, touching only the far end (such as the last
+  pages of a large pool) to stay cheap. Reviews should check every new or
+  changed offset computation for this. To debug an illegal memory access in
+  a Triton or Gluon kernel, rerun it with `TRITON_DEBUG=1`, which asserts on
+  int32 overflow in `+`, `-`, and `*`. This rule applies to every kernel
+  package in the repository, including `tokenspeed-mla/`.
 
 ## tokenspeed-kernel-amd
 
 Inside the root `tokenspeed-kernel-amd/` directory:
 
 * There should be no dependency on `tokenspeed-kernel`.
-* Add jit `launch_metadata` for Proton use along the Triton/Gluon kernels.
-* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
+* Add JIT `launch_metadata` for Proton use alongside the Triton/Gluon kernels.
+* AMD Gluon kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
-* The compile-time parameter rule in the `tokenspeed-kernel` section applies
-  to these kernels too.
-* For per kernel contract and algorithm details, put in
+* The compile-time parameter rule and the int32 offset overflow rule in the
+  `tokenspeed-kernel` section apply to these kernels too.
+* Put per-kernel contract and algorithm details in
   `python/tokenspeed_kernel_amd/ops/README.md`.
 * For Triton/Gluon kernels, one name should thread the whole stack: the
   `register_kernel(name=...)` value, the registered Python `def` it decorates,
   and the `@gluon.jit` (or `@triton.jit`) kernel that does the op's work all
-  share it. The AMD Python launcher should be called as `launch_<name>`.
+  share it. The AMD Python launcher should be named `launch_<name>`.
   Extra kernels launched only by that op insert a role before the arch suffix
   (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
   keep descriptive names. A `repr=` on the jit decorator replaces the compiled

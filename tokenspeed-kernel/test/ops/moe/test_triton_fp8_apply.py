@@ -97,6 +97,7 @@ def _plan(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "triton_fp8_block_precomputed_moe_apply"
     return plan
