@@ -634,7 +634,11 @@ required a cross-round capacity barrier. The empty-round retraction (below) is
 the one exception: it offers the freed pages to the round's decodes first. A
 round with no room left for the grant — its batch full or its token budget
 spent — retracts nothing: the victim would serve nobody, and its pages would
-wait for whoever asks first next round. Two edges of the loop:
+wait for whoever asks first next round. A D-role round full by batch count
+retracts nothing either, although its remote admission takes no batch slot:
+the batch already runs as many requests as it can hold, so retracting a
+resident for the admission would add no throughput and cost an image and a
+restore. Two edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the restore

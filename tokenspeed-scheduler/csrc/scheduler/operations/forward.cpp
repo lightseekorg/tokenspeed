@@ -1156,7 +1156,11 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         // No room left for the grant -- the batch full or the token budget
         // spent: a victim retracted now would serve nobody, and its pages
         // would wait for whoever asks first next round. (An empty round is
-        // never full.)
+        // never full.) A D-role remote admission takes no batch slot, so it
+        // could still join a round full by batch count, but it is not served
+        // either: that batch already runs as many requests as it can hold,
+        // so retracting a resident for the admission would add no throughput
+        // and cost an image and a restore.
         if (build.Full(config_.max_batch_size)) {
             return;
         }
