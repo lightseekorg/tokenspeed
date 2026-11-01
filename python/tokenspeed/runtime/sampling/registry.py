@@ -57,7 +57,7 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         if not platform.is_nvidia:
             return False
         try:
-            from tokenspeed.runtime.sampling.backends import flashinfer
+            from tokenspeed.runtime.sampling.backends import flashinfer  # noqa: F401
 
             return True
         except ImportError:
@@ -66,7 +66,9 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         if not platform.is_nvidia:
             return False
         try:
-            from tokenspeed.runtime.sampling.backends import flashinfer_full
+            from tokenspeed.runtime.sampling.backends import (  # noqa: F401
+                flashinfer_full,
+            )
 
             return True
         except ImportError:
@@ -79,7 +81,7 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         if not platform.is_npu:
             return False
         try:
-            from tokenspeed.runtime.sampling.backends import ascend_full
+            from tokenspeed.runtime.sampling.backends import ascend_full  # noqa: F401
 
             return True
         except ImportError:
