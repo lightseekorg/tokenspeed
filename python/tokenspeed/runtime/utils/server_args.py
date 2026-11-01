@@ -22,6 +22,7 @@
 
 import argparse
 import dataclasses
+import importlib
 import json
 import math
 import os
@@ -292,6 +293,26 @@ def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
     """
     if value not in choices:
         raise ValueError(f"{flag} must be one of {list(choices)}, got {value!r}")
+
+
+ASCEND_FULL_SAMPLING_DEPENDENCY = "flash_ops.npu_sample"
+"""The ``npu_sample`` operators ``ascend_full`` runs, shipped by flash-npu-kernel."""
+
+
+def _ascend_full_sampling_dependency_error() -> str | None:
+    """The import error of ``ascend_full``'s operators, or ``None`` when usable.
+
+    ``ascend_full`` executes the ``npu_sample`` operators from flash-npu-kernel
+    (``flash_ops``), which this repository neither ships nor installs. The backend
+    imports them eagerly, so a checkout without that package fails while the
+    executor is being built. Importing the same module here lets ``validate``
+    report the missing package while the user is still editing the command line.
+    """
+    try:
+        importlib.import_module(ASCEND_FULL_SAMPLING_DEPENDENCY)
+    except ImportError as exc:
+        return str(exc)
+    return None
 
 
 def validate_qcp(
@@ -1043,7 +1064,15 @@ class ServerArgs:
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
-                self.sampling_backend = "ascend_full"
+                # ``ascend_full`` runs operators that ship with flash-npu-kernel,
+                # not with this repository. Select it only where those operators
+                # are importable; otherwise ``greedy`` is what the Ascend recipe
+                # uses and what a source checkout can actually run.
+                self.sampling_backend = (
+                    "greedy"
+                    if _ascend_full_sampling_dependency_error() is not None
+                    else "ascend_full"
+                )
             else:
                 self.sampling_backend = "greedy"
 
@@ -2403,6 +2432,19 @@ class ServerArgs:
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
 
+        if self.sampling_backend == "ascend_full":
+            dependency_error = _ascend_full_sampling_dependency_error()
+            if dependency_error is not None:
+                raise ValueError(
+                    "--sampling-backend ascend_full runs the npu_sample operators from "
+                    "flash-npu-kernel (flash_ops), which this repository neither ships nor "
+                    f"installs, and they are not importable here: {dependency_error}. Install "
+                    "flash-npu-kernel built with those operators and a matching OPP, or drop "
+                    "the flag: the default on an Ascend NPU is then --sampling-backend greedy "
+                    "(the backend docs/recipes/models.md uses), which performs argmax and so "
+                    "ignores per-request temperature/top_p/top_k."
+                )
+
         self.validate_petit_moe_options()
         self.validate_rank_emulation()
 
@@ -3251,6 +3293,9 @@ class ServerArgs:
             "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "with Triton Gumbel-Max for single-step sampling. "
             "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
+            "Runs the npu_sample operators from flash-npu-kernel (flash_ops), which this "
+            "repository neither ships nor installs; the Ascend default is this backend "
+            "only where they are importable, and greedy otherwise. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
         )
