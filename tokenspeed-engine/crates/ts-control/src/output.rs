@@ -578,7 +578,10 @@ impl OutputProcessor {
         }
         state.finished_output = false;
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         self.log_end(rid, &state);
         committed.released.push(rid.to_owned());
@@ -634,7 +637,10 @@ impl OutputProcessor {
         }
         let mut state = self.states.remove(rid).expect("present above");
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         let kind = if state.to_abort {
             ForwardEventKind::Abort
@@ -665,10 +671,16 @@ impl OutputProcessor {
         if !state.finished() {
             state.abort("PD/EPD remote transfer failed or timed out", false, None);
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         } else if state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         committed.released.push(rid.to_owned());
         committed
@@ -711,7 +723,9 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
         }
         state.finished_output = false;
-        self.stream(&mut [(rid.to_owned(), &mut state)])
+        Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+            .into_iter()
+            .collect()
     }
 
     /// The ids of the requests registered and not ended.
@@ -729,7 +743,10 @@ impl OutputProcessor {
         };
         if state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         committed.released.push(rid.to_owned());
         committed
@@ -752,7 +769,10 @@ impl OutputProcessor {
         }
         if !state.to_abort || state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         self.log_end(rid, &state);
         committed.released.push(rid.to_owned());
@@ -773,13 +793,19 @@ impl OutputProcessor {
                     status_code: None,
                 });
                 committed.stats.capacity_aborts += 1;
-                committed
-                    .outputs
-                    .extend(self.stream(&mut [(abort.request_id.clone(), &mut state)]));
+                committed.outputs.extend(Self::stream_state(
+                    abort.request_id.as_str(),
+                    &mut state,
+                    self.stream_interval,
+                    self.spec_num_tokens,
+                ));
             } else if state.abort_notify_client {
-                committed
-                    .outputs
-                    .extend(self.stream(&mut [(abort.request_id.clone(), &mut state)]));
+                committed.outputs.extend(Self::stream_state(
+                    abort.request_id.as_str(),
+                    &mut state,
+                    self.stream_interval,
+                    self.spec_num_tokens,
+                ));
             }
             self.log_end(&abort.request_id, &state);
             committed.released.push(abort.request_id.clone());
@@ -983,8 +1009,12 @@ impl OutputProcessor {
             }
         }
 
-        let mut committed = Committed::default();
-        let mut streamed: Vec<String> = Vec::new();
+        // Most rows push one scheduler event and one streamed output.
+        let mut committed = Committed {
+            events: Vec::with_capacity(rows),
+            ..Committed::default()
+        };
+        let mut streamed: Vec<&str> = Vec::with_capacity(rows);
         let mut pt = 0usize;
         for i in 0..rows {
             let rid = &batch.request_ids[i];
@@ -1205,13 +1235,13 @@ impl OutputProcessor {
             if state.to_abort && state.finished() {
                 committed.events.push(finish(rid, nan_detected));
                 if state.abort_notify_client {
-                    streamed.push(rid.clone());
+                    streamed.push(rid);
                 } else {
                     self.release(rid, &mut committed);
                 }
                 continue;
             }
-            streamed.push(rid.clone());
+            streamed.push(rid);
             if state.finished() {
                 committed.events.push(finish(rid, nan_detected));
             } else if is_decode {
@@ -1224,23 +1254,7 @@ impl OutputProcessor {
             }
         }
 
-        let mut states: Vec<(String, RequestState)> = streamed
-            .iter()
-            .filter_map(|rid| self.states.remove_entry(rid))
-            .collect();
-        let mut refs: Vec<(String, &mut RequestState)> = states
-            .iter_mut()
-            .map(|(rid, state)| (rid.clone(), state))
-            .collect();
-        committed.outputs = self.stream(&mut refs);
-        for (rid, state) in states {
-            if state.finished() {
-                self.log_end(&rid, &state);
-                committed.released.push(rid);
-            } else {
-                self.states.insert(rid, state);
-            }
-        }
+        committed.outputs = self.stream(&streamed, &mut committed.released);
         Ok(committed)
     }
 
@@ -1251,56 +1265,80 @@ impl OutputProcessor {
         }
     }
 
-    /// The outputs due for `states` this step, each request's at its stream
-    /// interval.
-    fn stream(&self, states: &mut [(String, &mut RequestState)]) -> Vec<StreamedOutput> {
-        let mut outputs = Vec::new();
-        for (rid, state) in states.iter_mut() {
-            if !state.output_due(self.stream_interval) {
+    /// The output due from one request this step, at its stream interval,
+    /// if any is. A free function so the commit streams states in place
+    /// without lifting them out of the map.
+    fn stream_state(
+        rid: &str,
+        state: &mut RequestState,
+        stream_interval: i64,
+        spec_num_tokens: Option<usize>,
+    ) -> Option<StreamedOutput> {
+        if !state.output_due(stream_interval) {
+            return None;
+        }
+        if state.finished() {
+            state.finished_output = true;
+        }
+        let sent = state.send_token_offset;
+        let output_ids = state.output_ids[sent..].to_vec();
+        state.send_token_offset = state.output_ids.len();
+        let n_new = output_ids.len();
+        let output_logprobs = if state.return_logprob {
+            let start = state.output_logprobs.len().saturating_sub(n_new);
+            state.output_logprobs[start..].to_vec()
+        } else {
+            Vec::new()
+        };
+        // Prompt logprobs ship once, in the first output after the
+        // prompt's final chunk committed.
+        let input_logprobs = if state.input_logprobs_sent {
+            None
+        } else {
+            state.input_logprobs.clone()
+        };
+        state.input_logprobs_sent |= input_logprobs.is_some();
+        let output_top_logprobs = state.output_top_logprobs.as_ref().map(|(values, ids)| {
+            (
+                values[values.len().saturating_sub(n_new)..].to_vec(),
+                ids[ids.len().saturating_sub(n_new)..].to_vec(),
+            )
+        });
+        Some(StreamedOutput {
+            rid: rid.to_owned(),
+            output_ids,
+            finish_reason: state.finished_reason.as_ref().map(FinishReason::wire_type),
+            prompt_tokens: state.prompt_len,
+            completion_tokens: state.output_ids.len() as i64,
+            cached_tokens: state.cached_tokens,
+            output_logprobs,
+            finish_details: state.finished_reason.as_ref().map(FinishReason::details),
+            spec: spec_num_tokens.map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
+            input_logprobs,
+            output_top_logprobs,
+        })
+    }
+
+    /// The outputs due from `rids` this step, each request's at its stream
+    /// interval; a request this finishes leaves the processor, into
+    /// `released`.
+    fn stream(&mut self, rids: &[&str], released: &mut Vec<String>) -> Vec<StreamedOutput> {
+        let interval = self.stream_interval;
+        let spec = self.spec_num_tokens;
+        let mut outputs = Vec::with_capacity(rids.len());
+        for &rid in rids {
+            let Some(state) = self.states.get_mut(rid) else {
                 continue;
-            }
+            };
+            let Some(output) = Self::stream_state(rid, state, interval, spec) else {
+                continue;
+            };
+            outputs.push(output);
             if state.finished() {
-                state.finished_output = true;
+                let (_, state) = self.states.remove_entry(rid).expect("present above");
+                self.log_end(rid, &state);
+                released.push(rid.to_owned());
             }
-            let sent = state.send_token_offset;
-            let output_ids = state.output_ids[sent..].to_vec();
-            state.send_token_offset = state.output_ids.len();
-            let n_new = output_ids.len();
-            let output_logprobs = if state.return_logprob {
-                let start = state.output_logprobs.len().saturating_sub(n_new);
-                state.output_logprobs[start..].to_vec()
-            } else {
-                Vec::new()
-            };
-            // Prompt logprobs ship once, in the first output after the
-            // prompt's final chunk committed.
-            let input_logprobs = if state.input_logprobs_sent {
-                None
-            } else {
-                state.input_logprobs.clone()
-            };
-            state.input_logprobs_sent |= input_logprobs.is_some();
-            let output_top_logprobs = state.output_top_logprobs.as_ref().map(|(values, ids)| {
-                (
-                    values[values.len().saturating_sub(n_new)..].to_vec(),
-                    ids[ids.len().saturating_sub(n_new)..].to_vec(),
-                )
-            });
-            outputs.push(StreamedOutput {
-                rid: rid.clone(),
-                output_ids,
-                finish_reason: state.finished_reason.as_ref().map(FinishReason::wire_type),
-                prompt_tokens: state.prompt_len,
-                completion_tokens: state.output_ids.len() as i64,
-                cached_tokens: state.cached_tokens,
-                output_logprobs,
-                finish_details: state.finished_reason.as_ref().map(FinishReason::details),
-                spec: self
-                    .spec_num_tokens
-                    .map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
-                input_logprobs,
-                output_top_logprobs,
-            });
         }
         outputs
     }
