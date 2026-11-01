@@ -504,8 +504,11 @@ Repeat with `--input-format nvfp4` to cover prequantized inputs, and with
 reference, uneven/idle ranks, graph replay and alternating capacities.
 
 `test_trtllm_mega_moe_input_stage.py` separately checks byte-exact packed data
-and scales against FlashInfer quantization, route conversion, zero-token owners,
-changing live counts and alternating captured graphs on the same workspace.
+and scales against FlashInfer quantization, INT32/INT64 route inputs and outputs,
+zero-token owners, changing live counts and alternating captured graphs on the
+same workspace. The stager converts route IDs to the destination buffer dtype
+and caches a separate compiled specialization for each output dtype; current
+MegaMoE workspaces store INT32 IDs.
 
 Qwen3.5 follows K3's empty-owner path: gate, top-k, quantization and shared
 expert work are skipped when there are no local tokens, but the rank still
