@@ -704,7 +704,8 @@ kernel that needs the whole GPU (MegaMoE, DeepEP or any other all-to-all
 backend, fused DP projections, an MoE backend or solution the runtime does not
 list as safe). A window whose rows on some rank exceed the 13.5 MiB receive
 slot (24576 rows of an FP8 MLA cache, 12288 of a BF16 one) also uses NCCL. The
-fused kernel's waits end 30 s before `--distributed-timeout-seconds`. The
+fused kernel's waits end 30 s before `--distributed-timeout-seconds` (at half
+of it when it is under 90 s). The
 group's first rank logs the choice: `KVP history group ... gathers through the
 fused all-gather`, or `... keeps its NCCL all-gather:` with the reason.
 
