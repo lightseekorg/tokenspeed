@@ -439,7 +439,8 @@ def send_signal_to_peers(
     for peer in tl.static_range(0, world_size):
         remote_signal = tl.load(signal_ptrs + peer).to(tl.pointer_type(tl.uint32))
         send_addr = remote_signal + block_id * world_size + rank
-        send_old = tl.full((), 1, tl.int32)
+        # The CAS returns the signal's own type, uint32.
+        send_old = tl.full((), 1, tl.uint32)
         while send_old != 0:
             send_old = tl.atomic_cas(send_addr, 0, 1, sem="release", scope="sys")
 
@@ -452,7 +453,7 @@ def wait_signal_from_peers(
 ):
     for peer in tl.static_range(0, world_size):
         wait_addr = local_signal + block_id * world_size + peer
-        wait_old = tl.full((), 0, tl.int32)
+        wait_old = tl.full((), 0, tl.uint32)
         while wait_old != 1:
             wait_old = tl.atomic_cas(wait_addr, 1, 0, sem="acquire", scope="sys")
 
