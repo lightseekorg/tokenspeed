@@ -277,8 +277,8 @@ class VocabParallelTopK:
         rows = int(values.shape[0])
         staged, gathered = self._ensure_gather_buffers(rows, values.device)
         staged[:, :top_k].copy_(values)
-        staged[:, top_k:].copy_(ids)
-        staged[:, top_k:].add_(float(shard.org_vocab_start_index))
+        # Global ids in fp32, in one launch: both terms are exact below 2**24.
+        torch.add(ids, float(shard.org_vocab_start_index), out=staged[:, top_k:])
         all_gather_single(gathered, staged, self.tp_group)
 
         # Rank-major to row-major, so one row's candidates from every rank sit
@@ -294,5 +294,5 @@ class VocabParallelTopK:
         # Everything downstream indexes codebooks with these.
         candidate_ids = torch.gather(planes[:, 1], 1, lanes).to(torch.int64)
         if self.softcapping:
-            fused_softcap_generic(values, self.softcapping)
+            fused_softcap_generic(values, self.softcapping, 1.0)
         return candidate_ids, values

@@ -774,11 +774,124 @@ def test_fused_softcap_handles_large_logits_without_nan():
     )
     expected = cap * torch.tanh(logits / cap)
 
-    out = fused_softcap(logits.clone(), cap)
+    out = fused_softcap(logits.clone(), cap, 1.0)
     torch.cuda.synchronize()
 
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_softcap_scale_rounds_like_an_in_place_multiply(dtype):
+    torch.manual_seed(0)
+    logits = (torch.randn(7, 4099, device="cuda") * 40).to(dtype)
+    scale, cap = 0.1767766952966369, 20.0
+
+    fused = fused_softcap(logits.clone(), cap, scale)
+    separate = fused_softcap(logits.clone().mul_(scale), cap, 1.0)
+
+    assert torch.equal(fused, separate)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_scaled_softcapped_tp_logits_match_scaling_before_the_gather(
+    monkeypatch, nvidia_logits
+):
+    """The softcap kernel applies the logit scale after the vocab gather; the
+    result is bit for bit what scaling each rank's shard first gives."""
+    scale, cap = 0.1767766952966369, 20.0
+
+    def processor(softcap):
+        config = SimpleNamespace(
+            model_type="test", vocab_size=64, final_logit_softcapping=softcap
+        )
+        proc = LogitsProcessor(
+            config=config,
+            skip_all_gather=False,
+            do_argmax=False,
+            logit_scale=scale,
+            tp_rank=0,
+            tp_size=2,
+            tp_group=(0, 1),
+            dp_lm_head_tp=False,
+        )
+        proc._all_gather_state = None  # the collective gather path
+        return proc
+
+    def collective(output, logits, group):
+        output.copy_(torch.cat((logits, logits.flip(-1)), dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    torch.manual_seed(1)
+    hidden = torch.randn(5, 16, device="cuda", dtype=torch.bfloat16) * 4
+    head = SimpleNamespace(
+        weight=torch.randn(32, 16, device="cuda", dtype=torch.bfloat16)
+    )
+
+    def logits(proc):
+        return proc._get_logits(
+            hidden,
+            head,
+            logits_metadata=None,
+            embedding_bias=None,
+            plan=None,
+            require_full_vocab=False,
+        )
+
+    fused = logits(processor(cap))
+    expected = fused_softcap(logits(processor(None)), cap, 1.0)
+
+    assert torch.equal(fused, expected)
+
+
+@pytest.mark.parametrize("sink_armed", [False, True])
+def test_a_forward_whose_taps_went_to_the_sink_returns_no_capture(
+    nvidia_logits, sink_armed
+):
+    """With the drafter's sink attached, the drafter already has every tap:
+    the processor neither concatenates them nor stores a hidden capture."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=4),
+        skip_all_gather=True,
+        do_argmax=False,
+        logit_scale=None,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        dp_lm_head_tp=False,
+    )
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 3),
+        input_num_tokens=3,
+        forward_mode=ForwardMode.DECODE,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        target_capture_sink=object() if sink_armed else None,
+    )
+    hidden = torch.randn(3, 2)
+    taps = [torch.randn(3, 2), torch.randn(3, 2)]
+
+    output = processor(
+        None,
+        hidden,
+        SimpleNamespace(weight=torch.randn(4, 2)),
+        LogitsMetadata.from_forward_context(ctx),
+        taps,
+    )
+
+    assert output.next_token_logits.shape == (3, 4)
+    if sink_armed:
+        assert output.hidden_states is None
+    else:
+        assert torch.equal(output.hidden_states, torch.cat(taps, dim=-1))
 
 
 def test_argmax_routes_sharded_to_kernel(monkeypatch):
