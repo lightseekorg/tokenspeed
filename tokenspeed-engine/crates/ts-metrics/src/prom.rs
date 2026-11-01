@@ -69,16 +69,24 @@ impl PromFile {
         })
     }
 
-    /// Store `value` under `key`, adding the key on first use.
-    pub(crate) fn write(&mut self, key: &str, value: f64, timestamp: f64) -> io::Result<()> {
-        let position = match self.positions.get(key) {
-            Some(&position) => position,
-            None => self.append(key)?,
-        };
-        let mut doubles = [0u8; 16];
-        doubles[..8].copy_from_slice(&value.to_ne_bytes());
-        doubles[8..].copy_from_slice(&timestamp.to_ne_bytes());
-        self.file.write_all_at(&doubles, position)
+    /// Write `cells` (a position and its value each), merging runs of
+    /// consecutive slots into one write.
+    fn write_cells(&mut self, cells: &[(u64, f64)]) -> io::Result<()> {
+        let mut cells = cells.to_vec();
+        cells.sort_unstable_by_key(|&(position, _)| position);
+        let mut index = 0;
+        while index < cells.len() {
+            let start = cells[index].0;
+            let mut run = Vec::with_capacity(16);
+            while index < cells.len() && cells[index].0 == start + run.len() as u64 {
+                let (_, value) = cells[index];
+                run.extend_from_slice(&value.to_ne_bytes());
+                run.extend_from_slice(&0f64.to_ne_bytes());
+                index += 1;
+            }
+            self.file.write_all_at(&run, start)?;
+        }
+        Ok(())
     }
 
     fn append(&mut self, key: &str) -> io::Result<u64> {
@@ -116,17 +124,35 @@ impl PromFiles {
         }
     }
 
-    /// Store `value` under `key` in the file for `prefix` (`counter`,
-    /// `gauge_livemax`, `histogram`).
-    pub(crate) fn write(&mut self, prefix: &'static str, key: &str, value: f64) -> io::Result<()> {
-        let file = match self.files.get_mut(prefix) {
-            Some(file) => file,
-            None => {
-                let path = self.directory.join(format!("{prefix}_{}.db", self.pid));
-                self.files.entry(prefix).or_insert(PromFile::create(&path)?)
-            }
-        };
-        file.write(key, value, 0.0)
+    /// The buffered updates of one flush: resolve every entry to its cell,
+    /// then write each file's cells in as few writes as runs of consecutive
+    /// slots allow — the keys a round touches were appended together, so
+    /// they mostly sit next to each other.
+    pub(crate) fn write_batch<I>(&mut self, entries: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = (&'static str, String, f64)>,
+    {
+        let mut cells: HashMap<&'static str, Vec<(u64, f64)>> = HashMap::new();
+        for (prefix, key, value) in entries {
+            let file = self.file(prefix)?;
+            let position = match file.positions.get(key.as_str()) {
+                Some(&position) => position,
+                None => file.append(&key)?,
+            };
+            cells.entry(prefix).or_default().push((position, value));
+        }
+        for (prefix, cells) in cells {
+            self.file(prefix)?.write_cells(&cells)?;
+        }
+        Ok(())
+    }
+
+    fn file(&mut self, prefix: &'static str) -> io::Result<&mut PromFile> {
+        if !self.files.contains_key(prefix) {
+            let path = self.directory.join(format!("{prefix}_{}.db", self.pid));
+            self.files.insert(prefix, PromFile::create(&path)?);
+        }
+        Ok(self.files.get_mut(prefix).expect("present or just created"))
     }
 }
 

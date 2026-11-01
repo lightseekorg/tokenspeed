@@ -663,6 +663,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
             transfer: peers.transfer,
             embeddings: peers.embeddings,
             metrics,
+            exporter: exporter.clone(),
             kv_events,
             eplb,
             grammars,

@@ -72,7 +72,16 @@ pub struct MetricsConfig {
 pub struct Exporter {
     prom: Option<Mutex<PromFiles>>,
     relay: Option<RelaySender>,
+    /// Prometheus writes wait for one `flush` per serving round. Every
+    /// written value is cumulative — a counter total, a gauge, a bucket's
+    /// count — so the newest buffered value per key is exact and a round's
+    /// burst collapses to one write per distinct key.
+    pending: Mutex<HashMap<(&'static str, String), f64>>,
 }
+
+/// Pending writes above this flush themselves, so a caller without a
+/// round still lands its values.
+const PENDING_LIMIT: usize = 1024;
 
 impl Exporter {
     /// The outputs `config` selects.
@@ -87,6 +96,7 @@ impl Exporter {
                 .clone()
                 .map(|directory| Mutex::new(PromFiles::new(directory))),
             relay,
+            pending: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -95,13 +105,33 @@ impl Exporter {
         self.relay.as_ref().map_or(0, RelaySender::dropped)
     }
 
-    fn write(&self, prefix: &'static str, key: &str, value: f64) {
+    /// Write the buffered values out. Call once per serving round.
+    pub fn flush(&self) {
         let Some(prom) = &self.prom else {
             return;
         };
+        let pending = std::mem::take(&mut *self.pending.lock().expect("pending metrics lock"));
+        if pending.is_empty() {
+            return;
+        }
+        let entries = pending
+            .into_iter()
+            .map(|((prefix, key), value)| (prefix, key, value));
         let mut files = prom.lock().expect("metrics files lock");
-        if let Err(error) = files.write(prefix, key, value) {
-            tracing::warn!(%error, prefix, "writing a Prometheus multiprocess file failed");
+        if let Err(error) = files.write_batch(entries) {
+            tracing::warn!(%error, "writing Prometheus multiprocess files failed");
+        }
+    }
+
+    fn write(&self, prefix: &'static str, key: &str, value: f64) {
+        if self.prom.is_none() {
+            return;
+        }
+        let mut pending = self.pending.lock().expect("pending metrics lock");
+        let fresh = pending.insert((prefix, key.to_owned()), value).is_none();
+        if fresh && pending.len() >= PENDING_LIMIT {
+            drop(pending);
+            self.flush();
         }
     }
 
@@ -153,7 +183,10 @@ pub struct Metric {
     /// Histogram bounds, `+Inf` last.
     bounds: Vec<f64>,
     exporter: Arc<Exporter>,
-    series: Mutex<HashMap<Vec<String>, Series>>,
+    /// The metric's series — one per label set, a handful at most. A
+    /// scan comparing the label values allocates nothing, where a hashed
+    /// lookup would rebuild its `Vec<String>` key on every update.
+    series: Mutex<Vec<Series>>,
 }
 
 fn now_ns() -> u64 {
@@ -188,7 +221,7 @@ impl Metric {
             kind,
             bounds,
             exporter: Arc::clone(exporter),
-            series: Mutex::new(HashMap::new()),
+            series: Mutex::new(Vec::new()),
         }
     }
 
@@ -232,50 +265,58 @@ impl Metric {
             self.name,
             self.labelnames
         );
-        let mut series = self.series.lock().expect("metric series lock");
-        let key: Vec<String> = values.iter().map(|&value| value.to_owned()).collect();
-        let mut created = false;
-        let entry = series.entry(key).or_insert_with(|| {
-            created = true;
-            let labels: Vec<(&str, &str)> = self
-                .labelnames
+        // The label names are this metric's own; equal values are the same
+        // series.
+        let matches = |series: &Series| {
+            series
+                .labels
                 .iter()
-                .copied()
-                .zip(values.iter().copied())
-                .collect();
-            let sample = match self.kind {
-                Kind::Counter => format!("{}_total", self.name),
-                Kind::Gauge => self.name.to_owned(),
-                Kind::Histogram => format!("{}_sum", self.name),
-            };
-            let bucket_keys = if self.kind == Kind::Histogram {
-                let bucket = format!("{}_bucket", self.name);
-                self.bounds
-                    .iter()
-                    .map(|&bound| {
-                        let le = prom::le_label(bound);
-                        let mut with_le = labels.clone();
-                        with_le.push(("le", &le));
-                        prom::sample_key(self.name, &bucket, &with_le, self.help)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            Series {
-                labels: labels
-                    .iter()
-                    .map(|&(name, value)| (name.to_owned(), value.to_owned()))
-                    .collect(),
-                value: 0.0,
-                buckets: vec![0.0; self.bounds.len()],
-                sum: 0.0,
-                key: prom::sample_key(self.name, &sample, &labels, self.help),
-                bucket_keys,
-                last_gauge: None,
-            }
+                .zip(values)
+                .all(|((_, value), got)| value == got)
+        };
+        let mut series = self.series.lock().expect("metric series lock");
+        if let Some(entry) = series.iter_mut().find(|entry| matches(entry)) {
+            return update(entry);
+        }
+        let labels: Vec<(&str, &str)> = self
+            .labelnames
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .collect();
+        let sample = match self.kind {
+            Kind::Counter => format!("{}_total", self.name),
+            Kind::Gauge => self.name.to_owned(),
+            Kind::Histogram => format!("{}_sum", self.name),
+        };
+        let bucket_keys = if self.kind == Kind::Histogram {
+            let bucket = format!("{}_bucket", self.name);
+            self.bounds
+                .iter()
+                .map(|&bound| {
+                    let le = prom::le_label(bound);
+                    let mut with_le = labels.clone();
+                    with_le.push(("le", &le));
+                    prom::sample_key(self.name, &bucket, &with_le, self.help)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        series.push(Series {
+            labels: labels
+                .iter()
+                .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+                .collect(),
+            value: 0.0,
+            buckets: vec![0.0; self.bounds.len()],
+            sum: 0.0,
+            key: prom::sample_key(self.name, &sample, &labels, self.help),
+            bucket_keys,
+            last_gauge: None,
         });
-        if created && self.kind == Kind::Histogram {
+        let entry = series.last_mut().expect("just pushed");
+        if self.kind == Kind::Histogram {
             // As `prometheus_client` does: every bucket of a new series is
             // stored, so the scrape shows the empty ones too.
             self.exporter.write("histogram", &entry.key, 0.0);
