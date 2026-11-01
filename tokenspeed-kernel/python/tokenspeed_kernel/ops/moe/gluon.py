@@ -3298,11 +3298,6 @@ if platform.is_amd:
             )
         }
     )
-    _GFX950 = CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    )
     _GFX1250 = CapabilityRequirement(
         min_arch_version=ArchVersion(12, 5),
         max_arch_version=ArchVersion(12, 5),
