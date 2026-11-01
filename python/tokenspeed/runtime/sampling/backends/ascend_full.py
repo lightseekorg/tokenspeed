@@ -61,6 +61,7 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
     """
 
     _SUPPORTS_DP_VERIFY = True
+    _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = False
 
     def _create_capture_generator(
@@ -317,7 +318,7 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
         accept_length_local += 1
 
         logprobs_local = None
-        if raw_logits is not None:
+        if raw_logits is not None and dp_sampling:
             logprobs_local = gather_token_logprobs(
                 raw_logits,
                 predict_local.long(),
@@ -345,8 +346,14 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
             predict = predict_local
             accept_length = accept_length_local
             self.maybe_broadcast(predict, accept_index_local, accept_length)
-            if logprobs_local is not None:
-                logits_output.next_token_logprobs = logprobs_local.reshape(-1)
+            if raw_logits is not None:
+                # Replicated TP agrees on the token before scoring it. Compute
+                # the same logprob once, for the token the caller receives.
+                logits_output.next_token_logprobs = gather_token_logprobs(
+                    raw_logits,
+                    predict.long(),
+                    logprob_order=self.config.logprob_order,
+                )
             count_pool_indices = pool_indices_local
 
         self._accumulate_accepted_prefix(

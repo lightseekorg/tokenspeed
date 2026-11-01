@@ -33,6 +33,7 @@ fn result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
         output_tokens: tokens.to_vec(),
         output_lengths: lengths.to_vec(),
         output_logprobs: None,
+        output_token_cumulative_probs: None,
         nan_flags: None,
         next_input_ids: None,
         serving_compiles: None,

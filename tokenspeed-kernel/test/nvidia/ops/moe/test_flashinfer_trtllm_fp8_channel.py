@@ -488,7 +488,10 @@ def test_routed_kernel_matches_the_emulation(tokens, ispp, weights_dtype, ep):
     ep_rank = 1 if ep > 1 else 0
     local = experts // ep
     first = ep_rank * local
-    w13, w13_scale, w2, w2_scale = _experts(local, ispp, hidden, seed=tokens)
+    # Drawn on the GPU: CPU randn of the larger partitions dominated this test.
+    w13, w13_scale, w2, w2_scale = (
+        t.cpu() for t in _experts(local, ispp, hidden, seed=tokens, device="cuda")
+    )
     generator = torch.Generator().manual_seed(tokens)
     x = torch.randn(tokens, hidden, generator=generator).to(torch.bfloat16)
     topk_ids, topk_weights = _routes(tokens, experts, top_k, weights_dtype, generator)
