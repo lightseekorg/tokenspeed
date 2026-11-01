@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
@@ -34,6 +34,7 @@ from tokenspeed_kernel.platform import (
     prepare_cuda_toolkit_env,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import resolve_kernel_override
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
@@ -52,6 +53,7 @@ if platform.is_blackwell:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         fp8_fp4_mega_moe,
+        get_block_m_for_mega_moe,
         get_pdl,
         get_symm_buffer_for_mega_moe,
         set_pdl,
@@ -63,9 +65,9 @@ if platform.is_blackwell:
 
 _MXFP4_BLOCK_SIZE = 32
 _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
-_symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
+_symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
-    tuple[int, torch.device, int, int, int, int, int, float | None, bool]
+    tuple[int, torch.device, int, int, int, int, int, int, float | None, bool]
 ] = set()
 
 
@@ -74,6 +76,38 @@ class _DeepGemmMegaMoEState:
     l1_weights: tuple[torch.Tensor, torch.Tensor]
     l2_weights: tuple[torch.Tensor, torch.Tensor]
     device: torch.device
+    shared: DeepGemmSharedExpertWeights | None = None
+
+    @property
+    def num_shared_experts(self) -> int:
+        return int(self.shared is not None)
+
+    @property
+    def shared_l1_weights(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return None if self.shared is None else self.shared.l1_weights
+
+    @property
+    def shared_l2_weights(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return None if self.shared is None else self.shared.l2_weights
+
+
+def deep_gemm_supports_shared_expert_fusion(plan: dict) -> bool:
+    """Check the selected backend and explicit overrides before native fusion."""
+    if (
+        plan["apply_kernel_name"] != "deep_gemm_mxfp4_mega_moe_apply"
+        or plan["features"]
+        or plan["input_dtype"] != torch.bfloat16
+        or plan["internal_activation_dtype"] not in (None, "input")
+    ):
+        return False
+    for family, mode in (
+        ("gemm", "mm"),
+        ("quantization", "fp8_with_scale"),
+        ("activation", "silu_and_mul"),
+    ):
+        if resolve_kernel_override(family, mode, None) is not None:
+            return False
+    return True
 
 
 def _expected_shapes(
@@ -153,6 +187,136 @@ def _reorder_scale_rows_(
     return scale
 
 
+@dataclass(frozen=True)
+class DeepGemmSharedExpertWeights:
+    """Owned native shared weights and their geometry.
+
+    ``prepare`` copies canonical E4M3 weights and group-32 UE8M0 scales. It is
+    device independent so CPU validation exercises the production transform.
+    The descriptor does not establish native availability or model eligibility.
+    """
+
+    l1_weights: tuple[torch.Tensor, torch.Tensor]
+    l2_weights: tuple[torch.Tensor, torch.Tensor]
+    hidden_size: int
+    routed_intermediate_size: int
+    intermediate_size: int
+
+    @classmethod
+    def prepare(
+        cls,
+        l1_weights: tuple[torch.Tensor, torch.Tensor],
+        l2_weights: tuple[torch.Tensor, torch.Tensor],
+        *,
+        hidden_size: int,
+        routed_intermediate_size: int,
+        intermediate_size: int,
+        previous: DeepGemmSharedExpertWeights | None,
+    ) -> DeepGemmSharedExpertWeights:
+        """Build or refresh native copies, preserving all canonical inputs.
+
+        Geometry arguments describe the complete rank-local expert.
+        ``previous`` is the previously prepared descriptor, or ``None`` on first
+        preparation. A reload must keep geometry, dtype and device;
+        its existing storage and descriptor are returned after an in-place copy.
+        Unsupported geometry raises ``ValueError`` before writes.
+        """
+        if (
+            type(hidden_size) is not int
+            or hidden_size <= 0
+            or hidden_size % 256
+            or type(routed_intermediate_size) is not int
+            or routed_intermediate_size <= 0
+            or routed_intermediate_size % 128
+        ):
+            raise ValueError(
+                "MegaMoE hidden width must be 256-aligned and routed width 128-aligned"
+            )
+        if (
+            type(intermediate_size) is not int
+            or intermediate_size <= 0
+            or intermediate_size % 32
+            or intermediate_size > routed_intermediate_size
+        ):
+            raise ValueError(
+                "Shared width must be positive, 32-aligned, and no larger than routed width"
+            )
+        for pair in (l1_weights, l2_weights):
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError("Shared weights require a (weight, scale) tuple")
+        tensors = (*l1_weights, *l2_weights)
+        shapes = (
+            (2 * intermediate_size, hidden_size),
+            (2 * intermediate_size, hidden_size // 32),
+            (hidden_size, intermediate_size),
+            (hidden_size, intermediate_size // 32),
+        )
+        dtypes = (torch.float8_e4m3fn, torch.uint8) * 2
+        for tensor, shape, dtype in zip(tensors, shapes, dtypes):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError("Shared weights and scales must be tensors")
+            if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                raise ValueError(
+                    f"Shared tensor must have shape {shape} and dtype {dtype}"
+                )
+            if tensor.device != l1_weights[0].device:
+                raise ValueError("Shared weights and scales must share a device")
+        geometry = (
+            hidden_size,
+            routed_intermediate_size,
+            intermediate_size,
+        )
+        if previous is not None:
+            old_geometry = (
+                previous.hidden_size,
+                previous.routed_intermediate_size,
+                previous.intermediate_size,
+            )
+            if (
+                geometry != old_geometry
+                or previous.l1_weights[0].device != l1_weights[0].device
+            ):
+                raise ValueError(
+                    "Shared reload cannot change prepared geometry or device"
+                )
+        device = l1_weights[0].device
+        width = routed_intermediate_size
+        # New channels occupy complete quantization groups. Keep gate/up halves
+        # separate until after padding, and use exact zero codes/unit exponents.
+        l1 = torch.zeros((2 * width, hidden_size), dtype=torch.uint8, device=device)
+        l1_sf = torch.full(
+            (2 * width, hidden_size // 32), 127, dtype=torch.uint8, device=device
+        )
+        l2 = torch.zeros((hidden_size, width), dtype=torch.uint8, device=device)
+        l2_sf = torch.full(
+            (hidden_size, width // 32), 127, dtype=torch.uint8, device=device
+        )
+        l1.view(2, width, hidden_size)[:, :intermediate_size].copy_(
+            l1_weights[0].view(torch.uint8).reshape(2, intermediate_size, hidden_size)
+        )
+        l1_sf.view(2, width, hidden_size // 32)[:, :intermediate_size].copy_(
+            l1_weights[1].reshape(2, intermediate_size, hidden_size // 32)
+        )
+        l2[:, :intermediate_size].copy_(l2_weights[0].view(torch.uint8))
+        l2_sf[:, : intermediate_size // 32].copy_(l2_weights[1])
+        transformed_l1 = (
+            _interleave_gate_up_(l1, 8).view(torch.float8_e4m3fn),
+            _reorder_scale_rows_(_pack_ue8m0_scale_(l1_sf), True, 8),
+        )
+        transformed_l2 = (
+            l2.view(torch.float8_e4m3fn),
+            _reorder_scale_rows_(_pack_ue8m0_scale_(l2_sf), False, 8),
+        )
+        if previous is not None:
+            for old, new in zip(
+                (*previous.l1_weights, *previous.l2_weights),
+                (*transformed_l1, *transformed_l2),
+            ):
+                old.copy_(new)
+            return previous
+        return cls(transformed_l1, transformed_l2, *geometry)
+
+
 def deep_gemm_mxfp4_mega_moe_process_weights(
     plan: dict,
     w: torch.nn.Module,
@@ -193,13 +357,68 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
     w2_scale = _pack_ue8m0_scale_(w2_weight_scale)
     w2_scale = _reorder_scale_rows_(w2_scale, False, 8)
 
+    previous_state = w._moe_backend_state
     state = _DeepGemmMegaMoEState(
         l1_weights=(w13_weight, w13_scale),
         l2_weights=(w2_weight.view(torch.int8), w2_scale),
         device=w13_weight.device,
     )
+    if isinstance(previous_state, _DeepGemmMegaMoEState):
+        # Retain shared storage if the existing routed lifecycle rebuilds its
+        # state; the shared preparer refreshes it after loading completes.
+        state = replace(state, shared=previous_state.shared)
     w._moe_backend_state = state
     return state
+
+
+def deep_gemm_mxfp4_mega_moe_process_shared_weights(
+    plan: dict,
+    w: torch.nn.Module,
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    l2_weights: tuple[torch.Tensor, torch.Tensor],
+    *,
+    intermediate_size: int,
+) -> None:
+    """Prepare complete shared weights after routed preparation and eligibility.
+
+    Validate plan eligibility, the shared clamp and model geometry, then
+    refreshes backend-owned storage without changing canonical checkpoint data.
+    """
+    if not deep_gemm_supports_shared_expert_fusion(plan):
+        raise ValueError("Selected MegaMoE backend cannot fuse the shared expert")
+    state = w._moe_backend_state
+    if not isinstance(state, _DeepGemmMegaMoEState):
+        raise TypeError("process routed MegaMoE weights before shared weights")
+    if w.swiglu_arg is None or w.swiglu_arg.limit != 10.0:
+        raise ValueError("Shared MegaMoE requires activation clamp 10")
+    if l1_weights[0].device != state.device:
+        raise ValueError("Shared and routed MegaMoE weights must share a device")
+    # Native shared width is a multiple of the actual prepared routed width;
+    # the checkpoint model config may still describe the unpadded 2304 width.
+    routed_width = state.l2_weights[0].shape[-1] * 2
+    if routed_width != w.intermediate_size:
+        raise ValueError("Prepared routed width disagrees with the MoE module")
+    shared = DeepGemmSharedExpertWeights.prepare(
+        l1_weights,
+        l2_weights,
+        hidden_size=w.hidden_size,
+        routed_intermediate_size=routed_width,
+        intermediate_size=intermediate_size,
+        previous=state.shared,
+    )
+    w._moe_backend_state = replace(state, shared=shared)
+
+
+def deep_gemm_clear_shared_expert_weights(w: torch.nn.Module) -> None:
+    """Disable prepared shared output during initialization or reload."""
+    state = w._moe_backend_state
+    if isinstance(state, _DeepGemmMegaMoEState) and state.shared is not None:
+        w._moe_backend_state = replace(state, shared=None)
+
+
+def deep_gemm_output_includes_shared_expert(w: torch.nn.Module) -> bool:
+    state = w._moe_backend_state
+    return isinstance(state, _DeepGemmMegaMoEState) and state.shared is not None
 
 
 def _resolve_process_group(process_group: object | None) -> object:
@@ -237,6 +456,7 @@ def _get_symm_buffer(
         top_k,
         hidden_size,
         intermediate_size,
+        state.num_shared_experts,
     )
     buffer = _symm_buffer_cache.get(key)
     if buffer is None:
@@ -247,6 +467,7 @@ def _get_symm_buffer(
             top_k,
             hidden_size,
             intermediate_size,
+            num_shared_experts=state.num_shared_experts,
         )
         _symm_buffer_cache[key] = buffer
     return buffer
@@ -255,10 +476,31 @@ def _get_symm_buffer(
 def _warmup_m_values(max_tokens: int) -> list[int]:
     """Return token counts covering every DeepGEMM tile reachable at runtime."""
     dense = min(max_tokens, 2048)
-    values: set[int] = set(range(1, dense + 1))
+    values: set[int] = set(range(0, dense + 1))
     values.update(range(dense, max_tokens + 1, 16))
     values.add(max_tokens)
     return sorted(values)
+
+
+def _shared_input_layout(
+    shared: DeepGemmSharedExpertWeights | None,
+    symm_buffer: object,
+    num_tokens: int,
+) -> tuple[torch.Tensor | None, int]:
+    if shared is None:
+        return None, 0
+    # Use the allocator's rounded capacity and the exact output row count, so
+    # staging agrees with the native scheduler even on an empty local rank.
+    # This pybind query accepts positional arguments only.
+    block_m = get_block_m_for_mega_moe(
+        symm_buffer.group.size(),
+        symm_buffer.num_experts,
+        symm_buffer.num_max_tokens_per_rank,
+        num_tokens,
+        symm_buffer.num_topk,
+        symm_buffer.mma_type,
+    )
+    return symm_buffer.shared_l1_acts_sf, block_m
 
 
 def _warmup_mega_moe_jit(
@@ -270,6 +512,7 @@ def _warmup_mega_moe_jit(
     device: torch.device,
     transformed_l1_weights: tuple[torch.Tensor, torch.Tensor],
     transformed_l2_weights: tuple[torch.Tensor, torch.Tensor],
+    shared: DeepGemmSharedExpertWeights | None,
     symm_buffer: object,
     activation_clamp: float | None,
     fast_math: bool,
@@ -303,15 +546,27 @@ def _warmup_mega_moe_jit(
         )
 
         output = torch.empty_like(hidden_states)
-        symm_buffer.x[:num_tokens].copy_(hidden_states.to(torch.float8_e4m3fn))
-        symm_buffer.x_sf[:num_tokens].fill_(1.0)
-        symm_buffer.topk_idx[:num_tokens].copy_(topk_ids)
-        symm_buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        shared_sf, shared_block_m = _shared_input_layout(
+            shared, symm_buffer, num_tokens
+        )
+        stage_mxfp4_mega_moe_inputs(
+            hidden_states,
+            topk_weights,
+            topk_ids.to(torch.int64),
+            symm_buffer.x[:num_tokens],
+            symm_buffer.x_sf[:num_tokens],
+            symm_buffer.topk_idx[:num_tokens],
+            symm_buffer.topk_weights[:num_tokens],
+            shared_l1_acts_sf=shared_sf,
+            shared_block_m=shared_block_m,
+        )
         fp8_fp4_mega_moe(
             output,
             transformed_l1_weights,
             transformed_l2_weights,
             symm_buffer,
+            shared_l1_weights=None if shared is None else shared.l1_weights,
+            shared_l2_weights=None if shared is None else shared.l2_weights,
             activation_clamp=activation_clamp,
             fast_math=fast_math,
         )
@@ -327,6 +582,8 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     state = w._moe_backend_state
     if not isinstance(state, _DeepGemmMegaMoEState):
         raise TypeError("invalid DeepGEMM MegaMoE state")
+    if state.shared is not None and not deep_gemm_supports_shared_expert_fusion(plan):
+        raise RuntimeError("Shared MegaMoE policy changed before warmup")
     process_group = plan.get("process_group")
     num_experts = w.num_experts
     top_k = w.top_k
@@ -344,6 +601,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         top_k,
         hidden_size,
         intermediate_size,
+        state.num_shared_experts,
         activation_clamp,
         fast_math,
     )
@@ -368,6 +626,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         device=state.device,
         transformed_l1_weights=state.l1_weights,
         transformed_l2_weights=state.l2_weights,
+        shared=state.shared,
         symm_buffer=symm_buffer,
         activation_clamp=activation_clamp,
         fast_math=fast_math,
@@ -432,6 +691,12 @@ if platform.is_blackwell:
         state = w._moe_backend_state
         if not isinstance(state, _DeepGemmMegaMoEState):
             raise TypeError("invalid DeepGEMM MegaMoE state")
+        if state.shared is not None and not deep_gemm_supports_shared_expert_fusion(
+            plan
+        ):
+            raise RuntimeError(
+                "Shared MegaMoE policy changed after preparation; reprepare before execution"
+            )
         if x.device != state.device:
             raise ValueError("MegaMoE inputs and processed weights must share a device")
         if x.ndim != 2 or x.shape[1] != w.hidden_size:
@@ -462,6 +727,9 @@ if platform.is_blackwell:
         )
         num_tokens = x.shape[0]
         topk_ids = topk_ids.to(torch.int64)
+        shared_sf, shared_block_m = _shared_input_layout(
+            state.shared, symm_buffer, num_tokens
+        )
         stage_mxfp4_mega_moe_inputs(
             x,
             topk_weights,
@@ -470,6 +738,8 @@ if platform.is_blackwell:
             symm_buffer.x_sf[:num_tokens],
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
+            shared_l1_acts_sf=shared_sf,
+            shared_block_m=shared_block_m,
         )
         output = torch.empty_like(x, dtype=torch.bfloat16)
         fp8_fp4_mega_moe(
@@ -477,6 +747,8 @@ if platform.is_blackwell:
             state.l1_weights,
             state.l2_weights,
             symm_buffer,
+            shared_l1_weights=state.shared_l1_weights,
+            shared_l2_weights=state.shared_l2_weights,
             activation_clamp=(None if w.swiglu_arg is None else w.swiglu_arg.limit),
             fast_math=plan["fast_math"],
         )

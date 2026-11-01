@@ -51,6 +51,10 @@ __all__ = [
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
+    "moe_process_shared_expert_weights",
+    "moe_supports_shared_expert_fusion",
+    "moe_output_includes_shared_expert",
+    "moe_clear_shared_expert_weights",
     "moe_warmup",
     "moe_topk",
     "softmax_bias_topk",
@@ -2126,6 +2130,79 @@ def moe_process_weights(
         else:
             communication_initializer(initialize)
     return result
+
+
+def moe_supports_shared_expert_fusion(plan: dict) -> bool:
+    """Return whether a plan can prepare ordinary native shared-expert fusion.
+
+    This checks the selected MoE contract and explicit
+    GEMM, activation and quantizer overrides. The model must also establish
+    complete rank-local shared weights, TP1, clamp 10 and numerical eligibility.
+    The selected backend uses the declared native dependency's API.
+    """
+    from tokenspeed_kernel.ops.moe.deep_gemm import (
+        deep_gemm_supports_shared_expert_fusion,
+    )
+
+    return deep_gemm_supports_shared_expert_fusion(plan)
+
+
+def moe_process_shared_expert_weights(
+    plan: dict,
+    w: torch.nn.Module,
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    l2_weights: tuple[torch.Tensor, torch.Tensor],
+    *,
+    intermediate_size: int,
+) -> None:
+    """Prepare a complete shared expert after model eligibility is established.
+
+    ``plan`` and ``w`` identify the prepared routed MoE. L1 is canonical E4M3
+    gate-then-up weights [2 * intermediate_size, hidden] and uint8 group-32
+    UE8M0 scales. L2 is canonical E4M3 [hidden, intermediate_size] and its
+    group-32 scales. The pair represents one shared expert. Fusion uses native
+    arithmetic. Canonical tensors stay unchanged and same-geometry
+    reloads refresh owned storage in place. Unsupported explicit requests raise.
+
+    Prepare before warmup and capture. Successful preparation makes the MoE
+    output include the shared expert, reported by
+    ``moe_output_includes_shared_expert``; it must not be added again.
+    """
+    from tokenspeed_kernel.ops.moe.deep_gemm import (
+        deep_gemm_mxfp4_mega_moe_process_shared_weights,
+    )
+
+    deep_gemm_mxfp4_mega_moe_process_shared_weights(
+        plan,
+        w,
+        l1_weights,
+        l2_weights,
+        intermediate_size=intermediate_size,
+    )
+
+
+def moe_output_includes_shared_expert(plan: dict, w: torch.nn.Module) -> bool:
+    """Return whether this prepared plan produces routed plus shared output."""
+    if plan["apply_kernel_name"] != "deep_gemm_mxfp4_mega_moe_apply":
+        return False
+    from tokenspeed_kernel.ops.moe.deep_gemm import (
+        deep_gemm_output_includes_shared_expert,
+    )
+
+    return deep_gemm_output_includes_shared_expert(w)
+
+
+def moe_clear_shared_expert_weights(plan: dict, w: torch.nn.Module) -> None:
+    """Disable prepared shared fusion before warmup/capture or during reload.
+
+    The next call produces routed output only. Changing shared eligibility
+    after graph capture requires recapturing graphs before execution.
+    """
+    from tokenspeed_kernel.ops.moe.deep_gemm import (
+        deep_gemm_clear_shared_expert_weights,
+    )
+
+    deep_gemm_clear_shared_expert_weights(w)
 
 
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
