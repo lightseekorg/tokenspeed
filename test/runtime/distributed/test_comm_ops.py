@@ -261,6 +261,26 @@ class TestAutoBackendTopology:
         assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
         backend._iris.can_run.assert_not_called()
 
+    @pytest.mark.parametrize(("cdna5", "expected"), [(True, "iris"), (False, "nccl")])
+    def test_cross_node_all_reduce_routing_by_arch(
+        self, backend, monkeypatch, cdna5, expected
+    ):
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto
+
+        monkeypatch.setattr(
+            auto,
+            "current_platform",
+            lambda: SimpleNamespace(is_amd=True, is_cdna5=cdna5),
+        )
+        backend._iris.can_reduce_outputs.return_value = False
+        backend._iris.can_run.return_value = True
+        backend._iris.all_reduce.return_value = "iris"
+        backend._nccl.all_reduce.return_value = "nccl"
+        group = tuple(range(8))
+
+        assert backend.can_prepare_all_reduce_buffers(group, torch.bfloat16) is cdna5
+        assert backend.all_reduce(torch.empty(1), group) == expected
+
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
     import tokenspeed_kernel.ops.communication.fabric as fabric
