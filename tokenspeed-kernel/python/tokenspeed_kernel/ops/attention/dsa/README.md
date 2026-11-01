@@ -154,6 +154,23 @@ launches from it declares the feature alongside the keyword, and the facade
 reads the registration rather than probing call signatures, so a
 `*args, **kwargs` wrapper never receives a keyword its launcher cannot take.
 
+`row_starts_cpu` optionally supplies an int32 or int64 CPU mirror of each query's
+inclusive workspace-row start, shape `[tokens]`. A strided mirror is valid.
+Together with `candidate_lens_cpu`, it lets a leaf plan groups of queries
+sharing a history without reading metadata back from the device. The caller
+must provide the current invocation's values in the same workspace coordinates
+as `row_starts`, including any slice or group rebase. The facade checks shape,
+device, and dtype; it does not compare values against device metadata.
+A stale mirror violates the contract and can produce incorrect selection.
+
+`None` supplies no mirror and preserves existing selection. A supplied mirror
+requires `ROW_STARTS_CPU_FEATURE` (`"row_starts_cpu"`) and reaches the selected
+leaf unchanged. Ordinary selection, explicit overrides, and saved plans reject
+leaves without the feature instead of dropping the argument. A declaring leaf
+must accept the keyword and support its omission. No in-tree production leaf
+currently declares this feature; it is an extension contract for registered
+providers, not a standalone scoring optimization.
+
 ## Slot order of the sparse cores
 
 `dsa_decode` and `dsa_prefill` take a required `slot_order` in
