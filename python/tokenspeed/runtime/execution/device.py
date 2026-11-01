@@ -1365,6 +1365,9 @@ def build_device_side(
     )
     from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
     from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        prepare_prefix_history_transport,
+    )
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1396,6 +1399,12 @@ def build_device_side(
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+        prepare_prefix_history_transport(
+            server_args,
+            model_config,
+            [runner.model for runner in (target, draft) if runner is not None],
+            torch.device(server_args.device, gpu_id),
+        )
     if communication_first:
         prepare_multimodal()
 

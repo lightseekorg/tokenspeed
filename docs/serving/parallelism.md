@@ -688,6 +688,27 @@ query against that query's local causal length, so a width-`w` window reads
 each request's owned pages `w` times instead of once. The full rule set is in
 `docs/configuration/server.md`.
 
+The chunked prefill of an MLA model reads each prefix chunk's history from its
+page owners, a window of chunks per all-gather. On GB300 a KVP group of 2, 4
+or 8 ranks (on one host, or across hosts over an NVLink fabric) gathers these
+windows with a fused all-gather kernel instead of a pack copy plus an NCCL
+all-gather: each owner stores its rows straight from its cache into every
+rank's receive slot, over NVLink multicast where the group has it, else with
+one store per peer. There is no flag; startup picks it for the whole group and
+reserves `2 x kvp_size x 13.5 MiB` per GPU (216 MiB at KVP 8) before the KV
+cache is sized. The group keeps NCCL on other GPUs and group sizes, for
+DeepSeek V4.1 (which gathers its own history), on a PD decode engine, with
+`--kv-cache-quant-method per_token_head` (an FP8 `--kv-cache-dtype` cache is
+gathered fused), and when a configured kernel waits on other ranks inside a
+kernel that needs the whole GPU (MegaMoE, DeepEP or any other all-to-all
+backend, fused DP projections, an MoE backend or solution the runtime does not
+list as safe). A window whose rows on some rank exceed the 13.5 MiB receive
+slot (24576 rows of an FP8 MLA cache, 12288 of a BF16 one) also uses NCCL. The
+fused kernel's waits end 30 s before `--distributed-timeout-seconds` (at half
+of it when it is under 90 s). The
+group's first rank logs the choice: `KVP history group ... gathers through the
+fused all-gather`, or `... keeps its NCCL all-gather:` with the reason.
+
 ## Query context parallelism on the prefill role
 
 `--query-context-parallel-size N` (QCP) splits every extend forward's rows
