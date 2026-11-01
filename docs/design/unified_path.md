@@ -2264,3 +2264,12 @@ cache groups. Its eager and captured decode share metadata refresh and DCP
 partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
+
+### Distributed draft tuning
+
+The startup draft decode uses one request per attention TP rank so that
+sequence-parallel router projections have nonempty, equal local row counts.
+A single-request TP warmup can skip a GEMM on an empty peer while another
+peer waits in distributed tactic selection. The draft remains in the same
+autotune context as the target. Serving batches and graph capture sizes are
+unchanged.

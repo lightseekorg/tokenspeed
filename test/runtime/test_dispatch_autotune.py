@@ -96,6 +96,7 @@ class _AutotuneConfig:
 
     max_num_seqs: int = 8
     data_parallel_size: int = 1
+    attention_tp_size: int = 1
     chunked_prefill_size: int = -1
     context_len: int = 4
     world_size: int = 1
@@ -194,13 +195,21 @@ class _ProcessGroupManagerDouble:
         return self._group
 
 
+@pytest.mark.parametrize("attention_tp_size", [1, 2, 8])
 @pytest.mark.parametrize("chunk_size", [-1, 16, 17])
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize("prefill_only", [False, True])
 def test_startup_uses_native_buckets_without_reading_capture_sizes(
-    monkeypatch, tmp_path, chunk_size, speculative, disabled, failure, prefill_only
+    monkeypatch,
+    tmp_path,
+    chunk_size,
+    speculative,
+    disabled,
+    failure,
+    prefill_only,
+    attention_tp_size,
 ):
     events = []
     metadata = []
@@ -230,7 +239,10 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             raise RuntimeError("profiling failed")
 
     def draft(*, batch_sizes, graph_phase):
-        assert batch_sizes == (1,)
+        assert batch_sizes == (attention_tp_size,)
+        assert tuning_module.is_autotuning() is (
+            not disabled and tuning_module._autotuner is not None
+        )
         assert graph_phase is False
         assert tuning_module.is_warming_up()
         events.append("draft")
@@ -243,6 +255,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     executor = _AutotuneExecutor(
         config=_AutotuneConfig(
             chunked_prefill_size=chunk_size,
+            attention_tp_size=attention_tp_size,
             autotune_cache_key={},
             disable_autotune=disabled,
             prefill_only=prefill_only,
