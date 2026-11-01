@@ -46,10 +46,14 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _extract_gluon_raw_w,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (
+    MXFP4SortedRoutes,
     gluon_mxfp4_fp8_precomputed_situ,
+    gluon_mxfp4_sorted_down_gfx950,
+    gluon_mxfp4_sorted_gate_up_gfx950,
     gluon_mxfp_dynamic_mxfp4_fused_moe,
     gluon_mxfp_fused_moe,
     gluon_mxfp_precomputed_mxfp4_fused_moe,
+    sorted_route_capacity,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (
     _quantize_mxfp4_activation,
@@ -59,10 +63,14 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
 )
 
 __all__ = [
+    "MXFP4SortedRoutes",
     "gluon_mxfp4_fp8_precomputed_situ",
+    "gluon_mxfp4_sorted_down_gfx950",
+    "gluon_mxfp4_sorted_gate_up_gfx950",
     "gluon_mxfp_dynamic_mxfp4_fused_moe",
     "gluon_mxfp_fused_moe",
     "gluon_mxfp_precomputed_mxfp4_fused_moe",
+    "sorted_route_capacity",
     # Private helpers shared with the tokenspeed-kernel MoE adapter and the
     # unit tests.
     "_biased_grouped_topk_reference",
