@@ -71,11 +71,12 @@ class SpeculativeSamplingPools:
 class SamplingBackendConfig:
 
     synthetic_acceptance_length: float | None
-    # Draft-prob rejection sampling: verify gathers the drafter's recorded
-    # distributions by pool index into a persistent [max_pad_bs, N, vocab]
-    # fp32 buffer and runs the chain kernel's coin * q(x) < p(x) rule
-    # instead of the target-only rule. Selects the verify rule, so it is
-    # explicit.
+    # Draft-prob rejection sampling: the FlashInfer backends gather the step
+    # drafters' recorded distributions by pool index into a persistent
+    # [max_pad_bs, N, vocab] fp32 buffer, and the triton backend reads the
+    # DFlash2 walk's sparse q (SamplingBatchInfo.draft_q) in place; both run
+    # coin * q(x) < p(x) instead of the target-only rule. Selects the verify
+    # rule, so it is explicit.
     enable_speculative_sampling: bool
 
     # Random stream of the FlashInfer backends' sampled rows ("batch" or
@@ -406,7 +407,7 @@ class SamplingBackend(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} has no draft-prob verify; "
             "--enable-speculative-sampling needs the flashinfer or "
-            "flashinfer_full sampling backend"
+            "flashinfer_full sampling backend (triton for DFLASH)"
         )
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
