@@ -339,6 +339,37 @@ def quantize_mxfp4_rows_tile_gfx1250(
     )
 
 
+@gluon.jit
+def quantize_fp8_rows_tile_gfx1250(
+    x_ptr,
+    stride_x,
+    q_ptr,
+    stride_q,
+    inv_scale,
+    M,
+    tile,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Cast tile ``tile`` of ``[M, K]`` rows to FP8 E4M3 after scaling by
+    ``inv_scale``, ``BLOCK_M x BLOCK_K`` each."""
+    COL_TILES: gl.constexpr = (K + BLOCK_K - 1) // BLOCK_K
+    row_start = (tile // COL_TILES) * BLOCK_M
+    col_start = (tile % COL_TILES) * BLOCK_K
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [NUM_WARPS, 1], [1, 0])
+    rows = row_start + gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
+    cols = col_start + gl.arange(0, BLOCK_K, gl.SliceLayout(0, layout))
+    mask = (rows < M)[:, None] & (cols < K)[None, :]
+    x = gl.load(x_ptr + rows[:, None] * stride_x + cols[None, :], mask=mask, other=0.0)
+    gl.store(
+        q_ptr + rows[:, None] * stride_q + cols[None, :],
+        (x.to(gl.float32) * inv_scale).to(gl.float8e4nv),
+        mask=mask,
+    )
+
+
 def empty_mxfp4_activation_scale(
     rows: int, k: int, device: torch.device, row_align: int = _SCALE_ROW_ALIGN
 ) -> torch.Tensor:

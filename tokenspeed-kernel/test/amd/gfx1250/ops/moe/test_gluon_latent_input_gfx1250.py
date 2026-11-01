@@ -126,9 +126,10 @@ def test_decode_replays_in_a_graph() -> None:
             torch.testing.assert_close(output, reference, atol=0.0, rtol=0.0)
 
 
-# 2000 is not a multiple of the 256-row tile, so it exercises the clamped
-# descriptor and the masked store that a whole number of tiles never reaches.
-@pytest.mark.parametrize("tokens", [1025, 2000, 8192])
+# 129, 848 and 2000 leave a partial row tile, so they exercise the clamped
+# load descriptor and the clipped store that whole tiles never reach; 1280
+# and 1281 straddle the change from 128-row to 256-row tiles.
+@pytest.mark.parametrize("tokens", [129, 848, 1280, 1281, 2000, 8192])
 def test_prefill_matches_reference(tokens: int) -> None:
     _packed, views = _weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -143,7 +144,8 @@ def test_prefill_matches_reference(tokens: int) -> None:
     [
         (1, "gluon_latent_input_decode_gfx1250"),
         (64, "gluon_latent_input_decode_gfx1250"),
-        (1025, "gluon_latent_input_largem_gfx1250"),
+        (129, "gluon_latent_input_largem_gfx1250"),
+        (848, "gluon_latent_input_largem_gfx1250"),
         (8192, "gluon_latent_input_largem_gfx1250"),
     ],
 )

@@ -325,3 +325,94 @@ def test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(captured, expected, atol=0.0, rtol=0.0)
+
+
+def test_kimi_k3_tp_situ_stores_down_weight_in_k_planes_gfx1250() -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
+        preprocess_gluon_mxfp4_gfx1250_moe_weights,
+    )
+
+    module, raw, *_ = _make_case(1)
+    kernel_moe_process_weights(_make_plan(), module)
+    planes = module.w2_weight_triton_tensor
+    assert (planes.kplane_rows, planes.kplane_bytes) == (3584, 64)
+
+    rows_module, _ = _make_mxfp4_module(
+        num_experts=16,
+        hidden_size=3584,
+        intermediate_size=384,
+        top_k=16,
+        generator=torch.Generator(device="cuda").manual_seed(0),
+    )
+    rows_module.w2_weight.data.copy_(raw["w2_weight"])
+    rows_module.w2_weight_scale.data.copy_(raw["w2_scale"])
+    preprocess_gluon_mxfp4_gfx1250_moe_weights({}, rows_module)
+    rows = rows_module.w2_weight_triton_tensor.transpose(1, 2)
+    # Plane k of expert e holds bytes [64k, 64k + 64) of every N row.
+    storage = torch.as_strided(
+        planes, (16, 3, 3584, 64), (3 * 3584 * 64, 3584 * 64, 64, 1)
+    )
+    torch.testing.assert_close(
+        storage, rows.reshape(16, 3584, 3, 64).permute(0, 2, 1, 3), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_kimi_k3_tp_situ_paired_down_tiles_match_gfx1250(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
+        num_tokens
+    )
+    plan = _make_plan()
+    kernel_moe_process_weights(plan, module)
+
+    def apply() -> torch.Tensor:
+        return kernel_moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        ).clone()
+
+    single = apply()
+    monkeypatch.setattr(fused, "_DECODE_PAIR_N_TILES_PROGRAMS_PER_CU", 0)
+    assert (
+        fused._decode_down_n_tiles(num_tokens * 16, 16, 3584, 128, single.device) == 2
+    )
+    paired = apply()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(single).item() > 0
+    torch.testing.assert_close(paired, single, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
+@pytest.mark.parametrize("num_tokens", [2, 4, 64])
+def test_gfx1250_small_route_fp8_quantize_matches_standalone(
+    num_tokens: int, scaled: bool
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(7 + num_tokens)
+    hidden_states = torch.randn(
+        num_tokens, 3584, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, 896, 16)
+    scale = (
+        torch.full((1,), 0.37, dtype=torch.float32, device="cuda") if scaled else None
+    )
+    expected = fused._quantize_fp8_activation(hidden_states, scale)
+    routed = torch.empty_like(expected)
+    route = fused._precomputed_topk_route_small_m_gfx1250(
+        topk_weights.float().contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+        896,
+        quantize_fp8_into=(hidden_states, routed, scale),
+    )
+    plain = fused._precomputed_topk_route_small_m_gfx1250(
+        topk_weights.float().contiguous(), topk_ids.to(torch.int32).contiguous(), 896
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(routed.view(torch.uint8), expected.view(torch.uint8))
+    for actual, reference in zip(route[1:], plain[1:]):
+        assert torch.equal(actual, reference)

@@ -4443,7 +4443,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
     _assert_moe_plan(
         plan,
         apply=kernel_name,
-        preprocessor="gluon_mxfp4_gfx1250_moe_weights",
+        preprocessor="gluon_mxfp4_gfx1250_situ_moe_weights",
     )
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
