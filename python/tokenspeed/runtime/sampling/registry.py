@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
@@ -48,16 +49,16 @@ def _get_default_backend_name() -> str:
 def _is_sampling_backend_available(backend_name: str) -> bool:
     """Check if a sampling backend is available."""
     from tokenspeed_kernel.platform import current_platform
-    
+
     platform = current_platform()
-    
+
     if backend_name == "greedy":
         return True
     if backend_name == "flashinfer":
         if not platform.is_nvidia:
             return False
         try:
-            from tokenspeed.runtime.sampling.backends import flashinfer
+            importlib.import_module("tokenspeed.runtime.sampling.backends.flashinfer")
             return True
         except ImportError:
             return False
@@ -65,7 +66,9 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         if not platform.is_nvidia:
             return False
         try:
-            from tokenspeed.runtime.sampling.backends import flashinfer_full
+            importlib.import_module(
+                "tokenspeed.runtime.sampling.backends.flashinfer_full"
+            )
             return True
         except ImportError:
             return False
@@ -77,7 +80,7 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         if not platform.is_npu:
             return False
         try:
-            from tokenspeed.runtime.sampling.backends import ascend_full
+            importlib.import_module("tokenspeed.runtime.sampling.backends.ascend_full")
             return True
         except ImportError:
             return False
