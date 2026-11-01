@@ -370,6 +370,25 @@ its KV tail are evicted together, so a stale state is never matched). Resuming a
 of its kernel chunk regroups a floating-point reduction; `numerics.md`
 ("Prefix hits resume at any token") states the tolerance and the oracle.
 
+The shared post-convolution scan receives an immutable `StateScanContext`
+through `MambaAttnBackend._decode_scan_with_context` or
+`_prefill_scan_with_context`, and shared target verification receives it through
+`_verify_scan_with_context`. Its `layer_id` is the model-layer id supplied to
+the forward, without another cache-view offset. A family needing additional
+declared state fields can use that identity to select its layer's cache group.
+The default hooks forward every argument to the existing `_decode_scan`,
+`_prefill_scan` and `_verify_scan` overrides. Shared verification retains its
+convolution, candidate-state scratch and accepted-state commit; the context
+does not authorize speculative writes to committed state. A family with its
+own scan and accepted-state recovery may disable
+`verify_recurrent_state_scratch` without enabling the host replay algorithm;
+the shared convolution candidates remain allocated and seeded. Fused decode,
+whole-round fused verification and inline capacity-prefill implementations
+retain their existing entry points. The context owns no request state and
+changes neither cache allocation nor the
+two-slot protocol; the shared prefill caller still publishes the returned
+recurrent state to the live block.
+
 Capacity prefill graphs (`backends/state/prefill_capacity.py`) keep this
 contract at a captured request count: an unused request slot scans one
 padding row past the live tokens, its state-block index is negative so the
