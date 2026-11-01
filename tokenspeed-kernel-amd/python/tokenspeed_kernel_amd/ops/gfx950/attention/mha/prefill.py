@@ -1300,6 +1300,12 @@ def launch_gluon_mha_prefill_gfx950(
         ``(output, lse)`` when ``return_lse`` is set.
     """
     total_tokens, n_heads, _ = q.shape
+    # The strides are compiled into the kernels, which lets K and V share
+    # their load offsets when their rows have the same layout. A caller's
+    # rows may arrive as views or as compact copies (a packed QKV projection
+    # may yield views on some batches and copies on others), so compact the
+    # views here: one binary serves both, at the cost of copying the views.
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     config = get_config(
         q=q,
         k=k,

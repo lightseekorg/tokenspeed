@@ -111,20 +111,13 @@ def _resolve_grid(
 # ===-----------------------------------------------------------------------===#
 
 _EXTEND_BLOCK_N = 64
-_EXTEND_SHORT_Q_BLOCK_M = 64
-_EXTEND_SHORT_Q_NUM_WARPS = 2
-_EXTEND_LONG_Q_BLOCK_M = 128
-_EXTEND_LONG_Q_NUM_WARPS = 4
+# (BLOCK_M, NUM_WARPS) of the query tiles, smallest first.
+_EXTEND_TILES = ((64, 2), (128, 4))
 
 
-def _select_extend_tile(
-    max_seqlen_q: int, group_size: int
+def _extend_tile(
+    block_m: int, num_warps: int, group_size: int
 ) -> tuple[int, int, int, int]:
-    # Return (BLOCK_M, BLOCK_Q, BLOCK_N, NUM_WARPS) for the given max query length.
-    if max_seqlen_q <= _EXTEND_SHORT_Q_BLOCK_M:
-        block_m, num_warps = _EXTEND_SHORT_Q_BLOCK_M, _EXTEND_SHORT_Q_NUM_WARPS
-    else:
-        block_m, num_warps = _EXTEND_LONG_Q_BLOCK_M, _EXTEND_LONG_Q_NUM_WARPS
     # Each query position owns a power-of-two head span. Mask unused head
     # lanes instead of shrinking MFMA/range extents for groups such as 5 or 6.
     padded_group_size = triton.next_power_of_2(group_size)
@@ -132,6 +125,17 @@ def _select_extend_tile(
         block_m = padded_group_size
     block_q = block_m // padded_group_size
     return block_m, block_q, _EXTEND_BLOCK_N, num_warps
+
+
+def _select_extend_tile(
+    max_seqlen_q: int, group_size: int
+) -> tuple[int, int, int, int]:
+    # Return (BLOCK_M, BLOCK_Q, BLOCK_N, NUM_WARPS): the smallest tile with
+    # at least max_seqlen_q rows, or the largest one.
+    for block_m, num_warps in _EXTEND_TILES:
+        if max_seqlen_q <= block_m:
+            break
+    return _extend_tile(block_m, num_warps, group_size)
 
 
 @gluon.aggregate
@@ -724,7 +728,9 @@ def _stream_kv(
     return m_i, l_i, acc
 
 
-@gluon.jit
+# The request count follows the batch. Without do_not_specialize, Triton would
+# compile separate binaries for a count of 1 and for multiples of 16.
+@gluon.jit(do_not_specialize=("num_seqs",))
 def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -852,7 +858,7 @@ def gluon_mha_extend_gfx950(
     program.store_lse(l_i, m_i)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_seqs",))
 def gluon_mha_extend_split_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -1077,6 +1083,16 @@ _EXTEND_PIPELINED_WORKGROUPS_PER_CU = 2
 _EXTEND_SINGLE_WORKGROUPS_PER_CU = 3
 
 
+def _extend_stage_choices(
+    *, head_dim: int, page_size: int, element_size: int
+) -> tuple[int, ...]:
+    """Pipeline depths _extend_stages picks from, single-buffered first."""
+    pipeline_bytes = 2 * _EXTEND_STAGES * page_size * head_dim * element_size
+    if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES:
+        return (1,)
+    return (1, _EXTEND_STAGES)
+
+
 def _extend_stages(
     *,
     num_workgroups: int,
@@ -1091,18 +1107,18 @@ def _extend_stages(
     launch of num_workgroups workgroups pipelines only when the grid then needs
     no more rounds of resident workgroups than single-buffered.
     """
-    pipeline_bytes = 2 * _EXTEND_STAGES * page_size * head_dim * element_size
-    if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES:
-        return 1
-    if split:
-        return _EXTEND_STAGES
+    choices = _extend_stage_choices(
+        head_dim=head_dim, page_size=page_size, element_size=element_size
+    )
+    if split or len(choices) == 1:
+        return choices[-1]
     pipelined_rounds = triton.cdiv(
         num_workgroups, _EXTEND_PIPELINED_WORKGROUPS_PER_CU * _GFX950_SM_COUNT
     )
     single_rounds = triton.cdiv(
         num_workgroups, _EXTEND_SINGLE_WORKGROUPS_PER_CU * _GFX950_SM_COUNT
     )
-    return _EXTEND_STAGES if pipelined_rounds <= single_rounds else 1
+    return choices[-1] if pipelined_rounds <= single_rounds else choices[0]
 
 
 def launch_gluon_mha_extend_gfx950(
@@ -1125,12 +1141,98 @@ def launch_gluon_mha_extend_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    return _extend(
+        q,
+        cu_seqlens_q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        is_causal=is_causal,
+        window_left=window_left,
+        sinks=sinks,
+        return_lse=return_lse,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        compile_all_variants=False,
+    )
+
+
+def warmup_gluon_mha_extend_gfx950(
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    is_causal: bool = False,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    max_seqlen_q: int = 1,
+    max_seqlen_k: int = 1,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Compile every kernel variant the extend launcher can pick, without running.
+
+    Takes the launcher's arguments. The query tile, the K/V pipeline depth,
+    the grid, whether full attention splits the KV stream and whether the
+    split count is a multiple of 16 follow the batch; each choice is a
+    separate binary. This compiles all of them for the model's heads, dtypes, window,
+    sinks and LSE output, and for the tensors' strides and alignment, so a
+    server can compile them at startup. The batch shape of the arguments
+    (lengths, request count) does not matter.
+    """
+    _extend(
+        q,
+        cu_seqlens_q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        is_causal=is_causal,
+        window_left=window_left,
+        sinks=sinks,
+        return_lse=return_lse,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        compile_all_variants=True,
+    )
+
+
+def _extend(
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    is_causal: bool,
+    window_left: int,
+    sinks: torch.Tensor | None,
+    return_lse: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None,
+    compile_all_variants: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    # Picks the variant for this batch and launches it, or, with
+    # compile_all_variants, compiles every variant any batch can pick.
     head_dim = q.shape[2]
     n_heads = q.shape[1]
     n_kv_heads = k_cache.shape[2]
     group_size = n_heads // n_kv_heads
     page_size = k_cache.shape[1]
-    block_m, block_q, block_n, num_warps = _select_extend_tile(max_seqlen_q, group_size)
+    tile = _select_extend_tile(max_seqlen_q, group_size)
+    block_q = tile[1]
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     sm_scale = softmax_scale * _INV_LN2_VALUE
@@ -1189,30 +1291,18 @@ def launch_gluon_mha_extend_gfx950(
     # Bound on q-blocks with query rows: the dense count plus one partial
     # block for each further request.
     num_q_blocks = min(rect_num_q_blocks, triton.cdiv(total_q, block_q) + batch - 1)
+    stage_args = dict(
+        head_dim=head_dim, page_size=page_size, element_size=k_cache.element_size()
+    )
     num_stages = _extend_stages(
         num_workgroups=num_q_blocks * n_kv_heads,
         split=num_kv_splits > 1,
-        head_dim=head_dim,
-        page_size=page_size,
-        element_size=k_cache.element_size(),
+        **stage_args,
     )
 
-    if num_kv_splits > 1:
-        mid_o = torch.empty(
-            (total_q, n_heads, num_kv_splits, head_dim),
-            device=q.device,
-            dtype=torch.float32,
-        )
-        mid_lse = torch.empty(
-            (total_q, n_heads, num_kv_splits),
-            device=q.device,
-            dtype=torch.float32,
-        )
-        if use_ragged:
-            split_grid = (ragged_num_q_blocks, n_kv_heads, num_kv_splits)
-        else:
-            split_grid = (blocks_per_req * num_kv_splits, batch, n_kv_heads)
-        gluon_mha_extend_split_gfx950[split_grid](
+    def split_args(tile, num_stages, ragged, num_kv_splits, mid_o, mid_lse):
+        block_m, block_q, block_n, num_warps = tile
+        return (
             q,
             k_cache,
             v_cache,
@@ -1239,12 +1329,12 @@ def launch_gluon_mha_extend_gfx950(
             num_kv_splits,
             is_causal,
             is_fp8,
-            use_ragged,
+            ragged,
             num_stages,
-            num_warps=num_warps,
         )
-        reduce_grid = (total_q, n_heads)
-        gluon_mha_extend_reduce_gfx950[reduce_grid](
+
+    def reduce_args(num_kv_splits, mid_o, mid_lse):
+        return (
             mid_o,
             mid_lse,
             output,
@@ -1255,6 +1345,103 @@ def launch_gluon_mha_extend_gfx950(
             head_dim,
             has_sink,
             return_lse,
+        )
+
+    def unsplit_args(tile, num_stages, ragged):
+        block_m, block_q, block_n, num_warps = tile
+        return (
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            output,
+            lse_arg,
+            sink_arg,
+            cu_q_i32,
+            cache_i32,
+            batch,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            sm_scale,
+            page_table.stride(0),
+            page_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            block_m,
+            block_q,
+            block_n,
+            num_warps,
+            is_causal,
+            has_sink,
+            return_lse,
+            window_left,
+            is_fp8,
+            ragged,
+            num_stages,
+        )
+
+    def split_buffers(rows, num_kv_splits):
+        mid_o = torch.empty(
+            (rows, n_heads, num_kv_splits, head_dim),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        mid_lse = torch.empty(
+            (rows, n_heads, num_kv_splits),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        return mid_o, mid_lse
+
+    if compile_all_variants:
+        # Every tile _select_extend_tile can return, with every pipeline depth
+        # _extend_stages can pick for it, on both grids. Triton also compiles
+        # an integer argument separately when it is a multiple of 16, so the
+        # split kernels take one split count of each kind select_kv_splits
+        # can return. The request count is not specialized.
+        tiles = {_extend_tile(m, w, group_size) for m, w in _EXTEND_TILES}
+        stage_choices = _extend_stage_choices(**stage_args)
+        split_stages = _extend_stages(num_workgroups=1, split=True, **stage_args)
+        split_counts = {n % 16 == 0: n for n in range(2, MAX_KV_SPLITS + 1)}
+        # Compiling needs only their dtype and alignment, not their size.
+        mid_o, mid_lse = split_buffers(1, MAX_KV_SPLITS)
+        for tile in sorted(tiles):
+            options = dict(grid=(1,), num_warps=tile[3])
+            for ragged in (False, True):
+                for stages in stage_choices:
+                    gluon_mha_extend_gfx950.warmup(
+                        *unsplit_args(tile, stages, ragged), **options
+                    )
+                if is_sliding:
+                    continue
+                for splits in split_counts.values():
+                    gluon_mha_extend_split_gfx950.warmup(
+                        *split_args(tile, split_stages, ragged, splits, mid_o, mid_lse),
+                        **options,
+                    )
+        if not is_sliding:
+            for splits in split_counts.values():
+                gluon_mha_extend_reduce_gfx950.warmup(
+                    *reduce_args(splits, mid_o, mid_lse), grid=(1,), num_warps=1
+                )
+        return None
+
+    num_warps = tile[3]
+    if num_kv_splits > 1:
+        mid_o, mid_lse = split_buffers(total_q, num_kv_splits)
+        if use_ragged:
+            split_grid = (ragged_num_q_blocks, n_kv_heads, num_kv_splits)
+        else:
+            split_grid = (blocks_per_req * num_kv_splits, batch, n_kv_heads)
+        gluon_mha_extend_split_gfx950[split_grid](
+            *split_args(tile, num_stages, use_ragged, num_kv_splits, mid_o, mid_lse),
+            num_warps=num_warps,
+        )
+        reduce_grid = (total_q, n_heads)
+        gluon_mha_extend_reduce_gfx950[reduce_grid](
+            *reduce_args(num_kv_splits, mid_o, mid_lse),
             num_warps=1,
         )
         if return_lse:
@@ -1266,36 +1453,7 @@ def launch_gluon_mha_extend_gfx950(
     else:
         grid = (blocks_per_req, batch, n_kv_heads)
     gluon_mha_extend_gfx950[grid](
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        output,
-        lse_arg,
-        sink_arg,
-        cu_q_i32,
-        cache_i32,
-        batch,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        sm_scale,
-        page_table.stride(0),
-        page_size,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        block_m,
-        block_q,
-        block_n,
-        num_warps,
-        is_causal,
-        has_sink,
-        return_lse,
-        window_left,
-        is_fp8,
-        use_ragged,
-        num_stages,
+        *unsplit_args(tile, num_stages, use_ragged),
         num_warps=num_warps,
     )
     if return_lse:
