@@ -205,6 +205,26 @@ class EngineMetrics:
                 7680.0,
             ],
         )
+        # Both counters are in tokens; their ratio is the token-level
+        # prefix-cache hit rate.
+        self.prefix_cache_queries = factory.counter(
+            name="tokenspeed:prefix_cache_queries",
+            documentation=(
+                "Prompt tokens of released requests — the prefix-match "
+                "denominator. Aborted requests count too: they queried the "
+                "cache at admission."
+            ),
+            labelnames=labelnames,
+        )
+        self.prefix_cache_hits = factory.counter(
+            name="tokenspeed:prefix_cache_hits",
+            documentation=(
+                "Prompt tokens served from the prefix cache: each released "
+                "request's cached_tokens (the per-request stats line's "
+                "cache_tokens), accumulated."
+            ),
+            labelnames=labelnames,
+        )
 
     def set_scheduler_snapshot(
         self, *, running: int, waiting: int, kv_cache_usage_ratio: float
@@ -290,6 +310,15 @@ class EngineMetrics:
         if not self.enabled:
             return
         self.request_queue_time_seconds.labels(**self.labels).observe(queue_time)
+
+    def record_prefix_cache(self, query_tokens: int, hit_tokens: int) -> None:
+        """A commit's released requests, by their prompt and cached tokens."""
+        if not self.enabled:
+            return
+        if query_tokens > 0:
+            self.prefix_cache_queries.labels(**self.labels).inc(query_tokens)
+        if hit_tokens > 0:
+            self.prefix_cache_hits.labels(**self.labels).inc(hit_tokens)
 
 
 class KVTransferMetrics:
