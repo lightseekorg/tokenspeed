@@ -1939,7 +1939,7 @@ class ServerArgs:
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
         # pipeline needs the P role's structural guarantees (no decode token
-        # feedback, non-overlap loop).
+        # feedback, no overlap schedule).
         if self.pipeline_parallel_size > 1:
             # Debug escape hatch: run PP without PD to validate the stage
             # pipeline numerically (prefill + first token only — decode
@@ -3637,7 +3637,9 @@ class ServerArgs:
         parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
-            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker. "
+            "On a PD prefill server at PP=1 this also returns the event loop to in-flight depth 0; "
+            "under PP the chunk pipeline keeps one forward per stage in flight.",
         )
         parser.add_argument(
             "--disable-tf32",

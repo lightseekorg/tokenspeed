@@ -92,6 +92,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_ops_from_plan,
     engram_context_len,
     resolve_dspark_prefix_replay_tokens,
+    resolve_in_flight_depth,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.encode_host import EncodeBootstrap
@@ -501,6 +502,16 @@ class HostConfig:
     epd_receive_enabled: bool
     grammar: GrammarSettings | None
     eager_grammar: bool
+
+
+def host_in_flight_depth(server_args: ServerArgs) -> int:
+    """``HostConfig.in_flight_depth`` of a rank launched with
+    ``server_args`` (``resolve_in_flight_depth``)."""
+    return resolve_in_flight_depth(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+        pp_size=server_args.mapping.pp_size,
+    )
 
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
@@ -1052,7 +1063,8 @@ class HostBootstrap:
             else:
                 draft_model_config = None
             ngram_context_len = engram_context_len(model_config.hf_text_config)
-            if ngram_context_len and mapping.has_pp:
+            in_flight_depth = host_in_flight_depth(server_args)
+            if ngram_context_len and in_flight_depth > 1:
                 raise NotImplementedError(
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
@@ -1215,10 +1227,7 @@ class HostBootstrap:
                 handshake_address=server_args.zmq_handshake_endpoint(),
                 engine_index=server_args.zmq_engine_index + dp_rank,
                 ready_response=zmq_wire.encode(ready_response),
-                # The chunk pipeline keeps one forward per stage in flight.
-                in_flight_depth=(
-                    mapping.pp_size if mapping.has_pp else overlap_schedule_depth
-                ),
+                in_flight_depth=in_flight_depth,
                 vocab_size=model_config.vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 max_model_len=max_model_len,

@@ -60,8 +60,13 @@ from tokenspeed.runtime.engine.profiler import Profiler  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: E402
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
     HostDataPlane,
+    host_in_flight_depth,
     rust_host_refusals,
     start_rust_host,
+)
+from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+    resolve_in_flight_depth,
+    should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
@@ -240,6 +245,65 @@ def test_prefill_kv_capacity_must_exceed_the_unchanged_prompt_limit(
     else:
         with pytest.raises(ValueError, match="greater than max_req_input_len"):
             request_length_limits(**args)
+
+
+# ----------------------------------------------------------------------
+# The rank's in-flight depth
+# ----------------------------------------------------------------------
+
+# (disaggregation_mode, pp_size, disable_overlap_schedule) -> in-flight depth.
+_IN_FLIGHT_DEPTHS = {
+    ("null", 1, False): 1,
+    ("null", 1, True): 0,
+    ("decode", 1, False): 1,
+    ("decode", 1, True): 0,
+    # The prefill role commits one chunk behind.
+    ("prefill", 1, False): 1,
+    ("prefill", 1, True): 0,
+    # An encode rank runs no LM loop.
+    ("encode", 1, False): 0,
+    ("encode", 1, True): 0,
+    # The chunk pipeline keeps one forward per stage in flight, overlap
+    # disabled or not.
+    ("prefill", 2, False): 2,
+    ("prefill", 2, True): 2,
+    ("prefill", 4, False): 4,
+    ("null", 2, False): 2,
+}
+
+
+@pytest.mark.parametrize("mode, pp_size, disabled", sorted(_IN_FLIGHT_DEPTHS))
+def test_the_in_flight_depth_per_role_pipeline_and_overlap_flag(
+    mode, pp_size, disabled
+):
+    depth = resolve_in_flight_depth(
+        disable_overlap_schedule=disabled,
+        disaggregation_mode=mode,
+        pp_size=pp_size,
+    )
+
+    assert depth == _IN_FLIGHT_DEPTHS[mode, pp_size, disabled]
+
+
+def test_a_prefill_rank_runs_one_chunk_ahead_without_the_overlap_schedule():
+    def prefill(**fields) -> ServerArgs:
+        return ServerArgs(
+            model="x",
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+            **fields,
+        )
+
+    server_args = prefill()
+    assert host_in_flight_depth(server_args) == 1
+    # It reserves no decode KV for the forward in flight: the role never
+    # decodes locally.
+    assert not should_use_overlap_schedule(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+    )
+    assert host_in_flight_depth(prefill(disable_overlap_schedule=True)) == 0
+    assert host_in_flight_depth(prefill(pipeline_parallel_size=2)) == 2
 
 
 # ----------------------------------------------------------------------
