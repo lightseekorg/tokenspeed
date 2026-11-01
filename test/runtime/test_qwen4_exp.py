@@ -2476,6 +2476,26 @@ def test_ple_batch_indices_uniform_matches_general_path() -> None:
 
 
 @_requires_cuda
+def test_ple_ragged_batch_indices_do_not_synchronize() -> None:
+    # Prefill builds them on the forward thread, behind the step in flight.
+    lengths = [3, 1, 4]
+    device = torch.device("cuda")
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        req, col, lengths_t, starts, *_ = Qwen4ExpPLELayer._batch_indices(
+            lengths, device
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert req.tolist() == [0, 0, 0, 1, 2, 2, 2, 2]
+    assert col.tolist() == [0, 1, 2, 0, 0, 1, 2, 3]
+    assert lengths_t.tolist() == lengths
+    assert starts.tolist() == [0, 3, 4]
+
+
+@_requires_cuda
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_ple_eager_indices_after_shared_pool_graph_replay(
     monkeypatch: pytest.MonkeyPatch,

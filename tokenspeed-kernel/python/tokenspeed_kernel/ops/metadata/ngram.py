@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 
 @dataclass(frozen=True)
@@ -400,7 +401,9 @@ def prepare_ngram_inputs(
     # Small tiles minimize latency; larger runs amortize programs and skip
     # history reads once all predecessors are inside the packed input.
     rows = 4 if capacity <= 512 else 8 if capacity <= 2048 else 16
-    _prepare_ngram_hash[(triton.cdiv(max(capacity, bs), rows), layers)](
+    kernel_launcher(
+        _prepare_ngram_hash, (triton.cdiv(max(capacity, bs), rows), layers)
+    )(
         snapshots,
         positions,
         reset,
@@ -559,3 +562,6 @@ def commit_ngram_inputs(
             rows,
             num_warps=4,
         )
+
+
+register_triton_warmup(_prepare_ngram_hash, variants=({"ROWS": (4, 8, 16)},))

@@ -69,6 +69,7 @@ from tokenspeed.runtime.layers.ple_lookup import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
+from tokenspeed.runtime.utils.host_sync import host_to_device
 
 logger = get_colorful_logger(__name__)
 
@@ -607,7 +608,7 @@ class Qwen4ExpPLELayer(nn.Module):
             req, col, lengths_t, starts = bundle
         else:
             positions = torch.arange(total, device=device, dtype=torch.long)
-            lengths_t = torch.tensor(lengths, device=device, dtype=torch.long)
+            lengths_t = host_to_device(lengths, dtype=torch.long, device=device)
             ends = torch.cumsum(lengths_t, dim=0)
             starts = ends - lengths_t
             req = torch.searchsorted(ends.contiguous(), positions, right=True)
