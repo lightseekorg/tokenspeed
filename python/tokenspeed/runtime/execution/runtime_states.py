@@ -568,7 +568,9 @@ class RuntimeStates:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
-        self.spec_candidates_ready[req_pool_idx] = True
+        # fill_, not `[req_pool_idx] = True`: assigning a Python scalar stages
+        # it through a pageable host tensor, a host sync on the forward thread.
+        self.spec_candidates_ready[req_pool_idx].fill_(True)
         # The candidates come without their draft distribution; the row's
         # draft_probs still hold the sentinel reset_states wrote when the
         # remote cache length was seeded, so the first local verify rejects

@@ -730,6 +730,20 @@ class ServerArgs:
 
     enable_expert_parallel: bool = False
 
+    # Resolved in __post_init__; not options.
+    _grammar_backend_unset: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
+    _beam_checkpoint: bool | None = dataclasses.field(
+        default=False, init=False, repr=False
+    )
+    _beam_grammar_none_warned: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
+    _speculative_widths_explicit: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
+
     @property
     def spec_context_pad(self) -> int:
         """Tokens the physical KV extent must hold past the logical context_len.
@@ -813,7 +827,7 @@ class ServerArgs:
             self._beam_checkpoint
             and not self._grammar_backend_unset
             and self.grammar_backend == "none"
-            and not getattr(self, "_beam_grammar_none_warned", False)
+            and not self._beam_grammar_none_warned
         ):
             self._beam_grammar_none_warned = True
             logger.warning(
@@ -1738,9 +1752,7 @@ class ServerArgs:
             and (current_platform().is_hopper_plus or platform.is_amd)
             and (
                 self.mapping.nnodes == 1
-                or (
-                    getattr(self, "_beam_checkpoint", False) and platform.is_hopper_plus
-                )
+                or (self._beam_checkpoint and platform.is_hopper_plus)
             )
             and self.mapping.has_attn_tp
             and not self.mapping.has_attn_dp
@@ -2378,9 +2390,6 @@ class ServerArgs:
 
         self.validate_expert_placement_options()
 
-        from tokenspeed.runtime.utils.env import envs
-
-        envs.TOKENSPEED_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         if not self.disable_pdl:
             os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
             # Enable PDL for fused attention kernels.

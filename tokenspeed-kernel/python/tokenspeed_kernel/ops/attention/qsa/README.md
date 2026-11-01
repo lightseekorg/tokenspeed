@@ -152,6 +152,12 @@ but contribute zero complete blocks to scoring and top-k selection.
 Compressed-key RoPE is read only at compression write boundaries. Non-boundary
 draft rows may have valid raw-key tags before their group-start header is staged.
 
+Each recent-cache page owns a separate raw-key ring. A later token suppresses
+an earlier writer only when both address the same physical page and ring slot.
+Prefill must leave the last raw keys and group-start positions in every page
+it computes, including pages before the final window, so an interior state
+checkpoint has valid recent-cache data when the scheduler publishes it.
+
 Startup metadata preparation covers integer alignment classes for compressed
 page-table row strides. Recent-cache writes cover these classes for row count
 and the exclusive request-id bound. The ordinary unlimited prefill call also

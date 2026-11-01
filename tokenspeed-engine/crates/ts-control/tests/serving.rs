@@ -3203,9 +3203,10 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
 
     // The device acknowledges nothing until the test opens its gate. While
     // the third prompt's write-backs are unacknowledged, none of the pages
-    // they carry is reused from the Host: the first prompt sent again
-    // computes them anew, evicting the second prompt's last pages. Once the
-    // gate opens, the second prompt sent again loads those back.
+    // they carry is reused from the Host. The first prompt sent again waits
+    // for those copies instead of recomputing a shorter prefix. Opening the
+    // gate lets it load them back, evicting the second prompt's last pages;
+    // the second prompt sent again loads those back too.
     let (prefill, decode, _wire) = start_pd_pair(
         1,
         Layout::Single,
@@ -3225,38 +3226,25 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
         ("b-again", 10_000),
     ];
     for (room, (rid, first)) in (70_u64..).zip(prompts) {
-        if rid == "b-again" {
-            assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 0);
-            assert!(prefill.ranks[0].acknowledged.lock().unwrap().is_empty());
-            prefill.ranks[0].ack_gate.open();
-            let written_back = prefill.cache_ops(CacheOpKind::WriteBack);
-            for _ in 0..500 {
-                if prefill.ranks[0].acknowledged.lock().unwrap().len() == written_back {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(
-                prefill.ranks[0].acknowledged.lock().unwrap().len(),
-                written_back
-            );
-        }
         let request = TokenizedGenerateReqInput {
             input_ids: Some((first + 1..=first + 3000).collect()),
             ..disaggregated(rid, room, 1, 2)
         };
-        let (prefilled, decoded) = tokio::join!(
-            run(&prefill.client, request.clone()),
-            run(&decode.client, request)
-        );
+        let prefilled = prefill.client.generate(request.clone()).await.unwrap();
+        let decoded = decode.client.generate(request).await.unwrap();
+        if rid == "a-again" {
+            assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 0);
+            assert!(prefill.ranks[0].acknowledged.lock().unwrap().is_empty());
+            prefill.ranks[0].ack_gate.open();
+        }
+        let (prefilled, decoded) = tokio::join!(collect(prefilled), collect(decoded));
         assert_eq!(tokens(&prefilled), [1000], "{rid} held");
         assert_eq!(tokens(&decoded), [1000, 1001], "{rid} held");
         cached.push(prefilled.last().unwrap().cached_tokens);
     }
-    // The first prompt sent again hits only the full pages the Device kept;
-    // the second hits all of its own, loading the written-back ones.
-    assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1);
-    assert_eq!(cached, [0, 0, 0, 136 * 16, 187 * 16]);
+    // Both repeated prompts reuse all their full pages after the stores land.
+    assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 2);
+    assert_eq!(cached, [0, 0, 0, 187 * 16, 187 * 16]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

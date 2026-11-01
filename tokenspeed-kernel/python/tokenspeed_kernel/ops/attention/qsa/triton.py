@@ -1024,10 +1024,14 @@ def _qwen4_exp_qsa_recent_write_kernel(
         # other shapes no later row can shadow the current one.
         future = row + COMPRESS_RATIO
         if future < rows:
+            future_loc = tl.load(recent_locs + future).to(tl.int64)
             if HAS_EXTRA_MASK:
                 has_future = tl.load(write_mask + future) != 0
             else:
-                has_future = tl.load(recent_locs + future).to(tl.int64) > 0
+                has_future = future_loc > 0
+            # Each physical page has its own ring. Crossing into the next
+            # page must preserve the rows an earlier checkpoint resumes from.
+            has_future &= future_loc // recent_page_size == loc // recent_page_size
             if has_future:
                 has_future &= tl.load(request_indices + future).to(tl.int64) == tl.load(
                     request_indices + row
@@ -1098,7 +1102,7 @@ def qwen4_exp_qsa_recent_write(
     """Write the latest raw keys and group-start RoPE positions.
 
     Without ``write_mask`` the kernel keeps only the last writer of every
-    ring slot and can additionally skip rows whose request id is not smaller
+    physical page's ring slot and can additionally skip rows whose request id is not smaller
     than ``request_limit``. With ``write_mask`` the boolean mask selects the
     candidate rows; later masked writers of the same ring slot still shadow
     earlier ones so every physical slot receives exactly one deterministic

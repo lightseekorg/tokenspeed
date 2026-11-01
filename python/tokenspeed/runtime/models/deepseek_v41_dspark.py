@@ -286,7 +286,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         self.target_layer_ids = taps
         self.hidden_size = config.hidden_size
         self.noise_token_id = config.dspark_noise_token_id
-        self.window_size = config.sliding_window
         self.attention_params = {"head_dim": config.head_dim}
         self.main_proj = _replicated(
             len(taps) * config.hidden_size,
