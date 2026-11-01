@@ -41,7 +41,7 @@ the checkpoint's vision tower. Audio uses the `<audio>` anchor: one `<|audio|>`
 token per 1,920 samples of mono 24 kHz, encoded by the checkpoint's audio
 tower. SMG performs the preprocessing and anchor expansion.
 
-### MI355X MXFP4, MoE TP8
+### MI355X MXFP4
 
 The
 [AMD Quark MXFP4](https://huggingface.co/amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4)
@@ -49,10 +49,14 @@ checkpoint quantizes the routed-expert weights and activations of all but the
 first and last layers to MXFP4 and keeps everything else in BF16. On eight
 MI355X GPUs (gfx950), MoE TP8 with EP1 shards every expert over its
 intermediate dimension, so each GPU holds all 256 experts and no tokens are
-dispatched between GPUs:
+dispatched between GPUs. The launch below adds the
+[DFlash2](https://huggingface.co/RadixArk/Muse-Spark-Open-DFlash2) draft and an
+FP8 KV cache. The draft proposes seven tokens per step, and
+`--enable-speculative-sampling` verifies them by rejection sampling, so sampled
+requests keep the target model's output distribution:
 
 ```bash
-ts serve \
+DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
     --model amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
     --served-model-name muse-spark \
     --tp 8 \
@@ -61,26 +65,47 @@ ts serve \
     --dtype bfloat16 \
     --quantization mxfp4 \
     --moe-backend gluon \
+    --kv-cache-dtype fp8_e4m3 \
     --max-model-len 1048576 \
     --max-num-seqs 64 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --cudagraph-capture-sizes 1 2 4 8 16 32 64 \
+    --cudagraph-capture-sizes 1 2 3 4 5 6 8 12 16 32 64 \
     --max-cudagraph-capture-size 64 \
     --disable-prefill-graph \
     --gpu-memory-utilization 0.92 \
     --sampling-backend triton \
     --disable-kvstore \
     --kvstore-ratio 0.0 \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --enable-speculative-sampling \
     --host 127.0.0.1 \
     --port 8000
 ```
 
 `--max-model-len 1048576` keeps the checkpoint's native context, which agentic
 workloads with long cached prefixes need; prefix caching is on by default.
-Compared with `--ep-size 8 --moe-tp-size 1` on the same checkpoint, this
-layout decodes faster at low concurrency but has a higher time-to-first-token;
-prefer EP8 for prefill-heavy traffic.
+
+The two HIP runtime settings are needed for speed; TokenSpeed does not set them
+itself. `DEBUG_HIP_FORCE_GRAPH_QUEUES=1` matters most for the two-stream
+speculative decode graph. The extra capture sizes (3, 5, 6, 12) cut padding at
+the small batch sizes that speculative decoding runs at.
+
+For multi-turn agentic traffic, set `--max-num-seqs` by concurrency:
+
+| Concurrency | `--max-num-seqs` |
+| ----------- | ---------------- |
+| 1 to 4      | 64               |
+| 8           | 3                |
+| 16          | 4                |
+
+A `--max-num-seqs` below the concurrency queues the extra requests: decode
+batches stay small, which lowers TPOT, but queued requests wait longer for
+their first token. Keep 64 when time-to-first-token matters more.
 
 ### Blackwell NVFP4
 
