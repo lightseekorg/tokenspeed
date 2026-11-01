@@ -601,11 +601,20 @@ snapshot pool (`SchedulerConfig::HasSnapshotPool()`, §4) and a blob slot; a
 round that finds no victim it can image falls back to the last resort below
 and **aborts** one instead, so a capacity block never waits on a host budget.
 
-When every resident still has an outstanding forward or PD transfer, capacity
-retraction waits before ranking or planning images: no possible choice can
-quiesce in that round. Otherwise the normal rank and Host-fit order applies,
-including waiting for a better-ranked busy victim. Decode release counts are
-computed once per candidate for each ranking pass, before sorting.
+**Only a resident the round being built has dispatched no work for is offered
+as a victim**, in both tiers (below). One with this round's forward out cannot
+quiesce before the retraction runs, and the next round schedules it again
+before retraction runs, so waiting for it would last as long as its reserve
+does while every request blocked beside it holds idle pages; nor can its pages
+free in this round, which is what an abort is for. A request armed by the
+debug knob (below) sits its round out: marked scheduled with nothing
+dispatched, it stays offered. When every offered resident still has an
+outstanding forward or PD transfer — an earlier round's result still landing —
+capacity retraction waits before ranking or planning images: no possible
+choice can quiesce in that round. Otherwise the normal rank and Host-fit order
+applies among the offered residents, including waiting for a better-ranked one
+whose earlier forward is still landing. Decode release counts are computed once
+per candidate for each ranking pass, before sorting.
 
 **A retracted request loses no work.** It is *suspended*: its block tables are
 imaged to Host byte-for-byte, its Device pages are released, and the restore
@@ -622,8 +631,10 @@ retract) until it fits or the victims run out. The freed capacity therefore
 reaches the request it was freed for within the round; there is never a free
 page waiting for whoever asks first next round, which is what previously
 required a cross-round capacity barrier. The empty-round retraction (below) is
-the one exception: it offers the freed pages to the round's decodes first. Two
-edges of the loop:
+the one exception: it offers the freed pages to the round's decodes first. A
+round with no room left for the grant — its batch full or its token budget
+spent — retracts nothing: the victim would serve nobody, and its pages would
+wait for whoever asks first next round. Two edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the restore
@@ -721,9 +732,10 @@ the victim's progress). **The last resort is an abort, in one place.**
 blob slot is free and the split of the image the retraction would take once it
 has published, projected without mutation, has no shortfall — the probe and
 the retraction run the same plan of the L2 leg); when none does — and
-without a pool none ever does — it names the newest retractable resident (the
-least work lost; exempt requests excluded, they finish on their own reserve,
-except in the empty-round retraction below) and `Scheduler::onImageDoesNotFit`
+without a pool none ever does — it names the newest retractable resident it is
+offered (the least work lost among those whose pages can free this round;
+exempt requests excluded, they finish on their own reserve, except in the
+empty-round retraction below) and `Scheduler::onImageDoesNotFit`
 aborts it with that resident's shortfall: `fsm::AbortEvent` frees its pages
 and slot in that very round, the blocked grant proceeds exactly as after a
 retraction, and the plan records it (`ExecutionPlan::aborts`, a
@@ -794,19 +806,14 @@ mirrored schedulers on every rank hold the same values.
 out must not be retracted — its result would land on pages it no longer owns,
 and the image must know the landed tokens — and one whose pages a PD transfer
 still pins must not be either. Both are checked on the chosen victim; if it is
-not quiescent, retraction waits for it rather than sacrificing a worse-ranked
-request. A request the round being built has dispatched work for is not
-offered for an image at all: it cannot quiesce before retraction runs, and the
-next round schedules it again first, so waiting for it would leave every
-request blocked beside it holding idle pages for as long as its reserve lasts.
-The abort tier still considers every resident: when no offered image fits,
-the newest resident is aborted, or waited for while its forward is out, rather
-than an older blocked request. Two global gates remain. An in-flight
-load-back: it is writing pages its admission owns, and the victim policy
-cannot see that write. And an in-flight *pinned* store: it holds Device
-capacity the ack returns by itself, so retracting anyone for that capacity
-would be the thrash of §4 — the blocked admission retries against the
-released pins next round instead.
+not quiescent — an earlier round's result still landing — retraction waits for
+it rather than sacrificing a worse-ranked request. A request the round being
+built has dispatched work for is never offered (§2, above), so this wait ends
+when that result lands. Two global gates remain. An in-flight load-back: it is
+writing pages its admission owns, and the victim policy cannot see that write.
+And an in-flight *pinned* store: it holds Device capacity the ack returns by
+itself, so retracting anyone for that capacity would be the thrash of §4 — the
+blocked admission retries against the released pins next round instead.
 Stream-ordered stores — both legs of an image, and eviction write-backs —
 hold nothing and gate nothing, and an in-flight restore gates nothing: its
 request is `Restoring`, invisible to `chooseVictim`.
@@ -845,8 +852,10 @@ shortest path out of head-of-line — largest first, freeing the most at once;
 then decode work by most newly releasable LCM blocks and fewest **generated**
 tokens — the needed pages with the fewest victims disturb the fewest clients,
 and among equal frees the client that has streamed least is interrupted.
-Only candidates whose image fits are ranked, the Host L2 leg planned as the
-retraction places it (the abort fallback above takes over when none does).
+Only offered residents are ranked — none the round being built has dispatched
+work for (§2) — and among them only those whose image fits, the Host L2 leg
+planned as the retraction places it (the abort fallback above takes over when
+none does).
 Exempt in both tiers: a request whose reserve already covers its whole
 generation (`Request::ReserveCoversGeneration`) — retracting it frees exactly
 what its restore must take back, pure thrash — and it is not aborted either,
@@ -1360,11 +1369,13 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   running beside a stalled prefill.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
-  no PD transfer against its pages (§3.1) — and is imaged only if the same
-  round has dispatched no work for it; an in-flight load-back or an
-  in-flight pinned store defers all retraction; stream-ordered stores and
-  in-flight restores defer nothing. A victim that would serve nobody is not
-  retracted. A victim whose image does not fit is aborted through
+  no PD transfer against its pages (§3.1) — and, in both tiers, is chosen only
+  among the residents the same round has dispatched no work for (an armed
+  debug victim sitting the round out stays offered); an in-flight load-back
+  or an in-flight pinned store defers all retraction; stream-ordered stores
+  and in-flight restores defer nothing. A victim that would serve nobody is
+  not retracted, and a round with no room left for the grant retracts
+  nobody. A victim whose image does not fit is aborted through
   `onImageDoesNotFit` and nowhere else; the debug knob aborts only a victim
   whose image is refused after its publication, and leaves one its probe
   refuses running with nothing published.

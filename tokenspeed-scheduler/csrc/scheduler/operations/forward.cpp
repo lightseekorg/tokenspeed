@@ -864,9 +864,8 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // Retracted, Restoring, RemotePrefilling. Transient obstacles (a forward still
 // out, a PD transfer pin) do NOT redirect the choice; the caller waits for the
 // chosen victim to quiesce rather than sacrificing a worse-ranked request. The
-// capacity caller does not offer the requests its own round has dispatched
-// work for to the image tier -- those cannot quiesce before it runs -- but
-// keeps them for the abort tier.
+// caller decides which residents to offer (maybeRetractForCapacity offers
+// none its own round has dispatched work for).
 Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
     const auto retractable = [ignore_exemption](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
@@ -1108,9 +1107,9 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
 // The host side is finite too. When no candidate's image fits (no blob slot,
 // a snapshot pool too small for the tail, or a Host L2 that cannot take the
 // published pages the pool cannot -- always, without a pool) the last resort
-// is to ABORT the newest retractable resident instead of imaging anyone
-// (onImageDoesNotFit): its pages free in this round exactly as a
-// retraction's would and the grant proceeds. The alternative, waiting, can
+// is to ABORT the newest retractable resident offered (below) instead of
+// imaging anyone (onImageDoesNotFit): its pages free in this round exactly as
+// a retraction's would and the grant proceeds. The alternative, waiting, can
 // deadlock once every resident needs a page.
 //
 // A grant that cannot join its round (a fused prefill beside an already-built
@@ -1140,40 +1139,44 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         return;
     }
 
-    // Not a request this round has dispatched work for: its forward is out
-    // until the round runs, and the next round schedules it again before
-    // retraction runs, so a wait for it to quiesce lasts as long as its
-    // reserve does -- while every request blocked beside it keeps its pages
-    // idle. A forced victim sitting the round out (maybeForceRetraction) is
-    // marked scheduled with nothing dispatched; it stays a victim, waited for
-    // as before. Computed once: every path below that schedules work returns
-    // before the next chooseVictim.
-    std::vector<Request*> victims;
-    victims.reserve(candidates.size());
-    std::ranges::copy_if(candidates, std::back_inserter(victims), [this, &build](const Request* request) {
-        return !build.Scheduled(*request) || request->Id() == forced_victim_id_;
-    });
-    // The abort tier keeps every resident: when no image of an offered victim
-    // fits, the choice is the one chooseVictim makes over all residents -- the
-    // newest (the least work lost) is aborted, or waited for while its forward
-    // is out, rather than an older blocked request being aborted.
-    const auto choose_victim = [this, &victims, candidates](bool ignore_exemption) {
-        VictimChoice choice = chooseVictim(victims, ignore_exemption);
-        return choice.shortfall ? chooseVictim(candidates, ignore_exemption) : choice;
-    };
+    // Only a resident this round has dispatched no work for is offered as a
+    // victim, in both tiers. One with this round's forward out cannot quiesce
+    // before the retraction runs, and the next round schedules it again
+    // before retraction runs, so waiting for it would last as long as its
+    // reserve -- while every request blocked beside it keeps its pages idle
+    // -- and its pages cannot free in this round, which an abort exists to
+    // do. A forced victim sitting the round out (maybeForceRetraction) is
+    // marked scheduled with nothing dispatched: it stays offered, and is
+    // waited for while its earlier forward lands.
+    Request* const forced_victim = forced_victim_id_.empty() ? nullptr : findRequest(forced_victim_id_);
+    std::vector<Request*> offered;
+    offered.reserve(candidates.size());
 
     while (true) {
-        // No ranked choice can run while every resident is still being
-        // written. Avoid hashing and planning images that would all wait.
-        // With any quiescent resident, retain the full ranking and fit probe:
-        // a better-ranked busy victim must not be bypassed.
-        if (std::ranges::none_of(candidates, [this](const Request* request) {
+        // No room left for the grant -- the batch full or the token budget
+        // spent: a victim retracted now would serve nobody, and its pages
+        // would wait for whoever asks first next round. (An empty round is
+        // never full.)
+        if (build.Full(config_.max_batch_size)) {
+            return;
+        }
+        // Rebuilt each pass, so it never offers a request a pass scheduled.
+        offered.clear();
+        std::ranges::copy_if(candidates, std::back_inserter(offered), [&build, forced_victim](Request* request) {
+            return !build.Scheduled(*request) || request == forced_victim;
+        });
+        // No ranked choice can run while every offered resident is still
+        // being written -- a result of an earlier round still landing. Avoid
+        // hashing and planning images that would all wait. With any quiescent
+        // one, retain the full ranking and fit probe: a better-ranked busy
+        // victim must not be bypassed.
+        if (std::ranges::none_of(offered, [this](const Request* request) {
                 return request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
                        request->ResultsInFlight() == 0 && !pdTransferInFlight(*request);
             })) {
             return;
         }
-        VictimChoice choice = choose_victim(/*ignore_exemption=*/false);
+        VictimChoice choice = chooseVictim(offered, /*ignore_exemption=*/false);
         // A finished request whose last forward is still out frees its pages
         // when that forward lands (settleFinishedRequests), so a round that
         // waits for it is not empty either.
@@ -1185,7 +1188,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (empty_round) {
             // Nothing is retractable under the exemption and the round runs
             // nothing: the empty-round retraction (docs/design/scheduler.md §2).
-            choice = choose_victim(/*ignore_exemption=*/true);
+            choice = chooseVictim(offered, /*ignore_exemption=*/true);
         }
         Request* victim = choice.victim;
         if (victim == nullptr) {

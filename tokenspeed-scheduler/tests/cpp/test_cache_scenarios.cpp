@@ -29,6 +29,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -1354,51 +1355,170 @@ protected:
         SetTestSnapshotPool(cfg);
         return cfg;
     }
-};
 
-TEST_F(ScheduledVictimRetractionSuite, RequestScheduledThisRoundDoesNotStallTheBlockedDecodes) {
-    std::vector<RequestSpec> specs;
-    for (const auto& [id, start] : {std::pair{"a", 1}, std::pair{"b", 5000}, std::pair{"c", 10000}}) {
-        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/1, start);
+    static RequestSpec LongRequest(RequestSpec spec) {
         spec.max_new_tokens = 12000;
-        specs.push_back(spec);
-    }
-    Submit(specs);
-    const ExecutionPlan prefill_plan = PlanOnce();
-    const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
-    ASSERT_NE(prefill, nullptr);
-    ASSERT_EQ(prefill->request_ids.size(), 3u);
-    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 1);
-    for (const char* id : {"a", "b", "c"}) {
-        SendForwardDone(id, {42});
+        return spec;
     }
 
-    const std::vector<std::int32_t> decode_result(1024, 7);
-    for (std::int32_t round = 0; round < 3; ++round) {
-        const ExecutionPlan decode_plan = PlanOnce();
-        const ForwardBatch* decode = FindForwardBatch(decode_plan);
-        ASSERT_NE(decode, nullptr) << "decode round " << round;
-        ASSERT_EQ(decode->request_ids.size(), 3u) << "decode round " << round;
-        for (const char* id : {"a", "b", "c"}) {
-            SendForwardDone(id, decode_result);
+    // One plan prefills every submitted request, then `rounds` plans decode
+    // all of them, each step accepting 1024 tokens -- three rounds spend a
+    // 4096-token headroom block.
+    void PrefillAndDecode(const std::vector<std::string>& ids, std::int32_t rounds) {
+        const ExecutionPlan prefill_plan = PlanOnce();
+        const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
+        ASSERT_NE(prefill, nullptr);
+        ASSERT_EQ(prefill->request_ids, ids);
+        for (const std::string& id : ids) {
+            SendForwardDone(id, {42});
+        }
+        for (std::int32_t round = 0; round < rounds; ++round) {
+            const ExecutionPlan decode_plan = PlanOnce();
+            const ForwardBatch* decode = FindForwardBatch(decode_plan);
+            ASSERT_NE(decode, nullptr) << "decode round " << round;
+            ASSERT_EQ(decode->request_ids, ids) << "decode round " << round;
+            for (const std::string& id : ids) {
+                SendForwardDone(id, kDecodeStep);
+            }
         }
     }
 
+    const std::vector<std::int32_t> kDecodeStep = std::vector<std::int32_t>(1024, 7);
+};
+
+TEST_F(ScheduledVictimRetractionSuite, RequestScheduledThisRoundDoesNotStallTheBlockedDecodes) {
+    Submit({LongRequest(MakeRequestSpec("a", /*num_pages=*/1, /*start=*/1)),
+            LongRequest(MakeRequestSpec("b", /*num_pages=*/1, /*start=*/5000)),
+            LongRequest(MakeRequestSpec("c", /*num_pages=*/1, /*start=*/10000))});
+    PrefillAndDecode({"a", "b", "c"}, /*rounds=*/3);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 1);
+
     // All three have spent their headroom block. The oldest takes the free
     // block and is the largest resident -- the top-ranked victim -- but this
-    // round has just scheduled it. Waiting for it to quiesce would idle b and
-    // c for as long as its new block lasts; instead b gives way to c. b and c
-    // tie on releasable blocks and generated tokens, so the last tie-break of
-    // decode_rank, Id(), picks b; b is also the capacity blocker, so its pages
-    // go to c through the blocker redirect.
+    // round has just scheduled it, so it is not offered: waiting for it to
+    // quiesce would idle b and c for as long as its new block lasts. One of
+    // the blocked two gives way to the other instead; they tie on everything
+    // the ranking weighs, so either may.
     const ExecutionPlan blocked_plan = PlanOnce();
-    const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
-    ASSERT_NE(blocked, nullptr);
-    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"a", "c"}));
     EXPECT_EQ(scheduler_->RetractedSize(), 1u);
     const SnapshotStoreBatch* store = FindSnapshotStore(blocked_plan);
     ASSERT_NE(store, nullptr);
-    EXPECT_EQ(store->request_ids, std::vector<std::string>{"b"});
+    ASSERT_EQ(store->request_ids.size(), 1u);
+    const std::string victim = store->request_ids.front();
+    ASSERT_TRUE(victim == "b" || victim == "c") << victim;
+    const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
+    ASSERT_NE(blocked, nullptr);
+    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"a", victim == "b" ? "c" : "b"}));
+}
+
+// The debug knob arms the oldest decode at plan 5. Its forward is still out
+// there, so it sits the round out: marked scheduled, with nothing dispatched.
+class ForcedScheduledVictimSuite : public ScheduledVictimRetractionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ScheduledVictimRetractionSuite::MakeConfig();
+        // Ten usable blocks: a holds two prompt blocks and a headroom block,
+        // b, c and d a prompt block and a headroom block each, and one block
+        // is free.
+        cfg.device_allocator.total_pages = 11;
+        cfg.max_scheduled_tokens = 32768;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+        };
+        SetTestSnapshotPool(cfg);
+        cfg.debug_force_retraction_interval = 5;
+        return cfg;
+    }
+};
+
+TEST_F(ForcedScheduledVictimSuite, AForcedVictimSittingTheRoundOutIsStillOfferedAndWaitedFor) {
+    Submit({LongRequest(MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1)),
+            LongRequest(MakeRequestSpec("b", /*num_pages=*/1, /*start=*/10000)),
+            LongRequest(MakeRequestSpec("c", /*num_pages=*/1, /*start=*/15000)),
+            LongRequest(MakeRequestSpec("d", /*num_pages=*/1, /*start=*/20000))});
+    PrefillAndDecode({"a", "b", "c", "d"}, /*rounds=*/2);
+    // The third decode round (plan 4) spends every headroom block; a's result
+    // stays out.
+    const ExecutionPlan last_decode_plan = PlanOnce();
+    const ForwardBatch* last_decode = FindForwardBatch(last_decode_plan);
+    ASSERT_NE(last_decode, nullptr);
+    ASSERT_EQ(last_decode->request_ids, (std::vector<std::string>{"a", "b", "c", "d"}));
+    for (const char* id : {"b", "c", "d"}) {
+        SendForwardDone(id, kDecodeStep);
+    }
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 1);
+
+    // Plan 5 arms a, which sits the round out while its forward lands. b takes
+    // the free block; c and d block. a holds the most blocks, so it is the
+    // top-ranked victim, and it stays offered although the round marked it
+    // scheduled: retraction waits for its forward rather than retracting c or
+    // d.
+    const ExecutionPlan blocked_plan = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(FindSnapshotStore(blocked_plan), nullptr);
+    const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
+    ASSERT_NE(blocked, nullptr);
+    EXPECT_EQ(blocked->request_ids, std::vector<std::string>{"b"});
+    SendForwardDone("a", kDecodeStep);
+    SendForwardDone("b", kDecodeStep);
+
+    // a has quiesced: the knob retracts it, and its blocks reach c and d.
+    const ExecutionPlan retract_plan = PlanOnce();
+    const SnapshotStoreBatch* store = FindSnapshotStore(retract_plan);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"a"});
+    const ForwardBatch* resumed = FindForwardBatch(retract_plan);
+    ASSERT_NE(resumed, nullptr);
+    EXPECT_EQ(resumed->request_ids, (std::vector<std::string>{"b", "c", "d"}));
+}
+
+// A two-page snapshot pool: room for the image of a request holding two
+// blocks, not for one holding three.
+class ScheduledVictimSmallPoolSuite : public ScheduledVictimRetractionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ScheduledVictimRetractionSuite::MakeConfig();
+        // Eleven usable blocks: a holds a prompt block and a headroom block,
+        // b and d two prompt blocks and a headroom block each, c (admitted
+        // later) takes two of the three left, and one stays free.
+        cfg.device_allocator.total_pages = 12;
+        cfg.max_scheduled_tokens = 32768;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+        };
+        cfg.snapshot_allocator.total_pages = 3;  // the null page and two
+        cfg.max_retracted_requests = 4;
+        return cfg;
+    }
+};
+
+TEST_F(ScheduledVictimSmallPoolSuite, AScheduledResidentWhoseImageFitsIsNotChosenOverTheBlockedOnes) {
+    Submit({LongRequest(MakeRequestSpec("a", /*num_pages=*/1, /*start=*/1)),
+            LongRequest(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/5000)),
+            LongRequest(MakeRequestSpec("d", /*num_pages=*/2, /*start=*/15000))});
+    PrefillAndDecode({"a", "b", "d"}, /*rounds=*/3);
+    Submit({LongRequest(MakeRequestSpec("c", /*num_pages=*/1, /*start=*/10000))});
+    const ExecutionPlan admit_plan = PlanOnce();
+    const ForwardBatch* admitted = FindForwardBatch(admit_plan);
+    ASSERT_NE(admitted, nullptr);
+    ASSERT_EQ(admitted->request_ids, std::vector<std::string>{"c"});
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 1);
+    SendForwardDone("c", {42});
+
+    // a takes the free block, c runs on its fresh headroom, b and d block.
+    // Neither blocked image fits the pool (three blocks each); c's would (two
+    // blocks), but this round has scheduled c, so it is not offered -- an
+    // image of c could not be taken before the round runs, and the round
+    // after schedules c again. The abort tier takes d, the newest offered
+    // resident, and b runs on its blocks.
+    const ExecutionPlan blocked_plan = PlanOnce();
+    ASSERT_EQ(blocked_plan.aborts.size(), 1u);
+    EXPECT_EQ(blocked_plan.aborts.front().request_id, "d");
+    EXPECT_EQ(blocked_plan.aborts.front().reason, AbortReason::kImageDoesNotFit);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
+    ASSERT_NE(blocked, nullptr);
+    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"a", "c", "b"}));
 }
 
 // No snapshot pool: no image ever fits, so a capacity block always ends in the
@@ -1419,35 +1539,12 @@ protected:
     }
 };
 
-TEST_F(ScheduledVictimNoPoolSuite, TheAbortTierWaitsForTheNewestResidentRatherThanAbortingAnOlderOne) {
-    std::vector<RequestSpec> specs;
-    for (const auto& [id, start] : {std::pair{"a", 1}, std::pair{"b", 5000}, std::pair{"d", 15000}}) {
-        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/1, start);
-        spec.max_new_tokens = 12000;
-        specs.push_back(spec);
-    }
-    Submit(specs);
-    const ExecutionPlan prefill_plan = PlanOnce();
-    const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
-    ASSERT_NE(prefill, nullptr);
-    ASSERT_EQ(prefill->request_ids.size(), 3u);
-    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 3);
-    for (const char* id : {"a", "b", "d"}) {
-        SendForwardDone(id, {42});
-    }
-    const std::vector<std::int32_t> decode_result(1024, 7);
-    for (std::int32_t round = 0; round < 3; ++round) {
-        const ExecutionPlan decode_plan = PlanOnce();
-        const ForwardBatch* decode = FindForwardBatch(decode_plan);
-        ASSERT_NE(decode, nullptr) << "decode round " << round;
-        ASSERT_EQ(decode->request_ids.size(), 3u) << "decode round " << round;
-        for (const char* id : {"a", "b", "d"}) {
-            SendForwardDone(id, decode_result);
-        }
-    }
-    RequestSpec late = MakeRequestSpec("c", /*num_pages=*/1, /*start=*/10000);
-    late.max_new_tokens = 12000;
-    Submit({late});
+TEST_F(ScheduledVictimNoPoolSuite, TheAbortTierTakesTheNewestResidentWhosePagesCanFreeThisRound) {
+    Submit({LongRequest(MakeRequestSpec("a", /*num_pages=*/1, /*start=*/1)),
+            LongRequest(MakeRequestSpec("b", /*num_pages=*/1, /*start=*/5000)),
+            LongRequest(MakeRequestSpec("d", /*num_pages=*/1, /*start=*/15000))});
+    PrefillAndDecode({"a", "b", "d"}, /*rounds=*/3);
+    Submit({LongRequest(MakeRequestSpec("c", /*num_pages=*/1, /*start=*/10000))});
     const ExecutionPlan admit_plan = PlanOnce();
     const ForwardBatch* admitted = FindForwardBatch(admit_plan);
     ASSERT_NE(admitted, nullptr);
@@ -1456,16 +1553,102 @@ TEST_F(ScheduledVictimNoPoolSuite, TheAbortTierWaitsForTheNewestResidentRatherTh
     SendForwardDone("c", {42});
 
     // a, b and d have spent their headroom block; c, the newest resident, runs
-    // on its fresh one. a takes the free block, b and d block. No image fits,
-    // so the abort tier picks the newest resident, c, which this round has
-    // scheduled: retraction waits for it rather than aborting d, the newest of
-    // the blocked requests, which has streamed thousands of tokens.
+    // on its fresh one. a takes the free block, b and d block. The abort tier
+    // takes the newest resident it is offered: c is scheduled this round, so
+    // its pages cannot free in it, and waiting for it would idle b and d for
+    // as long as its headroom lasts -- only for c to block and be aborted
+    // then, its reserve not covering its generation. d is aborted now, and b
+    // runs on its blocks.
     const ExecutionPlan blocked_plan = PlanOnce();
-    EXPECT_TRUE(blocked_plan.aborts.empty());
-    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    ASSERT_EQ(blocked_plan.aborts.size(), 1u);
+    EXPECT_EQ(blocked_plan.aborts.front().request_id, "d");
+    EXPECT_EQ(blocked_plan.aborts.front().reason, AbortReason::kImageDoesNotFit);
     const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
     ASSERT_NE(blocked, nullptr);
-    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"a", "c"}));
+    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"a", "c", "b"}));
+
+    // The three keep decoding: nothing is left waiting on anyone.
+    for (std::int32_t round = 0; round < 2; ++round) {
+        for (const char* id : {"a", "c", "b"}) {
+            SendForwardDone(id, kDecodeStep);
+        }
+        const ExecutionPlan decode_plan = PlanOnce();
+        EXPECT_TRUE(decode_plan.aborts.empty()) << "decode round " << round;
+        const ForwardBatch* decode = FindForwardBatch(decode_plan);
+        ASSERT_NE(decode, nullptr) << "decode round " << round;
+        EXPECT_EQ(decode->request_ids, (std::vector<std::string>{"a", "b", "c"})) << "decode round " << round;
+    }
+}
+
+// Eight 1024-token decode steps spend the round's token budget.
+class FullRoundRetractionSuite : public ConsumedHeadroomRetractionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ConsumedHeadroomRetractionSuite::MakeConfig();
+        // Twenty usable blocks: ten requests hold a prompt block and a
+        // headroom block each.
+        cfg.device_allocator.total_pages = 21;
+        cfg.max_batch_size = 10;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+        };
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(FullRoundRetractionSuite, ARoundWithNoRoomForTheGrantRetractsNobody) {
+    // Submission order is the order the decode phase tries them in.
+    std::vector<std::string> ids{"b"};
+    for (std::int32_t i = 1; i <= 8; ++i) {
+        ids.push_back("r" + std::to_string(i));
+    }
+    ids.push_back("f");
+    std::vector<RequestSpec> specs;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        RequestSpec spec = MakeRequestSpec(ids[i], /*num_pages=*/1, /*start=*/1 + 5000 * static_cast<std::int32_t>(i));
+        spec.max_new_tokens = 12000;
+        specs.push_back(spec);
+    }
+    Submit(specs);
+    std::size_t prefilled = 0;
+    while (prefilled < ids.size()) {
+        const ExecutionPlan prefill_plan = PlanOnce();
+        const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
+        ASSERT_NE(prefill, nullptr);
+        ASSERT_FALSE(prefill->request_ids.empty());
+        ASSERT_EQ(prefill->NumExtends(), prefill->request_ids.size()) << "every prompt prefills whole";
+        for (const std::string& id : prefill->request_ids) {
+            SendForwardDone(id, {42});
+            ++prefilled;
+        }
+    }
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    // b and the next seven fill each round's budget. b accepts a whole step
+    // each round and spends its headroom in three; the others accept a token
+    // at a time and never need another block.
+    const std::vector<std::string> first_eight(ids.begin(), ids.begin() + 8);
+    for (std::int32_t round = 0; round < 3; ++round) {
+        const ExecutionPlan decode_plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(decode_plan);
+        ASSERT_NE(decode, nullptr) << "decode round " << round;
+        ASSERT_EQ(decode->request_ids, first_eight) << "decode round " << round;
+        for (const std::string& id : first_eight) {
+            SendForwardDone(id, id == "b" ? std::vector<std::int32_t>(1024, 7) : std::vector<std::int32_t>{7});
+        }
+    }
+
+    // b blocks; r1 to r8 spend the round's budget. f, never tried, ties with
+    // b on releasable blocks and has streamed least -- the top-ranked victim,
+    // and quiescent -- but no grant can join a round with no budget left:
+    // retracting f would serve nobody, so nothing is retracted.
+    const ExecutionPlan blocked_plan = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(FindSnapshotStore(blocked_plan), nullptr);
+    EXPECT_TRUE(blocked_plan.aborts.empty());
+    const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
+    ASSERT_NE(blocked, nullptr);
+    EXPECT_EQ(blocked->request_ids, std::vector<std::string>(ids.begin() + 1, ids.begin() + 9));
 }
 
 class FusedRetractionL2TestSuite : public CapacityBlockSuite {
