@@ -1121,10 +1121,14 @@ computes, the rest reuse, and nothing outlives its forward; the
 drafter's in-loop seq_lens edits are not a new forward and leave the share
 alone — the drafter itself
 hands each draft step the top-k it reuses (or clears it) through the draft
-backend, and starts from the target backend's. `ForwardContext` carries
-none of this. What unification still can NOT test: mempool reuse and
-hostfunc semantics — the e2e regression matrix keeps graph-on and graph-off
-configurations for this reason.
+backend, and starts from the target backend's. The MHA leaf's decode
+split schedule (`decode_schedule_buf`, read by gfx950 verify) is the same
+kind of memo: its decode refresh marks it stale, the first verify layer
+computes it from the forward's lengths (inside the graph under replay),
+and the rest reuse it. `ForwardContext` carries none of this. What
+unification still can NOT test: mempool reuse and hostfunc semantics — the
+e2e regression matrix keeps graph-on and graph-off configurations for this
+reason.
 
 ## Backend package layout
 

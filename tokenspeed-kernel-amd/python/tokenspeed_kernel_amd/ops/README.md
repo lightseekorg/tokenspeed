@@ -1250,6 +1250,8 @@ attention uses its own split kernels.
   x row blocks) and `max_seqlen_k`, capped at 64 splits. The count does not
   read device-resident lengths, so graphs pass the maximum context as
   `max_seqlen_k` and replay for any batch composition.
+- Optionally, full attention takes a `schedule` from `mha_decode_schedule`
+  instead (see Balanced split schedule).
 
 #### Algorithm
 
@@ -1288,6 +1290,41 @@ for the prefetches before the epilogue reuses their LDS.
 
 Every split stores its partial and LSE (-inf for rows without keys in it), so
 the reduce does not read cache lengths.
+
+#### Balanced split schedule
+
+Under a captured graph the split count above follows the padded batch, so a
+few long requests among short ones leave CUs idle. For calls whose shape
+takes a balanced schedule (`mha_decode_takes_schedule`, from
+`prefers_gluon_mha_decode_balanced_gfx950`), the caller computes one per step
+with `mha_decode_schedule` (`gluon_mha_decode_schedule_gfx950`) and passes it
+to `mha_decode_with_kvcache`, which then selects
+`gluon_mha_decode_balanced_gfx950` and its reduce,
+`gluon_mha_decode_balanced_reduce_gfx950`.
+
+- Full attention only. Every split covers the same number of pages, the
+  fewest whose work items fit 512 (two per CU), at least 2 and at most 128
+  splits per request; a padding request takes one. The grid holds at most
+  max(512, one per row block) items; positions past the last item exit.
+- A work-group finds its request by comparing its slot with 64 requests' first
+  slots per round of vector loads, and items run in XCD-contiguous order
+  (`_remap_xcd`), so the row blocks of a slot, which read the same pages, share
+  one XCD's L2. Splits are bounded by the live `cache_seqlens` and a request's
+  last split runs to its end, so a schedule older than the lengths (a drafter's
+  steps) still covers every key.
+- Page loads pipeline two deep in every split of at least one pipeline
+  iteration.
+- The reduce finds a row's partials from its request's first slot and split
+  count, stored next to each other, and loads them 16 bytes per lane in one
+  tile of 16 or 64 splits. A row without keys merges to its sink alone.
+- The choice is by shape only: calls whose rows of one KV head take a
+  multi-wave work-group (e.g. speculative verify) take the schedule. There it
+  matched or beat the split grid at every batch (1-64 requests) and length
+  (8k-190k, uniform and mixed) measured on MI355X, counting the 4-7 us
+  schedule once per step; one-wave work-groups (plain decode) lost up to
+  ~20% on uniform batches of 4 or more requests and keep the split grid.
+  Batch sizes and lengths are runtime values: the kernels compile once per
+  layer shape.
 
 ### gfx950 MHA prefill
 

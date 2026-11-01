@@ -280,6 +280,69 @@ def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
                 run(queries, 2100)
 
 
+# FP8 caches run their own variants.
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize("width", [1, 8], ids=["decode", "verify"])
+def test_mha_decode_balanced_batch_size(dtype, width):
+    """The balanced decode's schedule, split and reduce kernels take the batch
+    as runtime values: no batch size compiles a new variant."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import decode
+
+    heads, kv_heads, dim, page = 16, 2, 64, 64
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+    k_cache = torch.randn(
+        200, page, kv_heads, dim, device=DEVICE, generator=generator
+    ).to(dtype)
+    v_cache = torch.randn(
+        200, page, kv_heads, dim, device=DEVICE, generator=generator
+    ).to(dtype)
+    # A fixed table width keeps the table stride out of the sweep.
+    table_width = 64
+
+    def run(batch):
+        q = torch.randn(batch * width, heads, dim, device=DEVICE).to(dtype)
+        cache_seqlens = torch.randint(
+            width,
+            table_width * page,
+            (batch,),
+            dtype=torch.int32,
+            device=DEVICE,
+            generator=generator,
+        )
+        schedule = decode.launch_gluon_mha_decode_schedule_gfx950(
+            q, k_cache, cache_seqlens, max_seqlen_q=width, window_left=-1, out=None
+        )
+        decode.launch_gluon_mha_decode_balanced_gfx950(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=torch.randint(
+                1,
+                200,
+                (batch, table_width),
+                dtype=torch.int32,
+                device=DEVICE,
+                generator=generator,
+            ),
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=1 << 20,
+            max_seqlen_q=width,
+            schedule=schedule,
+        )
+
+    run(1)
+    run(16)
+    with assert_no_triton_compile(
+        decode.gluon_mha_decode_schedule_gfx950,
+        decode.gluon_mha_decode_balanced_gfx950,
+        decode.gluon_mha_decode_balanced_reduce_gfx950,
+    ):
+        for batch in (3, 5, 7, 12, 24, 40, 70):
+            run(batch)
+
+
 def test_mxfp8_gemm_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
 

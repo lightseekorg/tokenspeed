@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.mha import (
+    mha_decode_schedule,
+    mha_decode_takes_schedule,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,
@@ -112,7 +114,16 @@ class MHADecodeMetadata:
 
 
 class MHAAttnBackend(PagedAttentionBackend):
-    """Standard MHA leaf routed through tokenspeed_kernel attention APIs."""
+    """Standard MHA leaf routed through tokenspeed_kernel attention APIs.
+
+    Full-attention decode calls whose shape takes a split schedule
+    (``mha_decode_takes_schedule``, e.g. speculative verify on gfx950) read
+    one schedule per forward from ``decode_schedule_buf``. Like the layers'
+    shared sparse top-k, the first such layer computes it in place from the
+    step's lengths (``mha_decode_schedule``), inside the captured graph
+    under replay, and the rest reuse it; each decode metadata build marks it
+    stale.
+    """
 
     # Every kernel call site forwards layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
@@ -154,11 +165,25 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+        # The per-forward split schedule (see the class docstring), whether
+        # this forward's first schedule-reading layer has yet to compute it,
+        # and which (layer, query rows per request) calls read it.
+        self.decode_schedule_buf: torch.Tensor | None = None
+        self._schedule_stale = True
+        self._layer_reads_schedule: dict[tuple[int, int], bool] = {}
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self.forward_decode_metadata = None
         self.forward_extend_metadata = None
+        self.decode_schedule_buf = None
+
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        super().init_cuda_graph_state(max_bs)
+        # One header row and one row per request (mha_decode_schedule).
+        self.decode_schedule_buf = torch.zeros(
+            (self.seq_lens_buf.shape[0] + 1, 2), dtype=torch.int32, device=self.device
+        )
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         # Decode metadata exists only in decode rounds.
@@ -319,6 +344,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
             self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
+        self._schedule_stale = True
 
     def decode_buffer_targets(
         self, bs: int
@@ -336,6 +362,61 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> None:
         del seq_lens, num_extends
         self.forward_decode_metadata = self._decode_views(bs)
+        self._schedule_stale = True
+
+    def _decode_schedule(
+        self,
+        layer: PagedAttention,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        sinks: torch.Tensor | None,
+        scale_kwargs: dict,
+    ) -> torch.Tensor | None:
+        """The split schedule this layer's decode call reads, or None for
+        the kernel's default split. Only the target's full-attention layers
+        of the leaf's own shape read it; drafts keep the default, as their
+        in-round length updates rebuild no metadata."""
+        if self.is_draft or layer.sliding_window_size >= 0:
+            return None
+        key = (layer.layer_id, max_seqlen_q)
+        reads = self._layer_reads_schedule.get(key)
+        if reads is None:
+            reads = (
+                q.shape[1] == self.tp_q_head_num
+                and k_cache.shape[2] == self.tp_kv_head_num
+                and max_seqlen_q == self.verify_floor
+                and mha_decode_takes_schedule(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    max_seqlen_q=max_seqlen_q,
+                    logit_cap=layer.logit_cap,
+                    sinks=sinks,
+                    solution=self.kernel_solution,
+                    **scale_kwargs,
+                )
+            )
+            self._layer_reads_schedule[key] = reads
+        if not reads:
+            return None
+        if self._schedule_stale:
+            mha_decode_schedule(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_q=max_seqlen_q,
+                logit_cap=layer.logit_cap,
+                sinks=sinks,
+                out=self.decode_schedule_buf,
+                solution=self.kernel_solution,
+                **scale_kwargs,
+            )
+            self._schedule_stale = False
+        return self.decode_schedule_buf
 
     # ------------------------------------------------------------------
     # Forward
@@ -369,6 +450,17 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
+        sinks = kwargs.get("sinks")
+        schedule = self._decode_schedule(
+            layer,
+            q,
+            k_cache,
+            v_cache,
+            metadata.seq_lens,
+            max_seqlen_q,
+            sinks,
+            scale_kwargs,
+        )
         output = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -377,9 +469,10 @@ class MHAAttnBackend(PagedAttentionBackend):
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
-            sinks=kwargs.get("sinks"),
+            sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
+            schedule=schedule,
             solution=self.kernel_solution,
             **scale_kwargs,
         )
