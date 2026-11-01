@@ -528,6 +528,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             expert_start=expert_start,
             out=out,
             runtime_rows=False,
+            deterministic_order=False,
         )
         inter = torch.empty(
             (int(sorted_ids.shape[0]), i_dim),
@@ -1876,6 +1877,7 @@ def _maybe_gluon_package_mxfp4_prefill(
             sort_block_m,
             use_minimum_route_chunks=config.use_minimum_route_chunks,
             runtime_rows=config.runtime_rows,
+            deterministic_order=False,
             expert_start=expert_start,
             out=out,
         )
