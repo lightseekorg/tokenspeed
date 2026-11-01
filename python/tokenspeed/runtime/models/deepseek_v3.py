@@ -789,6 +789,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
+            self.fused_qkv_a_proj_with_mqa = None
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -2419,7 +2420,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             reduce_attn_results=False,
         )
 
-        if hasattr(self.self_attn, "fused_qkv_a_proj_with_mqa"):
+        if self.self_attn.fused_qkv_a_proj_with_mqa is not None:
             q_lora_rank = getattr(config, "q_lora_rank", 0) or 0
             kv_lora_rank = getattr(config, "kv_lora_rank", 512)
             qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 64)

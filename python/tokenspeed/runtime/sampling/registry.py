@@ -45,6 +45,45 @@ def _get_default_backend_name() -> str:
     return "greedy"
 
 
+def _is_sampling_backend_available(backend_name: str) -> bool:
+    """Check if a sampling backend is available."""
+    from tokenspeed_kernel.platform import current_platform
+    
+    platform = current_platform()
+    
+    if backend_name == "greedy":
+        return True
+    if backend_name == "flashinfer":
+        if not platform.is_nvidia:
+            return False
+        try:
+            from tokenspeed.runtime.sampling.backends import flashinfer
+            return True
+        except ImportError:
+            return False
+    if backend_name == "flashinfer_full":
+        if not platform.is_nvidia:
+            return False
+        try:
+            from tokenspeed.runtime.sampling.backends import flashinfer_full
+            return True
+        except ImportError:
+            return False
+    if backend_name == "triton":
+        return True
+    if backend_name == "triton_full":
+        return True
+    if backend_name == "ascend_full":
+        if not platform.is_npu:
+            return False
+        try:
+            from tokenspeed.runtime.sampling.backends import ascend_full
+            return True
+        except ImportError:
+            return False
+    return False
+
+
 def _resolve_backend_name(server_args: ServerArgs) -> str:
     return server_args.sampling_backend or _get_default_backend_name()
 

@@ -141,6 +141,7 @@ def _recipe(device):
             max_total_tokens=1024,
             disaggregation_mode="null",
             enable_prefix_caching=True,
+            speculative_algorithm=None,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=40,

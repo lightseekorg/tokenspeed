@@ -691,7 +691,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
     ) -> bool:
         if self.qkv_parallel is not None:
             return False
-        projection = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        projection = self.fused_qkv_a_proj_with_mqa
         if projection is None:
             return False
         blocks, weight_a, weight_b, eps, scratch_a, scratch_b = args
