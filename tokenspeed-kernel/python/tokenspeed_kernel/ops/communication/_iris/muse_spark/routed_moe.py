@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sanitize_lamport_bf16,
     _iris_sync_peers,
     _iris_wait_lamport_peers,
+    _iris_wait_lamport_slots,
 )
 
 
@@ -303,3 +304,116 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
     # Finish every subgroup's write-through stores before returning.
     WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.barrier()
+
+
+@gluon.jit(do_not_specialize=["rows"])
+def iris_fused_routed_rmsnorm_sum_lamport_allgather(
+    routes,
+    route_weights,
+    norm_weight,
+    output,
+    region,
+    epochs,
+    regions,
+    rows,
+    RANK: gl.constexpr,
+    WIDTH: gl.constexpr,
+    EPS: gl.constexpr,
+    WEIGHT_OFFSET: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
+):
+    """Normalize and sum each owned token's routes, then gather every token's sum.
+
+    Rank r owns tokens [r * L, (r + 1) * L), L = ceil(rows / WORLD_SIZE);
+    routes holds their complete routes as [L, 8, WIDTH] and route_weights is
+    [rows, 8]. Launch one eight-subgroup program per owned token. Its routed
+    RMSNorm and weighted sum follow the portable routed sum's operation
+    order and agree with it within BF16 rounding (FMA contraction and
+    reduction order). Subgroup w then pushes features [512w, 512w + 512)
+    to every peer through the Lamport one-shot mailbox, whose 512-element
+    tile index and stage it shares with the other one-shot uses, and polls
+    the peers' tiles on its own. A padding token pushes zeros, so every rank
+    waits on every peer. Writes BF16 [rows, WIDTH] output.
+    """
+    WORLD_SIZE: gl.constexpr = len(regions)
+    gl.static_assert(WIDTH == 4096)
+    gl.static_assert(gl.num_warps() == 8)
+    local_row = gl.program_id(0)
+    local_rows = gl.cdiv(rows, WORLD_SIZE)
+    token = RANK * local_rows + local_row
+    # The portable routed norm's eight-subgroup row: lane l of subgroup w
+    # holds features 512w + 8l + [0, 8).
+    layout: gl.constexpr = gl.BlockedLayout([8], [64], [8], [0])
+    columns = gl.arange(0, WIDTH, layout=layout)
+    weight = gl.load(norm_weight + columns).to(gl.float32)
+    weight = (weight + WEIGHT_OFFSET).to(gl.bfloat16).to(gl.float32)
+    combined = gl.zeros((WIDTH,), gl.float32, layout=layout)
+    if token < rows:
+        for slot in gl.static_range(8):
+            values = gl.load(routes + (local_row * 8 + slot) * WIDTH + columns).to(
+                gl.float32
+            )
+            values = values * weight
+            variance = gl.sum(values * values, 0) / WIDTH
+            inv_rms = gl.rsqrt(variance + EPS)
+            route_weight = gl.load(route_weights + token * 8 + slot).to(gl.float32)
+            combined += (values * inv_rms) * route_weight
+    # The same ownership as [WIDTH / 8 packs, 8]: pack p is lane p % 64 of
+    # subgroup p // 64.
+    packed: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [8, 1], [1, 0])
+    pack = gl.arange(0, WIDTH // 8, layout=gl.SliceLayout(1, packed))
+    element = gl.arange(0, 8, layout=gl.SliceLayout(0, packed))
+    features = pack[:, None] * 8 + element[None, :]
+    local = gl.convert_layout(
+        gl.reshape(
+            _iris_sanitize_lamport_bf16(combined.to(gl.bfloat16)), [WIDTH // 8, 8]
+        ),
+        packed,
+    )
+    tiles = local_row * (WIDTH // 512) + pack // 64
+    stage = gl.load(epochs + tiles).to(gl.uint32) % 3
+    offsets = (
+        (stage * (WORLD_SIZE * MAX_ELEMENTS)).to(gl.int32)[:, None]
+        + local_row * WIDTH
+        + features
+    )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        address = _iris_group_heap_base((RANK + delta) % WORLD_SIZE, regions)
+        target = gl.multiple_of(address.to(gl.pointer_type(gl.bfloat16)), 16)
+        gl.amd.cdna4.buffer_store(
+            local,
+            target,
+            RANK * MAX_ELEMENTS + offsets,
+            cache=PEER_SIGNAL_STORE_CACHE,
+        )
+    gl.amd.cdna4.buffer_store(
+        local, output, token * WIDTH + features, mask=(features >= 0) & (token < rows)
+    )
+    received = _iris_wait_lamport_slots(
+        region, offsets, pack >= 0, RANK, WORLD_SIZE, MAX_ELEMENTS, packed
+    )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        peer_token = ((RANK + delta) % WORLD_SIZE) * local_rows + local_row
+        gl.amd.cdna4.buffer_store(
+            received[delta - 1],
+            output,
+            peer_token * WIDTH + features,
+            mask=(features >= 0) & (peer_token < rows),
+        )
+    sentinel = (
+        gl.where(offsets % 2 == 0, 0, 0x8000)
+        .to(gl.uint16)
+        .to(gl.bfloat16, bitcast=True)
+    )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        gl.amd.cdna4.buffer_store(
+            sentinel,
+            region,
+            ((RANK + delta) % WORLD_SIZE) * MAX_ELEMENTS + offsets,
+            cache=".wt",
+        )
+    # Finish each subgroup's mailbox reset before it advances its tile's stage.
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    gl.store(epochs + tiles, ((stage + 1) % 3).to(gl.int32), mask=pack % 64 == 0)
