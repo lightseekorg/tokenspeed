@@ -277,7 +277,6 @@ def _backend(
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=4096,
         max_bs=8,
         is_draft=False,
@@ -457,7 +456,6 @@ def _super_attn_config(tp: int, kv_dtype: torch.dtype, *, is_draft: bool, device
         kv_cache_dtype=kv_dtype,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=128,
         kernel_page_size=64,
         context_len=16384,
         max_bs=2,
@@ -479,12 +477,13 @@ def _super_cache_recipe(
     return cache_recipe(
         "mamba2",
         server_args=SimpleNamespace(
-            prefix_granularity=128,
             max_total_tokens=None,
             speculative_num_draft_tokens=draft_tokens,
             speculative_eagle_topk=topk,
+            speculative_draft_tree=with_draft and topk > 1,
             enable_replay_ssm=with_draft,
             kv_offload_config=None,
+            mamba_ssm_dtype="float32",
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=SimpleNamespace()),
@@ -811,6 +810,54 @@ def test_mtp_head_refuses_patterns_its_narrowing_cannot_serve(blocks: list[str])
         NemotronHForCausalLMNextN(config, Mapping(rank=0, world_size=1))
 
 
+@pytest.mark.parametrize("mtp_quantized", [False, True])
+def test_mtp_head_follows_the_checkpoint_quantization(mtp_quantized: bool):
+    """Nemotron 3 Super's export names no MTP module and left the head in BF16;
+    a later export quantizes its experts."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        ModelOptMixedConfig,
+    )
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    layers = {"backbone.layers.2.mixer.experts": "NVFP4"}
+    if mtp_quantized:
+        layers["mtp.layers.1.mixer.experts"] = "NVFP4"
+    quant_config = ModelOptMixedConfig(quantized_layers=layers)
+    assert quant_config.quantizes_any("mtp.") == mtp_quantized
+    config = _config(
+        hidden_size=256,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["attention", "moe"],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=256,
+        moe_shared_expert_intermediate_size=256,
+    )
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        head = NemotronHForCausalLMNextN(
+            config, Mapping(rank=0, world_size=1), quant_config
+        )
+    expected = "nvfp4" if mtp_quantized else "unquant"
+    assert head.layers[1].mixer.experts._quant_kind == expected
+
+
+def test_mtp_head_shares_the_target_head_module():
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    head = NemotronHForCausalLMNextN.__new__(NemotronHForCausalLMNextN)
+    torch.nn.Module.__init__(head)
+    head.embed_tokens = torch.nn.Embedding(8, 4)
+    head.lm_head = torch.nn.Linear(4, 8, bias=False)
+    embed = torch.nn.Parameter(torch.ones(8, 4))
+    target_head = torch.nn.Linear(4, 8, bias=False)
+    head.set_embed_and_head_module(embed, target_head)
+    assert head.embed_tokens.weight is embed
+    assert head.lm_head is target_head
+    assert head.get_embed_and_head() == (embed, target_head.weight)
+
+
 def test_static_fp8_scale_names_only_per_tensor_static_linears():
     from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
     from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -840,7 +887,7 @@ def test_static_fp8_scale_names_only_per_tensor_static_linears():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mamba2_decode_reads_the_projection_view_in_place():
     """The flag that skips the decode copy: conv and state update read strided rows."""
-    from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+    from tokenspeed_kernel.ops.conv import (
         causal_conv1d_update,
     )
 
@@ -1164,6 +1211,54 @@ def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     assert torch.equal(out_prequantized, out)
 
 
+def test_mtp_head_takes_its_checkpoint_kv_cache_scales_at_startup_only(
+    tmp_path, monkeypatch
+):
+    from safetensors.torch import save_file
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    from tokenspeed.runtime.configs.load_config import LoadConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.model_loader import loader
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    config = _config(
+        hidden_size=256,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["attention", "moe"],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=256,
+        moe_shared_expert_intermediate_size=256,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        head = NemotronHForCausalLMNextN(config, mapping)
+    attn = head.layers[0].mixer.attn
+    scales = {
+        "mtp.layers.0.mixer.k_proj.k_scale": torch.tensor([0.0614]),
+        "mtp.layers.0.mixer.v_proj.v_scale": torch.tensor([0.0513]),
+    }
+    # A raw update stream (the Model Updater SDK) may carry them; it changes nothing.
+    head.load_weights(list(scales.items()))
+    assert attn.fp8_kv_scales is None
+
+    save_file(scales, str(tmp_path / "model.safetensors"))
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: head)
+    loader.DefaultModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=mapping,
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    k, v = (t.item() for t in scales.values())
+    assert attn.fp8_kv_scales == FP8TensorScales(k, v)
+
+
 def test_mtp_checkpoint_names_map_onto_the_head():
     from tokenspeed.runtime.models.nemotron_h_nextn import _mtp_param_name
 
@@ -1177,6 +1272,87 @@ def test_mtp_checkpoint_names_map_onto_the_head():
     assert _mtp_param_name("mtp.layers.1.mixer.gate.weight") == (
         "layers.1.mixer.gate.weight"
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the BF16 squared-ReLU experts run on SM100-class GPUs",
+)
+def test_eagle_taps_are_the_full_stream_after_each_named_block(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An EAGLE draft trained on layer ids reads, per id i, the residual stream
+    after block i (unnormed): the input of block i + 1, or of the final norm."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.models.nemotron_h import NemotronHForCausalLM
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    mapping = Mapping(rank=0, world_size=1)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    # The engine's default --moe-backend (an earlier test may have left another one set).
+    monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.AUTO)
+    config = _config(
+        hybrid_override_pattern="EEEE",
+        hidden_size=256,
+        vocab_size=64,
+        n_routed_experts=16,
+        num_experts_per_tok=4,
+        moe_intermediate_size=128,
+        moe_shared_expert_intermediate_size=256,
+        moe_latent_size=128,
+        routed_scaling_factor=2.5,
+    )
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            model = NemotronHForCausalLM(config, mapping)
+    finally:
+        torch.set_default_dtype(old_dtype)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    for param in model.parameters():
+        scale = param.shape[-1] ** -0.5 if param.dim() > 1 else 1.0
+        param.data.copy_(torch.randn(param.shape, generator=g, device="cuda") * scale)
+    for block in model.model.layers:
+        block.mixer.experts.process_weights_after_loading(block.mixer.experts)
+    outputs = []
+    for block in model.model.layers:
+        block.register_forward_hook(
+            lambda module, args, out: outputs.append(
+                ([t.clone() for t in out[0] if t is not None], out[1].clone())
+            )
+        )
+    tokens = torch.tensor([3, 1, 4, 1, 5, 9, 2], device="cuda")
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=tokens.shape[0],
+        forward_mode=ForwardMode.EXTEND,
+        output_layout=None,
+    )
+    assert model.model(tokens, None, ctx)[1] is None
+
+    model.set_eagle3_layers_to_capture([0, 3])
+    outputs.clear()
+    _, taps = model.model(tokens, None, ctx)
+
+    def stream_after(block: int) -> torch.Tensor:
+        """The block's input residual plus its two partial outputs, rounded as
+        the fused add + norm rounds them."""
+        (routed, shared), residual = outputs[block]
+        return ((routed + shared).float() + residual.float()).bfloat16()
+
+    assert len(taps) == 2
+    assert torch.equal(taps[0], stream_after(0))
+    assert torch.equal(taps[1], stream_after(3))
+    # Not the stream entering the named block.
+    assert not torch.equal(taps[0], outputs[0][1])
 
 
 if __name__ == "__main__":

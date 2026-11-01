@@ -38,7 +38,7 @@ Covered:
   weight sharding are what is tested.
 
 The GPU test the stubs stand in for: a head-TP + ``--tp-batch-invariant attn``
-decode engine must produce the TP1 replicated engine's bits under the aok
+decode engine must produce the TP1 replicated engine's bits under the batch-invariant
 GEMMs (``--numerics rl-bitwise``).
 """
 

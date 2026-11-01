@@ -29,6 +29,7 @@ The remaining tests run without a checkpoint or network access.
 import copy
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -37,6 +38,11 @@ from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import BatchEncoding, PreTrainedTokenizerFast
 
 from tokenspeed.runtime.utils import hf_transformers_utils as hf
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 
 @pytest.fixture
@@ -62,7 +68,7 @@ def base_tokenizer():
 @pytest.mark.parametrize("effort", [None, "low", "high", "max", 1, 37, 100])
 def test_effort_is_forwarded_without_v4_filtering(base_tokenizer, effort):
     encoder = Mock(return_value="<bos> hello")
-    tokenizer = hf._wrap_deepseek_tokenizer(base_tokenizer, encoder, is_v41=True)
+    tokenizer = hf._wrap_deepseek_tokenizer(base_tokenizer, encoder)
     messages = [{"role": "user", "content": "hello"}]
     assert (
         tokenizer.apply_chat_template(
@@ -87,7 +93,7 @@ def test_tokenization_has_one_bos_and_preserves_backend(
 ):
     backend_state = base_tokenizer.backend_tokenizer.to_str()
     encoder = Mock(return_value="<bos> hello")
-    tokenizer = hf._wrap_deepseek_tokenizer(base_tokenizer, encoder, is_v41=True)
+    tokenizer = hf._wrap_deepseek_tokenizer(base_tokenizer, encoder)
     assert tokenizer.backend_tokenizer.to_str() == backend_state
     result = tokenizer.apply_chat_template(
         [{"role": "user", "content": "hello"}],
@@ -134,7 +140,7 @@ def test_tokenization_has_one_bos_and_preserves_backend(
 )
 def test_media_is_rejected_before_encoding(base_tokenizer, field, content):
     encoder = Mock(return_value="must not encode media")
-    tokenizer = hf._wrap_deepseek_tokenizer(base_tokenizer, encoder, is_v41=True)
+    tokenizer = hf._wrap_deepseek_tokenizer(base_tokenizer, encoder)
     with pytest.raises(ValueError, match="text-only"):
         tokenizer.apply_chat_template(
             [{"role": "user", field: content}], tools=None, tokenize=False
@@ -179,8 +185,6 @@ def test_remote_v41_uses_pinned_snapshot_encoder(base_tokenizer, tmp_path):
         patch.object(
             hf, "_load_deepseek_encode_messages", return_value=encoder
         ) as load_encoder,
-        patch.object(hf, "_load_deepseek_v4_encode_messages") as load_v4,
-        patch.object(hf, "cached_file") as cached,
     ):
         tokenizer = hf.get_tokenizer(
             repo,
@@ -204,8 +208,6 @@ def test_remote_v41_uses_pinned_snapshot_encoder(base_tokenizer, tmp_path):
     load_encoder.assert_called_once_with(
         os.path.join(snapshot, "encoding", "encoding.py")
     )
-    load_v4.assert_not_called()
-    cached.assert_not_called()
     lock.__enter__.assert_called_once()
     lock.__exit__.assert_called_once()
     assert tokenizer.name_or_path == repo
@@ -222,7 +224,6 @@ def test_missing_local_v41_encoder_does_not_fall_back(base_tokenizer, tmp_path):
     with (
         patch.object(hf.AutoTokenizer, "from_pretrained", return_value=base_tokenizer),
         patch.object(hf, "snapshot_download") as download,
-        patch.object(hf, "cached_file") as cached,
         pytest.raises(RuntimeError, match="encoding/encoding.py"),
     ):
         hf.get_tokenizer(
@@ -234,7 +235,6 @@ def test_missing_local_v41_encoder_does_not_fall_back(base_tokenizer, tmp_path):
             architectures=["DeepseekV41ForCausalLM"],
         )
     download.assert_not_called()
-    cached.assert_not_called()
 
 
 @pytest.fixture(scope="module")
@@ -261,7 +261,6 @@ def reference():
         hf._load_deepseek_encode_messages(
             os.path.join(directory, "encoding", "encoding.py")
         ),
-        is_v41=True,
     )
     hf.reconcile_special_tokens(tokenizer)
     assert raw.chat_template is None

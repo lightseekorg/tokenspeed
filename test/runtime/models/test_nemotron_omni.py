@@ -66,7 +66,13 @@ from tokenspeed.runtime.models.parakeet import (  # noqa: E402
     ParakeetEncoder,
     _relative_positions,
 )
-from tokenspeed.runtime.models.radio import RadioVisionModel  # noqa: E402
+from tokenspeed.runtime.models.radio import (  # noqa: E402
+    RadioEncoderCudaGraphAdapter,
+    RadioVisionModel,
+)
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (  # noqa: E402
+    EncoderForwardStepRunner,
+)
 
 DEVICE = "cuda"
 PATCH = 16
@@ -267,6 +273,46 @@ def test_config_round_trips_through_its_dict():
     assert (rebuilt.image_token_id, rebuilt.audio_token_id) == (18, 27)
 
 
+def test_config_reads_a_transformers_format_radio_config():
+    # The ViT shape stated beside args, no args.model_norm, and an MTP language model.
+    vision = {
+        "args": {
+            "model": "vit_huge_patch16_224",
+            "cls_token_per_teacher": True,
+            "teachers": [{"name": 0}, {"name": 1}, {"name": 2}],
+            "register_multiple": 10,
+        },
+        "hidden_size": 1280,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 16,
+        "mlp_ratio": 4.0,
+        "hidden_act": "gelu",
+        "qkv_bias": True,
+        "use_swiglu_ffn": False,
+        "layerscale_value": 1.0,
+        "num_cls_tokens": 3,
+        "num_registers": 7,
+        "layer_norm_eps": 1e-5,
+    }
+    config = NemotronHOmniConfig(
+        llm_config={"num_nextn_predict_layers": 1}, vision_config=vision
+    )
+    radio = config.vision_config
+    assert (radio.hidden_size, radio.num_prefix_tokens) == (1280, 10)
+    assert (radio.layer_norm_eps, radio.final_norm) == (1e-5, False)
+    assert config.vision_final_layernorm
+    assert not NemotronHOmniConfig(vision_config=vision).vision_final_layernorm
+    rebuilt = NemotronHOmniConfig.from_dict(config.to_dict())
+    assert rebuilt.to_dict() == config.to_dict()
+    for name, value in [("hidden_size", 1024), ("num_registers", 6)]:
+        with pytest.raises(ValueError, match=name):
+            RadioVisionConfig(**{**vision, name: value})
+    with pytest.raises(ValueError, match="layer_norm_eps"):
+        RadioVisionConfig(
+            **{**vision, "args": {**vision["args"], "layer_norm_eps": 1e-6}}
+        )
+
+
 def test_config_refuses_a_sound_config_without_the_encoder_shape():
     sound = {k: v for k, v in SOUND_CONFIG.items() if k != "conv_kernel_size"}
     with pytest.raises(ValueError, match="conv_kernel_size"):
@@ -343,7 +389,7 @@ def test_projector_is_norm_linear_squared_relu_linear():
 
 def _omni_glue(**modules) -> SimpleNamespace:
     """The model's feature methods bound to stand-in modules."""
-    model = SimpleNamespace(**modules)
+    model = SimpleNamespace(**{"vision_final_norm": None, **modules})
     model._project_vision = lambda features, grids: (
         nemotron_omni.NemotronH_Nano_Omni_Reasoning_V3._project_vision(
             model, features, grids
@@ -401,6 +447,90 @@ def test_image_feature_shuffles_each_image_on_its_own_grid():
         ]
         expected = projector(torch.cat(shuffled))
     assert torch.equal(out, expected)
+
+
+def test_image_feature_layer_norms_the_vit_output_before_shuffling():
+    radio = _radio(final_norm=False)
+    hidden = radio.blocks[0].norm1.normalized_shape[0]
+    projector = _projector(4 * hidden)
+    norm = torch.nn.LayerNorm(hidden, eps=1e-6).to(DEVICE, torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.normal_(1.0, 0.1)
+        norm.bias.normal_(std=0.1)
+    model = _omni_glue(visual=radio, vision_projector=projector, vision_final_norm=norm)
+    rows, cols = 4, 6
+    patches = torch.randn(rows * cols, 3 * PATCH * PATCH, device=DEVICE)
+    item = SimpleNamespace(feature=patches, image_grid_hw=torch.tensor([rows, cols]))
+    get_image_feature = nemotron_omni.NemotronH_Nano_Omni_Reasoning_V3.get_image_feature
+    with torch.no_grad():
+        out = get_image_feature(model, [item])
+        features = norm(radio.embed_images(patches, [(rows, cols)]))
+        expected = projector(nemotron_omni.pixel_shuffle(features, rows, cols))
+    assert torch.equal(out, expected)
+
+
+def _image_items(grids: list[tuple[int, int]]) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            feature=torch.randn(rows * cols, 3 * PATCH * PATCH, device=DEVICE),
+            image_grid_hw=torch.tensor([rows, cols]),
+        )
+        for rows, cols in grids
+    ]
+
+
+def test_radio_encoder_graph_matches_the_eager_encoder():
+    radio = _radio(final_norm=True)
+    # 44, 28 and 68 packed rows replay budget graphs; 148 exceeds them all and runs eagerly.
+    grids = [(10, 4), (4, 6), (12, 12), (8, 8)]
+    items = _image_items(grids)
+    adapter = RadioEncoderCudaGraphAdapter(
+        tower=radio,
+        post_encode=lambda features, grids: features,
+        max_image_tokens=12 * 12 + radio.num_prefix_tokens,
+        capture_tp_size=1,
+        capture_tp_group=None,
+    )
+    runner = EncoderForwardStepRunner(
+        adapter=adapter, budget_range=(32, 128), max_metadata_sequences_per_batch=8
+    )
+    with torch.no_grad():
+        out = runner(items)
+        expected = radio.embed_images(
+            torch.cat([item.feature for item in items]), grids
+        )
+    assert sorted(runner.budget_graphs) == [32, 64, 128]
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_image_encoder_graph_serves_get_image_feature():
+    config = _radio_config(final_norm=False, temporal_patch_size=2)
+    config.args["min_num_patches"] = 6
+    radio = _radio(final_norm=False)
+    projector = _projector(4 * radio.blocks[0].norm1.normalized_shape[0])
+    model = _omni_glue(
+        visual=radio,
+        vision_projector=projector,
+        omni_config=SimpleNamespace(vision_config=config),
+    )
+    omni = nemotron_omni.NemotronH_Nano_Omni_Reasoning_V3
+    wrappers = omni.make_encoder_cudagraph_wrappers(
+        model, Mapping(rank=0, world_size=1)
+    )
+    items = _image_items([(4, 6), (6, 2)])
+    with torch.no_grad():
+        out = wrappers["image_encoder"](items)
+        expected = omni.get_image_feature(model, items)
+    # One smallest image is 6 patches plus 4 prefix tokens.
+    assert wrappers["image_encoder"].encoder_output_token_budgets == [
+        10,
+        20,
+        40,
+        80,
+        160,
+        320,
+    ]
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
 
 def _parakeet_pair() -> tuple[ParakeetEncoder, HFParakeetEncoder]:
@@ -494,6 +624,78 @@ def test_audio_feature_encodes_every_clip_of_every_item_in_order():
     assert torch.equal(out, expected)
 
 
+def _mtp_omni_config() -> NemotronHOmniConfig:
+    """A small Nemotron-H Omni config whose language model has one MTP layer."""
+    llm = dict(
+        hybrid_override_pattern="M*E",
+        hidden_size=256,
+        mamba_num_heads=8,
+        mamba_head_dim=4,
+        n_groups=2,
+        ssm_state_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["attention", "moe"],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=256,
+        moe_shared_expert_intermediate_size=256,
+    )
+    return NemotronHOmniConfig(llm_config=llm)
+
+
+def test_mtp_draft_reads_the_language_model_mtp_tensors():
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+
+    with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
+        draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(
+            _mtp_omni_config(), Mapping(rank=0, world_size=1)
+        )
+    names = [
+        "language_model.mtp.layers.0.enorm.weight",
+        "language_model.backbone.norm_f.weight",
+        "vision_model.radio_model.model.blocks.0.norm1.weight",
+    ]
+    assert [draft.checkpoint_weight_name_filter(n) for n in names] == [
+        True,
+        False,
+        False,
+    ]
+    draft.load_weights([(name, torch.full((256,), 2.0)) for name in names])
+    assert torch.all(draft.enorm.weight == 2)
+
+
+def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+
+    config = _mtp_omni_config()
+    mapping = Mapping(rank=0, world_size=1)
+    with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
+        target = nemotron_omni.NemotronH_Omni_Reasoning_V3(
+            config,
+            mapping,
+            None,
+            is_multimodal_active=False,
+            mm_attention_backend=None,
+        )
+        draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(config, mapping)
+    scales = {
+        "language_model.backbone.layers.1.mixer.k_proj.k_scale": 0.25,
+        "language_model.backbone.layers.1.mixer.v_proj.v_scale": 0.5,
+        "language_model.mtp.layers.0.mixer.k_proj.k_scale": 0.125,
+        "language_model.mtp.layers.0.mixer.v_proj.v_scale": 0.0625,
+    }
+    scales = {name: torch.tensor([s]) for name, s in scales.items()}
+    target.load_kv_cache_scales(scales)
+    draft.load_kv_cache_scales(scales)
+    assert target.model.layers[1].mixer.attn.fp8_kv_scales == FP8TensorScales(0.25, 0.5)
+    assert draft.layers[0].mixer.attn.fp8_kv_scales == FP8TensorScales(0.125, 0.0625)
+
+
 def test_checkpoint_tensors_route_to_their_modules():
     calls = []
 
@@ -502,11 +704,12 @@ def test_checkpoint_tensors_route_to_their_modules():
 
     model = SimpleNamespace(
         visual=recorder("visual"),
+        vision_final_norm=torch.nn.LayerNorm(1),
         vision_projector=recorder("vision_projector"),
         audio_tower=recorder("audio_tower"),
         audio_projector=recorder("audio_projector"),
     )
-    tensor = torch.zeros(1)
+    tensor = torch.full((1,), 2.0)
     names = [
         "language_model.backbone.layers.0.mixer.in_proj.weight",
         "vision_model.radio_model.model.blocks.3.attn.qkv.weight",
@@ -515,6 +718,8 @@ def test_checkpoint_tensors_route_to_their_modules():
         "sound_projection.linear1.weight",
         "vision_model.radio_model.input_conditioner.norm_mean",
         "sound_encoder.encoder.feature_extractor.featurizer.fb",
+        "vision_model.summary_idxs",
+        "vision_projector.vision_final_layernorm.bias",
     ]
     route = nemotron_omni.NemotronH_Nano_Omni_Reasoning_V3._route_encoder_weights
     language = [name for name, _ in route(model, [(n, tensor) for n in names])]
@@ -525,8 +730,13 @@ def test_checkpoint_tensors_route_to_their_modules():
         ("audio_tower", "layers.1.conv.norm.running_var"),
         ("audio_projector", "linear1.weight"),
     ]
+    assert model.vision_final_norm.bias.item() == 2.0
     with pytest.raises(KeyError):
         list(route(model, [("unknown.weight", tensor)]))
+    # Without MTP layers the model builds no vision LayerNorm to load it into.
+    model.vision_final_norm = None
+    with pytest.raises(KeyError):
+        list(route(model, [("vision_projector.vision_final_layernorm.bias", tensor)]))
     # With the encoders disabled their tensors are skipped, not unknown names.
     text_only = SimpleNamespace(visual=None)
     language = [name for name, _ in route(text_only, [(n, tensor) for n in names])]

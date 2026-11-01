@@ -89,8 +89,19 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
         for arg, default in _parameters_with_defaults(node.args)
         if arg.arg == "sentinel"
     }
-    assert set(sentinels) == {"store_lamport_sentinel_128", "fragment_is_dirty"}
+    assert set(sentinels) == {
+        "store_lamport_sentinel_128",
+        "fragment_is_dirty",
+        "fragment_halves_dirty",
+    }
     assert all(default is None for default in sentinels.values())
+    # The early exit calls it with the sentinel alone, so no parameter may join it.
+    dirty_check = next(
+        node
+        for node in ast.walk(ast.parse(primitives))
+        if isinstance(node, ast.FunctionDef) and node.name == "fragment_is_dirty"
+    )
+    assert [arg.arg for arg in dirty_check.args.args] == ["packed", "sentinel"]
 
     early_exit = (
         package
@@ -121,8 +132,11 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     }
     assert "NEG_ZERO_F32_BITS" in tail_imports
     down = (package / "ops/moe/_cute_dsl/latent_down.py").read_text()
-    assert "sentinel=_DOWN_SENTINEL" in down
+    assert "sentinel: int = _DOWN_SENTINEL" in down
     assert "_DOWN_SENTINEL = 0x80008000" in down
+    # Only the NaN-payload sentinel may poll halves; -0 arming keeps word compares.
+    assert "HALF_POLLED_SENTINEL = 0xFFFFFFFF" in down
+    assert "poll_halves=sentinel == HALF_POLLED_SENTINEL" in down
 
 
 @pytest.mark.parametrize(

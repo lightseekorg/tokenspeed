@@ -462,7 +462,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             sampling_info.req_pool_indices, logits.shape[0]
         )
         logits = self._apply_penalties_and_bias(logits, req_pool_indices)
-        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
+        offsets_pool = self._prepare_sampling_offsets(sampling_info)
         sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -534,7 +534,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
+        offsets_pool = self._prepare_sampling_offsets(sampling_info)
         target_sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -548,6 +548,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             accept_token_num=accept_length,
             candidates=candidates.to(torch.int32),
             target_sampled=target_sampled,
+            write_rejected_targets=False,
         )
 
         accept_length += 1

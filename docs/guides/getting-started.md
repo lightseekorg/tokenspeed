@@ -7,8 +7,8 @@ runtime can start.
 
 - NVIDIA GPU host for the runner container below, or a ROCm 7.2 GPU host for the ROCm nightly wheels
 - Docker with GPU support for the runner container
-- enough shared memory for model serving
-- access to the model checkpoints you plan to serve
+- Enough shared memory for model serving
+- Access to the model checkpoints you plan to serve
 
 ## Start a runner container
 

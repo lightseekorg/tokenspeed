@@ -26,9 +26,18 @@ from collections.abc import Callable
 
 import torch
 
-from tokenspeed.runtime.utils import get_colorful_logger
 
-logger = get_colorful_logger(__name__)
+def request_vocab_mask(
+    vocab_mask: torch.Tensor, requests: slice, *, mask_width: int, prefill: bool
+) -> torch.Tensor:
+    """The grammar-mask rows of ``requests``' output rows.
+
+    ``vocab_mask`` is request-major, ``mask_width`` rows per request. A
+    prefill request owns one output row, its first mask row; a decode request
+    owns all ``mask_width``, one per verify column.
+    """
+    mask = vocab_mask[requests.start * mask_width : requests.stop * mask_width]
+    return mask[::mask_width] if prefill else mask
 
 
 @dataclasses.dataclass
@@ -58,12 +67,13 @@ class SamplingBatchInfo:
     # seeds / penalties / logit_bias / counts) against this index.
     req_pool_indices: torch.Tensor | None = None
 
-    # int32[pool_rows] — RuntimeStates.valid_cache_lengths, read-only
-    # reference. Sampling backends derive the per-request Philox offset
-    # from `valid_cache_lengths.index_select(0, req_pool_indices)`;
-    # carrying the reference rather than the gathered view keeps the
-    # index_select inside the captured graph.
+    # Borrowed execution inputs, not sampler-owned state. The frontier is
+    # pool-indexed; extend_lengths covers the leading prefill requests only.
+    # Remaining requests predict after their first input, even for verify N>1.
+    # The frontier is required by paths that consume sampling offsets; None
+    # is allowed only when the selected sampler does not use positions.
     valid_cache_lengths: torch.Tensor | None = None
+    extend_lengths: torch.Tensor | None = None
 
     # fp32[pool_rows, N, vocab] — RuntimeStates.draft_probs, read-only
     # reference, present only under --enable-speculative-sampling. Verify
@@ -96,6 +106,15 @@ class SamplingBatchInfo:
         def _slice(t):
             return t[s] if t is not None else None
 
+        extend_lengths = self.extend_lengths
+        if extend_lengths is not None:
+            start, stop, step = s.indices(self.req_pool_indices.numel())
+            extend_lengths = extend_lengths[
+                start : min(stop, extend_lengths.numel()) : step
+            ]
+            if extend_lengths.numel() == 0:
+                extend_lengths = None
+
         return dataclasses.replace(
             self,
             temperatures=_slice(self.temperatures),
@@ -103,6 +122,7 @@ class SamplingBatchInfo:
             top_ks=_slice(self.top_ks),
             min_ps=_slice(self.min_ps),
             req_pool_indices=_slice(self.req_pool_indices),
+            extend_lengths=extend_lengths,
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
             batch_row_offset=self.batch_row_offset + (s.start or 0),

@@ -36,15 +36,18 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_step,
     gdn_tree_verify_needs_node_states,
 )
+from tokenspeed_kernel.ops.attention.gdn.flashinfer import (
+    is_rubin_decode_available as is_rubin_available,
+)
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     fused_qkv_split_gdn_prefill,
     pack_gdn_projection,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
-
-from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+from tokenspeed_kernel.ops.conv import (
     causal_conv1d_update,
 )
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +55,12 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=180, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=180,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="PDL requires NVIDIA SM90+",
+)
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"
@@ -152,7 +160,7 @@ def forbid_cake_backend(request, monkeypatch):
 
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("steps", [1, 4])
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "flashinfer_rubin"])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("heads,value_heads", [(4, 12), (4, 8)])
 def test_gdn_chain_pdl_toggle(
@@ -165,6 +173,10 @@ def test_gdn_chain_pdl_toggle(
     restore_pdl,
     forbid_cake_backend,
 ):
+    if solution == "flashinfer_rubin" and (
+        not is_rubin_available() or steps != 1 or state_dtype != torch.bfloat16
+    ):
+        pytest.skip("Rubin GDN requires SM107, PR6604, T=1 and BF16 state")
     if solution == "flashinfer" and not flashinfer_gdn.is_decode_available():
         pytest.skip("FlashInfer GDN unavailable")
     torch.manual_seed(31)
@@ -282,7 +294,7 @@ def test_gdn_chain_pdl_toggle(
         with torch.cuda.graph(graph):
             actual = forward()
         names, edges = _graph_kernel_edges(graph)
-        stages = ("pack_gdn", "causal_conv1d", "gdn", "rms_norm")
+        stages = ("pack_gdn", "causal_conv1d", "gdn", "gated_rmsnorm")
         for stage in stages:
             assert any(stage in name for name in names.values()), names
         if steps > 1:

@@ -83,7 +83,6 @@ def _recipe(*, draft_layers: int, pd: bool):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=8192,
         max_bs=2,
         pd_disaggregation_enabled=pd,
@@ -178,15 +177,17 @@ def test_history_and_draft_fields_share_the_planned_arena(
 
     if pd:
         from tokenspeed.runtime.pd.cache_protocol import (
-            CacheTransferContract,
             build_arena_cache_transfer_contract,
         )
 
         contract, base_addr = build_arena_cache_transfer_contract(arena)
-        received = CacheTransferContract.from_wire_bytes(contract.to_wire_bytes())
-        for field in received.plan.fields:
+        for field in contract.plan.fields:
+            # Each field lands where its page 0 sits in the one arena.
+            assert contract.field_addresses[field.field_id] == base_addr + (
+                contract.plan.field_page_byte_offset(field.field_id, 0)
+            )
             for page_id in (0, 1, 2):
-                offset = received.plan.field_page_byte_offset(field.field_id, page_id)
+                offset = contract.plan.field_page_byte_offset(field.field_id, page_id)
                 assert (
                     base_addr + offset
                     == arena.field(field.field_id)[page_id].data_ptr()
@@ -222,11 +223,13 @@ def test_unsupported_cache_encoding_is_rejected_before_allocation():
         recipe.groups()
 
 
-def test_prefix_grain_cannot_flatten_strided_history_pages():
+def test_prefix_grain_holds_whole_history_pages_without_flattening_them():
     recipe = _recipe(draft_layers=0, pd=False)
-    recipe.attn_config = replace(recipe.attn_config, prefix_granularity=64)
-    with pytest.raises(ValueError, match="128"):
-        recipe.groups()
+    spans = [spec.block_granularity for spec, _ in recipe.groups()]
+    assert spans == [64, 32]
+    # A grain equal to a field's page size would request a flat view.
+    assert recipe.prefix_granularity == 128
+    assert all(recipe.prefix_granularity % span == 0 for span in spans)
 
 
 def test_pool_views_keep_layer_geometry_and_draft_ownership():

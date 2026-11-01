@@ -22,15 +22,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import functools
-import io
-import ipaddress
 import json
 import logging
 import os
-import pickle
 import random
 import re
 import resource
@@ -40,7 +36,6 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from functools import lru_cache
-from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -51,16 +46,17 @@ from typing import (
 
 import numpy as np
 import psutil
-import pybase64
 import torch
 import torch.distributed
 import torch.distributed as dist
-import zmq
 from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.metrics.func_timer import enable_func_timer
-from tokenspeed.runtime.utils.network import get_free_port
+from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.utils.network import (  # noqa: F401
+    get_free_port,
+    is_valid_ipv6_address,
+)
 
 if TYPE_CHECKING:
     import uvicorn
@@ -344,138 +340,6 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
-class PipelinedPyobjBroadcaster:
-    """Overlap empty Python-object notifications with useful work."""
-
-    def __init__(
-        self,
-        rank: int,
-        dist_group: torch.distributed.ProcessGroup | None = None,
-        src: int = 0,
-    ) -> None:
-        self.rank = rank
-        self.dist_group = dist_group
-        self.src = src
-        self._data = None
-        self._ready = torch.zeros(1, dtype=torch.long)
-        self._work = None
-
-    @property
-    def in_flight(self) -> bool:
-        return self._work is not None
-
-    def start(self, data: list[Any] | None) -> None:
-        self._data = data
-        if self.rank == self.src:
-            self._ready[0] = bool(data)
-        self._work = dist.broadcast(
-            self._ready,
-            src=self.src,
-            group=self.dist_group,
-            async_op=True,
-        )
-
-    def finish(self) -> list[Any]:
-        self._work.wait()
-        data = self._data
-        self._data = None
-        self._work = None
-        if self._ready.item():
-            return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
-        return data or []
-
-
-def broadcast_pyobj(
-    data: list[Any],
-    rank: int,
-    dist_group: torch.distributed.ProcessGroup | None = None,
-    src: int = 0,
-    force_cpu_device: bool = True,
-):
-    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
-    The `rank` here refer to the source rank on global process group (regardless
-    of dist_group argument).
-    """
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
-    )
-
-    if rank == src:
-        if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-        else:
-            serialized_data = pickle.dumps(data)
-            size = len(serialized_data)
-
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(device)
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
-
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-            dist.broadcast(tensor_data, src=src, group=dist_group)
-        return data
-    else:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
-        size = tensor_size.item()
-
-        if size == 0:
-            return []
-
-        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
-
-        serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
-        return data
-
-
-step_counter = 0
-
-
-def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-) -> zmq.Socket:
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type == zmq.DEALER:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-    if bind:
-        socket.bind(endpoint)
-    else:
-        socket.connect(endpoint)
-
-    return socket
-
-
 # Temporary directory for prometheus multiprocess mode
 # Cleaned up automatically when this object is garbage collected
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -655,105 +519,10 @@ def dataclass_to_string_truncated(
         return str(data)
 
 
-class MultiprocessingSerializer:
-    @staticmethod
-    def serialize(obj, output_str: bool = False):
-        """
-        Serialize a Python object using ForkingPickler.
-
-        Args:
-            obj: The object to serialize.
-            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
-
-        Returns:
-            bytes or str: The serialized object.
-        """
-        buf = io.BytesIO()
-        ForkingPickler(buf).dump(obj)
-        buf.seek(0)
-        output = buf.read()
-
-        if output_str:
-            # Convert bytes to base64-encoded string
-            output = pybase64.b64encode(output).decode("utf-8")
-
-        return output
-
-    @staticmethod
-    def deserialize(data):
-        """
-        Deserialize a previously serialized object.
-
-        Args:
-            data (bytes or str): The serialized data, optionally base64-encoded.
-
-        Returns:
-            The deserialized Python object.
-        """
-        if isinstance(data, str):
-            # Decode base64 string to bytes
-            data = pybase64.b64decode(data, validate=True)
-
-        return ForkingPickler.loads(data)
-
-
 def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
-
-
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
-
-
-def launch_dummy_health_check_server(host, port, enable_metrics):
-
-    import uvicorn
-    from fastapi import FastAPI, Response
-
-    app = FastAPI()
-
-    @app.get("/health")
-    async def health():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    @app.get("/health_generate")
-    async def health_generate():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    # Add prometheus middleware
-    if enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-
-    config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        timeout_keep_alive=5,
-        loop="auto",
-        log_config=None,
-        log_level="warning",
-    )
-    server = uvicorn.Server(config=config)
-
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
-        )
-        loop.create_task(server.serve())
-
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
-        server.run()
 
 
 def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
@@ -761,8 +530,8 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
 
     With --enable-metrics every engine process on this node writes to the
     shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
-    engine's main process, which otherwise has no HTTP surface (the gRPC
-    servicer speaks gRPC only). The daemon thread keeps the synchronous
+    engine's main process, which otherwise has no HTTP surface (its frontend
+    speaks the msgpack wire only). The daemon thread keeps the synchronous
     launch path free of event-loop assumptions. The socket is bound eagerly
     on the calling thread, so a bind failure degrades to an error log and
     None — metrics must never take down serving — and the
@@ -770,7 +539,7 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
     (poll ``started`` for readiness), or None when --enable-metrics is off or
     the bind failed.
     """
-    if not server_args.enable_metrics:
+    if not metrics_enabled(server_args, "prometheus"):
         return None
 
     import uvicorn
@@ -833,8 +602,6 @@ def add_prefix(name: str, prefix: str) -> str:
 
 
 def log_info_on_rank0(logger, msg):
-    import torch.distributed as dist
-
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(msg)
 
@@ -958,9 +725,14 @@ def get_colorful_logger(name):
 def _maybe_json_dict(path: str | os.PathLike) -> dict[str, str]:
     with open(path) as f:
         try:
-            return json.loads(f.read())
-        except Exception:
+            value = json.loads(f.read())
+        except json.JSONDecodeError:
             return dict[str, str]()
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        return dict[str, str]()
+    return value
 
 
 def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
@@ -977,7 +749,8 @@ def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
 
 def maybe_model_redirect(model: str) -> str:
     """
-    Use model_redirect to redirect the model name to a local folder.
+    Redirect the model name using a JSON string-to-string mapping or
+    whitespace-separated pairs. Other JSON values use the whitespace fallback.
 
     :param model: hf model name
     :return: maybe redirect to a local folder

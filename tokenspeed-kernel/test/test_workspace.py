@@ -23,11 +23,17 @@
 from __future__ import annotations
 
 import contextlib
+import gc
+import weakref
 
 import pytest
 import tokenspeed_kernel.workspace as workspace
 import torch
-from tokenspeed_kernel.workspace import capture_session, zeroed_state
+from tokenspeed_kernel.workspace import (
+    capture_session,
+    retain_for_capture,
+    zeroed_state,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="graph capture needs a CUDA/HIP device"
@@ -106,6 +112,27 @@ def test_session_keeps_captured_state_alive_with_its_owner() -> None:
     torch.cuda.synchronize()
     assert torch.all(out == 1)
     assert torch.all(inner == 7) and torch.all(outer == 9)
+
+
+def test_session_keeps_prepared_resources_until_owner_release() -> None:
+    state = torch.full((64,), 7, device=_DEVICE)
+    state_ref = weakref.ref(state)
+    output = torch.empty_like(state)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+        retain_for_capture(state)
+        output.copy_(state)
+    del state
+    gc.collect()
+    assert state_ref() is not None
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+    del graph
+    gc.collect()
+    assert state_ref() is None
 
 
 def test_session_state_never_reuses_memory_freed_earlier_in_the_capture() -> None:

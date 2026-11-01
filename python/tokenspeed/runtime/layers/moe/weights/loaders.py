@@ -44,6 +44,7 @@ def copy_expert_shard(
     src: torch.Tensor,
     scale_dst: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     """Write one loaded expert shard into its destination buffer.
 
@@ -53,16 +54,24 @@ def copy_expert_shard(
         scale_dst: Destination view inside the block-scale buffer, or ``None``
             when the checkpoint values need no quantization.
         block_shape: ``(block_n, block_k)`` of one scale.
+        weight_copy: Optional destination copy for a backend weight layout,
+            applied after sharding and quantization.
     """
     if scale_dst is None or dst.dtype == src.dtype:
         src = preserve_e8m0_bytes_for_uint8_param(dst, src)
-        dst.copy_(src)
+        if weight_copy is None:
+            dst.copy_(src)
+        else:
+            weight_copy(dst, src)
         return
 
     quantized, scales = quantize_fp8(
         src.to(dst.device), granularity="block", block_size=block_shape
     )
-    dst.copy_(quantized)
+    if weight_copy is None:
+        dst.copy_(quantized)
+    else:
+        weight_copy(dst, quantized)
     scale_dst.copy_(scales)
 
 
@@ -95,6 +104,7 @@ def load_w13(
     load_up_proj_weight_first: bool = False,
     expert_scale: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     if shard_id not in {"w1", "w3", "w13"}:
         raise ValueError(f"Unexpected w13 shard_id: {shard_id}")
@@ -138,7 +148,7 @@ def load_w13(
             block_start,
             loaded_weight.shape[shard_dim],
         )
-    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape)
+    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape, weight_copy)
 
 
 def load_w2(
@@ -153,6 +163,7 @@ def load_w2(
     tp_size: int = 1,
     expert_scale: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     if not isinstance(expert_data, torch.Tensor) or not isinstance(
         loaded_weight, torch.Tensor
@@ -191,7 +202,7 @@ def load_w2(
             0,
             loaded_weight.shape[shard_dim],
         )
-    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape)
+    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape, weight_copy)
 
 
 def get_shard_dim(param: torch.Tensor, shard_id: str, do_transpose: bool) -> int:
@@ -215,6 +226,7 @@ def load_model_weight(
     use_presharded_weights: bool,
     do_transpose: bool,
     tp_size: int = 1,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
@@ -234,6 +246,7 @@ def load_model_weight(
             tp_size=tp_size,
             expert_scale=expert_scale,
             block_shape=block_shape,
+            weight_copy=weight_copy,
         )
     elif shard_id in {"w1", "w3", "w13"}:
         load_w13(
@@ -248,6 +261,7 @@ def load_model_weight(
             tp_size=tp_size,
             expert_scale=expert_scale,
             block_shape=block_shape,
+            weight_copy=weight_copy,
         )
     else:
         raise ValueError(f"Unknown shard_id: {shard_id}")
@@ -361,6 +375,41 @@ def load_per_tensor_input_scale(
 ) -> None:
     value = loaded_weight.detach().to(torch.float32).amax().to(param.device)
     torch.maximum(param.data, value, out=param.data)
+
+
+def load_per_expert_input_scale(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    local_expert_id: int | None,
+) -> None:
+    """Keep one activation scale per expert, broadcasting a checkpoint that ships one.
+
+    Checkpoints that ship a scalar scale per expert load it once per expert
+    with ``local_expert_id=None``; accumulate the running maximum so every
+    expert uses the global maximum, matching ``load_per_tensor_input_scale``.
+
+    Args:
+        param: The layer's ``[num_local_experts]`` activation scale.
+        loaded_weight: A scalar, or one scale per expert.
+        shard_id: Unused; the scale covers the whole projection.
+        local_expert_id: Expert this scale belongs to, or None when the tensor
+            already covers every local expert.
+    """
+    del shard_id
+    value = loaded_weight.detach().to(dtype=torch.float32, device=param.device)
+    if local_expert_id is not None:
+        param.data[local_expert_id] = value.amax()
+        return
+    if value.numel() == 1:
+        torch.maximum(param.data, value, out=param.data)
+        return
+    if value.numel() != param.data.numel():
+        raise ValueError(
+            f"expected one activation scale per expert, got {value.numel()} "
+            f"for {param.data.numel()} experts"
+        )
+    param.data.copy_(value.reshape(param.data.shape))
 
 
 def make_weight_loader(

@@ -113,10 +113,10 @@ perf:
 report:
   github_step_summary: true
 perf_threshold: 0.9
-# Values are [Latency (tps/user), Throughput (tps/gpu)]. 8x MI350X runs at
-# #1932, #1923, #1914, #1885, #1944 and #1948 measured (53.79/16.16,
-# 63.86/16.23, 75.53/14.93, 67.11/14.74, 68.21/16.03, 57.01/15.27), with
-# medians 65.49 / 15.65. Both references sit below the medians to absorb the
-# run-to-run variance, which is especially wide for latency.
+# Values are [Latency (tps/user), Throughput (tps/gpu)]. 15 passing per-commit
+# runs on the 8x MI350X runner measured latency 64.35-105.04 (median 81.30)
+# and throughput 15.58-16.92 (median 16.50). Latency varies widely from run
+# to run, so its reference sits near the observed minimum; throughput is
+# stable, so its reference sits close to the median.
 perf_reference:
-  16: [60, 15]
+  16: [65, 16]

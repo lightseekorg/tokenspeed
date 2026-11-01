@@ -94,9 +94,13 @@ def _load_key_tile(
     k_n = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_layout))
     k_d = gl.arange(0, HEAD_DIM_PAD, layout=gl.SliceLayout(1, k_layout))
     live = k_n < frontier
-    # Buffer loads mask out-of-range lanes without branches.
+    # Int64 lengths can widen tile offsets; the host bounds the page table to
+    # 2 GiB, so valid buffer offsets fit in int32. Key addresses stay int64.
     pages = cdna4.buffer_load(
-        page_table, request * stride_pt_b + k_n // page_size, mask=live, other=0
+        page_table,
+        (request * stride_pt_b + k_n // page_size).to(gl.int32),
+        mask=live,
+        other=0,
     )
     slots = pages.to(gl.int64) * page_size + k_n % page_size
     # 64-bit addressing: the compressed cache may exceed the 2 GiB reach of
@@ -154,7 +158,6 @@ def gluon_qsa_block_scores_gfx950(
     # A program owns BLOCK_Q query rows and every col_splits-th block tile.
     row0 = gl.program_id(0) * BLOCK_Q
     split = gl.program_id(1)
-    num_tiles = gl.cdiv(num_blocks, BLOCK_N)
     q_idx = gl.arange(0, BLOCK_Q, layout=row_layout)
     q_rows = row0 + q_idx
     row_mask = q_rows < rows
@@ -186,8 +189,11 @@ def gluon_qsa_block_scores_gfx950(
         )
         in_run = row_mask & (q_idx >= start) & (q_idx < run_end)
         frontier = gl.where(
-            request >= 0, gl.max(gl.where(in_run, complete, 0), axis=0), 0
+            request >= 0,
+            gl.minimum(gl.max(gl.where(in_run, complete, 0), axis=0), num_blocks),
+            0,
         )
+        num_tiles = gl.cdiv(frontier, BLOCK_N)
         # Key gathers run one tile ahead of the MFMA.
         keys = _load_key_tile(
             page_table,
@@ -219,25 +225,18 @@ def gluon_qsa_block_scores_gfx950(
                 BLOCK_N,
             )
             block_ids = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=col_layout)
-            if tile * BLOCK_N < frontier:
-                acc = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mma)
-                acc = cdna4.mfma(q_tile, keys, acc)
-                acc = gl.maximum(acc, 0.0)
-                scores = gl.sum(gl.reshape(acc, [BLOCK_Q, HEADS_PAD, BLOCK_N]), axis=1)
-                scores = gl.convert_layout(scores, out_layout)
-            else:
-                scores = gl.full(
-                    [BLOCK_Q, BLOCK_N], float("-inf"), gl.float32, out_layout
-                )
-            # Blocks at or beyond a row's frontier become -inf, so selection
-            # drops them.
-            scores = gl.where(
-                block_ids[None, :] < complete[:, None], scores, float("-inf")
-            )
+            acc = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mma)
+            acc = cdna4.mfma(q_tile, keys, acc)
+            acc = gl.maximum(acc, 0.0)
+            scores = gl.sum(gl.reshape(acc, [BLOCK_Q, HEADS_PAD, BLOCK_N]), axis=1)
+            scores = gl.convert_layout(scores, out_layout)
+            # Selection reads each row's complete prefix; leave its tail unwritten.
             gl.store(
                 out_rows + block_ids[None, :],
                 scores,
-                mask=in_run[:, None] & (block_ids < num_blocks)[None, :],
+                mask=in_run[:, None]
+                & (block_ids < num_blocks)[None, :]
+                & (block_ids[None, :] < complete[:, None]),
             )
             keys = next_keys
         start = run_end
@@ -296,13 +295,19 @@ def _radix_pass(
     return prefix | (digit.to(gl.uint32) << SHIFT), remaining - above
 
 
-@gluon.jit(launch_metadata=_select_metadata, do_not_specialize=["n_cols"])
+@gluon.jit(
+    launch_metadata=_select_metadata,
+    do_not_specialize=["n_cols", "stride_l_n", "stride_o_n", "stride_len"],
+)
 def gluon_qsa_block_topk_select_gfx950(
     logits,
+    lengths,
     out,
     n_cols,
     stride_l_n,
     stride_o_n,
+    stride_len,
+    HAS_LENGTHS: gl.constexpr,
     TOPK: gl.constexpr,
     CHUNK: gl.constexpr,
     IN_REGS: gl.constexpr,
@@ -316,6 +321,9 @@ def gluon_qsa_block_topk_select_gfx950(
     out_layout: gl.constexpr = gl.BlockedLayout([1], [64], [num_warps], [0])
     row = gl.program_id(0)
     row_ptr = logits + row.to(gl.int64) * stride_l_n
+    if HAS_LENGTHS:
+        # Score tails may be uninitialized. Bound every pass by the live prefix.
+        n_cols = gl.minimum(gl.maximum(gl.load(lengths + row * stride_len), 0), n_cols)
     cols = gl.arange(0, CHUNK, layout=layout)
     bins = gl.arange(0, 256, layout=bins_layout)
     resident = gl.load(row_ptr + cols, mask=cols < n_cols, other=float("-inf"))
@@ -399,7 +407,8 @@ def launch_gluon_qsa_block_scores_gfx950(
 
     Returns:
         FP32 scores shaped ``[rows, pages * page_size]``: ``sum_h relu(q_h .
-        k)`` below each row's ``complete_blocks`` and ``-inf`` elsewhere.
+        k)`` below each row's ``complete_blocks``. Values outside that prefix
+        are undefined.
     """
 
     rows, num_heads, head_dim = query.shape
@@ -458,7 +467,7 @@ def launch_gluon_qsa_block_scores_gfx950(
 
 
 def launch_gluon_qsa_block_topk_select_gfx950(
-    logits: torch.Tensor, topk: int
+    logits: torch.Tensor, topk: int, *, lengths: torch.Tensor | None
 ) -> torch.Tensor:
     """Select each row's ``topk`` largest finite scores.
 
@@ -466,6 +475,8 @@ def launch_gluon_qsa_block_topk_select_gfx950(
         logits: FP32 scores shaped ``[rows, cols]`` with a contiguous last
             dimension; ``-inf`` entries are never selected.
         topk: Entries selected per row.
+        lengths: Per-row valid column counts, clamped to the score width.
+            Pass None to scan full rows. Columns past the counts are not read.
 
     Returns:
         Int32 column ids shaped ``[rows, topk]`` in increasing order, padded
@@ -484,10 +495,13 @@ def launch_gluon_qsa_block_topk_select_gfx950(
     chunk = min(_SELECT_CHUNK, max(256, triton.next_power_of_2(cols)))
     gluon_qsa_block_topk_select_gfx950[(rows,)](
         logits,
+        lengths,
         selected,
         cols,
         logits.stride(0),
         selected.stride(0),
+        lengths.stride(0) if lengths is not None else 0,
+        HAS_LENGTHS=lengths is not None,
         TOPK=topk,
         CHUNK=chunk,
         IN_REGS=cols <= chunk,

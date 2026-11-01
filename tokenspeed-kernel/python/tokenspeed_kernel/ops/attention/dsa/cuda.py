@@ -66,7 +66,6 @@ if platform.is_hopper_plus:
     )
 
 _decode_sched_meta_cache: dict[tuple, object] = {}
-_query_workspace_cache: dict[tuple, torch.Tensor] = {}
 
 
 def _flashmla_sparse_prefill_head_multiple() -> int:
@@ -87,32 +86,15 @@ def _flashmla_sparse_decode_padded_heads(num_heads: int) -> int:
     return num_heads
 
 
-def _get_query_workspace(
-    *,
-    q: torch.Tensor,
-    shape: tuple[int, ...],
-    cache_prefix: str,
-) -> torch.Tensor:
-    key = (cache_prefix, q.device, q.dtype, shape)
-    workspace = _query_workspace_cache.get(key)
-    if workspace is None:
-        workspace = torch.empty(shape, dtype=q.dtype, device=q.device)
-        workspace.zero_()
-        _query_workspace_cache[key] = workspace
-    return workspace
-
-
 def _pad_prefill_query(q: torch.Tensor) -> tuple[torch.Tensor, int]:
     q = q.reshape(-1, q.shape[-2], q.shape[-1]).contiguous()
     actual_heads = q.shape[1]
     padded_heads = _flashmla_sparse_prefill_padded_heads(actual_heads)
     if padded_heads == actual_heads:
         return q, actual_heads
-    q_padded = _get_query_workspace(
-        q=q,
-        shape=(q.shape[0], padded_heads, q.shape[2]),
-        cache_prefix="prefill",
-    )
+    # Call-local storage lets the allocator track stream ordering and graph
+    # pool lifetime without retaining every prefill length in a global cache.
+    q_padded = q.new_empty((q.shape[0], padded_heads, q.shape[2]))
     q_padded[:, :actual_heads, :].copy_(q)
     q_padded[:, actual_heads:, :].zero_()
     return q_padded, actual_heads
@@ -131,11 +113,8 @@ def _pad_decode_query(q: torch.Tensor, q_len_per_req: int) -> tuple[torch.Tensor
     padded_heads = _flashmla_sparse_decode_padded_heads(actual_heads)
     if padded_heads == actual_heads:
         return q, actual_heads
-    q_padded = _get_query_workspace(
-        q=q,
-        shape=(q.shape[0], q.shape[1], padded_heads, q.shape[3]),
-        cache_prefix="decode",
-    )
+    # Each capture owns its storage; eager calls cannot overwrite graph buffers.
+    q_padded = q.new_empty((q.shape[0], q.shape[1], padded_heads, q.shape[3]))
     q_padded[:, :, :actual_heads, :].copy_(q)
     q_padded[:, :, actual_heads:, :].zero_()
     return q_padded, actual_heads
@@ -206,9 +185,9 @@ def ragged_decode_topk(
     topk: int,
     *,
     lengths: torch.Tensor,
-    workspace: torch.Tensor,
     max_seq_len: int | None = None,
-    q_len_per_req: int = 1,
+    q_len_per_req: int,
+    enable_pdl: bool,
 ) -> None:
     """Select per-row top-``topk`` local offsets over ragged (length-aware) logits.
 
@@ -219,9 +198,9 @@ def ragged_decode_topk(
             selected column indices.
         topk: Number of candidates to select per row.
         lengths: Per-row valid context length, cast to int32 and flattened.
-        workspace: Scratch uint8 buffer for the persistent kernel.
         max_seq_len: Max scanned columns; defaults to ``logits.shape[1]``.
         q_len_per_req: Query rows per request (speculative decode); 1 for decode.
+        enable_pdl: Enable programmatic CUDA launch dependencies.
 
     Raises:
         RuntimeError: if the CUDA persistent kernel is unavailable.
@@ -232,10 +211,10 @@ def ragged_decode_topk(
         logits.contiguous(),
         lengths.to(torch.int32).contiguous().reshape(-1),
         out,
-        workspace,
         int(topk),
-        int(max_seq_len or logits.shape[1]),
+        int(logits.shape[1] if max_seq_len is None else max_seq_len),
         int(q_len_per_req),
+        enable_pdl=enable_pdl,
     )
 
 

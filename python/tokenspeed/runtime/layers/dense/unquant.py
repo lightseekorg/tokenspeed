@@ -21,6 +21,7 @@
 
 import torch
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import plan_dense_gemm
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch.nn.parameter import Parameter
 
@@ -31,6 +32,12 @@ from tokenspeed.runtime.utils import set_weight_attrs
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
+
+    def __init__(self):
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+        self.kernel_plan = None
 
     def create_weights(
         self,
@@ -53,9 +60,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        if self.batch_invariant:
+            self.kernel_plan = plan_dense_gemm(
+                mode="mm",
+                input_size=input_size_per_partition,
+                output_size=sum(output_partition_sizes),
+                dtype=params_dtype,
+                batch_size=None,
+                batch_invariant=True,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        return
+        if self.batch_invariant and self.kernel_plan is None:
+            self.kernel_plan = plan_dense_gemm(
+                mode="mm",
+                input_size=layer.weight.shape[1],
+                output_size=layer.weight.shape[0],
+                dtype=layer.weight.dtype,
+                batch_size=None,
+                batch_invariant=True,
+            )
 
     def apply(
         self,
@@ -63,19 +87,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-            # Bitwise envelopes: one batch-invariant GEMM for every shape. The
-            # GEMV and large-M fast paths below switch kernels by shape, which
-            # is exactly the row-result drift the envelope forbids. A missing
-            # "aok" leaf fails selection loudly rather than falling back.
-            return kernel_mm(
-                x,
-                layer.weight,
-                bias=bias,
-                override="aok",
-            )
+        if self.batch_invariant:
+            if self.kernel_plan is None:
+                raise RuntimeError(
+                    "Batch-invariant Linear requires a kernel plan before execution"
+                )
+            return kernel_mm(x, layer.weight, bias=bias, plan=self.kernel_plan)
 
         if resolve_kernel_override("gemm", "mm", None) is not None:
             return kernel_mm(x, layer.weight, bias=bias)

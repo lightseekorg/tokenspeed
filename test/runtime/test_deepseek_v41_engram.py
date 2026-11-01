@@ -35,6 +35,7 @@ import importlib.util
 import json
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,9 +56,45 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramLayout,
     RowShardedEngramEmbedding,
     build_compressed_token_map,
-    build_engram_previous_tokens,
     compute_hash_multipliers,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+
+def build_engram_previous_tokens(
+    token_histories: Sequence[Sequence[int]],
+    request_indices: Sequence[int],
+    positions: Sequence[int],
+) -> torch.Tensor:
+    """Test oracle: CPU int64 [tokens, 3] raw lookbacks, newest first.
+
+    Histories are physical-position request histories with nonparticipating
+    positions marked -1; request indices and positions describe each packed
+    token, as the runtime's fused preparation resolves them.
+    """
+    if len(request_indices) != len(positions):
+        raise ValueError("Engram request indices and positions must have equal lengths")
+    windows = []
+    for request_index, position in zip(request_indices, positions, strict=True):
+        if not 0 <= request_index < len(token_histories):
+            raise ValueError(f"Invalid Engram history request index {request_index}")
+        history = token_histories[request_index]
+        if not 0 <= position <= len(history):
+            raise ValueError(
+                f"Engram history is missing tokens before position {position}"
+            )
+        window = [
+            history[position - shift] if position >= shift else -1
+            for shift in (1, 2, 3)
+        ]
+        if any(token_id < -1 for token_id in window):
+            raise ValueError("Mark nonparticipating history tokens with -1")
+        windows.append(window)
+    return torch.tensor(windows, dtype=torch.int64, device="cpu").reshape(-1, 3)
 
 
 class _Tokenizer:
@@ -239,6 +276,7 @@ def test_history_chunk_prefix_reorder_and_speculative_rollback():
     assert set(dict(state.named_buffers())) == {
         "token_map",
         "primes",
+        "reciprocals",
         "offsets",
         "multipliers",
     }
@@ -334,6 +372,40 @@ def test_scale_bytes_and_loader_validation():
         embed.weight_loader(embed.scale, scales.float())
     with pytest.raises(ValueError, match="row width"):
         embed.weight_loader(embed.weight, codes[:, :32])
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires a GPU"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("ndim", [1, 2, 3])
+def test_embedding_noncontiguous_ids(device, ndim):
+    embed = RowShardedEngramEmbedding(
+        64, 256, _mapping(0, 1, 1), device, False, "gpu", 1
+    )
+    codes = torch.randn(64, 256, device=device).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 132, (64, 8), dtype=torch.uint8, device=device)
+    embed.weight_loader(embed.weight, codes)
+    embed.weight_loader(embed.scale, scales)
+    storage = torch.arange(96, device=device, dtype=torch.int64) % 70
+    if ndim == 1:
+        ids = storage[::2]
+    elif ndim == 2:
+        ids = storage.reshape(2, 2, 24)[:, 1]
+    else:
+        ids = storage.reshape(2, 4, 12).transpose(0, 1)
+    assert not ids.is_contiguous()
+    expected = _dequant(codes, scales)[ids.clamp(0, 63)]
+    expected[ids >= 64] = 0
+    torch.testing.assert_close(embed(ids), expected, rtol=0, atol=0)
 
 
 def _model(device, quant_config):
@@ -446,31 +518,6 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_hash_kernel_matches_the_cpu_chain():
-    """The fused hash kernel reproduces the eager reference bit for bit."""
-    config = _config()
-    cpu, cuda = (EngramHashState(config, _Tokenizer(), d) for d in ("cpu", "cuda:0"))
-    torch.manual_seed(5)
-    vocab = cpu.token_map.shape[0]
-    ids = torch.randint(0, vocab, (513,))
-    previous = torch.randint(-1, vocab, (513, 3))
-    mask = torch.rand(513) > 0.25
-    # Masked-out current ids may be clamped image placeholders outside the vocab.
-    ids[~mask] = 999_999
-    expected = cpu(ids, previous, mask)
-    actual = cuda(ids.cuda(), previous.cuda(), mask.cuda())
-    assert actual.device.type == "cuda" and actual.dtype == torch.int64
-    assert torch.equal(actual.cpu(), expected)
-    # Any leading shape is preserved, as with the eager chain.
-    batched = cuda(
-        ids.cuda().view(3, 171),
-        previous.cuda().view(3, 171, 3),
-        mask.cuda().view(3, 171),
-    )
-    assert torch.equal(batched.cpu(), expected.view(3, 171, *expected.shape[1:]))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_lookup_hash_and_graph_replay():
     state = EngramHashState(_config(), _Tokenizer(), "cuda:0")
     embed = RowShardedEngramEmbedding(
@@ -528,7 +575,11 @@ def test_cuda_quantized_projection_forward():
     reference.wkv.weight.data.copy_((weight.float() / 64).to(torch.bfloat16))
     expected = reference(hidden, ids, mask)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
-    assert model.wkv.weight.dtype == torch.float8_e4m3fn
+    # Hopper uses BF16 projection weights; other supported GPUs retain FP8.
+    expected_dtype = (
+        torch.bfloat16 if v41.current_platform().is_hopper else torch.float8_e4m3fn
+    )
+    assert model.wkv.weight.dtype == expected_dtype
     for _ in range(2):
         model(hidden, ids, mask)
     torch.cuda.synchronize()

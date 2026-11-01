@@ -104,6 +104,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
     supports_mla_dcp: bool = False
+    prefill_needs_host_page_table: bool = False
 
     @classmethod
     def resolve_kernel_page_size(
@@ -190,15 +191,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """The drafting lanes' cascade while a lane forward runs, else None."""
         if not self.tree_lane_step_active:
             return None
-        lanes = self.tree_draft
-        return TreeCascadeRows(
-            page_table=self.page_table_buf[:bs],
-            seq_lens=lanes.window_seq_lens[:bs],
-            prefix_lens=lanes.frontier[:bs],
-            mask=lanes.lane_mask[: bs * lanes.topk],
-            rows=lanes.topk,
-            window=lanes.num_slots,
-        )
+        return self.tree_draft.cascade_rows(self, bs)
 
     def _tree_verify_rows(
         self, bs: int, q_len: int, page_table: torch.Tensor, seq_lens: torch.Tensor
@@ -387,6 +380,38 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 seeding). Branch on it only for graph-mechanics asymmetries
                 a shared in-place refresh cannot express.
         """
+
+    def decode_buffer_targets(
+        self, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The ``(seq_lens, page_table)`` buffer views a decode refresh copies into.
+
+        A leaf whose :meth:`refresh_decode_metadata` is exactly those two
+        copies (seq_lens clamped to :attr:`decode_seq_lens_floor`) followed
+        by :meth:`publish_decode_metadata` returns them, so the router can
+        fill every such leaf with one batched copy; a leaf with any other
+        refresh returns None and refreshes itself.
+
+        Args:
+            bs: Requests to prepare (the padded graph batch under replay).
+        """
+        return None
+
+    @property
+    def decode_seq_lens_floor(self) -> int:
+        """The minimum the router clamps ``seq_lens`` to before copying them
+        into :meth:`decode_buffer_targets`. Decode ``seq_lens`` are at least
+        1 (padding rows replay at 1), so 1 copies them unchanged."""
+        return 1
+
+    def publish_decode_metadata(
+        self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
+    ) -> None:
+        """The rest of :meth:`refresh_decode_metadata` once the router has
+        filled :meth:`decode_buffer_targets`; arguments as there."""
+        raise NotImplementedError(
+            f"{type(self).__name__} returns no decode_buffer_targets"
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self, bs: int, seq_lens: torch.Tensor, page_table: torch.Tensor

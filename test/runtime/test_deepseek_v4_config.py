@@ -19,31 +19,19 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.dsv4.cuda import (
-    has_indexer_topk_prefill,
-    indexer_topk_prefill,
-)
-from tokenspeed_kernel.ops.attention.dsv4.triton import (
-    dsv4_compute_global_topk_indices_and_lens,
+from tokenspeed_kernel.numerics.torch.residual import (
+    torch_mhc_post,
+    torch_mhc_pre,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
 
-from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
-from tokenspeed.runtime.configs.model_config import (
-    AttentionArch,
-    ModelConfig,
-    _derive_num_attention_layers,
-    configure_deepseek_v4_attention,
-    is_deepseek_v4,
-    is_deepseek_v4_nextn,
-)
+from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
 )
@@ -52,9 +40,6 @@ from tokenspeed.runtime.execution.forward_step import (
     ForwardStepRunner,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
-from tokenspeed.runtime.layers.attention.page_table import (
-    group_slot_mapping_from_raw as _group_slot_mapping_from_raw,
-)
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.moe import topk as topk_module
 from tokenspeed.runtime.layers.quantization import (
@@ -83,12 +68,6 @@ from tokenspeed.runtime.utils.env import (
     global_server_args_dict,
     global_server_args_dict_update,
 )
-from tokenspeed.runtime.utils.hf_transformers_utils import (
-    _CONFIG_REGISTRY,
-    _wrap_deepseek_v4_tokenizer,
-    get_tokenizer,
-    prefers_deepseek_v4_tokenizer,
-)
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import count_dspark_stages
 
@@ -100,17 +79,6 @@ def _fake_pool(*group_specs, **arena_attrs) -> SimpleNamespace:
     )
 
 
-def _mhc_sinkhorn_reference(
-    mixes: torch.Tensor, iters: int, eps: float
-) -> torch.Tensor:
-    mixes = torch.softmax(mixes, dim=-1) + eps
-    mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(iters - 1):
-        mixes = mixes / (mixes.sum(dim=-1, keepdim=True) + eps)
-        mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    return mixes
-
-
 def _mhc_pre_reference(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -120,41 +88,17 @@ def _mhc_pre_reference(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, hc_mult, _ = residual.shape
-    x = residual.flatten(1).float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
-    mixes = F.linear(x, fn.float()) * rsqrt
-    pre_raw, post_raw, comb_raw = torch.split(
-        mixes, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre_base, post_base, comb_base = torch.split(
-        hc_base.float(), [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre = torch.sigmoid(pre_raw * hc_scale[0].float() + pre_base) + hc_eps
-    post = (torch.sigmoid(post_raw * hc_scale[1].float() + post_base) * 2.0).unsqueeze(
-        -1
-    )
-    comb = _mhc_sinkhorn_reference(
-        comb_raw.reshape(num_tokens, hc_mult, hc_mult) * hc_scale[2].float()
-        + comb_base.reshape(1, hc_mult, hc_mult),
-        sinkhorn_iters,
+    return torch_mhc_pre(
+        residual,
+        fn.float(),
+        hc_scale,
+        hc_base,
+        rms_eps,
         hc_eps,
+        sinkhorn_iters,
+        None,
+        None,
     )
-    layer_input = torch.sum(pre.unsqueeze(-1) * residual.float(), dim=1)
-    return layer_input.to(residual.dtype), post, comb
-
-
-def _mhc_post_reference(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-) -> torch.Tensor:
-    if post.dim() == 2:
-        post = post.unsqueeze(-1)
-    mixed_residual = torch.einsum("tnm,tnh->tmh", comb.float(), residual.float())
-    block_update = post.float() * hidden_states.float().unsqueeze(1)
-    return (mixed_residual + block_update).to(hidden_states.dtype)
 
 
 class TestDeepseekV4Config:
@@ -163,10 +107,6 @@ class TestDeepseekV4Config:
         "activation_scheme": "dynamic",
         "scale_fmt": "ue8m0",
     }
-
-    def test_config_registry(self):
-        assert (DeepseekV4Config.model_type) == ("deepseek_v4")
-        assert (_CONFIG_REGISTRY["deepseek_v4"]) is (DeepseekV4Config)
 
     def test_fp4_expert_contract_overrides_model_wide_fp8_config(self):
         quant_config = Fp8Config(
@@ -402,12 +342,14 @@ class TestDeepseekV4Config:
                 correction_bias=correction_bias,
                 routed_scaling_factor=2.0,
                 hash_routing=False,
+                weights_dtype=torch.bfloat16,
             )(hidden_states, router_logits)
 
         assert (output.topk_weights) is (topk_weights)
         assert (output.topk_ids) is (topk_ids)
         assert (output.router_logits) is (router_logits)
-        assert (calls[0][0][2:6]) == (("sqrt_softplus", "topk", True, 2.0))
+        assert calls[0][0][2:6] == ("sqrt_softplus", "topk", True, 2.0)
+        assert (calls[0][1]["topk_weights_dtype"]) == (torch.bfloat16)
 
     def test_deepseek_v4_topk_routes_simulated_logits(self):
         router_logits = torch.zeros((2, 4))
@@ -428,6 +370,7 @@ class TestDeepseekV4Config:
                 correction_bias=torch.zeros(4),
                 routed_scaling_factor=1.0,
                 hash_routing=False,
+                weights_dtype=torch.float32,
             )(torch.ones((2, 3)), router_logits)
             expected = topk_module.simulated_router_logits(router_logits)
 
@@ -493,6 +436,7 @@ class TestDeepseekV4Config:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
                 self.topk_output_format = object()
+                self.topk_weights_dtype = torch.bfloat16
 
         class FakeTopK:
             def __init__(self, **kwargs):
@@ -543,6 +487,101 @@ class TestDeepseekV4Config:
         assert (captured["routing_mode"]) == ("precomputed_topk")
         assert (captured["routing_config"]["routed_scaling_factor"]) == (1.0)
         assert (topk_config["routed_scaling_factor"]) == (2.5)
+        assert (topk_config["weights_dtype"]) == (torch.bfloat16)
+
+    @staticmethod
+    def _fake_deferred_moe(
+        make_moe, hidden_states, input_ids, route_weights, kernel_result
+    ):
+        moe = make_moe(
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            [],
+            norm_topk_prob=True,
+        )
+        moe.topk = lambda *args, **kwargs: SimpleNamespace(topk_weights=route_weights)
+        moe.experts = Mock(return_value=kernel_result)
+        moe.experts.supports_deferred_cuda_finalize = True
+        return moe
+
+    def test_deepseek_v4_moe_deferred_finalize_fuses_the_shared_expert(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        route_weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = hidden_states + 1
+        indices = torch.arange(2, dtype=torch.int32)
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
+            hidden_states,
+            input_ids,
+            route_weights,
+            (gemm, route_weights, indices),
+        )
+
+        def finalize(gemm2_out, expanded_idx, expert_weights, shared, **kwargs):
+            assert gemm2_out is gemm and expanded_idx is indices
+            assert expert_weights is route_weights
+            assert kwargs["top_k"] == 1
+            assert kwargs["hidden_dim"] == hidden_states.shape[-1]
+            return (
+                gemm2_out.float() * expert_weights.float() + shared.float()
+            ).bfloat16()
+
+        with patch.object(
+            deepseek_v4_model, "moe_finalize_fuse_shared", side_effect=finalize
+        ):
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert not moe.experts.call_args.kwargs["do_finalize"]
+        torch.testing.assert_close(
+            actual, (hidden_states + 1) * 2 + hidden_states + 3, atol=0, rtol=0
+        )
+
+    def test_deepseek_v4_moe_common_finalize_trims_padding_without_shared(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = torch.ones(2, 8, dtype=torch.bfloat16)
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
+            hidden_states,
+            input_ids,
+            weights,
+            (gemm, weights, torch.arange(2, dtype=torch.int32)),
+        )
+        moe.n_shared_experts = None
+        moe.shared_experts = None
+        with patch.object(
+            deepseek_v4_model,
+            "moe_finalize_fuse_shared",
+            return_value=(gemm * weights)[:, : hidden_states.shape[-1]].contiguous(),
+        ) as finalize:
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert finalize.call_args.args[3] is None
+        assert finalize.call_args.kwargs["hidden_dim"] == hidden_states.shape[-1]
+        assert actual.shape == hidden_states.shape
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)
+
+    def test_deepseek_v4_moe_keeps_finalize_for_unsupported_consumer(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            [],
+            norm_topk_prob=True,
+        )
+        moe.experts = Mock(return_value=hidden_states * 2)
+        moe.experts.supports_deferred_cuda_finalize = False
+        with patch.object(deepseek_v4_model, "moe_finalize_fuse_shared") as finalize:
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert moe.experts.call_args.kwargs["do_finalize"]
+        finalize.assert_not_called()
+        torch.testing.assert_close(
+            actual, hidden_states * 2 + hidden_states + 3, atol=0, rtol=0
+        )
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -749,6 +788,7 @@ class TestDeepseekV4Config:
             torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             use_graph=True,
+            settle=lambda: None,
         )
 
         # (padded_bs, actual_bs) are the leading positional args.
@@ -787,6 +827,7 @@ class TestDeepseekV4Config:
             torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             use_graph=True,
+            settle=lambda: None,
             block_tables={"v4.swa": table},
         )
 
@@ -938,6 +979,7 @@ class TestDeepseekV4Config:
             seq_lens,
             forward_mode=ForwardMode.DECODE,
             use_graph=False,
+            settle=lambda: None,
         )
 
         draft_args, draft_kwargs = captured["draft"][-1]
@@ -949,102 +991,10 @@ class TestDeepseekV4Config:
         assert (wrapper.drafter.draft_seq_lens_buf.tolist()) == ([21, 22])
         assert (draft_kwargs["forward_mode"]) == (ForwardMode.DECODE)
 
-    def test_deepseek_v4_tokenizer_wrapper_uses_model_encoder(self):
-        calls = []
-
-        class DummyTokenizer:
-            vocab_size = 5
-
-            def __call__(self, text, add_special_tokens=False, **kwargs):
-                self.last_call = (text, add_special_tokens, kwargs)
-                return {"input_ids": [len(text)]}
-
-            def encode(self, text, add_special_tokens=False, **kwargs):
-                return [len(text)]
-
-            def get_added_vocab(self):
-                return {"<extra>": 5}
-
-        def encode_messages(messages, **kwargs):
-            calls.append((messages, kwargs))
-            return "<encoded>"
-
-        tokenizer = _wrap_deepseek_v4_tokenizer(DummyTokenizer(), encode_messages)
-
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "hi"}],
-            tokenize=False,
-            enable_thinking=True,
-            reasoning_effort="medium",
-        )
-        token_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "hi"}],
-            truncation=True,
-            max_length=16,
-        )
-
-        assert (prompt) == ("<encoded>")
-        assert (token_ids) == ([9])
-        assert (len(tokenizer)) == (6)
-        assert (calls[0][1]["thinking_mode"]) == ("thinking")
-        assert (calls[0][1]["reasoning_effort"]) is None
-        assert (calls[1][1]["thinking_mode"]) == ("chat")
-        assert (tokenizer.last_call) == (
-            ("<encoded>", False, {"truncation": True, "max_length": 16})
-        )
-
-    def test_deepseek_v4_tokenizer_is_auto_selected_by_architecture(self):
-        assert prefers_deepseek_v4_tokenizer(["DeepseekV4ForCausalLM"])
-        assert not (prefers_deepseek_v4_tokenizer(["KimiK2ForCausalLM"]))
-        assert not (prefers_deepseek_v4_tokenizer(None))
-
-    def test_auto_tokenizer_mode_wraps_deepseek_v4_architecture(self):
-        class DummyTokenizer:
-            vocab_size = 5
-
-            def __call__(self, text, add_special_tokens=False, **kwargs):
-                return {"input_ids": [len(text)]}
-
-            def encode(self, text, add_special_tokens=False, **kwargs):
-                return [len(text)]
-
-            def get_added_vocab(self):
-                return {}
-
-        def encode_messages(messages, **kwargs):
-            return "<encoded>"
-
-        with (
-            patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils.snapshot_download",
-                return_value="/nonexistent/tokenizer-snapshot",
-            ),
-            patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils.AutoTokenizer.from_pretrained",
-                return_value=DummyTokenizer(),
-            ),
-            patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils._load_deepseek_v4_encode_messages",
-                return_value=encode_messages,
-            ),
-        ):
-            tokenizer = get_tokenizer(
-                "deepseek-ai/DeepSeek-V4-Flash",
-                tokenizer_mode="auto",
-                architectures=["DeepseekV4ForCausalLM"],
-            )
-
-        assert (
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": "hi"}],
-            )
-        ) == ([9])
-
     def test_deepseek_v4_server_args_cli_flags_round_trip(self):
         # Defaults match dataclass declaration
         assert (ServerArgs.deepseek_v4_mega_moe_max_num_tokens) == (0)
         assert (ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb) == (512)
-        assert (ServerArgs.deepseek_v4_prefill_chunk_size) == (4)
         assert not (hasattr(ServerArgs, "deepseek_v4_prefix_state_policy"))
 
         # CLI flags parse
@@ -1062,13 +1012,11 @@ class TestDeepseekV4Config:
                 "--model=stub",
                 "--deepseek-v4-mega-moe-max-num-tokens=128",
                 "--deepseek-v4-indexer-prefill-max-logits-mb=256",
-                "--deepseek-v4-prefill-chunk-size=8",
             ]
         )
         args = ServerArgs.from_cli_args(ns)
         assert (args.deepseek_v4_mega_moe_max_num_tokens) == (128)
         assert (args.deepseek_v4_indexer_prefill_max_logits_mb) == (256)
-        assert (args.deepseek_v4_prefill_chunk_size) == (8)
 
         # Propagation into global_server_args_dict
         snapshot = dict(global_server_args_dict)
@@ -1080,7 +1028,6 @@ class TestDeepseekV4Config:
             assert (
                 global_server_args_dict["deepseek_v4_indexer_prefill_max_logits_mb"]
             ) == (256)
-            assert (global_server_args_dict["deepseek_v4_prefill_chunk_size"]) == (8)
         finally:
             global_server_args_dict.clear()
             global_server_args_dict.update(snapshot)
@@ -1140,10 +1087,10 @@ class TestDeepseekV4Config:
         assert torch.equal(q_out, q_norm(q))
         assert torch.equal(kv_out, kv_norm(kv))
 
-    def test_model_config_maps_deepseek_v4_to_standard_fp8(self):
+    def test_model_config_maps_deepseek_v41_to_standard_fp8(self):
         model_config = object.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(
-            model_type="deepseek_v4", quantization_config=self.quant_config
+            model_type="deepseek_v41", quantization_config=self.quant_config
         )
         model_config.quantization = None
 
@@ -1151,212 +1098,15 @@ class TestDeepseekV4Config:
 
         assert (model_config.quantization) == ("fp8")
 
-    def test_model_config_overrides_default_block_size_for_deepseek_v4(self):
-        def make_hf_config():
-            return SimpleNamespace(
-                architectures=["DeepseekV4ForCausalLM"],
-                model_type="deepseek_v4",
-                head_dim=512,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                rope_scaling=None,
-                hidden_size=4096,
-                num_attention_heads=8,
-                num_key_value_heads=8,
-                num_hidden_layers=1,
-                vocab_size=32000,
-                quantization_config=None,
-            )
-
-        def build(prefix_granularity):
-            server_args = SimpleNamespace(
-                mapping=None,
-                prefix_granularity=prefix_granularity,
-                speculative_algorithm=None,
-                load_format="auto",
-                ext_yaml=None,
-                validate_tp_batch_invariant_weights=lambda *args: None,
-            )
-            hf_config = make_hf_config()
-            with (
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_config",
-                    return_value=hf_config,
-                ),
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_generation_config",
-                    return_value=SimpleNamespace(eos_token_id=None),
-                ),
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_hf_text_config",
-                    return_value=hf_config,
-                ),
-                patch(
-                    "tokenspeed.runtime.configs.model_config.get_context_length",
-                    return_value=4096,
-                ),
-                patch.object(ModelConfig, "_verify_quantization"),
-            ):
-                ModelConfig(
-                    "stub",
-                    model_override_args="{}",
-                    server_args=server_args,
-                )
-            return server_args
-
-        assert (build(64).prefix_granularity) == (256)
-        assert (build(128).prefix_granularity) == (128)
-
-    def test_model_config_advertises_v4_dspark_prefix_replay_requirement(self):
-        hf_config = SimpleNamespace(
-            architectures=["DeepseekV4ForCausalLMDSpark"],
-            model_type="deepseek_v4",
-            head_dim=512,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            rope_scaling=None,
-            hidden_size=4096,
-            num_attention_heads=8,
-            num_key_value_heads=8,
-            num_hidden_layers=1,
-            vocab_size=32000,
-            quantization_config=None,
-            dspark_block_size=5,
-            dspark_window_size=96,
-        )
-        server_args = SimpleNamespace(
-            mapping=None,
-            speculative_algorithm="DSPARK",
-            enable_prefix_caching=True,
-            speculative_num_steps=5,
-            speculative_num_draft_tokens=6,
-            prefix_granularity=256,
-            load_format="auto",
-            ext_yaml=None,
-        )
-        with (
-            patch(
-                "tokenspeed.runtime.configs.model_config.get_config",
-                return_value=hf_config,
-            ),
-            patch(
-                "tokenspeed.runtime.configs.model_config.get_generation_config",
-                return_value=SimpleNamespace(eos_token_id=None),
-            ),
-            patch(
-                "tokenspeed.runtime.configs.model_config.get_hf_text_config",
-                return_value=hf_config,
-            ),
-            patch(
-                "tokenspeed.runtime.configs.model_config.count_dspark_stages",
-                return_value=2,
-            ) as count_stages,
-            patch(
-                "tokenspeed.runtime.configs.model_config.get_context_length",
-                return_value=4096,
-            ),
-            patch.object(ModelConfig, "_verify_quantization"),
-        ):
-            model_config = ModelConfig(
-                "external-draft",
-                model_override_args="{}",
-                is_draft_worker=True,
-                server_args=server_args,
-            )
-        assert (model_config.dspark_prefix_replay_tokens) == (96)
-        assert (model_config.num_attention_layers) == (2)
-        count_stages.assert_called_once_with("external-draft", revision=None)
-
     def test_model_config_keeps_incompatible_user_quantization_error(self):
         model_config = object.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(
-            model_type="deepseek_v4", quantization_config=self.quant_config
+            model_type="deepseek_v41", quantization_config=self.quant_config
         )
         model_config.quantization = "mxfp4"
 
         with pytest.raises((ValueError), match=("does not match")):
             model_config._verify_quantization()
-
-    def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
-        if not current_platform().is_hopper_plus:
-            pytest.skip("FlashMLA requires NVIDIA Hopper or newer")
-
-        from tokenspeed_kernel.ops.attention.mla.cuda import (
-            flash_mla_sparse_fwd,
-            flash_mla_with_kvcache,
-            get_mla_metadata,
-        )
-
-        assert callable(flash_mla_with_kvcache)
-        assert callable(flash_mla_sparse_fwd)
-        assert callable(get_mla_metadata)
-
-    def test_deepseek_v4_model_config_uses_mla_runtime_metadata(self):
-        model_config = object.__new__(ModelConfig)
-        model_config.hf_config = SimpleNamespace(
-            architectures=["DeepseekV4ForCausalLM"],
-            head_dim=512,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            rope_scaling=None,
-        )
-
-        assert is_deepseek_v4(model_config.hf_config)
-
-        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
-
-        assert (model_config.attention_arch) == (AttentionArch.MLA)
-        assert (model_config.head_dim) == (512)
-        assert (model_config.kv_lora_rank) == (512)
-        assert (model_config.qk_rope_head_dim) == (64)
-        assert (model_config.qk_nope_head_dim) == (448)
-        assert (model_config.v_head_dim) == (512)
-        assert (model_config.index_head_dim) == (128)
-        _pytest_first_1 = model_config.scaling
-        _pytest_second_2 = 512**-0.5
-        assert (
-            _pytest_first_1 == _pytest_second_2
-            or round(abs(_pytest_first_1 - _pytest_second_2), 7) == 0
-        )
-
-    def test_deepseek_v4_nextn_architecture_uses_v4_runtime_metadata(self):
-        model_config = object.__new__(ModelConfig)
-        model_config.hf_config = SimpleNamespace(
-            architectures=["DeepseekV4ForCausalLMNextN"],
-            head_dim=512,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            rope_scaling=None,
-        )
-
-        assert is_deepseek_v4(model_config.hf_config)
-        assert is_deepseek_v4_nextn(model_config.hf_config)
-        assert is_deepseek_v4(
-            SimpleNamespace(architectures=["DeepseekV4ForCausalLMDSpark"])
-        )
-
-        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
-
-        assert (model_config.attention_arch) == (AttentionArch.MLA)
-        assert (model_config.head_dim) == (512)
-        assert (model_config.qk_nope_head_dim) == (448)
-        assert (
-            _derive_num_attention_layers(
-                SimpleNamespace(
-                    architectures=["DeepseekV4ForCausalLMNextN"],
-                    num_nextn_predict_layers=1,
-                ),
-                num_hidden_layers=43,
-            )
-        ) == (1)
-        assert not (is_deepseek_v4(SimpleNamespace(architectures=None)))
-        assert not (is_deepseek_v4_nextn(SimpleNamespace()))
-        assert (
-            _derive_num_attention_layers(
-                SimpleNamespace(architectures=None),
-                num_hidden_layers=43,
-            )
-        ) == (43)
 
     def test_dspark_stage_count_requires_contiguous_namespaces(self):
         with tempfile.TemporaryDirectory() as model_path:
@@ -1511,14 +1261,6 @@ class TestDeepseekV4Config:
                 logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
-    def test_dspark_tp_only_contract_uses_resolved_mapping(self):
-        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1))
-        DeepseekV41DSpark._validate_tp_only_mapping(mapping)
-
-        invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
-        with pytest.raises((ValueError), match=("tensor parallelism only")):
-            DeepseekV41DSpark._validate_tp_only_mapping(invalid)
-
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(
             model="unused",
@@ -1620,88 +1362,6 @@ class TestDeepseekV4Config:
         assert (server_args.speculative_num_steps) == (5)
         assert (server_args.speculative_num_draft_tokens) == (6)
 
-    def test_deepseek_v4_group_slot_mapping_expands_per_request_indices(self):
-        slots = _group_slot_mapping_from_raw(
-            positions=torch.tensor([0, 1, 2, 64, 65, 66], dtype=torch.int64),
-            req_indices=torch.tensor([0, 1], dtype=torch.int32),
-            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
-            rows_per_page=64,
-        )
-
-        assert torch.equal(slots, torch.tensor([640, 641, 642, 1344, 1345, 1346]))
-
-    def test_deepseek_v4_group_slot_mapping_from_raw(self):
-        block_table = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
-        slots = _group_slot_mapping_from_raw(
-            positions=torch.tensor([0, 63, 64, 9, 10], dtype=torch.int64),
-            req_indices=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32),
-            block_table=block_table,
-            rows_per_page=64,
-            entry_stride_tokens=1,
-        )
-        assert torch.equal(slots, torch.tensor([640, 703, 704, 1289, 1290]))
-
-        compressed_slots = _group_slot_mapping_from_raw(
-            positions=torch.tensor([0, 255, 256, 511], dtype=torch.int64),
-            req_indices=torch.tensor([0, 0, 0, 1], dtype=torch.int32),
-            block_table=block_table,
-            rows_per_page=64,
-            entry_stride_tokens=4,
-        )
-        assert torch.equal(compressed_slots, torch.tensor([640, 703, 704, -1]))
-
-    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
-    def test_deepseek_v4_prefill_topk_cuda_op_matches_torch_topk(self):
-        if not has_indexer_topk_prefill():
-            pytest.skip("DeepSeek V4 prefill top-k op is unavailable")
-
-        torch.manual_seed(0)
-        lengths = torch.tensor([0, 3, 17, 33], device="cuda", dtype=torch.int32)
-        logits = torch.randn((lengths.numel(), 40), device="cuda", dtype=torch.float32)
-        row_starts = torch.zeros_like(lengths)
-        out = torch.full((lengths.numel(), 8), -1, device="cuda", dtype=torch.int32)
-
-        indexer_topk_prefill(logits, row_starts, lengths, out, out.shape[-1])
-        torch.cuda.synchronize()
-
-        for row, raw_len in enumerate(lengths.cpu().tolist()):
-            selected = min(raw_len, out.shape[-1])
-            actual = out[row, :selected].sort().values.cpu()
-            if selected == 0:
-                assert torch.equal(out[row], torch.full_like(out[row], -1))
-                continue
-            expected = (
-                torch.topk(
-                    logits[row, :raw_len],
-                    k=selected,
-                    dim=-1,
-                    sorted=False,
-                )
-                .indices.sort()
-                .values.cpu()
-                .to(torch.int32)
-            )
-            assert torch.equal(actual, expected)
-            assert torch.equal(
-                out[row, selected:],
-                torch.full_like(out[row, selected:], -1),
-            )
-
-    def test_deepseek_v4_global_topk_cpu_masks_invalid_req_before_indexing(self):
-        indices, lens = dsv4_compute_global_topk_indices_and_lens(
-            topk_indices=torch.tensor([[0, 4], [0, 1]], dtype=torch.int32),
-            token_to_req_indices=torch.tensor([0, 99], dtype=torch.int32),
-            block_table=torch.tensor([[10]], dtype=torch.int32),
-            block_size=4,
-            is_valid_token=torch.tensor([True, False]),
-        )
-
-        assert torch.equal(
-            indices,
-            torch.tensor([[40, -1], [-1, -1]], dtype=torch.int32),
-        )
-        assert torch.equal(lens, torch.tensor([2, 0], dtype=torch.int32))
-
     def test_hidden_compression_reference_preserves_expected_shapes(self):
         torch.manual_seed(0)
         tokens, hc_mult, hidden = 3, 4, 5
@@ -1720,7 +1380,7 @@ class TestDeepseekV4Config:
             hc_eps=1e-6,
             sinkhorn_iters=2,
         )
-        updated = _mhc_post_reference(layer_input, residual, post, comb)
+        updated = torch_mhc_post(layer_input, residual, post, comb)
 
         assert (tuple(layer_input.shape)) == ((tokens, hidden))
         assert (tuple(post.shape)) == ((tokens, hc_mult, 1))
@@ -1784,7 +1444,7 @@ class TestDeepseekV4Config:
         post = torch.tensor([[[0.5], [0.25]]], dtype=torch.float32)
         comb = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32)
 
-        updated = _mhc_post_reference(hidden_states, residual, post, comb)
+        updated = torch_mhc_post(hidden_states, residual, post, comb)
 
         expected = torch.empty_like(residual)
         expected[:, 0] = (
@@ -1958,7 +1618,15 @@ class TestDeepseekV4Config:
         topk_ids = torch.empty(3, 6, device="cuda", dtype=torch.int32)
 
         try:
-            softplus_sqrt_topk_flash(logits, bias, topk_ids, topk_weights, 1.0, True)
+            softplus_sqrt_topk_flash(
+                logits,
+                bias,
+                topk_ids,
+                topk_weights,
+                1.0,
+                True,
+                enable_pdl=pdl_enabled(),
+            )
         except (AttributeError, RuntimeError) as exc:
             pytest.skip(f"fused DeepSeek V4 router op unavailable: {exc}")
         torch.cuda.synchronize()
@@ -2012,7 +1680,14 @@ class TestDeepseekV4Config:
 
         try:
             hash_softplus_sqrt_topk_flash(
-                logits, input_ids, table, topk_ids, topk_weights, 1.0, True
+                logits,
+                input_ids,
+                table,
+                topk_ids,
+                topk_weights,
+                1.0,
+                True,
+                enable_pdl=pdl_enabled(),
             )
         except (AttributeError, RuntimeError) as exc:
             pytest.skip(f"fused DeepSeek V4 hash router op unavailable: {exc}")

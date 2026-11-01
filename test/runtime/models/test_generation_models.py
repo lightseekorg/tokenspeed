@@ -3,7 +3,7 @@ Usage:
 
 To test a specific model:
 1. Add it to ALL_OTHER_MODELS
-2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m pytest test/runtime/models/test_generation_models.py::TestGenerationModels::test_others`
+2. Run `ONLY_RUN=Qwen/Qwen3-0.6B python3 -m pytest test/runtime/models/test_generation_models.py::TestGenerationModels::test_others`
 """
 
 import os
@@ -64,7 +64,8 @@ class ModelCase:
     max_model_len: int = None
     max_new_tokens: int = 32
     blackwell_only: bool = False
-    extra_kwargs: dict = dataclasses.field(default_factory=dict)
+    # More of the engine's command line.
+    extra_args: list[str] = dataclasses.field(default_factory=list)
 
 
 # Popular models that run on the CI
@@ -77,23 +78,29 @@ CI_MODELS = [
         skip_long_prompt=True,
         blackwell_only=True,
         max_new_tokens=256,
-        extra_kwargs={
-            "disable_prefill_graph": True,
-            "max_total_tokens": 32768,
-            "max_model_len": 16384,
-            "speculative_algorithm": "MTP",
-            "speculative_num_steps": 3,
-            "speculative_eagle_topk": 1,
-            "speculative_num_draft_tokens": 4,
-            "enable_replay_ssm": False,
-            "gpu_memory_utilization": 0.9,
-        },
+        extra_args=[
+            "--disable-prefill-graph",
+            "--max-total-tokens",
+            "32768",
+            "--max-model-len",
+            "16384",
+            "--speculative-algorithm",
+            "MTP",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--disable-replay-ssm",
+            "--gpu-memory-utilization",
+            "0.9",
+        ],
     ),
 ]
 
 # All other models that do not run on the CI
 ALL_OTHER_MODELS = [
-    ModelCase("Qwen/Qwen2-1.5B-Instruct"),
     ModelCase("Qwen/Qwen3.5-27B"),
     ModelCase("Qwen/Qwen3.5-35B-A3B"),
     ModelCase("Qwen/Qwen3.5-122B-A10B"),
@@ -149,16 +156,13 @@ class TestGenerationModels:
 
         with RTRunner(
             model_path,
-            disable_autotune=True,
-            world_size=model_case.tp_size,
             torch_dtype=torch_dtype,
-            model_type="generation",
+            world_size=model_case.tp_size,
             trust_remote_code=model_case.trust_remote_code,
             enforce_eager=model_case.enforce_eager,
-            # port=None uses auto-incrementing port
-            **model_case.extra_kwargs,
+            extra_args=["--disable-autotune", *model_case.extra_args],
         ) as rt_runner:
-            if "speculative_algorithm" in model_case.extra_kwargs:
+            if "--speculative-algorithm" in model_case.extra_args:
                 rt_outputs = rt_runner.batch_forward(
                     prompts, max_new_tokens=max_new_tokens
                 )

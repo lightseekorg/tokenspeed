@@ -71,7 +71,7 @@ class Nvfp4Config(QuantizationConfig):
         if quant_method is not None:
             kv_cache_quant_algo = config.get("kv_cache_quant_algo", "auto")
             group_size = config.get("group_size", 16)
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get("exclude_modules") or config.get("ignore", [])
         else:
             # Fall back to nested format (hf_quant_config.json)
             try:

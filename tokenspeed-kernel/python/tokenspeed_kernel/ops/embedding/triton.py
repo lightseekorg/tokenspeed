@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     dense_tensor_format,
@@ -494,6 +494,13 @@ def apply_rope_mla_set_kv_buffer_triton(
         MAX_FINITE=max_finite,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
+        # On AMD, keep the rotation scalar: LLVM then folds each FMA and its
+        # FP16 store conversion into one v_fma_mixlo_f16 with a single
+        # rounding, as embedding.rope compiles to. SLP-vectorized FMAs round
+        # to FP32 first and differ from it in rare ties.
+        **(
+            {"llvm_cl_opts": "vectorize-slp=false"} if current_platform().is_amd else {}
+        ),
     )
 
 
@@ -718,8 +725,10 @@ def _mla_nope_quantize_fp8_kernel(
     kno_stride_h,
     kro_stride_t,
     kro_stride_h,
+    num_heads: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_R: tl.constexpr,
     HAS_SCALE_Q_TENSOR: tl.constexpr,
@@ -727,8 +736,20 @@ def _mla_nope_quantize_fp8_kernel(
     BROADCAST_K: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
+    # One program per token and block of BLOCK_H heads: each of the four parts
+    # is a [BLOCK_H, dim] tile, masked to the real heads and columns.
     token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64) * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
+    q_rows = head < num_heads
+    # A single-head K is stored once, by the row of head 0.
+    if BROADCAST_K:
+        k_rows = head == 0
+    else:
+        k_rows = q_rows
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
+    mask_n = offs_n < nope_dim
+    offs_r = tl.arange(0, BLOCK_R)[None, :]
+    mask_r = offs_r < rope_dim
     # PDL: launched with launch_pdl; the q/k inputs may still be in flight from
     # the producer until griddepcontrol.wait orders them.
     if ENABLE_PDL:
@@ -738,59 +759,46 @@ def _mla_nope_quantize_fp8_kernel(
     if HAS_SCALE_KV_TENSOR:
         scale_kv = tl.load(scale_kv)
 
-    offs_n = tl.arange(0, BLOCK_N)
-    mask_n = offs_n < nope_dim
-    offs_r = tl.arange(0, BLOCK_R)
-    mask_r = offs_r < rope_dim
-
     qn = tl.load(
         q_nope + token * qn_stride_t + head * qn_stride_h + offs_n,
-        mask=mask_n,
+        mask=q_rows & mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    qr = tl.load(
+        q_rope + token * qr_stride_t + head * qr_stride_h + offs_r,
+        mask=q_rows & mask_r,
+        other=0.0,
+    ).to(tl.float32)
+    kn = tl.load(
+        k_nope + token * kn_stride_t + head * kn_stride_h + offs_n,
+        mask=k_rows & mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    kr = tl.load(
+        k_rope + token * kr_stride_t + head * kr_stride_h + offs_r,
+        mask=k_rows & mask_r,
         other=0.0,
     ).to(tl.float32)
     tl.store(
         q_nope_out + token * qno_stride_t + head * qno_stride_h + offs_n,
         (qn * scale_q).to(tl.float8e4nv),
-        mask=mask_n,
+        mask=q_rows & mask_n,
     )
-    qr = tl.load(
-        q_rope + token * qr_stride_t + head * qr_stride_h + offs_r,
-        mask=mask_r,
-        other=0.0,
-    ).to(tl.float32)
     tl.store(
         q_rope_out + token * qro_stride_t + head * qro_stride_h + offs_r,
         (qr * scale_q).to(tl.float8e4nv),
-        mask=mask_r,
+        mask=q_rows & mask_r,
     )
-
-    if BROADCAST_K:
-        store_k = head == 0
-    else:
-        store_k = True
-
-    kn = tl.load(
-        k_nope + token * kn_stride_t + head * kn_stride_h + offs_n,
-        mask=mask_n,
-        other=0.0,
-    ).to(tl.float32)
-    if store_k:
-        tl.store(
-            k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
-            (kn * scale_kv).to(tl.float8e4nv),
-            mask=mask_n,
-        )
-    kr = tl.load(
-        k_rope + token * kr_stride_t + head * kr_stride_h + offs_r,
-        mask=mask_r,
-        other=0.0,
-    ).to(tl.float32)
-    if store_k:
-        tl.store(
-            k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
-            (kr * scale_kv).to(tl.float8e4nv),
-            mask=mask_r,
-        )
+    tl.store(
+        k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
+        (kn * scale_kv).to(tl.float8e4nv),
+        mask=k_rows & mask_n,
+    )
+    tl.store(
+        k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
+        (kr * scale_kv).to(tl.float8e4nv),
+        mask=k_rows & mask_r,
+    )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -811,7 +819,10 @@ def mla_nope_quantize_fp8_triton(
 ) -> None:
     """The no-RoPE tail of apply_rope_mla: quantize the four query/key parts
     straight into their FP8 output slices in one launch. ``k_rope`` may carry
-    a single head; it broadcasts across the output heads via a zero stride."""
+    a single head; it broadcasts across the output heads via a zero stride.
+
+    The outputs must not overlap any input; the order in which programs run
+    is unspecified."""
     num_tokens, num_heads, nope_dim = q_nope.shape
     rope_dim = q_rope.shape[-1]
     kv_heads = k_nope.shape[1]
@@ -861,8 +872,14 @@ def mla_nope_quantize_fp8_triton(
     if isinstance(quant_scale_kv, torch.Tensor):
         quant_scale_kv = quant_scale_kv.contiguous()
 
+    block_n = max(16, _next_power_of_2(nope_dim))
+    block_r = max(16, _next_power_of_2(rope_dim))
+    # Heads per program: about 2048 elements in the wider of the NoPE and RoPE
+    # tiles. Derived from the model's head count and dims only, so it never
+    # changes per batch.
+    block_h = min(_next_power_of_2(num_heads), max(1, 2048 // max(block_n, block_r)))
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
-    _mla_nope_quantize_fp8_kernel[(num_tokens, num_heads)](
+    _mla_nope_quantize_fp8_kernel[(num_tokens, triton.cdiv(num_heads, block_h))](
         q_nope,
         q_rope,
         k_nope,
@@ -889,10 +906,12 @@ def mla_nope_quantize_fp8_triton(
         k_nope_out.stride(1),
         k_rope_out.stride(0),
         k_rope_out.stride(1),
+        num_heads=num_heads,
         nope_dim=nope_dim,
         rope_dim=rope_dim,
-        BLOCK_N=max(16, _next_power_of_2(nope_dim)),
-        BLOCK_R=max(16, _next_power_of_2(rope_dim)),
+        BLOCK_H=block_h,
+        BLOCK_N=block_n,
+        BLOCK_R=block_r,
         HAS_SCALE_Q_TENSOR=isinstance(quant_scale_q, torch.Tensor),
         HAS_SCALE_KV_TENSOR=isinstance(quant_scale_kv, torch.Tensor),
         BROADCAST_K=broadcast_k,
@@ -1099,12 +1118,18 @@ def triton_embedding_rope_mla(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["index_width", "index_stride_row", "index_stride_col"],
+)
 def _mxfp8_embedding_kernel(
     W,
     S,
     I,
     O,
+    index_width,
+    index_stride_row,
+    index_stride_col,
+    STRIDED_IDS: tl.constexpr,
     D: tl.constexpr,
     START: tl.constexpr,
     END: tl.constexpr,
@@ -1112,9 +1137,16 @@ def _mxfp8_embedding_kernel(
     SS: tl.constexpr,
     B: tl.constexpr,
 ):
-    row = tl.program_id(0)
     d = tl.arange(0, B)
-    index = tl.load(I + row)
+    if STRIDED_IDS:
+        index_col = tl.program_id(0).to(tl.int64)
+        index_row = tl.program_id(1).to(tl.int64)
+        row = index_row * index_width + index_col
+        index_offset = index_row * index_stride_row + index_col * index_stride_col
+    else:
+        row = tl.program_id(0).to(tl.int64)
+        index_offset = row
+    index = tl.load(I + index_offset).to(tl.int64)
     local = (index >= START) & (index < END)
     code = tl.load(W + (index - START) * WS + d, local & (d < D), 0.0).to(tl.float32)
     exponent = tl.load(S + (index - START) * SS + d // 32, local & (d < D), 127).to(
@@ -1197,121 +1229,6 @@ def vocab_shard_embedding(weight, indices, org_range, num_org_padding, added_ran
     return out
 
 
-@triton.jit
-def _engram_hash_kernel(
-    I,
-    P,
-    M,
-    TOKEN_MAP,
-    MULTIPLIERS,
-    PRIMES,
-    OFFSETS,
-    O,
-    num_tokens,
-    pad_id,
-    dead_id,
-    LAYERS: tl.constexpr,
-    HEADS: tl.constexpr,
-    HEADS_PAD: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    live = rows < num_tokens
-    heads = tl.arange(0, HEADS_PAD)
-    head_ok = heads < HEADS
-    # The current token and its three predecessors, newest first. A token is
-    # dead when missing (barrier) or, for the current one, masked out; every
-    # lookback at or beyond a dead token hashes as padding.
-    raw0 = tl.load(I + rows, live, dead_id).to(tl.int64)
-    raw1 = tl.load(P + rows * 3, live, dead_id).to(tl.int64)
-    raw2 = tl.load(P + rows * 3 + 1, live, dead_id).to(tl.int64)
-    raw3 = tl.load(P + rows * 3 + 2, live, dead_id).to(tl.int64)
-    blocked0 = (raw0 == dead_id) | (tl.load(M + rows, live, 0) == 0)
-    blocked1 = blocked0 | (raw1 == dead_id)
-    blocked2 = blocked1 | (raw2 == dead_id)
-    blocked3 = blocked2 | (raw3 == dead_id)
-    # Dead ids may lie outside the tokenizer vocabulary: map row 0 instead.
-    token0 = tl.load(TOKEN_MAP + tl.where(blocked0, 0, raw0), live, 0)
-    token1 = tl.load(TOKEN_MAP + tl.where(blocked1, 0, raw1), live, 0)
-    token2 = tl.load(TOKEN_MAP + tl.where(blocked2, 0, raw2), live, 0)
-    token3 = tl.load(TOKEN_MAP + tl.where(blocked3, 0, raw3), live, 0)
-    token0 = tl.where(blocked0, pad_id, token0)
-    token1 = tl.where(blocked1, pad_id, token1)
-    token2 = tl.where(blocked2, pad_id, token2)
-    token3 = tl.where(blocked3, pad_id, token3)
-    for layer in tl.static_range(LAYERS):
-        rolling = token0 * tl.load(MULTIPLIERS + layer * 4)
-        for shift in tl.static_range(1, 4):
-            if shift == 1:
-                rolling = rolling ^ (token1 * tl.load(MULTIPLIERS + layer * 4 + shift))
-            elif shift == 2:
-                rolling = rolling ^ (token2 * tl.load(MULTIPLIERS + layer * 4 + shift))
-            else:
-                rolling = rolling ^ (token3 * tl.load(MULTIPLIERS + layer * 4 + shift))
-            column = (layer * 3 + shift - 1) * HEADS
-            primes = tl.load(PRIMES + column + heads, head_ok, 1)
-            offsets = tl.load(OFFSETS + column + heads, head_ok, 0)
-            # Python's modulo: the bucket takes the sign of the (positive) prime.
-            bucket = rolling[:, None] % primes[None, :]
-            bucket = tl.where(bucket < 0, bucket + primes[None, :], bucket)
-            tl.store(
-                O + rows[:, None] * (LAYERS * 3 * HEADS) + column + heads[None, :],
-                bucket + offsets[None, :],
-                live[:, None] & head_ok[None, :],
-            )
-
-
-@register_kernel(
-    "embedding",
-    "engram_hash",
-    name="triton_engram_hash",
-    solution="triton",
-    signatures=[format_signature(indices=dense_tensor_format(torch.int64))],
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    priority=Priority.PORTABLE,
-)
-def engram_hash(
-    input_ids,
-    previous_token_ids,
-    token_mask,
-    token_map,
-    multipliers,
-    primes,
-    offsets,
-    pad_id,
-    dead_id,
-):
-    """Hash each token's 2/3/4-gram windows into per-layer table rows."""
-    layers, heads = primes.shape[0], primes.shape[2]
-    num_tokens = input_ids.shape[0]
-    out = torch.empty(
-        (num_tokens, layers, 3 * heads), dtype=torch.int64, device=input_ids.device
-    )
-    if num_tokens:
-        # 64-bit remainders dominate; small blocks keep each thread at one
-        # bucket per (layer, order) even for a decode step's dozen tokens.
-        block = 16
-        _engram_hash_kernel[(triton.cdiv(num_tokens, block),)](
-            input_ids,
-            previous_token_ids,
-            token_mask.view(torch.int8),
-            token_map,
-            multipliers,
-            primes,
-            offsets,
-            out,
-            num_tokens,
-            pad_id,
-            dead_id,
-            LAYERS=layers,
-            HEADS=heads,
-            HEADS_PAD=triton.next_power_of_2(heads),
-            BLOCK=block,
-            num_warps=4,
-        )
-    return out
-
-
 @register_kernel(
     "embedding",
     "mxfp8_embedding",
@@ -1327,11 +1244,24 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         (*indices.shape, weight.shape[1]), dtype=torch.bfloat16, device=indices.device
     )
     if indices.numel():
-        _mxfp8_embedding_kernel[(indices.numel(),)](
+        strided = not indices.is_contiguous()
+        if strided and indices.shape[0] > 2048:
+            # Large prefills amortize the ID copy and favor the flat gather.
+            # This also keeps the second grid dimension within its limit.
+            indices = indices.contiguous()
+            strided = False
+        # A two-dimensional grid provides the ID coordinates without a
+        # per-workgroup runtime division for decode and short prefills.
+        grid = (indices.shape[1], indices.shape[0]) if strided else (indices.numel(),)
+        _mxfp8_embedding_kernel[grid](
             weight,
             scales,
             indices,
             out,
+            indices.shape[1] if strided else 1,
+            indices.stride(0) if strided else 1,
+            indices.stride(1) if strided else 1,
+            strided,
             weight.shape[1],
             row_start,
             row_end,

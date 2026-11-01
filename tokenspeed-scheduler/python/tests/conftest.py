@@ -79,3 +79,16 @@ def _find_forward_op(plan):
 
 def _positive(row) -> list[int]:
     return [page for page in row if page > 0]
+
+
+def storage_ops(plan):
+    """The Host-only commands in a scheduler's unified cache plan."""
+    Cache = ts.Cache
+
+    types = (
+        Cache.StorageQueryOp,
+        Cache.StorageGetOp,
+        Cache.StoragePutOp,
+        Cache.StorageCancelOp,
+    )
+    return [operation for operation in plan.cache if isinstance(operation, types)]

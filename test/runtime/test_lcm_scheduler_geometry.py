@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from tokenspeed.runtime.engine.scheduler_utils import scheduler_cache_geometry_from_pool
 
 
@@ -39,3 +41,49 @@ def test_lcm_scheduler_geometry_uses_contract_token_capacity():
 
     assert geometry.num_usable_pages == 37
     assert geometry.token_capacity == 10_000
+
+
+@pytest.mark.parametrize("grain", [None, 4096])
+def test_state_checkpoint_granularity_survives_the_scheduler_bridge(grain):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+        cache_group_config,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    spec = CacheGroupSpec(
+        group_id="state",
+        attn_kind="state",
+        replayable=False,
+        checkpoint_granularity=grain,
+    )
+    config = cache_group_config(spec, total_pages=257, cache_blocks_per_lcm_block=1)
+    config.validate()
+    assert config.checkpoint_granularity == (grain or 1)
+    assert config.block_granularity == 0
+
+
+@pytest.mark.parametrize("grain", [0, -1, True, 1.5])
+def test_invalid_state_checkpoint_grain_is_rejected(grain):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    with pytest.raises(ValueError, match="checkpoint_granularity"):
+        CacheGroupSpec(
+            group_id="state",
+            attn_kind="state",
+            replayable=False,
+            checkpoint_granularity=grain,
+        )
+
+
+def test_history_groups_do_not_accept_a_state_checkpoint_grain():
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    with pytest.raises(ValueError, match="checkpoint_granularity"):
+        CacheGroupSpec(
+            group_id="kv",
+            attn_kind="full_history",
+            replayable=False,
+            rows_per_page=128,
+            entry_stride_tokens=1,
+            checkpoint_granularity=4096,
+        )

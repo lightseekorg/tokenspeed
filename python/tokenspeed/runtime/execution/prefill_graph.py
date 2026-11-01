@@ -1021,7 +1021,7 @@ class PrefillGraph:
 
     def _dummy_group_tables(self, bs: int) -> dict[str, "torch.Tensor"]:
         """Build the capture batch's group tables: one row per fabricated
-        request, one width per group, row ``i`` holding block ``i + 1``.
+        request, one width per group, and disjoint parents across groups.
 
         A history group's width is ``ceil(physical_context_len / grain)``,
         whatever its retention. The physical extent is the quantity every
@@ -1064,8 +1064,16 @@ class PrefillGraph:
         # Built on the host: make_dummy_batch's only use of these is
         # ``.cpu().numpy()`` for the contract packer, so a device tensor here
         # would be allocated and copied straight back off per group per bucket.
-        first_block = torch.arange(1, bs + 1, dtype=torch.int32)
+        parent_offset = 0
         for spec in self.token_to_kv_pool.arena.cache_group_specs:
+            packing = self.token_to_kv_pool.arena.runtime_contract.virtual_packing[
+                spec.group_id
+            ]
+            # Groups share byte planes, so each must own separate physical parents.
+            first_block = (
+                torch.arange(1, bs + 1, dtype=torch.int32) + parent_offset * packing
+            )
+            parent_offset += -(-bs // packing)
             if spec.attn_kind == "state":
                 rows = torch.zeros((bs, STATE_TABLE_SLOTS), dtype=torch.int32)
                 rows[:, STATE_LIVE_SLOT] = first_block
@@ -1102,7 +1110,7 @@ class PrefillGraph:
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot; per-group table widths come from
         :meth:`_dummy_group_tables`. Backends with extra cache groups
-        (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every group
+        (DeepSeek V4.1: SWA + compressor + indexer state) need every group
         table, or their extend metadata is incomplete.
 
         On a query-sharding engine (``config.query_shard_size > 1``) the
@@ -1282,6 +1290,19 @@ class PrefillGraph:
             if ctx.global_num_tokens is not None
             else [num_tokens] * self.config.world_size
         )
+        # The layerwise Host-load waits are made eagerly, and a captured
+        # segment holds none: a prologue writes latent rows into a page a
+        # tail hit loads, and an inline KDA layer reads the State checkpoint
+        # a hit loads, both inside segments. So a replay waits for the
+        # plan's whole Host load (its last layer's event, which the load
+        # stream records after every earlier layer's copy) before its first
+        # segment.
+        tracker = self.token_to_kv_pool.layerwise_load_tracker
+        if tracker is not None:
+            for index in tracker.consumer_indices:
+                torch.cuda.current_stream().wait_event(
+                    tracker.event_sets[index].last_layer_done_event
+                )
         if self._narrowing is not None:
             hidden_states, aux_hidden_states = self._replay_narrowed(
                 bucket, ctx, num_tokens

@@ -19,7 +19,7 @@ server:
     MAX_MODEL_LEN=80000
     bash test/ci_system/serve_qwen35_397b_nvfp4_pd_1p1d.sh
   ready:
-    url: http://127.0.0.1:8000/v1/models
+    url: http://127.0.0.1:8000/readiness
     timeout: 2400
     interval: 10
 eval:

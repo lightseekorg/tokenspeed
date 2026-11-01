@@ -1,7 +1,7 @@
 # KDA prefill CUDA graphs
 
 KDA prefill runs a sequence of short kernels for state preparation, convolution,
-gate projection, recurrent scanning and state writeback. Launching those kernels
+gate projection, recurrent scanning, and state writeback. Launching those kernels
 from Python at every layer can leave gaps between GPU operations, especially
 when an incremental request adds relatively few tokens to a cached conversation.
 
@@ -20,7 +20,7 @@ prefill computation and the scheduler-owned two-slot state table.
 
 The outer prefill graph captures the model in segments, with attention calls
 normally forming breaks between them. For eligible KDA batches, KDA runs inside
-those segments alongside its input projections, gated RMSNorm, output projection
+those segments alongside its input projections, gated RMSNorm, output projection,
 and neighboring model operations. Consecutive KDA layers can therefore share a
 segment. MLA attention calls still form breaks.
 
@@ -43,7 +43,7 @@ create a new graph during serving.
 
 With the feature enabled, supported pure-prefill forwards use the same
 capacity-shaped metadata for eager execution, capture and replay. Before the
-forward, the backend prepares request boundaries, convolution maps and
+forward, the backend prepares request boundaries, convolution maps, and
 state-block indices once for all KDA layers. Captured shapes refresh retained
 buffers at their original addresses. Uncaptured shapes use temporary storage.
 The scheduler remains responsible for cache allocation and for which block a
@@ -76,11 +76,11 @@ packing of an unpadded forward, so the captured replay and the eager forward
 agree bit for bit.
 
 An unused request slot has zero convolution length, negative input/output
-state-block indices and one zero-input padding row in the scan. No padding
+state-block indices, and one zero-input padding row in the scan. No padding
 result reaches a real request or cache block: the masked state writer drops
 rows whose block is negative, and the padded output rows are zeroed. Padding
 never becomes a scheduler request or a persistent cache entry. The live batch
-size is unchanged for MLA, output sampling and scheduling. The backend
+size is unchanged for MLA, output sampling, and scheduling. The backend
 refreshes retained metadata in place when a capture alternates between
 partially and fully occupied batches.
 
@@ -108,7 +108,7 @@ The shared server configuration supplies this setting to every TP worker.
 
 | Setting | Meaning |
 |---|---|
-| `--prefill-graph-max-tokens` | Largest captured token capacity. Defaults to `min(2048, chunked-prefill size)`; `0` disables prefill graphs. |
+| `--prefill-graph-max-tokens` | Largest captured token capacity. Defaults to `min(8192, chunked-prefill size)`; `0` disables prefill graphs. |
 | `--prefill-graph-capture-token-sizes` | Shared token buckets for outer and KDA captures. There is no separate KDA bucket list. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities captured with inline KDA; replay rounds up to a fitting capacity. Independent of the decode graph's batch-size list. |
 
@@ -147,7 +147,7 @@ metadata remain resident per configuration.
 ## Coverage and fallback
 
 Merged KDA capture applies to pure prefill batches with a fitting request capacity
-and token bucket. Live counts, lengths and prefix hits can vary within that
+and token bucket. Live counts, lengths, and prefix hits can vary within that
 configuration.
 
 - Mixed prefill/decode batches and request counts above captured capacity retain the
@@ -173,4 +173,4 @@ rest of the model. The runtime reports capture failures and invalid metadata
 as errors. It does not silently treat them as unsupported batches.
 
 See [the execution invariants](unified_path.md#recurrent-prefill-subgraphs-kda-mamba2-gdn)
-for the metadata, padding and graph-pool lifetime contracts.
+for the metadata, padding, and graph-pool lifetime contracts.

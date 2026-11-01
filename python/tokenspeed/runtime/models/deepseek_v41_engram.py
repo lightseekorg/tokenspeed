@@ -22,11 +22,13 @@
 
 Integration contract:
 * Construct one EngramHashState from the text config and the actual tokenizer.
-  Pass raw previous-three IDs, newest first, alongside every current token.
+  Its immutable input_parameters are borrowed by runtime preparation, which
+  resolves raw previous-three IDs and computes hashes before model execution.
   -1 denotes a sequence boundary or a nonparticipating (e.g. image) token.
 * Input preparation owns these small windows, including pending overlap tokens
   and the current speculative branch. Refresh pointer-stable input buffers for
-  eager and graph forwards alike; never put request tensors in ForwardContext.
+  eager and graph forwards alike. Models receive prepared hashes and masks;
+  never put request tensors in ForwardContext.
 * Hidden states, hashes and masks must be replicated within mapping.attn.tp_group.
   GPU-resident tables are row-sharded across attention TP and all-reduced.
   Host tables stay in anonymous or shared host memory and gather through UVA.
@@ -54,7 +56,6 @@ import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -62,6 +63,10 @@ import torch
 from sympy import isprime
 from tokenizers import Regex, normalizers
 from tokenspeed_kernel.ops.embedding import host_gather
+from tokenspeed_kernel.ops.metadata.ngram import (
+    NGramHashParams,
+    engram_hash_reciprocals,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -77,7 +82,6 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
-DEAD_TOKEN_ID = -1
 _ENGRAM_EMBED_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
 
 
@@ -199,41 +203,6 @@ class EngramLayout:
         )
 
 
-def build_engram_previous_tokens(
-    token_histories: Sequence[Sequence[int]],
-    request_indices: Sequence[int],
-    positions: Sequence[int],
-) -> torch.Tensor:
-    """Return CPU int64 [tokens, 3] raw lookbacks, newest first.
-
-    Histories are existing physical-position request histories (prompt + accepted
-    output), with nonparticipating positions marked -1. For verification, supply
-    the proposed branch as well. Request indices and positions describe each
-    packed forward token, so reordering, prefix hits and chunking need no state.
-    No history is mutated or copied in full. The forward thread transfers this
-    small result; callers must overlay pending GPU-owned overlap/draft IDs there.
-    """
-    if len(request_indices) != len(positions):
-        raise ValueError("Engram request indices and positions must have equal lengths")
-    windows = []
-    for request_index, position in zip(request_indices, positions, strict=True):
-        if not 0 <= request_index < len(token_histories):
-            raise ValueError(f"Invalid Engram history request index {request_index}")
-        history = token_histories[request_index]
-        if not 0 <= position <= len(history):
-            raise ValueError(
-                f"Engram history is missing tokens before position {position}"
-            )
-        window = [
-            history[position - shift] if position >= shift else DEAD_TOKEN_ID
-            for shift in (1, 2, 3)
-        ]
-        if any(token_id < DEAD_TOKEN_ID for token_id in window):
-            raise ValueError("Mark nonparticipating history tokens with -1")
-        windows.append(window)
-    return torch.tensor(windows, dtype=torch.int64, device="cpu").reshape(-1, 3)
-
-
 class EngramHashState(nn.Module):
     """Immutable tokenizer/hash constants only; no per-request token cache."""
 
@@ -248,9 +217,15 @@ class EngramHashState(nn.Module):
         if not 0 <= config.engram_pad_token_id < len(token_map):
             raise ValueError("Engram pad token is outside the tokenizer vocabulary")
         self.pad_id = token_map[config.engram_pad_token_id]
-        primes = torch.tensor(self.layout.primes, dtype=torch.int64, device=device)
+        host_primes = torch.tensor(self.layout.primes, dtype=torch.int64, device="cpu")
+        primes = host_primes.to(device=device)
         flat = primes.flatten(1)
         self.register_buffer("primes", primes, persistent=False)
+        self.register_buffer(
+            "reciprocals",
+            engram_hash_reciprocals(host_primes).to(device=device),
+            persistent=False,
+        )
         self.register_buffer("offsets", flat.cumsum(-1) - flat, persistent=False)
         self.register_buffer(
             "token_map",
@@ -291,34 +266,19 @@ class EngramHashState(nn.Module):
             or previous_token_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise TypeError("Engram expects int32/int64 IDs and a bool token mask")
-        if input_ids.is_cuda:
-            from tokenspeed_kernel.ops.embedding import engram_hash
+        return self.input_parameters.hash(input_ids, previous_token_ids, token_mask)
 
-            hashes = engram_hash(
-                input_ids.reshape(-1).contiguous(),
-                previous_token_ids.reshape(-1, 3).contiguous(),
-                token_mask.reshape(-1).contiguous(),
-                self.token_map,
-                self.multipliers,
-                self.primes,
-                self.offsets,
-                self.pad_id,
-                DEAD_TOKEN_ID,
-            )
-            return hashes.view(*input_ids.shape, *self.offsets.shape)
-        raw = torch.cat((input_ids.unsqueeze(-1), previous_token_ids), dim=-1).long()
-        dead = raw == DEAD_TOKEN_ID
-        dead[..., 0] |= ~token_mask
-        # Replace BEFORE indexing: nonparticipating current IDs can be out of vocab.
-        mapped = self.token_map[raw.masked_fill(dead, 0)]
-        blocked = dead.long().cumsum(-1) > 0
-        tokens = mapped.masked_fill(blocked, self.pad_id)
-        products = tokens.unsqueeze(-2) * self.multipliers
-        rolling, hashes = products[..., 0], []
-        for shift in range(1, 4):
-            rolling = torch.bitwise_xor(rolling, products[..., shift])
-            hashes.append(rolling.unsqueeze(-1) % self.primes[:, shift - 1])
-        return torch.cat(hashes, dim=-1) + self.offsets
+    @property
+    def input_parameters(self) -> NGramHashParams:
+        """Expose the current immutable buffers to executor-owned input preparation."""
+        return NGramHashParams(
+            self.token_map,
+            self.primes,
+            self.reciprocals,
+            self.offsets,
+            self.multipliers,
+            self.pad_id,
+        )
 
 
 def _host_table_dir(nbytes: int) -> str:
@@ -716,10 +676,14 @@ class RowShardedEngramEmbedding(nn.Module):
         if indices.is_cuda and not self.host_table:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
+            # Each layer's 2D hash slice can be gathered directly; retain the
+            # contiguous fallback for arbitrary leading dimensions.
+            if indices.ndim != 2:
+                indices = indices.contiguous()
             values = mxfp8_embedding(
                 self.weight,
                 self.scale,
-                indices.contiguous(),
+                indices,
                 self.row_start,
                 self.row_end,
             )

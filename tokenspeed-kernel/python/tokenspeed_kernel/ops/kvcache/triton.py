@@ -127,32 +127,61 @@ def _copy_geometry_slice(
                 + host_child * host_block_bytes
                 + host_field_offset
             )
-            byte_offsets = chunk_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            mask = byte_offsets < payload_bytes
-            device_ptr = tl.cast(
-                device_address + device_offset,
-                tl.pointer_type(tl.uint8),
-            )
-            host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
-            if DIRECTION == 0:
-                values = tl.load(
-                    device_ptr + byte_offsets,
-                    mask=mask,
-                    cache_modifier=".cg",
+            device_base = device_address + device_offset
+            host_base = host_address + host_offset
+            if ((device_base | host_base | payload_bytes) & 15) == 0:
+                # All addresses and the masked final group are 16-byte aligned.
+                # Word accesses avoid one memory instruction for every byte.
+                word_offsets = chunk_index * (BLOCK_SIZE // 4) + tl.arange(
+                    0, BLOCK_SIZE // 4
                 )
-                tl.store(
-                    host_ptr + byte_offsets,
-                    values,
-                    mask=mask,
-                    cache_modifier=".cs",
+                word_count = tl.multiple_of(payload_bytes // 4, 4)
+                word_mask = word_offsets < word_count
+                device_words = tl.cast(
+                    tl.multiple_of(device_base, 16), tl.pointer_type(tl.uint32)
                 )
+                host_words = tl.cast(
+                    tl.multiple_of(host_base, 16), tl.pointer_type(tl.uint32)
+                )
+                if DIRECTION == 0:
+                    word_values = tl.load(
+                        device_words + word_offsets,
+                        mask=word_mask,
+                        cache_modifier=".cg",
+                    )
+                    tl.store(
+                        host_words + word_offsets,
+                        word_values,
+                        mask=word_mask,
+                        cache_modifier=".cs",
+                    )
+                else:
+                    word_values = tl.load(
+                        host_words + word_offsets, mask=word_mask, cache_modifier=".cg"
+                    )
+                    tl.store(device_words + word_offsets, word_values, mask=word_mask)
             else:
-                values = tl.load(
-                    host_ptr + byte_offsets,
-                    mask=mask,
-                    cache_modifier=".cg",
-                )
-                tl.store(device_ptr + byte_offsets, values, mask=mask)
+                byte_offsets = chunk_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                byte_mask = byte_offsets < payload_bytes
+                device_bytes = tl.cast(device_base, tl.pointer_type(tl.uint8))
+                host_bytes = tl.cast(host_base, tl.pointer_type(tl.uint8))
+                if DIRECTION == 0:
+                    byte_values = tl.load(
+                        device_bytes + byte_offsets,
+                        mask=byte_mask,
+                        cache_modifier=".cg",
+                    )
+                    tl.store(
+                        host_bytes + byte_offsets,
+                        byte_values,
+                        mask=byte_mask,
+                        cache_modifier=".cs",
+                    )
+                else:
+                    byte_values = tl.load(
+                        host_bytes + byte_offsets, mask=byte_mask, cache_modifier=".cg"
+                    )
+                    tl.store(device_bytes + byte_offsets, byte_values, mask=byte_mask)
 
 
 @triton.jit
@@ -447,7 +476,7 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     )
 
 
-@triton.jit(do_not_specialize=["num_fields"])
+@triton.jit(do_not_specialize=["num_fields", "num_ranges"])
 def _zero_page_fields_kernel(
     backing_ptr,
     pages_ptr,
@@ -455,22 +484,23 @@ def _zero_page_fields_kernel(
     # Runtime: the field count follows the cache group and the page count the
     # batch; neither may specialize the binary.
     num_fields,
+    num_ranges,
     BLOCK_SIZE: tl.constexpr,
 ):
-    entry = tl.program_id(0)
-    page = tl.load(pages_ptr + entry // num_fields).to(tl.int64)
-    field = fields_ptr + (entry % num_fields) * 3
-    range_offset = tl.load(field) + page * tl.load(field + 1)
-    range_size = tl.load(field + 2)
-    for start in range(
-        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
-    ):
-        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
-        tl.store(
-            backing_ptr + range_offset + byte_offsets,
-            0,
-            mask=byte_offsets < range_size,
-        )
+    for entry in range(tl.program_id(0), num_ranges, tl.num_programs(0)):
+        page = tl.load(pages_ptr + entry // num_fields).to(tl.int64)
+        field = fields_ptr + (entry % num_fields) * 3
+        range_offset = tl.load(field) + page * tl.load(field + 1)
+        range_size = tl.load(field + 2)
+        for start in range(
+            tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+        ):
+            byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+            tl.store(
+                backing_ptr + range_offset + byte_offsets,
+                0,
+                mask=byte_offsets < range_size,
+            )
 
 
 def zero_page_fields(
@@ -522,11 +552,18 @@ def zero_page_fields(
         num_ranges,
         min(tiles_per_range, triton.cdiv(max_field_bytes, block_size)),
     )
+    # Ascend's launch limit applies to the flattened grid. Stride the ranges
+    # when long-context admission exceeds it; every requested page is cleared.
+    # With num_ranges >= 1, tiles_per_range <= 1024, so this cap always
+    # leaves at least one program in the first dimension.
+    if backing.device.type == "npu":
+        grid = (min(grid[0], 65535 // grid[1]), grid[1])
     _zero_page_fields_kernel[grid](
         backing,
         pages,
         fields,
         fields.shape[0],
+        num_ranges,
         BLOCK_SIZE=block_size,
         num_warps=4,
     )
@@ -631,7 +668,7 @@ def copy_page_fields(
 # -----------------------------------------------------------------------------
 
 
-@triton.jit(do_not_specialize=["rows_per_layer"])
+@triton.jit(do_not_specialize=["rows_per_layer", "work_start"])
 def _copy_state_rows_kernel(
     src_addresses_ptr,
     dst_addresses_ptr,
@@ -640,6 +677,7 @@ def _copy_state_rows_kernel(
     src_rows_ptr,
     dst_rows_ptr,
     rows_per_layer,
+    work_start,
     ROW_I32: tl.constexpr,
     BLOCK_I32: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -653,7 +691,7 @@ def _copy_state_rows_kernel(
     """
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-    work_index = tl.program_id(0)
+    work_index = tl.program_id(0) + work_start
     chunk_index = tl.program_id(1)
     layer_index = work_index // rows_per_layer
 
@@ -693,7 +731,7 @@ def copy_state_rows(
     src_row_strides: torch.Tensor,
     dst_row_strides: torch.Tensor,
 ) -> None:
-    """Copy state rows between per-layer slab pairs in one Triton launch.
+    """Copy state rows between per-layer slabs with a bounded device grid.
 
     Replaces per-layer ``dst[dst_rows] = src[src_rows]`` gather/scatter chains
     (e.g. MTP verify-scratch seeding and post-verify state commit) with a
@@ -717,7 +755,8 @@ def copy_state_rows(
             int32 units.
 
     Returns:
-        None. Rows are copied in place in one launch.
+        None. Rows are copied in place. Ascend uses a conservative cap of
+        65535 programs per launch; other devices use one launch.
     """
     enable_pdl = pdl_enabled()
     total = src_rows.numel()
@@ -746,22 +785,38 @@ def copy_state_rows(
     row_i32 = row_bytes // 4
     block_i32 = 1024
     chunks = triton.cdiv(row_i32, block_i32)
-    _copy_state_rows_kernel[(total, chunks)](
-        src_addresses,
-        dst_addresses,
-        src_row_strides,
-        dst_row_strides,
-        src_rows,
-        dst_rows,
-        total // num_layers,
-        ROW_I32=row_i32,
-        BLOCK_I32=block_i32,
-        ENABLE_PDL=enable_pdl,
-        **({"launch_pdl": True} if enable_pdl else {}),
+    # Ascend flattens the logical Triton grid into coreDim. Keep a conservative
+    # 65535-program cap and split only grids that exceed it.
+    rows_per_launch = (
+        min(total, 65535 // chunks) if src_addresses.device.type == "npu" else total
     )
+    if rows_per_launch == 0:
+        raise ValueError("one state row exceeds the NPU kernel launch grid limit")
+    for start in range(0, total, rows_per_launch):
+        _copy_state_rows_kernel[(min(total - start, rows_per_launch), chunks)](
+            src_addresses,
+            dst_addresses,
+            src_row_strides,
+            dst_row_strides,
+            src_rows,
+            dst_rows,
+            total // num_layers,
+            start,
+            ROW_I32=row_i32,
+            BLOCK_I32=block_i32,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
 
 
-@triton.jit(do_not_specialize=["num_rows", "state_width"])
+@triton.jit(
+    do_not_specialize=["num_rows", "state_width"],
+    **(
+        {"do_not_specialize_on_alignment": ["blocks"]}
+        if current_platform().is_npu
+        else {}
+    ),
+)
 def _store_state_rows_kernel(
     states,
     slab,
@@ -838,7 +893,7 @@ def store_state_rows(
         blocks.numel() > 1 and blocks.stride(0) != 1
     ):
         raise ValueError("blocks must be a unit-stride int32/int64 vector")
-    if not states.is_cuda:
+    if states.device.type not in ("cuda", "npu"):
         live = blocks >= 0
         slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
         return
@@ -1244,7 +1299,6 @@ def _set_mla_kv_buffer_kernel(
 
 @triton.jit(
     do_not_specialize=["n_loc"],
-    do_not_specialize_on_alignment=["n_loc"],
 )
 def _set_mla_kv_buffer_per_loc_kernel(
     kv_buffer_ptr,
@@ -1831,6 +1885,8 @@ def _store_kv_cache_kernel(
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Dependents may launch now; their own wait still covers this grid's completion.
+        tl.extra.cuda.gdc_launch_dependents()
 
     dst_row = tl.load(loc_ptr + row).to(tl.int64)
 
@@ -1844,9 +1900,6 @@ def _store_kv_cache_kernel(
             k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
         )
         tl.store(k_dst_ptr + dst_row * k_dst_row_stride + offsets, src, mask=mask)
-
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def store_kv_cache(

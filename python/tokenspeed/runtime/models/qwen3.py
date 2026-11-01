@@ -46,7 +46,6 @@ from tokenspeed.runtime.layers.paged_attention import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed.runtime.layers.utils import get_layer_id
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
@@ -392,25 +391,6 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(BaseCausalLM):
     model_cls = Qwen3Model
 
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
-
     def __init__(
         self,
         config: Qwen3Config,
@@ -450,17 +430,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
         for name, loaded_weight in weights:
             if "Embedding" in self.config.name_or_path:
                 name = add_prefix(name, "model")
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

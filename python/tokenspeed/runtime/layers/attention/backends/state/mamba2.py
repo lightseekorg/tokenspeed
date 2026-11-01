@@ -26,6 +26,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.mamba2 import (
     Mamba2ChunkMetadata,
     build_mamba2_chunk_metadata,
@@ -184,12 +185,17 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         num_real_tokens: int,
         lower_bound: float | None,
         cu_seqlens_cpu: torch.Tensor | None = None,
+        state_checkpoints: GdnStateCheckpoints | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked SSD scan from the gathered states; see the base seam.
 
         Returns ``([1, T, H, P]`` output, ``[bs, H, P, N]`` final states)``.
         Rows past the live boundaries stay zero.
         """
+        if state_checkpoints is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} stores no in-forward State checkpoints"
+            )
         del seq_len, num_real_tokens
         D = _require_mamba2_inputs(
             D, b, g_raw, f_a_out, f_b_weight, beta_raw, lower_bound

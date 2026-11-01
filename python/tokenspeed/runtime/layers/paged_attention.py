@@ -34,9 +34,11 @@ from typing import Protocol
 
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
+    FP8TensorScales,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
+    KVCacheFormat,
     LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
@@ -47,12 +49,19 @@ from tokenspeed_kernel.ops.attention.prologue import (
 )
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+from tokenspeed.runtime.distributed.comm_ops import (
+    token_all_gather,
+    token_all_gather_rows,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.model_loader.weight_utils import (
+    K_CACHE_SCALE_SUFFIXES,
+    V_CACHE_SCALE_SUFFIXES,
+)
 
 
 @dataclass(frozen=True)
@@ -156,6 +165,31 @@ class PagedAttention(nn.Module):
         self._group_id: str | None = None
         self.rotary_emb = rotary_emb
         self.qk_norm = qk_norm
+        # Per-tensor FP8 KV-cache scales (None at unit); a non-FP8 cache ignores them.
+        self.fp8_kv_scales: FP8TensorScales | None = None
+
+    def load_kv_cache_scale(self, name: str, scale: torch.Tensor) -> None:
+        """Take a checkpoint's key, value or shared KV-cache scale tensor."""
+        if scale.numel() != 1:
+            raise NotImplementedError(
+                f"PagedAttention layer_id={self.layer_id}: {name} holds "
+                f"{scale.numel()} scales; only per-tensor KV-cache scales are "
+                "supported"
+            )
+        k, v = (
+            (1.0, 1.0)
+            if self.fp8_kv_scales is None
+            else (self.fp8_kv_scales.k, self.fp8_kv_scales.v)
+        )
+        if name.endswith(K_CACHE_SCALE_SUFFIXES):
+            k = float(scale.item())
+        elif name.endswith(V_CACHE_SCALE_SUFFIXES):
+            v = float(scale.item())
+        elif name.endswith(".kv_scale"):
+            k = v = float(scale.item())
+        else:
+            raise KeyError(f"{name!r} is not a KV-cache scale tensor")
+        self.fp8_kv_scales = None if k == v == 1.0 else FP8TensorScales(k, v)
 
     @property
     def group_id(self) -> str:
@@ -266,6 +300,31 @@ class PagedAttention(nn.Module):
             override=None,
         )
 
+    def store_prepared(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> GQAPrologueOutput:
+        """Write rows whose projection or collective already applied norm/RoPE.
+
+        The producer must match this layer's prologue numerical contract.
+        This method owns the usual padded write slots and cache conversion;
+        call :meth:`attend` with its result to avoid repeating the head steps.
+        """
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=None,
+            rotary=None,
+            cache=self._write_target(q, ctx),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
     def _steps(
         self, positions: torch.Tensor | None
     ) -> tuple[HeadNorm | None, Rotary | None]:
@@ -289,7 +348,21 @@ class PagedAttention(nn.Module):
         slots, owned = resolve_cache_slots(
             slots, ctx.attn_backend.cache_placement(self)
         )
-        return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+        target = ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+        if (
+            self.fp8_kv_scales is not None
+            and isinstance(target, HeadKVCache)
+            and target.format is KVCacheFormat.FP8
+        ):
+            # Every reader of this cache must apply the scales it was written at.
+            if not ctx.attn_backend.reads_fp8_kv_scales(self):
+                raise NotImplementedError(
+                    f"layer {self.layer_id} has per-tensor KV-cache scales "
+                    f"{self.fp8_kv_scales}, which "
+                    f"{type(ctx.attn_backend).__name__} does not read"
+                )
+            target = replace(target, scales=self.fp8_kv_scales)
+        return target
 
     def attend_live_rows(
         self,
@@ -404,6 +477,85 @@ class PagedAttention(nn.Module):
             cache=self._local_target(slots, ctx),
         )
         return out
+
+    def latent_prologue_with_rows(
+        self,
+        query: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        *,
+        slots: torch.Tensor,
+        key_rows: QueryShardGather,
+        extra_rows: torch.Tensor,
+    ) -> tuple[MLAPrologueOutput, torch.Tensor]:
+        """A query shard's prologue with extra rows riding its gather.
+
+        ``extra_rows`` (``[local_rows, width]``, the latent's dtype) are
+        concatenated after the rotated latent columns and all-gathered in the
+        same collective as the shard's latent rows; they come back in span
+        order. ``width`` must keep the latent half of the payload 16-byte
+        aligned (a multiple of 8 fp16/bf16 elements), which the latent store
+        slices require. The latent is rotated and stored exactly as
+        :meth:`latent_prologue` does -- only the wiring differs, so the store
+        writes the same bytes. Returns the prologue output and the gathered
+        extra rows (``[total_rows, width]``).
+        """
+        plan = key_rows.plan
+        if latent_cache.shape[0] != plan.local_rows:
+            raise ValueError(
+                f"query shard rank {plan.rank} rotates {plan.local_rows} rows, "
+                f"got {latent_cache.shape[0]}"
+            )
+        if slots.numel() != plan.total_rows:
+            raise ValueError(
+                f"a sharded latent store takes the whole span of {plan.total_rows} "
+                f"slots, got {slots.numel()}"
+            )
+        if (
+            extra_rows.dim() != 2
+            or extra_rows.shape[0] != plan.local_rows
+            or extra_rows.dtype != latent_cache.dtype
+        ):
+            raise ValueError(
+                "extra rows must be a [local_rows, width] tensor of the latent's "
+                f"dtype: got {tuple(extra_rows.shape)} {extra_rows.dtype} for "
+                f"{plan.local_rows} rows of {latent_cache.dtype}"
+            )
+        if extra_rows.shape[1] * extra_rows.element_size() % 16:
+            raise ValueError(
+                "extra rows must keep the gathered latent half 16-byte aligned: "
+                f"got {extra_rows.shape[1]} elements of "
+                f"{extra_rows.element_size()} bytes, which is not a multiple of 16"
+            )
+        rotary = (
+            None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions)
+        )
+        if plan.local_rows > 0:
+            out = mla_prologue(
+                query,
+                q_pe,
+                latent_cache,
+                expanded=None,
+                rotary=rotary,
+                cache=None,
+                solution=None,
+                override=None,
+            )
+        else:
+            out = MLAPrologueOutput(
+                query=query, key=None, value=None, latent=latent_cache
+            )
+        width = extra_rows.shape[1]
+        payload = torch.cat((extra_rows, out.latent), dim=1).contiguous()
+        gathered = token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
+        latent_store(
+            gathered[:, width:],
+            kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],
+            cache=self._local_target(slots, ctx),
+        )
+        return out, gathered[:, :width].contiguous()
 
 
 class _CacheGroupSpecLike(Protocol):

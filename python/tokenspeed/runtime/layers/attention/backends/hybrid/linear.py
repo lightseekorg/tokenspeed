@@ -150,6 +150,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def cache_placement(self, layer):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
+    def reads_fp8_kv_scales(self, layer):
+        return self._backend_for_layer(layer.layer_id).reads_fp8_kv_scales(layer)
+
     @property
     def cache_consumer_attn_kinds(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""
@@ -160,6 +163,13 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def child_backends(self):
         return (self.full_attn_backend, self.linear_attn_backend)
+
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        return all(
+            backend.stores_in_forward_state_checkpoints
+            for backend in self.child_backends()
+        )
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if layer_id in self.full_attn_layers:
@@ -345,14 +355,13 @@ class HybridLinearAttnBackend(AttentionBackend):
     def tree_support(self) -> TreeSupport:
         return TreeSupport(verify_blocker=None, draft_blocker=None)
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_acceptance(
         self,
         accepted_lengths: torch.Tensor,
         *,
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        if num_extends == 0:
-            self.linear_attn_backend.commit_verified_state(
-                accepted_lengths, accepted_path=accepted_path
-            )
+        self.linear_attn_backend.commit_state_after_acceptance(
+            accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
+        )

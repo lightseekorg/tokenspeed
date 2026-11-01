@@ -42,6 +42,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     projection_all_to_all,
     projection_reduce_scatter,
     try_fused_dp_column_linear,
+    try_fused_dp_row_linear,
 )
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
@@ -1380,6 +1381,7 @@ def _projection_rows(
     ctx: "ForwardContext",
     parallel: DenseLayerMapping,
     workspace: ProjectionWorkspace | None,
+    input_scales: torch.Tensor | None,
 ) -> tuple[int, tuple[int, ...]]:
     """Read explicit physical owner counts, including graph padding, by global rank.
 
@@ -1408,10 +1410,18 @@ def _projection_rows(
         or any(count < 0 for count in counts)
         or inputs.ndim != 2
         or inputs.shape != (counts[parallel.rank], spec.input_size)
-        or inputs.dtype != spec.dtype
+        or inputs.dtype
+        != (torch.float8_e4m3fn if input_scales is not None else spec.dtype)
         or inputs.device != spec.device
     ):
         raise ValueError("DP linear requires matching physical per-rank token counts")
+    if input_scales is not None and (
+        spec.dtype != torch.bfloat16
+        or input_scales.shape != (inputs.shape[0], spec.input_size // 128)
+        or input_scales.dtype != torch.float32
+        or input_scales.device != inputs.device
+    ):
+        raise ValueError("Prequantized DP linear requires FP32 per-128 input scales")
     owner_rows = tuple(counts[rank] for rank in parallel.tp_group)
     rows = max(owner_rows)
     if rows > spec.max_tokens:
@@ -1472,7 +1482,7 @@ class DPColumnParallelLinear(ColumnParallelLinear):
         ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, None]:
         rows, owner_rows = _projection_rows(
-            inputs, ctx, self.parallel, self.projection_workspace
+            inputs, ctx, self.parallel, self.projection_workspace, None
         )
         if rows == 0:
             return inputs.new_empty((0, self.logical_output_size)), None
@@ -1549,8 +1559,10 @@ class DPRowParallelLinear(RowParallelLinear):
             override_kernel_name=None,
             interleave_linear_and_gate=False,
         )
-        # Its collectives exchange activation rows, without quantization scales.
-        self.supports_fp8_group128_input = False
+        self.supports_fp8_group128_input = (
+            self.supports_fp8_group128_input
+            and self.input_size_per_partition % 128 == 0
+        )
         self.parallel = parallel
         self.projection_workspace: ProjectionWorkspace | None = None
         self.comm_backend: CommBackend | None = None
@@ -1558,15 +1570,61 @@ class DPRowParallelLinear(RowParallelLinear):
     def forward(
         self,
         inputs: torch.Tensor,
+        scale: torch.Tensor | None = None,
         *,
         ctx: "ForwardContext",
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        rows, _ = _projection_rows(
-            inputs, ctx, self.parallel, self.projection_workspace
+        """Project locally owned rows, optionally into a caller-owned out tensor.
+
+        scale supplies FP32 per-128 scales for prequantized E4M3 inputs, which
+        produce BF16 outputs. Omit scale for unquantized activation rows.
+        """
+        if scale is not None and not self.supports_fp8_group128_input:
+            raise ValueError("This DP row linear does not support prequantized inputs")
+        rows, owner_rows = _projection_rows(
+            inputs, ctx, self.parallel, self.projection_workspace, scale
         )
+        output_dtype = self.projection_workspace.spec.dtype
+        if out is not None and (
+            out.shape != (inputs.shape[0], self.output_size)
+            or out.dtype != output_dtype
+            or out.device != inputs.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError("DP row linear requires a matching contiguous output")
         if rows == 0:
-            return inputs.new_empty((0, self.output_size)), None
-        values, _ = projection_all_to_all(
+            return (
+                out
+                if out is not None
+                else inputs.new_empty((0, self.output_size), dtype=output_dtype)
+            ), None
+        weight_scales = (
+            self.weight_scale_inv
+            if isinstance(self.quant_method, Fp8LinearMethod)
+            and self.quant_method.block_quant
+            and tuple(self.quant_method.quant_config.weight_block_size) == (128, 128)
+            else None
+        )
+        fused_output = (
+            out
+            if out is not None
+            else inputs.new_empty(
+                (inputs.shape[0], self.output_size), dtype=output_dtype
+            )
+        )
+        if try_fused_dp_row_linear(
+            inputs,
+            scale,
+            self.weight,
+            weight_scales,
+            owner_rows,
+            fused_output,
+            self.projection_workspace,
+            self.comm_backend,
+        ):
+            return fused_output, None
+        values, scales = projection_all_to_all(
             inputs,
             rows,
             False,
@@ -1574,15 +1632,20 @@ class DPRowParallelLinear(RowParallelLinear):
             None,
             self.projection_workspace,
             self.comm_backend,
+            input_scales=scale,
         )
         destination = acquire_projection_output(
             rows, self.projection_workspace, self.comm_backend
         )
-        partial, _ = super().forward(values, scale=None, out=destination)
+        partial, _ = super().forward(values, scale=scales, out=destination)
         output = projection_reduce_scatter(
             partial, rows, self.projection_workspace, self.comm_backend
         )
-        return output[: inputs.shape[0]], None
+        output = output[: inputs.shape[0]]
+        if out is not None:
+            out.copy_(output)
+            output = out
+        return output, None
 
 
 def prepare_dp_linear_communication(

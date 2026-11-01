@@ -26,7 +26,10 @@ from types import ModuleType
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.dsv41.triton import _PAGED_FORMATS
+from tokenspeed_kernel.ops.attention.dsv41.triton import (
+    _PAGED_FORMATS,
+    _copy_attention_heads,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -67,6 +70,8 @@ def _native_query(q, sink):
     if not 1 <= heads <= 128:
         raise ValueError("FlashMLA V4.1 requires 1..128 query heads")
     padded = 64 if heads <= 64 else 128
+    if sink is None:
+        return F.pad(q, (0, 0, 0, padded - heads)).contiguous(), None
     if (
         sink.shape not in ((heads,), (padded,))
         or sink.dtype != torch.float32
@@ -77,14 +82,19 @@ def _native_query(q, sink):
         )
     if padded == heads:
         return q.contiguous(), sink.contiguous()
-    return (
-        F.pad(q, (0, 0, 0, padded - heads)).contiguous(),
-        (
-            sink
-            if sink.numel() == padded
-            else F.pad(sink, (0, padded - heads), value=-float("inf"))
-        ).contiguous(),
+    q_native = torch.empty((q.shape[0], padded, 512), dtype=q.dtype, device=q.device)
+    sink_native = (
+        sink.contiguous()
+        if sink.numel() == padded
+        else torch.empty(padded, dtype=sink.dtype, device=sink.device)
     )
+    _copy_attention_heads(
+        q_native,
+        q,
+        sink if sink.numel() != padded else None,
+        sink_native if sink.numel() != padded else None,
+    )
+    return q_native, sink_native
 
 
 def _paged(cache, role, stride_alignment):
@@ -166,6 +176,8 @@ def selected_attention(
     schedule,
     prefill_kv,
     prefill_indices,
+    *,
+    lse=None,
 ):
     """Use a caller-built prefill workspace or native paged decode, returning BF16.
 
@@ -217,10 +229,19 @@ def selected_attention(
         destination = out
         if destination is None and q.shape[0] > query_chunk_size:
             destination = torch.empty_like(q)
+        query_buffer = None
         for start in range(0, q.shape[0], query_chunk_size):
             end = min(start + query_chunk_size, q.shape[0])
-            q_native, sink_native = _native_query(q[start:end], attn_sink)
-            result, _, _ = api.flash_mla_sparse_fwd(
+            if query_buffer is None:
+                q_native, sink_native = _native_query(q[start:end], attn_sink)
+                if q_native.shape[1] != q.shape[1]:
+                    query_buffer = q_native
+            else:
+                q_native = query_buffer[: end - start]
+                _copy_attention_heads(
+                    q_native[:, : q.shape[1]], q[start:end], None, None
+                )
+            result, _, tile_lse = api.flash_mla_sparse_fwd(
                 q=q_native,
                 kv=prefill_kv,
                 indices=indices[start:end].contiguous().unsqueeze(1),
@@ -229,11 +250,15 @@ def selected_attention(
                 attn_sink=sink_native,
                 topk_length=None,
             )
+            if lse is not None:
+                lse[start:end].copy_(tile_lse[:, : q.shape[1]])
             if destination is None:
                 return result[:, : q.shape[1], :]
-            destination[start:end].copy_(result[:, : q.shape[1], :])
-            # Do not keep the previous tile's padded output alive while the next
-            # native call allocates its Q/output pair from the same stream pool.
+            _copy_attention_heads(
+                destination[start:end], result[:, : q.shape[1], :], None, None
+            )
+            # Same-stream calls can reuse Q's zero padding across tiles. Release
+            # each padded output before allocating the next one.
             del result, q_native
         return destination
     else:
@@ -252,7 +277,7 @@ def selected_attention(
             if global_cache is None
             else _slots(global_slots, global_lens, q.shape[0])
         )
-        result, _ = api.flash_mla_with_kvcache(
+        result, native_lse = api.flash_mla_with_kvcache(
             q=q_native.unsqueeze(1),
             k_cache=_paged(swa_cache, "swa", 512),
             block_table=None,
@@ -272,6 +297,8 @@ def selected_attention(
             topk_length=lengths,
             extra_topk_length=extra_lengths,
         )
+        if lse is not None:
+            lse.copy_(native_lse.squeeze(-1)[:, : q.shape[1]])
         result = result.squeeze(1)
     result = result[:, : q.shape[1], :]
     if out is None:

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -42,6 +42,20 @@ from tokenspeed_kernel.selection import (
     _oracles,
 )
 from utils import make_sample_specs
+
+
+@pytest.fixture
+def set_matmul_precision() -> Iterator[Callable[[str], None]]:
+    # PyTorch stores this setting outside __dict__, so monkeypatch cannot undo it.
+    previous = torch.backends.cuda.matmul.fp32_precision
+
+    def set_precision(precision: str) -> None:
+        torch.backends.cuda.matmul.fp32_precision = precision
+
+    try:
+        yield set_precision
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = previous
 
 
 @pytest.fixture

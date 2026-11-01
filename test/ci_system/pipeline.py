@@ -36,6 +36,7 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 # after startup (a per-batch constexpr) fails the run instead of stalling it.
 SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
 JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
+DATA_PLANE_SYNC_DEBUG_ENV = "TOKENSPEED_DATA_PLANE_SYNC_DEBUG"
 SUPPORTED_TRIGGERS = {
     "per-commit",
     "post-submit",
@@ -48,6 +49,7 @@ SUPPORTED_TRIGGERS = {
 # requests and on pushes to main; `post-submit` tasks run only on pushes.
 SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
 WORKFLOW_STAGE_TYPES = {
+    "import-check": {"ut"},
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
     "model-test": {"eval", "perf"},
@@ -61,7 +63,16 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_RUNNER_GROUPS = (
+    "all",
+    "amd",
+    "amd-mi350",
+    "amd-mi450",
+    "nvidia",
+    "nvidia-arm",
+    "nvidia-x86",
+    "npu",
+)
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -73,7 +84,9 @@ STALE_PROCESS_PATTERNS = [
     # setproctitle, so the python pattern above stops matching once
     # the router is fully up.
     r"smg::",
-    r"smg_grpc_servicer\.tokenspeed",
+    # ts serve's engine: the headless launcher, whose ranks run as
+    # ``tokenspeed::`` processes.
+    r"tokenspeed\.runtime\.entrypoints\.engine",
     r"run_ci_suite",
 ]
 JIT_CACHE_ENV_SUBDIRS = {
@@ -95,6 +108,7 @@ AMD_RUNNER_PREFIXES = (
     "amd-mi450-",
     "amd-mi45x-",
 )
+AMD_MI450_RUNNER_PREFIXES = ("amd-mi450-", "amd-mi45x-")
 # A pool whose label names cpu instead of a GPU count holds no accelerator.
 CPU_ONLY_RUNNER_MARKER = "-cpu-"
 NVIDIA_ARM_RUNNER_PREFIXES = (
@@ -118,6 +132,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def is_npu_runner(runner: str) -> bool:
+    return runner == "tokenspeed-npu-arm64"
+
+
 def is_cpu_only_runner(runner: str) -> bool:
     return CPU_ONLY_RUNNER_MARKER in runner
 
@@ -129,8 +147,18 @@ def is_nvidia_arm_runner(runner: str) -> bool:
 def runner_matches_group(runner: str, runner_group: str) -> bool:
     if runner_group == "all":
         return True
+    if runner_group == "npu":
+        return is_npu_runner(runner)
+    if is_npu_runner(runner):
+        return False
     if runner_group == "amd":
         return is_amd_runner(runner)
+    if runner_group == "amd-mi450":
+        return runner.startswith(AMD_MI450_RUNNER_PREFIXES)
+    if runner_group == "amd-mi350":
+        return is_amd_runner(runner) and not runner.startswith(
+            AMD_MI450_RUNNER_PREFIXES
+        )
     if runner_group == "nvidia":
         return not is_amd_runner(runner)
     if runner_group == "nvidia-arm":
@@ -200,6 +228,12 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         or not all(isinstance(label, str) and label for label in labels)
     ):
         raise ValueError(f"{path}: runner.labels must be a non-empty string list")
+    if workflow_stage == "import-check" and not all(
+        is_amd_runner(label) for label in labels
+    ):
+        raise ValueError(
+            f"{path}: workflow_stage 'import-check' requires AMD runner labels"
+        )
     runner_env = runner.get("env", {})
     if runner_env:
         if not isinstance(runner_env, dict):
@@ -217,6 +251,16 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 raise ValueError(
                     f"{path}: runner.env[{label!r}] must be a string mapping"
                 )
+    # CI serves with the data-plane sync check raising (execute_task), and no
+    # task may relax it.
+    for where, env in [("env", data.get("env") or {})] + [
+        (f"runner.env[{label!r}]", env) for label, env in (runner_env or {}).items()
+    ]:
+        if DATA_PLANE_SYNC_DEBUG_ENV in env:
+            raise ValueError(
+                f"{path}: {where} sets {DATA_PLANE_SYNC_DEBUG_ENV}; CI serves "
+                "with it set to error and a task cannot change it"
+            )
     if "priority" in data:
         priority = data["priority"]
         if isinstance(priority, str):
@@ -769,6 +813,9 @@ def setup_runner(
         return local_env, pgm
     if setup_mode != "ci":
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
+    if is_npu_runner(runner):
+        # The existing NPU entry owns its deployed environment and host lock.
+        return local_env, pgm
 
     if is_gb200_runner(runner):
         pgm = make_manager()
@@ -1848,6 +1895,8 @@ def execute_task(
         )
     declared_runner = runner
     runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
+    if is_npu_runner(runner) and (task["type"] != "ut" or setup_mode != "ci"):
+        raise ValueError("NPU operator tasks require type=ut and --setup-mode=ci")
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -1871,6 +1920,9 @@ def execute_task(
         env[JIT_COMPILE_CHECK_ENV] = str(
             task.get("env", {}).get(JIT_COMPILE_CHECK_ENV, "error")
         )
+        # Not even the task may relax this one (validate_task), and a value
+        # inherited from the runner's environment is overridden too.
+        env[DATA_PLANE_SYNC_DEBUG_ENV] = "error"
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
@@ -2095,7 +2147,7 @@ def execute_task(
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         _stop_managed_server()
-        if setup_mode == "ci" and not keep_runner_state:
+        if setup_mode == "ci" and not keep_runner_state and not is_npu_runner(runner):
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)

@@ -36,15 +36,15 @@ The workflow completes these stages in order:
    identical distributions to the wheelhouse.
 5. Update the stable CUDA and ROCm pip indexes, preserving previous releases.
 6. Publish the existing NVIDIA Docker image for `linux/amd64` and `linux/arm64`.
-   The image installs and checks the exact released kernel, scheduler and MLA
+   The image installs and checks the exact released kernel, scheduler, and MLA
    versions. Confirm both platforms are in the published manifest.
 7. Create `v<version>` at the TokenSpeed release commit with generated release
-   notes, a component version table and links to PyPI, wheelhouse releases,
-   stable pip indexes, Docker and the publication runs. Notes use the previous
+   notes, a component version table, and links to PyPI, wheelhouse releases,
+   stable pip indexes, Docker, and the publication runs. Notes use the previous
    stable release tag and stay below the page size limit. The notes always
    retain the full changelog link.
 8. Verify the published sources and release page, then delete this run's three
-   release branches with their expected commit leases. Tags, published assets
+   release branches with their expected commit leases. Tags, published assets,
    and unrelated branches remain available. Cleanup is safe to retry. A moved
    branch stops cleanup for inspection.
 
@@ -61,7 +61,7 @@ Every effective ruleset must explicitly allow the bot to bypass its requirements
 The controller fast-forwards that exact PR commit to `main` with an expected-SHA
 lease, so a concurrent source commit prevents the merge without rewriting history.
 It then waits for GitHub to report the PR merged at that same commit. Requested
-changes, merge conflicts and missing bypass permission require manual intervention.
+changes, merge conflicts, and missing bypass permission require manual intervention.
 The workflow never changes repository rules. Publication builds and verification
 remain mandatory for every released package and Docker image.
 
@@ -71,25 +71,25 @@ verification. Missing or conflicting provenance stops publication.
 
 ## Recovery
 
-Any failed main CI retry, publication or wait stops downstream stages and fails the
+Any failed main CI retry, publication, or wait stops downstream stages and fails the
 weekly run. The summary and `weekly-state-<stage>` artifacts retain the reserved
-versions, PRs, source commits and child run IDs. Each stage allows up to 340
-minutes for checks, approvals, queueing and publication before requiring manual
+versions, PRs, source commits, and child run IDs. Each stage allows up to 340
+minutes for checks, approvals, queueing, and publication before requiring manual
 intervention. The workflow creates no release page for an incomplete run.
 
 Fix the first failed stage. If a child workflow failed, inspect and repair it,
 then rerun the appropriate child jobs before rerunning **failed jobs** in the
-weekly workflow. The controller reuses the same versions, immutable refs and
+weekly workflow. The controller reuses the same versions, immutable refs, and
 child runs. It never automatically retries a failed publisher or overwrites a
 published PyPI version. Do not start a new weekly run to resume an interrupted
-release. An ambiguous dispatch, conflicting source, edited version PR or expired
+release. An ambiguous dispatch, conflicting source, edited version PR, or expired
 recovery artifact requires inspection rather than guessing a new version.
 
 If you need a controller fix after all publications succeeded, merge the fix
 and start **Biweekly release** from `main` with **resume_run_id** set to the
 original run ID and **version** empty. This uses the corrected controller and
 runs only release notes and branch cleanup. The resumed run skips version
-planning, version PRs, package uploads, index publication and Docker builds.
+planning, version PRs, package uploads, index publication, and Docker builds.
 The source run must be complete, belong to this workflow on `main`, and have
 successful stages through Docker. Its saved state must match the original run
 ID, and all recorded publishers must still match their exact source and
@@ -116,7 +116,7 @@ stages are:
 1. Bump `tokenspeed-scheduler/pyproject.toml` through a signed metadata PR.
 2. Run the existing scheduler publisher at that exact commit on a pinned branch.
    Wait for wheel builds, GitHub release and PyPI publication. Check PyPI source
-   provenance, matching distribution hashes and availability in the pip index.
+   provenance, matching distribution hashes, and availability in the pip index.
 3. Update only `tokenspeed-scheduler>=<version>` in `python/pyproject.toml` through
    a second signed metadata PR. TokenSpeed's own version remains unchanged.
 
@@ -152,7 +152,7 @@ Leaving it empty increments the greater version's patch. Its three stages are:
 
 Both metadata PRs merge without waiting for main or PR CI, using the same bot
 exemption and exact-diff lease as the scheduler. The pipelines share the release
-lock, token and recovery mechanism. Source changes or a changed dependency pin
+lock, token, and recovery mechanism. Source changes or a changed dependency pin
 stop the MLA pipeline. Recover failures with **re-run failed jobs**, using the
 recorded child run and `weekly-state-mla-*` artifacts. Do not start a new release
 to retry publication. An interrupted MLA release can block biweekly preflight

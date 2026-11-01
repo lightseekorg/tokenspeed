@@ -78,8 +78,10 @@ def sample_multiproc_dir(tmp_path, monkeypatch):
 
 def test_metrics_endpoint_serves_aggregated_metrics(sample_multiproc_dir):
     port = get_free_port()
+    # Unset reporters resolve to Prometheus (see test_metrics_config.py).
     args = SimpleNamespace(
         enable_metrics=True,
+        metrics_reporters=None,
         metrics_host=None,
         metrics_port=port,
         host="127.0.0.1",
@@ -104,13 +106,16 @@ def test_metrics_server_off_without_enable_metrics():
     assert launch_metrics_server(args) is None
 
 
-def test_metrics_server_bind_failure_degrades_to_none(sample_multiproc_dir):
+def test_metrics_server_bind_failure_degrades_to_none(tmp_path, monkeypatch):
+    # The bind fails before anything is served, so no sample is needed.
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
     blocker = socket.socket()
     blocker.bind(("127.0.0.1", 0))
     blocker.listen()
     port = blocker.getsockname()[1]
     args = SimpleNamespace(
         enable_metrics=True,
+        metrics_reporters=["prometheus"],
         metrics_host=None,
         metrics_port=port,
         host="127.0.0.1",
@@ -121,3 +126,8 @@ def test_metrics_server_bind_failure_degrades_to_none(sample_multiproc_dir):
         assert launch_metrics_server(args) is None
     finally:
         blocker.close()
+
+
+def test_plugin_only_does_not_start_prometheus_endpoint():
+    args = SimpleNamespace(enable_metrics=True, metrics_reporters=["test_reporter"])
+    assert launch_metrics_server(args) is None

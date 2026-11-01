@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The batch-invariant all-reduce on real groups: the route, the kernel and
-the startup self-check, end to end on several GPUs."""
+"""The batch-invariant all-reduce on real groups: the route and the ordered
+fold, end to end on several GPUs."""
 
 import socket
 import traceback
@@ -28,7 +28,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from tokenspeed_kernel.platform import current_platform
 
 HIDDEN = 2048
 
@@ -37,6 +36,27 @@ def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
+
+
+def ill_conditioned_payload(
+    rank_in_group: int, world_size: int, rows: int, device
+) -> torch.Tensor:
+    """This rank's slice of a payload whose group sum exposes the order.
+
+    Per element one rank holds ``+B``, another ``-B`` and the rest values whose
+    low bits fall below fp32's resolution at ``B``, so almost any two
+    association orders round the sum differently. Every rank draws the whole
+    assignment from one seed and keeps its own slice.
+    """
+    gen = torch.Generator(device=device).manual_seed(7)
+    holder = torch.rand(world_size, rows, HIDDEN, generator=gen, device=device)
+    holder = holder.argsort(dim=0)
+    big = 2.0 ** torch.randint(4, 12, (rows, HIDDEN), generator=gen, device=device)
+    small = torch.randn(world_size, rows, HIDDEN, generator=gen, device=device)
+    mine = small[rank_in_group] * big * 2.0**-18
+    mine = torch.where(holder[0] == rank_in_group, big, mine)
+    mine = torch.where(holder[1] == rank_in_group, -big, mine)
+    return mine.to(torch.bfloat16)
 
 
 def worker_fn(rank, world_size, port, attn_tp, error_dict):
@@ -55,9 +75,6 @@ def worker_main(rank: int, world_size: int, port: int, attn_tp: int) -> None:
         AutoBackend,
         Collective,
         Route,
-    )
-    from tokenspeed.runtime.distributed.comm_backend.self_check import (
-        verify_multimem_all_reduce,
     )
     from tokenspeed.runtime.distributed.comm_ops import all_reduce
     from tokenspeed.runtime.distributed.mapping import Mapping
@@ -98,84 +115,80 @@ def worker_main(rank: int, world_size: int, port: int, attn_tp: int) -> None:
         backend = get_global_backend()
         assert isinstance(backend, AutoBackend)
         group = mapping.attn.tp_group
+        world_pg = pg_manager.get_process_group("nccl", mapping.world_group)
         probe = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=device)
-        assert backend.route(Collective.ALL_REDUCE, probe, group) is Route.MULTIMEM
-        assert (
-            backend.route(Collective.TOKEN_REDUCE_SCATTER, probe, group)
-            is Route.ORDERED_FOLD
-        )
-
-        # The startup self-check on the deployment's own groups: with
-        # attn_tp < world_size there are several attention TP groups, so the
-        # one-function leg compares the switch's order across them and pins
-        # the kind to the fold where the GPU sets reduce differently (measured
-        # for groups of four on 8xH20; groups of two cannot differ).
-        kinds = (
-            ("attention TP", mapping.attn.tp_group),
-            ("dense TP", mapping.dense.tp_group),
-            ("MoE TP-EP", mapping.moe.tp_ep_group),
-        )
-        outcome = verify_multimem_all_reduce(
-            backend,
-            groups=kinds,
-            world_group=mapping.world_group,
-            rank=rank,
-            hidden_size=HIDDEN,
-            device=device,
-            repetitions=8,
-        )
-        routes = dict(outcome)
-        assert set(routes) == {kind for kind, _ in kinds}, outcome
-        # One group of everyone has nothing to disagree with; two groups of
-        # two cannot order two addends differently. Larger groups of a kind
-        # may land either way, but the decision must be the route served.
-        assert routes["MoE TP-EP"] is Route.MULTIMEM, outcome
-        if attn_tp == world_size or attn_tp == 2:
-            assert routes["attention TP"] is Route.MULTIMEM, outcome
-        # The dense TP group is the attention TP group here: decided once.
-        assert routes["dense TP"] is routes["attention TP"], outcome
-        for kind, kind_group in kinds:
-            assert (
-                backend.route(Collective.ALL_REDUCE, probe, kind_group) is routes[kind]
-            )
+        for collective in (Collective.ALL_REDUCE, Collective.TOKEN_REDUCE_SCATTER):
+            assert backend.route(collective, probe, group) is Route.ORDERED_FOLD
 
         # The public all-reduce every layer calls: in place, equal on every
-        # rank, the sum up to the association order, the same bits for a row
-        # whatever the batch around it -- and, the contract the self-check
-        # exists for, the same bits on every group of the kind (the payload
-        # is seeded by rank in group, so the groups reduce identical inputs).
-        gen = torch.Generator(device=device).manual_seed(100 + group.index(rank))
-        scale = 2.0 ** torch.randint(-6, 7, (rows, 1), generator=gen, device=device)
-        payload = (torch.randn(rows, HIDDEN, generator=gen, device=device) * scale).to(
-            torch.bfloat16
-        )
+        # rank, and the rank-ordered fp32 fold of the partials bit for bit.
+        payload = ill_conditioned_payload(group.index(rank), len(group), rows, device)
         full = payload.clone()
         assert all_reduce(full, group) is full
-        world_pg = pg_manager.get_process_group("nccl", mapping.world_group)
         gathered = [torch.empty_like(full) for _ in mapping.world_group]
         dist.all_gather(gathered, full, group=world_pg)
-        for peer in mapping.world_group:
+        for peer in group:
             assert torch.equal(gathered[peer], full), f"rank {peer} disagrees"
+        # Groups of the same kind reduce identical inputs (the payload is
+        # seeded by rank in group) to identical bits, whichever GPUs they are.
+        for peer in mapping.world_group:
+            assert torch.equal(gathered[peer], full), f"group of {peer} disagrees"
         parts = [torch.empty_like(payload) for _ in mapping.world_group]
         dist.all_gather(parts, payload, group=world_pg)
         folded = torch.zeros(rows, HIDDEN, dtype=torch.float32, device=device)
         for peer in group:
             folded += parts[peer].float()
-        torch.testing.assert_close(
-            full.float(), folded.to(torch.bfloat16).float(), rtol=2**-7, atol=1e-2
-        )
+        assert torch.equal(full, folded.to(torch.bfloat16))
+
+        # A row's bits depend on neither how many rows ride along nor where it
+        # sits in the batch. The in-switch reduction fails the second on this
+        # payload: its order follows the row's offset in the buffer.
         for row_count in (1, 5, rows // 2):
             part = payload[:row_count].clone()
             all_reduce(part, group)
             assert torch.equal(part, full[:row_count]), row_count
+        for shift in (1, 3, 16):
+            moved = torch.cat([payload[:shift].flip(0), payload[: rows - shift]])
+            all_reduce(moved, group)
+            assert torch.equal(moved[shift:], full[: rows - shift]), shift
+
+        # The armed workspace folds the same bits (-0.0 as +0.0), chunked past capacity.
+        big, capacity = 512, 200
+        payload = ill_conditioned_payload(group.index(rank), len(group), big, device)
+        payload[:, :8] = -0.0
+        parts = [torch.empty_like(payload) for _ in mapping.world_group]
+        dist.all_gather(parts, payload, group=world_pg)
+        folded = torch.zeros(big, HIDDEN, dtype=torch.float32, device=device)
+        for peer in group:
+            folded += parts[peer].float()
+        expected = folded.to(torch.bfloat16)
+        if backend.trtllm_ar.configure_group(
+            rank=group.index(rank),
+            group=group,
+            max_token_num=capacity,
+            hidden_dim=HIDDEN,
+        ):
+            for row_count in (5, capacity, big):
+                folded_rows = backend.trtllm_ar.ordered_all_reduce(
+                    payload[:row_count].clone(), group
+                )
+                assert folded_rows is not None, row_count
+                assert torch.equal(
+                    folded_rows.view(torch.int16),
+                    expected[:row_count].view(torch.int16),
+                ), row_count
+            folded_rows = all_reduce(payload.clone(), group)
+            assert torch.equal(
+                folded_rows.view(torch.int16), expected.view(torch.int16)
+            )
     finally:
         dist.barrier()
         dist.destroy_process_group()
 
 
 def run_test(world_size: int, attn_tp: int) -> None:
-    if not torch.cuda.is_available() or not current_platform().is_nvidia:
-        pytest.skip("the in-switch (NVLS) all-reduce is NVIDIA-only")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the multi-GPU all-reduce")
     if world_size > torch.cuda.device_count():
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
     port = get_open_port()

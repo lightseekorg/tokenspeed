@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import socket
@@ -55,6 +56,28 @@ def get_free_port():
             return s.getsockname()[1]
 
 
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ValueError:
+        return False
+
+
+def join_host_port(host: str, port: int | str) -> str:
+    """Join ``host`` and ``port`` for a URL or a ZMQ TCP endpoint.
+
+    An IPv6 literal is bracketed (``[::1]:80``) so its colons do not read as
+    the port separator. IPv4 addresses, hostnames and already-bracketed hosts
+    are kept as given. A link-local literal keeps its zone ID inside the
+    brackets (``[fe80::1%eth0]:80``), the form libzmq accepts. ``port`` may
+    also be ZMQ's ``*`` wildcard.
+    """
+    if is_valid_ipv6_address(host):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
 def get_local_ip_by_remote() -> str | None:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -66,7 +89,7 @@ def get_local_ip_by_remote() -> str | None:
     try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+        if ip and ip != "0.0.0.0" and not ipaddress.ip_address(ip).is_loopback:
             return ip
     except Exception:
         pass
@@ -89,7 +112,8 @@ def get_ip() -> str:
     try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+        # Debian-style /etc/hosts maps the hostname to 127.0.1.1, which no peer can reach.
+        if ip and ip != "0.0.0.0" and not ipaddress.ip_address(ip).is_loopback:
             return ip
     except Exception:
         pass

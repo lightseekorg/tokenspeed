@@ -43,8 +43,8 @@ tokenspeed serve <model> \
 | `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
-| `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP on a PD prefill or decode engine (see "KV parallelism" below). |
-| `--decode-context-parallel-size` | Decode context parallelism: the decode role's compute over the sharded pages; required with and equal to `--kv-parallel-size` there. |
+| `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP on an aggregated or PD engine (see "KV parallelism" below). |
+| `--decode-context-parallel-size` | Decode context parallelism in aggregated or PD decode engines; required with and equal to `--kv-parallel-size` there. |
 | `--query-context-parallel-size` | Query context parallelism: the prefill role's query-row sharding over the sharded pages; equal to `--kv-parallel-size` and `--attn-tp-size` (see "Query context parallelism" below). |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
@@ -59,14 +59,14 @@ wide-QKV MoonViT encoder at TP1 with whole-item DP8.
 An MLA decode engine runs attention at TP1 with DP across the world: the
 per-token latent KV cannot shard by heads, so every rank keeps its own KV.
 That layout replicates every non-MoE weight on every rank: the MLA head
-projections (`q_b_proj`, `kv_b_proj`, `o_proj`), the dense MLPs and the LM
+projections (`q_b_proj`, `kv_b_proj`, `o_proj`), the dense MLPs, and the LM
 head. On a large model that is tens of GB per rank that could hold KV
 instead. Three knobs shard those weights over contiguous groups of DP ranks
 (one node, typically) while attention and the KV stay TP1/DP:
 
 | Parameter | Use |
 | --- | --- |
-| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj` and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--query-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
+| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj`, and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--query-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
 | `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
 | `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
 | `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
@@ -164,7 +164,7 @@ The decode preset for a 128-way DP MLA model is thus one node-local group
 of 8 reused three times:
 
 ```bash
-tokenspeed serve <model> \
+tokenspeed serve --headless <model> \
   --world-size 128 --nprocs-per-node 8 --attn-tp-size 1 --data-parallel-size 128 \
   --attn-head-tp-size 8 --dense-tp-size 8 --lm-head-tp-size 8 \
   --tp-batch-invariant attn+dense --disaggregation-mode decode ...
@@ -183,21 +183,22 @@ reduce-scatter remains batch-invariant, see `docs/design/numerics.md`).
 
 Each attention-DP rank owns a private prefix cache, so multi-turn requests
 only reuse their cache when every turn lands on the same rank. The
-`data_parallel_rank` request field (`Engine.generate` / `async_generate`, or
-the gateway's gRPC protocol) pins a request to one rank: it dispatches
-straight there, bypassing load balancing — overload spill is the router's
-job. An invalid pin fails that request. The engine keeps serving. Engines
-without attention DP drop the pin.
+`data_parallel_rank` field of the wire request a frontend submits pins a
+request to one rank: the frontend dispatches it straight there, bypassing load
+balancing — overload spill is the router's job. A pin that names no rank fails
+that request. The engine keeps serving.
 
-Disaggregation engines ignore the pin: the `bootstrap_room` residue
-(`room % dp_size`) governs prefill placement (and decode placement under
-`round_robin`), so steer placement by minting the room instead. The engine
-logs and ignores a conflicting pin rather than rejecting it.
+Disaggregated prefill and decode requests each honor their own rank pin,
+since any decode rank finds the prefill rank from the room. The
+`bootstrap_room` still identifies the prefill KV source: `room % dp_size`
+must match the rank a prefill pin selects, so a frontend pins the prefill
+rank and mints the room from one decision. Without a pin, a PD request
+follows the room residue (`room % dp_size`).
 
-With the bundled gateway, pass `--policy cache_aware --dp-aware` to
-`ts serve` to enable per-rank affinity routing. This requires bundled smg
-releases that carry the TokenSpeed dp-affinity support; see the lockstep
-note in `serve_smg.py`.
+Under `ts serve`, the engine's attention-DP ranks register with the bundled
+gateway as one grouped worker, which places each unpinned request on its
+least-loaded rank itself; the gateway's `--dp-aware` expansion does not apply
+to it.
 
 ## MoE deployments
 
@@ -222,9 +223,9 @@ tail, so the extra dimensions do not change the MoE result. For example,
 TokenSpeed pads a 640-wide expert under MoE TP4 from 160 to 192 values per
 rank. TokenSpeed zero-pads BF16 SiLU/SwiGLU expert shards the same way to a
 multiple of 64 (128 when it cannot adapt the installed FlashInfer launcher,
-or when FlashInfer's JIT cannot build the adapted one, for example without
-nvcc). For example, Qwen3-30B-A3B's 768-wide experts need no padding under
-MoE TP4 (192 per rank), while TokenSpeed pads a 96-wide shard to 128.
+or when FlashInfer's JIT cannot build the adapted one). For example,
+Qwen3-30B-A3B's 768-wide experts need no padding under MoE TP4 (192 per
+rank), while TokenSpeed pads a 96-wide shard to 128.
 
 On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
 (`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input
@@ -312,7 +313,7 @@ on a CUDA-IPC-accessible node to use the optimized paths.
 TP4 reduces the selected weights to approximately one quarter per GPU, not
 total model memory or latency. Communication and padding can outweigh GEMM
 savings, especially for uneven traffic or large prefill batches. Compare TTFT,
-decode latency and cache capacity separately with real weights and the full
+decode latency, and cache capacity separately with real weights and the full
 model. A fixed memory budget can turn weight savings into more cache rather
 than lower device usage. Reduced-layer tests do not establish full-model capacity.
 
@@ -336,17 +337,17 @@ python -m tokenspeed.cli serve \
   --dist-init-addr HEAD_NODE:29500 \
   --max-num-seqs 256 --max-model-len 4096 \
   --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
-  --prefix-granularity 128 --enable-prefix-caching --disable-kvstore \
+  --enable-prefix-caching --disable-kvstore \
   --max-cudagraph-capture-size 16 --cudagraph-capture-sizes 1 2 4 8 16
 ```
 
 Launch one server process per node on four nodes with four GPUs each, using the
-same checkpoint, container and environment. `HEAD_NODE` is the allocated head
+same checkpoint, container, and environment. `HEAD_NODE` is the allocated head
 node, not localhost. On Slurm, reserve a persistent allocation with `salloc`,
 then launch through the site's `submit` wrapper or `srun`. The global sequence
 limit above allows 16 requests per rank. For higher concurrency, increase both
 the sequence budget and graph capture sizes and check cache admission. Keep
-hardware, inputs and serving settings fixed when comparing TP configurations.
+hardware, inputs, and serving settings fixed when comparing TP configurations.
 
 ### DeepEP all-to-all
 
@@ -362,12 +363,12 @@ and DP4/TP8/EP32 decode.
 
 All DeepEP MoE plans reserve their persistent communication buffer during the
 common `moe_process_weights` call, after backend weight preprocessing and before
-KV cache memory profiling. This applies to Marlin, DeepGEMM and FlashInfer.
+KV cache memory profiling. This applies to Marlin, DeepGEMM, and FlashInfer.
 Non-DeepEP plans do not initialize DeepEP. The input hidden width and global
 expert count come from the MoE module's declared geometry, never inferred from
 packed weights. Dispatchers retain their backend-specific execution settings
 and reuse the prepared buffer. Compatible layers share the process-wide buffer.
-Incompatible geometry, mode or capacity fails through the same reuse checks as
+Incompatible geometry, mode, or capacity fails through the same reuse checks as
 runtime acquisition. The capacity remains the explicit server setting (256 by
 default), with no model-name-based sizing in `ModelRunner`.
 
@@ -380,7 +381,7 @@ DeepEP has two sets of legs, and `--deepep-mode` picks between them:
 | `auto` (default) | Both are allocated; each forward picks | Aggregated serving, which mixes both shapes |
 
 For block-scale FP8 with `deep_gemm`, keep `auto` unless the instance only ever
-sees one shape -- for example a decode-only worker in a PD split, which can pin
+sees one shape -- for example, a decode-only worker in a PD split, which can pin
 `low_latency` and skip the normal-mode buffers. The nvfp4
 `flashinfer_cutedsl` kernel implements only the low-latency legs, so it requires
 an explicit `--deepep-mode low_latency`. TokenSpeed rejects `auto` and
@@ -399,7 +400,9 @@ is decoding", so one extending rank moves the whole group to the normal legs.
 
 When DeepEP is selected, TokenSpeed disables the prefill CUDA graph:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
-graph cannot capture a host sync. Decode graphs are unaffected.
+graph cannot capture a host sync. Decode graphs replay the low-latency legs;
+`--deepep-mode normal` has none to replay, so it disables CUDA graphs
+altogether.
 
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
@@ -453,7 +456,7 @@ profile record, or online from the live counters ([dynamic
 rebalancing](#dynamic-expert-rebalancing) below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
 from the placement and loading every placed slot — LongCat-Flash does.
-TokenSpeed refuses the placement flags for any other model, so TokenSpeed
+TokenSpeed refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):
 replicas live on other ranks.
@@ -472,14 +475,13 @@ replicas live on other ranks.
    counters once capture is done, so the first window -- a profile's or a
    rebalance's -- starts at the first served forward.
 
-   ```bash
-   curl -X POST localhost:8401/start_profile -H 'Content-Type: application/json' \
-     -d '{"output_dir": "/tmp/expert-load", "activities": ["EXPERT_LOAD"]}'
-   # ... serve the workload ...
-   curl -X POST localhost:8401/stop_profile
-   ```
+   Start a profile with the `EXPERT_LOAD` activity and an `output_dir` (the
+   engine's `ProfileReq` control operation, which the frontend driving the
+   engine sends; under `ts serve`, the gateway's `POST /start_profile` with
+   `{"activities": ["EXPERT_LOAD"], "output_dir": ...}`), serve the
+   workload, then stop the profile (`POST /stop_profile`).
 
-   `stop_profile` writes one record per rank,
+   Stopping writes one record per rank,
    `<id>-<rank tag>.expert-load.pt`, holding what *that rank's* router
    counted: `physical_count` (`[layers, slots]`, int64), the same summed
    over each logical expert's replicas as `logical_count`
@@ -528,7 +530,7 @@ replicas live on other ranks.
      (`--ep-dispatch-algorithm static*`; the `dynamic*` variants draw at
      random per route). The runtime computes the map only on this path.
    - Under replicated-input EP (every rank routes every token, such as the
-     rl-bitwise aok path) exactly one rank must compute each route, so the
+     rl-bitwise slot-combine path) exactly one rank must compute each route, so the
      replica is a pure function of the token:
      `replicas[logical, (token row + route rank) mod replicas]`, identical
      on every rank. TokenSpeed refuses random replica choice on this path.
@@ -569,8 +571,8 @@ tables right after, so a forward never sees a layer whose tables and slots
 disagree.
 TokenSpeed allows `--ep-num-redundant-experts 0`: the rebalance then only
 permutes experts across ranks. `--init-expert-location` still seeds the first
-placement. `POST /rebalance_experts` starts one rebalance now (it replies
-once it takes the load snapshot; the moves follow). TokenSpeed refuses the
+placement. The `RebalanceExpertsReqInput` control operation starts one
+rebalance now (it replies once it takes the load snapshot; the moves follow). TokenSpeed refuses the
 `EXPERT_LOAD` profile activity under `--enable-eplb`, since the rebalance
 owns the same counters. The engine log reports the balancedness each snapshot
 saw and the one the new placement is expected to reach.
@@ -636,9 +638,9 @@ things:
 - **DCP** (decode context parallelism) is the *decode-side compute* over KVP
   pages: every rank keeps all of its query heads, attends only the pages it
   owns, and the partial outputs are merged across the KVP group by their
-  log-sum-exp (LSE). `--decode-context-parallel-size N` names it on the PD
-  decode role, where it is the only way to read a sharded cache (so the
-  decode role requires it with `--kv-parallel-size N`, equal); the attention
+  log-sum-exp (LSE). `--decode-context-parallel-size N` names it in aggregated
+  or PD decode engines, where it is the only way to decode over a sharded cache
+  (so both require it with `--kv-parallel-size N`, equal); the attention
   backends' decode algorithms, their kernels and the LSE-merge code carry the
   DCP name and key on `kvp_size`, which the drafter's steps on a sharded
   prefill engine take as well.
@@ -650,17 +652,35 @@ things:
 `--kv-parallel-size N` must divide `--attn-tp-size`; the KVP subgroups are
 aligned runs of `N` consecutive attention-TP ranks. It applies to the
 full-history groups of MLA/DSA models (latent KV and index-K) and to DeepSeek
-V4's compressed KV; groups that every rank reads whole (sliding windows,
+V4.1's global KV; groups that every rank reads whole (sliding windows,
 compressor state) stay replicated. The attention backend decides how it
 attends the sharded pages (DCP decode, chunked or gathered prefill history);
 the scheduler plans the same virtual blocks on every rank and the runtime
 translates ownership where it reads, writes or copies them
-(`docs/design/cache-concepts.md`). PD roles only: a prefill engine (with or
-without a query shard) and a decode engine (with `--decode-context-parallel-size`)
-each shard their cache independently (a transfer edge copies the pages its
-prefill rank and its decode rank both own); an aggregated engine does not
-shard, since its steady-state decode would be DCP. Works with the Host
-KVStore and the retraction snapshot pool; not yet with L3 storage.
+(`docs/design/cache-concepts.md`). An aggregated engine combines the existing
+sharded-history prefill with DCP decode, without a PD transfer or QCP. On PD,
+a prefill engine (with or without a query shard) and a decode engine (with
+`--decode-context-parallel-size`) each shard their cache independently; a
+transfer edge copies the pages its prefill rank and decode rank both own.
+Works with the Host KVStore, the retraction snapshot pool and L3 storage.
+The Host KVStore takes either `--kvstore-write-policy`; `write_back` only on
+an aggregated or prefill engine, without a query shard or L3 storage. L3 reuse
+requires the same CP layout; see
+[Host L2 and Mooncake Store L3](../configuration/server.md#host-l2-and-mooncake-store-l3),
+which also lists every `write_back` requirement.
+
+For non-PD MLA serving, use a DCP-capable backend, for example:
+
+```bash
+ts serve --model MODEL --attention-backend flashmla \
+  --attn-tp-size 8 --kv-parallel-size 8 --decode-context-parallel-size 8
+```
+
+Keep `--disaggregation-mode` at `null` and QCP at 1. Aggregated DCP requires
+separate prefill/decode rounds and rejects `--enable-mixed-batch` for all
+backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
+shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
+
 Speculative decoding runs on a sharded cache with the backends whose DCP
 decode takes a verify window (FlashMLA, CuTe MLA, GPU DSA); the draft group
 shards like the target's. A FlashMLA verify under KVP runs one kernel row per
@@ -693,8 +713,9 @@ movement, so a row's bits do not depend on which rank computes it
 
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
-Host KVStore and the retraction snapshot pool but not L3 storage, as every
-KVP engine does), `N == --attn-tp-size`, attention DP 1, no
+Host KVStore, the retraction snapshot pool and L3 storage, as every
+KVP engine does, but not yet `--kvstore-write-policy write_back`),
+`N == --attn-tp-size`, attention DP 1, no
 `--enable-mixed-batch`, GPU DSA attention with a bf16 KV cache (checked where
 the attention config is built), and `--dense-tp-size` and the MoE TP×EP group
 each 1 or `N` (attention returns complete rows, so the drafter's replicated
@@ -706,7 +727,7 @@ every row on every rank.
 
 **Head TP over the query shards.** Without `--attn-head-tp-size` the shard
 group's ranks hold different rows and every rank holds every head of
-`q_b_proj`, `kv_b_proj` and `o_proj` (the mapping resolves
+`q_b_proj`, `kv_b_proj`, and `o_proj` (the mapping resolves
 `attn.head_tp_size` to 1). `--attn-head-tp-size N` shards those three
 projections by heads over the shard group instead — the same head group the
 decode-side layout above builds over DP ranks, here `== qcp_group`, with the
@@ -741,14 +762,10 @@ cache takes.
 
 Numerics: with row-parallel `o_proj` the shard group computes the same
 per-rank head partials the plain TP8 prefill engine does and reduce-scatters
-them where TP8 all-reduces. The bits agree only when both engines sum in the
-same order. Under `--numerics rl-bitwise` the reduce-scatter always takes the
-ordered fold while an all-reduce takes the in-switch reduction where
-multicast reaches (an order that is per GPU set). Pin the TP8 engine to the
-fold with `--force-deterministic-rsag` for the two to be bitwise. The QCP
-engine's own drafter decode steps all-reduce `o_proj`
-(replicated rows). `--force-deterministic-rsag` on it pins them to the fold
-as well. With `--tp-batch-invariant attn` there is no cross-rank sum in
+them where TP8 all-reduces. Under `--numerics rl-bitwise` both are the
+rank-ordered fold, so the two engines sum `o_proj` bitwise alike, and so do
+the QCP engine's own drafter decode steps (replicated rows, all-reduced).
+With `--tp-batch-invariant attn` there is no cross-rank sum in
 `o_proj`, and QCP is bitwise the TP1 / head-replicated form the decode
 engine's batch-invariant layout computes (`docs/design/numerics.md`, "Layout
 invariance of query context parallelism").
@@ -757,7 +774,7 @@ A preset for an eight-GPU prefill engine with head TP and the
 batch-invariant `o_proj`:
 
 ```bash
-tokenspeed serve <dsa-model> \
+tokenspeed serve --headless <dsa-model> \
   --disaggregation-mode prefill \
   --attn-tp-size 8 --dense-tp-size 1 --enable-expert-parallel \
   --kv-parallel-size 8 --query-context-parallel-size 8 \
@@ -794,11 +811,17 @@ Each node must use the same model, backend, precision, and scheduler settings.
 Only `--node-rank` should differ between nodes.
 
 Run one `tokenspeed serve` per node. Node rank 0 serves the HTTP API. Higher
-ranks run the engine only and expose no endpoint.
+ranks run the engine only and expose no endpoint. Each attention-DP replica's
+first rank registers with node 0's bundled gateway: over a same-host socket
+when every one of them is on node 0, otherwise over TCP. The gateway then
+listens on the host of `--dist-init-addr`, at the port below its, which every
+node derives from its own flags, so keep that port free on node 0 and
+reachable from the other nodes. These sockets carry no authentication: run
+the nodes on a trusted network.
 
 ### Under a launcher
 
-Inside a multi-node Slurm step, TokenSpeed derives `--nnodes`, `--node-rank`
+Inside a multi-node Slurm step, TokenSpeed derives `--nnodes`, `--node-rank`,
 and `--dist-init-addr` from the step environment when you do not give them,
 so the same command line runs on every node:
 
@@ -819,7 +842,7 @@ Rules:
 - TokenSpeed always uses an explicit `--dist-init-addr` as given.
 - Derivation only engages inside an `srun` step of more than one node. Outside
   a step — including the batch script of a multi-node `sbatch` — or in a
-  single-node step, behaviour is unchanged: launch the ranks yourself and pass
+  single-node step, behavior is unchanged: launch the ranks yourself and pass
   `--nnodes`/`--node-rank`/`--dist-init-addr`.
 - If TokenSpeed detects a multi-node step but cannot resolve the topology,
   startup fails with the reason rather than falling back to a single node.
@@ -844,6 +867,18 @@ Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different
 `NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.
 
+### Stopping
+
+Stop every node. A node that stops does not stop the others: they find out
+at their next collective with it, which fails or can hang.
+
+A node that receives SIGTERM or SIGINT, or whose scheduler fails, sends
+SIGTERM to the engine rank processes it started and gives them 30 seconds to
+exit. It then kills whatever is left of them and of the processes they
+started. On Linux the rank processes of a node of rank 1 or higher are also
+killed when the node process itself is killed, for example with SIGKILL at
+the end of a grace period.
+
 ## Emulating rank 0 on one GPU
 
 `--emulate-rank-zero` runs only global rank 0 of the configured layout, so you
@@ -854,7 +889,7 @@ tokenspeed serve <model> --tp 8 --emulate-rank-zero --load-format dummy
 ```
 
 The layout resolves as usual (TP8 here), so the rank builds the weight shards,
-kernels and cache sizing rank 0 of the full deployment would. Its collectives
+kernels, and cache sizing rank 0 of the full deployment would. Its collectives
 are local stand-ins that return the real shapes and dtypes, filled from this
 rank's operand alone.
 
@@ -876,7 +911,7 @@ of a real run.
 TokenSpeed currently supports the flag on AMD GPUs, on one node, without
 pipeline, context or attention data parallelism, an MoE TP x EP size other
 than the attention TP size, `--mm-encoder-tp-mode data`, PD disaggregation,
-fused all-reduce or an `--all2all-backend` transport.
+fused all-reduce, or an `--all2all-backend` transport.
 
 ## Runtime notes
 
@@ -902,14 +937,11 @@ across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. Layouts such as attention DP with dense TP or MoE EP
 spanning nodes need this fallback.
 
-Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) the
-all-reduce on a multicast-reachable group is the NVLS in-switch reduction
-issued by the group's rank 0 through the same RSAG buffers, verified
-bitwise at startup on every group it serves. AutoBackend keeps a kind whose
-groups the switch reduces in different orders (several TP groups of three or
-more GPUs) on the fold and logs it. The reduce-scatters, other payloads
-and unreachable groups take NCCL data movement plus a rank-ordered fp32
-fold, and the gathers stay on the multicast kernels. The distributed argmax
+Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
+reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the
+gathers stay on the multicast kernels; the in-switch reduction's order moves
+with a row's offset in the buffer, so it serves only the performance routes.
+The distributed argmax
 and the fused all-reduce kernels are off. `--force-deterministic-rsag` keeps
 every collective on NCCL (reductions on the fold). `AutoBackend.route` is
 the one place that decides. `docs/design/numerics.md` has the measured

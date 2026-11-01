@@ -1498,10 +1498,6 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     return out
 
 
-gluon_a16w4_warp_decode_ep_gfx950 = gluon_a16w4_situ_warp_decode_ep_gfx950
-
-
 __all__ = [
     "gluon_a16w4_situ_warp_decode_ep_gfx950",
-    "gluon_a16w4_warp_decode_ep_gfx950",
 ]

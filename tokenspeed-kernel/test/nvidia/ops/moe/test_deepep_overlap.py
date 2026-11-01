@@ -187,26 +187,20 @@ def test_routing_metadata_is_canonicalized_once() -> None:
     assert got_ids.is_contiguous()
 
 
-def test_overlap_only_reaches_all_to_all_plans(monkeypatch) -> None:
+def test_overlap_only_reaches_all_to_all_plans() -> None:
     """Plans that own no dispatch legs must not see the window argument."""
     seen: dict = {}
 
-    def fake_select_kernel(*args, **kwargs):
-        del args, kwargs
+    def kernel(**kw):
+        seen.update(kw)
 
-        def kernel(**kw):
-            seen.update(kw)
-
-        return kernel
-
-    monkeypatch.setattr("tokenspeed_kernel.ops.moe.select_kernel", fake_select_kernel)
     x = torch.zeros((1, HIDDEN), dtype=torch.bfloat16)
 
     def overlap_fn() -> None:
         return None
 
     moe_apply(
-        {"apply_kernel_name": None, "a2a_backend": "deepep"},
+        {"apply_kernel": kernel, "features": frozenset(), "a2a_backend": "deepep"},
         x,
         _weights(),
         torch.zeros((1, NUM_LOCAL_EXPERTS)),
@@ -216,7 +210,7 @@ def test_overlap_only_reaches_all_to_all_plans(monkeypatch) -> None:
 
     seen.clear()
     moe_apply(
-        {"apply_kernel_name": None, "a2a_backend": None},
+        {"apply_kernel": kernel, "features": frozenset(), "a2a_backend": None},
         x,
         _weights(),
         torch.zeros((1, NUM_LOCAL_EXPERTS)),

@@ -26,6 +26,7 @@ from functools import partial
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kpool import kpool_scores
 from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -190,14 +191,13 @@ def _reference(
     )
     expected = []
     for row, end_tensor in enumerate(row_ends):
-        end = int(end_tensor.item())
-        pools = pool_offset + torch.arange(end, device=_DEVICE)
-        request = int(req_ids[row].item())
-        pages = block_table[request, pools // _PAGE_SIZE].long()
+        pools = pool_offset + torch.arange(int(end_tensor), device=_DEVICE)
+        pages = block_table[int(req_ids[row]), pools // _PAGE_SIZE].long()
         selected_keys = keys[pages, pools.remainder(_PAGE_SIZE)]
-        head_scores = torch.einsum("hd,pd->hp", q[row].float(), selected_keys.float())
         expected.append(
-            (head_scores.relu() * weights[row, :, None]).sum(dim=0) * _SOFTMAX_SCALE
+            kpool_scores(
+                q[row], selected_keys, weights[row], _SOFTMAX_SCALE, apply_relu=True
+            )
         )
     return expected, row_ends
 
@@ -367,12 +367,9 @@ def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
         assert actual[row, end:].isnan().all()
 
 
-# GFX1250 folds heads in logical order regardless of the flag.
-@pytest.mark.parametrize("ordered_head_fold", (True, False) if is_cdna5() else (True,))
 @pytest.mark.parametrize("planned", (False, True))
 def test_kpool_ordered_head_fold_matches_sequential_signed_reference(
     planned: bool,
-    ordered_head_fold: bool,
 ) -> None:
     q = torch.zeros((1, _HEADS, _HEAD_DIM), device=_DEVICE, dtype=torch.bfloat16)
     q[:, :, 0] = 1.0
@@ -416,7 +413,7 @@ def test_kpool_ordered_head_fold_matches_sequential_signed_reference(
         pool_offset=0,
         window_cols=_PAGE_SIZE,
         softmax_scale=1.0,
-        ordered_head_fold=ordered_head_fold,
+        ordered_head_fold=True,
     )
     expected = torch.zeros((_PAGE_SIZE,), device=_DEVICE, dtype=torch.float32)
     for head in range(_HEADS):
@@ -500,9 +497,9 @@ def test_kpool_prefill_logits_preserve_nonfinite_visible_scores(
         assert torch.isposinf(actual).all()
 
 
-# The flag selects a different head reduction only on GFX950. The top-level op
-# captures only the planned scorer; the page-table path is eager-only.
-@pytest.mark.parametrize("ordered_head_fold", (False, True) if is_cdna4() else (True,))
+# The top-level op captures only the planned scorer; the page-table path is
+# eager-only.
+@pytest.mark.parametrize("ordered_head_fold", (False, True))
 def test_kpool_plan_graph_replay_reads_refreshed_inputs(
     ordered_head_fold: bool,
 ) -> None:

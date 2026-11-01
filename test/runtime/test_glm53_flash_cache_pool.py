@@ -89,7 +89,6 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_quant_method="none",
-        prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=8,
         components=(dsa, linear),
@@ -102,6 +101,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     groups = declare_glm53_flash_groups(
         text_config.num_hidden_layers,
         attn_config=attn_config,
+        recurrent_state_dtype=torch.float32,
         draft_attn_config=draft_attn_config,
         draft_layers=1,
     )
@@ -113,6 +113,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     packing = glm53_flash_packing_counts(
         tp_size=4,
         mla_element_size=torch.float8_e4m3fn.itemsize,
+        recurrent_state_dtype=torch.float32,
         state_group_ids=state_group_ids,
     )
     plan = pack(

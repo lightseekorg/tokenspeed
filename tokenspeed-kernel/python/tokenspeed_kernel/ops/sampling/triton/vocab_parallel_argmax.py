@@ -47,12 +47,12 @@ def _pack_argmax_key_kernel(
     row = tl.program_id(0)
     index = tl.load(index_ptr + row).to(tl.int64)
     safe_index = tl.maximum(index, 0)
-    # Adding +0.0 turns -0.0 into +0.0 so signed zeros tie as in argmax.
-    value = (
-        tl.load(logits_ptr + row.to(tl.int64) * stride_m + safe_index).to(tl.float32)
-        + 0.0
+    value = tl.load(logits_ptr + row.to(tl.int64) * stride_m + safe_index).to(
+        tl.float32
     )
     bits = value.to(tl.int32, bitcast=True)
+    # Canonicalize signed zero explicitly: compilers may fold away x + 0.0.
+    bits = tl.where(value == 0.0, 0, bits)
     # Flip the magnitude bits of negatives so int32 order matches float order.
     ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
     # A local argmax that picks NaN ranks it above every number, as

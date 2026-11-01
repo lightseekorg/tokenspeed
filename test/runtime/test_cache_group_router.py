@@ -12,6 +12,7 @@ import os
 import sys
 import textwrap
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -359,6 +360,7 @@ class TestGroupTableStacksTest:
 
         from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
             _unpack_group_kernel,
+            _unpack_packed_groups_kernel,
         )
         from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
             _extend_locs_kernel,
@@ -373,7 +375,9 @@ class TestGroupTableStacksTest:
             results = []
             for stacks, table in ((cpu, base), (gpu, base.cuda())):
                 raw = table[offset : offset + rows]
-                stacks.fill(rows, rows, {FULL: raw, SWA: raw})
+                # Packed views and a lone copy take the two kernels.
+                swa = raw if extend % 2 else raw.clone()
+                stacks.fill(rows, rows, {FULL: raw, SWA: swa})
                 lens = torch.full((rows,), extend, dtype=torch.int32)
                 locs = stacks.extend_locations(
                     torch.zeros_like(lens).to(table.device),
@@ -391,18 +395,26 @@ class TestGroupTableStacksTest:
 
         # Spans past max_extend_tokens (16) take a fresh tensor strided by the total.
         run(2, 0, 9)
-        kernels = (_unpack_group_kernel, _extend_locs_kernel)
+        run(2, 0, 8)
+        kernels = (
+            _unpack_group_kernel,
+            _unpack_packed_groups_kernel,
+            _extend_locs_kernel,
+        )
         with (
             patch.object(
                 kernels[0], "_do_compile", wraps=kernels[0]._do_compile
             ) as unpack,
             patch.object(
                 kernels[1], "_do_compile", wraps=kernels[1]._do_compile
+            ) as packed,
+            patch.object(
+                kernels[2], "_do_compile", wraps=kernels[2]._do_compile
             ) as extend,
         ):
             for rows, offset, length in ((1, 1, 1), (2, 1, 9), (4, 0, 8), (3, 1, 11)):
                 run(rows, offset, length)
-        assert ((unpack.call_count, extend.call_count)) == ((0, 0))
+        assert (unpack.call_count, packed.call_count, extend.call_count) == (0, 0, 0)
 
     @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
     def test_cuda_fill_matches_torch_reference(self):
@@ -424,6 +436,87 @@ class TestGroupTableStacksTest:
         stacks_cuda.tables.zero_()
         stacks_cuda.fill(7, 5, {FULL: full.clone(), SWA: swa.clone()})
         torch.testing.assert_close(stacks_cuda.tables, stacks_ref.tables)
+
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
+    def test_cuda_fill_reads_any_packed_order_and_in_place_padding(self):
+        from unittest.mock import patch
+
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            _unpack_packed_groups_kernel,
+        )
+
+        torch.manual_seed(2)
+        stacks_cuda = self._stacks("cuda", max_bs=8)
+        stacks_ref = self._stacks("cuda", max_bs=8)
+
+        def fill(bs, swa_cols, other_cols, full_cols):
+            # The upload packs another router's group between this router's
+            # two, in the other order; a stopped request's row is -1.
+            packed = torch.randint(
+                -1, 20, (bs * (swa_cols + other_cols + full_cols),), dtype=torch.int32
+            ).cuda()
+            swa = packed[: bs * swa_cols].view(bs, swa_cols)
+            full = packed[bs * (swa_cols + other_cols) :].view(bs, full_cols)
+            full[1].fill_(-1)
+            for stacks in (stacks_cuda, stacks_ref):
+                stacks.tables.fill_(7)
+            stacks_cuda.fill(7, bs - 1, {FULL: full, SWA: swa})
+            stacks_ref._fill_torch(7, bs - 1, [full, swa])
+            assert torch.equal(stacks_cuda.tables, stacks_ref.tables)
+            assert not stacks_cuda.tables[0, 1].any()
+
+        fill(5, 2, 4, 3)
+        compile_ = _unpack_packed_groups_kernel._do_compile
+        with patch.object(
+            _unpack_packed_groups_kernel, "_do_compile", wraps=compile_
+        ) as packed:
+            for bs, swa_cols, other_cols, full_cols in (
+                (4, 1, 16, 2),
+                (6, 3, 1, 1),
+                (3, 2, 0, 16),
+            ):
+                fill(bs, swa_cols, other_cols, full_cols)
+        assert packed.call_count == 0
+
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
+    def test_cuda_stacks_compile_their_packed_fill_before_serving(self):
+        from unittest.mock import patch
+
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            _unpack_packed_groups_kernel,
+        )
+
+        # A geometry no other test builds, so only the construction compiles it.
+        specs = [
+            GroupTableSpec(
+                "a", block_granularity=8, kernel_page_size=8, max_num_pages=5
+            ),
+            GroupTableSpec(
+                "b", block_granularity=8, kernel_page_size=2, max_num_pages=9
+            ),
+            GroupTableSpec(
+                "c", block_granularity=8, kernel_page_size=4, max_num_pages=7
+            ),
+        ]
+        stacks = GroupTableStacks(
+            specs, max_bs=4, max_tokens_per_req=1, max_extend_tokens=0, device="cuda"
+        )
+        assert not stacks.tables.any()
+        packed = torch.arange(1, 7, dtype=torch.int32, device="cuda")
+        tables = {
+            gid: packed[2 * i : 2 * i + 2].view(2, 1) for i, gid in enumerate("abc")
+        }
+        compile_ = _unpack_packed_groups_kernel._do_compile
+        with patch.object(
+            _unpack_packed_groups_kernel, "_do_compile", wraps=compile_
+        ) as compiled:
+            stacks.fill(3, 2, tables)
+        assert compiled.call_count == 0
+        assert stacks.table("a", 3).tolist() == [
+            [1, 0, 0, 0, 0],
+            [2, 0, 0, 0, 0],
+            [0] * 5,
+        ]
 
 
 class _StubLeaf(PagedAttentionBackend):
@@ -633,6 +726,49 @@ class TestCacheGroupRouterTest:
             ]
         )
         assert (leaves[FULL].calls[-2]) == (("refresh", 4, 2, 0, False))
+
+    def test_refresh_fills_copy_only_leaves_in_one_batched_copy(self):
+        class _CopyOnlyLeaf(_StubLeaf):
+            def decode_buffer_targets(self, bs):
+                return self.seq_lens_buf[:bs], self.page_table_buf[:bs]
+
+            def publish_decode_metadata(self, bs, seq_lens, *, num_extends):
+                self.calls.append(("publish", bs, num_extends))
+
+        batched, own = _CopyOnlyLeaf(4), _StubLeaf(2)
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), {FULL: batched, SWA: own})
+        router.init_cuda_graph_state(4)
+        foreach_copy = torch._foreach_copy_
+        launches = []
+
+        def counting_copy(dsts, srcs):
+            launches.append(len(dsts))
+            foreach_copy(dsts, srcs)
+
+        with mock.patch.object(torch, "_foreach_copy_", counting_copy):
+            router.refresh_decode_metadata(
+                4,
+                2,
+                torch.arange(4, dtype=torch.int32),
+                torch.tensor([9, 4, 1, 1], dtype=torch.int32),
+                forward_mode=ForwardMode.DECODE,
+                block_tables=self._tables(),
+            )
+        assert launches == [2]
+        assert batched.seq_lens_buf.tolist() == [9, 4, 1, 1]
+        assert batched.page_table_buf.tolist() == (
+            [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0], [0] * 6, [0] * 6]
+        )
+        assert batched.calls[-2] == ("publish", 4, 0)
+        # A leaf without targets keeps its own refresh.
+        assert own.calls[-2] == ("refresh", 4, 2, 0, False)
 
     def test_forward_dispatches_by_group_with_group_write_locations(self):
         router, leaves = self._router()

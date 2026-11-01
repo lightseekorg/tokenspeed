@@ -6,6 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
+from tokenspeed_kernel.numerics.torch.attention.mla import (
+    torch_mla_paged_attention,
+)
 from tokenspeed_kernel.ops.attention.mla import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
@@ -100,18 +104,17 @@ def test_mla_prefill(
     q_offset = 0
     kv_offset = 0
     for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
-        q_i = q[q_offset : q_offset + q_len].float()
-        k_i = k[kv_offset : kv_offset + kv_len].float()
-        v_i = v[kv_offset : kv_offset + kv_len].float()
-        scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * softmax_scale
-        if is_causal:
-            q_pos = torch.arange(q_len, device=device) + max(kv_len - q_len, 0)
-            k_pos = torch.arange(kv_len, device=device)
-            mask = q_pos[:, None] >= k_pos[None, :]
-            scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.einsum("hqk,khd->qhd", probs, v_i))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).transpose(0, 1))
+        ref, ref_lse = torch_dense_attention(
+            q[q_offset : q_offset + q_len].float(),
+            k[kv_offset : kv_offset + kv_len].float(),
+            v[kv_offset : kv_offset + kv_len].float(),
+            scale=softmax_scale,
+            causal_offset=max(kv_len - q_len, 0) if is_causal else None,
+            window_left=None,
+            sinks=None,
+        )
+        refs.append(ref)
+        ref_lses.append(ref_lse)
         q_offset += q_len
         kv_offset += kv_len
     out_ref = torch.cat(refs, dim=0)
@@ -414,21 +417,14 @@ def test_mla_decode_with_kvcache(
         solution=solution,
     )
 
-    refs = []
-    ref_lses = []
-    for batch_idx in range(batch_size):
-        kv_rows = []
-        for pos in range(int(cache_seqlens[batch_idx].item())):
-            page = page_table[batch_idx, pos // page_size]
-            kv_rows.append(kv_cache[page, pos % page_size, 0])
-        kv = torch.stack(kv_rows).float()
-        scores = torch.einsum("hd,kd->hk", q[batch_idx, 0].float(), kv)
-        scores = scores * softmax_scale
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.matmul(probs, kv[:, :kv_lora_rank]).unsqueeze(0))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).unsqueeze(0))
-    out_ref = torch.stack(refs, dim=0)
-    lse_ref = torch.stack(ref_lses, dim=0)
+    out_ref, lse_ref = torch_mla_paged_attention(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        kv_lora_rank=kv_lora_rank,
+        softmax_scale=softmax_scale,
+    )
 
     assert out.shape == (batch_size, q_len, num_heads, kv_lora_rank)
     if q_dtype in _FP8_DTYPES:
@@ -742,26 +738,19 @@ def _run_fixed_bf16_mla_decode_case(
                 atol=2e-2,
             )
 
-    refs = []
-    ref_lses = []
-    for batch_idx in range(batch_size):
-        kv_rows = []
-        for pos in range(int(cache_seqlens[batch_idx].item())):
-            page = page_table[batch_idx, pos // page_size]
-            kv_rows.append(kv_cache[page, pos % page_size, 0])
-        kv = torch.stack(kv_rows).float()
-        scores = torch.einsum("hd,kd->hk", q[batch_idx, 0].float(), kv)
-        scores = scores * softmax_scale
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.matmul(probs, kv[:, :kv_lora_rank]).unsqueeze(0))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).unsqueeze(0))
-    out_ref = torch.stack(refs, dim=0)
+    out_ref, lse_ref = torch_mla_paged_attention(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        kv_lora_rank=kv_lora_rank,
+        softmax_scale=softmax_scale,
+    )
 
     assert out.shape == (batch_size, 1, num_heads, kv_lora_rank)
     torch.testing.assert_close(out.float(), out_ref, rtol=8e-2, atol=8e-2)
     if return_lse:
         assert lse is not None
-        lse_ref = torch.stack(ref_lses, dim=0)
         assert lse.shape == (batch_size, 1, num_heads)
         torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 

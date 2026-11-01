@@ -23,8 +23,9 @@
 Spec verify on the overlap scheduler commits past the logical context_len for
 a finished request that lingers exactly one extra step. The physical extent
 (context_len + ServerArgs.spec_context_pad) absorbs that overshoot so no
-per-request table needs a runtime clamp; these tests pin the pad math and the
-tripwire that guards the one-lingering-step assumption.
+per-request table needs a runtime clamp; these tests pin the pad math, the
+tripwire that guards the one-lingering-step assumption, and the startup warning
+for a RoPE table the pad runs past.
 """
 
 from types import SimpleNamespace
@@ -76,36 +77,34 @@ class TestDraftTableWidth:
         assert width * block_granularity >= context_len + spec
 
 
-class TestOutputProcessorTripwire:
-    def _processor(self, physical_context_len):
-        from tokenspeed.runtime.engine.generation_output_processor import (
-            OutputProcesser,
+class TestRopeTableWarning:
+    @pytest.fixture
+    def warning(self, monkeypatch, caplog):
+        """The startup warning for a model at a 4096-token context and
+        ``physical`` positions, or an empty string."""
+        import tokenspeed.runtime.execution.model_executor as module
+
+        # The colorful logger does not propagate; let caplog see its records.
+        monkeypatch.setattr(module.logger, "propagate", True)
+        model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(max_position_embeddings=4096)
         )
 
-        return OutputProcesser(
-            send_to_tokenizer=lambda *_: None,
-            spec_algorithm="DFLASH",
-            spec_num_tokens=4,
-            physical_context_len=physical_context_len,
-            metrics=SimpleNamespace(),
-        )
+        def warn(model, physical):
+            caplog.clear()
+            with caplog.at_level("WARNING"):
+                module.warn_past_rope_table(model, model_config, 4096, physical)
+            return caplog.text
 
-    @staticmethod
-    def _state(prompt_len, prior_output):
-        return SimpleNamespace(
-            prompt_input_ids=list(range(prompt_len)),
-            output_ids=list(range(prior_output)),
-        )
+        return warn
 
-    def test_at_the_physical_limit_passes(self):
-        p = self._processor(physical_context_len=100)
-        p._check_physical_extent("r0", self._state(50, 46), output_length=4)
+    def test_tables_are_assumed_to_end_at_the_derived_context(self, warning):
+        model = object()
+        assert "Lower --max-model-len by at least 48" in warning(model, 4096 + 48)
+        assert warning(model, 4096) == ""
 
-    def test_past_the_physical_limit_raises(self):
-        p = self._processor(physical_context_len=100)
-        with pytest.raises(RuntimeError, match="physical_context_len=100"):
-            p._check_physical_extent("r0", self._state(50, 47), output_length=4)
-
-    def test_disabled_when_none(self):
-        p = self._processor(physical_context_len=None)
-        p._check_physical_extent("r0", self._state(50, 470), output_length=4)
+    def test_a_model_that_sizes_its_table_is_checked_against_it(self, warning):
+        assert warning(SimpleNamespace(rope_positions=4096 + 64), 4096 + 48) == ""
+        short = SimpleNamespace(rope_positions=4096)
+        assert "Lower --max-model-len by at least 48" in warning(short, 4096 + 48)
+        assert warning(SimpleNamespace(rope_positions=None), 4096 + 48) == ""

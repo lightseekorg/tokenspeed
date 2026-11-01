@@ -44,7 +44,11 @@ class DummyDrafter(BaseDrafter):
 
     @override
     def idle_forward_global_num_tokens(
-        self, global_num_tokens: list[int], global_bs: list[int]
+        self,
+        global_num_tokens: list[int],
+        global_bs: list[int],
+        *,
+        global_num_decodes: list[int],
     ) -> list[list[int]]:
         del global_num_tokens, global_bs
         return []

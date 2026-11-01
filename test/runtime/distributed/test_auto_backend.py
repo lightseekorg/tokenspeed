@@ -8,21 +8,16 @@ import pytest
 import torch
 
 from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
-from tokenspeed.runtime.distributed.comm_backend import (
-    triton_rsag as triton_rsag_module,
-)
 from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
     Collective,
     Route,
+    ordered_fold_sum,
 )
 from tokenspeed.runtime.distributed.comm_backend.iris import (
     IrisBackend,
 )
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-from tokenspeed.runtime.distributed.comm_backend.triton_rsag import (
-    TritonRSAGBackend,
-)
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
@@ -411,15 +406,9 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
 
 @pytest.fixture
 def routing(backend, monkeypatch):
-    """The fixture backend with the real payload test and a controllable
-    multicast verdict; ``mapping`` None makes every group node-local."""
+    """The fixture backend with a controllable multicast verdict; ``mapping``
+    None makes every group node-local."""
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
-    monkeypatch.setattr(
-        triton_rsag_module, "current_platform", lambda: SimpleNamespace(is_nvidia=True)
-    )
-    backend._rsag.serves_multimem_all_reduce = (
-        TritonRSAGBackend.serves_multimem_all_reduce
-    )
     return backend
 
 
@@ -432,6 +421,7 @@ def _switches(monkeypatch, *, force: bool, invariant: bool) -> None:
 
 ROWS = torch.empty(4, 16, dtype=torch.bfloat16)
 GROUP = (0, 1)
+REDUCTIONS = [collective for collective in Collective if collective.is_reduction]
 
 
 @pytest.mark.parametrize("collective", list(Collective))
@@ -446,50 +436,32 @@ def test_force_deterministic_rsag_routes_everything_to_nccl(
 def test_force_deterministic_rsag_keeps_reductions_on_the_fold(
     routing, monkeypatch, collective
 ):
-    # Under rl-bitwise plus the knob: today's behaviour, fold for reductions
-    # and NCCL for the gathers, never the switch.
     _switches(monkeypatch, force=True, invariant=True)
     expected = Route.ORDERED_FOLD if collective.is_reduction else Route.NCCL
     assert routing.route(collective, ROWS, GROUP) is expected
 
 
-def test_batch_invariant_all_reduce_takes_the_switch_where_multicast_reaches(
-    routing, monkeypatch
-):
-    _switches(monkeypatch, force=False, invariant=True)
-    assert routing.route(Collective.ALL_REDUCE, ROWS, GROUP) is Route.MULTIMEM
-    # A group multicast cannot map falls to the fold, not to NCCL.
-    monkeypatch.setattr(
-        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
-    )
-    assert routing.route(Collective.ALL_REDUCE, ROWS, GROUP) is Route.ORDERED_FOLD
-
-
+@pytest.mark.parametrize("collective", REDUCTIONS)
+@pytest.mark.parametrize("reachable", [True, False])
 @pytest.mark.parametrize(
     "payload",
     [
-        torch.empty(4, 16, dtype=torch.float32),  # not bf16
-        torch.empty(64, dtype=torch.bfloat16),  # not 2-D
-        torch.empty(4, 12, dtype=torch.bfloat16),  # width not a multiple of 8
+        torch.empty(4, 16, dtype=torch.bfloat16),
+        torch.empty(4, 16, dtype=torch.float32),
+        torch.empty(64, dtype=torch.bfloat16),
+        torch.empty(4, 12, dtype=torch.bfloat16),
     ],
 )
-def test_batch_invariant_all_reduce_folds_payloads_the_switch_cannot_take(
-    routing, monkeypatch, payload
+def test_batch_invariant_reductions_always_fold(
+    routing, monkeypatch, collective, reachable, payload
 ):
+    # The in-switch reduction's order moves with a row's offset in the buffer,
+    # so no reduction takes it under the contract, whatever multicast reaches.
     _switches(monkeypatch, force=False, invariant=True)
-    assert routing.route(Collective.ALL_REDUCE, payload, GROUP) is Route.ORDERED_FOLD
-
-
-@pytest.mark.parametrize(
-    "collective", [Collective.REDUCE_SCATTER, Collective.TOKEN_REDUCE_SCATTER]
-)
-def test_batch_invariant_reduce_scatters_keep_the_fold(
-    routing, monkeypatch, collective
-):
-    # The in-switch order depends on the issuing rank, so a per-rank slice
-    # would move a row's bits with the slicing; the fold moves each byte once.
-    _switches(monkeypatch, force=False, invariant=True)
-    assert routing.route(collective, ROWS, GROUP) is Route.ORDERED_FOLD
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: reachable)
+    )
+    assert routing.route(collective, payload, GROUP) is Route.ORDERED_FOLD
 
 
 @pytest.mark.parametrize(
@@ -526,31 +498,80 @@ def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkey
 
 
 def test_route_never_reads_the_row_count(routing, monkeypatch):
-    # A site's route must not move with the batch; only the capacity check
-    # inside the multimem all-reduce sees the rows, and it refuses rather
-    # than reroutes.
+    # A site's route must not move with the batch.
     _switches(monkeypatch, force=False, invariant=True)
     for rows in (0, 1, 7, 100_000):
         payload = torch.empty(rows, 16, dtype=torch.bfloat16)
-        assert routing.route(Collective.ALL_REDUCE, payload, GROUP) is Route.MULTIMEM
+        assert (
+            routing.route(Collective.ALL_REDUCE, payload, GROUP) is Route.ORDERED_FOLD
+        )
 
 
-def test_batch_invariant_all_reduce_dispatches_to_the_multimem_backend(
+def test_batch_invariant_all_reduce_folds_the_gathered_partials_in_rank_order(
     routing, monkeypatch
 ):
     _switches(monkeypatch, force=False, invariant=True)
-    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
-    routing._rsag.multimem_all_reduce.return_value = tensor
+    routing._trtllm_ar.has_trtllm_ar.return_value = False
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
+    )
+    # Two partials whose sum rounds differently in bf16 than in fp32: the fold
+    # accumulates in fp32 and rounds once.
+    mine = torch.full((4, 16), 1.0, dtype=torch.bfloat16)
+    peer = torch.full((4, 16), 2.0**-9, dtype=torch.bfloat16)
+    routing._nccl.all_gather.side_effect = lambda tensor, group, dim: torch.cat(
+        [mine, peer], dim=dim
+    )
+    tensor = mine.clone()
 
     assert routing.all_reduce(tensor, GROUP) is tensor
 
-    routing._rsag.multimem_all_reduce.assert_called_once_with(tensor, GROUP)
+    expected = (mine.float() + peer.float()).to(torch.bfloat16)
+    assert torch.equal(tensor, expected)
     routing._nccl.all_reduce.assert_not_called()
-    routing._nccl.all_gather.assert_not_called()
+    assert not routing._rsag.method_calls
     # Collections take the same route tensor by tensor.
-    routing._rsag.multimem_all_reduce.reset_mock()
-    routing.all_reduce((tensor, tensor), GROUP)
-    assert routing._rsag.multimem_all_reduce.call_count == 2
+    routing._nccl.all_gather.reset_mock()
+    routing.all_reduce((mine.clone(), mine.clone()), GROUP)
+    assert routing._nccl.all_gather.call_count == 2
+
+
+def test_batch_invariant_all_reduce_takes_the_trtllm_fold_where_it_serves(
+    routing, monkeypatch
+):
+    _switches(monkeypatch, force=False, invariant=True)
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
+    )
+    routing._trtllm_ar.has_trtllm_ar.return_value = True
+    folded = torch.full((4, 16), 3.0, dtype=torch.bfloat16)
+    routing._trtllm_ar.ordered_all_reduce.return_value = folded
+    routing._nccl.all_gather.side_effect = lambda tensor, group, dim: torch.cat(
+        [tensor, tensor], dim=dim
+    )
+    gather_fold = torch.full((4, 16), 2.0, dtype=torch.bfloat16)
+    assert routing.all_reduce(torch.ones(4, 16, dtype=torch.bfloat16), GROUP) is folded
+
+    # The rsag override keeps the fold off the symmetric-memory workspace.
+    _switches(monkeypatch, force=True, invariant=True)
+    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
+    assert routing.all_reduce(tensor, GROUP) is tensor
+    assert torch.equal(tensor, gather_fold)
+
+    # A shape the workspace does not serve takes the gather and the fold.
+    _switches(monkeypatch, force=False, invariant=True)
+    routing._trtllm_ar.ordered_all_reduce.return_value = None
+    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
+    assert routing.all_reduce(tensor, GROUP) is tensor
+    assert torch.equal(tensor, gather_fold)
+
+
+def test_ordered_fold_sum_stores_a_zero_sum_as_positive_zero():
+    # The torch fold matches the kernels: only an all -0.0 sum would keep its sign.
+    parts = torch.tensor([[-0.0, -0.0, 1.0], [-0.0, 0.0, -1.0]])
+    out = torch.empty(3)
+    ordered_fold_sum(parts, out)
+    assert out.view(torch.int32).tolist() == [0, 0, 0]
 
 
 def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(
@@ -565,29 +586,3 @@ def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(
             GROUP,
             op=torch.distributed.ReduceOp.PRODUCT,
         )
-
-
-def test_batch_invariant_all_reduce_skips_the_kernel_for_empty_rows(
-    routing, monkeypatch
-):
-    _switches(monkeypatch, force=False, invariant=True)
-    empty = torch.empty(0, 16, dtype=torch.bfloat16)
-    assert routing.all_reduce(empty, GROUP) is empty
-    routing._rsag.multimem_all_reduce.assert_not_called()
-
-
-def test_multimem_all_reduce_refuses_a_payload_past_its_buffer(monkeypatch):
-    # The ordered fold would return different bits for that batch alone, so
-    # the contract forbids rerouting; a payload the launch did not size for is
-    # a bug reported as such.
-    monkeypatch.setattr(
-        triton_rsag_module, "current_platform", lambda: SimpleNamespace(is_nvidia=True)
-    )
-    rsag = TritonRSAGBackend(fallback=Mock())
-    monkeypatch.setattr(
-        rsag, "_get_or_create", lambda group, hidden: SimpleNamespace(max_token_num=4)
-    )
-    with pytest.raises(RuntimeError, match="past the 4"):
-        rsag.multimem_all_reduce(torch.ones(8, 16, dtype=torch.bfloat16), GROUP)
-    with pytest.raises(ValueError, match="2-D bf16"):
-        rsag.multimem_all_reduce(torch.ones(8, 16, dtype=torch.float32), GROUP)

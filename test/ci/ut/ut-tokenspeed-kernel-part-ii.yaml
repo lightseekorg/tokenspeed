@@ -18,5 +18,8 @@ install:
 ut:
   commands:
     - python3 -m pytest tokenspeed-kernel/test/ops/ -v
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/ -v --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py
 report:
   github_step_summary: true

@@ -93,7 +93,7 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     assert {"tokenspeed-kernel-amd", "tokenspeed-iris"}.isdisjoint(requirements)
     assert "tokenspeed-triton-kernels" not in requirements
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
-    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.30.0"
+    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.31.0"
 
 
 def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
@@ -121,10 +121,8 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "tokenspeed-triton",
         "tokenspeed-kernel-amd",
         "tokenspeed-iris",
-        "triton",
         "torch",
     } <= requirements.keys()
-    assert str(requirements["triton"].specifier) == "==3.8.0"
     assert {
         specifier.operator
         for specifier in requirements["tokenspeed-kernel-amd"].specifier

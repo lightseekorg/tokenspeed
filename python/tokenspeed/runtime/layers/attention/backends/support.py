@@ -23,8 +23,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.utils import get_colorful_logger
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.selection import KernelPlan
 
 logger = get_colorful_logger(__name__)
 
@@ -33,9 +37,11 @@ logger = get_colorful_logger(__name__)
 class CudaGraphSupport:
     """Per-backend-class CUDA-graph capability declaration.
 
-    Rank-uniform by construction: declarations are class attributes, resolved
-    identically on every rank at startup (event-loop.md requires graph
-    decisions to derive from replicated state). ``decode_graph=False``
+    Rank-uniform by construction: declarations are class attributes or are
+    derived at construction from replicated configuration (such as the leaves
+    planned from static geometry, ``from_plans``), resolved identically on
+    every rank at startup (event-loop.md requires graph decisions to derive
+    from replicated state). ``decode_graph=False``
     disables capture/replay of the whole-step decode graph — the unified
     refresh still serves eager decode, so ``init_cuda_graph_state`` and
     ``refresh_decode_metadata`` stay mandatory. ``prefill_graph=False``
@@ -47,6 +53,21 @@ class CudaGraphSupport:
 
     decode_graph: bool = True
     prefill_graph: bool = True
+
+    @classmethod
+    def from_plans(
+        cls, *, prefill: KernelPlan | None, decode: KernelPlan | None
+    ) -> CudaGraphSupport:
+        """Support of a backend whose attention leaves are planned at startup.
+
+        A planned leaf is recorded into a graph only if it declares the
+        registry's ``cuda_graph`` feature. An axis without a plan keeps the
+        default.
+        """
+        return cls(
+            decode_graph=decode is None or "cuda_graph" in decode.spec.features,
+            prefill_graph=prefill is None or "cuda_graph" in prefill.spec.features,
+        )
 
     def __and__(self, other: CudaGraphSupport) -> CudaGraphSupport:
         return CudaGraphSupport(

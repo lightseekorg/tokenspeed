@@ -62,6 +62,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        input_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -131,7 +133,7 @@ class MoELayer(torch.nn.Module):
             self.swiglu_arg = SwigluArg(alpha=activation_alpha, limit=swiglu_limit)
         # Per-model knobs the MoE backend reads in process_weights_after_loading.
         # ``swiglu_beta``: gpt-oss uses silu(α·gate)·(up + 1) and sets 1.0;
-        # standard SwiGLU (e.g. deepseek-v4) leaves it None.
+        # standard SwiGLU (e.g. DeepSeek V4.1) leaves it None.
         # ``w13_input_layout``: "interleaved" for HF gpt-oss-style row layout
         # ([w1_0, w3_0, w1_1, w3_1, ...]); "concatenated" (default) for the
         # shared MoE checkpoint loader's [w1_all | w3_all] block layout.
@@ -228,8 +230,13 @@ class MoELayer(torch.nn.Module):
         internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+            # The loader slices each rank's block scales at ceil(ispp / block)
+            # rows, which follow its weight rows only for a block-aligned
+            # ispp, whatever kernel then runs the layer: pad for every backend.
             self._apply_trtllm_ispp_padding(
-                fp8_scale_block_shape[0], "FP8 block scales tile it"
+                fp8_scale_block_shape[0],
+                "FP8 block scales tile it",
+                every_backend=True,
             )
         if self._quant_kind == "unquant":
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
@@ -337,9 +344,12 @@ class MoELayer(torch.nn.Module):
                 )
             internal_activation_dtype = "mxfp4"
 
-        input_dtype = torch.get_default_dtype()
-        if input_dtype not in {torch.float16, torch.bfloat16}:
-            input_dtype = torch.float16
+        if input_dtype is None:
+            input_dtype = torch.get_default_dtype()
+            if input_dtype not in {torch.float16, torch.bfloat16}:
+                input_dtype = torch.float16
+        elif input_dtype not in {torch.float16, torch.bfloat16}:
+            raise ValueError("MoE input dtype must be FP16 or BF16")
         # The activation dtype the plan is signed for; callers that feed the
         # layer synthetic inputs (kernel tuning) must match it.
         self.input_dtype = input_dtype
@@ -373,7 +383,9 @@ class MoELayer(torch.nn.Module):
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         # --moe-combine-order: how a token's routed contributions meet across
         # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
-        # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".
+        # ServerArgs already refused MoE TP > 1 under "slot"; over DeepEP the
+        # plan admits only a leaf that owns the exchange and folds in slot
+        # order (supports_all_to_all_ep with the slot combine).
         combine_order = global_server_args_dict["moe_combine_order"]
         self.combine_order: str = combine_order
         if combine_order == "slot" and self.ep_size > 1:
@@ -381,6 +393,112 @@ class MoELayer(torch.nn.Module):
             # it is the fold's group whatever the plan's solution.
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+        precision_policy = routing_config.get("precision_policy", "default")
+        output_scale = float(routing_config.get("output_scale", 1.0))
+        if precision_policy not in {
+            "default",
+            "bf16_route_accum_fp32",
+            "bf16_vendor_fp32_route",
+            "nvfp4_vendor_fp32_route",
+            "fp8ch_vendor_fp32_route",
+        }:
+            raise ValueError(f"Unsupported MoE precision policy: {precision_policy!r}")
+        if precision_policy == "bf16_route_accum_fp32":
+            # A BF16 finalized output cannot be rescaled to recover a scale
+            # applied before its rounding. Select only the implementation that
+            # owns all of the requested intermediate rounding boundaries.
+            if (
+                self._quant_kind != "unquant"
+                or input_dtype != torch.bfloat16
+                or self.activation != "silu"
+                or self.ep_size != 1
+                or with_bias
+                or self._spec.use_deepep
+                or combine_order != "rank"
+            ):
+                raise ValueError(
+                    f"{precision_policy} requires BF16 input and unquantized "
+                    "weights with SiLU, without expert parallelism, all-to-all, "
+                    "bias or slot combine"
+                )
+            if moe_backend not in {None, "triton"}:
+                raise ValueError(
+                    f"{precision_policy} requires --moe-backend triton for "
+                    f"unquantized weights, not {moe_backend!r}"
+                )
+            if routing_mode not in {None, "precomputed_topk"}:
+                raise ValueError(f"{precision_policy} requires precomputed top-k")
+            if self._routed_scaling_factor != 1.0:
+                raise ValueError(f"{precision_policy} requires unscaled route weights")
+            if not 0.0 < output_scale < float("inf"):
+                raise ValueError("MoE output_scale must be finite and positive")
+            moe_backend = "triton"
+            routing_mode = "precomputed_topk"
+        elif precision_policy == "bf16_vendor_fp32_route":
+            # FlashInfer's TRT-LLM BF16 experts with a finalized BF16 output
+            # and no later scale. The DeepSeekV3 correction bias is added in
+            # FP32: in the kernel when its hook builds that router, otherwise
+            # by TokenSpeed's top-k on precomputed routes (moe_plan). Expert
+            # parallelism runs on precomputed routes.
+            if (
+                self._quant_kind != "unquant"
+                or input_dtype != torch.bfloat16
+                or self.activation != "silu"
+                or with_bias
+                or self._spec.use_deepep
+                or moe_backend != "flashinfer_trtllm"
+                or combine_order != "rank"
+                or output_scale != 1.0
+                or self._routing_method_type != RoutingMethodType.DeepSeekV3
+            ):
+                raise ValueError(
+                    "bf16_vendor_fp32_route requires BF16 unquantized SiLU experts "
+                    "with DeepSeekV3 routing on --moe-backend flashinfer_trtllm, "
+                    "without all-to-all, bias, slot combine or an output scale"
+                )
+            if self.intermediate_size != intermediate_size:
+                # Padding moves channels between the MoE TP ranks (the loader
+                # shards the padded size), and a rank whose FlashInfer takes
+                # 64 would not pad: serve the policy only where the kernels
+                # take the size as is.
+                raise ValueError(
+                    "bf16_vendor_fp32_route requires an intermediate size per "
+                    f"partition that is a multiple of {TRTLLM_UNQUANT_ISPP_ALIGNMENT}"
+                )
+            self._fp32_correction_bias = True
+            if self.ep_size > 1:
+                routing_mode = "precomputed_topk"
+        elif precision_policy in ("nvfp4_vendor_fp32_route", "fp8ch_vendor_fp32_route"):
+            # The vendor policy's contract on FlashInfer's TRT-LLM NVFP4 or FP8
+            # per-channel (fp8_channel) experts, always on precomputed routes
+            # (the caller's top-k folds the routed scale into the FP32 route
+            # weights): the kernel quantizes its BF16 input itself and the
+            # output is finalized with the FP32 route weights.
+            quant_kind, label = (
+                ("nvfp4", "NVFP4")
+                if precision_policy == "nvfp4_vendor_fp32_route"
+                else ("fp8_channel", "FP8 per-channel")
+            )
+            if (
+                self._quant_kind != quant_kind
+                or input_dtype != torch.bfloat16
+                or self.activation != "silu"
+                or with_bias
+                or self._spec.use_deepep
+                or moe_backend != "flashinfer_trtllm"
+                or combine_order != "rank"
+                or output_scale != 1.0
+                or routing_mode not in {None, "precomputed_topk"}
+            ):
+                raise ValueError(
+                    f"{precision_policy} requires {label} SiLU experts on "
+                    "--moe-backend flashinfer_trtllm and precomputed top-k, "
+                    "without all-to-all, bias, slot combine or an output scale; "
+                    f"the layer has {self._quant_kind} {self.activation} experts"
+                )
+            routing_mode = "precomputed_topk"
+        elif output_scale != 1.0:
+            raise ValueError("MoE output_scale requires an explicit precision policy")
         self.plan = kernel_moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -391,6 +509,8 @@ class MoELayer(torch.nn.Module):
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
             hidden=hidden_size,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
             swiglu_form=self._swiglu_form(),
             activation_clamped=(
                 self.swiglu_arg is not None and self.swiglu_arg.limit is not None
@@ -405,6 +525,11 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
+            features=(
+                frozenset({"batch_invariant"})
+                if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+                else frozenset()
+            ),
             solution=moe_backend,
             # rl-bitwise promises one reduction order; fast-math epilogues
             # trade exactly that away.
@@ -412,6 +537,29 @@ class MoELayer(torch.nn.Module):
             combine_order=combine_order,
             fp32_correction_bias=self._fp32_correction_bias,
         )
+        self.plan["cutlass_fused_finalize"] = global_server_args_dict[
+            "moe_cutlass_fused_finalize"
+        ]
+        if precision_policy == "bf16_route_accum_fp32":
+            if self.plan["apply_kernel_name"] != "triton_bf16_precomputed_moe_apply":
+                raise ValueError(
+                    "Selected MoE kernel does not implement the precision policy"
+                )
+            self.plan["precision_policy"] = precision_policy
+            self.plan["output_scale"] = output_scale
+        elif precision_policy in (
+            "bf16_vendor_fp32_route",
+            "nvfp4_vendor_fp32_route",
+            "fp8ch_vendor_fp32_route",
+        ):
+            if self.plan["solution"] != "flashinfer_trtllm":
+                raise ValueError(
+                    "Selected MoE kernel does not implement the precision policy"
+                )
+            # The policy's output is the kernel's finalized combine.
+            self.plan["supports_deferred_finalize"] = False
+            self.plan["precision_policy"] = precision_policy
+            self.plan["output_scale"] = output_scale
 
         create_layer_weights(
             self._spec,
@@ -435,7 +583,9 @@ class MoELayer(torch.nn.Module):
             return "standard"
         return "generalized"
 
-    def _apply_trtllm_ispp_padding(self, alignment: int, reason: str) -> None:
+    def _apply_trtllm_ispp_padding(
+        self, alignment: int, reason: str, *, every_backend: bool = False
+    ) -> None:
         """Round the intermediate size up when the trtllm backend needs it.
 
         Args:
@@ -443,11 +593,13 @@ class MoELayer(torch.nn.Module):
                 (the FP8 scale block size, or the kernel's declared
                 ``ispp_alignment``).
             reason: Log fragment describing why the padding is required.
+            every_backend: Pad whatever ``--moe-backend`` is, for a layout
+                that every kernel needs aligned (FP8 block scales).
         """
         backend = get_moe_backend().value
         # Only the trtllm kernels run non-gated experts, so ``auto`` selects them.
         trtllm_only = backend == "auto" and not self._spec.gated
-        if backend != "flashinfer_trtllm" and not trtllm_only:
+        if not every_backend and backend != "flashinfer_trtllm" and not trtllm_only:
             return
         ispp = self.intermediate_size // self.tp_size
         if ispp % alignment == 0:
@@ -466,7 +618,9 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
-        kernel_moe_process_weights(self.plan, module)
+        kernel_moe_process_weights(
+            self.plan, module, communication_initializer=initialize_communication
+        )
         self._weights_processed = True
 
     @property
@@ -479,6 +633,11 @@ class MoELayer(torch.nn.Module):
         return self.plan.get("supports_precomputed_topk", not self.support_routing)
 
     @property
+    def topk_weights_dtype(self) -> torch.dtype:
+        """Preferred route-weight storage at the selected expert boundary."""
+        return self.plan["topk_weights_dtype"]
+
+    @property
     def topk_output_format(self):
         if self.support_routing:
             return TopKOutputFormat.BYPASSED
@@ -487,6 +646,32 @@ class MoELayer(torch.nn.Module):
     @property
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
+
+    @property
+    def deferred_output_is_token_order(self) -> bool:
+        """Whether deferred row ``token * topk + slot`` holds that route.
+
+        Only owned routes are written; with EP > 1 the other rows are stale.
+        """
+        return self.plan["deferred_output_is_token_order"]
+
+    @property
+    def supports_deferred_out(self) -> bool:
+        """Whether the kernel accepts a caller-owned deferred destination."""
+        return self.plan["supports_deferred_out"]
+
+    @property
+    def supports_deferred_cuda_finalize(self) -> bool:
+        """Whether callers can defer to ``moe_finalize_fuse_shared``.
+
+        That fused finalizer is a CUDA library, so other platforms keep the
+        kernel's own finalize even when the kernel can defer it.
+        """
+        return current_platform().is_nvidia and self.supports_deferred_finalize
+
+    @property
+    def supports_prequantized_input(self) -> bool:
+        return self.plan["supports_prequantized_input"]
 
     @property
     def supports_all_to_all_ep(self) -> bool:
@@ -507,13 +692,18 @@ class MoELayer(torch.nn.Module):
         shared_input: torch.Tensor | None = None,
         shared_weight: torch.Tensor | None = None,
         shared_out: torch.Tensor | None = None,
+        x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+        routing_prepared: object | None = None,
+        deferred_out: torch.Tensor | None = None,
+        valid_token_mask: torch.Tensor | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
         Args:
             hidden_states: ``[tokens, hidden]`` local hidden states, or a
-                ``(packed_nvfp4, block_scales)`` pair for kernels accepting
-                prequantized input. Block scales use linear per-token layout.
+                ``(packed_fp4, block_scales)`` pair for kernels accepting
+                prequantized input. NVFP4 scales use linear per-token layout;
+                gfx950 MXFP4 scales use the CDNA4 swizzle.
             topk_output: Routing result, or the raw logits when the kernel
                 routes itself.
             num_global_tokens: Token count summed over the attention DP ranks.
@@ -525,6 +715,23 @@ class MoELayer(torch.nn.Module):
                 ``moe.utils.use_deepep_low_latency``.
             overlap_fn: Optional work to run inside an all-to-all EP dispatch
                 window; ignored by plans that own no dispatch legs.
+            x_quantized: ``hidden_states`` already quantized in the kernel's
+                activation format (for NVFP4: packed E2M1 rows and linear E4M3
+                block scales); the kernel then skips its own quantize.
+                Only kernels advertising the format accept it.
+            routing_prepared: Routing metadata already populated from the
+                precomputed top-k, so the kernel skips its routing launch.
+                Only kernels advertising prepared routing accept it.
+            deferred_out: Optional caller-owned route destination for
+                ``do_finalize=False``; requires ``supports_deferred_out``.
+            valid_token_mask: Optional live-row mask for a kernel that declares
+                ``valid_token_mask`` support. It is never silently discarded.
+
+        Returns:
+            Finalized ``[tokens, hidden]`` hidden states, or with
+            ``do_finalize=False`` ``(route_outputs, route_weights,
+            expanded_idx)`` for the caller's finalize. Precomputed routes
+            always come with their weights.
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
@@ -567,6 +774,10 @@ class MoELayer(torch.nn.Module):
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
                 **shared_kwargs,
+                x_quantized=x_quantized,
+                routing_prepared=routing_prepared,
+                deferred_out=deferred_out,
+                valid_token_mask=valid_token_mask,
             )
             output_scale = topk_output.output_scale
             if isinstance(output_scale, torch.Tensor):
@@ -578,7 +789,7 @@ class MoELayer(torch.nn.Module):
             raise ValueError(
                 "selected MoE kernel does not support precomputed top-k routing"
             )
-        return kernel_moe_apply(
+        output = kernel_moe_apply(
             self.plan,
             hidden_states,
             self,
@@ -591,4 +802,13 @@ class MoELayer(torch.nn.Module):
             low_latency=low_latency,
             overlap_fn=overlap_fn,
             **shared_kwargs,
+            x_quantized=x_quantized,
+            routing_prepared=routing_prepared,
+            deferred_out=deferred_out,
+            valid_token_mask=valid_token_mask,
         )
+        if not do_finalize and output[1] is None:
+            # Some precomputed-route kernels (Triton MXFP4) return no route
+            # weights; finalize with the ones they were given.
+            output = (output[0], topk_output.topk_weights, output[2])
+        return output

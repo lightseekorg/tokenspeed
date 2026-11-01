@@ -22,6 +22,9 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.gdn import (
+    torch_prepare_prefill_state_inputs,
+)
 from tokenspeed_kernel.ops.attention.gdn._triton.prefill_state_inputs import (
     prepare_prefill_state_inputs,
 )
@@ -32,15 +35,6 @@ def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires a GPU")
     return request.param
-
-
-def _reference(conv, state, src, dst):
-    history = src > 0
-    safe = torch.where(history, src, dst).long()
-    conv[dst.long()] = conv[safe]
-    recurrent = state[safe]
-    recurrent.masked_fill_(~history[:, None, None, None], 0)
-    return recurrent, history
 
 
 def _inputs(device, dtype, strided, shape):
@@ -75,7 +69,9 @@ def test_state_preparation_exact(device, dtype, strided, shape):
         ::2
     ]
     expected_conv = conv.clone()
-    expected, expected_history = _reference(expected_conv, state, src, dst)
+    expected, expected_history = torch_prepare_prefill_state_inputs(
+        expected_conv, state, src, dst
+    )
     actual, history = prepare_prefill_state_inputs(conv, state, src, dst)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
     assert torch.equal(history, expected_history)
@@ -109,7 +105,9 @@ def test_state_preparation_cuda_graph():
     for sources in ([2, 0, 2], [0, 2, 0]):
         src.copy_(torch.tensor(sources, dtype=torch.int32, device="cuda"))
         expected_conv = conv.clone()
-        expected, expected_history = _reference(expected_conv, state, src, dst)
+        expected, expected_history = torch_prepare_prefill_state_inputs(
+            expected_conv, state, src, dst
+        )
         graph.replay()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
         assert torch.equal(history, expected_history)

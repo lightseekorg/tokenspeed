@@ -33,6 +33,8 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._iris.all_gather import IrisAllGather
+    from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
@@ -49,6 +51,8 @@ class IrisBackend(CommBackend):
     ):
         self._fallback = fallback
         self._instances: dict[tuple[Group, torch.dtype], IrisAllReduce] = {}
+        self._gathers: dict[tuple[Group, torch.dtype], IrisAllGather] = {}
+        self._broadcasts: dict[Group, IrisBroadcast] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -69,6 +73,33 @@ class IrisBackend(CommBackend):
         if previous is not None and previous is not state:
             raise RuntimeError("cannot replace a prepared Iris all-reduce state")
         self._instances[group, state.dtype] = state
+
+    def install_all_gather(self, group: Group, state: "IrisAllGather") -> None:
+        """Bind a prepared gather without replacing captured storage."""
+        key = (group, state.producer.data.dtype)
+        previous = self._gathers.get(key)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris all-gather")
+        self._gathers[key] = state
+
+    def install_broadcast(self, group: Group, state: "IrisBroadcast") -> None:
+        """Bind a prepared broadcast without replacing captured mailboxes."""
+        previous = self._broadcasts.get(group)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris broadcast")
+        self._broadcasts[group] = state
+
+    def get_prepared_all_gather(
+        self, group: Group, dtype: torch.dtype
+    ) -> "IrisAllGather | None":
+        return self._gathers.get((group, dtype))
+
+    def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
+        state = self._broadcasts.get(group)
+        if state is None or not state.can_run(tensor):
+            return False
+        state.run(tensor)
+        return True
 
     def _create(
         self,
@@ -230,6 +261,25 @@ class IrisBackend(CommBackend):
             max_bytes=max_bytes,
         )
 
+    def all_reduce_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        group: Group,
+    ) -> torch.Tensor | None:
+        """Fuse CDNA4 all-reduce and mHC post when prepared Iris state permits.
+
+        Return None on other platforms, without state, or for ineligible operands.
+        """
+        if not current_platform().is_cdna4:
+            return None
+        state = self.state(group, tensor.dtype)
+        if state is None or not state.can_reduce_mhc_post(tensor, residual, post, comb):
+            return None
+        return state.all_reduce_symmetric_mhc_post(tensor, residual, post, comb)
+
     def can_reduce_outputs(
         self,
         tensors: tuple[torch.Tensor, ...],
@@ -249,6 +299,37 @@ class IrisBackend(CommBackend):
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
+        if (
+            current_platform().is_cdna4
+            and len(group) in (4, 8)
+            and tensor.ndim == 2
+            and dim in (-1, tensor.ndim - 1)
+            and tensor.dtype == torch.bfloat16
+            and tensor.is_cuda
+            and tensor.is_contiguous()
+        ):
+            gather = self.get_prepared_all_gather(group, tensor.dtype)
+            if gather is None:
+                state = self.state(group, tensor.dtype)
+                max_bytes = (
+                    state.producer_direct_max_numel * tensor.element_size()
+                    if state is not None
+                    else self._producer_direct_max_bytes
+                )
+                from tokenspeed_kernel.ops.communication._iris.all_gather import (
+                    IrisAllGather,
+                    all_gather_columns_can_run,
+                )
+
+                if all_gather_columns_can_run(
+                    len(group), 1, tensor.shape[1], tensor.dtype, max_bytes
+                ):
+                    state = self._get_or_create(group, tensor.dtype)
+                    gather = IrisAllGather(state.producer)
+                    self.install_all_gather(group, gather)
+                    state.peers.finish_prepare()
+            if gather is not None and gather.can_run(tensor):
+                return gather.run(tensor)
         return self._fallback.all_gather(tensor, group, dim)
 
     def all_gather_single(

@@ -20,6 +20,7 @@
 
 """Fused operators for normalization layers."""
 
+from collections.abc import Callable
 from typing import ClassVar
 
 import torch
@@ -134,10 +135,13 @@ class RMSNorm(torch.nn.Module):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        *,
+        kernel: Callable | None = None,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.kernel = rmsnorm if kernel is None else kernel
 
     def forward(
         self,
@@ -152,7 +156,7 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        return rmsnorm(
+        return self.kernel(
             x,
             self.weight.data,
             self.variance_epsilon,
@@ -175,6 +179,8 @@ class RMSNorm(torch.nn.Module):
         """
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
         """
+        if self.kernel is not rmsnorm:
+            raise ValueError("A selected RMSNorm kernel cannot use all-reduce fusion")
 
         if residual is not None:
 
@@ -213,6 +219,10 @@ class RMSNorm(torch.nn.Module):
         """
         Forward method with reducescatter fusion, prioritizing flashinfer fused operations
         """
+        if self.kernel is not rmsnorm:
+            raise ValueError(
+                "A selected RMSNorm kernel cannot use reduce-scatter fusion"
+            )
 
         if residual is not None:
 
@@ -634,6 +644,7 @@ def sandwich_rmsnorm(
     *,
     x_scale: float | None = None,
     residual_scale: float | None = None,
+    token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A pre/post ("sandwich") norm boundary on a reduced sublayer output.
 
@@ -651,6 +662,9 @@ def sandwich_rmsnorm(
         norm: The norm of the new residual stream (the next pre-norm).
         x_scale, residual_scale: Optional multipliers of the two addends
             (a missing one is 1.0; NVIDIA only, as ``rmsnorm``'s).
+        token_fp8_out: Optional ``(codes, scales)`` buffers (contiguous FP8
+            E4M3 ``[T, H]``, FP32 ``[T, 1]``): the second norm also writes
+            ``out`` quantized per token, as ``rmsnorm``'s ``token_fp8_out``.
 
     Returns:
         ``(out, residual_out)``.
@@ -672,6 +686,7 @@ def sandwich_rmsnorm(
         round_residual_sum_bf16=True,
         x_scale=x_scale,
         residual_scale=residual_scale,
+        **({} if token_fp8_out is None else {"token_fp8_out": token_fp8_out}),
     )
 
 
@@ -708,6 +723,7 @@ def sandwich_rmsnorm_with_allreduce(
     group: tuple[int, ...],
     x_scale: float | None = None,
     residual_scale: float | None = None,
+    token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-reduce a sublayer partial and run the sandwich boundary on the sum.
 
@@ -733,6 +749,11 @@ def sandwich_rmsnorm_with_allreduce(
         rank: This rank's index in ``group``.
         group: Global ranks of the all-reduce.
         x_scale, residual_scale: Optional multipliers of the two addends.
+        token_fp8_out: Optional ``(codes, scales)`` buffers (contiguous FP8
+            E4M3 ``[T, H]``, FP32 ``[T, 1]``) that both paths fill with
+            ``out`` quantized per token (``fp8_quantize_per_token``'s codes
+            and scales of ``out``): the fused launch in its epilogue, the
+            unfused chain in its second norm.
 
     Returns:
         ``(out, residual_out)`` as :func:`sandwich_rmsnorm` of the reduced
@@ -742,6 +763,7 @@ def sandwich_rmsnorm_with_allreduce(
         ValueError: As :func:`sandwich_rmsnorm`, before any collective.
     """
     _check_plain_gamma(post_norm, norm)
+    fp8_kwargs = {} if token_fp8_out is None else {"token_fp8_out": token_fp8_out}
     if _sandwich_fusion_applies(x, residual, post_norm, norm, group):
         fused = allreduce_sandwich_rmsnorm(
             x.contiguous(),
@@ -754,11 +776,18 @@ def sandwich_rmsnorm_with_allreduce(
             x_scale=x_scale,
             residual_scale=residual_scale,
             max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
+            **fp8_kwargs,
         )
         if fused is not None:
             return fused
     if len(group) > 1:
         x = all_reduce(x, group)
     return sandwich_rmsnorm(
-        x, residual, post_norm, norm, x_scale=x_scale, residual_scale=residual_scale
+        x,
+        residual,
+        post_norm,
+        norm,
+        x_scale=x_scale,
+        residual_scale=residual_scale,
+        **fp8_kwargs,
     )

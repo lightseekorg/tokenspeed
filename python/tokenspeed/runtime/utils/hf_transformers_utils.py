@@ -41,10 +41,8 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
-from transformers.utils import cached_file
 
 from tokenspeed.runtime.configs import (
-    DeepseekV4Config,
     DeepseekV41Config,
     DeepseekV41TextConfig,
     InklingMMConfig,
@@ -54,7 +52,7 @@ from tokenspeed.runtime.configs import (
     KimiK3DSparkConfig,
     KimiK25Config,
     MiniMaxM3Config,
-    Qwen2Config,
+    MuseSparkConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
@@ -64,22 +62,24 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.configs.beam_config import BeamConfig
 from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
 from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
+from tokenspeed.runtime.hf_hub_retry import call_with_hf_rate_limit_retry
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
+_TURN_FINAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|eot|>")
 logger = logging.getLogger(__name__)
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    BeamConfig.model_type: BeamConfig,
     Dots3NoteConfig.model_type: Dots3NoteConfig,
-    Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
-    DeepseekV4Config.model_type: DeepseekV4Config,
     DeepseekV41Config.model_type: DeepseekV41Config,
     DeepseekV41TextConfig.model_type: DeepseekV41TextConfig,
     Qwen3_5Config.model_type: Qwen3_5Config,
@@ -97,6 +97,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Glm53FlashConfig.model_type: Glm53FlashConfig,
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
+    MuseSparkConfig.model_type: MuseSparkConfig,
+    "nemotron_h_omni": NemotronHOmniConfig,
     "glm5_next": Glm53FlashConfig,
 }
 
@@ -367,11 +369,17 @@ def get_config(
     if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-        with get_lock(model):
-            model_path = snapshot_download(
+        def download_metadata() -> str:
+            return snapshot_download(
                 model,
                 revision=revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
+
+        with get_lock(model):
+            model_path = call_with_hf_rate_limit_retry(
+                f"downloading metadata of {model}",
+                download_metadata,
             )
             raw_config = load_raw_config(model_path)
 
@@ -388,11 +396,24 @@ def get_config(
                     # into transformers_modules. Remote code must not call
                     # get_config/get_tokenizer recursively for this repo: the
                     # host-local FileLock is intentionally non-reentrant.
-                    config = AutoConfig.from_pretrained(
-                        model,
-                        trust_remote_code=True,
-                        revision=snapshot_revision,
-                        **kwargs,
+                    def load_remote_code_config():
+                        return AutoConfig.from_pretrained(
+                            model,
+                            trust_remote_code=True,
+                            revision=snapshot_revision,
+                            **kwargs,
+                        )
+
+                    # Guard, not retry coverage: Transformers converts hub
+                    # HTTP errors into OSError inside from_pretrained, which
+                    # call_with_hf_rate_limit_retry does not catch. The real
+                    # protection is the snapshot_revision pin: the retried
+                    # snapshot_download above already cached every non-weight
+                    # file, so the remote-code load resolves from the local
+                    # cache without new hub requests.
+                    config = call_with_hf_rate_limit_retry(
+                        f"loading remote-code config of {model}",
+                        load_remote_code_config,
                     )
                 else:
                     logger.warning(
@@ -470,9 +491,9 @@ def get_config(
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
     ):
-        if speculative_algorithm == "DSPARK" and config.architectures[0] in (
-            "DeepseekV4ForCausalLM",
-            "DeepseekV41ForCausalLM",
+        if (
+            speculative_algorithm == "DSPARK"
+            and config.architectures[0] == "DeepseekV41ForCausalLM"
         ):
             config.architectures[0] += "DSpark"
         else:
@@ -515,6 +536,8 @@ def get_config(
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3NextN",
         "NemotronHOmniConfig",
     ]:
         if config is text_config:
@@ -550,11 +573,17 @@ def get_generation_config(
         if not os.path.isdir(model):
             from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-            with get_lock(model):
-                model_path = snapshot_download(
+            def download_generation_config() -> str:
+                return snapshot_download(
                     model,
                     revision=revision,
                     ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                )
+
+            with get_lock(model):
+                model_path = call_with_hf_rate_limit_retry(
+                    f"downloading generation config of {model}",
+                    download_generation_config,
                 )
         return GenerationConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code, **kwargs
@@ -601,65 +630,6 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
-_DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
-    {
-        "DeepseekV4ForCausalLM",
-    }
-)
-
-
-def prefers_deepseek_v4_tokenizer(architectures: list[str] | None) -> bool:
-    if not architectures:
-        return False
-    return any(arch in _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES for arch in architectures)
-
-
-def _find_deepseek_v4_encoding_file(
-    tokenizer_name: str,
-    tokenizer_revision: str | None,
-) -> str:
-    if os.path.isdir(tokenizer_name):
-        encoding_path = os.path.join(tokenizer_name, "encoding", "encoding_dsv4.py")
-        if os.path.exists(encoding_path):
-            return encoding_path
-        raise RuntimeError(
-            "DeepSeek V4 tokenizer mode requires "
-            f"`encoding/encoding_dsv4.py` in {tokenizer_name}."
-        )
-
-    try:
-        encoding_path = cached_file(
-            tokenizer_name,
-            "encoding/encoding_dsv4.py",
-            revision=tokenizer_revision,
-            _raise_exceptions_for_gated_repo=False,
-            _raise_exceptions_for_missing_entries=False,
-            _raise_exceptions_for_connection_errors=False,
-        )
-    except TypeError:
-        encoding_path = cached_file(
-            tokenizer_name,
-            "encoding/encoding_dsv4.py",
-            revision=tokenizer_revision,
-        )
-
-    if not encoding_path:
-        raise RuntimeError(
-            "DeepSeek V4 tokenizer mode requires "
-            "`encoding/encoding_dsv4.py` from the model repository."
-        )
-    return encoding_path
-
-
-def _load_deepseek_v4_encode_messages(
-    tokenizer_name: str,
-    tokenizer_revision: str | None,
-) -> Callable[..., str]:
-    return _load_deepseek_encode_messages(
-        _find_deepseek_v4_encoding_file(tokenizer_name, tokenizer_revision)
-    )
-
-
 def _load_deepseek_encode_messages(encoding_path: str) -> Callable[..., str]:
     """Load a standalone encoder from the already resolved checkpoint snapshot."""
     if not os.path.isfile(encoding_path):
@@ -675,14 +645,6 @@ def _load_deepseek_encode_messages(encoding_path: str) -> Callable[..., str]:
     if encode_messages is None:
         raise RuntimeError(f"{encoding_path} does not define encode_messages")
     return encode_messages
-
-
-def _wrap_deepseek_v4_tokenizer(
-    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
-    encode_messages: Callable[..., str],
-) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
-    """Attach DeepSeek V4's model-provided chat encoder to a HF tokenizer."""
-    return _wrap_deepseek_tokenizer(tokenizer, encode_messages, is_v41=False)
 
 
 def _validate_deepseek_v41_text_content(content: Any) -> None:
@@ -710,22 +672,17 @@ def _validate_deepseek_v41_text_content(content: Any) -> None:
 def _wrap_deepseek_tokenizer(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     encode_messages: Callable[..., str],
-    *,
-    is_v41: bool,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Attach the checkpoint encoder without changing the backend vocabulary.
 
     V4.1 accepts text-only messages and passes numeric reasoning budgets and
-    low/high/max aliases unchanged to encoding/encoding.py. V4 retains its
-    high/max filtering and legacy vocabulary bookkeeping.
+    low/high/max aliases unchanged to encoding/encoding.py.
     """
     wrapped_tokenizer = copy.copy(tokenizer)
     added_vocab = tokenizer.get_added_vocab()
     # V4.1's added tokens overlap its base vocabulary. Double-counting them
     # changes Engram's compressed token map and therefore its n-gram hashes.
-    tokenizer_vocab_size = (
-        len(tokenizer) if is_v41 else tokenizer.vocab_size + len(added_vocab)
-    )
+    tokenizer_vocab_size = len(tokenizer)
 
     class _DeepseekTokenizer(tokenizer.__class__):  # type: ignore
         def apply_chat_template(
@@ -743,12 +700,9 @@ def _wrap_deepseek_tokenizer(
                 conversation.insert(0, {"role": "system", "tools": tools})
 
             reasoning_effort = kwargs.get("reasoning_effort")
-            if is_v41:
-                for message in conversation:
-                    for key in ("content", "content_blocks", "reasoning_content"):
-                        _validate_deepseek_v41_text_content(message.get(key))
-            elif reasoning_effort not in ("max", "high"):
-                reasoning_effort = None
+            for message in conversation:
+                for key in ("content", "content_blocks", "reasoning_content"):
+                    _validate_deepseek_v41_text_content(message.get(key))
 
             prompt = encode_messages(
                 conversation,
@@ -787,8 +741,7 @@ def _wrap_deepseek_tokenizer(
         def get_added_vocab(self) -> dict[str, int]:
             return added_vocab.copy()
 
-    version = "DSV41" if is_v41 else "DSV4"
-    _DeepseekTokenizer.__name__ = f"{version}{tokenizer.__class__.__name__}"
+    _DeepseekTokenizer.__name__ = f"DSV41{tokenizer.__class__.__name__}"
     wrapped_tokenizer.__class__ = _DeepseekTokenizer
     return wrapped_tokenizer
 
@@ -898,27 +851,34 @@ def get_tokenizer(
                 _load_deepseek_encode_messages(
                     os.path.join(tokenizer_path, "encoding", "encoding.py")
                 ),
-                is_v41=True,
-            )
-        elif tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
-            loaded_tokenizer = _wrap_deepseek_v4_tokenizer(
-                loaded_tokenizer,
-                _load_deepseek_v4_encode_messages(tokenizer_path, tokenizer_revision),
             )
         return loaded_tokenizer
 
     if not os.path.isdir(tokenizer_name):
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-        with get_lock(tokenizer_name):
-            tokenizer_path = snapshot_download(
+        def download_tokenizer_files() -> str:
+            return snapshot_download(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
             )
+
+        with get_lock(tokenizer_name):
+            tokenizer_path = call_with_hf_rate_limit_retry(
+                f"downloading tokenizer files of {tokenizer_name}",
+                download_tokenizer_files,
+            )
             snapshot_revision = _snapshot_commit_hash(tokenizer_path)
             if trust_remote_code and snapshot_revision is not None:
-                tokenizer = load_tokenizer(tokenizer_name, snapshot_revision)
+                # Same guard as the remote-code config load in get_config:
+                # hub errors inside the reload surface as OSError and are not
+                # retried; the snapshot_revision pin makes the reload resolve
+                # from the local cache filled (and 429-retried) above.
+                tokenizer = call_with_hf_rate_limit_retry(
+                    f"loading remote-code tokenizer of {tokenizer_name}",
+                    lambda: load_tokenizer(tokenizer_name, snapshot_revision),
+                )
             elif trust_remote_code:
                 logger.warning(
                     "Cannot derive an immutable Hugging Face commit from "
@@ -958,9 +918,11 @@ def reconcile_special_tokens(tokenizer):
                 replace_extra_special_tokens=False,
             )
 
-    # Special handling for stop token <|eom_id|> generated by llama 3 tool use.
+    # Turn-final markers resolve by name; Muse's <|eom|> only ends a channel, not the turn.
     added_vocab = tokenizer.get_added_vocab()
-    if "<|eom_id|>" in added_vocab:
-        tokenizer.additional_stop_token_ids = {added_vocab["<|eom_id|>"]}
-    else:
-        tokenizer.additional_stop_token_ids = None
+    stop_ids = {
+        added_vocab[token]
+        for token in _TURN_FINAL_STOP_TOKEN_TEXTS
+        if token in added_vocab
+    }
+    tokenizer.additional_stop_token_ids = stop_ids or None

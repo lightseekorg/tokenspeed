@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.ops.gemm.flashinfer import cublas_fp8_gemm
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -177,7 +177,7 @@ def cute_dsl_ll_bf16_router(
     Returns:
         ``[M, N]`` FP32 router logits, ``out`` when it was given.
     """
-    return ll_bf16_router(hidden_states, weight, out)
+    return ll_bf16_router(hidden_states, weight, out, enable_pdl=pdl_enabled())
 
 
 def ll_bf16_router_supported(
@@ -187,6 +187,8 @@ def ll_bf16_router_supported(
 
     Once serving, it declines the calls the dot-product kernel would take: that
     kernel compiles once per exact M, so the caller's other GEMM runs them.
+    This guard also applies to DSV4 projection selection; startup CUDA graphs
+    retain their captured kernels when serving begins.
 
     Args:
         hidden_states: ``[M, K]`` activation; weight: ``[N, K]`` weight.
@@ -200,8 +202,43 @@ def ll_bf16_router_supported(
     )
 
 
+@register_kernel(
+    "gemm",
+    "dsv4_linear_fp32",
+    name="cute_dsl_dsv4_linear_fp32",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=_BF16_IN_FP32_OUT,
+    priority=Priority.SPECIALIZED + 1,
+    traits={
+        "ll_bf16_supported": frozenset({True}),
+    },
+)
+def cute_dsl_dsv4_linear_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Project DSV4 inputs with the shared low-latency BF16 router driver.
+
+    Args:
+        hidden_states: Contiguous BF16 ``[M, K]`` activations, up to ``MAX_M``
+            rows.
+        weight: Contiguous BF16 ``[N, K]`` projection weights.
+        enable_pdl: PDL policy used for compilation and launch.
+
+    Returns:
+        FP32 router logits, accumulated and reduced in FP32.
+    """
+    return ll_bf16_router(hidden_states, weight, None, enable_pdl=enable_pdl)
+
+
 __all__ = [
     "MAX_M",
+    "cute_dsl_dsv4_linear_fp32",
     "cute_dsl_ll_bf16_router",
     "ll_bf16_router_supported",
 ]

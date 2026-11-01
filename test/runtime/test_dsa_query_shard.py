@@ -76,6 +76,8 @@ def _backend(
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = PAGE
     backend.kernel_solution = None
+    backend.prefill_kernel_plan = None
+    backend.decode_kernel_plan = None
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
     backend.q_data_type = torch.bfloat16

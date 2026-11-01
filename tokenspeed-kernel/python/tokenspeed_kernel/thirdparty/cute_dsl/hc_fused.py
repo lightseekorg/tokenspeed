@@ -198,8 +198,9 @@ class FusedGatedResidualKernel:
 
     Each CTA reduces M_proj / split_K columns in fixed split-rank order and
     writes post-scale/SiLU activation once. Independent weight and activation
-    TMA producers share stage barriers. Up's three R320 stages are recycled
-    between output tiles, only after their previous MMA reader has completed.
+    TMA producers share stage barriers. Up weights recycle their three stages
+    after the previous MMA reader completes; Up activations remain in shared
+    memory for all output tiles of the current token tile.
     Independent weights must be ready and immutable within the forward call.
 
     Rows come from the dynamic input layout; only the CTA tactic is compiled.
@@ -783,6 +784,12 @@ class FusedGatedResidualKernel:
                             up_iteration = tile_iteration * cta_up_steps + up_step
                             cute.arch.mbarrier_wait(up_empty, (up_iteration - 1) % 2)
                             map_u = cute_ext.get_cta_v_map_ab(up, up_tiler, up_mma, "A")
+                            # Activation stays ready in sa. Supply its arrival
+                            # without another transfer; weights still complete
+                            # their own transaction on each two-arrival barrier.
+                            with cute.arch.elect_one():
+                                for stage in cutlass.range_constexpr(3):
+                                    cute.arch.mbarrier_arrive(up_full + stage)
                             self._load_up(up, su, up_full, map_u, up_id)
             elif warp == 5:
                 if cutlass.const_expr(self.single_tile and projection_step == 0):
@@ -1088,13 +1095,7 @@ class FusedGatedResidualKernel:
                             up_phase = (tile_iteration * cta_up_steps + up_step) % 2
                             if cutlass.const_expr(up_step > 0):
                                 _epilogue_barrier()
-                            if warp == 0:
-                                if cutlass.const_expr(up_step > 0):
-                                    cute.arch.mbarrier_wait(
-                                        up_empty,
-                                        (tile_iteration * cta_up_steps + up_step - 1)
-                                        % 2,
-                                    )
+                            if warp == 0 and cutlass.const_expr(up_step == 0):
                                 workspace_rows = self.workers * self.slot_rows
                                 if cutlass.const_expr(self.clusters == 1):
                                     workspace_rows = activation.shape[0]

@@ -33,6 +33,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import (
+    quantize_fp8_rows,
+    quantize_fp8_rows_trtllm,
+    round_to_bf16_exact,
+)
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.platform import Platform, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
@@ -158,37 +165,6 @@ def test_scales_left_unpermuted_show():
     assert not torch.equal(d2, _dequantized(w2, w2_scale))
 
 
-def _bf16(x: torch.Tensor) -> torch.Tensor:
-    # One RNE rounding of FP64 values.
-    mantissa, exponent = torch.frexp(x)
-    return torch.ldexp(torch.round(mantissa * 256) / 256, exponent)
-
-
-def _quantize_rows(x: torch.Tensor):
-    """Per-row E4M3 of the input: s = amax / 448 (FP32), codes = RNE(x / s)."""
-    scale = (x.abs().amax(dim=1) / 448.0).float().clamp(min=2.0**-126)
-    codes = (x / scale.double()[:, None]).float().clamp(-448.0, 448.0).to(FP8)
-    return codes, scale
-
-
-def _requantize_rows(x: torch.Tensor):
-    """The kernel's FC2-input quantizer, TRT-LLM's perTokenQuantization with
-    fp8RowWise on BF16 rows: amax at least BF16(1e-6), scale max(amax / 448,
-    1 / (448 * 512)) and codes RNE_sat(E4M3(BF16(x * min(448 / amax,
-    448 * 512)))). The product is FP32; quantizeAndStore converts it with
-    cuda_cast<__nv_fp8x2_e4m3, float2>, which rounds to BF16 (RNE) first.
-    The codes use the reciprocal, the dequantization the scale. The kernel's
-    quotients are -use_fast_math divisions, within an ulp or two of the IEEE
-    ones used here."""
-    rows = x.float()
-    amax = rows.abs().amax(dim=1).clamp(min=float(torch.tensor(1e-6).bfloat16()))
-    scale = torch.maximum(amax / 448.0, torch.tensor(1.0 / (448.0 * 512.0)))
-    multiplier = torch.minimum(448.0 / amax, torch.tensor(448.0 * 512.0))
-    product = (rows * multiplier[:, None]).bfloat16().float()
-    codes = product.clamp(-448.0, 448.0).to(FP8)
-    return codes, scale
-
-
 def _emulate(
     x,
     w13,
@@ -205,32 +181,40 @@ def _emulate(
     row shuffle: the input quantized per token (``quantized_input``: the codes
     and scales the kernel received), FC1 with SiLU(gate) * up in its epilogue
     rounded to BF16, the FC2 input quantized per route over the (padded)
-    partition as the kernel does (:func:`_requantize_rows`), FC2 rounded to
-    BF16 per route, the FP32 combine. ``local_experts``: the global id of the
-    first of this rank's experts (``w13.shape[0]`` of them); routes to other
-    experts add nothing."""
-    ispp = w2.shape[-1]
+    partition as the kernel does (TRT-LLM's per-token quantization), FC2
+    rounded to BF16 per route, the FP32 combine. ``local_experts``: the global
+    id of the first of this rank's experts (``w13.shape[0]`` of them); routes
+    to other experts add nothing."""
     if quantized_input is None:
-        x_codes, x_scale = _quantize_rows(x.double())
+        x_codes, x_scale = quantize_fp8_rows(x.double())
     else:
         x_codes, x_scale = (t.cpu() for t in quantized_input)
         x_scale = x_scale.reshape(-1)
-    first_expert = local_experts or 0
-    output = torch.zeros(x.shape, dtype=torch.float64)
-    for expert in range(w13.shape[0]):
-        tokens, slots = torch.where(topk_ids == first_expert + expert)
-        if tokens.numel() == 0:
-            continue
-        fc1 = x_codes[tokens].double() @ w13[expert].double().T
-        fc1 *= x_scale[tokens, None].double() * w13_scale[expert].double()
-        first, second = fc1[:, :ispp], fc1[:, ispp:]
+
+    def activation(fc1: torch.Tensor) -> torch.Tensor:
+        first, second = fc1.chunk(2, dim=-1)
         up, gate = (first, second) if up_first else (second, first)
-        activated = _bf16(gate * torch.sigmoid(gate) * up)
-        act_codes, act_scale = _requantize_rows(activated)
-        fc2 = act_codes.double() @ w2[expert].double().T
-        fc2 = _bf16(fc2 * act_scale[:, None].double() * w2_scale[expert].double())
-        output.index_add_(0, tokens, fc2 * topk_weights[tokens, slots, None].double())
-    return _bf16(output)
+        return round_to_bf16_exact(gate * torch.sigmoid(gate) * up)
+
+    def requantize(activated: torch.Tensor) -> torch.Tensor:
+        codes, scale = quantize_fp8_rows_trtllm(activated)
+        return codes.double() * scale.double()[:, None]
+
+    output = torch_moe_experts(
+        x_codes.double() * x_scale.double()[:, None],
+        _dequantized(w13, w13_scale),
+        _dequantized(w2, w2_scale),
+        topk_ids,
+        topk_weights,
+        activation=activation,
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=requantize,
+        round_expert_output=round_to_bf16_exact,
+        first_expert=local_experts or 0,
+    )
+    return round_to_bf16_exact(output)
 
 
 def _reference(
@@ -238,19 +222,20 @@ def _reference(
 ):
     """The experts' exact math in FP64 on the dequantized weights, without any
     activation quantization or rounding: what the FP8 scheme approximates."""
-    ispp = w2.shape[-1]
-    output = torch.zeros(x.shape, dtype=torch.float64)
-    for expert in range(w13.shape[0]):
-        tokens, slots = torch.where(topk_ids == local_experts + expert)
-        if tokens.numel() == 0:
-            continue
-        fc1 = x[tokens].double() @ _dequantized(w13[expert], w13_scale[expert]).T
-        gate, up = fc1[:, :ispp], fc1[:, ispp:]
-        fc2 = (gate * torch.sigmoid(gate) * up) @ _dequantized(
-            w2[expert], w2_scale[expert]
-        ).T
-        output.index_add_(0, tokens, fc2 * topk_weights[tokens, slots, None].double())
-    return output
+    return torch_moe_experts(
+        x.double(),
+        _dequantized(w13, w13_scale),
+        _dequantized(w2, w2_scale),
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: torch_silu_and_mul(gate_up, None),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=None,
+        round_expert_output=None,
+        first_expert=local_experts,
+    )
 
 
 def test_padding_adds_exactly_zero():
@@ -401,6 +386,7 @@ def _plan_on(platform, **overrides) -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     kwargs.update(overrides)
     registry = KernelRegistry.get()
@@ -480,7 +466,8 @@ def _routes(tokens, experts, top_k, weights_dtype, generator):
 
 @requires_sm100
 @pytest.mark.parametrize("tokens", [1, 8, 64, 512])
-@pytest.mark.parametrize("ispp", [192, 2048])
+# 320 and 2,560: Beam's partitions at TP8 and under --ep-size 8.
+@pytest.mark.parametrize("ispp", [192, 2048, 320, 2560])
 @pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("ep", [1, 4])
 def test_routed_kernel_matches_the_emulation(tokens, ispp, weights_dtype, ep):
@@ -501,7 +488,10 @@ def test_routed_kernel_matches_the_emulation(tokens, ispp, weights_dtype, ep):
     ep_rank = 1 if ep > 1 else 0
     local = experts // ep
     first = ep_rank * local
-    w13, w13_scale, w2, w2_scale = _experts(local, ispp, hidden, seed=tokens)
+    # Drawn on the GPU: CPU randn of the larger partitions dominated this test.
+    w13, w13_scale, w2, w2_scale = (
+        t.cpu() for t in _experts(local, ispp, hidden, seed=tokens, device="cuda")
+    )
     generator = torch.Generator().manual_seed(tokens)
     x = torch.randn(tokens, hidden, generator=generator).to(torch.bfloat16)
     topk_ids, topk_weights = _routes(tokens, experts, top_k, weights_dtype, generator)
@@ -541,12 +531,14 @@ def test_routed_kernel_matches_the_emulation(tokens, ispp, weights_dtype, ep):
 
 @requires_sm100
 @pytest.mark.parametrize("tokens", [1, 64, 512])
-def test_unpadded_partition_equals_the_padded_one(tokens, monkeypatch):
-    """A 192 partition runs unpadded: bit-identical to the same experts
-    padded to 256 (a 128 alignment)."""
+@pytest.mark.parametrize("ispp", [192, 320])
+def test_unpadded_partition_equals_the_padded_one(tokens, ispp, monkeypatch):
+    """A partition that is a multiple of 64 but not of 128 (192, and Beam's
+    320 at TP8) runs unpadded: bit-identical to the same experts padded to
+    the next multiple of 128."""
     import tokenspeed_kernel.ops.moe.flashinfer as module
 
-    experts, hidden, top_k, ispp = 16, 1024, 4, 192
+    experts, hidden, top_k = 16, 1024, 4
     w13, w13_scale, w2, w2_scale = _experts(experts, ispp, hidden, seed=tokens)
     generator = torch.Generator().manual_seed(tokens)
     x = torch.randn(tokens, hidden, generator=generator).to(torch.bfloat16).cuda()
@@ -555,7 +547,8 @@ def test_unpadded_partition_equals_the_padded_one(tokens, monkeypatch):
     for alignment in (module.TRTLLM_FP8_CHANNEL_ISPP_ALIGNMENT, 128):
         monkeypatch.setattr(module, "TRTLLM_FP8_CHANNEL_ISPP_ALIGNMENT", alignment)
         w = _vendor_experts(w13, w13_scale, w2, w2_scale, experts, top_k, 0)
-        assert w.intermediate_size_per_partition == (192 if alignment == 64 else 256)
+        padded = ispp if alignment == 64 else -(-ispp // 128) * 128
+        assert w.intermediate_size_per_partition == padded
         outputs.append(
             module.flashinfer_trtllm_fp8_channel_routed_moe_apply(
                 {}, x, w, None, topk_weights.cuda(), topk_ids.cuda()

@@ -96,7 +96,8 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         lambda: MoeBackend(moe_backend),
     )
     plan = kimi_k3.Kimi3MoEExecutionPlan(
-        use_mega_moe=mega_moe,
+        use_mega_moe=moe_backend == "mega_moe",
+        owns_ep_communication=mega_moe,
         use_native=False,
         use_trtllm=not mega_moe,
         overlap_shared_experts=False,
@@ -311,8 +312,9 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     gathers = iter([*activation_payloads, ("AG_ids", ids), ("AG_weights", weights)])
     quant_scale = torch.tensor(0.125)
 
-    def quantize(tensor, scale, *, is_sf_swizzled_layout, enable_pdl):
+    def quantize(tensor, scale, *, is_sf_swizzled_layout, enable_pdl, out=None):
         events.append("quantize")
+        assert out is None
         assert scale is quant_scale and not is_sf_swizzled_layout
         torch.testing.assert_close(tensor, latent[rank, :rows])
         return packed[rank, :rows], scales[rank, :rows]
@@ -404,7 +406,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             attn=SimpleNamespace(dp_rank=rank),
             moe=SimpleNamespace(ep_group=group),
         ),
-        execution_plan=SimpleNamespace(use_mega_moe=False),
+        execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=False),
         moe_alltoall=(
             SimpleNamespace(dispatch=dispatch, combine=combine)
             if use_alltoall
@@ -579,7 +581,7 @@ def test_attn_dp_forward_requires_context() -> None:
 @pytest.mark.parametrize("rows", [0, 2])
 @pytest.mark.parametrize("shared_tp", [False, True])
 @pytest.mark.parametrize("weight_dtype", ["nvfp4", "mxfp4"])
-def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
+def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     monkeypatch, rows, shared_tp, weight_dtype
 ):
     hidden = torch.randn(rows, 8, dtype=torch.bfloat16)
@@ -613,7 +615,7 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
     )
     up = mock.Mock(return_value=hidden + prefix)
     layer = SimpleNamespace(
-        execution_plan=SimpleNamespace(use_mega_moe=True),
+        execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=True),
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),

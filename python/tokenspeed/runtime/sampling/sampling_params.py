@@ -110,8 +110,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             self.stop_token_ids = None
 
-        # Process some special cases
-        if self.temperature < _SAMPLING_EPS:
+        # A near-zero temperature means greedy; verify() rejects a negative one.
+        if 0.0 <= self.temperature < _SAMPLING_EPS:
             self.temperature = 1.0
             self.top_k = 1
         if self.top_k == 1:
@@ -153,7 +153,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
             )
-        if not 0.0 <= self.repetition_penalty <= 2.0:
+        if not 0.0 < self.repetition_penalty <= 2.0:
             raise ValueError(
                 "repetition_penalty must be in (0, 2], got "
                 f"{self.repetition_penalty}."

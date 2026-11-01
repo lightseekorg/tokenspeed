@@ -25,14 +25,14 @@ import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
 from tokenspeed_kernel.numerics.gemm import tolerance as gemm_tolerance
 from tokenspeed_kernel.numerics.inputs import get_input_generator, shape_traits
-from tokenspeed_kernel.numerics.reference.gemm import (
+from tokenspeed_kernel.numerics.tolerance import Tolerance
+from tokenspeed_kernel.numerics.torch.gemm import (
     torch_bmm_fp8_blockscale,
     torch_bmm_fp8_scaled,
     torch_mm_fp8_blockscale,
     torch_mm_fp8_scaled_mnk,
     torch_mm_fp8_scaled_nkm,
 )
-from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import (
     _verification_signature_and_reference,
     verify_kernel,
@@ -340,7 +340,7 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
         name="test_tensor_scale_reference",
         family="gemm",
         mode="mm",
-        solution="reference",
+        solution="torch",
         format_signatures=frozenset({tensor_signature}),
         traits={"b_layout": frozenset({"KN"})},
     )
@@ -376,7 +376,7 @@ class TestNumericsVerification:
             if family and family_name != family:
                 continue
             for spec in registry.get_for_operator(family_name, mode, platform=platform):
-                if spec.solution == "reference":
+                if spec.solution == "torch":
                     continue
                 if spec.solution == "deep_gemm":
                     continue
@@ -412,7 +412,7 @@ class TestNumericsVerification:
                 name="test_dense_reference",
                 family="gemm",
                 mode="collector_mm",
-                solution="reference",
+                solution="torch",
                 format_signatures=frozenset({dense_signature}),
             ),
             KernelSpec(
