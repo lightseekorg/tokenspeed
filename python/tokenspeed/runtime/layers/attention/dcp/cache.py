@@ -478,16 +478,22 @@ class FusedHistoryTransport:
         *,
         reader: object,
     ) -> tuple[torch.Tensor, torch.cuda.Event, int] | None:
-        """Start gathering ``window``'s rows of ``cache`` (one layer's
-        ``[slots, *row]`` latent plane) into the next epoch's slot for
-        ``reader``, after the current stream's work so far.
+        """Start gathering ``window``'s rows of ``cache`` into the next
+        epoch's slot for ``reader``, after the current stream's work so far.
 
-        Returns None, on every rank alike, for a window the transport does
-        not take: past the slot, rows of another layout than compiled, or
-        fetch slots not of the kernel's int32. Otherwise the slot as
-        ``[degree * cap_rows, *row]`` rows of the cache dtype (rank ``p``'s
-        rows from row ``p * send_rows``), the event its reader waits for, and
-        the epoch. ``header`` (32 bits, equal on every rank) names the window.
+        Args:
+            cache: One layer's ``[slots, *row]`` latent plane.
+            window: The planned window to gather.
+            header: The window's 32-bit identity, equal on every rank.
+            reader: The window's only consumer.
+
+        Returns:
+            None, on every rank alike, for a window the transport does not
+            take: past the slot, rows of another layout than compiled, or
+            fetch slots not of the kernel's int32. Otherwise the slot as
+            ``[degree * cap_rows, *row]`` rows of the cache dtype (rank
+            ``p``'s rows from row ``p * send_rows``), the event its reader
+            waits for, and the epoch.
         """
         if self.poisoned:
             raise RuntimeError(

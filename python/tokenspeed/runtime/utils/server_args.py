@@ -2814,7 +2814,8 @@ class ServerArgs:
             default=ServerArgs.distributed_timeout_seconds,
             help="Set the timeout of the torch.distributed process groups "
             "(initialization and collectives); the fused KVP history "
-            "all-gather's in-kernel waits end 30 s before it.",
+            "all-gather's in-kernel waits end 30 s before it (at half of it "
+            "when it is under 90 s).",
         )
         parser.add_argument(
             "--download-dir",
