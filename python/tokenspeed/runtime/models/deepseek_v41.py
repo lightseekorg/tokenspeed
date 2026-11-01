@@ -1328,21 +1328,12 @@ class DeepseekV41MoE(DeepseekV4MoE):
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob and self.config.num_experts_per_tok > 1
 
-    def _routing_inputs(self, hidden_states, image_mask):
-        bias_vl = self.gate.bias_vl
-        if hidden_states.is_cuda and (bias_vl is None or image_mask is None):
-            return super()._routing_inputs(hidden_states, None)
-        bias = self.gate.e_score_correction_bias
-        if bias_vl is not None and image_mask is not None:
-            bias = torch.where(image_mask.unsqueeze(-1), bias_vl, bias)
-        logits = F.linear(hidden_states.float(), self.gate.weight.float())
-        return logits, bias, None, None
-
     def _compute_topk_output(self, hidden_states, image_mask):
         gate, config = self.gate, self.topk.topk_config
+        correction_bias_alt = gate.bias_vl if image_mask is not None else None
+        bias_alt_mask = image_mask if correction_bias_alt is not None else None
         if (
             hidden_states.is_cuda
-            and (gate.bias_vl is None or image_mask is None)
             and gate.tid2eid is None
             and not self.topk.simulate_routing
             and self.experts.supports_precomputed_topk
@@ -1360,12 +1351,23 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     topk_weights_dtype=self.topk.weights_dtype,
                     hidden_states=hidden_states,
                     gate_weight=gate.weight,
+                    correction_bias_alt=correction_bias_alt,
+                    bias_alt_mask=bias_alt_mask,
                 )
             except NoKernelFoundError:
                 pass
             else:
                 return StandardTopKOutput(topk_weights, topk_ids, None)
-        return super()._compute_topk_output(hidden_states, image_mask)
+        # Keep the same router GEMM for text and image rows. The selector
+        # chooses the one-dimensional bias inside its kernel.
+        router_logits, correction_bias, _, _ = self._routing_inputs(hidden_states, None)
+        return self.topk(
+            hidden_states,
+            router_logits,
+            routing_correction_bias=correction_bias,
+            correction_bias_alt=correction_bias_alt,
+            bias_alt_mask=bias_alt_mask,
+        )
 
 
 @dataclass(frozen=True)

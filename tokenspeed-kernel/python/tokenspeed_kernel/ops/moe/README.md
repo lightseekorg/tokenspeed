@@ -438,6 +438,11 @@ byte on random rows, tie, edge, and NaN corpora and in CUDA-graph replay.
 routing stores its weights in that dtype after FP32 scoring, normalization, and
 scaling.
 
+V4.1 text and image rows share the router GEMM. Sqrt-softplus top-k selects
+`correction_bias_alt` on rows marked by `bias_alt_mask`, preserving unbiased
+route weights. CUDA and portable Triton select the bias inside the kernel;
+the `bias_alt` routing trait excludes implementations without this support.
+
 On NVIDIA, the DeepSeek V4 MoE defers finalization for BF16 activations
 whenever the selected kernel supports it (TRT-LLM MXFP4 SwiGLU, Triton MXFP4,
 and the other deferred-capable kernels). The kernel returns expert rows and row

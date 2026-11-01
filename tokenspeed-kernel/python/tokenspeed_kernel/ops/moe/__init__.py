@@ -1100,6 +1100,8 @@ def moe_topk(
     hidden_states: torch.Tensor | None = None,
     gate_weight: torch.Tensor | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    correction_bias_alt: torch.Tensor | None = None,
+    bias_alt_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
 
@@ -1120,6 +1122,11 @@ def moe_topk(
         routed_scaling_factor: Optional scale applied to selected weights.
         correction_bias: Optional selection-only bias shaped [experts] or
             [tokens, experts].
+        correction_bias_alt: Optional alternate [experts] selection bias for
+            sqrt-softplus top-k. Requires a one-dimensional correction_bias
+            and bias_alt_mask; weights still use the unbiased scores.
+        bias_alt_mask: Optional bool [tokens] tensor selecting correction_bias_alt
+            on true rows and correction_bias on false rows.
         hash_indices_table: Optional token-id to expert-id table.
         input_ids: Token ids used with hash_indices_table.
         logical_to_physical_map: Optional expert-id map for sigmoid routing.
@@ -1139,6 +1146,16 @@ def moe_topk(
         Weights and expert ids shaped [tokens, top_k], using the requested
         output dtypes, or the supplied out buffers.
     """
+    if (correction_bias_alt is None) != (bias_alt_mask is None):
+        raise ValueError(
+            "correction_bias_alt and bias_alt_mask must be supplied together"
+        )
+    if correction_bias_alt is not None and (
+        score_function != "sqrt_softplus" or selection_method != "topk"
+    ):
+        raise ValueError(
+            "alternate correction bias requires sqrt_softplus topk selection"
+        )
     if selection_method not in {"topk", "hash"}:
         raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
     if selection_method == "hash":
@@ -1232,6 +1249,29 @@ def moe_topk(
         raise ValueError(
             f"correction_bias must have shape [{experts}] or [{tokens}, {experts}]"
         )
+    if correction_bias_alt is not None:
+        if correction_bias is None or correction_bias.ndim != 1:
+            raise ValueError(
+                "alternate correction bias requires a one-dimensional correction_bias"
+            )
+        if correction_bias_alt.shape != (experts,):
+            raise ValueError(f"correction_bias_alt must have shape [{experts}]")
+        if bias_alt_mask.shape != (tokens,) or bias_alt_mask.dtype != torch.bool:
+            raise ValueError(
+                f"bias_alt_mask must be a bool tensor with shape [{tokens}]"
+            )
+        for name, value in (
+            ("correction_bias", correction_bias),
+            ("correction_bias_alt", correction_bias_alt),
+        ):
+            if not value.is_floating_point():
+                raise ValueError(f"{name} must be a floating-point tensor")
+            if value.device != router_like.device:
+                raise ValueError(f"{name} must be on the same device as router_logits")
+        if bias_alt_mask.device != router_like.device:
+            raise ValueError(
+                "bias_alt_mask must be on the same device as router_logits"
+            )
     if hash_indices_table is not None:
         if (
             hash_indices_table.ndim != 2
@@ -1257,7 +1297,18 @@ def moe_topk(
         _assert_indices_in_range(selected_experts, experts, "hash_indices_table")
         input_ids = safe_input_ids
 
-    routing_kind = _routing_kind(correction_bias, hash_indices_table)
+    routing_kind = (
+        "bias_alt"
+        if correction_bias_alt is not None
+        else _routing_kind(correction_bias, hash_indices_table)
+    )
+    # Only kernels advertising bias_alt receive these inputs. Older fused
+    # routers remain eligible for their existing contracts.
+    alt_bias_kwargs = (
+        {"correction_bias_alt": correction_bias_alt, "bias_alt_mask": bias_alt_mask}
+        if correction_bias_alt is not None
+        else {}
+    )
     per_token_bias = correction_bias is not None and correction_bias.ndim == 2
     if fused:
         if per_token_bias:
@@ -1284,6 +1335,7 @@ def moe_topk(
                 hash_indices_table,
                 input_ids,
                 scaling_factor,
+                **alt_bias_kwargs,
             )
             return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
     traits = {
@@ -1361,6 +1413,7 @@ def moe_topk(
                 if topk_weights_dtype in (torch.float32, torch.bfloat16)
                 else torch.float32
             ),
+            **alt_bias_kwargs,
         )
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 

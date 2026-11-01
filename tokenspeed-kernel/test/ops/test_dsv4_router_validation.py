@@ -80,6 +80,30 @@ def test_hash_router_rejects_correction_bias() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "alt,mask",
+    [
+        (None, torch.ones(2, dtype=torch.bool)),
+        (torch.ones(4), None),
+        (torch.ones(5), torch.ones(2, dtype=torch.bool)),
+        (torch.ones(4), torch.ones(2)),
+    ],
+)
+def test_alt_bias_requires_paired_inputs_with_valid_layout(alt, mask):
+    with pytest.raises(ValueError, match="correction_bias_alt|bias_alt_mask"):
+        moe_topk(
+            torch.zeros(2, 4),
+            top_k=2,
+            score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            correction_bias=torch.zeros(4),
+            correction_bias_alt=alt,
+            bias_alt_mask=mask,
+        )
+
+
 @pytest.mark.parametrize("tokens", [0, 2])
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("routing", ["plain", "bias", "per_token_bias", "hash"])

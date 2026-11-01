@@ -205,6 +205,8 @@ class DeepseekV4TopK(TopK):
         routing_correction_bias: torch.Tensor | None = None,
         hash_indices_table: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
+        correction_bias_alt: torch.Tensor | None = None,
+        bias_alt_mask: torch.Tensor | None = None,
     ) -> TopKOutput:
         correction_bias = (
             self.topk_config.correction_bias
@@ -224,6 +226,8 @@ class DeepseekV4TopK(TopK):
             hash_indices_table=hash_indices_table,
             input_ids=input_ids,
             topk_weights_dtype=self.weights_dtype,
+            correction_bias_alt=correction_bias_alt,
+            bias_alt_mask=bias_alt_mask,
         )
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 

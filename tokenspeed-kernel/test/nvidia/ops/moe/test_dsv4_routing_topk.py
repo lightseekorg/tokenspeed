@@ -32,7 +32,8 @@ if not (torch.cuda.is_available() and current_platform().is_nvidia):
 
 
 @pytest.mark.parametrize(
-    "experts,kind", [(256, "bias"), (384, "bias"), (384, "hash32"), (384, "hash64")]
+    "experts,kind",
+    [(256, "bias"), (384, "bias"), (256, "bias_alt"), (384, "hash32"), (384, "hash64")],
 )
 @pytest.mark.parametrize("tokens", [0, 17])
 @pytest.mark.parametrize("scaling_factor", [0.0, 2.5])
@@ -41,10 +42,16 @@ def test_weight_dtype_scales_in_fp32_before_store(
 ):
     torch.manual_seed(17)
     logits = torch.randn(tokens, experts, device="cuda") * 8
-    bias = torch.randn(experts, device="cuda") if kind == "bias" else None
+    bias = torch.randn(experts, device="cuda") if kind.startswith("bias") else None
+    alt = (-bias.repeat_interleave(2))[::2] if kind == "bias_alt" else None
+    mask = (
+        (torch.arange(tokens * 2, device="cuda") % 3 == 0)[::2]
+        if alt is not None
+        else None
+    )
     table = None
     input_ids = None
-    if kind != "bias":
+    if kind.startswith("hash"):
         table = torch.stack(
             [torch.randperm(experts, device="cuda")[:6] for _ in range(19)]
         ).int()
@@ -54,7 +61,7 @@ def test_weight_dtype_scales_in_fp32_before_store(
     args = dict(
         top_k=6,
         score_function="sqrt_softplus",
-        selection_method="topk" if kind == "bias" else "hash",
+        selection_method="topk" if bias is not None else "hash",
         renormalize=True,
         correction_bias=bias,
         hash_indices_table=table,
@@ -62,10 +69,21 @@ def test_weight_dtype_scales_in_fp32_before_store(
         topk_indices_dtype=torch.int32,
         override="cuda_sqrt_softplus_topk",
         solution=None,
+        correction_bias_alt=alt,
+        bias_alt_mask=mask,
     )
     unscaled, ids = moe_topk(
         logits, routed_scaling_factor=1.0, topk_weights_dtype=torch.float32, **args
     )
+    if alt is not None:
+        scores = torch.nn.functional.softplus(logits).sqrt()
+        selected = (
+            (scores + torch.where(mask[:, None], alt, bias)).topk(6, dim=-1).indices
+        )
+        expected = scores.gather(1, selected)
+        expected /= expected.sum(-1, keepdim=True)
+        torch.testing.assert_close(ids.long(), selected, atol=0, rtol=0)
+        torch.testing.assert_close(unscaled, expected, atol=1e-6, rtol=2e-6)
 
     def run():
         return moe_topk(
@@ -149,6 +167,8 @@ def test_router_pdl_chain_reads_updated_graph_input(pdl):
     x = torch.randn(4, 5120, device="cuda", dtype=torch.bfloat16)
     gate = (torch.randn(384, 5120, device="cuda") * 0.01).bfloat16()
     bias = torch.randn(384, device="cuda") * 0.2
+    alt = -bias
+    mask = torch.zeros(4, device="cuda", dtype=torch.bool)
     ids = torch.empty(4, 6, device="cuda", dtype=torch.int32)
     weights = torch.empty(4, 6, device="cuda", dtype=torch.bfloat16)
     original_pdl = pdl_enabled()
@@ -158,7 +178,15 @@ def test_router_pdl_chain_reads_updated_graph_input(pdl):
         def run():
             logits = dsv4_linear_fp32(x, gate)
             softplus_sqrt_topk_flash(
-                logits, bias, ids, weights, 1.0, True, enable_pdl=pdl
+                logits,
+                bias,
+                ids,
+                weights,
+                1.0,
+                True,
+                enable_pdl=pdl,
+                correction_bias_alt=alt,
+                bias_alt_mask=mask,
             )
             # A dependent consumer also must observe the current route outputs.
             return ids.clone(), weights.clone()
@@ -167,14 +195,17 @@ def test_router_pdl_chain_reads_updated_graph_input(pdl):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             actual_ids, actual_weights = run()
-        for _ in range(3):
+        for images in ("image", "text", "mixed"):
             x.normal_()
+            mask.fill_(images == "image")
+            if images == "mixed":
+                mask[::2] = True
             expected_ids, expected_weights = run()
             graph.replay()
             torch.testing.assert_close(actual_ids, expected_ids, atol=0, rtol=0)
             torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
             scores = torch.nn.functional.softplus(dsv4_linear_fp32(x, gate)).sqrt()
-            reference_ids = (scores + bias).argsort(
+            reference_ids = (scores + torch.where(mask[:, None], alt, bias)).argsort(
                 dim=-1, descending=True, stable=True
             )[:, :6]
             selected = scores.gather(1, reference_ids)
@@ -187,3 +218,24 @@ def test_router_pdl_chain_reads_updated_graph_input(pdl):
             )
     finally:
         pdl_enabled(original_pdl)
+
+
+def test_hash_table_offset_beyond_int32():
+    rows = 2**31 // 6 + 2
+    if torch.cuda.mem_get_info()[0] < rows * 6 * 4 + 2**30:
+        pytest.skip("requires space for a sparse hash table beyond 2^31 elements")
+    table = torch.empty(rows, 6, device="cuda", dtype=torch.int32)
+    table[-1] = torch.arange(6, device="cuda", dtype=torch.int32)
+    weights, ids = moe_topk(
+        torch.zeros(1, 256, device="cuda"),
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="hash",
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        hash_indices_table=table,
+        input_ids=torch.tensor([rows - 1], device="cuda"),
+        override="cuda_sqrt_softplus_topk",
+    )
+    torch.testing.assert_close(ids, table[-1:], atol=0, rtol=0)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1 / 6))

@@ -26,6 +26,8 @@ def cuda_sqrt_softplus_topk(
     need_scores: bool,
     routed_scaling_factor: float,
     weights_dtype: torch.dtype,
+    correction_bias_alt: torch.Tensor | None = None,
+    bias_alt_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the fused CUDA sqrt-softplus expert selector."""
     logits_f32 = router_logits.float().contiguous()
@@ -69,6 +71,14 @@ def cuda_sqrt_softplus_topk(
             routed_scaling_factor,
             renormalize,
             enable_pdl=pdl_enabled(),
+            correction_bias_alt=(
+                correction_bias_alt.float().contiguous()
+                if correction_bias_alt is not None
+                else None
+            ),
+            bias_alt_mask=(
+                bias_alt_mask.contiguous() if bias_alt_mask is not None else None
+            ),
         )
     else:
         raise ValueError("fused DeepSeek V4 selection requires bias or hash routing")
@@ -93,7 +103,7 @@ if routing_available():
             "experts": frozenset({256, 384}),
             "top_k": frozenset({6}),
             "renormalize": frozenset({True}),
-            "routing_kind": frozenset({"bias", "hash"}),
+            "routing_kind": frozenset({"bias", "bias_alt", "hash"}),
             "score_function": frozenset({"sqrt_softplus"}),
         },
         priority=Priority.SPECIALIZED,

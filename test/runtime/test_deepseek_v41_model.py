@@ -50,8 +50,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
 from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
+from tokenspeed_kernel.selection import kernel_override
 from torch import nn
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
@@ -3541,38 +3541,42 @@ def test_generic_safetensors_engram_load_is_bounded(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "vision,with_images", [(False, False), (True, False), (True, True)]
 )
-def test_routing_matches_reference_bias_and_normalization(topk, vision, with_images):
+def test_routing_matches_reference_bias_and_normalization(
+    monkeypatch, topk, vision, with_images
+):
     logits = torch.tensor([[-100.0, -99.0, -98.0, -97.0], [0.0, 1.0, 2.0, 3.0]])
     bias = torch.tensor([4.0, 3.0, 0.0, 0.0])
     bias_vl = torch.tensor([0.0, 0.0, 5.0, 0.0]) if vision else None
     image_mask = torch.tensor([False, True]) if with_images else None
-    moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
-    nn.Module.__init__(moe)
-    moe.config = SimpleNamespace(num_experts_per_tok=topk, norm_topk_prob=True)
-    moe.gate = SimpleNamespace(
-        weight=torch.eye(4), e_score_correction_bias=bias, bias_vl=bias_vl
-    )
-    moe.hash_indices_dtype = torch.int64
-    moe.use_mega_moe = False
-    moe.use_gluon_petit = False
-    empty = logits[:0]
+    config = v41.DeepseekV41Config(
+        text_config=vars(_config())
+        | {
+            "num_experts_per_tok": topk,
+            "routed_scaling_factor": 1.0,
+        }
+    ).text_config
+    mapping = _mapping(0, 1, 2)
+    # Only the expert GPU backend and process group are stubbed on CPU.
+    _mock_loader_hardware(monkeypatch, mapping)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    hidden = torch.zeros(2, config.hidden_size)
+    hidden[:, :4] = logits
+    with torch.no_grad():
+        moe.gate.weight.zero_()
+        moe.gate.weight[:, :4].copy_(torch.eye(4))
+        moe.gate.e_score_correction_bias.copy_(bias)
+    moe.gate.bias_vl = nn.Parameter(bias_vl, requires_grad=False) if vision else None
+    empty = hidden[:0]
     target = torch.empty_like(empty)
+    moe.use_mega_moe = False
     assert moe(empty, image_mask, 0, 0) is empty
     assert moe(empty, image_mask, 0, 0, out=target) is target
     moe.use_mega_moe = True
     with pytest.raises(ValueError, match="MegaMoE does not support out"):
         moe(empty, image_mask, 0, 0, out=target)
-    router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
-    weights, ids = moe_topk(
-        router_logits,
-        top_k=topk,
-        score_function="sqrt_softplus",
-        selection_method="topk",
-        renormalize=topk > 1,
-        routed_scaling_factor=1.0,
-        correction_bias=actual_bias,
-        solution="torch",
-    )
+    with kernel_override("moe", "topk", "torch_sqrt_softplus_topk"):
+        routed = moe._compute_topk_output(hidden, image_mask)
+    weights, ids = routed.topk_weights, routed.topk_ids
     expected_scores = F.softplus(logits).sqrt()
     expected_bias = torch.stack([bias, bias_vl]) if with_images else bias
     expected_ids = (expected_scores + expected_bias).topk(topk, dim=-1).indices
