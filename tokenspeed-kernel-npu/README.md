@@ -216,3 +216,10 @@ It also checks fresh default targets and explicit allocation reuse for both
 planes with bounded and full-cache history over successive forwards.
 The history-only rounds use a separate compute stream, wait via readiness
 events, and reuse both planes and packing storage without per-round CPU waits.
+
+Variable-length MLA converts FIA's empty-KV LSE sentinel to the partial-state
+identity before returning it through the registry: the request's query rows
+have zero output and natural-log LSE `-inf`. Cumulative Q/KV endpoints determine
+those rows, including mixed batches and history loops where only one request
+has keys. Nonempty rows keep their original output and LSE. Repeated prefix
+merges therefore preserve a zero-history request's current causal result.
