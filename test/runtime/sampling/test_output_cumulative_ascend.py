@@ -90,6 +90,7 @@ def test_verify_scores_the_final_tp_token_once(monkeypatch):
         ForwardOutputLayout(0, 0, 1, 1),
         sample,
         enabled=backend.config.enable_output_cumulative_probs,
+        finalize=None,
     )
     final_ids = tokens.cpu().long()
     assert lengths.cpu().tolist() == [1]

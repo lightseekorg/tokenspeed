@@ -50,7 +50,10 @@ The optional `output_token_cumulative_probs_val` tail carries each selected
 token's cumulative probability diagnostic alongside its logprob. The control
 plane retains the same token ordering, stop truncation and streaming slices
 for both columns, and emits diagnostics only for requests returning logprobs.
-An older producer defaults this column to empty; older readers skip it.
+Once a request has any value, each of its outputs carries one per token, NaN
+for a token that came without one, so the column never misaligns with the
+tokens. An older producer defaults this column to empty; older readers skip
+it.
 
 ## Building
 

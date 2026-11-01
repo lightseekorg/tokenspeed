@@ -32,6 +32,7 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.grammar.base_grammar_backend import get_apply_vocab_mask_func
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.diagnostics import sample_with_diagnostics
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -98,19 +99,6 @@ class TruncatedTokensSampler(TorchCategoricalSampler):
         return tokens[:-1], lengths
 
 
-class PackedGrammar:
-    """Apply the ordinary int32 vocabulary bitmask with real CPU tensor math."""
-
-    def __init__(self, vocab_size):
-        self.vocab_size = vocab_size
-
-    def __call__(self, logits, vocab_mask):
-        columns = torch.arange(self.vocab_size)
-        words = vocab_mask[:, columns // 32].long()
-        allowed = ((words >> (columns % 32)) & 1).bool()
-        logits.masked_fill_(~allowed, -torch.inf)
-
-
 def reference_mass(logits, tokens):
     probabilities = logits.double().softmax(-1)
     expected = []
@@ -138,6 +126,7 @@ def test_an_extension_sampler_gets_metadata_without_a_diagnostic_hook():
         ForwardOutputLayout(8, 8, 0, 1),
         sampler,
         enabled=True,
+        finalize=None,
     )
     assert result is sampler.result
     assert output.next_token_logprobs is sampler.logprobs
@@ -164,6 +153,7 @@ def test_disabled_entry_keeps_argmax_only_sampling_and_clears_stale_metadata():
         ForwardOutputLayout(1, 1, 0, 1),
         sampler,
         enabled=False,
+        finalize=None,
     )
     assert result is sampler.result
     assert result[0].tolist() == [7]
@@ -191,6 +181,7 @@ def test_flag_preserves_real_sampling_logprob_bits_and_rng_stream():
                 ForwardOutputLayout(4, 4, 0, 1),
                 sampler,
                 enabled=enabled,
+                finalize=None,
             )
         )
         outputs.append(output)
@@ -220,7 +211,9 @@ def test_entry_scores_before_inplace_bias_and_after_grammar(with_grammar):
         device="cpu",
         vocab_size=4,
         vocab_mask=torch.tensor([[14]], dtype=torch.int32) if with_grammar else None,
-        apply_vocab_mask=PackedGrammar(4) if with_grammar else None,
+        apply_vocab_mask=(
+            get_apply_vocab_mask_func("xgrammar") if with_grammar else None
+        ),
     )
     output = LogitsProcessorOutput(next_token_logits=logits.clone())
     sampler = TorchCategoricalSampler(
@@ -237,6 +230,7 @@ def test_entry_scores_before_inplace_bias_and_after_grammar(with_grammar):
         ForwardOutputLayout(1, 1, 0, 1),
         sampler,
         enabled=True,
+        finalize=None,
     )
     assert tokens.tolist() == [3]
     assert output.next_token_logits.argmax(1).tolist() == [3]
@@ -260,8 +254,10 @@ def test_mixed_open_prefills_and_chain_rows_use_their_own_grammar_masks(
     layout = ForwardOutputLayout(2, prefill_outputs, 2, 3)
     rows = layout.num_output_tokens
     logits = torch.randn(rows, 4, generator=torch.Generator().manual_seed(43))
-    # Completing prefill uses mask row 0; open prefill rows have empty masks
-    # and no logits. Decode requests use mask rows 6..11, in chain order.
+    # A compact layout (as on attention backends that skip incomplete
+    # prefills' outputs): the completing prefill uses mask row 0, and the open
+    # prefill's rows have empty masks and no logits. Decode requests use mask
+    # rows 6..11, in chain order.
     decode_words = [13, 11, 7, 3, 5, 9]
     words = torch.tensor([14, 1, 2, 0, 0, 0] + decode_words, dtype=torch.int32)[:, None]
     packed_words = ([14] if prefill_outputs else []) + decode_words
@@ -273,7 +269,7 @@ def test_mixed_open_prefills_and_chain_rows_use_their_own_grammar_masks(
         device="cpu",
         vocab_size=4,
         vocab_mask=words,
-        apply_vocab_mask=PackedGrammar(4),
+        apply_vocab_mask=get_apply_vocab_mask_func("xgrammar"),
         req_pool_indices=torch.tensor([1, 2, 3, 4]),
     )
     output = LogitsProcessorOutput(next_token_logits=logits.clone())
@@ -287,7 +283,7 @@ def test_mixed_open_prefills_and_chain_rows_use_their_own_grammar_masks(
         record_logprobs=True,
     )
     tokens, actual_lengths = sample_with_diagnostics(
-        output, info, layout, sampler, enabled=True
+        output, info, layout, sampler, enabled=True, finalize=None
     )
     assert torch.equal(actual_lengths, lengths)
     expected_scores = logits.masked_fill(~allowed, -torch.inf)
@@ -301,6 +297,44 @@ def test_mixed_open_prefills_and_chain_rows_use_their_own_grammar_masks(
         expected_scores.log_softmax(-1).gather(1, tokens.long()[:, None]).squeeze(1)
     )
     assert torch.equal(output.next_token_logprobs, expected_lp)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_the_diagnostic_scores_the_tokens_finalize_leaves(enabled):
+    # A drafter rewrites its verify outputs in place before anything reads
+    # them; the diagnostic must score the tokens it commits.
+    probabilities = torch.tensor([0.55, 0.25, 0.15, 0.05])
+    output = LogitsProcessorOutput(next_token_logits=probabilities.log().repeat(2, 1))
+    sampler = TorchCategoricalSampler(
+        output,
+        torch.ones(2, dtype=torch.int32),
+        seed=7,
+        allowed=None,
+        bias=None,
+        record_logprobs=True,
+    )
+    seen = []
+
+    def rewrite(tokens, lengths):
+        seen.append((tokens.clone(), lengths.clone()))
+        tokens.copy_(torch.tensor([3, 1], dtype=torch.int32))
+
+    tokens, _ = sample_with_diagnostics(
+        output,
+        SamplingBatchInfo(device="cpu"),
+        ForwardOutputLayout(2, 2, 0, 1),
+        sampler,
+        enabled=enabled,
+        finalize=rewrite,
+    )
+    assert len(seen) == 1, "finalize runs once, with or without the diagnostic"
+    assert tokens.tolist() == [3, 1]
+    if enabled:
+        torch.testing.assert_close(
+            output.next_token_cumulative_probs, torch.tensor([0.95, 0.55])
+        )
+    else:
+        assert output.next_token_cumulative_probs is None
 
 
 def test_zero_emission_needs_no_scores_or_grammar_applier():
@@ -319,6 +353,7 @@ def test_zero_emission_needs_no_scores_or_grammar_applier():
         ForwardOutputLayout(2, 0, 0, 3),
         sampler,
         enabled=True,
+        finalize=None,
     )
     assert result is sampler.result
     assert result[0].numel() == 0
@@ -351,6 +386,7 @@ def test_requested_diagnostic_rejects_incomplete_sampler_outputs(failure):
             ForwardOutputLayout(2, 2, 0, 1),
             sampler,
             enabled=True,
+            finalize=None,
         )
 
 
@@ -371,4 +407,5 @@ def test_mask_without_an_applier_is_a_configuration_error():
             ForwardOutputLayout(1, 1, 0, 1),
             sampler,
             enabled=True,
+            finalize=None,
         )

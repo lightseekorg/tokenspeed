@@ -20,9 +20,10 @@
 
 """Fixed-sample native calibration of generated tokens against reported probabilities.
 
-Requires --enable-output-logprobs --enable-output-cumulative-probs on a
-non-speculative engine. Statistical analysis uses only the standard library;
-the runner tokenizes prompts and drives the engine with WireDriver.
+Requires --enable-output-logprobs --enable-output-cumulative-probs. Chain
+speculative verification is supported; draft trees are not. Statistical
+analysis uses only the standard library; the runner tokenizes prompts and
+drives the engine with WireDriver.
 See docs/guides/sampling-calibration.md for the hypotheses and power limits.
 """
 
@@ -462,13 +463,13 @@ def run(
     args: argparse.Namespace,
     *,
     driver: WireDriver | None = None,
-    tokenizer: Any | None = None,
 ) -> dict:
     """Run one fixed-sample experiment, optionally borrowing an existing engine.
 
-    Omitted resources are created for this run. A provided driver is neither
-    entered nor closed; the caller owns its lifetime and must ensure its
-    configuration agrees with engine-config. The tokenizer is also reusable.
+    Without a driver, the run starts its engine from ``args`` and closes it.
+    A borrowed driver is neither entered nor closed; it must have been started
+    exactly as ``args`` describes (engine-config, --num-engines, --routing and
+    --startup-timeout), or the run is invalid before it submits anything.
     """
     directory = args.output_dir.resolve()
     if not directory.is_dir() or any(directory.iterdir()):
@@ -495,7 +496,6 @@ def run(
             ),
             "resolved_client_rng_seed": rng_seed,
             "borrowed_driver": driver is not None,
-            "borrowed_tokenizer": tokenizer is not None,
         },
     )
     try:
@@ -532,18 +532,40 @@ def run(
         for flag in ("--enable-output-logprobs", "--enable-output-cumulative-probs"):
             if flag not in server_args:
                 raise ValueError(f"engine-config must explicitly enable {flag}")
+        if driver is not None:
+            # A borrowed engine must be the one these arguments describe: they
+            # are recorded as the experiment's configuration.
+            started = {
+                "engine-config": driver.server_args,
+                "--num-engines": driver.num_engines,
+                "--routing": driver.routing,
+                "--startup-timeout": driver.startup_timeout_s,
+            }
+            requested = {
+                "engine-config": server_args,
+                "--num-engines": args.num_engines,
+                "--routing": args.routing,
+                "--startup-timeout": args.startup_timeout,
+            }
+            mismatched = [
+                name for name in requested if started[name] != requested[name]
+            ]
+            if mismatched:
+                raise ValueError(
+                    "the borrowed driver was not started with this run's "
+                    f"{', '.join(mismatched)}"
+                )
         write_json(directory / "engine-args.json", server_args)
+        from transformers import AutoTokenizer
+
         from tokenspeed.runtime.entrypoints.wire_driver import (
             WireDriver,
             generate_request,
         )
 
-        if tokenizer is None:
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                args.model, trust_remote_code=args.tokenizer_trust_remote_code
-            )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=args.tokenizer_trust_remote_code
+        )
         input_ids = {}
         for plan in plans:
             # Cache tokenization only; every request still gets a fresh engine rid.

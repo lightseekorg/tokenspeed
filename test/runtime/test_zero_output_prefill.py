@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.logits_processor_output import (
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
+    request_vocab_mask,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -130,7 +131,9 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
         _sampling_info_for_requests=load_symbol(
-            RUNTIME + "execution/model_executor.py", "_sampling_info_for_requests"
+            RUNTIME + "execution/model_executor.py",
+            "_sampling_info_for_requests",
+            request_vocab_mask=request_vocab_mask,
         ),
     )
     backend = SharedBufferSampler()

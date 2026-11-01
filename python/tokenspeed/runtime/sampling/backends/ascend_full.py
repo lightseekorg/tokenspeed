@@ -61,6 +61,7 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
     """
 
     _SUPPORTS_DP_VERIFY = True
+    _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = False
 
     def _create_capture_generator(

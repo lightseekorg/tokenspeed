@@ -228,6 +228,38 @@ def test_diagnostic_does_not_modify_scores_tokens_or_existing_logprobs():
     assert torch.equal(rescored, logprobs)
 
 
+@pytest.mark.parametrize("token", [-1, 4, 2**31 - 1])
+def test_a_token_outside_the_vocabulary_has_no_mass(token):
+    # A sampler can return the vocabulary size for an all-NaN row (its argmax
+    # lands on padding); the engine clamps the token only later.
+    probabilities = torch.tensor([0.55, 0.25, 0.15, 0.05])
+    logits = torch.stack([probabilities.log(), torch.full((4,), torch.nan)])
+    actual = gather_token_cumulative_probs(logits, torch.tensor([1, token]))
+    torch.testing.assert_close(actual[:1], torch.tensor([0.55]))
+    assert actual[1].isnan()
+
+
+def test_rows_in_several_chunks_match_the_reference():
+    # 2**20 entries per row: the 2**23-entry chunk bound splits 20 rows into
+    # chunks of 8, 8 and 4.
+    generator = torch.Generator().manual_seed(29)
+    logits = torch.randn(20, 1 << 20, generator=generator)
+    tokens = torch.randint(0, 1 << 20, (20,), generator=generator)
+    probabilities = logits.double().softmax(-1)
+    selected = logits.gather(1, tokens[:, None])
+    columns = torch.arange(1 << 20)
+    preceding = (logits > selected) | (
+        (logits == selected) & (columns < tokens[:, None])
+    )
+    expected = torch.where(preceding, probabilities, 0.0).sum(-1)
+    torch.testing.assert_close(
+        gather_token_cumulative_probs(logits, tokens).double(),
+        expected,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 def test_empty_batch_preserves_the_empty_result_shape():
     actual = gather_token_cumulative_probs(
         torch.empty(0, 17), torch.empty(0, dtype=torch.int64)

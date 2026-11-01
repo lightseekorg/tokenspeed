@@ -112,7 +112,8 @@ pub struct LogprobPlan {
 impl ForwardResult {
     /// The result as a pipeline's last stage shares it. The top-k
     /// alternatives are not shared: the ingress refuses them under pipeline
-    /// parallelism.
+    /// parallelism. Nor are the cumulative probabilities: the engine refuses
+    /// that diagnostic under pipeline parallelism.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Writer::new();
         out.i32s(&self.output_tokens);
@@ -127,7 +128,6 @@ impl ForwardResult {
         });
         out.option(self.grammar_terminated_at.as_deref(), Writer::i32s);
         out.option(self.input_token_logprobs.as_deref(), Writer::f64s);
-        out.option(self.output_token_cumulative_probs.as_deref(), Writer::f64s);
         out.finish()
     }
 
@@ -145,12 +145,12 @@ impl ForwardResult {
         })?;
         let grammar_terminated_at = reader.option(Reader::i32s)?;
         let input_token_logprobs = reader.option(Reader::f64s)?;
-        let output_token_cumulative_probs = reader.option(Reader::f64s)?;
         reader.finish(Self {
             output_tokens,
             output_lengths,
             output_logprobs,
-            output_token_cumulative_probs,
+            // Not shared: the engine refuses the diagnostic under a pipeline.
+            output_token_cumulative_probs: None,
             nan_flags,
             next_input_ids,
             serving_compiles: None,
@@ -1159,6 +1159,14 @@ impl OutputProcessor {
                         .as_ref()
                         .and_then(|probs| probs.get(j))
                     {
+                        // The column stays indexed like `output_ids`: an
+                        // earlier token that came without a value (a remote
+                        // prefill's bootstrap token) keeps its place as NaN.
+                        let before = state.output_ids.len() - 1;
+                        state.output_token_cumulative_probs.resize(
+                            before.max(state.output_token_cumulative_probs.len()),
+                            f64::NAN,
+                        );
                         state.output_token_cumulative_probs.push(*prob);
                     }
                 }
@@ -1313,15 +1321,21 @@ impl OutputProcessor {
             } else {
                 Vec::new()
             };
-            let output_token_cumulative_probs = if state.return_logprob {
-                let start = state
-                    .output_token_cumulative_probs
-                    .len()
-                    .saturating_sub(n_new);
-                state.output_token_cumulative_probs[start..].to_vec()
-            } else {
-                Vec::new()
-            };
+            // Indexed like `output_ids` (see the commit), so the new tokens'
+            // values start where theirs do. Once the request has any value,
+            // every output carries one per token, NaN where none arrived, so
+            // the column never misaligns with the tokens.
+            let output_token_cumulative_probs =
+                if state.return_logprob && !state.output_token_cumulative_probs.is_empty() {
+                    let mut values = state
+                        .output_token_cumulative_probs
+                        .get(sent..)
+                        .map_or_else(Vec::new, <[f64]>::to_vec);
+                    values.resize(n_new, f64::NAN);
+                    values
+                } else {
+                    Vec::new()
+                };
             // Prompt logprobs ship once, in the first output after the
             // prompt's final chunk committed.
             let input_logprobs = if state.input_logprobs_sent {
@@ -1710,6 +1724,45 @@ mod tests {
     }
 
     #[test]
+    fn a_bootstrap_token_without_a_cumulative_probability_keeps_the_column_aligned() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG);
+        register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
+        // The prefill node sends the first token's logprob, but no cumulative
+        // probability.
+        p.remote_prefill_done("r", 9, 0, Some(-0.25));
+        let decode = ForwardResult {
+            output_logprobs: Some(vec![-0.5]),
+            output_token_cumulative_probs: Some(vec![0.375]),
+            ..result(&[10], &[1])
+        };
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 3)], 0), None, &decode)
+            .unwrap();
+        let output = &c.outputs[0];
+        assert_eq!(output.output_ids, [9, 10]);
+        assert_eq!(output.output_logprobs, [-0.25, -0.5]);
+        // One value per token: the bootstrap token's place holds NaN.
+        let probs = &output.output_token_cumulative_probs;
+        assert_eq!(probs.len(), 2);
+        assert!(probs[0].is_nan());
+        assert_eq!(probs[1], 0.375);
+        // The next output starts at the next token.
+        let c = p
+            .commit(
+                &batch(&[("r", 1, 0, 3)], 0),
+                None,
+                &ForwardResult {
+                    output_logprobs: Some(vec![-0.75]),
+                    output_token_cumulative_probs: Some(vec![0.625]),
+                    ..result(&[11], &[1])
+                },
+            )
+            .unwrap();
+        assert_eq!(c.outputs[0].output_ids, [11]);
+        assert_eq!(c.outputs[0].output_token_cumulative_probs, [0.625]);
+    }
+
+    #[test]
     fn the_prefill_role_ships_its_prompt_logprobs_with_its_final_output() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, true);
@@ -1757,7 +1810,6 @@ mod tests {
             output_tokens: vec![5, -1, 7],
             output_lengths: vec![2, 1],
             output_logprobs: Some(vec![-0.25, -1.5, f64::NEG_INFINITY]),
-            output_token_cumulative_probs: Some(vec![0.75, 0.875, 1.0]),
             nan_flags: Some(vec![0, 1]),
             next_input_ids: Some(vec![vec![5, 6], vec![]]),
             serving_compiles: None,

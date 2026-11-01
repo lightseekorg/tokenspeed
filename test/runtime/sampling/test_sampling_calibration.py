@@ -22,10 +22,19 @@
 
 import json
 import math
+import sys
 from dataclasses import replace
-from test.runtime.sampling import run_sampling_calibration as calibration
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci
+
+# Standard-library statistics, scheduled with the sampling regressions.
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+from test.runtime.sampling import run_sampling_calibration as calibration  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -273,6 +282,72 @@ def test_invalid_experiment_config_preserves_an_invalid_report(tmp_path):
     assert report["validated_samples"] == 0
     assert "--enable-output-cumulative-probs" in report["error"]
     assert json.loads((directory / "report.json").read_text()) == report
+
+
+def test_a_borrowed_driver_must_match_the_run_configuration(tmp_path):
+    server_args = [
+        "--model",
+        "/path/to/model",
+        "--enable-output-logprobs",
+        "--enable-output-cumulative-probs",
+    ]
+    config = tmp_path / "engine.json"
+    config.write_text(json.dumps(server_args))
+
+    class StartedEngine:
+        # What a WireDriver records about how it started its engine; this
+        # one was started without the cumulative diagnostic.
+        def __init__(self):
+            self.server_args = server_args[:-1]
+            self.num_engines = 1
+            self.routing = "round_robin"
+            self.startup_timeout_s = 60.0
+
+        def generate(self, requests):
+            raise AssertionError("a mismatched engine must not be used")
+
+    directory = tmp_path / "results"
+    directory.mkdir()
+    args = calibration.parse_args(
+        [
+            "--mode",
+            "prefill",
+            "--run-name",
+            "borrowed",
+            "--engine-config",
+            str(config),
+            "--model",
+            "/path/to/model",
+            "--num-engines",
+            "2",
+            "--routing",
+            "round_robin",
+            "--startup-timeout",
+            "60",
+            "--no-tokenizer-trust-remote-code",
+            "--no-add-special-tokens",
+            "--samples",
+            "1000",
+            "--bins",
+            "10",
+            "--alpha",
+            "0.001",
+            "--client-rng-seed",
+            "42",
+            "--batch-size",
+            "16",
+            "--prompt",
+            "A fixed prompt",
+            "--output-dir",
+            str(directory),
+        ]
+    )
+    report = calibration.run(args, driver=StartedEngine())
+    assert report["status"] == "INVALID"
+    assert "engine-config" in report["error"]
+    assert "--num-engines" in report["error"]
+    assert "--routing" not in report["error"]
+    assert not (directory / "engine-args.json").exists()
 
 
 def test_raw_snapshot_preserves_invalid_values_without_mutating_the_response():

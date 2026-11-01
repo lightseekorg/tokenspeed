@@ -31,51 +31,46 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.types import ForwardLogprobs
+from tokenspeed.runtime.execution.forward_step import live_graph_outputs
 
 
-def test_cumulative_probabilities_survive_logits_metadata_and_host_copy():
-    from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
-
-    output = LogitsProcessorOutput(next_token_logits=torch.zeros(2, 4))
-    assert ForwardLogprobs.of(output) is None
-    output.next_token_cumulative_probs = torch.tensor([0.0, 0.875])
-    output.input_token_logprobs = torch.tensor([-1.0, -2.0])
-    metadata = ForwardLogprobs.of(output)
-    assert metadata is not None
-    host = metadata.to_host()
-    torch.testing.assert_close(
-        host.output_token_cumulative_probs, torch.tensor([0.0, 0.875])
+@pytest.mark.parametrize("live_bs", [0, 1, 3])
+def test_graph_replay_slices_cumulative_probabilities_with_the_sampled_tokens(
+    live_bs,
+):
+    # A padded batch of four decodes, two verify columns each.
+    width = 2
+    tokens = torch.arange(8, dtype=torch.int32)
+    lengths = torch.full((4,), width, dtype=torch.int32)
+    logprobs = -torch.arange(8, dtype=torch.float32)
+    cumulative = torch.linspace(0.0, 0.875, 8)
+    live = live_graph_outputs(
+        (tokens, lengths, logprobs, cumulative, None), live_bs, width
     )
-    torch.testing.assert_close(host.input_token_logprobs, torch.tensor([-1.0, -2.0]))
+    rows = live_bs * width
+    assert torch.equal(live[0], tokens[:rows])
+    assert torch.equal(live[1], lengths[:live_bs])
+    assert torch.equal(live[2], logprobs[:rows])
+    assert torch.equal(live[3], cumulative[:rows])
+    assert live[4] is None
+    # Each replay refreshes the captured storage the slices view.
+    cumulative.copy_(torch.linspace(0.125, 1.0, 8))
+    assert torch.equal(live[3], torch.linspace(0.125, 1.0, 8)[:rows])
 
 
-@pytest.mark.parametrize("live_rows", [0, 1, 3])
-def test_decode_metadata_trims_padding_and_reads_refreshed_capture_storage(live_rows):
-    captured = torch.tensor([0.0, 0.25, 0.875, -99.0])
-    metadata = ForwardLogprobs(
-        output_token_cumulative_probs=captured,
-        input_token_logprobs=torch.tensor([-3.0]),
-        output_top_logprobs_val=torch.tensor([[-0.5]]),
-    )
-    live = metadata.decode_slice(live_rows)
-    assert live is not None
-    assert live.input_token_logprobs is None
-    assert live.output_top_logprobs_val is None
-    torch.testing.assert_close(live.output_token_cumulative_probs, captured[:live_rows])
-    captured.copy_(torch.tensor([0.125, 0.5, 0.75, -98.0]))
-    torch.testing.assert_close(
-        live.output_token_cumulative_probs,
-        torch.tensor([0.125, 0.5, 0.75])[:live_rows],
-    )
+def test_graph_replay_without_the_diagnostic_returns_none_for_it():
+    tokens = torch.arange(4, dtype=torch.int32)
+    lengths = torch.ones(4, dtype=torch.int32)
+    live = live_graph_outputs((tokens, lengths, None, None, None), 2, 1)
+    assert live[2] is None and live[3] is None and live[4] is None
 
 
-def test_decode_without_diagnostics_has_no_metadata():
-    assert ForwardLogprobs().decode_slice(2) is None
-    assert (
-        ForwardLogprobs(input_token_logprobs=torch.tensor([-1.0])).decode_slice(2)
-        is None
-    )
+def test_a_captured_decode_with_prompt_or_top_k_logprobs_is_refused():
+    from tokenspeed.runtime.execution.types import ForwardLogprobs
+
+    metadata = ForwardLogprobs(output_top_logprobs_val=torch.tensor([[-0.5]]))
+    with pytest.raises(RuntimeError, match="prompt or top-k"):
+        live_graph_outputs((torch.zeros(1), torch.ones(1), None, None, metadata), 1, 1)
 
 
 def _args(**overrides):
@@ -167,16 +162,36 @@ def test_disabled_diagnostics_do_not_restrict_other_sampling_backends():
     assert not args.enable_output_logprobs and not args.enable_output_cumulative_probs
 
 
-def test_cumulative_metadata_requires_logprobs():
-    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+def test_a_backend_that_does_not_declare_aligned_logprobs_is_refused_at_startup():
+    from tokenspeed.runtime.sampling.backends.base import (
+        SamplingBackend,
+        SamplingBackendConfig,
+    )
 
-    with pytest.raises(ValueError, match="cumulative probabilities require"):
-        SamplingBackendConfig(
+    class ExtensionBackend(SamplingBackend):
+        def sample(self, logits_output, sampling_info):
+            raise NotImplementedError
+
+        def verify(self, logits_output, sampling_info, candidates, tree):
+            raise NotImplementedError
+
+    def config(enabled):
+        return SamplingBackendConfig(
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
             sampling_stream="batch",
             logprob_order="torch",
-            enable_output_logprobs=False,
-            enable_output_cumulative_probs=True,
-            max_draft_tokens_per_req=4,
+            enable_output_logprobs=True,
+            enable_output_cumulative_probs=enabled,
+            max_draft_tokens_per_req=1,
+            device="cpu",
         )
+
+    ExtensionBackend(config(False))
+    with pytest.raises(ValueError, match="_SUPPORTS_OUTPUT_CUMULATIVE_PROBS"):
+        ExtensionBackend(config(True))
+
+    class DeclaringBackend(ExtensionBackend):
+        _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
+
+    DeclaringBackend(config(True))

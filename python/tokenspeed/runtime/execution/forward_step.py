@@ -182,6 +182,29 @@ class DeepEPCudaGraphRunnerAdapter:
         cls.set_dispatch_mode_as_low_latency()
 
 
+def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tuple:
+    """A captured decode graph's outputs, sliced to the live batch.
+
+    ``outputs`` is what the captured forward returned: ``(output_tokens,
+    output_lengths, output_logprobs, output_cumulative_probs,
+    forward_logprobs)`` for the padded batch. The sampled-token columns keep
+    ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
+    never gathers prompt logprobs or top-k alternatives, so its last output is
+    None.
+    """
+    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
+    if forward_logprobs is not None:
+        raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
+    rows = bs * max_tokens_per_req
+    return (
+        tokens[:rows],
+        lengths[:bs],
+        None if logprobs is None else logprobs[:rows],
+        None if cumulative_probs is None else cumulative_probs[:rows],
+        None,
+    )
+
+
 class ForwardStepRunner:
     """Owns one forward step end to end: metadata prep, then execution.
 
@@ -1082,9 +1105,12 @@ class ForwardStepRunner:
         first.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        forward_logprobs)``. Optional ``ForwardLogprobs`` holds eager
-        prompt/top-k metadata and, when enabled, sampled-token cumulative
-        probabilities from both eager execution and decode graph replay.
+        output_cumulative_probs, forward_logprobs)``; the last is an
+        extend/mixed forward's ``ForwardLogprobs`` (the prompt-logprob gather
+        of ``ctx.input_logprob_rows`` and the top-k alternatives
+        ``ctx.sampled_top_k`` asks for) and None otherwise. The sampled
+        tokens' logprobs and cumulative probabilities (None when not enabled)
+        share the tokens' rows on both paths.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1214,30 +1240,8 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # Prompt/top-k metadata stays eager-only. Cumulative probabilities
-            # are captured with sampled logprobs and refreshed on every replay.
-            (
-                output_tokens,
-                output_lengths,
-                output_logprobs,
-                forward_logprobs,
-            ) = self.output_buffers[graph_key]
-
-            live_logprobs = (
-                forward_logprobs.decode_slice(bs * self.max_tokens_per_req)
-                if forward_logprobs is not None
-                else None
-            )
-
-            result = (
-                output_tokens[: bs * self.max_tokens_per_req],
-                output_lengths[:bs],
-                (
-                    output_logprobs[: bs * self.max_tokens_per_req]
-                    if output_logprobs is not None
-                    else None
-                ),
-                live_logprobs,
+            result = live_graph_outputs(
+                self.output_buffers[graph_key], bs, self.max_tokens_per_req
             )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)

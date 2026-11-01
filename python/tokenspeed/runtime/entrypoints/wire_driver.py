@@ -164,6 +164,11 @@ class WireDriver:
         )
         handshake_port = listener.handshake_address.rsplit(":", 1)[1]
         pending = listener.accept()
+        # What the engine was started with, for callers that borrow it.
+        self.server_args = list(server_args)
+        self.num_engines = num_engines
+        self.routing = routing
+        self.startup_timeout_s = startup_timeout_s
         self._encoder = MsgpackEncoder()
         self.process = subprocess.Popen(
             [

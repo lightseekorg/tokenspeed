@@ -1065,49 +1065,13 @@ These are sampler tests with constructed logits, not full-model acceptance tests
 
 ### Outputs are persistent-buffer slices on both paths
 
-Optional sampled-token cumulative probabilities follow the same output
-lifetime as sampled logprobs. They describe the mass before the selected
-token in descending-logit, ascending-token-ID order. The native executor calls
-the common `sample_with_diagnostics` boundary after `NanGuard.audit_logits`
-and the grammar-bitmask wait. With the diagnostic enabled, it copies the
-target score logits and applies the grammar mask to that copy before calling
-the existing sampling callback. The copy isolates scoring from a backend's
-in-place penalties or other sampling adjustments. The callback retains the
-backend's existing token selection, TP agreement and logprob arithmetic;
-the common boundary then computes cumulative mass for its final tokens.
-
-Logits and tokens use `ForwardOutputLayout`'s packed order: one row per
-completing prefill, no rows for open prefills, and the fixed verify width per
-decode request. Grammar masks remain request-indexed and are packed into
-that same output order before application. A chain's accepted drafts,
-replacement and bonus token are scored against the corresponding target
-rows; accepted lengths and stop conditions trim the committed prefix later.
-Draft trees, output-rewriting harnesses and simulated acceptance remain
-outside this diagnostic's supported geometry.
-
-The diagnostic normalizes max-shifted weights independently of the rounded
-selected-token logprob. Mass before the token is divided by the sum of the
-mass before and after that boundary, so valid rows stay in `[0, 1]` without
-clipping invalid distributions. It uses the reported score distribution,
-not temperature, penalty, or truncation adjustments applied only for sampling.
-
-Sampling backends, including extensions, need no diagnostic hook or alternate
-`sample`/`verify` API. This is a native Engine execution boundary; direct calls
-to a sampling backend do not produce cumulative probabilities. The boundary
-validates requested output alignment without reading tensor values on the
-host. With the feature off, it calls the same sampling callback without
-copying logits, applying a diagnostic mask or doing any tensor operations.
-A non-emitting forward needs no diagnostic rows. Both server flags gate
-computation for the batch; a request's `return_logprob` gates returned metadata.
-
-Recording consumes no random numbers and changes neither the token nor the
-reported logprob, including a backend's fused logprob arithmetic. Its decode
-tensor is captured with the same forward on eager and graph paths, trimmed
-to live rows on replay, kept in packed output order for mixed batches, and
-copied to the host before the result's copy event. It owns no request-slot
-state. Native wire outputs append an
-optional column; older frontends can ignore it, while consumers that need
-it must validate alignment with the sampled token and logprob columns.
+Optional sampled-token cumulative probabilities (`--enable-output-cumulative-probs`)
+follow the sampled logprobs' rows and lifetime: the forward returns them beside
+`output_logprobs`, a decode graph captures them with the same forward, and
+replay slices both to the live rows. They are computed once, at the common
+sampling boundary (`sampling/diagnostics.py`), from a copy of the target
+scores; no backend computes them. `docs/guides/sampling-calibration.md` is
+the contract: ordering, masking, supported configurations and cost.
 
 `sample()` and `verify()` land their outputs in each sampling backend's
 persistent output buffers, on eager and replay alike. The FlashInfer backend

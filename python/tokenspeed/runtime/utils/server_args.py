@@ -773,11 +773,8 @@ class ServerArgs:
             raise ValueError(
                 "--enable-output-cumulative-probs requires --enable-output-logprobs"
             )
-        if self.synthetic_acceptance_length is not None:
-            raise ValueError(
-                "--enable-output-cumulative-probs requires real sampling, "
-                "without synthetic acceptance"
-            )
+        # Synthetic acceptance needs no check here: resolve_speculative_decoding
+        # already refuses it with --enable-output-logprobs.
         if envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get():
             raise ValueError(
                 "--enable-output-cumulative-probs does not support "
@@ -788,7 +785,7 @@ class ServerArgs:
                 "--enable-output-cumulative-probs currently supports chain "
                 "verification only, without draft trees or EAGLE-Harness"
             )
-        if self.dp_sampling or self.mapping.attn.dp_size != 1:
+        if self.dp_sampling or self.mapping.has_attn_dp:
             raise ValueError(
                 "--enable-output-cumulative-probs currently requires DP1 without DP sampling"
             )
@@ -3539,8 +3536,11 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_output_cumulative_probs,
             help="Return probability mass preceding each sampled token, ordered by "
-            "descending probability and then ascending token ID. Requires output "
-            "logprobs; adds diagnostic work to prefill and decode graphs.",
+            "descending probability and then ascending token ID, for sampling "
+            "calibration. Requires output logprobs. Every sampling step keeps a "
+            "copy of the score logits plus bounded temporaries; prefill and mixed "
+            "steps sample outside any CUDA graph, so this memory comes from "
+            "runtime headroom (leave room with --gpu-memory-utilization).",
         )
         parser.add_argument(
             "--input-logprob-chunk-tokens",

@@ -149,6 +149,7 @@ def _draw(backend, logits, info, candidates):
         layout,
         sample,
         enabled=backend.config.enable_output_cumulative_probs,
+        finalize=None,
     )
     return (
         tokens.clone(),
