@@ -55,6 +55,10 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     iris_fused_lamport_allreduce_muse_attntail,
     iris_fused_pull_allgather_muse_attntail,
 )
+from tokenspeed_kernel.ops.communication._iris.muse_spark.column_split import (
+    iris_column_routed_rmsnorm_sum_return,
+    iris_pull_allgather_sorted_mxfp4_slices,
+)
 from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
     iris_fused_gemv_lamport_allgather_muse_moetail,
 )
@@ -75,6 +79,9 @@ if current_platform().is_cdna4:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_geometry_gfx950,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        sorted_route_capacity,
+    )
 
 _MUSE_BOUNDARY_MAX_ROWS = 26
 _MUSE_WEIGHTED_BOUNDARY_MAX_ROWS = 25
@@ -92,6 +99,14 @@ _MUSE_ROW_SCATTER_PROGRAMS = 24
 _MUSE_ROW_GATHER_PROGRAMS = 128
 _MUSE_TOPK = 8
 _MUSE_ROUTE_WIDTH = 4096
+_MUSE_EXPERTS = 256
+_MUSE_INTERMEDIATE = 4096
+# 8-rank gather of an 8192-token prefill's intermediate: 355 us with 48-64
+# programs, 575 us with 256 (more concurrent peer reads slowed the links).
+_MUSE_INTERMEDIATE_GATHER_PROGRAMS = 64
+# The routed norm is latency bound: 256 programs were within 8% of the best
+# grid from 192 to 8192 tokens.
+_MUSE_COLUMN_NORM_PROGRAMS = 256
 # Most decode rows for the fused post-expert tail at TP8; it lost to the
 # replicated projection plus boundary at 16 rows in 8-rank graph replay.
 # Rows match the single-row tail bit for bit within 1-8 rows; 16 rows take
@@ -119,6 +134,7 @@ class MuseIrisState:
         world_size: int,
         enable_lamport: bool,
         owned_route_max_rows: int,
+        intermediate_gather_max_rows: int,
     ) -> int:
         rows = min(max_numel // _MUSE_BOUNDARY_WIDTH, _MUSE_BOUNDARY_MAX_ROWS)
         size = ProducerAllReduce.heap_bytes(
@@ -144,7 +160,28 @@ class MuseIrisState:
             size += allocation_bytes(
                 (_MUSE_ROW_SCATTER_PROGRAMS, world_size), torch.uint32
             )
+        if intermediate_gather_max_rows:
+            for shape, dtype in MuseIrisState._intermediate_gather_buffers(
+                intermediate_gather_max_rows, world_size
+            ):
+                size += allocation_bytes(shape, dtype)
         return size
+
+    @staticmethod
+    def _intermediate_gather_buffers(
+        max_rows: int, world_size: int
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        """Shapes of the column-split exchange buffers, in allocation order."""
+        sorted_rows = sorted_route_capacity(max_rows, _MUSE_EXPERTS, _MUSE_TOPK)
+        slice_width = _MUSE_INTERMEDIATE // world_size
+        return (
+            ((sorted_rows, slice_width // 2), torch.uint8),
+            ((triton.cdiv(sorted_rows, 32) * 32, slice_width // 32), torch.uint8),
+            ((max_rows * _MUSE_TOPK,), torch.float32),
+            ((max_rows, _MUSE_ROUTE_WIDTH // world_size), torch.bfloat16),
+            ((2, _MUSE_INTERMEDIATE_GATHER_PROGRAMS, world_size), torch.uint32),
+            ((3, _MUSE_COLUMN_NORM_PROGRAMS, world_size), torch.uint32),
+        )
 
     def __init__(
         self,
@@ -152,6 +189,7 @@ class MuseIrisState:
         *,
         enable_lamport: bool,
         owned_route_max_rows: int,
+        intermediate_gather_max_rows: int,
     ):
         self._arch = iris_arch_policy()
         self.all_reduce = all_reduce
@@ -255,6 +293,30 @@ class MuseIrisState:
             if owned_route_max_rows
             else None
         )
+        # Expert TP prefill with the down projection split by output columns:
+        # this rank's sorted intermediate slice, the per-route partial sums
+        # of squares, and its normalized output columns, all read by peers.
+        self.intermediate_gather_max_rows = intermediate_gather_max_rows
+        # The exchange serves owned rows only.
+        self.intermediate_gather_min_rows = _MUSE_OWNED_MIN_ROWS
+        buffers = (
+            [
+                peers.ctx.zeros(shape, dtype=dtype)
+                for shape, dtype in self._intermediate_gather_buffers(
+                    intermediate_gather_max_rows, self.world_size
+                )
+            ]
+            if intermediate_gather_max_rows
+            else [None] * 6
+        )
+        (
+            self.intermediate_slice,
+            self.intermediate_slice_scales,
+            self.route_partial_squares,
+            self.route_column_sums,
+            self.intermediate_gather_flags,
+            self.column_norm_flags,
+        ) = buffers
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy.
@@ -584,6 +646,233 @@ class MuseIrisState:
             WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
+
+    def can_gather_expert_intermediate(self, rows: int) -> bool:
+        """Whether expert TP prefill of ``rows`` tokens exchanges intermediates.
+
+        The alternative to ``reduce_scatter_owned_routes``: every rank gathers
+        the sorted MXFP4 intermediate slices, projects its share of the
+        output columns, and ``column_routed_rmsnorm_sum`` returns owned rows.
+        Depends only on the row count and prepared capacity, so every rank
+        decides alike.
+        """
+        return (
+            self.intermediate_gather_min_rows
+            <= rows
+            <= self.intermediate_gather_max_rows
+            and self.can_use_owned_rows(rows)
+        )
+
+    def acquire_expert_intermediate(
+        self, rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Borrow this rank's symmetric slot for its sorted intermediate slice.
+
+        Returns uint8 rows ``[capacity, 4096 / (2 P)]`` and contiguous scale
+        panels ``[capacity rounded up to 32, 4096 / (32 P)]`` for P ranks.
+        Write them on the stream of the next ``gather_expert_intermediate``.
+        """
+        assert self.can_gather_expert_intermediate(rows)
+        return self.intermediate_slice, self.intermediate_slice_scales
+
+    def gather_expert_intermediate(
+        self, routes, rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather every rank's sorted intermediate slice into full-width rows.
+
+        ``routes`` is the sorted-route handle the gate/up GEMM returned for
+        the acquired slot; every rank sorted the same top-k IDs in their
+        fixed order. Returns independent uint8 ``[sorted rows, 2048]`` rows,
+        rank r's slice at bytes ``[r * 2048 / P, (r + 1) * 2048 / P)``, and
+        ``[sorted rows rounded up to 32, 128]`` scale panels: the layout the
+        gate/up GEMM writes for the full intermediate. Padding rows are left
+        unset. Peers finish reading the slot before this returns.
+        """
+        assert self.can_gather_expert_intermediate(rows) and routes.rows == rows
+        sorted_rows = routes.sorted_ids.shape[0]
+        device = self.all_reduce.device
+        output = torch.empty(
+            (sorted_rows, _MUSE_INTERMEDIATE // 2), dtype=torch.uint8, device=device
+        )
+        output_scales = torch.empty(
+            (triton.cdiv(sorted_rows, 32) * 32, _MUSE_INTERMEDIATE // 32),
+            dtype=torch.uint8,
+            device=device,
+        )
+        self._launch_intermediate_gather(
+            routes.sorted_ids,
+            routes.num_valid_ids,
+            output,
+            output_scales,
+            rows,
+            compile_only=False,
+        )
+        return output, output_scales
+
+    def column_routed_rmsnorm_sum(
+        self,
+        routes: torch.Tensor,
+        route_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+        rows: int,
+    ) -> torch.Tensor:
+        """Normalize column-split routes and return owned rows of weighted sums.
+
+        ``routes`` holds this rank's ``4096 / P`` output columns of every
+        route, BF16 ``[rows * 8, 4096 / P]`` in token/slot order. Each route's
+        RMSNorm over all 4096 columns (gain applied first) uses FP32 partial
+        sums of squares added in rank order, so all ranks scale alike; the
+        weighted slot sums follow the portable routed sum's order. Returns
+        independent BF16 ``[ceil(rows / P), 4096]`` owned rows, padding rows
+        zero. Peers finish reading this rank's buffers before it returns.
+        """
+        assert self.can_gather_expert_intermediate(rows)
+        width = _MUSE_ROUTE_WIDTH // self.world_size
+        assert routes.shape == (rows * _MUSE_TOPK, width) and routes.is_contiguous()
+        assert routes.dtype == torch.bfloat16
+        assert route_weights.shape == (rows, _MUSE_TOPK)
+        assert route_weights.dtype == torch.float32 and route_weights.is_contiguous()
+        assert norm_weight.shape == (_MUSE_ROUTE_WIDTH,)
+        assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
+        assert all(
+            value.device == self.all_reduce.device
+            for value in (routes, route_weights, norm_weight)
+        )
+        output = torch.empty(
+            (triton.cdiv(rows, self.world_size), _MUSE_ROUTE_WIDTH),
+            dtype=torch.bfloat16,
+            device=self.all_reduce.device,
+        )
+        self._launch_column_norm(
+            routes,
+            route_weights,
+            norm_weight,
+            output,
+            rows,
+            eps,
+            weight_offset,
+            compile_only=False,
+        )
+        return output
+
+    def warmup_expert_intermediate_exchange(
+        self, norm_weight: torch.Tensor, eps: float, weight_offset: float
+    ) -> None:
+        """Compile the intermediate gather and column-split routed norm.
+
+        Startup may never run an owned-row batch before serving, and the
+        first one would compile both while peers wait in the exchange.
+        """
+        if not self.intermediate_gather_max_rows:
+            return
+        device = self.all_reduce.device
+        rows = self.intermediate_gather_min_rows
+        self._launch_intermediate_gather(
+            torch.zeros((32,), dtype=torch.int32, device=device),
+            torch.zeros((2,), dtype=torch.int32, device=device),
+            torch.empty(
+                (32, _MUSE_INTERMEDIATE // 2), dtype=torch.uint8, device=device
+            ),
+            torch.empty(
+                (32, _MUSE_INTERMEDIATE // 32), dtype=torch.uint8, device=device
+            ),
+            rows,
+            compile_only=True,
+        )
+        self._launch_column_norm(
+            torch.empty(
+                (rows * _MUSE_TOPK, _MUSE_ROUTE_WIDTH // self.world_size),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            torch.empty((rows, _MUSE_TOPK), dtype=torch.float32, device=device),
+            norm_weight,
+            torch.empty((rows, _MUSE_ROUTE_WIDTH), dtype=torch.bfloat16, device=device),
+            rows,
+            eps,
+            weight_offset,
+            compile_only=True,
+        )
+
+    def _launch_intermediate_gather(
+        self,
+        sorted_ids: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        output: torch.Tensor,
+        output_scales: torch.Tensor,
+        rows: int,
+        *,
+        compile_only: bool,
+    ) -> None:
+        kernel = iris_pull_allgather_sorted_mxfp4_slices
+        slice_width = _MUSE_INTERMEDIATE // self.world_size
+        args = (
+            self.intermediate_slice.view(torch.int32),
+            self.intermediate_slice_scales.view(torch.int32),
+            sorted_ids,
+            num_valid_ids,
+            output.view(torch.int32),
+            output_scales.view(torch.int32),
+            self.intermediate_gather_flags,
+            self.all_reduce.peers.addresses[: self.world_size],
+            rows,
+        )
+        options = dict(
+            RANK=self.all_reduce.rank_in_group,
+            SLICE_WORDS=slice_width // 8,
+            PANEL_WORDS=slice_width // 4,
+            FLAG_ROWS=_MUSE_INTERMEDIATE_GATHER_PROGRAMS,
+            BLOCK=1024,
+            NUM_WARPS=4,
+            num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
+        )
+        if compile_only:
+            kernel.warmup(*args, grid=(1,), **options)
+        else:
+            kernel[(_MUSE_INTERMEDIATE_GATHER_PROGRAMS,)](*args, **options)
+
+    def _launch_column_norm(
+        self,
+        routes: torch.Tensor,
+        route_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        output: torch.Tensor,
+        rows: int,
+        eps: float,
+        weight_offset: float,
+        *,
+        compile_only: bool,
+    ) -> None:
+        kernel = iris_column_routed_rmsnorm_sum_return
+        args = (
+            routes,
+            route_weights,
+            norm_weight,
+            self.route_partial_squares,
+            self.route_column_sums,
+            output,
+            self.column_norm_flags,
+            self.all_reduce.peers.addresses[: self.world_size],
+            rows,
+        )
+        options = dict(
+            RANK=self.all_reduce.rank_in_group,
+            WIDTH=_MUSE_ROUTE_WIDTH,
+            EPS=eps,
+            WEIGHT_OFFSET=weight_offset,
+            FLAG_ROWS=_MUSE_COLUMN_NORM_PROGRAMS,
+            NUM_WARPS=4,
+            num_warps=4,
+            WAIT_STORES=self._arch.wait_stores,
+            WAIT_VMEM=self._arch.wait_vmem,
+        )
+        if compile_only:
+            kernel.warmup(*args, grid=(1,), **options)
+        else:
+            kernel[(_MUSE_COLUMN_NORM_PROGRAMS,)](*args, **options)
 
     def all_gather_owned_rows(
         self,
@@ -1467,6 +1756,7 @@ def prepare_muse_communication(
     producer_direct_max_numel: int,
     enable_lamport: bool,
     owned_route_max_rows: int,
+    intermediate_gather_max_rows: int,
     all_reduce: IrisAllReduce | None,
     device: torch.device,
 ) -> MuseIrisState:
@@ -1496,6 +1786,7 @@ def prepare_muse_communication(
         world_size=group.size(),
         enable_lamport=enable_lamport,
         owned_route_max_rows=owned_route_max_rows,
+        intermediate_gather_max_rows=intermediate_gather_max_rows,
     )
     if all_reduce is None:
         size += IrisAllReduce.heap_bytes(
@@ -1510,6 +1801,7 @@ def prepare_muse_communication(
         all_reduce,
         enable_lamport=enable_lamport,
         owned_route_max_rows=owned_route_max_rows,
+        intermediate_gather_max_rows=intermediate_gather_max_rows,
     )
     all_reduce.peers.finish_prepare()
     return state
