@@ -512,24 +512,18 @@ expert work are skipped when there are no local tokens, but the rank still
 participates in the collective MegaMoE call. Nonempty ranks use normal tuning;
 the model does not disable GEMM tuning for uneven batches.
 
-MegaMoE reserves scratch for every tactic reachable by the selected execution
-mode before CUDA graph capture. With tactic autotuning disabled, this is the
-union of heuristic tactics across all supported token buckets; unused FC2
-write-back scratch is omitted. `MEGAMOE_TACTIC_AUTOTUNE=1` retains the full
-candidate workspace; the upstream candidate set excludes FC2 write-back
-tactics. Token capacity and persistent addresses do not change,
+MegaMoE reserves scratch for all candidate tactics before CUDA graph capture,
+whether tactic autotuning is enabled or disabled. With tuning disabled,
+`forward()` selects the original capacity-based default; enabling
+`MEGAMOE_TACTIC_AUTOTUNE=1` searches the candidates. The candidate set excludes
+FC2 write-back tactics. Token capacity and persistent addresses do not change,
 and launches with an unreserved tactic or capacity are rejected.
 
-The collective scratch arena holds at most 128 source tokens per rank. Larger
-forwards reuse it in rank-identical chunks and copy each completed result to
-a per-call output tensor sized to live local rows before reuse. The collective
-token bound, never
-local row count, determines the number of chunks, so idle ranks still
-participate. This bounds dispatch and combine storage independently of the
-prefill ceiling; it does not reduce the supported forward token count.
-Decode forwards up to 128 tokens per rank retain a single MegaMoE launch.
-
-Kimi K3 can still write packed activations and routes directly into the runner's
-input buffers. Calls within the arena capacity use its symmetric views; larger
-producers receive per-call buffers for their live rows, which are staged one
-chunk at a time. This keeps unconsumed input separate from reused scratch.
+The temporary full-capacity workspace experiment reserves the configured maximum
+per-rank token capacity before capture, including the prefill ceiling (8192 in
+the capacity test) and the MTP verification batch (64 requests times 4 tokens).
+This follows the serving-capacity allocation policy of vLLM's MegaMoE buffer;
+the CuTe kernel retains its own layouts and alignment. Each forward executes
+one collective with no 128-token chunk loop. All layers and captured capacities
+continue to share stable workspace addresses. Kimi K3 writes packed activations
+and routes directly into views of this full-capacity symmetric allocation.

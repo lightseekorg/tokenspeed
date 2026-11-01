@@ -305,7 +305,9 @@ def run_correctness(
     _check(output, expected, "eager")
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
 
-    runner = get_runner(plan, w, prequantized=prequantized)
+    runner = (
+        get_runner(plan, w) if prequantized else get_runner(plan, w, prequantized=False)
+    )
     if prequantized:
         staged_x, staged_sf, staged_ids, staged_weights = runner.input_buffers(
             x[0].shape[0], capacity
@@ -385,16 +387,16 @@ def run_correctness(
     _check(output, expected, "uneven/idle rank")
 
     arena = runner.workspace
-    assert arena.capacity <= 128
-    # Disabled tuning must not reserve the unused full FC2 write-back pool.
-    if not tune and arena.capacity <= 8192:
-        assert "fc2_output_workspace" not in arena.region_sizes["local"]
-        with pytest.raises(ValueError, match="not reserved"):
-            arena._kernel(4, (256, 512, "static", "reuse_dispatch_warps", 8))
-    if tune:
-        assert "fc2_output_workspace" not in arena.region_sizes["local"]
+    assert arena.capacity == 1 << (get_autotune_max_num_tokens() - 1).bit_length()
+    # Every candidate must be usable without growing the reserved arena,
+    # including when the normal execution path has tactic tuning disabled.
+    for tactic in runner.TACTICS:
+        arena._kernel(arena.capacity, tactic)
+    assert "fc2_output_workspace" not in arena.region_sizes["local"]
     with pytest.raises(ValueError, match="not reserved"):
-        arena._kernel(arena.capacity * 2, arena.tactics[0])
+        arena._kernel(4, (256, 512, "static", "reuse_dispatch_warps", 8))
+    with pytest.raises(ValueError, match="not reserved"):
+        arena._kernel(arena.capacity * 2, runner.TACTICS[0])
     pointers = (
         arena.storage.data_ptr(),
         arena.local.data_ptr(),
@@ -470,8 +472,8 @@ def test_nvfp4_megamoe(tune, activation, prequantized, monkeypatch):
                 set_autotune_process_group(dist.group.WORLD)
                 run_correctness(4, 4, tune, activation, prequantized=prequantized)
                 if not tune and activation == "silu":
-                    # Nonempty later chunks and a partial tail, then idle ranks
-                    # and alternating graphs that reuse the same small arena.
+                    # Larger live batches, then idle ranks and alternating
+                    # graphs that retain the full-capacity arena.
                     run_correctness(
                         512, 300, False, activation, prequantized=prequantized
                     )
