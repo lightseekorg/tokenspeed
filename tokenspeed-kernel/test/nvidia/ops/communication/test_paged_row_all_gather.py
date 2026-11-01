@@ -374,17 +374,18 @@ def test_paged_row_all_gather_failures(case, tmp_path):
     """Each rank in a process of its own (a trapped context cannot take part
     in a collective, and ``mp.spawn`` stops the others when one fails): the
     error records name the expected stage on every rank."""
+    size = 4
+    if torch.cuda.device_count() < size or not kernel_supported(
+        "cute_dsl_paged_row_all_gather"
+    ):
+        pytest.skip(f"requires {size} node-local GB300 GPUs")
+    # Imported once the platform is known to have CuTe DSL.
     from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
         STAGE_ENTRY_AHEAD,
         STAGE_ENTRY_TIMEOUT,
         STAGE_HEADER,
     )
 
-    size = 4
-    if torch.cuda.device_count() < size or not kernel_supported(
-        "cute_dsl_paged_row_all_gather"
-    ):
-        pytest.skip(f"requires {size} node-local GB300 GPUs")
     context = multiprocessing.get_context("spawn")
     rendezvous = f"file://{tmp_path / 'rendezvous'}"
     workers = [
