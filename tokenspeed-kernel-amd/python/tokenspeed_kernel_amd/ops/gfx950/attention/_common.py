@@ -27,6 +27,17 @@ _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 _LN2_VALUE = 0.6931471805599453
 _LN2 = tl.constexpr(_LN2_VALUE)
 
+# An FP8 attention kernel converts its softmax probabilities to FP8 for the
+# P @ V MFMA. Probabilities lie in [0, 1], where e4m3 has 3 mantissa bits only
+# down to 2^-6 and rounds anything at or below 2^-10 to zero, while the row
+# sum that normalizes the output keeps them in fp32. So the kernels subtract
+# this from the running max before exponentiating, making each base-2 exponent
+# 8 larger and each probability 2^8 times larger: the largest is 256, and the
+# row sum carries the same factor, so the normalized output is unchanged.
+# Base-2 LSE outputs and sinks account for it (fp8_lse_shift). e5m2 has more
+# range, so the same scale is safe for it.
+FP8_PROBABILITY_LOG2_SCALE = tl.constexpr(8.0)
+
 # Upper bound of select_kv_splits. Reduce kernels take the split count at
 # runtime and must handle any value up to this bound.
 MAX_KV_SPLITS = 32
@@ -51,6 +62,17 @@ def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
         out_dtype=gl.float32,
     )
     return gl.tensor(output.handle, acc.type)
+
+
+def reject_block_scales(kernel: str, **scales) -> None:
+    """Raise if block scales reach a kernel that reads FP8 at unit scale.
+
+    The registry never routes a block-scaled cache to these kernels; this
+    keeps a direct caller from having its scales ignored.
+    """
+    names = [name for name, scale in scales.items() if scale is not None]
+    if names:
+        raise ValueError(f"{kernel} reads FP8 at unit scale, got {', '.join(names)}")
 
 
 def select_kv_splits(
@@ -87,6 +109,24 @@ def select_kv_splits(
     if splits_for_pages > max_page_splits:
         splits_for_pages = max_page_splits
     return min(splits_for_occupancy, splits_for_pages)
+
+
+@gluon.jit
+def fp8_probability_shift(m_scaled, IS_FP8: gl.constexpr):
+    """What to subtract from the base-2 logits before exp2: the running max
+    m_scaled (base-2 units), less FP8_PROBABILITY_LOG2_SCALE for FP8 so the
+    probabilities come out 2^8 larger."""
+    if IS_FP8:
+        return m_scaled - FP8_PROBABILITY_LOG2_SCALE
+    return m_scaled
+
+
+@gluon.jit
+def fp8_lse_shift(m_i, SM_SCALE: gl.constexpr, IS_FP8: gl.constexpr):
+    """The running max m_i in base-2 units, less the FP8 probability scale
+    the row sum l_i carries, so that fp8_lse_shift(m_i) + log2(l_i) is the
+    base-2 LSE."""
+    return fp8_probability_shift(m_i * SM_SCALE, IS_FP8)
 
 
 @gluon.jit
