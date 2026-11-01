@@ -132,6 +132,99 @@ def _supports_flashinfer_fp8_blockscale(m: int, _n: int, _k: int) -> bool:
 
 
 if gemm_fp8_nt_groupwise is not error_fn:
+    from flashinfer.autotuner import (
+        AutoTuner,
+        DynamicTensorSpec,
+        TunableRunner,
+        TuningConfig,
+    )
+
+    class _Fp8BlockscaleRunner(TunableRunner):
+        def __init__(self, enable_pdl: bool):
+            self.enable_pdl = enable_pdl
+
+        def get_valid_tactics(self, inputs, profile):
+            return [1, 2]
+
+        def get_cache_key_extras(self, inputs):
+            return (
+                "cutlass",
+                "K",
+                self.enable_pdl,
+                torch.cuda.get_device_capability(inputs[0].device),
+                tuple(str(t.dtype) for t in inputs),
+                tuple(tuple(t.stride()) for t in inputs),
+            )
+
+        def forward(self, inputs, tactic=-1, do_preparation=False):
+            a, b, a_scale, b_scale, out = inputs
+            return gemm_fp8_nt_groupwise(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                scale_major_mode="K",
+                mma_sm=1 if tactic == -1 else tactic,
+                out=out,
+                backend="cutlass",
+            )
+
+    _FP8_BLOCKSCALE_RUNNERS = {
+        enabled: _Fp8BlockscaleRunner(enabled) for enabled in (False, True)
+    }
+
+    def _fp8_tuning_rows(rows):
+        # One startup prefill also profiles decode sizes. Keep exact lookup:
+        # unseen sizes safely fall back rather than borrowing another tactic.
+        return sorted(
+            {rows} | {1 << i for i in range(rows.bit_length()) if 1 << i != 32}
+        )
+
+    _FP8_BLOCKSCALE_TUNING = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec((0, 2, 4), (0, 0, 0), _fp8_tuning_rows, lambda m: m),
+        ),
+        use_cold_l2_cache=True,
+    )
+
+    def flashinfer_fp8_blockscale_tuned(A, B, A_scales, B_scales, out):
+        """Select CUTLASS mma_sm through FI's startup tuner and native cache.
+
+        Args:
+            A: FP8 activations shaped [M, K].
+            B: FP8 weights shaped [N, K].
+            A_scales: Contiguous FP32 scales shaped [M, K / 128].
+            B_scales: Contiguous FP32 scales shaped [N / 128, K / 128].
+            out: Preallocated output shaped [M, N].
+
+        Returns:
+            The updated output tensor.
+        """
+        inputs = [A, B, A_scales, B_scales, out]
+        runner = _FP8_BLOCKSCALE_RUNNERS[pdl_enabled()]
+
+        def choose():
+            return AutoTuner.get().choose_one(
+                custom_op="tokenspeed_fp8_blockscale_gemm",
+                runners=[runner],
+                tuning_config=_FP8_BLOCKSCALE_TUNING,
+                inputs=inputs,
+            )
+
+        # FI reference-counts tuning contexts: nested autotune(False) does not
+        # disable an outer autotune(True). Capture must only query the cache.
+        if torch.cuda.is_current_stream_capturing():
+            tuner = AutoTuner.get()
+            with tuner._lock:
+                was_tuning = tuner.is_tuning_mode
+                tuner.is_tuning_mode = False
+                try:
+                    chosen, tactic = choose()
+                finally:
+                    tuner.is_tuning_mode = was_tuning
+        else:
+            chosen, tactic = choose()
+        return chosen(inputs, tactic=tactic)
 
     @register_kernel(
         "gemm",
@@ -189,15 +282,12 @@ if gemm_fp8_nt_groupwise is not error_fn:
             and out.is_contiguous()
             and out.shape == (orig_m, B.shape[0])
         )
-        output = gemm_fp8_nt_groupwise(
-            A,
-            B,
-            A_scales,
-            B_scales,
-            scale_major_mode="K",
-            out=out if direct_out else None,
-            out_dtype=out_dtype,
+        destination = (
+            out
+            if direct_out
+            else torch.empty((orig_m, B.shape[0]), dtype=out_dtype, device=A.device)
         )
+        output = flashinfer_fp8_blockscale_tuned(A, B, A_scales, B_scales, destination)
         if out is not None and not direct_out:
             out.copy_(output)
             return out

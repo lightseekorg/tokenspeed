@@ -79,6 +79,54 @@ its request partition is invalidated before another PD owner uses it.
 | `--kv-cache-quant-method` | KV cache quantization method. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
+| `--enable-fp8-attn-proj` | Opt-in online block-FP8 full-attention QKV/O and GDN QKVZ/output projections for Qwen3.5 and Qwen4-Exp. GDN BA projections keep the model's floating dtype. |
+
+The Qwen projection switch defaults to off. It accepts
+an unquantized checkpoint (including an existing online FP8 config), or an
+NVFP4 checkpoint whose selected attention projections are all excluded from
+weight quantization. Online conversion requires floating projection weights;
+there is no per-projection validation of the checkpoint's exclusion list.
+Existing FP8 configs are reused, including serialized FP8 checkpoint configs.
+
+Weights are quantized once after loading with 128x128 block scales. Each
+linear dynamically quantizes its input in groups of 128 channels per token
+and returns the model's floating activation dtype. The existing
+`--dense-gemm-backend` selects the GEMM implementation. Attention cores,
+KV-cache formats, GDN states, and TP communication keep their existing
+contracts. The switch applies to the corresponding target and draft layers.
+
+On SM100/SM103, `--dense-gemm-backend deepgemm` requantizes block-FP8 dense
+weights to UE8M0 once after loading. Activations are quantized directly into
+DeepGEMM's packed int32 scale layout, including PDL and CUDA Graph support.
+This changes quantization scales; `auto` retains its existing FP32-scale path.
+
+`Fp8Config` permits online quantization of GDN QKVZ/output projections by
+default. BA, conv, Mamba mixer projections and grouped `wo_a`
+remain excluded, and explicit checkpoint exclusions still apply. The Qwen
+projection switch selects this ordinary FP8 config for its attention
+projections; there is no separate GDN configuration toggle. The Qwen GDN
+constructor keeps its projections unquantized when this switch is off, even
+with an existing global online FP8 config. Serialized FP8 checkpoints continue
+to use their existing quantization configuration when the switch is off.
+
+With GDN FP8 projections enabled, the input projection is split into an FP8
+QKVZ GEMM and a floating BA GEMM. This keeps the recurrence-control inputs
+out of FP8 and adds a GEMM launch compared with the fully merged floating
+projection. Conv and gated normalization keep their existing precision.
+When an auxiliary CUDA stream is available, block-FP8 QKVZ and floating BA
+run concurrently. Events order both branches after their input and join them
+before GDN consumes the projections; the same dependency graph is captured
+for CUDA Graph replay. PDL remains enabled within each stream when requested,
+and block-FP8 activation quantization follows the global PDL setting.
+For Qwen4-Exp, PLE, hyper-connections, and the QSA indexer retain their
+existing quantization choices.
+
+For an NVFP4 checkpoint with floating attention projections, add the flag
+to the usual launch command to enable both projection groups:
+
+```bash
+--quantization nvfp4 --enable-fp8-attn-proj
+```
 
 ## Numerics
 

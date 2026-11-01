@@ -44,11 +44,15 @@ from tokenspeed.runtime.layers.dense import fp8 as dense_fp8
 from tokenspeed.runtime.layers.dense import nvfp4 as dense_nvfp4
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.models import qwen3_5_moe
 from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
+    Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
     _input_norm,
     _post_attn_norm,
@@ -214,6 +218,54 @@ def bf16_default_dtype():
     torch.set_default_dtype(torch.bfloat16)
     yield
     torch.set_default_dtype(previous)
+
+
+@pytest.mark.parametrize(
+    "checkpoint, enabled, quantized, split",
+    [
+        ("bf16", False, False, False),
+        ("bf16", True, True, True),
+        ("online_fp8", False, False, False),
+        ("online_fp8", True, True, True),
+        ("nvfp4", False, False, False),
+        ("nvfp4", True, True, True),
+        ("serialized_fp8", False, True, False),
+        ("serialized_fp8", True, True, False),
+    ],
+)
+def test_gdn_projection_fp8_requires_opt_in(
+    monkeypatch, bf16_default_dtype, checkpoint, enabled, quantized, split
+):
+    monkeypatch.setitem(global_server_args_dict, "enable_fp8_attn_proj", enabled)
+    config = Qwen3_5TextConfig(
+        hidden_size=512,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    config.dtype = torch.bfloat16
+    quant_config = {
+        "bf16": None,
+        "online_fp8": Fp8Config(),
+        "serialized_fp8": Fp8Config(is_checkpoint_fp8_serialized=True),
+        "nvfp4": Nvfp4Config(exclude_modules=["*.linear_attn.*"]),
+    }[checkpoint]
+    gdn = Qwen3_5GatedDeltaNet(
+        config,
+        Mapping(rank=0, world_size=1),
+        0,
+        quant_config=quant_config,
+        prefix="model.layers.0.linear_attn",
+    )
+    assert gdn._split_in_proj == split
+    input_proj = gdn.in_proj_qkvz if split else gdn.in_proj_qkvzba
+    expected = Fp8LinearMethod if quantized else UnquantizedLinearMethod
+    assert isinstance(input_proj.quant_method, expected)
+    assert isinstance(gdn.out_proj.quant_method, expected)
+    assert isinstance(gdn.conv1d.quant_method, UnquantizedLinearMethod)
+    if split:
+        assert isinstance(gdn.in_proj_ba.quant_method, UnquantizedLinearMethod)
 
 
 def _decoder_layer(kind: str, split_gdn: bool):

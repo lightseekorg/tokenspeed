@@ -70,6 +70,7 @@ from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
     _gdn_in_proj_stacked_mapping,
+    _get_attn_proj_quant_config,
 )
 from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
@@ -78,6 +79,7 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +295,12 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         self.mapping = mapping
         self.layer_id = layer_id
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, quant_config, prefix=prefix
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            prefix=prefix,
+            alt_stream=alt_stream,
         )
         self.mlp, self.is_moe = _build_qwen4_exp_mlp(
             config,
@@ -391,11 +398,13 @@ class Qwen4ExpAttentionDecoderLayer(
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "nvfp4"
-            else quant_config
+        fp8_proj = global_server_args_dict["enable_fp8_attn_proj"]
+        attn_quant_config = _get_attn_proj_quant_config(
+            quant_config,
+            enabled=fp8_proj,
         )
+        if not fp8_proj and quant_config and quant_config.get_name() == "nvfp4":
+            attn_quant_config = None
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,

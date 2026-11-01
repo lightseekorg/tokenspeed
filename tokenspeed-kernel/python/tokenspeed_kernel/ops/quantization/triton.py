@@ -346,6 +346,201 @@ def fp8_quantize_per_token(
     return codes, scales
 
 
+@triton.jit
+def _fp8_group128_quantize_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    num_groups,
+    GROUPS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    group = tl.program_id(0).to(tl.int64) * GROUPS + tl.arange(0, GROUPS)
+    offsets = group[:, None] * 128 + tl.arange(0, 128)[None, :]
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + offsets, group[:, None] < num_groups, other=0).to(tl.float32)
+    epsilon = tl.full((), 1.0e-10, tl.float32).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), epsilon)
+    # Match the native quantizer's epsilon and round-to-nearest divisions.
+    inverse_scale = tl.div_rn(448.0, amax)
+    q = tl.clamp(x * inverse_scale[:, None], -448.0, 448.0)
+    tl.store(out_ptr + offsets, q, group[:, None] < num_groups)
+    # Flattened groups already follow canonical [M, K/128] scale order.
+    tl.store(scale_ptr + group, tl.div_rn(1.0, inverse_scale), group < num_groups)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_group128",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "granularity": frozenset({"token_group_128"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.PERFORMANT + 1,
+)
+def triton_quantize_fp8_group128(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write FP8 values and canonical FP32 group scales in one launch."""
+    if granularity != "token_group" or group_size != 128 or scale_encoding != "float32":
+        raise ValueError("requires token_group=128 with float32 scales")
+    if x.shape[-1] % 128:
+        raise ValueError("input width must be divisible by 128")
+    x = x.contiguous()
+    output = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(
+        (*x.shape[:-1], x.shape[-1] // 128), device=x.device, dtype=torch.float32
+    )
+    num_groups = x.numel() // 128
+    groups = 1 if num_groups < 128 else 4 if num_groups <= 2048 else 16
+    _fp8_group128_quantize_kernel[(triton.cdiv(num_groups, groups),)](
+        x,
+        output,
+        scales,
+        num_groups,
+        GROUPS=groups,
+        ENABLE_PDL=enable_pdl,
+        num_warps=1 if groups == 1 else 4,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return output, scales
+
+
+@triton.jit(do_not_specialize=["rows", "padded_rows", "num_groups"])
+def _fp8_group128_quantize_packed_kernel(
+    x_ptr,
+    out_ptr,
+    scale_bytes_ptr,
+    rows,
+    padded_rows,
+    num_groups,
+    K: tl.constexpr,
+    GROUPS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    groups_per_row: tl.constexpr = K // 128
+    padded_groups: tl.constexpr = triton.cdiv(groups_per_row, 4) * 4
+    group = tl.program_id(0).to(tl.int64) * GROUPS + tl.arange(0, GROUPS)
+    row = group // padded_groups
+    column = group % padded_groups
+    valid = (row < rows) & (column < groups_per_row)
+    offsets = row[:, None] * K + column[:, None] * 128 + tl.arange(0, 128)[None, :]
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + offsets, valid[:, None], other=0).to(tl.float32)
+    scale = tl.div_rn(tl.maximum(tl.max(tl.abs(x), 1), 1.0e-10), 448.0)
+    # vLLM's packed quantizer rounds the IEEE exponent up directly. log2 can
+    # round an exact power of two upward and select the next scale instead.
+    bits = scale.to(tl.uint32, bitcast=True)
+    exponent = tl.minimum(
+        tl.maximum(((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0), 1), 254
+    )
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    q = tl.clamp(tl.div_rn(x, scale[:, None]), -448.0, 448.0)
+    tl.store(out_ptr + offsets, q, valid[:, None])
+    # One group owns one byte, including both row and K padding. This avoids
+    # atomics and a separate memset/transpose/packing kernel.
+    destination = (column // 4) * padded_rows * 4 + row * 4 + column % 4
+    tl.store(
+        scale_bytes_ptr + destination,
+        tl.where(valid, exponent, 0).to(tl.uint8),
+        group < num_groups,
+    )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_group128_packed",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token_group_128"}),
+        "scale_encoding": frozenset({"packed_ue8m0"}),
+        "scale_layout": frozenset({"mn_major"}),
+    },
+    priority=Priority.PERFORMANT,
+)
+def triton_quantize_fp8_group128_packed(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize 1x128 groups directly into DeepGEMM's packed UE8M0 layout.
+
+    Args:
+        x: Contiguous BF16/FP16 activations, with K divisible by 128.
+        granularity: Must be token_group.
+        group_size: Must be 128.
+        scale_encoding: Must be packed_ue8m0.
+        enable_pdl: Wait for the producer and signal dependent kernels.
+
+    Returns:
+        E4M3 codes shaped like x and int32 scales [M,ceil(K/512)], with
+        strides [1,round_up(M,4)]. Every padding byte is initialized.
+    """
+    if (
+        granularity != "token_group"
+        or group_size != 128
+        or scale_encoding != "packed_ue8m0"
+    ):
+        raise ValueError("requires token_group=128 with packed_ue8m0 scales")
+    if x.shape[-1] % 128:
+        raise ValueError("input width must be divisible by 128")
+    x = x.contiguous()
+    k = x.shape[-1]
+    rows = x.numel() // k
+    padded_rows = triton.cdiv(rows, 4) * 4
+    packs = triton.cdiv(k // 128, 4)
+    storage = torch.empty((packs, padded_rows), dtype=torch.int32, device=x.device)
+    scales = storage.t()[:rows]
+    output = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    if rows:
+        num_groups = padded_rows * packs * 4
+        valid_groups = rows * (k // 128)
+        groups = 1 if valid_groups < 128 else 4 if valid_groups <= 2048 else 16
+        _fp8_group128_quantize_packed_kernel[(triton.cdiv(num_groups, groups),)](
+            x,
+            output,
+            storage.view(torch.uint8),
+            rows,
+            padded_rows,
+            num_groups,
+            K=k,
+            GROUPS=groups,
+            ENABLE_PDL=enable_pdl,
+            num_warps=1 if groups == 1 else 4,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
+    return output, scales
+
+
 @triton.jit(do_not_specialize=["groups"])
 def _fp8_token_group_quantize_kernel(
     x_ptr,
@@ -1398,6 +1593,8 @@ __all__ = [
     "triton_quantize_fp8_roundtrip",
     "triton_quantize_mxfp4",
     "triton_rmsnorm_nvfp4_quant",
+    "triton_quantize_fp8_group128",
+    "triton_quantize_fp8_group128_packed",
     "triton_quantize_fp8_with_scale",
 ]
 

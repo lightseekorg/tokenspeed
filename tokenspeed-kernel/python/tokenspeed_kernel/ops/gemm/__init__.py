@@ -128,6 +128,7 @@ __all__ = [
     "prepare_mxfp4_linear",
     "mm",
     "prepare_mxfp8_weight_scales",
+    "prepare_deepgemm_fp8_weight",
     "prepare_nvfp4_a16_weights",
 ]
 
@@ -229,7 +230,9 @@ def _gemm_format_signature(
             raise ValueError("mxfp8 format selection requires B_scales")
         # Match the scale encoding used by online activation quantization.
         online_scale_dtype = (
-            torch.uint8 if B_scales.dtype == torch.uint8 else torch.float32
+            B_scales.dtype
+            if B_scales.dtype in (torch.uint8, torch.int32)
+            else torch.float32
         )
         a_scale = ScaleFormat(
             storage_dtype=(
@@ -749,7 +752,11 @@ def mm(
         A, A_scales = _online_quantize_mxfp8(
             A,
             block_size,
-            "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
+            (
+                "packed_ue8m0"
+                if B_scales.dtype == torch.int32
+                else "ue8m0" if B_scales.dtype == torch.uint8 else "float32"
+            ),
             enable_pdl=enable_pdl,
             kernel_name=kernel.name,
         )
@@ -3726,7 +3733,9 @@ def kimi3_router_projection(
 # isort: off
 import tokenspeed_kernel.numerics.torch.gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
-import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
+from tokenspeed_kernel.ops.gemm.deepgemm import (
+    prepare_deepgemm_fp8_weight,
+)  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: E402,F401

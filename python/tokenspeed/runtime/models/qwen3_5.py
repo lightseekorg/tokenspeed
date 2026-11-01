@@ -68,6 +68,7 @@ from tokenspeed.runtime.layers.parameter import (
     PerTensorScaleParameter,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import check_equal_or_regex_match
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -105,7 +106,8 @@ from tokenspeed.runtime.utils import (
     make_layers,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,21 @@ def _is_ignored_checkpoint_param(model, name: str) -> bool:
         return False
     quant_method = getattr(module, "quant_method", None)
     return leaf in getattr(quant_method, "ignored_checkpoint_params", ())
+
+
+def _get_attn_proj_quant_config(
+    quant_config: QuantizationConfig | None,
+    *,
+    enabled: bool,
+) -> QuantizationConfig | None:
+    """Select online FP8 for floating projection weights; reuse existing FP8 configs."""
+    if not enabled or isinstance(quant_config, Fp8Config):
+        return quant_config
+    return Fp8Config(
+        is_checkpoint_fp8_serialized=False,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
 
 
 def _gdn_group_unquantized(prefix, shard_names, quant_config) -> bool:
@@ -227,6 +244,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -261,6 +279,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
+        fp8_proj = global_server_args_dict["enable_fp8_attn_proj"]
+        if (
+            not fp8_proj
+            and isinstance(quant_config, Fp8Config)
+            and not quant_config.is_checkpoint_fp8_serialized
+        ):
+            # Preserve the original online-FP8 behavior: GDN stays unquantized
+            # unless attention projection quantization is explicitly enabled.
+            quant_config = None
+        quant_config = _get_attn_proj_quant_config(
+            quant_config,
+            enabled=fp8_proj,
+        )
         qkvz_unquant = _gdn_group_unquantized(
             prefix, ("in_proj_qkv", "in_proj_z"), quant_config
         )
@@ -324,6 +355,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ) // self.attn_tp_size
             self._ba_dim = (self.num_v_heads * 2) // self.attn_tp_size
             self._bind_packed_weight_loaders(self.in_proj_qkvzba)
+
+        self._ba_fork = StreamFork(
+            alt_stream
+            if (
+                fp8_proj
+                and self._split_in_proj
+                and isinstance(quant_config, Fp8Config)
+                and quant_config.weight_block_size is not None
+                and not qkvz_unquant
+                and ba_unquant
+            )
+            else None
+        )
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -527,8 +571,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ):
         projection_input = hidden_states if hidden_fp8 is None else hidden_fp8
         if self._split_in_proj:
-            projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            if self._ba_fork.aux_stream is None:
+                projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
+                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                return projected_states_qkvz, projected_states_ba
+            main_stream = torch.cuda.current_stream(hidden_states.device)
+            hidden_states.record_stream(self._ba_fork.aux_stream)
+            # Events fork after input production and join before either output
+            # is consumed. PDL remains local to each stream, including in graphs.
+            with self._ba_fork.scope(enable=True, overlap=True) as fork:
+                with fork.branch():
+                    projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
+            # BA is allocated on aux but consumed on main after the join.
+            projected_states_ba.record_stream(main_stream)
             return projected_states_qkvz, projected_states_ba
         projected_all, _ = self.in_proj_qkvzba(projection_input)
         projected_states_qkvz, projected_states_ba = projected_all.split(
@@ -622,7 +678,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.layer_id = layer_id
 
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, quant_config, prefix=prefix
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            prefix=prefix,
+            alt_stream=alt_stream,
         )
 
         #  Determine the MLP type based on the model type
@@ -803,11 +864,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "nvfp4"
-            else quant_config
+        fp8_proj = global_server_args_dict["enable_fp8_attn_proj"]
+        attn_quant_config = _get_attn_proj_quant_config(
+            quant_config,
+            enabled=fp8_proj,
         )
+        if not fp8_proj and quant_config and quant_config.get_name() == "nvfp4":
+            attn_quant_config = None
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,

@@ -423,7 +423,9 @@ def _select_fp8_dynamic(
     traits = {
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
-        "scale_layout": "token_major",
+        "scale_layout": (
+            "mn_major" if scale_encoding == "packed_ue8m0" else "token_major"
+        ),
     }
     if rows is not None:
         # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
@@ -873,6 +875,7 @@ def rmsnorm_nvfp4_quant(
 
 
 # Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.quantization.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401

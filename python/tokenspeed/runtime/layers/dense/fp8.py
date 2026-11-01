@@ -29,8 +29,10 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.gemm import (
     mm,
+    prepare_deepgemm_fp8_weight,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.weights import get_weight_broker
 from torch.nn.parameter import Parameter
 
@@ -197,6 +199,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 else:
                     broker.preprocess(preprocessor, layer)
                 return
+            if global_server_args_dict["dense_gemm_backend"] == "deepgemm" and tuple(
+                self.quant_config.weight_block_size
+            ) == (128, 128):
+                weight, scales = prepare_deepgemm_fp8_weight(
+                    layer.weight.data, layer.weight_scale_inv.data
+                )
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale_inv = Parameter(scales, requires_grad=False)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -273,13 +283,20 @@ class Fp8LinearMethod(LinearMethodBase):
         output_dtype = output_dtype or x.dtype
         if block_scale is None:
             scale_encoding = (
-                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
+                "packed_ue8m0"
+                if layer.weight_scale_inv.dtype == torch.int32
+                else (
+                    "ue8m0"
+                    if layer.weight_scale_inv.dtype == torch.uint8
+                    else "float32"
+                )
             )
             input_2d, block_scale = quantize_fp8(
                 input_2d,
                 granularity="token_group",
                 group_size=self.quant_config.weight_block_size[1],
                 scale_encoding=scale_encoding,
+                enable_pdl=pdl_enabled(),
             )
         solution = None
         if global_server_args_dict["dense_gemm_backend"] in (
