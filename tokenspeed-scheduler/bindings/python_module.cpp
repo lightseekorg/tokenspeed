@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
@@ -268,9 +269,23 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // Host L2 counters (Scheduler.host_cache_stats), read-only. Every by-group
     // list is indexed like SchedulerConfig.cache_groups.
+    using IdleBuckets =
+        tokenspeed::CacheCoordinator::BucketCounts<tokenspeed::CacheCoordinator::kHostIdleBoundsMs.size()>;
+    nb::class_<IdleBuckets>(m, "IdleBucketCounts")
+        .def_ro("counts", &IdleBuckets::counts)
+        .def_ro("sums", &IdleBuckets::sums);
+    using TokenBuckets =
+        tokenspeed::CacheCoordinator::BucketCounts<tokenspeed::CacheCoordinator::kEvictedThenNeededTokenBounds.size()>;
+    nb::class_<TokenBuckets>(m, "TokenBucketCounts")
+        .def_ro("counts", &TokenBuckets::counts)
+        .def_ro("sums", &TokenBuckets::sums);
     nb::class_<tokenspeed::CacheCoordinator::HostEvictionCounts>(m, "HostEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheCoordinator::HostEvictionCounts::blocks)
-        .def_ro("device_resident", &tokenspeed::CacheCoordinator::HostEvictionCounts::device_resident);
+        .def_ro("device_resident", &tokenspeed::CacheCoordinator::HostEvictionCounts::device_resident)
+        .def_ro("kv_idle_ms", &tokenspeed::CacheCoordinator::HostEvictionCounts::kv_idle_ms)
+        .def_ro("state_idle_ms", &tokenspeed::CacheCoordinator::HostEvictionCounts::state_idle_ms)
+        .def_ro("evicted_then_needed_tokens",
+                &tokenspeed::CacheCoordinator::HostEvictionCounts::evicted_then_needed_tokens);
     nb::class_<tokenspeed::CacheCoordinator::HostEvictionStats>(m, "HostEvictionStats")
         .def_ro("lru", &tokenspeed::CacheCoordinator::HostEvictionStats::lru)
         .def_ro("duplicate", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate)
@@ -668,8 +683,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Host L2 pool parents (0 without a Host pool).")
         .def("host_cache_stats", &tokenspeed::Scheduler::GetHostCacheStats,
              "Host L2 counters and the Device evictions they are read against, cumulative since start. "
-             "Accounting only, for tests and inspection: no scheduling decision reads them, the runtime "
-             "exports none, and reading them changes nothing.")
+             "Accounting only: no scheduling decision reads them, and reading them changes nothing. The "
+             "runtime exports the prefix hits by tier and the Host evictions by reason.")
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
         .def("storage_held_blocks", &tokenspeed::Scheduler::StorageHeldBlocks)

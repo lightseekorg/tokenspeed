@@ -108,6 +108,10 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             match_order_.push_back(i);
         }
     }
+    if (host_pool_ != nullptr) {
+        recent_host_evictions_.resize(kRecentHostEvictionBuckets);
+        recent_host_tail_evictions_.resize(kRecentHostTailEvictions);
+    }
 }
 
 bool CacheCoordinator::GroupIsState(std::size_t i) const {
@@ -212,6 +216,9 @@ bool CacheCoordinator::ClearCache() {
     // holds a node: the scheduler refuses a clear while a store is in flight.
     tails_.Clear();
     boundary_tree_.Clear();
+    // What the Host held before the flush is no prompt's recent eviction.
+    std::ranges::fill(recent_host_evictions_, decltype(recent_host_evictions_)::value_type{});
+    std::ranges::fill(recent_host_tail_evictions_, RecentHostTailEviction{});
     return true;
 }
 
@@ -1128,6 +1135,23 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
             tails_.Touch(tier->tail->hash);
         }
     }
+    // A Device hit acquires the Device's entries alone. The Host copies of
+    // its pages, tail and checkpoint (write-through's stores, or what a
+    // load-back read) take its epoch here too (Registering an existing entry
+    // only re-dates it, keeping its position and boundary kind), so the
+    // Host's LRU follows their use rather than the order they were stored
+    // in, which would age a hot prefix out of the Host first.
+    if (host_pool_ != nullptr) {
+        forEachStorageDependency(probe.device, *probe.group_keys, /*floor_tokens=*/0,
+                                 [&](const CacheKey& key, std::int32_t /*logical_block*/) {
+                                     PrefixCacheIndex& index = groups_[key.group_id].Index();
+                                     if (CacheBlockRef block = index.Find(*host_pool_, key)) {
+                                         index.Register(*host_pool_, block, key, access_epoch,
+                                                        /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                        /*newly_cached=*/nullptr);
+                                     }
+                                 });
+    }
     out.device = acquireTierWithKeys<CacheTier::kDevice>(*probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
                                                          access_epoch);
     // The storage tier is never acquired: an admission loads Host entries
@@ -2009,6 +2033,9 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
 bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                                             HostEvictionCounts HostEvictionStats::*reason) {
     const auto evict_entry = [&](std::uint32_t entry_group, CacheBlockLocation entry_location) {
+        // Read while the entry is still there, for its idle time.
+        const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
+            groups_[entry_group].Index().MetadataFor(*host_pool_, entry_location);
         std::optional<CacheKey> removed = groups_[entry_group].Index().Evict(*host_pool_, entry_location);
         if (!removed) {
             return removed;
@@ -2018,6 +2045,52 @@ bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLo
         // Contains takes no reference, so it pins nothing on the Device tier.
         if (groups_[entry_group].Index().Contains(pool_, *removed)) {
             ++evicted.device_resident;
+        }
+        // Accounting only from here on. The entry's idle time runs from the
+        // last sample at or below its epoch (SampleAccessClock); an epoch
+        // below every sample was issued before the oldest one and, once that
+        // one is the span old, is idle at least its age.
+        const std::uint64_t epoch = metadata->last_access_epoch;
+        auto sample = std::ranges::upper_bound(access_clock_samples_, epoch, {}, &AccessClockSample::first_epoch);
+        if (sample != access_clock_samples_.begin()) {
+            --sample;
+        }
+        if (epoch != kSupersededAccessEpoch && sample != access_clock_samples_.end() &&
+            (sample->first_epoch <= epoch || access_clock_now_ - sample->time >= kAccessClockSpan)) {
+            const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(access_clock_now_ - sample->time);
+            (GroupIsState(entry_group) ? evicted.state_idle_ms : evicted.kv_idle_ms)
+                .Observe(kHostIdleBoundsMs, static_cast<std::uint64_t>(idle.count()));
+        }
+        // The recent evictions EvictedThenNeeded reads: the slot recording
+        // this key already, else the bucket's oldest. A tail's length goes
+        // under its prior too, newest first (its tree node is still there:
+        // syncTreeNode runs last).
+        const std::size_t content_hash = std::hash<ContentHash>{}(removed->content_hash);
+        auto& bucket = recent_host_evictions_[CacheKeyHash{}(*removed) % kRecentHostEvictionBuckets];
+        *std::ranges::min_element(bucket, {},
+                                  [&](const RecentHostEviction& slot) {
+                                      return std::pair{!slot.Records(*removed, content_hash), slot.sequence};
+                                  }) = RecentHostEviction{.content_hash = content_hash,
+                                                          .namespace_id = removed->namespace_id,
+                                                          .group_id = removed->group_id,
+                                                          .page_offset = removed->page_offset,
+                                                          .sequence = ++host_eviction_sequence_,
+                                                          .reason = reason};
+        if (const BoundaryTree::Node* node = boundary_tree_.Find(removed->content_hash);
+            node != nullptr && node->tail_tokens > 0) {
+            const std::size_t prior_hash =
+                std::hash<ContentHash>{}(node->parent != nullptr ? *node->parent->hash : ContentHash{});
+            RecentHostTailEviction& tails = recent_host_tail_evictions_[prior_hash % kRecentHostTailEvictions];
+            if (tails.prior_hash != prior_hash) {
+                tails = RecentHostTailEviction{.prior_hash = prior_hash};
+            }
+            // Its length, or else the oldest, moves to the front.
+            auto length = std::ranges::find(tails.tail_tokens, node->tail_tokens);
+            if (length == tails.tail_tokens.end()) {
+                --length;
+            }
+            std::rotate(tails.tail_tokens.begin(), length, std::next(length));
+            tails.tail_tokens.front() = node->tail_tokens;
         }
         return removed;
     };
@@ -2041,6 +2114,126 @@ bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLo
     }
     syncTreeNode(removed->content_hash);
     return true;
+}
+
+void CacheCoordinator::SampleAccessClock(std::chrono::steady_clock::time_point now) {
+    if (host_pool_ == nullptr) {
+        return;  // nothing to time: no Host entry is ever evicted
+    }
+    access_clock_now_ = now;
+    if (!access_clock_samples_.empty() && access_clock_samples_.back().first_epoch > next_access_epoch_) {
+        // No epoch was issued since the last sample: it holds from `now` on.
+        access_clock_samples_.back().time = now;
+    } else if (access_clock_samples_.empty() || now - access_clock_samples_.back().time >= kAccessClockStep) {
+        access_clock_samples_.push_back(AccessClockSample{.first_epoch = next_access_epoch_ + 1, .time = now});
+    }
+    // An epoch below the second sample was issued by its time, so the first
+    // goes once the second is the span old.
+    while (access_clock_samples_.size() >= 2 && now - access_clock_samples_[1].time >= kAccessClockSpan) {
+        access_clock_samples_.pop_front();
+    }
+}
+
+CacheCoordinator::HostEvictionCounts CacheCoordinator::HostEvictionStats::*CacheCoordinator::EvictedThenNeeded(
+    const PromptPrefix& prompt, std::int32_t hit_tokens, std::int32_t kv_tokens) const {
+    if (host_pool_ == nullptr || hit_tokens >= prompt.max_tokens) {
+        return nullptr;
+    }
+    // Over the boundary's keys `needed(group, page offset)` selects, the
+    // missing ones (as the header defines them: the Device's KV prefix ends at
+    // or before the KV's reach, so only a checkpoint can come from the
+    // Device): the reason the Host evicted the first of them when it evicted
+    // each of them recently, else (and without any) nullptr. A KV tail the
+    // Device holds whole thus counts only once the Host evicted its copy too.
+    const auto evicted_reason = [&](const ContentHash& hash, std::int32_t tail_tokens, const auto& needed) {
+        const std::size_t content_hash = std::hash<ContentHash>{}(hash);
+        HostEvictionCounts HostEvictionStats::*first = nullptr;
+        bool each_recent = true;
+        ForEachBoundaryKey(CacheKey{.content_hash = hash}, tail_tokens, [&](std::size_t i, const CacheKey& key) {
+            if (!each_recent || !needed(i, key.page_offset) || groups_[i].Index().Contains(*host_pool_, key) ||
+                (GroupIsState(i) && groups_[i].Index().Contains(pool_, key))) {
+                return;
+            }
+            const auto& bucket = recent_host_evictions_[CacheKeyHash{}(key) % kRecentHostEvictionBuckets];
+            const auto slot = std::ranges::find_if(
+                bucket, [&](const RecentHostEviction& recent) { return recent.Records(key, content_hash); });
+            each_recent = slot != bucket.end() && host_eviction_sequence_ - slot->sequence < kRecentHostEvictions;
+            if (each_recent && first == nullptr) {
+                first = slot->reason;
+            }
+        });
+        return each_recent ? first : nullptr;
+    };
+    const std::int32_t granularity = prefix_granularity_;
+    const auto num_pages = static_cast<std::int32_t>(prompt.prefix_hashes.size());
+    const auto prior_of = [&](std::int32_t page) {
+        return page == 0 ? ContentHash{} : prompt.prefix_hashes[static_cast<std::size_t>(page) - 1];
+    };
+    const auto prompt_hash_at = [&](std::int32_t page, std::int32_t tail_tokens) {
+        return HashPrefixPage(
+            prompt.tokens.subspan(static_cast<std::size_t>(page * granularity), static_cast<std::size_t>(tail_tokens)),
+            prior_of(page));
+    };
+    const std::int32_t reach = std::max(hit_tokens, kv_tokens);
+    const std::int32_t page = reach / granularity;
+    _assert(page <= num_pages && static_cast<std::size_t>(reach) <= prompt.tokens.size(),
+            "the KV reach lies inside the probed prompt");
+    if (reach > hit_tokens) {
+        // The KV reaches past the hit, which stopped for want of a State
+        // checkpoint there.
+        const std::int32_t tail_tokens = reach % granularity;
+        if (const auto reason =
+                evicted_reason(tail_tokens == 0 ? prior_of(page) : prompt_hash_at(page, tail_tokens), tail_tokens,
+                               [this](std::size_t i, std::int32_t) { return GroupIsState(i); })) {
+            return reason;
+        }
+    }
+    // Where the KV stopped: the page after its full pages, then a tail past
+    // the reach inside that page.
+    if (page < num_pages && (page + 1) * granularity <= prompt.max_tokens) {
+        const auto page_kv = [&](std::size_t i, std::int32_t offset) {
+            if (GroupIsState(i)) {
+                return false;
+            }
+            if (groups_[i].Matcher().IsPrefixClosed()) {
+                return true;
+            }
+            // A sliding group needs only its window behind the page's end.
+            const auto group = static_cast<std::int32_t>(i);
+            const BlockRange window = SlidingWindowBlocks(group, (page + 1) * granularity);
+            const std::int32_t block = page * BlocksPerBoundary(group) + offset;
+            return block >= window.first && block < window.past_end;
+        };
+        if (const auto reason =
+                evicted_reason(prompt.prefix_hashes[static_cast<std::size_t>(page)], /*tail_tokens=*/0, page_kv)) {
+            return reason;
+        }
+    }
+    const std::size_t prior_hash = std::hash<ContentHash>{}(prior_of(page));
+    const RecentHostTailEviction& tails = recent_host_tail_evictions_[prior_hash % kRecentHostTailEvictions];
+    if (tails.prior_hash != prior_hash) {
+        return nullptr;
+    }
+    for (const std::int32_t tail_tokens : tails.tail_tokens) {
+        const std::int32_t tail_end = page * granularity + tail_tokens;
+        if (tail_tokens == 0 || tail_end <= reach || tail_end > prompt.max_tokens ||
+            static_cast<std::size_t>(tail_end) > prompt.tokens.size()) {
+            continue;
+        }
+        // Under the prompt's own hash there: a prompt diverging inside the
+        // tail names blocks nobody evicted.
+        if (const auto reason = evicted_reason(prompt_hash_at(page, tail_tokens), tail_tokens,
+                                               [](std::size_t, std::int32_t) { return true; })) {
+            return reason;
+        }
+    }
+    return nullptr;
+}
+
+void CacheCoordinator::CountEvictedThenNeeded(HostEvictionCounts HostEvictionStats::*reason, std::int32_t tokens) {
+    _assert(reason != nullptr && tokens >= 0, "an evicted-then-needed admission has a reason and its uncached tokens");
+    (host_evictions_.*reason)
+        .evicted_then_needed_tokens.Observe(kEvictedThenNeededTokenBounds, static_cast<std::uint64_t>(tokens));
 }
 
 std::optional<CacheBlockLocation> CacheCoordinator::locationOf(const BlockPool& pool, std::size_t group_index,

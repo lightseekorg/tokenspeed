@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -473,6 +474,8 @@ bool Scheduler::CanAbortBeforeAdmission(const std::string& id) const {
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
+    // Accounting only: the clock the Host eviction idle times read.
+    coordinator_.SampleAccessClock(std::chrono::steady_clock::now());
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     std::erase_if(requests_, [this](const auto& request) {
         if (!request->template Is<fsm::Finished>()) {
@@ -594,6 +597,8 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
+    // Accounting only: the clock the Host eviction idle times read.
+    coordinator_.SampleAccessClock(std::chrono::steady_clock::now());
     for (const auto& item : event.Events()) {
         std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }

@@ -21,6 +21,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -525,11 +527,51 @@ public:
     // entries was touched after access_epoch, the finishing request's: another
     // request acquired or published it since.
     void MarkSupersededStateInput(const ContentHash& resumed_tail_hash, std::uint64_t access_epoch);
+    // The bucket bounds of the Host eviction histograms below, each bucket
+    // holding the values up to its bound: idle times in milliseconds, and the
+    // prompt tokens of an admission past its hit. The one definition; the
+    // metrics exporter reads them through the scheduler facade.
+    static constexpr std::array<std::uint64_t, 13> kHostIdleBoundsMs{
+        500, 1'000, 2'000, 5'000, 10'000, 30'000, 60'000, 120'000, 300'000, 600'000, 1'200'000, 1'800'000, 3'600'000};
+    static constexpr std::array<std::uint64_t, 6> kEvictedThenNeededTokenBounds{1'024,  4'096,   16'384,
+                                                                                65'536, 262'144, 1'048'576};
+    // Observations in disjoint buckets: counts[i] those in (bounds[i - 1],
+    // bounds[i]], the last entry those above every bound, and sums[i] their
+    // total. Cumulative since start, never reset.
+    template <std::size_t NumBounds>
+    struct BucketCounts {
+        std::array<std::uint64_t, NumBounds + 1> counts{};
+        std::array<std::uint64_t, NumBounds + 1> sums{};
+
+        void Observe(const std::array<std::uint64_t, NumBounds>& bounds, std::uint64_t value) {
+            const auto bucket = static_cast<std::size_t>(std::ranges::lower_bound(bounds, value) - bounds.begin());
+            ++counts[bucket];
+            sums[bucket] += value;
+        }
+    };
     // Host entries evicted for one reason, each also counted as
-    // device_resident when the Device index still held its key.
+    // device_resident when the Device index still held its key. Accounting
+    // only, like the histograms beside them.
     struct HostEvictionCounts {
         std::uint64_t blocks{0};
         std::uint64_t device_resident{0};
+        // Per evicted entry, how long it had gone unused as the Host's LRU
+        // sees it: how long ago its access epoch was issued, by its store or
+        // by the last admission that used it on either tier, whichever was
+        // later. A copy written back on a Device eviction is stored with its
+        // Device entry's epoch, which the request that last used or published
+        // it there issued. KV blocks and State checkpoints apart
+        // (SampleAccessClock says how it is timed). An entry `blocks` counts
+        // is observed unless a flush evicted it or no sample times its epoch:
+        // epoch 0 (a superseded entry) and an epoch issued before a first
+        // sample younger than kAccessClockSpan, so `blocks` can exceed the
+        // two histograms' counts.
+        BucketCounts<kHostIdleBoundsMs.size()> kv_idle_ms;
+        BucketCounts<kHostIdleBoundsMs.size()> state_idle_ms;
+        // Per first admission whose hit stopped at blocks the Host evicted
+        // recently for this reason (EvictedThenNeeded), its prompt tokens
+        // past the hit.
+        BucketCounts<kEvictedThenNeededTokenBounds.size()> evicted_then_needed_tokens;
     };
     // Host evictions over every cache group, by why the entry left. The other
     // State groups' checkpoints a State entry takes along at its hash count
@@ -557,7 +599,8 @@ public:
         // tail's Device blocks (device_resident when the Device kept a pinned
         // companion).
         HostEvictionCounts tail_cap;
-        // ClearCache, after the Device clear, so never device_resident.
+        // ClearCache, after the Device clear, so never device_resident, and
+        // its histograms stay empty.
         HostEvictionCounts flush;
         // A segment plan reclaimed a prefix-closed KV copy independently of
         // the boundary's checkpoints, while the Device still held its key.
@@ -702,6 +745,45 @@ public:
     // before any drain took them.
     const HostEvictionStats& HostEvictions() const { return host_evictions_; }
     std::uint64_t StoreCandidatesDroppedByFlush() const { return store_candidates_dropped_by_flush_; }
+    // Samples of the access clock, which the idle histograms read: (first
+    // epoch, time) pairs, each saying every epoch from its first on was issued
+    // at or after its time.
+    // The scheduler samples it at the start of each call that can issue an
+    // epoch or evict (NextExecutionPlan, Advance); the coordinator reads no
+    // clock. While no epoch was issued after the last sample, the sample moves
+    // to `now`; once one was, `now` starts a new sample when the last is
+    // kAccessClockStep old. Of the samples older than kAccessClockSpan only the
+    // newest stays: at most 36,001 are kept, none without a Host pool. An
+    // entry's idle time runs from its epoch's sample to the latest call,
+    // within kAccessClockStep plus one scheduler call of its epoch's age. An
+    // epoch issued before the oldest sample, once that is kAccessClockSpan
+    // old, is idle at least that sample's age (the value observed); epoch 0
+    // and an epoch issued before a younger first sample are not observed.
+    void SampleAccessClock(std::chrono::steady_clock::time_point now);
+    // The reason the Host recently evicted the blocks a first admission's hit
+    // stopped at; nullptr when it did not, and without a Host pool. Accounting
+    // only, never read by a decision. Read from the admission's own probe
+    // before the admission, which may evict: hit_tokens is its hit and
+    // kv_tokens its KV reach (both the larger tier's), prompt what it probed.
+    // The blocks the hit needed next: when the KV reaches past the hit, every
+    // State group's checkpoint at the KV's reach (none short of it is looked
+    // for); then every KV group's blocks of the page after the KV's full
+    // pages (a sliding group's of its window behind that page), or else a
+    // tail's blocks and checkpoints, a tail the Host evicted recently inside
+    // that page which the prompt's tokens reach. KV past the Device's own KV
+    // prefix loads from the Host alone, so a KV block is missing unless the
+    // Host holds it, a checkpoint unless either tier does. It counts when the
+    // Host evicted each missing block, at least one, among its last
+    // kRecentHostEvictions evicted blocks; the reason is the first one's. It
+    // says where the hit stopped, not what keeping those blocks would have
+    // saved: the hit may also need a checkpoint further on. Nothing past that
+    // page is looked at, which misses a sliding group's window published
+    // further on, and every full-page checkpoint of a model without KV groups.
+    HostEvictionCounts HostEvictionStats::*EvictedThenNeeded(const PromptPrefix& prompt, std::int32_t hit_tokens,
+                                                             std::int32_t kv_tokens) const;
+    // Counts a first admission EvictedThenNeeded classified, with its prompt
+    // tokens past the hit.
+    void CountEvictedThenNeeded(HostEvictionCounts HostEvictionStats::*reason, std::int32_t tokens);
     // The Device entries an admission or a restore evicted under the
     // write-back policy without recording them: no probe could resume from
     // them on the Host (a tail whose hint is gone, a boundary with no
@@ -1165,6 +1247,58 @@ private:
     std::uint64_t dead_entries_not_written_back_{0};
     std::uint64_t store_candidates_dropped_by_flush_{0};
     DeviceEvictionStats device_evictions_;
+    // Samples of the access clock (SampleAccessClock), accounting only, and
+    // the time of its latest sample call.
+    struct AccessClockSample {
+        std::uint64_t first_epoch{0};
+        std::chrono::steady_clock::time_point time;
+    };
+    static constexpr std::chrono::milliseconds kAccessClockStep{100};
+    static constexpr std::chrono::hours kAccessClockSpan{1};
+    std::deque<AccessClockSample> access_clock_samples_;
+    std::chrono::steady_clock::time_point access_clock_now_;
+    // The Host's recent evictions, accounting only (EvictedThenNeeded; with a
+    // Host pool). Each evicted block takes the next number of the eviction
+    // sequence and a slot in the bucket its key's hash selects -- the one
+    // recording its key already, else the oldest -- which keeps the key (its
+    // content hash by its string hash), the number and the reason. A block
+    // counts as evicted recently while it is among the last
+    // kRecentHostEvictions evicted. The buckets hold twice that many slots,
+    // so a record seldom leaves its bucket earlier (under 1% of them by the
+    // end of the window, for evenly spread keys); a record that left misses
+    // an eviction, and one never vouches for another key (barring a 64-bit
+    // string hash collision). A tail block also records its length under the
+    // tail's prior, the last kRecentTailsPerPrior lengths in the slot the
+    // prior's hash selects (another prior's tail eviction there replaces
+    // them), so a prompt can hash its own tokens up to each. A
+    // flush records nothing and a successful ClearCache empties both tables.
+    struct RecentHostEviction {
+        std::size_t content_hash{0};
+        CacheNamespaceId namespace_id{kDefaultCacheNamespaceId};
+        std::uint32_t group_id{0};
+        std::int32_t page_offset{0};
+        std::uint64_t sequence{0};  // 0: an empty slot
+        HostEvictionCounts HostEvictionStats::*reason{nullptr};
+
+        // Whether this slot records `key`, whose content hash's string hash
+        // is `key_content_hash`.
+        bool Records(const CacheKey& key, std::size_t key_content_hash) const {
+            return sequence != 0 && content_hash == key_content_hash && namespace_id == key.namespace_id &&
+                   group_id == key.group_id && page_offset == key.page_offset;
+        }
+    };
+    static constexpr std::size_t kRecentTailsPerPrior{4};
+    struct RecentHostTailEviction {
+        std::size_t prior_hash{0};
+        std::array<std::int32_t, kRecentTailsPerPrior> tail_tokens{};  // newest first, 0 past the last
+    };
+    static constexpr std::uint64_t kRecentHostEvictions{std::uint64_t{1} << 17};
+    static constexpr std::size_t kRecentHostEvictionWays{16};
+    static constexpr std::size_t kRecentHostEvictionBuckets{2 * kRecentHostEvictions / kRecentHostEvictionWays};
+    static constexpr std::size_t kRecentHostTailEvictions{std::size_t{1} << 14};
+    std::vector<std::array<RecentHostEviction, kRecentHostEvictionWays>> recent_host_evictions_;
+    std::vector<RecentHostTailEviction> recent_host_tail_evictions_;
+    std::uint64_t host_eviction_sequence_{0};
 };
 
 // The prefix-match policy of one spec: full attention is prefix-closed with

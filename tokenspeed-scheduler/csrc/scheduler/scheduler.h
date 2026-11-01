@@ -63,8 +63,10 @@ struct PrefixHitStats {
 };
 
 // Host L2 counters, and the Device evictions they are read against:
-// cumulative since start and never reset. Accounting only, for tests and
-// inspection: no scheduling decision reads them and the runtime exports none.
+// cumulative since start and never reset. Accounting only: no scheduling
+// decision reads them. The runtime exports the prefix hits by tier and the
+// Host evictions by reason with their histograms
+// (docs/configuration/server.md, "Prefix cache and Host L2 metrics").
 struct HostCacheStats {
     PrefixHitStats prefix_hits;
     TierTransferManager::WriteBackStats publication_stores;
@@ -185,6 +187,8 @@ private:
         std::span<const std::string> candidate_prefix_hashes;
         std::span<const std::string> extension_hashes;
         std::span<const std::string> prefix_hashes;
+        // The probe's bound in tokens; 0 with the prefix cache off.
+        std::int32_t max_cacheable_tokens{0};
     };
 
     struct KvEventHashProgress {

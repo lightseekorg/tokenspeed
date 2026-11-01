@@ -509,7 +509,9 @@ publish calls. They only fragment batches.
 
 The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
-scheduler stats.
+scheduler stats. The scheduler's cumulative counters behind the prefix cache
+and Host L2 metrics are sampled at the round head instead, at most once a
+second, as the L3 tier's are; each sample exports what grew since the last.
 
 Metric output plugins run in the node's metrics relay process
 (`metrics/relay.py`); the rank's `ts-metrics` hands them every update as an

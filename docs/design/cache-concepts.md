@@ -1062,7 +1062,10 @@ Its responsibilities:
   accessed child, so a cold sibling cannot cause newer data to be discarded.
   Equal epochs prefer
   evicting one child; group and physical location break remaining ties. A
-  prefix hit refreshes its access epoch, and earlier reuse grants no
+  prefix hit refreshes its access epoch -- a Device hit those of the Host
+  copies of what it hits, too (its pages, its tail and its checkpoint), so
+  the Host ages a prefix by its use, not by when it was stored -- and earlier
+  reuse grants no
   additional protection. Pinned entries, partially pinned foreign parents,
   and blocks allocated earlier in the same batch remain protected. Parent
   candidates are snapshots; selection skips parents that are now empty or
@@ -1317,7 +1320,12 @@ Its responsibilities:
   ranking retraction (preemption) victims. Device and Host evictions are
   counted by reason (`DeviceEvictionStats`, `HostEvictionStats` in
   `cache_coordinator.h`); the counts are accounting only and never change
-  what is evicted. Under the write-back policy (`write_back_evictions`) the
+  what is evicted. A Host eviction other than a flush also records the
+  entry's idle time and, in a fixed-size table of recent evictions, its key,
+  so a first admission can count whether its hit stopped at blocks the Host
+  evicted recently
+  ([metrics](../configuration/server.md#prefix-cache-and-host-l2-metrics)).
+  Under the write-back policy (`write_back_evictions`) the
   coordinator also collects *dead prefix entries* on both tiers, entries no
   probe can resume from any more: everything under a page no checkpoint
   boundary is left under on either tier (with State groups), a tail whose

@@ -415,8 +415,9 @@ class HostConfig:
         metrics_relay_endpoint: The node's metrics relay, when an output
             plugin is selected; else None.
         engine_metrics: This rank reports the scheduler loop's metrics
-            (the ``EngineMetrics`` set): the attention-TP group's first rank,
-            with ``--enable-metrics``.
+            (the ``EngineMetrics`` set) and the prefix cache's (the host's
+            ``HostCacheMetrics``): the attention-TP group's first rank, with
+            ``--enable-metrics``.
         transfer_metrics: This rank reports PD transfer metrics (the
             ``KVTransferMetrics`` set): every rank, with ``--enable-metrics``.
         metrics_model_name: The ``model_name`` label.

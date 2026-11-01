@@ -64,7 +64,8 @@ use ts_control::{
     transport::{EngineTransport, TransportError},
 };
 use ts_metrics::{
-    EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3Labels, L3Metrics, MetricsConfig,
+    EngineLabels, EngineMetrics, Exporter, HostCacheMetrics, KvTransferMetrics, L3Labels,
+    L3Metrics, MetricsConfig,
 };
 use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
@@ -256,7 +257,8 @@ fn reasoning_grammar(grammar: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGra
 /// `metrics_*` fields).
 struct Metrics {
     outputs: MetricsConfig,
-    /// The scheduler loop's metrics, on the attention-TP group's first rank.
+    /// The scheduler loop's metrics and the prefix cache's, on the
+    /// attention-TP group's first rank.
     engine: bool,
     /// The PD transfer metrics, on every rank of a disaggregated engine.
     transfer: bool,
@@ -633,6 +635,18 @@ fn serve(args: &Args) -> Result<(), HostError> {
         .as_ref()
         .filter(|_| config.metrics.engine)
         .map(|exporter| EngineMetrics::new(exporter, &config.metrics.labels));
+    let host_cache_metrics = exporter
+        .as_ref()
+        .filter(|_| config.metrics.engine)
+        .map(|exporter| {
+            let bounds = ts_scheduler::host_eviction_bucket_bounds();
+            HostCacheMetrics::new(
+                exporter,
+                &config.metrics.labels,
+                &bounds.idle_ms,
+                &bounds.evicted_then_needed_tokens,
+            )
+        });
     // The L3 tier's executor connects its store before serving starts.
     let l3 = config.l3.as_ref().map(ts_l3::Settings::start).transpose()?;
     let grammars = config
@@ -663,6 +677,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
             transfer: peers.transfer,
             embeddings: peers.embeddings,
             metrics,
+            host_cache_metrics,
             kv_events,
             eplb,
             grammars,

@@ -325,6 +325,59 @@ mod ffi {
         cleanup_dropped_backup_keys: u64,
     }
 
+    /// One histogram of the scheduler's (`CacheCoordinator::BucketCounts`),
+    /// cumulative: per bucket, the observations and their total, the last
+    /// bucket above every bound.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BucketView {
+        /// Observations per bucket.
+        counts: Vec<u64>,
+        /// Their total per bucket.
+        sums: Vec<u64>,
+    }
+
+    /// The Host L2 entries evicted for one reason (`HostEvictionCounts`),
+    /// cumulative.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HostEvictionView {
+        /// `lru`, `duplicate`, `superseded`, `dead_entry`, `tail_cap`,
+        /// `flush` or `duplicate_kv`.
+        reason: String,
+        /// Entries evicted, over every cache group.
+        blocks: u64,
+        /// Their idle times in milliseconds, KV blocks.
+        kv_idle_ms: BucketView,
+        /// Their idle times in milliseconds, State checkpoints.
+        state_idle_ms: BucketView,
+        /// The prompt tokens past the hit of first admissions whose hit
+        /// stopped at blocks evicted recently for this reason.
+        evicted_then_needed_tokens: BucketView,
+    }
+
+    /// The scheduler's prefix-cache observations (`HostCacheStats`),
+    /// cumulative.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HostCacheStatsView {
+        /// First admissions' prompt tokens.
+        prompt_tokens: u64,
+        /// Of them, what the Device's prefix cache served.
+        device_hit_tokens: u64,
+        /// Of them, what Host L2 served.
+        host_hit_tokens: u64,
+        /// Host L2 evictions, one row per reason.
+        host_evictions: Vec<HostEvictionView>,
+    }
+
+    /// The bucket bounds of the Host eviction histograms, as the scheduler
+    /// counts them (`+Inf` excluded).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HostEvictionBucketBounds {
+        /// Idle times, in milliseconds.
+        idle_ms: Vec<u64>,
+        /// Prompt tokens past the hit.
+        evicted_then_needed_tokens: Vec<u64>,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
@@ -399,6 +452,8 @@ mod ffi {
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
+        fn host_cache_stats(scheduler: &Scheduler) -> HostCacheStatsView;
+        fn host_eviction_bucket_bounds() -> HostEvictionBucketBounds;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
@@ -418,11 +473,17 @@ mod ffi {
 }
 
 pub use ffi::{
-    BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView,
+    BlockTableView, BucketView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind,
+    CacheOpView, ForwardBatchView, ForwardEvent, ForwardEventKind, HostCacheStatsView,
+    HostEvictionBucketBounds, HostEvictionView, KvEventView, RequestSpec, SchedulerAbortView,
     SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
     StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
+
+/// The bucket bounds the scheduler's Host eviction histograms count by.
+pub fn host_eviction_bucket_bounds() -> HostEvictionBucketBounds {
+    ffi::host_eviction_bucket_bounds()
+}
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
 /// storage clock, the cancellations and the storage completions; then the
@@ -582,6 +643,11 @@ impl Scheduler {
     /// The scheduler's storage observations.
     pub fn storage_stats(&self) -> StorageStatsView {
         ffi::storage_stats(self.get())
+    }
+
+    /// The scheduler's prefix-cache and Host L2 observations.
+    pub fn host_cache_stats(&self) -> HostCacheStatsView {
+        ffi::host_cache_stats(self.get())
     }
 
     /// The prefix-cache mutations since the last drain, in order; empty

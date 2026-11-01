@@ -839,7 +839,10 @@ Device to Host L2, under either Host write policy, not only under
 (publication, finish, retraction or eviction) names the drain point; it only
 selects the Host L2 counters a store's outcomes land in, which no scheduling
 decision reads. They count deterministic events only (no clock), so the
-mirrored schedulers on every rank hold the same values.
+mirrored schedulers on every rank hold the same values. The one exception,
+also read by no decision, is the idle time of each Host eviction: the
+scheduler samples a clock at the start of `NextExecutionPlan` and `Advance`
+for it, so it differs across ranks, and one rank exports it.
 
 **Per-victim quiescence, not global.** A request whose own forward is still
 out must not be retracted — its result would land on pages it no longer owns,

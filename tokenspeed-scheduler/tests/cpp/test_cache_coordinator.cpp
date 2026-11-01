@@ -22,10 +22,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <set>
@@ -2986,6 +2988,65 @@ TEST(CacheCoordinatorHostReplacement, CrossGroupUsesMostRecentChildAccess) {
     }
 }
 
+// Write-through keeps a Host copy of what the Device holds, and a Device hit
+// acquires only the Device's entries. The hit dates the Host copies of its
+// pages, its KV tail and its checkpoint with its own epoch, so the Host's LRU
+// takes a page nobody hit rather than the hot prefix the Host stored before it.
+TEST(CacheCoordinatorHostReplacement, ADeviceHitRefreshesTheHostCopiesItHits) {
+    BlockPool device_pool(16, {1, 1});
+    BlockPool host_pool(5, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    // Two pages and a tail at 10, where the previous turn's prompt ended.
+    const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const ContentHash tail = HashPrefixPage(token_span(tokens).subspan(8, 2), hashes[1]);
+    const std::array hit_keys{Key(hashes[0], 0), Key(hashes[1], 0), Key(tail, 0), Key(tail, 1)};
+    const CacheKey cold = Key("cold", 0);
+    // The Host stored the prefix first, then a page nobody hits, which fills
+    // it; the Device holds the prefix too.
+    for (const CacheKey& key : hit_keys) {
+        CacheBoundaryForGroup(coordinator, host_pool, key.content_hash, key.group_id,
+                              CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*logical_block_index=*/-1);
+    }
+    CacheBoundaryForGroup(coordinator, host_pool, cold.content_hash, cold.group_id,
+                          CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*logical_block_index=*/-1);
+    for (const CacheKey& key : hit_keys) {
+        CacheBoundaryForGroup(coordinator, device_pool, key.content_hash, key.group_id,
+                              CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*logical_block_index=*/-1);
+    }
+    coordinator.CacheHostTail(hashes[1], TailPublication{.tail_tokens = 2, .hash = tail});
+
+    CacheCoordinator::PrefixProbe probe =
+        coordinator.ProbePromptPrefix({.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 10});
+    ASSERT_EQ(probe.device_only_hit_tokens, 10) << "the Device alone resumes at the tail";
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const auto result = AdmitForTest(coordinator, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->load_pairs.empty()) << "the Host supplies nothing";
+    for (const CacheKey& key : hit_keys) {
+        const CacheBlockRef host_copy = coordinator.FindHostCachedBlock(key);
+        ASSERT_TRUE(host_copy);
+        EXPECT_EQ(coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
+                      .MetadataFor(host_pool, host_copy->Location())
+                      ->last_access_epoch,
+                  result->access_epoch)
+            << key.content_hash << " in group " << key.group_id;
+    }
+
+    // One more Host block evicts the least recently used entry.
+    ASSERT_TRUE(coordinator.AcquireHostBlock(0, /*bucket=*/0));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(cold));
+    for (const CacheKey& key : hit_keys) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key)) << key.content_hash << " in group " << key.group_id;
+    }
+}
+
 TEST(CacheCoordinatorHostReplacement, EqualEpochDoesNotProtectPreviouslyAcquiredEntry) {
     BlockPool device_pool(2, {2});
     BlockPool host_pool(1, {2});
@@ -3603,6 +3664,435 @@ TEST(CacheCoordinatorHostReplacement, FlushCountsHostEvictionsAndUndrainedStoreC
     EXPECT_EQ(coordinator.HostEvictions().flush.blocks, 5u) << "three Host entries in group 0, two in group 1";
     EXPECT_EQ(coordinator.HostEvictions().flush.device_resident, 0u);
     EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+}
+
+// The idle histograms over a Host LRU eviction: each entry's idle time runs
+// from the clock sample before its access epoch to the eviction. A page and
+// its checkpoint stored at t0 and evicted at t0 + 40 s were idle 40 s; the
+// ones a Host hit dated at t0 + 37 s, 3 s. KV blocks and State checkpoints
+// are observed apart.
+TEST(CacheCoordinatorHostReplacement, AnEvictionObservesTheIdleTimeSinceTheLastAccess) {
+    BlockPool device_pool(4, {1, 1});
+    BlockPool host_pool(8, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+    const std::array keys{Key(hashes[0], 0), Key(hashes[0], 1), Key("cold", 0), Key("cold", 1)};
+    const auto t0 = std::chrono::steady_clock::time_point{} + std::chrono::hours{2};
+    coordinator.SampleAccessClock(t0);
+    for (const CacheKey& key : keys) {
+        CacheBlockRef block = host_pool.AcquireBlock(key.group_id);
+        coordinator.CacheHostBlock(block, key, std::nullopt);
+    }
+    coordinator.SampleAccessClock(t0 + std::chrono::seconds{37});
+    EXPECT_EQ(CacheCoordinatorTestAccess::MatchPrefix(coordinator, hashes).host.num_common_tokens, 4)
+        << "a Host hit on the page and its checkpoint";
+    coordinator.SampleAccessClock(t0 + std::chrono::seconds{40});
+    for (const CacheKey& key : keys) {
+        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, key));
+    }
+
+    const CacheCoordinator::HostEvictionCounts& lru = coordinator.HostEvictions().lru;
+    EXPECT_EQ(lru.blocks, 4u);
+    decltype(lru.kv_idle_ms) expected{};
+    expected.counts[3] = expected.counts[6] = 1;  // (2 s, 5 s] and (30 s, 60 s]
+    expected.sums[3] = 3'000;
+    expected.sums[6] = 40'000;
+    EXPECT_EQ(lru.kv_idle_ms.counts, expected.counts);
+    EXPECT_EQ(lru.kv_idle_ms.sums, expected.sums);
+    EXPECT_EQ(lru.state_idle_ms.counts, expected.counts);
+    EXPECT_EQ(lru.state_idle_ms.sums, expected.sums);
+}
+
+// Access clock samples: a gap with no epoch issued moves the last one along, so
+// an entry stored after it is idle from its store; a pinned entry is not
+// evicted and not observed. After two hours of samples 100 ms apart, an epoch
+// issued between every two, the samples older than an hour go but the newest
+// of them, so 36,001 stay. An entry stored before every sample is then idle
+// at least that sample's age: exactly an hour falls in the 3,600 s bucket,
+// 50 ms more above it. An entry at epoch 0 is never observed.
+TEST(CacheCoordinatorHostReplacement, TheAccessClockKeepsAnHourOfSamples) {
+    using std::chrono::milliseconds;
+    BlockPool device_pool(4, {1});
+    BlockPool host_pool(8, {1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    const auto store = [&](const std::string& hash) {
+        CacheBlockRef block = host_pool.AcquireBlock(0);
+        coordinator.CacheHostBlock(block, Key(hash, 0), std::nullopt);
+    };
+    const auto evict = [&](const std::string& hash) {
+        return CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, Key(hash, 0));
+    };
+    const CacheCoordinator::HostEvictionCounts& lru = coordinator.HostEvictions().lru;
+    const auto observed = [&] {
+        return std::accumulate(lru.kv_idle_ms.counts.begin(), lru.kv_idle_ms.counts.end(), std::uint64_t{0});
+    };
+
+    store("before-1");
+    store("before-2");
+    auto now = std::chrono::steady_clock::time_point{} + std::chrono::hours{3};
+    coordinator.SampleAccessClock(now);
+    now += std::chrono::minutes{10};
+    coordinator.SampleAccessClock(now);
+    store("after-gap");
+    now += std::chrono::seconds{3};
+    coordinator.SampleAccessClock(now);
+    ASSERT_TRUE(evict("after-gap"));
+    EXPECT_EQ(lru.kv_idle_ms.counts[3], 1u) << "(2 s, 5 s]";
+    EXPECT_EQ(lru.kv_idle_ms.sums[3], 3'000u);
+    {
+        const CacheBlockRef pinned = coordinator.FindHostCachedBlock(Key("before-1", 0));
+        EXPECT_FALSE(evict("before-1"));
+    }
+    EXPECT_EQ(lru.blocks, 1u);
+    EXPECT_EQ(observed(), 1u);
+
+    for (std::int32_t step = 1; step <= 72'000; ++step) {
+        CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+        coordinator.SampleAccessClock(now + step * milliseconds{100});
+    }
+    now += std::chrono::hours{2};
+    EXPECT_EQ(CacheCoordinatorTestAccess::NumAccessClockSamples(coordinator), 36'001u);
+    ASSERT_TRUE(evict("before-1"));
+    EXPECT_EQ(lru.kv_idle_ms.counts[12], 1u) << "(1,800 s, 3,600 s]";
+    EXPECT_EQ(lru.kv_idle_ms.sums[12], 3'600'000u);
+    coordinator.SampleAccessClock(now + milliseconds{50});
+    ASSERT_TRUE(evict("before-2"));
+    EXPECT_EQ(lru.kv_idle_ms.counts[13], 1u) << "above 3,600 s";
+    EXPECT_EQ(lru.kv_idle_ms.sums[13], 3'600'050u);
+
+    CacheBoundaryForGroup(coordinator, host_pool, "epoch-0", 0, /*access_epoch=*/0, /*logical_block_index=*/-1);
+    ASSERT_TRUE(evict("epoch-0"));
+    EXPECT_EQ(lru.blocks, 4u);
+    EXPECT_EQ(observed(), 3u);
+}
+
+// EvictedThenNeeded over the coordinator's own probe, as a first admission
+// reads it, on two KV groups: one block per page in group 0, two in group 1.
+// The Host holds the prompt's first page; what happened to its second decides.
+class EvictedThenNeededPageTest : public ::testing::Test {
+protected:
+    static constexpr std::int32_t kP = 4;
+
+    EvictedThenNeededPageTest()
+        : coordinator_{MakeCoordinator(
+              std::vector<CacheGroupSpec>{
+                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}},
+              kP, device_, /*enable_l3_storage=*/false, &host_, /*snapshot_pool=*/nullptr,
+              /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false)},
+          hashes_{ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}})},
+          page_keys_{{Key(hashes_[0], 0), Key(hashes_[0], 1, 0), Key(hashes_[0], 1, 1)},
+                     {Key(hashes_[1], 0), Key(hashes_[1], 1, 0), Key(hashes_[1], 1, 1)}} {
+        for (const CacheKey& key : page_keys_[0]) {
+            CacheBlockRef block = host_.AcquireBlock(key.group_id);
+            coordinator_.CacheHostBlock(block, key, std::nullopt);
+        }
+    }
+
+    // A Host copy, then its LRU eviction.
+    bool EvictFromHost(const CacheKey& key) {
+        CacheBlockRef block = host_.AcquireBlock(key.group_id);
+        coordinator_.CacheHostBlock(block, key, std::nullopt);
+        block.reset();
+        return CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, key);
+    }
+    CacheCoordinator::HostEvictionCounts CacheCoordinator::HostEvictionStats::*Classify(
+        const CacheCoordinator::PromptPrefix& prompt) const {
+        const CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(prompt);
+        const std::int32_t hit_tokens = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+        EXPECT_EQ(hit_tokens, 4) << "the Host's first page";
+        return coordinator_.EvictedThenNeeded(prompt, hit_tokens,
+                                              std::max(probe.device.kv_tokens, probe.host.kv_tokens));
+    }
+
+    BlockPool device_{16, {1, 1}};
+    BlockPool host_{32, {1, 1}};
+    CacheCoordinator coordinator_;
+    const std::vector<std::int32_t> tokens_ = MakeTokens(13);
+    const std::vector<std::string> hashes_;
+    const CacheCoordinator::PromptPrefix prompt_{.prefix_hashes = hashes_, .tokens = tokens_, .max_tokens = 12};
+    // Every block of the prompt's first two pages, group by group.
+    const std::vector<std::vector<CacheKey>> page_keys_;
+};
+
+// Every block of the second page left the Host recently: the reason counts.
+// A page with a block never cached does not count, though its other blocks
+// were evicted (one offset vouches for no other).
+TEST_F(EvictedThenNeededPageTest, CountsWhenTheHostEvictedEveryMissingBlock) {
+    ASSERT_TRUE(EvictFromHost(page_keys_[1][0]));
+    ASSERT_TRUE(EvictFromHost(page_keys_[1][1]));
+    EXPECT_EQ(Classify(prompt_), nullptr) << "group 1's second block was never cached";
+    ASSERT_TRUE(EvictFromHost(page_keys_[1][2]));
+    EXPECT_EQ(Classify(prompt_), &CacheCoordinator::HostEvictionStats::lru);
+}
+
+// Past the hit the KV loads from the Host alone: the Device's copy of group
+// 0's block of the second page, which never reached the Host, leaves the
+// page short of a block the Host evicted, though it evicted group 1's. Once
+// the Host evicted its own copy of that block too, the page counts.
+TEST_F(EvictedThenNeededPageTest, ADeviceCopyPastTheHitIsNoUse) {
+    CacheBoundaryForGroup(coordinator_, device_, hashes_[1], 0,
+                          CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
+                          /*logical_block_index=*/-1);
+    ASSERT_TRUE(EvictFromHost(page_keys_[1][1]));
+    ASSERT_TRUE(EvictFromHost(page_keys_[1][2]));
+    EXPECT_EQ(Classify(prompt_), nullptr);
+    ASSERT_TRUE(EvictFromHost(page_keys_[1][0]));
+    EXPECT_EQ(Classify(prompt_), &CacheCoordinator::HostEvictionStats::lru);
+}
+
+// A block counts as evicted recently while fewer than kRecentHostEvictions
+// Host evictions followed it, here those of one other key, which takes one
+// slot; a refused ClearCache keeps the record, one that succeeds forgets it.
+TEST_F(EvictedThenNeededPageTest, RecentMeansWithinTheLastEvictionsUntilAFlush) {
+    for (const CacheKey& key : page_keys_[1]) {
+        ASSERT_TRUE(EvictFromHost(key));
+    }
+    const CacheKey other = Key("other", 0);
+    for (std::uint64_t evictions = 3; evictions < CacheCoordinatorTestAccess::kRecentHostEvictions; ++evictions) {
+        ASSERT_TRUE(EvictFromHost(other));
+    }
+    EXPECT_EQ(Classify(prompt_), &CacheCoordinator::HostEvictionStats::lru)
+        << "the first of the three is the window's oldest";
+    ASSERT_TRUE(EvictFromHost(other));
+    EXPECT_EQ(Classify(prompt_), nullptr);
+
+    for (const CacheKey& key : page_keys_[1]) {
+        ASSERT_TRUE(EvictFromHost(key));
+    }
+    {
+        const CacheBlockRef pinned = coordinator_.FindHostCachedBlock(page_keys_[0][0]);
+        ASSERT_FALSE(coordinator_.ClearCache());
+    }
+    EXPECT_EQ(Classify(prompt_), &CacheCoordinator::HostEvictionStats::lru);
+    ASSERT_TRUE(coordinator_.ClearCache());
+    for (const CacheKey& key : page_keys_[0]) {
+        CacheBlockRef block = host_.AcquireBlock(key.group_id);
+        coordinator_.CacheHostBlock(block, key, std::nullopt);
+    }
+    EXPECT_EQ(Classify(prompt_), nullptr);
+}
+
+// A prompt that never shared the evicted page reads nothing of it.
+TEST_F(EvictedThenNeededPageTest, AnotherPromptsPageDoesNotCount) {
+    for (const CacheKey& key : page_keys_[1]) {
+        ASSERT_TRUE(EvictFromHost(key));
+    }
+    std::vector<std::int32_t> other = tokens_;
+    other[5] = 100;
+    const std::vector<std::string> other_hashes = ContentHashes({{1, 2, 3, 4}, {5, 100, 7, 8}, {9, 10, 11, 12}});
+    EXPECT_EQ(Classify({.prefix_hashes = other_hashes, .tokens = other, .max_tokens = 12}), nullptr);
+}
+
+// A record vouches for its own key only, not for one sharing its slot: groups
+// 6 and 7 of the page found below share a CacheKeyHash. Eight KV groups; the
+// Host holds groups 0 to 5 of the page, evicted group 6's, and never held
+// group 7's.
+TEST(EvictedThenNeededKeyTest, ARecordVouchesForItsOwnKeyOnly) {
+    BlockPool device_pool(4, std::vector<std::int32_t>(8, 1));
+    BlockPool host_pool(16, std::vector<std::int32_t>(8, 1));
+    const std::vector<CacheGroupSpec> specs(
+        8, CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    std::int32_t first_token = 1;
+    std::vector<std::string> hashes;
+    for (; first_token < (1 << 16); ++first_token) {
+        hashes = ContentHashes({{first_token, 2, 3, 4}});
+        if (CacheKeyHash{}(Key(hashes[0], 6)) == CacheKeyHash{}(Key(hashes[0], 7))) {
+            break;
+        }
+    }
+    ASSERT_LT(first_token, 1 << 16) << "no page whose groups 6 and 7 share a CacheKeyHash";
+    const std::vector<std::int32_t> tokens{first_token, 2, 3, 4, 5};
+    for (std::uint32_t group = 0; group < 7; ++group) {
+        HostPut(coordinator, host_pool, hashes[0], group);
+    }
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, Key(hashes[0], 6)));
+
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 4};
+    const CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+    ASSERT_EQ(std::max(probe.device.num_common_tokens, probe.host.num_common_tokens), 0);
+    EXPECT_EQ(coordinator.EvictedThenNeeded(prompt, 0, 0), nullptr) << "group 7's block was never cached";
+}
+
+// The record keeps the newest evictions of each bucket, one slot per key:
+// the Host evicted the prompt's second page; 100 evictions of one other key
+// of its bucket, then of all but one further key it can take, leave the page
+// recorded; one more key replaces the bucket's oldest record, the page's.
+TEST(EvictedThenNeededKeyTest, ABucketKeepsItsNewestRecordsOnePerKey) {
+    using Access = CacheCoordinatorTestAccess;
+    BlockPool device_pool(4, {1});
+    BlockPool host_pool(8, {1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    const std::vector<std::int32_t> tokens = MakeTokens(9);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const auto evict = [&](const std::string& hash) {
+        HostPut(coordinator, host_pool, hash, 0);
+        return Access::EvictHostCachedBlock(coordinator, Key(hash, 0));
+    };
+    HostPut(coordinator, host_pool, hashes[0], 0);
+    ASSERT_TRUE(evict(hashes[1]));
+    const auto classify = [&] {
+        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 8};
+        const CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+        EXPECT_EQ(std::max(probe.device.num_common_tokens, probe.host.num_common_tokens), 4);
+        return coordinator.EvictedThenNeeded(prompt, 4, std::max(probe.device.kv_tokens, probe.host.kv_tokens));
+    };
+    ASSERT_EQ(classify(), &CacheCoordinator::HostEvictionStats::lru);
+    const std::size_t bucket = CacheKeyHash{}(Key(hashes[1], 0)) % Access::kRecentHostEvictionBuckets;
+    std::vector<std::string> others;
+    for (std::int32_t n = 0; others.size() < Access::kRecentHostEvictionWays; ++n) {
+        const std::string hash = "other-" + std::to_string(n);
+        if (CacheKeyHash{}(Key(hash, 0)) % Access::kRecentHostEvictionBuckets == bucket) {
+            others.push_back(hash);
+        }
+    }
+
+    for (std::int32_t repeat = 0; repeat < 100; ++repeat) {
+        ASSERT_TRUE(evict(others[0]));
+    }
+    EXPECT_EQ(classify(), &CacheCoordinator::HostEvictionStats::lru) << "one key keeps one slot";
+    for (std::size_t other = 1; other + 1 < others.size(); ++other) {
+        ASSERT_TRUE(evict(others[other]));
+    }
+    EXPECT_EQ(classify(), &CacheCoordinator::HostEvictionStats::lru) << "the bucket is full";
+    ASSERT_TRUE(evict(others.back()));
+    EXPECT_EQ(classify(), nullptr) << "the page's record was the bucket's oldest";
+}
+
+// One KV group and one State group; the Host holds KV pages 0 to 5 and, but
+// in one case, the checkpoint at 24, which the hit needs. A hit the State
+// limits counts the checkpoint at the KV's reach and the KV past it: with
+// the checkpoint evicted the KV reaches 24 and the hit is 0; with KV page 2
+// evicted the KV reaches 8, where no checkpoint ever was, and the hit is 0.
+// Never cached, the checkpoint counts nothing.
+TEST(EvictedThenNeededStateTest, AStateLimitedHitCountsTheCheckpointAtTheKvReachAndTheKvPastIt) {
+    struct Case {
+        bool checkpoint_cached;
+        std::optional<CacheKey> evicted;  // under the prompt's hashes, by page
+        std::int32_t hit_tokens;
+        std::int32_t kv_tokens;
+        bool counts;
+    };
+    const std::vector<std::int32_t> tokens = MakeTokens(29);
+    std::vector<std::vector<std::int32_t>> pages;
+    for (std::int32_t page = 0; page < 7; ++page) {
+        pages.emplace_back(tokens.begin() + page * 4, tokens.begin() + (page + 1) * 4);
+    }
+    const std::vector<std::string> hashes = ContentHashes(pages);
+    const std::array cases{
+        Case{.checkpoint_cached = true, .evicted = std::nullopt, .hit_tokens = 24, .kv_tokens = 24, .counts = false},
+        Case{.checkpoint_cached = false, .evicted = std::nullopt, .hit_tokens = 0, .kv_tokens = 24, .counts = false},
+        Case{.checkpoint_cached = true, .evicted = Key(hashes[5], 1), .hit_tokens = 0, .kv_tokens = 24, .counts = true},
+        Case{.checkpoint_cached = true, .evicted = Key(hashes[2], 0), .hit_tokens = 0, .kv_tokens = 8, .counts = true}};
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const Case& c = cases[i];
+        SCOPED_TRACE(i);
+        BlockPool device_pool(8, {1, 1});
+        BlockPool host_pool(16, {1, 1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+            CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        for (std::size_t page = 0; page < 6; ++page) {
+            HostPut(coordinator, host_pool, hashes[page], 0);
+        }
+        if (c.checkpoint_cached) {
+            HostPut(coordinator, host_pool, hashes[5], 1);
+        }
+        if (c.evicted) {
+            ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, *c.evicted));
+        }
+
+        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 28};
+        const CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+        const std::int32_t hit_tokens = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+        const std::int32_t kv_tokens = std::max(probe.device.kv_tokens, probe.host.kv_tokens);
+        ASSERT_EQ(hit_tokens, c.hit_tokens);
+        ASSERT_EQ(kv_tokens, c.kv_tokens);
+        EXPECT_EQ(coordinator.EvictedThenNeeded(prompt, hit_tokens, kv_tokens),
+                  c.counts ? &CacheCoordinator::HostEvictionStats::lru : nullptr);
+    }
+}
+
+// A sliding group needs only its window behind the next page: a Full group
+// and a sliding one of window 4 with 4-token blocks, on 8-token pages, so a
+// page boundary needs only the page's second sliding block. The Host holds
+// both Full blocks of pages 0 to 3 and the second sliding block of each, the
+// window every page boundary published, but page 1's in one case; it evicts
+// page 1's blocks, and the hit stops at 8. Page 1's first sliding block,
+// never cached, is not needed; its second, never cached, is.
+TEST(EvictedThenNeededSlidingTest, ASlidingGroupNeedsOnlyItsWindowOfTheNextPage) {
+    for (const bool window_cached : {false, true}) {
+        SCOPED_TRACE(window_cached);
+        BlockPool device_pool(16, {1, 1});
+        BlockPool host_pool(32, {1, 1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+            CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                           .sliding_window = 4,
+                           .cache_blocks_per_lcm_block = 1,
+                           .block_granularity = 4}};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 8, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        const std::vector<std::int32_t> tokens = MakeTokens(33);
+        std::vector<std::vector<std::int32_t>> pages;
+        for (std::int32_t page = 0; page < 4; ++page) {
+            pages.emplace_back(tokens.begin() + page * 8, tokens.begin() + (page + 1) * 8);
+        }
+        const std::vector<std::string> hashes = ContentHashes(pages);
+        const auto put = [&](const CacheKey& key) {
+            CacheBlockRef block = host_pool.AcquireBlock(key.group_id);
+            coordinator.CacheHostBlock(block, key, std::nullopt);
+        };
+        std::vector<CacheKey> evicted{Key(hashes[1], 0, 0), Key(hashes[1], 0, 1)};
+        if (window_cached) {
+            evicted.push_back(Key(hashes[1], 1, 1));
+        }
+        for (const std::string& hash : hashes) {
+            put(Key(hash, 0, 0));
+            put(Key(hash, 0, 1));
+            if (hash != hashes[1] || window_cached) {
+                put(Key(hash, 1, 1));
+            }
+        }
+        for (const CacheKey& key : evicted) {
+            ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, key));
+        }
+
+        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 32};
+        const CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+        const std::int32_t hit_tokens = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+        const std::int32_t kv_tokens = std::max(probe.device.kv_tokens, probe.host.kv_tokens);
+        ASSERT_EQ(hit_tokens, 8);
+        ASSERT_EQ(kv_tokens, 8);
+        EXPECT_EQ(coordinator.EvictedThenNeeded(prompt, hit_tokens, kv_tokens),
+                  window_cached ? &CacheCoordinator::HostEvictionStats::lru : nullptr);
+    }
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingDoesNotRescanPlacementPoolPerVictim) {
@@ -4708,7 +5198,8 @@ INSTANTIATE_TEST_SUITE_P(L3OffAndOn, HostSuffixHitTest, ::testing::Bool());
 
 // A checkpoint on the Device's last full page, aligned: the Device keeps the KV
 // of pages h0-h3, the Host the three checkpoints at 16. The hit is 16 with no
-// KV loaded; a Host copy of the same pages changes nothing.
+// KV loaded; a Host copy of the same pages changes nothing but its epoch, which
+// the Device hit dates as the Host hit dates the checkpoints.
 TEST_P(HostSuffixHitTest, ADeviceKvPrefixResumesAtAHostCheckpointOnItsLastPage) {
     std::vector<CacheBlockLocation> device_pages;
     for (std::size_t page = 0; page < 4; ++page) {
@@ -4743,6 +5234,73 @@ TEST_P(HostSuffixHitTest, ADeviceKvPrefixResumesAtAHostCheckpointOnItsLastPage) 
         for (std::size_t page = 0; page < 4; ++page) {
             EXPECT_EQ(tables[0].Blocks()[page]->Location(), device_pages[page]) << "the Device's own KV page";
         }
+        if (!host_duplicates) {
+            continue;
+        }
+        for (std::size_t page = 0; page < 4; ++page) {
+            const CacheBlockRef host_copy = coordinator_.FindHostCachedBlock(Key(hashes_[page], 0));
+            ASSERT_TRUE(host_copy);
+            EXPECT_EQ(coordinator_.GroupPrefixIndex(0).MetadataFor(host_, host_copy->Location())->last_access_epoch,
+                      result->access_epoch);
+        }
+    }
+}
+
+// A Device hit at a page boundary -- the KV of h0-h3 and the checkpoints at
+// 16 -- dates the Host copies of what it hits with its epoch, and only those:
+// the Host has no copy of h2, and h4, which it holds past the hit, and the
+// checkpoints at 8, which the hit passes, keep their epochs.
+TEST_P(HostSuffixHitTest, ADeviceHitDatesTheHostCopiesOfWhatItHitsAlone) {
+    std::vector<CacheKey> hit_keys;
+    for (std::size_t page = 0; page < 4; ++page) {
+        hit_keys.push_back(Key(hashes_[page], 0));
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        hit_keys.push_back(Key(hashes_[3], group));
+    }
+    std::vector<CacheKey> kept_keys{Key(hashes_[4], 0)};
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        kept_keys.push_back(Key(hashes_[1], group));
+    }
+    for (const CacheKey& key : hit_keys) {
+        if (key.content_hash != hashes_[2]) {
+            Put(host_, key.content_hash, key.group_id);
+        }
+    }
+    for (const CacheKey& key : kept_keys) {
+        Put(host_, key.content_hash, key.group_id);
+    }
+    for (const CacheKey& key : hit_keys) {
+        Put(device_, key.content_hash, key.group_id);
+    }
+    const auto host_epoch = [&](const CacheKey& key) {
+        return coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
+            .MetadataFor(host_, coordinator_.FindHostCachedBlock(key)->Location())
+            ->last_access_epoch;
+    };
+    std::vector<std::uint64_t> kept_epochs;
+    for (const CacheKey& key : kept_keys) {
+        kept_epochs.push_back(host_epoch(key));
+    }
+
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    ASSERT_EQ(probe.device_only_hit_tokens, 16);
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->load_pairs.empty());
+    for (const CacheKey& key : hit_keys) {
+        if (key.content_hash == hashes_[2]) {
+            EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(key));
+        } else {
+            ASSERT_TRUE(coordinator_.ContainsHostCachedBlock(key));
+            EXPECT_EQ(host_epoch(key), result->access_epoch) << key.content_hash << " in group " << key.group_id;
+        }
+    }
+    for (std::size_t i = 0; i < kept_keys.size(); ++i) {
+        ASSERT_TRUE(coordinator_.ContainsHostCachedBlock(kept_keys[i]));
+        EXPECT_EQ(host_epoch(kept_keys[i]), kept_epochs[i])
+            << kept_keys[i].content_hash << " in group " << kept_keys[i].group_id;
     }
 }
 
@@ -8018,6 +8576,176 @@ TEST_F(BoundaryTreeCoordinatorTest, WriteThroughEvictsBlocksAsBefore) {
     // A's tail: its KV block and three checkpoints.
     EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 4u);
     coordinator_.Free(tables);
+}
+
+// EvictedThenNeeded at a tail: published prompts of 20, 21 and 22 tokens, a
+// checkpoint at each end, reach the Host whole; the Device keeps nothing. The
+// Host then evicts the tail at 21, then the one at 22, their KV blocks and
+// checkpoints. A prompt continuing either hits 20 on the Host; the page after
+// holds nothing ever cached, but a tail inside it was evicted recently: it
+// counts, the earlier one too. A prompt diverging inside both never needed
+// them.
+TEST_F(BoundaryTreeCoordinatorTest, AHitStoppedBeforeAnEvictedTailCountsIt) {
+    std::vector<BlockTable> short_tables(4);
+    PublishFinal(short_tables, MakeTokens(20));
+    coordinator_.Free(short_tables);
+    std::vector<TailPublication> tails;
+    for (const std::int32_t num_tokens : {21, 22}) {
+        std::vector<BlockTable> tables(4);
+        tails.push_back(*PublishFinal(tables, MakeTokens(num_tokens)));
+        coordinator_.Free(tables);
+    }
+    for (const std::string& hash : hashes_) {
+        StoreOnHost(Key(hash, 0));
+    }
+    for (std::uint32_t group = 0; group < 4; ++group) {
+        for (const TailPublication& tail : tails) {
+            StoreOnHost(Key(tail.hash, group));
+        }
+        if (group > 0) {
+            StoreOnHost(Key(hashes_.back(), group));
+        }
+    }
+    ASSERT_TRUE(coordinator_.ClearDeviceCache());
+    for (const TailPublication& tail : tails) {
+        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key(tail.hash, 0)));
+        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key(tail.hash, 1)))
+            << "the other State groups' checkpoints go along";
+    }
+
+    // Which token the prompt changes, if any, and whether it counts.
+    for (const auto& [changed, counts] : {std::pair{-1, true}, std::pair{21, true}, std::pair{20, false}}) {
+        SCOPED_TRACE(changed);
+        std::vector<std::int32_t> tokens = MakeTokens(30);
+        if (changed >= 0) {
+            tokens[static_cast<std::size_t>(changed)] = 100;
+        }
+        std::vector<std::vector<std::int32_t>> pages;
+        for (std::size_t page = 0; page < 7; ++page) {
+            pages.emplace_back(tokens.begin() + page * kP, tokens.begin() + (page + 1) * kP);
+        }
+        const std::vector<std::string> hashes = ContentHashes(pages);
+        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 29};
+        const CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(prompt);
+        const std::int32_t hit_tokens = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+        const std::int32_t kv_tokens = std::max(probe.device.kv_tokens, probe.host.kv_tokens);
+        ASSERT_EQ(hit_tokens, 20);
+        ASSERT_EQ(kv_tokens, 20);
+        EXPECT_EQ(coordinator_.EvictedThenNeeded(prompt, hit_tokens, kv_tokens),
+                  counts ? &CacheCoordinator::HostEvictionStats::lru : nullptr);
+    }
+}
+
+// A tail's blocks of a sliding group are needed too: one Full, one sliding
+// and one State group publish a prompt of 2 tokens, a tail in page 0. The
+// Host evicts the Full block and the checkpoint of that tail; the sliding
+// block never reached the Host. A longer prompt over it counts the tail only
+// once the Host evicted the sliding block as well.
+TEST(EvictedThenNeededStateTest, ATailNeedsItsSlidingBlocksToo) {
+    for (const bool sliding_evicted : {false, true}) {
+        SCOPED_TRACE(sliding_evicted);
+        BlockPool device_pool(16, {1, 1, 1});
+        BlockPool host_pool(16, {1, 1, 1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+            CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                           .sliding_window = 8,
+                           .cache_blocks_per_lcm_block = 1,
+                           .block_granularity = 4},
+            CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        const std::vector<std::int32_t> tokens = MakeTokens(10);
+        const TailPublication tail{.tail_tokens = 2, .hash = HashPrefixPage(token_span(tokens).subspan(0, 2), "")};
+        std::vector<BlockTable> tables(3);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, 2));
+        coordinator.CacheCompletedBlocks(
+            tables,
+            RequestProgress{
+                .completed_pages =
+                    CompletedPages{.tail = tail, .publish_state = true, .boundary_kind = CacheBoundaryKind::kEndpoint},
+                .num_computed_tokens = 2},
+            CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        coordinator.Free(tables);
+        for (std::uint32_t group = 0; group < 3; ++group) {
+            if (group != 1 || sliding_evicted) {
+                CacheBlockRef block = host_pool.AcquireBlock(group);
+                coordinator.CacheHostBlock(block, Key(tail.hash, group), std::nullopt);
+            }
+        }
+        ASSERT_TRUE(coordinator.ClearDeviceCache());
+        for (std::uint32_t group = 0; group < 3; ++group) {
+            if (group != 1 || sliding_evicted) {
+                ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, Key(tail.hash, group)));
+            }
+        }
+
+        const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 9};
+        const CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+        ASSERT_EQ(std::max(probe.device.num_common_tokens, probe.host.num_common_tokens), 0);
+        ASSERT_EQ(std::max(probe.device.kv_tokens, probe.host.kv_tokens), 0);
+        EXPECT_EQ(coordinator.EvictedThenNeeded(prompt, 0, 0),
+                  sliding_evicted ? &CacheCoordinator::HostEvictionStats::lru : nullptr);
+    }
+}
+
+// The tail record keeps the last four lengths evicted under a prior: a Full
+// and a State group publish prompts of 1 to 5 tokens, tails in page 0 of 8
+// tokens, which reach the Host whole; the Host evicts them, shortest first.
+// A prompt continuing the tail at 2 and diverging after it counts; one
+// continuing only the tail at 1, the oldest, does not.
+TEST(EvictedThenNeededStateTest, TheLastFourTailsEvictedUnderAPriorCount) {
+    BlockPool device_pool(16, {1, 1});
+    BlockPool host_pool(16, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 8},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 8, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    const std::vector<std::int32_t> tokens = MakeTokens(10);
+    std::vector<TailPublication> tails;
+    for (std::int32_t tail_tokens = 1; tail_tokens <= 5; ++tail_tokens) {
+        tails.push_back(TailPublication{.tail_tokens = tail_tokens,
+                                        .hash = HashPrefixPage(token_span(tokens).subspan(0, tail_tokens), "")});
+        std::vector<BlockTable> tables(2);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, tail_tokens));
+        coordinator.CacheCompletedBlocks(
+            tables,
+            RequestProgress{.completed_pages = CompletedPages{.tail = tails.back(),
+                                                              .publish_state = true,
+                                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
+                            .num_computed_tokens = tail_tokens},
+            CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        coordinator.Free(tables);
+        for (std::uint32_t group = 0; group < 2; ++group) {
+            CacheBlockRef block = host_pool.AcquireBlock(group);
+            coordinator.CacheHostBlock(block, Key(tails.back().hash, group), std::nullopt);
+        }
+    }
+    ASSERT_TRUE(coordinator.ClearDeviceCache());
+    for (const TailPublication& tail : tails) {
+        for (std::uint32_t group = 0; group < 2; ++group) {
+            ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, Key(tail.hash, group)));
+        }
+    }
+
+    for (const auto& [changed, counts] : {std::pair{2, true}, std::pair{1, false}}) {
+        SCOPED_TRACE(changed);
+        std::vector<std::int32_t> prompt_tokens = tokens;
+        prompt_tokens[static_cast<std::size_t>(changed)] = 100;
+        const std::vector<std::string> hashes = ContentHashes({{prompt_tokens.begin(), prompt_tokens.begin() + 8}});
+        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = prompt_tokens, .max_tokens = 9};
+        const CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+        ASSERT_EQ(std::max(probe.device.num_common_tokens, probe.host.num_common_tokens), 0);
+        ASSERT_EQ(std::max(probe.device.kv_tokens, probe.host.kv_tokens), 0);
+        EXPECT_EQ(coordinator.EvictedThenNeeded(prompt, 0, 0),
+                  counts ? &CacheCoordinator::HostEvictionStats::lru : nullptr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12401,9 +13129,10 @@ TEST_F(WriteBackTransactionTest, ASegmentPublishesOnlyAtItsLastAck) {
 
 // The Host holds every block of X already: the eviction copies nothing and
 // issues no op, and the segment settles at once, each entry with the newer of
-// its Host and Device epochs -- the Device's for the pages, which a hit
-// touched after their Host copies were made, the Host's for the tail and its
-// checkpoints, copied after that hit.
+// its Host and Device epochs -- the Device's for the pages, which a second
+// publication of X touched after their Host copies were made (a hit would
+// date the Host copies with it), the Host's for the tail and its checkpoints,
+// copied after that publication.
 TEST_F(WriteBackTransactionTest, ASegmentAlreadyOnTheHostSettlesWithoutAnOp) {
     const std::vector<std::int32_t> tokens = MakeTokens(18);
     std::vector<BlockTable> tables(4);
@@ -12413,8 +13142,8 @@ TEST_F(WriteBackTransactionTest, ASegmentAlreadyOnTheHostSettlesWithoutAnOp) {
     for (std::size_t page = 0; page < 4; ++page) {
         StoreOnHost(keys[page]);
     }
-    CacheCoordinatorTestAccess::MatchPromptPrefix(
-        coordinator_, CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 18});
+    PublishFinal(tables, tokens);
+    coordinator_.Free(tables);
     for (std::size_t member = 4; member < keys.size(); ++member) {
         StoreOnHost(keys[member]);
     }
