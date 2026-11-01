@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950._xcd import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
 )
@@ -106,26 +107,6 @@ def _dense16_mediumm_launch_metadata(grid, kernel, args):
             args["addend_a_ptr"].element_size() + args["addend_b_ptr"].element_size()
         )
     return metadata
-
-
-@gluon.jit
-def _remap_xcd(pid, num_programs, NUM_XCDS: gl.constexpr):
-    # Hardware dispatches program i to XCD i % NUM_XCDS; give each XCD a
-    # contiguous range of program ids instead.
-    pids_per_xcd = (num_programs + NUM_XCDS - 1) // NUM_XCDS
-    tall_xcds = num_programs % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
-    return pid
 
 
 @gluon.jit
