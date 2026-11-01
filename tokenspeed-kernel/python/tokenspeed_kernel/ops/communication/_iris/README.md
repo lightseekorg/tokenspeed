@@ -63,12 +63,17 @@ With expert TP8 (EP1), batches whose routes outgrow the Lamport two-shot
 all-reduce (44 rows) and stay below the owned-row cutoff reduce-scatter each
 token's raw routes onto its owner through the owned-row route staging,
 normalize them there, and gather the 8x smaller sums through the Lamport
-one-shot mailbox; smaller batches all-reduce the routes. With Muse's
-output-column-split down copy, owned-row batches instead gather the sorted
-MXFP4 intermediate slices, and ranks add their FP32 partial sums of squares in
-rank order for the routed RMSNorm. Per-program flags pair the same tokens on
-every rank in each phase; each kernel exits after peers finish reading its
-symmetric buffers.
+one-shot mailbox. With Muse's output-column-split down copy, owned-row batches
+instead gather the sorted MXFP4 intermediate slices, and ranks add their FP32
+partial sums of squares in rank order for the routed RMSNorm. Per-program flags
+pair the same tokens on every rank in each phase; each kernel exits after
+peers finish reading its symmetric buffers.
+
+Batches below the reduce-scatter range complete their routes column-owned in
+one launch, with its own mailboxes and per-(token, owner) stages: rank q sums
+the partials of columns [512q, 512q + 512) of every route and publishes them
+with their partial sums of squares, then every rank normalizes, weights and
+sums all columns.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
