@@ -29,6 +29,16 @@ prepared variants using the existing shape and topology policies. Different
 staging geometries have separate synchronization buffers because their workgroup
 IDs cover different element ranges. Triton RSAG remains independent.
 
+A model can also install its prepared `ProducerAllReduce` as a group's ordinary
+all-reduce. The backend then reduces caller-owned BF16 tensors in place through
+`reduce_ordinary`: Lamport windows directly, the TP4 push window with a copy
+back, and other payloads up to a measured per-group-size limit through the
+producer buffer and the generic pull. Past the limit they fall back to RCCL.
+Results never borrow state storage, but ordinary reductions write the producer
+buffer and pull scratch, so no borrowed producer-buffer or pull-scratch view,
+nor the ready flags guarding it, may be live across an ordinary reduction on
+the group.
+
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
 `reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
@@ -44,7 +54,8 @@ advances a three-stage counter. Fusions sharing the one-shot mailbox keep its
 per-512-element stage counters; the TP8 two-shot owns its mailboxes and
 counters.
 
-Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
+Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950; its own
+ordinary all-reduces use the same `reduce_ordinary` policy. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
 owned-row paths. Owned rows use ceil(global rows / world size), with padded
 rows masked; QKVG exchange derives each rank's head widths from the group size.
