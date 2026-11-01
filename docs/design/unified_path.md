@@ -651,6 +651,10 @@ before capture begins. This applies to ordinary, encoder, and decoder captures.
 Graph-memory observation wraps only capture; eager warmups, decoder rearming
 and smoke-test replay stay outside the measured region.
 
+Capture records kernels without executing them. Before each eager break,
+replay the preceding segment on the capture stream so the break consumes
+valid producer outputs. Serving executes each segment and break once.
+
 ### One output layout per forward
 
 Every ForwardContext and grammar completion carries a required, immutable
@@ -707,11 +711,11 @@ loose argument a captured break would freeze. Capture runs the
 narrowing before every decoder run, as serving does: the decoder consumes
 per-forward backend state its predecessor produces (V4.1's reuse layers read
 the index source's selection, which later sources overwrite). Under
-attention DP the split graph stays off: the narrowed row count is rank-local
-(which prompts complete on this rank), so the decoder bucket and the
-collective shapes its graph bakes would differ across ranks, and the stages
-size their collectives from their own rows, which the DP metadata gather
-does not carry. Eager TP1 attention/dense with fused EP may narrow: the
+attention DP every rank selects the decoder bucket from the maximum across
+ranks of `min(input_tokens, request_count * max_decoder_rows_per_request)`.
+Each stage publishes its padded token count for collectives; ranks with no
+live decoder rows still replay and participate. Mixed and idle rounds stay
+eager. Eager TP1 attention/dense with fused EP may narrow: the
 fused dispatch exchanges the actual local row counts, while the original
 DP counts remain capacity bounds. The CPU metadata gather also carries
 per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
@@ -720,6 +724,14 @@ Prefill writes context KV; if another rank has decodes, prefill-only and
 idle ranks join its draft collectives with empty rows. A round with no
 decodes performs no draft forward. Decode graph warmup and capture use the
 same uniform padded decode counts as their target batches.
+
+`PrefillGraphInputModel` prepares embeddings and additional row tensors
+eagerly. The graph owns fixed buffers, validates each input's layout, refreshes
+every live row and clears padding before replay. V4.1's `image_mask` is all
+false for text prefills and follows CED narrowing into decoder state.
+Models with this contract, or the existing embeds-only seam, admit multimodal
+DP batches using the replicated counts. Models with unsupported multimodal
+inputs remain disabled under DP to keep collective order consistent.
 
 V4.1 completes deferred HC posts and reductions before stage handoffs or
 Engram updates. The fixed graph input state contains only completed residuals.

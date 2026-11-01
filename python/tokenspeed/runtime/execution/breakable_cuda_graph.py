@@ -306,7 +306,7 @@ class BreakableCapture:
         self._capturing = False
 
     def add_eager(self, fn: Callable[[], Any]) -> Any:
-        """End the current segment, run ``fn`` eagerly, record it, start a new one.
+        """End and replay this segment, run ``fn`` eagerly, then start a new one.
 
         ``fn`` is a zero-arg callable that performs the break-point op and writes
         its result into a stable (pool-pinned) address. It is stored verbatim and
@@ -314,6 +314,8 @@ class BreakableCapture:
         """
         assert self._capturing, "add_eager called outside an active capture"
         self._end_segment()
+        # Capture only records kernels; the eager break needs their outputs now.
+        self.segments[-1]()
         result = fn()
         self.segments.append(fn)
         self._begin_segment()

@@ -591,6 +591,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    owner._graph_input_model = None
     owner._expert_load_rows = None
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
@@ -911,6 +912,7 @@ def kimi_host_cache():
     hybrid = HybridLinearAttnBackend(full, leaf, [mla_layer_id(pool)])
     owner = object.__new__(PrefillGraph)
     owner._narrowing = None
+    owner._graph_input_model = None
     owner._expert_load_rows = None
     owner._engaged_logged = set()
     owner._captures = {}

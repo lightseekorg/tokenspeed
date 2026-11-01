@@ -953,7 +953,9 @@ class TestDummyGroupTablesTest:
         inner_model = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner_model),
-            model_config=SimpleNamespace(requires_request_token_history=False),
+            model_config=SimpleNamespace(
+                requires_request_token_history=False, is_multimodal_active=False
+            ),
             is_generation=True,
             is_multimodal=False,
         )
@@ -1025,6 +1027,7 @@ class TestCaptureFailureIsLoudTest:
         pg._encoders = {}
         pg._decoders = {}
         pg._narrowing = None
+        pg._graph_input_model = None
         pg.attn_backend = SimpleNamespace(
             init_prefill_graph_state=lambda **kwargs: None
         )
@@ -1139,7 +1142,9 @@ class TestNarrowingPrefillGraphTest:
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
-                model_config=SimpleNamespace(requires_request_token_history=False),
+                model_config=SimpleNamespace(
+                    requires_request_token_history=False, is_multimodal_active=False
+                ),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1166,23 +1171,25 @@ class TestNarrowingPrefillGraphTest:
             assert (graph._narrowing) is (inner if expected_buckets else None)
             assert (graph.decoder_buckets) == (expected_buckets)
 
-    def test_narrowing_model_stays_eager_under_attention_dp(self):
-        """The narrowed row count is rank-local, so decoder buckets (and the
-        collective shapes their graphs bake) could differ across DP ranks:
-        the split graph is off under DP; an ordinary model keeps its graph."""
+    def test_narrowing_model_captures_under_attention_dp(self):
+        """Both model forms retain graphs; narrowing also has a decoder ladder."""
         from unittest import mock
 
         model, _ = self._model(128, [])
-        for inner, expected_disable in (
-            (model, True),
-            (SimpleNamespace(embed_tokens=object()), False),
+        for inner, multimodal, active, expected_decoder_buckets in (
+            (model, False, False, [64, 256]),
+            (model, True, False, [64, 256]),
+            (model, True, True, []),
+            (SimpleNamespace(embed_tokens=object()), False, False, []),
         ):
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
-                model_config=SimpleNamespace(requires_request_token_history=False),
+                model_config=SimpleNamespace(
+                    requires_request_token_history=False, is_multimodal_active=active
+                ),
                 is_generation=True,
-                is_multimodal=False,
+                is_multimodal=multimodal,
             )
             config = SimpleNamespace(
                 enforce_eager=False,
@@ -1203,8 +1210,8 @@ class TestNarrowingPrefillGraphTest:
                     input_buffers=object(),
                     config=config,
                 )
-            assert (graph.disable) == (expected_disable)
-            assert (graph.decoder_buckets) == ([])
+            assert graph.disable == active
+            assert graph.decoder_buckets == expected_decoder_buckets
 
     def _bare(self, model, State, decoder_buckets, calls):
         pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
@@ -1297,6 +1304,29 @@ class TestNarrowingPrefillGraphTest:
             ]
         )
         assert (hidden.shape) == ((300, 2))
+
+    @pytest.mark.parametrize(
+        "tokens, requests, live_rows, expected_bucket",
+        [
+            ([200, 40], [2, 1], [180, 0], 256),
+            ([8192, 7000], [1, 1], [0, 0], 128),
+            ([8192, 7000], [3, 1], [129, 1], None),
+        ],
+    )
+    def test_dp_decoder_bucket_agrees_with_different_completed_prompts(
+        self, tokens, requests, live_rows, expected_bucket
+    ):
+        model, State = self._model(0, [])
+        graph = self._bare(model, State, [64, 128, 256], [])
+        graph.dp_size = 2
+        decisions = []
+        for rank, rows in enumerate(live_rows):
+            ctx = self._ctx(tokens[rank])
+            ctx.bs = ctx.num_extends = requests[rank]
+            ctx.global_num_tokens = tokens
+            ctx.global_bs = requests
+            decisions.append(graph._decoder_replay_bucket(ctx, rows))
+        assert decisions == [expected_bucket] * 2
 
     def test_narrowing_disagreeing_with_the_metadata_is_fatal(self):
         calls = []
@@ -1400,7 +1430,9 @@ class TestPrefillRoleGraphsTest:
         inner = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner),
-            model_config=SimpleNamespace(requires_request_token_history=False),
+            model_config=SimpleNamespace(
+                requires_request_token_history=False, is_multimodal_active=False
+            ),
             is_generation=True,
             is_multimodal=False,
         )

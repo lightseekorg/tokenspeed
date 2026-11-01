@@ -849,6 +849,9 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     num_tokens = 0 if mode == ForwardMode.IDLE else 2
 
     class Model:
+        def __init__(self):
+            self.is_multimodal_active = False
+
         def forward(self, ctx, input_ids, positions, **kwargs):
             return DeepseekV41ForCausalLM.prepare_model_kwargs(
                 self, ctx, input_ids, kwargs
@@ -947,7 +950,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         events.append("forward")
 
     runner = ModelRunner.__new__(ModelRunner)
-    runner.model = SimpleNamespace(forward=forward)
+    runner.model = SimpleNamespace(forward=forward, is_multimodal_active=False)
     runner.is_generation = True
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
@@ -1330,6 +1333,7 @@ def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
     # Exercise the real hook and scatter with small, pre-encoded image features.
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
+    adapter.is_multimodal_active = True
     adapter.config = SimpleNamespace(image_token_id=5)
     adapter.model = nn.Module()
     adapter.model.embed_tokens = nn.Embedding.from_pretrained(

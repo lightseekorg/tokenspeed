@@ -1049,6 +1049,9 @@ class DeepseekV41Attention(nn.Module):
             or positions.numel() != hidden_states.shape[0]
         ):
             raise ValueError("V4.1 hidden rows and backend query metadata disagree")
+        if hidden_states.shape[0] == 0:
+            # Empty DP ranks skip cache work but still join the graph's FFN.
+            return hidden_states
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = meta.positions, meta.request_indices
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
@@ -2291,8 +2294,8 @@ class DeepseekV41Model(nn.Module):
     def allocate_decoder_state(self, rows: int) -> V41RowState:
         """A zero ``rows``-row state laid out like ``narrowing_forward``'s output.
 
-        Text routing only (no image mask): a multimodal forward never lands
-        here. Taps taken at or below the candidate source get one static each.
+        The visual routing mask follows the same row selection as activations.
+        Taps taken at or below the candidate source get one static each.
         """
         weight = self.embed_tokens.weight
         device, dtype = weight.device, weight.dtype
@@ -2311,6 +2314,11 @@ class DeepseekV41Model(nn.Module):
             for layer_id in self.dspark_capture_layers
             if layer_id <= self.ced_decoder_start
         )
+        image_mask = (
+            torch.zeros(rows, dtype=torch.bool, device=device)
+            if any(layer.ffn.gate.bias_vl is not None for layer in self.layers)
+            else None
+        )
         return V41RowState(
             torch.zeros(
                 (rows, self.config.hc_mult, hidden_size), dtype=dtype, device=device
@@ -2319,7 +2327,7 @@ class DeepseekV41Model(nn.Module):
                 (rows, self.config.hc_mult), dtype=torch.float32, device=device
             ),
             torch.zeros(rows, dtype=torch.int64, device=device),
-            None,
+            image_mask,
             hashes,
             mask,
             [
@@ -2490,6 +2498,34 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
     def resolve_logits_processor(self, config):
         return super().resolve_logits_processor(config.text_config)
 
+    def allocate_prefill_graph_inputs(
+        self, max_num_tokens: int
+    ) -> dict[str, torch.Tensor]:
+        """Allocate graph-owned visual routing state without retaining it here."""
+        if not self.is_multimodal_active:
+            return {}
+        return {
+            "image_mask": torch.zeros(
+                max_num_tokens,
+                dtype=torch.bool,
+                device=self.get_input_embeddings().weight.device,
+            )
+        }
+
+    def prepare_prefill_graph_inputs(
+        self,
+        input_ids: torch.Tensor,
+        ctx: ForwardContext,
+        multimodal_context: MultimodalForwardContext | None,
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Use the eager input preparation before replaying the language graph."""
+        prepared = self.prepare_model_kwargs(
+            ctx, input_ids, {"multimodal_context": multimodal_context}
+        )
+        return prepared["input_embeds"], (
+            {"image_mask": prepared["image_mask"]} if self.is_multimodal_active else {}
+        )
+
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict
     ) -> dict:
@@ -2519,6 +2555,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             )
             if embeds is not None:
                 result["input_embeds"] = embeds
+        if (
+            self.is_multimodal_active
+            and not ctx.forward_mode.is_decode_or_idle()
+            and result["image_mask"] is None
+        ):
+            # Text and image prefills use the same tensor-valued routing input.
+            # In particular, text after an image must overwrite the old mask.
+            result["image_mask"] = torch.zeros_like(input_ids, dtype=torch.bool)
         return result
 
     @staticmethod
