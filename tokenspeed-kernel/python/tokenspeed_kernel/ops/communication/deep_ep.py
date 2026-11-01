@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 from enum import Enum, IntEnum, auto
@@ -96,7 +97,7 @@ class _MissingBuffer(metaclass=_MissingBufferMeta):
         _raise_deepep_unavailable()
 
 
-if current_platform().is_nvidia:
+if current_platform().is_nvidia and importlib.util.find_spec("deep_ep") is not None:
     from deep_ep import Buffer
 else:
     Buffer = _MissingBuffer

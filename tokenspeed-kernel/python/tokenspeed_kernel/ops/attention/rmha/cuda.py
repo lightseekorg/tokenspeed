@@ -17,6 +17,7 @@
 
 """Architecture-selected FlashAttention kernels for relative MHA."""
 
+import importlib.util
 import math
 
 import torch
@@ -30,7 +31,13 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
-if platform.is_nvidia and platform.is_blackwell:
+if (
+    platform.is_nvidia
+    and platform.is_blackwell
+    and importlib.util.find_spec("flash_attn") is not None
+    and importlib.util.find_spec("quack") is not None
+    and importlib.util.find_spec("flash_attn.cute") is not None
+):
     from flash_attn.cute import flash_attn_varlen_func
 
     # Relative-attention kernels support both SM100 and SM103.

@@ -27,12 +27,14 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 _HAS_TRTLLM_KERNEL = (
-    platform.is_nvidia and importlib.util.find_spec("trtllm_kernel") is not None
+    platform.is_nvidia
+    and importlib.util.find_spec("trtllm_kernel") is not None
+    and importlib.util.find_spec("deep_ep") is not None
 )
 __all__ = []
 
@@ -176,3 +178,6 @@ if _HAS_TRTLLM_KERNEL:
         "trtllm_fp8_token_group_128",
         "trtllm_fp8_token",
     ]
+else:
+    # Keep FlashInfer's existing Triton fallback available.
+    _per_token_group_quant_8bit = error_fn

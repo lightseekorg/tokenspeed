@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 from dataclasses import dataclass
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 # DeepGEMM implementation of the DeepSeek V4/V4.1 MegaMoE boundary.
 
 
-if platform.is_blackwell:
+if platform.is_blackwell and importlib.util.find_spec("deep_gemm") is not None:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         fp8_fp4_mega_moe,
@@ -375,7 +376,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     _warmed_configs.add(warmup_key)
 
 
-if platform.is_blackwell:
+if platform.is_blackwell and importlib.util.find_spec("deep_gemm") is not None:
 
     @register_kernel(
         "moe",
