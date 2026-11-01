@@ -1236,6 +1236,9 @@ struct Setup {
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
+    /// `--enable-metrics`: the base of each rank's Prometheus multiprocess
+    /// directory, one `rank<N>` folder inside it.
+    metrics_dir: Option<std::path::PathBuf>,
 }
 
 impl Layout {
@@ -1345,6 +1348,28 @@ fn run_rank<F: Frontend>(
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
+    let (metrics, _exporter) = setup
+        .metrics_dir
+        .clone()
+        .map(|base| {
+            let dir = base.join(format!("rank{rank}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
+                prometheus_dir: Some(dir),
+                relay_endpoint: None,
+            })
+            .unwrap();
+            let metrics = ts_metrics::EngineMetrics::new(
+                &exporter,
+                &ts_metrics::EngineLabels {
+                    model_name: "m".to_owned(),
+                    app_key: String::new(),
+                    dp_rank: rank as i64,
+                },
+            );
+            (Some(metrics), Some(exporter))
+        })
+        .unwrap_or((None, None));
     let outputs = OutputProcessor::new(
         None,
         1,
@@ -1397,7 +1422,7 @@ fn run_rank<F: Frontend>(
                     awaiting: Vec::new(),
                 }) as Box<dyn EmbeddingReceiver + Send>
             }),
-            metrics: None,
+            metrics,
             kv_events: None,
             eplb: eplb.map(|config| Controller::new(config(world, rank)).unwrap()),
             grammars: grammar.then(|| {
@@ -1730,6 +1755,31 @@ async fn collect(mut stream: RequestStream) -> Vec<OutputChunk> {
     chunks
 }
 
+/// The sorted Prometheus exposition of a rank's multiprocess directory,
+/// rendered by the ts-metrics fixture generator; `None` when the Python
+/// has no `prometheus_client` (the test skips).
+fn render_metrics(dir: &std::path::Path) -> Option<String> {
+    let python = std::env::var("TS_TEST_PYTHON")
+        .or_else(|_| std::env::var("PYO3_PYTHON"))
+        .unwrap_or_else(|_| "python3".to_owned());
+    let generator = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ts-metrics/tests/fixtures/generate.py");
+    let output = std::process::Command::new(python)
+        .arg(generator)
+        .arg("--render")
+        .arg(dir)
+        .output()
+        .expect("running Python");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No module named 'prometheus_client'") {
+            return None;
+        }
+        panic!("rendering failed:\n{stderr}");
+    }
+    Some(String::from_utf8(output.stdout).expect("the exposition is UTF-8"))
+}
+
 async fn run(client: &EngineClient, request: TokenizedGenerateReqInput) -> Vec<OutputChunk> {
     collect(client.generate(request).await.unwrap()).await
 }
@@ -1766,6 +1816,38 @@ async fn idle_load_reports_preserve_resident_cache_capacity() {
     assert_eq!(load.kv_active_pages, 0);
     assert!(load.kv_used_pages > 0, "reclaimable prefixes stay resident");
     assert_eq!(load.kv_total_pages, 512);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_prefix_cache_counters_follow_released_requests() {
+    // Two identical prompts: the second admits on the first's cached
+    // prefix, so the exported counters hold both prompts' tokens as
+    // queries and the reused prefix as hits.
+    let base = std::env::temp_dir().join(format!("ts-metrics-prefix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let engine = start_ranks_with(
+        Layout::Single,
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            metrics_dir: Some(base.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    run(&engine.client, request("cold", 32, budget(1))).await;
+    run(&engine.client, request("warm", 32, budget(1))).await;
+    let Some(exposition) = render_metrics(&base.join("rank0")) else {
+        return;
+    };
+    // The last of the prompt's two 16-token blocks is always recomputed,
+    // so the second request reuses exactly one block.
+    let labels = r#"{app_key="",dp_rank="0",model_name="m"}"#;
+    assert!(exposition.contains(&format!(
+        "tokenspeed:prefix_cache_queries_total{labels} 64.0"
+    )));
+    assert!(exposition.contains(&format!("tokenspeed:prefix_cache_hits_total{labels} 16.0")));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test(flavor = "multi_thread")]
