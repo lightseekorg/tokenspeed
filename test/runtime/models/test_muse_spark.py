@@ -418,6 +418,12 @@ class _TwoRankGather:
     ) -> torch.Tensor:
         return torch.cat((rows, rows + 100))[:global_rows]
 
+    def all_gather_owned_stream_bf16(
+        self, stream: torch.Tensor, global_rows: int
+    ) -> torch.Tensor:
+        assert stream.dtype == torch.float32
+        return self.all_gather_owned_rows(stream.bfloat16(), global_rows, False)
+
 
 def test_owned_row_taps_gather_full_rows() -> None:
     model, sink, ctx = _tapping_model([0])
@@ -1555,7 +1561,9 @@ def test_attention_output_preserves_dense_projection(
 
 
 @requires_gpu
-@pytest.mark.parametrize("tokens", [2, 16])
+# 2-64 rows (up to eight verify blocks) take the decode GEMV or GEMM; 96 rows
+# take the decode GEMM's 128-row bucket.
+@pytest.mark.parametrize("tokens", [2, 16, 32, 64, 96])
 def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     bf16_default_dtype, tokens: int
 ) -> None:
@@ -1563,7 +1571,7 @@ def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     from tokenspeed_kernel.ops.gemm import mm
 
     if not current_platform().is_cdna4:
-        pytest.skip("the direct gather-slice projection is the CDNA4 path")
+        pytest.skip("measured and validated on gfx950 only")
     torch.manual_seed(5)
     with torch.device("cuda"):
         linear = _shard_linear(512, 8192, tp_rank=0, tp_size=1)
@@ -1583,7 +1591,9 @@ def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     assert torch.equal(local, mm(x, linear.weight))
 
 
-def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> None:
+def _gathered_mxfp4_workspace_worker(
+    rank: int, port: int, world_size: int, enable_lamport: bool
+) -> None:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,
     )
@@ -1599,13 +1609,13 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
     try:
         device = torch.device("cuda", rank)
         state = prepare_muse_communication(
-            enable_lamport=False,
+            enable_lamport=enable_lamport,
             owned_route_max_rows=0,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
-            staged_max_numel=128 * 4096,
-            producer_direct_max_numel=128 * 4096,
+            staged_max_numel=256 * 4096,
+            producer_direct_max_numel=256 * 4096,
             device=device,
         )
         torch.set_default_dtype(torch.bfloat16)
@@ -1613,7 +1623,9 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
             linear = _shard_linear(4096, 256, tp_rank=rank, tp_size=world_size)
         linear.weight.data.zero_()
         linear.weight.data[:, rank] = 1
-        linear.workspace = torch.zeros(64, 4096, device=device)
+        linear.workspace = torch.zeros(
+            module._GATHER_MXFP4_MAX_ROWS, 4096, device=device
+        )
         linear.iris_state = state
         norm_weight = torch.ones(4096, device=device)
         # Route the layer through the real peer kernels without a serving process.
@@ -1623,7 +1635,15 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
                 "all_gather",
                 lambda local, group, dim, backend: state.gather.run(local),
             )
-            for tokens in (64, 65):
+            # The pull variant needs one ready flag per row; with Lamport
+            # mailboxes the fused path runs up to _GATHER_MXFP4_MAX_ROWS at
+            # both TP4 and TP8.
+            fused_max = (
+                module._GATHER_MXFP4_MAX_ROWS
+                if enable_lamport
+                else state.gather.ready_flags.shape[0]
+            )
+            for tokens in (64, 65, 84, 85, fused_max, fused_max + 1):
                 x = torch.ones(tokens, 256, device=device)
                 x[:, :world_size] = torch.arange(1, world_size + 1, device=device)
                 rows, packed = linear.forward_mxfp4(x, norm_weight, 1e-6, 1.0)
@@ -1646,7 +1666,11 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
                     atol=0,
                     rtol=0,
                 )
-                if tokens > 64:
+                # The fused path returns unfilled workspace rows as a
+                # placeholder; the unfused path returns the gathered rows.
+                fused = rows.data_ptr() == linear.workspace.data_ptr()
+                assert fused == (tokens <= fused_max)
+                if not fused:
                     torch.testing.assert_close(rows, expected_rows, atol=0, rtol=0)
                 torch.cuda.synchronize()
     finally:
@@ -1654,8 +1678,11 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
 
 
 @requires_gpu
+@pytest.mark.parametrize("enable_lamport", [False, True])
 @pytest.mark.parametrize("world_size", [4, 8])
-def test_gathered_mxfp4_preserves_rows_across_workspace_boundary(world_size) -> None:
+def test_gathered_mxfp4_preserves_rows_across_workspace_boundary(
+    world_size, enable_lamport
+) -> None:
     if not current_platform().is_cdna4 or torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} CDNA4 GPUs")
     with socket.socket() as listener:
@@ -1663,7 +1690,7 @@ def test_gathered_mxfp4_preserves_rows_across_workspace_boundary(world_size) -> 
         port = listener.getsockname()[1]
     mp.spawn(
         _gathered_mxfp4_workspace_worker,
-        args=(port, world_size),
+        args=(port, world_size, enable_lamport),
         nprocs=world_size,
         join=True,
     )
@@ -1744,6 +1771,7 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
             layer_id=0,
             layer_count=2,
             replicate_for_owned_rows=True,
+            workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
         )
     with torch.no_grad():
         linear.weight.normal_(std=hidden**-0.5)
