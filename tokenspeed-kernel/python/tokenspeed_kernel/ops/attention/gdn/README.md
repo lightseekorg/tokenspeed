@@ -146,3 +146,12 @@ masked during loading. Aligned state accesses are vectorized, with fallbacks
 for unaligned rows and arbitrary row strides. Batch size, window length, and
 payload layer stride remain runtime scalars, so serving shape changes reuse
 the compiled kernel.
+
+On NVIDIA, a pipelined variant takes over for BF16 payloads and states with
+K = 128, V divisible by 64, and at most 8 tokens per window, when the caller
+reports 16-byte aligned pool rows (`rows_aligned`, known from its host-side
+pool tables) and the payload is 16-byte aligned too. One CTA per layer,
+request, and key head streams its value heads' state tiles through a
+two-stage cp.async shared-memory ring, loading the next tile while the
+current one replays. It keeps the per-tile arithmetic, so results match the
+per-tile kernel bitwise.

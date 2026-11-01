@@ -1015,6 +1015,7 @@ def gdn_replay_commit(
     draft_token_num: int,
     geometry: tuple[int, int, int, int],
     state_dtype: torch.dtype,
+    rows_aligned: bool,
     override: str | None = None,
     solution: str | None = None,
 ) -> None:
@@ -1040,6 +1041,10 @@ def gdn_replay_commit(
         draft_token_num: Number of verify positions per request (``T``).
         geometry: ``(num_k_heads, num_v_heads, head_k_dim, head_v_dim)``.
         state_dtype: Element dtype shared by all recurrent-state pools.
+        rows_aligned: Whether every pool base address and row stride is a
+            multiple of 16 bytes, as the caller knows from its host-side pool
+            tables. Passed to the selected solution; the Triton one may then
+            take its pipelined kernel.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     """
@@ -1095,6 +1100,7 @@ def gdn_replay_commit(
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
             state_dtype=state_dtype,
+            rows_aligned=rows_aligned,
         )
 
 
