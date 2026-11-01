@@ -326,7 +326,6 @@ def _bare(model_cls):
         Qwen3MoeForCausalLM,
         Qwen3OmniMoeForConditionalGeneration,
         DeepseekV41ForCausalLM,
-        MuseSparkForConditionalGeneration,
         Qwen4ExpForConditionalGeneration,
     ],
 )
@@ -341,7 +340,13 @@ def test_capture_is_refused_where_forward_returns_no_taps(model_cls):
 
 
 @pytest.mark.parametrize(
-    "model_cls", [LlamaForCausalLM, GptOssForCausalLM, NemotronHForCausalLM]
+    "model_cls",
+    [
+        LlamaForCausalLM,
+        GptOssForCausalLM,
+        NemotronHForCausalLM,
+        MuseSparkForConditionalGeneration,
+    ],
 )
 def test_capture_is_accepted_where_forward_returns_taps(model_cls):
     lm = _bare(model_cls)
