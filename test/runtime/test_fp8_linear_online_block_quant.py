@@ -134,24 +134,42 @@ def test_online_partitions_need_no_block_alignment() -> None:
     assert layer.weight_scale_inv.shape == (2, 3)
 
 
-def test_online_quantization_ignores_linear_attention_layers() -> None:
-    """Online fp8 must exclude GDN/mamba projections (delta-rule recurrence
-    amplifies quantization error; official pre-quantized checkpoints exclude
-    linear_attn as well). Serialized checkpoints keep their own list."""
-    from tokenspeed.runtime.layers.quantization.utils import (
-        check_equal_or_regex_match,
-    )
+@pytest.mark.parametrize(
+    "prefix, quantized",
+    [
+        ("model.layers.0.linear_attn.in_proj_qkvz", True),
+        ("model.layers.0.linear_attn.in_proj_qkv", True),
+        ("model.layers.0.linear_attn.in_proj_z", True),
+        ("model.layers.0.linear_attn.out_proj", True),
+        ("language_model.model.layers.0.linear_attn.in_proj_qkvz", True),
+        ("linear_attn.out_proj", True),
+        ("model.layers.0.self_attn.qkv_proj", True),
+        ("model.layers.0.linear_attn.in_proj_ba", False),
+        ("model.layers.0.linear_attn.in_proj_b", False),
+        ("model.layers.0.linear_attn.in_proj_a", False),
+        ("model.layers.0.linear_attn.in_proj_qkvzba", False),
+        ("model.layers.0.linear_attn.conv1d", False),
+        ("model.layers.0.mixer.in_proj", False),
+        ("model.layers.0.mixer.out_proj", False),
+        ("model.layers.0.mixer.in_proj_qkvz", False),
+    ],
+)
+def test_online_quantization_gdn_projection_methods(
+    prefix: str, quantized: bool
+) -> None:
+    layer = ReplicatedLinear(128, 128, quant_config=Fp8Config(), prefix=prefix)
+    expected_method = Fp8LinearMethod if quantized else UnquantizedLinearMethod
+    assert isinstance(layer.quant_method, expected_method)
 
-    online = Fp8Config()
-    for name in (
-        "model.layers.0.linear_attn.in_proj_qkvz",
-        "model.layers.3.linear_attn.conv1d",
-        "model.layers.7.linear_attn.out_proj",
-    ):
-        assert check_equal_or_regex_match(name, online.ignored_layers)
-    assert not check_equal_or_regex_match(
-        "model.layers.0.self_attn.qkv_proj", online.ignored_layers
+
+def test_online_quantization_honors_explicit_gdn_exclusion() -> None:
+    layer = ReplicatedLinear(
+        128,
+        128,
+        quant_config=Fp8Config(ignored_layers=["re:.*linear_attn.*"]),
+        prefix="model.layers.0.linear_attn.out_proj",
     )
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
 
     serialized = Fp8Config(is_checkpoint_fp8_serialized=True)
     assert not serialized.ignored_layers
