@@ -329,7 +329,9 @@ class _Backend:
         swa_norm_weight,
         swa_norm_eps,
         out_rope_cache,
+        key_rows=None,
     ):
+        assert key_rows is None
         self.calls.append(
             (
                 layer_id,
@@ -3690,3 +3692,318 @@ def test_short_history_skips_query_projections_but_preserves_keys(
     assert bool(backend.global_writes) == (layer_id in (2, 20))
     if layer_id in (2, 20):
         assert backend.global_writes[layer_id][1].numel() > 0
+
+
+@pytest.mark.parametrize(
+    "lengths,prefixes,complete",
+    [
+        ([257, 3], [0, 0], [True, False]),
+        ([1, 2], [0, 0], [True, True]),
+        ([7, 2], [0, 0], [False, False]),
+        ([140, 3], [64, 0], [True, True]),
+    ],
+)
+def test_model_qcp_ced_communication_and_outputs(
+    monkeypatch, lengths, prefixes, complete
+):
+    from tokenspeed.runtime.distributed import comm_ops
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    total = sum(lengths)
+    ends = [p + n for p, n in zip(prefixes, lengths)]
+    prompts = [end if done else end + 64 for end, done in zip(ends, complete)]
+    sample_encoder = torch.tensor(lengths).cumsum(0)[torch.tensor(complete)] - 1
+    for rank in range(4):
+        mapping = Mapping(
+            rank=rank,
+            world_size=4,
+            attn_tp_size=4,
+            attn_qcp_size=4,
+            dense_tp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=4,
+        )
+        config = _config()
+        config.hidden_size = 256
+        config.engram_layer_ids = []
+        # Real model/communication classes; weights are unnecessary when testing
+        # stage layouts and output gathering, so allocate them on meta.
+        with torch.device("meta"):
+            model = DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu")
+        backend = _backend("cpu", 2)
+        meta = _extend(backend, _tables("cpu"), lengths, prefixes, [0, 0], prompts)
+        view = backend.decoder_view()
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+        )
+        ctx = _ctx(backend, total, ForwardMode.EXTEND)
+        ctx.bs = ctx.num_extends = 2
+        ctx.output_layout = ForwardOutputLayout.from_prefill(
+            prefix_lengths=prefixes,
+            input_lengths=lengths,
+            prompt_lengths=prompts,
+            num_decodes=0,
+            decode_width=1,
+        )
+        ctx.query_shard = plan
+        ctx.collective_num_tokens = view.metadata.positions.numel()
+        local = backend.partition_prefill_queries(plan, sampled_rows_cpu=sample_encoder)
+        for layer_id in (2, 20, 24):
+            layer = model.layers[layer_id]
+            ffn_ctx = layer._ffn_context(ctx)
+            wanted = plan.row_counts if layer_id < 20 else local.decoder_plan.row_counts
+            assert layer.comm_manager.scattered_num_tokens(ffn_ctx) == list(wanted)
+            assert ctx.query_shard is plan
+            assert ctx.collective_num_tokens == view.metadata.positions.numel()
+        full_hidden = torch.arange(view.metadata.positions.numel() * config.hidden_size)
+        full_hidden = (
+            full_hidden.remainder(257)
+            .reshape(-1, config.hidden_size)
+            .to(torch.bfloat16)
+        )
+        samples = torch.tensor(view.logits_rows_cpu, dtype=torch.int64)
+        torch.testing.assert_close(
+            view.metadata.positions[samples], meta.positions[sample_encoder]
+        )
+        torch.testing.assert_close(
+            view.metadata.request_indices[samples], meta.request_indices[sample_encoder]
+        )
+        expected = full_hidden[samples]
+        counts = plan.rows_per_rank(sample_encoder)
+
+        def gather(payload, group, row_counts, backend=None):
+            assert group == mapping.attn.qcp_group
+            assert row_counts == list(counts)
+            first = sum(counts[:rank])
+            torch.testing.assert_close(payload, expected[first : first + counts[rank]])
+            return expected.clone()
+
+        monkeypatch.setattr(comm_ops, "token_all_gather", gather)
+        actual, captured = model.finish_forward(
+            full_hidden[local.decoder_plan.local_slice], [], ctx
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert actual.shape[0] == sum(complete)
+        assert captured is None and ctx.logits_rows_selected
+        assert ctx.query_shard is plan
+
+        # CPU tests replace only the unavailable distributed collective.
+        # Include empty owners and open chunks with no sampled output.
+        taps = [full_hidden, full_hidden + 1]
+
+        def gather_taps(payload, group, row_counts):
+            assert group == mapping.attn.qcp_group
+            assert row_counts == list(local.decoder_plan.row_counts)
+            expected_taps = torch.cat(taps, dim=-1)
+            torch.testing.assert_close(
+                payload, expected_taps[local.decoder_plan.local_slice], rtol=0, atol=0
+            )
+            return expected_taps.clone()
+
+        monkeypatch.setattr(
+            "tokenspeed.runtime.models.deepseek_v41.token_all_gather_rows",
+            gather_taps,
+        )
+        ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+        actual, captured = model.finish_forward(
+            full_hidden[local.decoder_plan.local_slice],
+            [tap[local.decoder_plan.local_slice] for tap in taps],
+            ctx,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual_tap, expected_tap in zip(captured, taps, strict=True):
+            torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
+        if view.keep_rows is not None:
+            torch.testing.assert_close(
+                ctx.captured_rows.positions, view.metadata.positions
+            )
+
+
+@torch.inference_mode()
+def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
+    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
+        pytest.skip("launch with torchrun --nproc_per_node=4")
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    kvp_size = 4
+    rank = int(os.environ["RANK"])
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    torch.cuda.set_device(device)
+    mapping = Mapping(
+        rank=rank,
+        world_size=4,
+        attn_tp_size=4,
+        attn_qcp_size=4,
+        attn_kvp_size=kvp_size,
+        dense_tp_size=4,
+        moe_tp_size=1,
+        moe_ep_size=4,
+    )
+    for key, value in dict(
+        mapping=mapping,
+        chunked_prefill_size=512,
+        max_prefill_tokens=512,
+        max_model_len=512,
+        max_num_seqs=4,
+        ep_num_redundant_experts=0,
+        speculative_algorithm=None,
+    ).items():
+        monkeypatch.setitem(global_server_args_dict, key, value)
+    pg_manager.init_distributed(
+        mapping,
+        distributed_init_method="env://",
+        backend="nccl",
+        timeout=120,
+        device_id=device,
+    )
+    pg_manager.init_process_group(mapping.attn.tp_group, backend="nccl")
+    try:
+        config = _config()
+        config.hidden_size = config.moe_intermediate_size = 256
+        config.num_attention_heads = config.o_groups = config.index_n_heads = 2
+        config.head_dim, config.index_head_dim = 512, 128
+        config.qk_rope_head_dim, config.q_lora_rank = 64, 128
+        with set_default_torch_dtype(torch.bfloat16), torch.device(device):
+            adapter = DeepseekV41ForCausalLM(
+                SimpleNamespace(text_config=config),
+                mapping,
+                _quant(),
+                is_multimodal_active=False,
+                mm_attention_backend=None,
+            )
+        adapter.load_weights(
+            _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
+        )
+        adapter.initialize_engram(_Tokenizer())
+        for module in adapter.modules():
+            if isinstance(module, LinearBase):
+                module.quant_method.process_weights_after_loading(module)
+            elif isinstance(module, MoELayer):
+                module.process_weights_after_loading(module)
+        from test.runtime.test_deepseek_v41_cache import _pool, _recipe
+
+        from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+            DeepseekV41AttentionBackend,
+        )
+        from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
+            DeepseekV41Config,
+        )
+
+        replicated = _backend(str(device), 2)
+        recipe = _recipe(str(device))
+        recipe.attn_config = replace(
+            recipe.attn_config,
+            kvp_size=kvp_size,
+            kvp_rank=rank,
+            kvp_group=tuple(range(kvp_size)),
+        )
+        sharded_config = recipe.attn_config
+        partitioned = DeepseekV41AttentionBackend(
+            sharded_config, sharded_config.component(DeepseekV41Config)
+        )
+        partitioned.set_cache_pool(_pool(recipe, str(device)))
+        tables = _tables(str(device))
+        kvp_tables = {gid: table.clone() for gid, table in tables.items()}
+        # Virtual KVP pages must map to the same disjoint physical LCM
+        # parents as the replicated fixture, rather than aliasing SWA pages.
+        for gid in (R1, R2):
+            table = kvp_tables[gid]
+            offset = (table[0, 0] - 1) * (kvp_size - 1)
+            table.add_(torch.where(table > 0, offset, 0))
+        for length in (2, 7, 257):
+            ids = torch.arange(length, device=device) % 7
+            previous = torch.stack(
+                [
+                    torch.where(
+                        torch.arange(length, device=device) >= distance,
+                        (torch.arange(length, device=device) - distance) % 7,
+                        -1,
+                    )
+                    for distance in (1, 2, 3)
+                ],
+                dim=1,
+            )
+            mask = torch.ones(length, dtype=torch.bool, device=device)
+            hashes = adapter.model.engram_hash(ids, previous, mask)
+            outputs = []
+            for sharded, backend in (
+                (False, replicated),
+                (True, replicated),
+                (True, partitioned),
+            ):
+                backend.cache_pool.arena.buffer.zero_()
+                plan = (
+                    QueryShardPlan.from_forward(
+                        total_tokens=length,
+                        input_lengths=[length],
+                        size=4,
+                        rank=rank,
+                    )
+                    if sharded
+                    else None
+                )
+                meta = _extend(
+                    backend,
+                    kvp_tables if backend is partitioned else tables,
+                    [length],
+                    [0],
+                    [0],
+                    [length],
+                    query_shard=plan,
+                )
+                ctx = _ctx(backend, length, ForwardMode.EXTEND)
+                ctx.query_shard = plan
+                rows = plan.local_slice if plan is not None else slice(None)
+                result, _ = adapter.model(
+                    ids[rows],
+                    meta.positions[rows],
+                    ctx,
+                    None,
+                    None,
+                    engram_hash_ids=hashes[rows],
+                    engram_token_mask=mask[rows],
+                    image_mask=None,
+                )
+                assert torch.isfinite(result).all(), (length, sharded, backend.kvp_size)
+                outputs.append(result[-1:].clone())
+            # Different GEMM row shapes and EP reduction order may round BF16
+            # differently; this checks the sampled hidden output, not task accuracy.
+            torch.testing.assert_close(outputs[1], outputs[0], rtol=0.03, atol=0.03)
+            # Packed history transport must not change the QCP computation.
+            torch.testing.assert_close(outputs[2], outputs[1], rtol=0, atol=0)
+            gathered = [torch.empty_like(outputs[2]) for _ in range(4)]
+            torch.distributed.all_gather(gathered, outputs[2])
+            for other in gathered:
+                torch.testing.assert_close(outputs[2], other, rtol=0, atol=0)
+
+            # Verify capture transport independently of GEMM/EP rounding:
+            # deterministic taps must be restored byte-for-byte across uneven
+            # CED owners, including ranks with no local rows.
+            view = backend.decoder_view()
+            local = backend.partition_prefill_queries(
+                plan, sampled_rows_cpu=torch.tensor([length - 1])
+            )
+            full = (
+                torch.arange(
+                    view.metadata.positions.numel() * config.hidden_size,
+                    device=device,
+                )
+                .remainder(127)
+                .reshape(-1, config.hidden_size)
+                .to(torch.bfloat16)
+            )
+            taps = [full, -full]
+            ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+            actual, captured = adapter.model.finish_forward(
+                full[local.decoder_plan.local_slice],
+                [tap[local.decoder_plan.local_slice] for tap in taps],
+                ctx,
+            )
+            expected = full[torch.tensor(view.logits_rows_cpu, device=device)]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            for actual_tap, expected_tap in zip(captured, taps, strict=True):
+                torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()

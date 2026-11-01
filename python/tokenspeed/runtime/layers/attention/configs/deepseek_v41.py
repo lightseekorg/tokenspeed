@@ -69,8 +69,8 @@ class DeepseekV41Config(SoftmaxAttnConfig):
                 "V4.1 FlatKV config describes target attention only"
             )
         if server_args.mapping.attn.kvp_size > 1:
-            if server_args.disaggregation_mode not in ("null", "prefill"):
-                raise ValueError("V4.1 KVP supports aggregate or prefill roles only")
+            if server_args.disaggregation_mode not in ("null", "prefill", "decode"):
+                raise ValueError("V4.1 KVP requires aggregate, prefill or decode role")
             if server_args.speculative_algorithm not in (None, "DSPARK"):
                 raise ValueError("V4.1 KVP supports DSpark speculation only")
             if not server_args.disable_prefill_graph or server_args.enable_mixed_batch:
@@ -119,6 +119,27 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             raise ValueError(
                 "V4.1 indexer query parallel size must be 1 or attention TP"
             )
+        if attn.has_qcp:
+            if server_args.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "V4.1 model QCP currently requires the PD prefill role"
+                )
+            if attn.head_tp_size != 1:
+                raise ValueError("V4.1 model QCP requires head TP=1")
+            if (
+                not server_args.disable_prefill_graph
+                or server_args.enable_mixed_batch
+                or server_args.speculative_algorithm not in (None, "DSPARK")
+                or server_args.mapping.has_pp
+            ):
+                raise ValueError(
+                    "V4.1 model QCP requires eager pure prefill without PP; only DSpark speculation is supported"
+                )
+            if (
+                query_size != 1
+                or server_args.deepseek_v41_attention_query_parallel_size != 1
+            ):
+                raise ValueError("V4.1 model QCP cannot combine with aggregate QCP")
         query_rank = attn.tp_rank if query_size > 1 else 0
         query_group = (
             attn.tp_group if query_size > 1 else (attn.tp_group[attn.tp_rank],)
@@ -148,7 +169,7 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             num_attention_heads=model_config.num_attention_heads,
             num_kv_heads=1,
             head_dim=int(hf.head_dim),
-            attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
+            attn_tp_size=attn.head_tp_size,
             attention_query_swa_min_tokens=attention_swa_min_tokens,
             attention_query_min_tokens=attention_min_tokens,
             attention_query_rank=attn.tp_rank if attention_size > 1 else 0,
