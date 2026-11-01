@@ -55,9 +55,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     hybrid_slab_group_size,
     layer_group_ids,
 )
+from tokenspeed.runtime.layers.moe.down_columns import MoEDownColumns
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.models import muse_spark as module
+from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.models.muse_spark import (
     RESIDUAL_GATE_EPS,
     MuseSparkAttention,
@@ -1400,6 +1402,49 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
     assert prepared_for == [2] and list(moe.prepared_routing) == [2]
 
 
+def test_communication_fallback_frees_the_column_split_down_copy() -> None:
+    """Only the Iris intermediate exchange reads the copy; without it, free it."""
+    mlp = SimpleNamespace(down_columns=MoEDownColumns(2, 16, 64, tp_rank=0, tp_size=8))
+    owner = SimpleNamespace(
+        # Muse prepares Iris communication only at attention TP4 or TP8.
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+    )
+
+    prepared = MuseSparkForConditionalGeneration.prepare_communication_runtime(
+        owner, 8192
+    )
+
+    assert prepared is False
+    assert mlp.down_columns is None
+
+
+@requires_gpu
+def test_weight_update_is_refused_before_writing_with_a_column_split_down_copy(
+    bf16_default_dtype,
+) -> None:
+    model = _tiny_model()
+    layer = model.model.layers[0]
+    # The tiny config is too small to build the copy; attach one.
+    layer.mlp.down_columns = MoEDownColumns(4, 128, 64, tp_rank=0, tp_size=8)
+    norm = layer.input_layernorm.weight
+    before = norm.clone()
+
+    with pytest.raises(RuntimeError, match="column-split copy"):
+        with weight_update_session([model], require_complete=False, cpu_group=None):
+            model.load_weights(
+                [
+                    (
+                        "model.language_model.layers.0.input_layernorm.weight",
+                        before + 1,
+                    )
+                ]
+            )
+
+    assert torch.equal(norm, before)
+    assert not model._weight_update_active
+
+
 def test_select_experts_routes_in_the_topk_kernel_when_prepared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1611,6 +1656,7 @@ def _gathered_mxfp4_workspace_worker(
         state = prepare_muse_communication(
             enable_lamport=enable_lamport,
             owned_route_max_rows=0,
+            intermediate_gather_max_rows=0,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
