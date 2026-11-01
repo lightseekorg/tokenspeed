@@ -200,6 +200,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", lambda pool: [])
     args = SimpleNamespace(
         disaggregation_mode="null",
+        mapping=Mapping(rank=0, world_size=1),
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,

@@ -39,6 +39,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.execution import device  # noqa: E402
 from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
     probe_arena_parent_blocks,
@@ -431,6 +432,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     monkeypatch.setattr(device, "_rebind_under_reserve", rebind)
     server_args = SimpleNamespace(
         disaggregation_mode="null",
+        mapping=Mapping(rank=0, world_size=1),
         enable_external_encoder=False,
         chunked_prefill_size=8192,
         attention_backend=None,
