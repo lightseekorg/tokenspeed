@@ -1001,6 +1001,11 @@ def test_two_ranks_round_trip_a_sharded_image_through_both_tiers(io_backend):
 
 
 def _round_trip_two_ranks(io_backend, executors):
+    if io_backend == "kernel":
+        from tokenspeed_kernel.ops.kvcache.triton import _transfer_cache_blocks_kernel
+
+        # Earlier tests must not hide a missing startup specialization.
+        _transfer_cache_blocks_kernel.device_caches.clear()
     torch.manual_seed(0)
     # Per rank: 2 local LCM blocks x packing 2 = 4 local blocks of 8 B at
     # stride 16 from offset 8. The sharded group has 2 x 2 x 2 = 8 virtual
@@ -1012,10 +1017,8 @@ def _round_trip_two_ranks(io_backend, executors):
         num_lcm_blocks=2,
         token_capacity=32,
     )
-    buffers = {
-        rank: torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
-        for rank in (0, 1)
-    }
+    initial = torch.arange(128, dtype=torch.uint8)
+    buffers = {rank: initial.cuda() for rank in (0, 1)}
     slot_states = {rank: _CudaSlotState(rows=4, width=5) for rank in (0, 1)}
     with patch.object(executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
         for rank in (0, 1):
@@ -1051,6 +1054,8 @@ def _round_trip_two_ranks(io_backend, executors):
                 world_cpu_group=None,
             )
     assert (executors[0].num_host_pages, executors[0].num_snapshot_pages) == (4, 4)
+    for buffer in buffers.values():
+        assert torch.equal(buffer.cpu(), initial)
 
     originals = {
         rank: torch.randint(1, 255, (128,), dtype=torch.uint8, device="cuda")
@@ -1099,11 +1104,21 @@ def _round_trip_two_ranks(io_backend, executors):
         pool_index=3,
     )
     empty_restore = _restore_op(4, 2, [], pool_index=0)
-    for executor in executors.values():
-        executor.submit_load_backs(
-            [restore, empty_restore],
-            prerequisite_stream=stream,
+    compile_check = nullcontext()
+    if io_backend == "kernel":
+        compile_check = patch.object(
+            _transfer_cache_blocks_kernel,
+            "_do_compile",
+            wraps=_transfer_cache_blocks_kernel._do_compile,
         )
+    with compile_check as compiles:
+        for executor in executors.values():
+            executor.submit_load_backs(
+                [restore, empty_restore],
+                prerequisite_stream=stream,
+            )
+    if io_backend == "kernel":
+        compiles.assert_not_called()
     torch.cuda.synchronize()
     assert [_acks(executor.poll_results()) for executor in executors.values()] == [
         _restore_done(2, 4),

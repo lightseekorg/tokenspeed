@@ -80,6 +80,10 @@ struct CacheCoordinatorTestAccess {
     static const BoundaryTree& BoundaryTreeOf(const CacheCoordinator& coordinator) {
         return coordinator.boundary_tree_;
     }
+
+    static auto NodeEntries(const CacheCoordinator& coordinator, const BlockPool& pool, const ContentHash& hash) {
+        return coordinator.NodeEntries(pool, *coordinator.boundary_tree_.Find(hash));
+    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {

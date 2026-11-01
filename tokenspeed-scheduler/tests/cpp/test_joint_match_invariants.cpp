@@ -684,6 +684,41 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     }
 }
 
+TEST(JointMatchInvariantsTest, RejectedCheckpointsDoNotKeepHitsAtTheOlderBoundary) {
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+    };
+    BlockPool device(16, {1, 1, 1});
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false);
+    const auto hashes = MakeHashes(3);
+    for (const auto& hash : hashes) {
+        CacheBlockFor(coordinator, device, hash, 0);
+    }
+    for (std::uint32_t group : {1u, 2u}) {
+        CacheBlockFor(coordinator, device, hashes[0], group);
+    }
+    CacheBlockFor(coordinator, device, hashes[2], 1);
+    CacheBlockFor(coordinator, device, hashes[1], 2);
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .max_tokens = 12};
+    const auto older = coordinator.ProbePromptPrefix(prompt);
+    EXPECT_EQ(older.device.num_common_tokens, 4);
+    EXPECT_EQ(older.device.kv_tokens, 12);
+    for (const auto& group : older.device.per_group) {
+        EXPECT_EQ(group.hits, (std::vector<std::uint8_t>{1}));
+    }
+
+    CacheBlockFor(coordinator, device, hashes[2], 2);
+    const auto newer = coordinator.ProbePromptPrefix(prompt);
+    EXPECT_EQ(newer.device.num_common_tokens, 12);
+    for (std::size_t group : {1u, 2u}) {
+        EXPECT_EQ(newer.device.per_group[group].hits, (std::vector<std::uint8_t>{0, 0, 1}));
+    }
+}
+
 TEST(JointMatchInvariantsTest, AvailabilitySeparatesStateMissingFromFullKvMissing) {
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -782,6 +817,46 @@ TEST(JointMatchInvariantsTest, AvailabilityIncludesUnalignedTailAndStateOnAnothe
     EXPECT_EQ(rows[0].union_missing, 0u);
     EXPECT_EQ(rows[0].device_missing, 3u);
     EXPECT_EQ(rows[0].host_missing, 1u);
+}
+
+TEST(JointMatchInvariantTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
+    BlockPool device(16, {1, 1, 1});
+    BlockPool host(16, {1, 1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+    };
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true);
+    const auto entries = [&](const BlockPool& pool) {
+        return CacheCoordinatorTestAccess::NodeEntries(coordinator, pool, "page");
+    };
+    const auto groups = [&](const BlockPool& pool) {
+        std::vector<std::uint32_t> result;
+        for (const auto& entry : entries(pool)) result.push_back(entry.group_id);
+        return result;
+    };
+    auto device_kv = device.AcquireBlock(0);
+    auto host_kv = host.AcquireBlock(0);
+    coordinator.CacheDeviceBlock(device_kv, KeyFor("page", 0), 0, CacheBoundaryKind::kChunk, 1);
+    coordinator.CacheHostBlock(host_kv, KeyFor("page", 0), std::nullopt);
+    EXPECT_EQ(groups(device), (std::vector<std::uint32_t>{0}));
+    EXPECT_EQ(groups(host), (std::vector<std::uint32_t>{0}));
+
+    // A single State group is still a checkpoint mark, independently per tier.
+    auto host_state = host.AcquireBlock(2);
+    coordinator.CacheHostBlock(host_state, KeyFor("page", 2), std::nullopt);
+    EXPECT_EQ(groups(host), (std::vector<std::uint32_t>{2, 0}));
+    EXPECT_TRUE(entries(host).front().in_use);
+    host_state.reset();
+    EXPECT_FALSE(entries(host).front().in_use);
+    EXPECT_EQ(groups(device), (std::vector<std::uint32_t>{0}));
+    auto device_state = device.AcquireBlock(1);
+    coordinator.CacheDeviceBlock(device_state, KeyFor("page", 1), 0, CacheBoundaryKind::kEndpoint, 2);
+    EXPECT_EQ(groups(device), (std::vector<std::uint32_t>{1, 0}));
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, KeyFor("page", 2)));
+    EXPECT_EQ(groups(host), (std::vector<std::uint32_t>{0}));
+    EXPECT_EQ(groups(device), (std::vector<std::uint32_t>{1, 0}));
 }
 
 }  // namespace
