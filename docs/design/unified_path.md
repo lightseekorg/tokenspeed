@@ -46,8 +46,8 @@ and leaf (`backends/paged/base.py`) alike: `extend_seq_lens`,
 `extend_seq_lens_cpu`, `extend_prefix_lens`, `extend_prefix_lens_cpu` are
 plain `torch.Tensor` (`[>= num_extends]` entries; empty, never `None`, when
 there are no extend requests) and `extend_with_prefix` is a plain `bool`, and `query_shard` is the forward's
-`QueryShardPlan` (plain host integers: which rows of the span this rank
-computes under query context parallelism) or `None` when every rank computes
+`QueryShardPlan` (which rows of the span this rank computes under query
+context parallelism: host integers and the staged row-index tensors) or `None` when every rank computes
 every row.
 Runner-facing nodes additionally take two host-only facts the scheduler
 knows and only V4.1 plans from: `extend_replay_lens_cpu` (how many leading
@@ -1861,17 +1861,49 @@ attn.tp_size == attn.kvp_size`) shards every extend forward of a PD prefill
 engine over the attention TP group, over the pages `--kv-parallel-size N`
 shards. One forward, one path: the scheduler plans the whole
 chunk on every rank, the executor builds a `QueryShardPlan` from the request
-lengths (`execution/query_shard.py`: `row_counts = scatter_count(total, N)`
-— the reduce-scatter / all-gather split, so the `CommManager` row tables
-already describe the shard and the final gather needs no permutation; rank
-order is request order) and puts it on `ForwardContext.query_shard`. The
-model's rows are then `input_ids_buf[start:end]`, `positions_buf[start:end]`
-and the same slice of every per-row input; per-request inputs keep the whole
-batch with `RequestTokenHistoryView.row_offset = start`; a pipeline stage's
-boundary bundle carries shard rows. `ctx.input_num_tokens` and
+lengths (`execution/query_shard.py`) and puts it on
+`ForwardContext.query_shard`. The shard is zigzag per request: every
+request's new rows are cut into `2N` near-equal segments and rank `r` takes
+segments `r` and `2N - 1 - r` of every request, so every rank holds an early
+and a late part of sufficiently long requests — under causal attention the
+two approximately balance. Short requests can leave ranks empty; those ranks
+still join every history collective.
+A contiguous split of the chunk would hand whole requests to single ranks
+and serialize the group-by-group history gathers behind whichever rank owns
+the group's rows. A rank's rows are ascending span rows but not one range:
+the model's rows are `input_ids_buf[plan.local_row_ids]`,
+`positions_buf[plan.local_row_ids]` and the same rows of every per-row
+input; per-request inputs keep the whole batch; a pipeline stage's boundary
+bundle carries shard rows. The collectives over the shard group concatenate
+the ranks' rows rank by rank (*gather order*, `plan.span_to_gather_cpu`), with
+the per-rank counts `plan.row_counts` as the `CommManager` row tables: a leg
+that only moves or sums rows (the dense and MoE legs, the head exchanges,
+the embedding's id gather and row reduce-scatter) works in that order
+unchanged, and whoever reads gathered rows by their span position — the KV
+and index-K writes by slot, the n-gram hash, the sampled and prompt rows of
+the exit — puts them in span order first (`plan.to_span_order`, or the
+`RowSplit` of `plan.split_rows`), one `index_select` of bytes. `ctx.input_num_tokens` and
 `global_num_tokens` keep the scheduler's full-chunk meaning: only collective
 sizing (`CommManager`, `models/base/comm_ops.py`) reads them, a model reads
 its rows from its tensors or `ctx.query_shard`.
+
+Plugin API 4 replaces the contiguous query-shard contract with per-request
+zigzag rows. Plugins must declare support for API 4 after migrating their
+row-layout and request-history consumers; API 3 adapters are incompatible.
+`QueryShardPlan.from_forward` requires an explicit `device` for its row
+indices (use `device="cpu"` for host-only plans).
+The CPU permutation tables are `span_to_gather_cpu` and `gather_to_span_cpu`;
+their target-device copies are `span_to_gather` and `gather_to_span`.
+
+Adapter migration: a query shard no longer exposes a contiguous range
+(`local_slice`, `local_start`, `local_end`). Use `local_row_ids` for device
+row selection and `local_row_ids_cpu` for host planning. Consumers of
+`RequestTokenHistoryView` must use the full request layout together with
+`ctx.query_shard`; `row_offset` cannot represent a zigzag shard. Upgrade
+adapters that rely on those fields together with the runtime. A row gather
+returns rank-major rows, so position-dependent consumers must restore span
+order before reading them; span-order partials must be put in gather order
+before reduce-scatter.
 
 The contract a model (in tree or a plugin) implements:
 
@@ -1902,23 +1934,25 @@ The contract a model (in tree or a plugin) implements:
 * `PagedAttention.latent_prologue(..., key_rows=QueryShardGather(ctx.query_shard,
   mapping.attn.qcp_group))` (through `DeepseekV3AttentionMLA.forward_absorb_qkv_proj`
   automatically): the prologue rotates the local rows without a cache
-  (`mla_prologue(cache=None)`), all-gathers the rotated latent to the whole
-  span with the plan's row counts and stores it owner-masked
+  (`mla_prologue(cache=None)`), all-gathers the rotated latent with the
+  plan's row counts, puts it in span order and stores it owner-masked
   (`latent_store`); `slots` is the whole span. A rank whose shard is empty
   rotates nothing but joins the gather and the store, so a model must reach
   the prologue (and every other QCP collective: the index-K gather, each
   group's history gathers) with zero rows rather than return early; the
   dense MLA path (`DeepseekV3AttentionMLA.forward`, the expanded prologue)
   refuses a shard up front. Index-K the model gathers the same way
-  (`token_all_gather` of the local keys before quantization) and writes
-  with the owner mask.
+  (`token_all_gather` of the local keys before quantization, then span
+  order) and writes with the owner mask.
 * GPU DSA (`backends/paged/dsa.py`): `init_forward_metadata` builds a
   `DSAQueryShardMetadata` — request groups whose summed history fits the
   gather workspace (one whole history, reserved from the cache budget by the
   recipe's `workspace_bytes`, allocated once on the target tree by
   `registry._prepare_fixed_workspaces` and shared with the draft tree, whose
   extend step never gathers concurrently), each with its `row_base` in the request-major
-  history-row numbering, this rank's `local_query` slice, and a
+  history-row numbering, this rank's `local_query` slice (a rank's rows
+  are in request order, so a request range is one run of them; the counts
+  come from `plan.local_rows_per_request`), and a
   `HistoryGatherPlan` (per-owner row counts from `page_table_cpu`,
   `dcp/placement.py: owned_history_rows`). For the indexer the model calls
   `backend.gather_history_index_k(layer_id, pool, group)` per group, which
@@ -1985,7 +2019,8 @@ The contract a model (in tree or a plugin) implements:
   first, then selects the sampled rows — `hidden_states[gather_ids]` on
   whole rows, `gather_sampled_rows` over the group on a shard (one
   byte-preserving all-gather, `token_all_gather_rows`, with
-  `sampled_rows_per_rank`; rank order is request order) — and runs the LM
+  `sampled_rows_per_rank`, then `plan.sampled_to_request` back to request
+  order) — and runs the LM
   head on the batch's `[bs, hidden]` rows, so the vocab all-gather is the
   TP one. The group of both gathers is the processor's TP group: the LM
   head is vocab-sharded over it, every rank of it must end with the same
@@ -2002,11 +2037,12 @@ The contract a model (in tree or a plugin) implements:
   model cannot serve prompt logprobs, sharded or not. `ctx.gather_ids`
   keeps the batch's full layout on every forward, the
   drafters' extend steps included (Eagle's step 0 and every depth of the
-  multi-depth `Mtp` drafter read the shard's slice of the shifted prefill
+  multi-depth `Mtp` drafter read the shard's rows of the shifted prefill
   ids and positions, chain the shard's hidden rows, and carry the plan on
   their context; `Mtp` sums its cross-chunk stash of target hiddens over
-  the group, one owner per row): `QueryShardPlan.local_sampled_ids(
-  ctx.gather_ids)` is the one place that cuts them to the shard, used by
+  the group, one owner per row). The plan derives `local_sampled_index`
+  from each request's last row; QCP consumers read it directly instead of
+  passing full-layout gather ids into a shard-local selector. It is used by
   `gather_sampled_rows` and by any model that narrows to its live rows
   itself. A draft model's FULL capture under a shard is the shard's rows,
   which is what the next depth consumes.
@@ -2015,15 +2051,15 @@ The contract a model (in tree or a plugin) implements:
   plan's targets and slots on every rank (the shifted ids are the whole span
   everywhere, so the target audit flags the same requests on every rank)
   and keeps as this rank's `InputLogprobRows.rows` the plan's rows inside
-  its shard, re-based to it; the plan's rows are sorted, so each rank's are
-  one contiguous run and the per-rank counts (`rows_per_rank`) are host
-  arithmetic over the shard boundaries (`QueryShardPlan.rows_per_rank`,
-  `local_rows_run` — the one row split of the plan, the same that counts
-  the sampled rows per rank; it refuses unsorted rows rather than miscount
-  them). Scoring a row needs its full-vocabulary logits, and
+  its shard, as indices into it, with the per-rank counts (`rows_per_rank`)
+  and the index that restores plan order after the gather
+  (`gathered_to_rows`): host arithmetic over the shard's row tables
+  (`QueryShardPlan.split_rows` — the one row split of the plan, the same
+  that splits the sampled rows). Scoring a row needs its full-vocabulary
+  logits, and
   the head is vocab-sharded over the group: every rank must hold every
   planned row, so `compute_input_token_logprobs` all-gathers the planned
-  rows' activations with those counts (`[plan rows, hidden]`, rank order is
+  rows' activations with those counts (`[plan rows, hidden]`, put back in
   row order — a rank without a planned row contributes none and still
   joins) and then runs the unsharded chunk loop over the whole plan on
   every rank; the chunk schedule is thereby the same on every rank, which

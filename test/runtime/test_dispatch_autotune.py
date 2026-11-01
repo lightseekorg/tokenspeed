@@ -322,12 +322,14 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
 
 def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     """The dummy extend carries the engine's shard plan (make_dummy_batch),
-    and the target forward sees this rank's slice of the span -- ids,
+    and the target forward sees this rank's rows of the span -- ids,
     positions and the per-row model inputs -- as a real sharded extend does."""
     plan = QueryShardPlan.from_forward(
-        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2
+        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2, device="cpu"
     )
-    assert plan.local_slice == slice(8, 12)
+    # Every request is four rows, one per zigzag segment of the first four:
+    # rank 2 computes the third row of each.
+    assert plan.local_row_ids.tolist() == [2, 6, 10, 14]
     seen = {}
     events = []
     group = object()  # Stands in for the gloo CPU group.
@@ -380,9 +382,9 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     )
     _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
     ModelExecutor.autotune(executor)
-    assert seen["input_ids"].tolist() == [8, 9, 10, 11]
-    assert seen["positions"].tolist() == [80, 90, 100, 110]
-    assert seen["rows"] == slice(8, 12) and seen["span"] == 16
+    assert seen["input_ids"].tolist() == [2, 6, 10, 14]
+    assert seen["positions"].tolist() == [20, 60, 100, 140]
+    assert seen["rows"].tolist() == [2, 6, 10, 14] and seen["span"] == 16
     assert pg_manager.requests == [("gloo", (0, 1, 2, 3))]
     assert events == [
         ("load", None, group, 0),
