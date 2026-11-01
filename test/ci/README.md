@@ -86,6 +86,20 @@ The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
 GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
 unquantized.
 
+The Qwen3.8 Flash Next MXFP4 monokernel task serves the same checkpoint on
+one GPU with `--decode-monokernel` and three-step MTP. It uses the same 2-GPU
+MI35x runners, whose Hugging Face cache already holds the checkpoint. It sends the first
+128 GSM8K test questions one at a time
+(`test/single_request_benchmark/gsm8k_decode.py`). Every decode step then has
+one request, so the decode monokernel serves every step. The batched GSM8K
+eval runs more than four token rows per step, so it keeps the regular path.
+One server start gates two things. The benchmark exits with status 1 when
+accuracy is below 0.88. `perf_reference` gates the per-request decode rate,
+which leaves out time to first token. The reference is provisional and the
+task is optional until runs on the runner set the reference. The benchmark
+writes per-request records under
+`.ci-artifacts/published/gsm8k-single-request`.
+
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
 invalid TPOT fails collection instead of producing a zero-throughput report.
