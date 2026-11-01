@@ -34,7 +34,13 @@ from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        launch_gluon_mha_decode_balanced_gfx950 as _decode_balanced_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
         launch_gluon_mha_decode_gfx950 as _decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        launch_gluon_mha_decode_schedule_gfx950 as _decode_schedule_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
         launch_gluon_mha_extend_gfx950 as _extend_impl,
@@ -72,7 +78,9 @@ if current_platform().is_amd:
                 torch.float8_e5m2,
             },
         ),
-        priority=Priority.SPECIALIZED,
+        # Above the balanced-schedule decode, which only calls with a
+        # schedule select.
+        priority=Priority.SPECIALIZED + 1,
         traits={
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64}),
@@ -84,6 +92,58 @@ if current_platform().is_amd:
     )
     def gluon_mha_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _decode_impl(*args, **kwargs)
+
+    # The balanced-schedule decode: full attention split by a schedule that
+    # mha_decode_schedule computes from the lengths once per step. It reads
+    # one (the split_schedule feature); the split grid ranks above it, so
+    # calls without a schedule keep that.
+    _BALANCED_GFX950 = dict(
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            },
+        ),
+        traits={
+            "head_dim": frozenset({64, 128}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "sliding_window": frozenset({False}),
+        },
+    )
+
+    @register_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        name="gluon_mha_decode_balanced_gfx950",
+        features={"split_schedule"},
+        priority=Priority.SPECIALIZED,
+        **_BALANCED_GFX950,
+    )
+    def gluon_mha_decode_balanced_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        return _decode_balanced_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mha_decode_schedule",
+        name="gluon_mha_decode_schedule_gfx950",
+        priority=Priority.SPECIALIZED,
+        **_BALANCED_GFX950,
+    )
+    def gluon_mha_decode_schedule_gfx950(**kwargs):
+        return _decode_schedule_impl(**kwargs)
 
     @register_kernel(
         "attention",
