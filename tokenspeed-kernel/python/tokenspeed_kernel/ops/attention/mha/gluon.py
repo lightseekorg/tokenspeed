@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -37,6 +38,9 @@ if current_platform().is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
         launch_gluon_mha_extend_gfx950 as _extend_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        warmup_gluon_mha_extend_gfx950 as _extend_warmup_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (
         launch_gluon_mha_prefill_gfx950 as _prefill_impl,
@@ -213,4 +217,8 @@ if current_platform().is_amd:
         },
     )
     def gluon_mha_extend_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        if is_warming_up():
+            # The tile, pipeline depth and grid follow the batch; compile
+            # every choice at startup rather than on a later request's forward.
+            _extend_warmup_impl(*args, **kwargs)
         return _extend_impl(*args, **kwargs)
