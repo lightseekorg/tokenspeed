@@ -380,10 +380,17 @@ def triton_gqa_prologue(
     norm: HeadNorm | None,
     rotary: Rotary | None,
     cache: HeadKVCache,
+    query_dtype: torch.dtype,
     return_kv: bool,
     enable_pdl: bool,
 ) -> GQAPrologueOutput:
-    prepared = current_platform().is_cdna4 and norm is None and rotary is None
+    # A query to convert takes the copying path even when prepared.
+    prepared = (
+        current_platform().is_cdna4
+        and norm is None
+        and rotary is None
+        and query_dtype == q.dtype
+    )
     num_tokens = q.shape[0]
     num_kv_heads, head_dim = cache.k_cache.shape[1:]
     num_q_heads = q.shape[1:].numel() // head_dim
@@ -391,7 +398,7 @@ def triton_gqa_prologue(
         q.flatten(1)
         if prepared
         else torch.empty(
-            (num_tokens, num_q_heads * head_dim), dtype=q.dtype, device=q.device
+            (num_tokens, num_q_heads * head_dim), dtype=query_dtype, device=q.device
         )
     )
     k_out = (

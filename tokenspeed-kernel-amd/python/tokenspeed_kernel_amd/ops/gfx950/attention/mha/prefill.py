@@ -32,7 +32,10 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2_VALUE,
     _LN2,
     InputStrides,
+    _mfma_unscaled_fp8,
     attention_layouts,
+    fp8_lse_shift,
+    fp8_probability_shift,
     max,
     maximum,
 )
@@ -103,7 +106,8 @@ class AttentionConfig:
         assert HEAD_DIM in (64, 128)
         assert NUM_WARPS == 4
 
-        # Prefill uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        # Prefill uses a 32x32 MFMA with NUM_WARPS warp tiling: depth 16 for
+        # BF16, depth 64 (F8F6F4, twice the rate) for FP8.
         (
             qk_layout,
             pv_layout,
@@ -121,7 +125,7 @@ class AttentionConfig:
             IS_FP8,
             KV_DTYPE,
             num_warps=NUM_WARPS,
-            instr_shape=[32, 32, 16],
+            instr_shape=[32, 32, 64] if IS_FP8 else [32, 32, 16],
         )
         self.N_HEADS = gl.constexpr(N_HEADS)
         self.N_KV_HEADS = gl.constexpr(N_KV_HEADS)
@@ -329,10 +333,14 @@ class AttentionProgram:
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
+        if cfg.IS_FP8:
+            return _mfma_unscaled_fp8(q, k, qk)
         return cdna4.mfma(q, k, qk)
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
+        if self.cfg.IS_FP8:
+            return _mfma_unscaled_fp8(p, v, acc)
         return cdna4.mfma(p, v, acc)
 
     @gluon.jit
@@ -413,7 +421,8 @@ class AttentionProgram:
                 invalid = m_new == -float("inf")
                 m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
 
-            qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+            p_shift = fp8_probability_shift(m_new_scaled, cfg.IS_FP8)
+            qk_shifted = qk * cfg.SM_SCALE - p_shift[:, None]
             p_f32 = gl.exp2(qk_shifted)
             m_diff = m_i * cfg.SM_SCALE - m_new_scaled
             if HAS_INVALID:
@@ -430,7 +439,7 @@ class AttentionProgram:
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            l_i += gl.exp2(sink_log2 - m_i * cfg.SM_SCALE)
+            l_i += gl.exp2(sink_log2 - fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8))
         return l_i
 
     @gluon.jit
@@ -461,10 +470,11 @@ class AttentionProgram:
             )
             mask = offs_m < self.seq_len
             lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
-            # Softmax runs in base-2 (exp2 hardware fast path), so m_i*SM_SCALE +
-            # log2(l_i) is the LSE in base-2 units. Convert to natural log (the
-            # public op contract / torch.logsumexp convention) by scaling by ln2.
-            lse = (m_i * cfg.SM_SCALE + gl.log2(lse_l_i)) * _LN2
+            # Softmax runs in base 2, so `fp8_lse_shift(m_i) + log2(l_i)` is
+            # the base-2 LSE; scale by ln 2 for the natural-log contract.
+            lse = (
+                fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8) + gl.log2(lse_l_i)
+            ) * _LN2
             cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
 
@@ -802,12 +812,13 @@ def process_single_attention_tile(program: AttentionProgram):
     row_has_valid = gl.any(valid, axis=1)
     row_max = max(qk, 1)
     m_i = gl.where(row_has_valid, row_max, 0.0)
-    m_i_scaled = m_i * cfg.SM_SCALE
-    p = gl.where(valid, gl.exp2(qk * cfg.SM_SCALE - m_i_scaled[:, None]), 0.0)
+    # Scales p up for an FP8 conversion (see FP8_PROBABILITY_LOG2_SCALE).
+    p_shift = fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8)
+    p = gl.where(valid, gl.exp2(qk * cfg.SM_SCALE - p_shift[:, None]), 0.0)
     l_i = gl.sum(p, axis=1)
     if cfg.HAS_SINK:
         sink_log2 = gl.load(program.sink_ptr + program.q_head).to(gl.float32) * _INV_LN2
-        l_i += gl.exp2(sink_log2 - m_i_scaled)
+        l_i += gl.exp2(sink_log2 - p_shift)
 
     acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
     p = p.to(program.q_ptr.dtype.element_ty)

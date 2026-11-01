@@ -1238,6 +1238,10 @@ attention uses its own split kernels.
 - The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
   64 or 128. FP8 queries produce a BF16 output. Sinks are supported;
   `logit_cap` and LSE output are not.
+- FP8 queries and caches are read at unit scale. Their P @ V MFMA takes the
+  softmax probabilities in FP8 at 256 times their value, so a probability
+  down to about 2^-17 of its row's largest keeps a nonzero FP8 value
+  (2^-17 x 256 = 2^-9, e4m3's smallest subnormal; e5m2 has more range).
 - Each request has `max_seqlen_q` queries, its last cached tokens (1 for plain
   decode, the verify width for speculative verify): query `i` sees the keys
   before `cache_seqlens - (max_seqlen_q - 1 - i)`, so every length counts at
@@ -1299,6 +1303,8 @@ KV cache, and `gluon_mha_prefill_sliding_gfx950` the sliding-window variant.
   then still uses one binary, at the cost of a copy of the views.
 - The request count and `max_seqlen` are unspecialized runtime arguments:
   one binary serves every batch.
+- FP8 Q/K/V are read at unit scale, with the probabilities scaled as in
+  decode, and produce a BF16 output.
 
 #### Algorithm
 
@@ -1310,7 +1316,8 @@ slots, which take that request's query blocks in alternating directions so
 the long late blocks spread out. More requests take further rounds; in the
 last round, slots past the last request are skipped. With skip-softmax, a
 shared ticket counter hands out blocks instead. The sliding-window kernel
-walks (request, head, query block) items in order, 512 apart.
+walks (request, head, query block) items in order, 512 apart. FP8 runs both
+products on `V_MFMA_F32_32X32X64_F8F6F4`, as in extend.
 
 ### gfx950 MHA cached extension
 
@@ -1325,7 +1332,8 @@ the partials by LSE.
 - The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
   64 or 128. Query heads per KV head need not be a power of two. Full,
   causal and sliding-window masking, sinks and LSE output are supported;
-  `logit_cap` is not.
+  `logit_cap` is not. FP8 queries and caches are read at unit scale, with
+  the probabilities scaled as in decode.
 - The split count comes from the query blocks and `max_seqlen_k`, not from
   device-resident lengths, so graphs replay for any batch composition.
   Sliding-window attention does not split.
@@ -1351,6 +1359,9 @@ window of at least 2047 keys a prefix of at least the window and one to four
 work-groups per CU over the launch. `max_seqlen_k` should be the longest
 request's length, as serving passes for pure extends; the context limit would
 send short-prefix extends to the slower 8-wave tile.
+Both products run on 32x32 MFMAs: depth 16 for BF16, and
+`V_MFMA_F32_32X32X64_F8F6F4` for FP8, four times the depth in twice the cycles
+(CDNA4 ISA, Table 28).
 
 K/V pages use the same four-deep LDS pipeline as decode when the buffers leave
 two workgroups per CU (head dim 64). Split launches always pipeline; unsplit

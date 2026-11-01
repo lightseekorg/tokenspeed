@@ -34,8 +34,11 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2_VALUE,
     InputStrides,
     attention_layouts,
+    fp8_lse_shift,
+    fp8_probability_shift,
     max,
     maximum,
+    reject_block_scales,
     select_kv_splits,
 )
 
@@ -416,7 +419,7 @@ class AttentionProgram:
     def apply_sinks(self, l_i, m_i, sink_log2, has_sink: gl.constexpr):
         cfg = self.cfg
         if has_sink:
-            l_i += gl.exp2(sink_log2 - m_i * cfg.SM_SCALE)
+            l_i += gl.exp2(sink_log2 - fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8))
         return l_i
 
     @gluon.jit
@@ -572,7 +575,8 @@ class AttentionProgram:
             # one query position every row sees the same keys, so no row does.
             invalid = m_new == -float("inf")
             m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
-        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+        p_shift = fp8_probability_shift(m_new_scaled, cfg.IS_FP8)
+        qk_shifted = qk * cfg.SM_SCALE - p_shift[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
         if cfg.MAX_SEQLEN_Q > 1:
@@ -608,7 +612,7 @@ class AttentionProgram:
         part_o = gl.where(has_kv[:, None], acc * recip_l_i[:, None], 0.0)
         part_lse = gl.where(
             has_kv,
-            m_i * cfg.SM_SCALE + gl.log2(l_i),
+            fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8) + gl.log2(l_i),
             -float("inf"),
         )
         mid_o_offsets = (
@@ -1378,6 +1382,9 @@ def launch_gluon_mha_decode_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    reject_block_scales(
+        "gluon_mha_decode_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
     total_q = q.shape[0]
 
     has_sink = sinks is not None
