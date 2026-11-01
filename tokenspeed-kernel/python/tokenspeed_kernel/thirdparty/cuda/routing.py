@@ -88,8 +88,14 @@ def softplus_sqrt_topk_flash(
     renorm: bool = False,
     *,
     enable_pdl: bool,
+    correction_bias_alt: torch.Tensor | None = None,
+    bias_alt_mask: torch.Tensor | None = None,
 ) -> None:
-    """Select routes using the explicitly supplied PDL launch policy."""
+    """Select routes, optionally choosing an alternate bias on masked rows.
+
+    correction_bias_alt is a contiguous FP32 [experts] vector and bias_alt_mask
+    a contiguous bool [tokens] tensor. Supply both or neither.
+    """
     _load_routing_module().softplus_sqrt_topk_flash(
         input,
         correction_bias,
@@ -97,6 +103,8 @@ def softplus_sqrt_topk_flash(
         topk_weights,
         bool(renorm),
         float(scaling_factor),
+        correction_bias_alt,
+        bias_alt_mask,
         bool(enable_pdl),
     )
 

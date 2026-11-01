@@ -116,7 +116,7 @@ register_kernel(
         for dtype in (torch.float16, torch.bfloat16, torch.float32)
     ),
     traits={
-        "routing_kind": frozenset({"plain", "bias", "hash"}),
+        "routing_kind": frozenset({"plain", "bias", "bias_alt", "hash"}),
         "score_function": frozenset({"sqrt_softplus"}),
     },
     priority=Priority.PORTABLE,
