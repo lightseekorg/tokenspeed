@@ -1143,6 +1143,8 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         # K3 width-64 decode: 1,024 routes take the fused one-program
         # histogram and prefix scan; most of the 896 experts stay empty.
         (64, 896, 16, 16, True),
+        # Dense 1,024 routes over 256 experts: most experts get a padded block.
+        (128, 256, 8, 16, True),
     ],
 )
 def test_route_sort_contract_gfx950(
