@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import replace
 from fractions import Fraction
 from functools import cached_property
@@ -45,6 +46,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_name,
+    cache_field_layer_id,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
     QwenGDNRecipe,
@@ -55,6 +58,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
+
+
+def _own_planes(
+    spec: CacheGroupSpec, fields: tuple[CacheFieldSpec, ...]
+) -> tuple[CacheFieldSpec, ...]:
+    """Move a side group's fields from the decoder planes onto planes of its own."""
+    return tuple(
+        replace(field, plane_id=f"{spec.group_id}.{field.plane_id}") for field in fields
+    )
 
 
 class Qwen4ExpRecipe(QwenGDNRecipe):
@@ -323,7 +335,9 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 plane_capacity[field.plane_id] = max(
                     plane_capacity.get(field.plane_id, 0), field.payload_bytes
                 )
-        shared_extras = []
+        groups = list(decoder_groups)
+        # Indices in groups of shared side groups wider than a K page somewhere.
+        wider_than_k_page = []
         for spec, fields in extras:
             plane_bytes: dict[str, int] = {}
             for field in sorted(fields, key=lambda field: field.field_id):
@@ -348,13 +362,51 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                         size <= plane_capacity[plane]
                         for plane, size in plane_bytes.items()
                     )
-            if not compatible:
-                fields = tuple(
-                    replace(field, plane_id=f"{spec.group_id}.{field.plane_id}")
-                    for field in fields
+                    if compatible and any(
+                        size > attention_plane_bytes[plane]
+                        for plane, size in plane_bytes.items()
+                    ):
+                        wider_than_k_page.append(len(groups))
+            groups.append((spec, fields if compatible else _own_planes(spec, fields)))
+        # A pipeline stage allocates each plane its own layers' fields touch,
+        # whole (CacheMemoryPlan.narrow_to_layers), so a side field on a plane
+        # that its layer's decoder fields do not use costs that layer's stage
+        # the whole plane, which can exceed the plane of its own that sharing
+        # saves. A group that fits one K page per plane keeps the layout it
+        # always had. A wider one shares only if no stage of a single layer
+        # then holds more bytes; a stage of several layers then holds no more
+        # either, whatever the split, so every stage plans the same layout.
+        for index in wider_than_k_page:
+            spec, fields = groups[index]
+            separate = groups.copy()
+            separate[index] = (spec, _own_planes(spec, fields))
+            layers = sorted({cache_field_layer_id(field.field_id) for field in fields})
+            if any(
+                shared > own
+                for shared, own in zip(
+                    self._single_layer_stage_bytes(groups, layers),
+                    self._single_layer_stage_bytes(separate, layers),
+                    strict=True,
                 )
-            shared_extras.append((spec, fields))
-        return decoder_groups + tuple(shared_extras)
+            ):
+                groups = separate
+        return tuple(groups)
+
+    def _single_layer_stage_bytes(
+        self, groups: Sequence[CacheGroupDeclaration], layers: Sequence[int]
+    ) -> list[int]:
+        """Bytes per parent that a stage of just one layer holds, per ``layers``."""
+        parent = pack(
+            groups,
+            prefix_granularity=self.prefix_granularity,
+            cache_blocks_per_lcm_block=self.packing(groups),
+            alignment=self.alignment,
+            max_padding_fraction=self.max_padding_fraction,
+        ).bind(1)
+        return [
+            parent.narrow_to_layers(layer, layer + 1).resident_block_bytes
+            for layer in layers
+        ]
 
     @override
     def _verify_workspace_field_suffixes(self) -> tuple[str, ...]:

@@ -46,6 +46,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qwen4_exp_ple_conv_field,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
+    local_cache_capacity,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     pack,
@@ -866,6 +869,102 @@ def test_qwen4_exp_ple_commit_writes_each_layer_at_its_page_stride() -> None:
             torch.testing.assert_close(field[page], rows[row], rtol=0, atol=0)
             field[page].view(torch.uint8).fill_(0x5A)
     assert torch.equal(arena.buffer, poisoned)
+
+
+def test_qwen4_exp_ple_sharing_never_grows_a_pipeline_stage() -> None:
+    # One recurrent layer and three attention layers in two pipeline stages,
+    # every plane 512 KiB: one fp32 recurrent state, or eight 64 KiB FP8 K or
+    # V pages. The PLE state (16,384 x 9 bf16) sits on layer 2, in stage 1.
+    recipe = _qwen4_exp_fp8_kv_recipe(
+        layer_types=(LINEAR_ATTENTION,) + (FULL_ATTENTION,) * 3,
+        ple_layer_ids=[3],
+        hidden_size=4096,
+        linear=LinearAttnConfig(
+            num_k_heads=4,
+            num_v_heads=8,
+            head_k_dim=128,
+            head_v_dim=128,
+            conv_kernel_size=4,
+            layer_ids=(0,),
+            tp_size=1,
+        ),
+        num_kv_heads=2,
+        head_dim=256,
+        mamba_ssm_dtype="float32",
+        qsa=False,
+        draft_num_kv_heads=None,
+        verify_width=1,
+        max_bs=2,
+        cache_budget_bytes=512 << 20,
+        device="cpu",
+    )
+    stages = {
+        window: recipe.setup_for_layers(
+            resident_cache_window=window, synchronize_capacity=local_cache_capacity
+        )
+        for window in ((0, 2), (2, 4))
+    }
+    resident = {
+        window: setup.spec.memory_plan.narrow_to_layers(*window).resident_block_bytes
+        for window, setup in stages.items()
+    }
+    # Shared, the PLE state would take layer 0's recurrent-state plane, which
+    # stage 1 would then hold whole: five planes per parent, 203 parents. Its
+    # own plane (295,168 bytes with the n-gram context) costs less.
+    assert resident == {(0, 2): 3 * (512 << 10), (2, 4): 4 * (512 << 10) + 295_168}
+    assert [setup.local_parent_limit for setup in stages.values()] == [340, 223]
+
+
+@pytest.mark.parametrize("ple_layer_ids", ([2], [3]), ids=("served", "moved"))
+def test_qwen4_exp_served_shape_ple_state_costs_no_parents(ple_layer_ids) -> None:
+    # Qwen3.8-Flash-Next at TP1 as served: FP8 KV, bf16 recurrent state, QSA
+    # and one nextn MTP layer verifying four tokens, with a 194.3 GB cache
+    # budget as on a GB300. Served, the PLE state is on layer 1; "moved" puts
+    # it on layer 2, which does not use the plane PLE shares.
+    layer_types = ((LINEAR_ATTENTION,) * 3 + (FULL_ATTENTION,)) * 12
+
+    def setup(ple_layer_ids):
+        return _qwen4_exp_fp8_kv_recipe(
+            layer_types=layer_types,
+            ple_layer_ids=ple_layer_ids,
+            hidden_size=2560,
+            linear=LinearAttnConfig(
+                num_k_heads=16,
+                num_v_heads=48,
+                head_k_dim=128,
+                head_v_dim=128,
+                conv_kernel_size=4,
+                layer_ids=tuple(
+                    layer
+                    for layer, layer_type in enumerate(layer_types)
+                    if layer_type == LINEAR_ATTENTION
+                ),
+                tp_size=1,
+            ),
+            num_kv_heads=2,
+            head_dim=256,
+            mamba_ssm_dtype="bfloat16",
+            qsa=True,
+            draft_num_kv_heads=2,
+            verify_width=4,
+            max_bs=1,
+            cache_budget_bytes=194_300_000_000,
+            device="cpu",
+        ).setup()
+
+    with_ple = setup(ple_layer_ids).spec.memory_plan
+    without_ple = setup([]).spec.memory_plan
+    # Thirteen K/V layer pairs on 26 planes of one 1.5 MiB recurrent state each.
+    # The 180 KiB PLE state packs onto them instead of a 22.5 MiB plane of its
+    # own, which made parents 64,489,472 bytes: 3,007 of them in this budget.
+    assert with_ple.lcm_block_bytes == without_ple.lcm_block_bytes == 26 * (3 << 19)
+    assert with_ple.num_lcm_blocks == without_ple.num_lcm_blocks == 4_743
+    # A pipeline stage holds no more for the PLE state either.
+    for window in ((0, 24), (24, 49)):
+        assert (
+            with_ple.narrow_to_layers(*window).resident_block_bytes
+            == without_ple.narrow_to_layers(*window).resident_block_bytes
+        )
 
 
 def test_parent_is_its_planes_whatever_the_group_packings() -> None:

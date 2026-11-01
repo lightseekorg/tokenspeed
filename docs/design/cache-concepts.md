@@ -1645,8 +1645,12 @@ planes reserved in every attention or recurrent-state parent. Compressed QSA
 keeps its exact page stride; PLE and recent QSA state consume the explicit
 strides chosen by the common packer, which differ between planes of different
 widths, so each layer's state is copied at its own stride.
-Groups whose fields do not fit the attention planes, or whose exact strides
-require inconsistent packing ratios, retain separate planes.
+Groups whose fields do not fit the widest decoder field of each plane, or whose
+exact strides require inconsistent packing ratios, retain separate planes. A
+group wider than one K page also retains them when sharing would make a
+pipeline stage of one layer hold more bytes: a stage allocates every plane its
+layers' fields touch, so a field on another layer's plane costs that stage the
+whole plane.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
