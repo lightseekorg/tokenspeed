@@ -21,6 +21,7 @@
 #include "scheduler/types.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -148,6 +149,24 @@ void SchedulerConfig::Validate() const {
         throw std::invalid_argument(
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
             "pool (--retraction-snapshot-host-gb > 0): without one nothing can be retracted");
+    }
+    if (HasHostCache() || HasSnapshotPool()) {
+        if (host_group_packing.size() != cache_groups.size()) {
+            throw std::invalid_argument("Scheduler: Host pools require explicit packing for every cache group");
+        }
+        for (std::size_t i = 0; i < cache_groups.size(); ++i) {
+            const std::int32_t packing = host_group_packing[i];
+            if (packing <= 0 || packing % cache_groups[i].shard_count != 0) {
+                throw std::invalid_argument("Scheduler: Host packing must be positive and divisible by shard_count");
+            }
+            const std::int64_t parents =
+                std::max(host_allocator.NumUsableBlocks(), snapshot_allocator.NumUsableBlocks());
+            if (parents * packing > std::numeric_limits<std::int32_t>::max()) {
+                throw std::invalid_argument("Scheduler: Host cache block ids exceed int32 range");
+            }
+        }
+    } else if (!host_group_packing.empty()) {
+        throw std::invalid_argument("Scheduler: Host packing requires an L2 or snapshot pool");
     }
 }
 

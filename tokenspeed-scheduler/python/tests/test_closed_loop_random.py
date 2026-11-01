@@ -188,6 +188,11 @@ class _Loop:
             groups = list(cfg.cache_groups)
             random.Random(seed + 2).shuffle(groups)
             cfg.cache_groups = groups
+        if host_pages > 0 or num_snapshot_pages > 1:
+            # These scenarios use Device packing on Host, in declaration order.
+            cfg.host_group_packing = [
+                group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+            ]
         self.history_group = [group.group_id for group in cfg.cache_groups].index(
             HISTORY
         )

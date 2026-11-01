@@ -255,6 +255,7 @@ def scheduler_config_from_args(
         enable_l3_storage=has_l3,
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,
+        host_group_packing=specs.host_group_packing,
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
         host_write_policy=server_args.kvstore_write_policy,

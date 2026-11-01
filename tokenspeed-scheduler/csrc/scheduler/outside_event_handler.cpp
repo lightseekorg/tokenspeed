@@ -139,6 +139,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
             coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
         }
     }
+    coordinator_.RefreshRetainedCheckpoint(progress.retained_input_checkpoint);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }

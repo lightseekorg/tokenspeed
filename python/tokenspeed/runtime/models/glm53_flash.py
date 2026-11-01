@@ -97,12 +97,10 @@ from tokenspeed.runtime.models.glm5 import (
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -1473,8 +1471,6 @@ class Glm53FlashDecoderLayer(nn.Module):
 class Glm53FlashModel(nn.Module):
     """GLM-5.3-Flash text backbone with alternating KDA and sparse MLA layers."""
 
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: Glm53FlashTextConfig,
@@ -1816,13 +1812,6 @@ class Glm53FlashForConditionalGeneration(nn.Module):
                 "GLM-5.3-Flash encoder-only mode does not expose an LM head"
             )
         return self.language_model.lm_head
-
-    def pad_input_ids(
-        self,
-        input_ids: list[int],
-        mm_inputs: MultimodalInputs,
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def multimodal_input_embeds(

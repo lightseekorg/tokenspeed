@@ -684,5 +684,105 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     }
 }
 
+TEST(JointMatchInvariantsTest, AvailabilitySeparatesStateMissingFromFullKvMissing) {
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    BlockPool device(64, {1, 1, 1});
+    BlockPool host(64, {1, 1, 1});
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/true);
+    const auto hashes = MakeHashes(3);
+    CacheBlockFor(coordinator, device, hashes[0], 0);
+    CacheBlockFor(coordinator, host, hashes[1], 0);
+    CacheBlockFor(coordinator, device, hashes[1], 1);
+    CacheBlockFor(coordinator, host, hashes[0], 2);
+    CacheBlockFor(coordinator, host, hashes[2], 1);
+    CacheBlockFor(coordinator, device, hashes[2], 2);
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .max_tokens = 12};
+    const auto before = coordinator.ProbePromptPrefix(prompt);
+    const auto rows = coordinator.InspectPrefixAvailability(prompt);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0].tokens, 12);
+    EXPECT_EQ(rows[0].union_missing, 1u);  // Both states exist, the Full KV has a hole.
+    EXPECT_EQ(rows[1].tokens, 8);
+    EXPECT_EQ(rows[1].union_missing, 4u);  // Full KV spans the tiers; only state2 is missing.
+    EXPECT_EQ(rows[2].tokens, 4);
+    EXPECT_EQ(rows[2].union_missing, 2u);  // state1 and state2 have no common boundary.
+    EXPECT_EQ(rows[1].device_missing, 5u);
+    EXPECT_EQ(rows[1].host_missing, 7u);
+    const auto after = coordinator.ProbePromptPrefix(prompt);
+    EXPECT_EQ(before.host.num_common_tokens, after.host.num_common_tokens);
+    EXPECT_EQ(before.device.num_common_tokens, after.device.num_common_tokens);
+    EXPECT_EQ(after.host.num_common_tokens, 0);
+}
+
+TEST(JointMatchInvariantsTest, AvailabilityChecksSlidingLookbackAndSkipsReplayableGroups) {
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 4},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .replayable = true,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 4},
+    };
+    BlockPool device(64, {1, 1, 1});
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false);
+    const auto hashes = MakeHashes(3);
+    for (const auto& hash : hashes) {
+        CacheBlockFor(coordinator, device, hash, 0);
+    }
+    CacheBlockFor(coordinator, device, hashes[0], 1);
+    CacheBlockFor(coordinator, device, hashes[2], 1);
+    const auto rows = coordinator.InspectPrefixAvailability({.prefix_hashes = hashes, .max_tokens = 12});
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0].union_missing, 2u);  // Last window block alone is insufficient.
+    EXPECT_EQ(rows[1].union_missing, 2u);
+    EXPECT_EQ(rows[2].union_missing, 0u);
+    EXPECT_EQ(rows[2].host_missing, 3u);  // No Host pool; replayable group is still excluded.
+}
+
+TEST(JointMatchInvariantsTest, AvailabilityIncludesUnalignedTailAndStateOnAnotherTier) {
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    BlockPool device(64, {1, 1});
+    BlockPool host(64, {1, 1});
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/true);
+    const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6};
+    const std::vector<std::string> hashes{HashPrefixPage(std::span(tokens).first(4), "")};
+    const auto tail_hash = HashPrefixPage(std::span(tokens).subspan(4), hashes[0]);
+    CacheBlockFor(coordinator, device, hashes[0], 0);
+    CacheBlockFor(coordinator, device, hashes[0], 1);
+    CacheBlockFor(coordinator, host, tail_hash, 0);
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes,
+                                                .tokens = tokens,
+                                                .max_tokens = 6,
+                                                .tail = TailPublication{.tail_tokens = 2, .hash = tail_hash}};
+    auto rows = coordinator.InspectPrefixAvailability(prompt);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0].tokens, 6);
+    EXPECT_EQ(rows[0].union_missing, 2u);
+    EXPECT_EQ(rows[1].tokens, 4);
+    EXPECT_EQ(rows[1].union_missing, 0u);
+    CacheBlockFor(coordinator, host, tail_hash, 1);
+    rows = coordinator.InspectPrefixAvailability(prompt);
+    EXPECT_EQ(rows[0].union_missing, 0u);
+    EXPECT_EQ(rows[0].device_missing, 3u);
+    EXPECT_EQ(rows[0].host_missing, 1u);
+}
+
 }  // namespace
 }  // namespace tokenspeed

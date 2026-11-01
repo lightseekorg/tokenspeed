@@ -113,6 +113,7 @@ def make_config(
     role: str,
     *,
     num_snapshot_pages: int,
+    host_group_packing: Sequence[int],
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
     host_write_policy: str,
@@ -147,6 +148,8 @@ def make_config(
             resident instead of suspending anyone; more enables suspend and
             restore on the fused and decode roles (the prefill role refuses a
             pool).
+        host_group_packing: Virtual children per compact Host parent in
+            scheduler group order; empty when both Host pools are absent.
         max_retracted_requests: Slot-state arena rows, hence the most
             requests suspended at once; positive exactly when a pool exists.
             A victim whose image does not fit the Host (L2 pins, pool, rows)
@@ -208,6 +211,7 @@ def make_config(
 
     cfg.num_host_pages = num_host_pages
     cfg.num_snapshot_pages = num_snapshot_pages
+    cfg.host_group_packing = list(host_group_packing)
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.storage_config = storage_config

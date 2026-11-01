@@ -276,5 +276,71 @@ TEST(BoundaryTreeTest, HostLeavesFollowPresence) {
     EXPECT_EQ(tree.FirstHostLeaf(), nullptr);
 }
 
+TEST(BoundaryTreeTest, DuplicatePreflightPrunesPendingAndIncompletePrefixesAcrossRoots) {
+    BoundaryTree tree;
+    Node& root = tree.FindOrAdd("root", nullptr, 4, 0);
+    Node& left = tree.FindOrAdd("left", &root, 8, 0);
+    Node& leaf = tree.FindOrAdd("leaf", &left, 12, 0);
+    Node& other = tree.FindOrAdd("other", nullptr, 4, 0);
+    for (Node* node : {&root, &left, &leaf, &other}) {
+        tree.SetDeviceKvCoverage(*node, true, 4);
+    }
+    tree.SetHostKvDuplicate(leaf, true);
+    ASSERT_TRUE(tree.HasHostKvDuplicateCandidate());
+    ++root.pending_host_stores;
+    EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
+    tree.SetHostKvDuplicate(other, true);
+    EXPECT_TRUE(tree.HasHostKvDuplicateCandidate()) << "another root is not covered";
+    tree.SetDeviceKvCoverage(other, false, 4);
+    EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
+    --root.pending_host_stores;
+    EXPECT_TRUE(tree.HasHostKvDuplicateCandidate());
+    tree.SetDeviceKvCoverage(root, false, 4);
+    EXPECT_FALSE(tree.HasHostKvDuplicateCandidate()) << "the Device gap also covers the descendant";
+    tree.SetDeviceKvCoverage(root, true, 4);
+    EXPECT_TRUE(tree.HasHostKvDuplicateCandidate());
+    tree.SetHostKvDuplicate(leaf, false);
+    tree.Remove(leaf);
+    tree.Remove(left);
+    tree.Remove(root);
+    tree.SetDeviceKvCoverage(other, true, 4);
+    EXPECT_TRUE(tree.HasHostKvDuplicateCandidate()) << "removing the first root keeps the next";
+    tree.Clear();
+    EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
+    Node& fresh = tree.FindOrAdd("fresh", nullptr, 4, 0);
+    tree.SetDeviceKvCoverage(fresh, true, 4);
+    tree.SetHostKvDuplicate(fresh, true);
+    EXPECT_TRUE(tree.HasHostKvDuplicateCandidate());
+}
+
+TEST(BoundaryTreeTest, LinkingAPendingRootAppliesBothStoreHolds) {
+    for (const bool ancestor_first : {true, false}) {
+        SCOPED_TRACE(ancestor_first);
+        BoundaryTree tree;
+        Node& detached = tree.FindOrAdd("detached", nullptr, 0, 0);
+        Node& leaf = tree.FindOrAdd("leaf", &detached, 12, 0);
+        Node& root = tree.FindOrAdd("root", nullptr, 4, 0);
+        tree.SetHostKvDuplicate(leaf, true);
+        tree.SetDeviceKvCoverage(root, true, 4);
+        tree.SetDeviceKvCoverage(detached, true, 4);
+        tree.SetDeviceKvCoverage(leaf, true, 4);
+        EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
+        ++detached.pending_host_stores;
+        ++root.pending_host_stores;
+        tree.FindOrAdd("detached", &root, 8, 0);
+        tree.SetDeviceKvCoverage(detached, true, 4);
+        EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
+        --(ancestor_first ? root : detached).pending_host_stores;
+        EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
+        --(ancestor_first ? detached : root).pending_host_stores;
+        EXPECT_TRUE(tree.HasHostKvDuplicateCandidate());
+        tree.SetHostKvDuplicate(leaf, false);
+        tree.Remove(leaf);
+        tree.Remove(detached);
+        tree.Remove(root);
+        EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
+    }
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

@@ -30,8 +30,12 @@ and its first chunk starts right at the hit.
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
+
 import numpy as np
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -75,6 +79,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             enable_l3_storage=False,
             role="fused",
             num_snapshot_pages=1,
+            host_group_packing=(),
             max_retracted_requests=0,
             host_write_policy="write_through",
             storage_config=None,

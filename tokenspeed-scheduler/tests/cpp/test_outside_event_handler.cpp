@@ -1105,7 +1105,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AClaimedPromptEndStateIsSupersededOnlyB
     SetTestSnapshotPool(config_);
     for (const bool r1_decodes : {false, true}) {
         SCOPED_TRACE(r1_decodes);
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
         RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1);
         r1.tokens.push_back(42);
         // Each lands with the bootstrap token 42; old and r0 decode it and

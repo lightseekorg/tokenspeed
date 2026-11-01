@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "cache/prefix/prefix_hasher.h"
+#include "scheduler/request.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -42,6 +43,34 @@ token_span Tokens(const std::vector<std::int32_t>& v) {
 }
 key_span Keys(const std::vector<std::string>& v) {
     return key_span(v.data(), v.size());
+}
+
+TEST(RequestPromptHashesTest, RepeatedQueriesKeepTheFullInputPageChain) {
+    Request request(RequestSpec{.request_id = "prompt", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}},
+                    /*prefix_granularity=*/4, Role::kFused);
+    const std::string first = HashPrefixPage(Tokens({1, 2, 3, 4}), "");
+    const std::string second = HashPrefixPage(Tokens({5, 6, 7, 8}), first);
+    const std::vector<std::string> expected{first, second};
+    for (int retry = 0; retry < 3; ++retry) {
+        const auto hashes = request.PromptPrefixHashes();
+        EXPECT_EQ(std::vector<std::string>(hashes.begin(), hashes.end()), expected);
+    }
+}
+
+TEST(RequestPromptHashesTest, AnAlignedInputKeepsItsLastFullPageForDecodeRoleMatching) {
+    Request request(RequestSpec{.request_id = "decode", .tokens = {1, 2, 3, 4}},
+                    /*prefix_granularity=*/2, Role::kD);
+    const std::string first = HashPrefixPage(Tokens({1, 2}), "");
+    const std::string second = HashPrefixPage(Tokens({3, 4}), first);
+    const auto hashes = request.PromptPrefixHashes();
+    EXPECT_EQ(std::vector<std::string>(hashes.begin(), hashes.end()), (std::vector<std::string>{first, second}));
+}
+
+TEST(RequestPromptHashesTest, AShortInputHasNoFullPageHashes) {
+    Request request(RequestSpec{.request_id = "short", .tokens = {1, 2, 3}},
+                    /*prefix_granularity=*/4, Role::kFused);
+    EXPECT_TRUE(request.PromptPrefixHashes().empty());
+    EXPECT_TRUE(request.PromptPrefixHashes().empty());
 }
 
 // ---- hex helpers --------------------------------------------------------

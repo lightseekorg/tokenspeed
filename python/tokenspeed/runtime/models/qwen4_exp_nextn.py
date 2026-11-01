@@ -311,11 +311,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return "mtp" in name or "shared_head" in name
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
-    ):
-        del is_mtp
-
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         def remap():
             for name, weight in weights:
                 if "mtp" not in name and "shared_head" not in name:

@@ -926,7 +926,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     config_.disable_l2_cache = false;
     config_.host_allocator.total_pages = 15;  // 12 streamed pages plus the finish-time tail in both groups
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
 
@@ -1125,6 +1125,35 @@ TEST_F(CapacityBlockPrefixCacheSuite, FailedAdmissionLeavesCacheProgressUncommit
     ASSERT_EQ(op->request_ids, std::vector<std::string>{"r3"});
     EXPECT_EQ(op->extend_prefix_lens.at(0), 6)
         << "page 2 was never published: the failed admission's progress leaked into the request";
+}
+
+TEST_F(CapacityBlockSuite, AllBusyResidentsWaitUntilTheirResultsLand) {
+    Submit(MakeRequestSpec("r1", 2));
+    Submit(MakeRequestSpec("r2", 2, 101));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    PlanOnce();
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    PlanOnce();
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    Submit(MakeRequestSpec("waiting", 1, 201));
+    const ExecutionPlan waiting = PlanOnce();
+    EXPECT_TRUE(waiting.aborts.empty());
+    EXPECT_EQ(FindSnapshotStore(waiting), nullptr);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 2u);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+    const ExecutionPlan resumed = PlanOnce();
+    const SnapshotStoreBatch* store = FindSnapshotStore(resumed);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_TRUE(resumed.aborts.empty());
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
 }
 
 TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
@@ -2869,7 +2898,7 @@ TEST_F(NoImageFitsSuite, TheDebugKnobLeavesAVictimItCannotImageRunningWithNothin
     // as a tail on the block a writes next, and the page's own publication
     // would later find that block under the tail's key.
     config_.debug_force_retraction_interval = 3;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(MakeRequestSpec("a", /*num_pages=*/2));
     PlanOnce();  // plan 1: prefill
     SendForwardDone("a", {42});
@@ -3774,7 +3803,7 @@ TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsBlockGranularity) {
     SchedulerConfig config = MakeConfig();
     config.cache_groups[1].block_granularity = 1;
     SetTestSnapshotPool(config);
-    Scheduler scheduler{std::move(config)};
+    Scheduler scheduler{WithHostPackingFromDevice(std::move(config))};
 
     // Eight parents fit ceil(tokens / 2) pages for the first group and one
     // page per token for the second group. Five tokens use 3 + 5 parents.
@@ -3785,7 +3814,7 @@ TEST_F(RetractExactFitSuite, IncludesOverlapDecodeReserveInTokenCapacity) {
     SchedulerConfig config = MakeConfig();
     config.overlap_schedule_depth = 1;
     SetTestSnapshotPool(config);
-    Scheduler scheduler{std::move(config)};
+    Scheduler scheduler{WithHostPackingFromDevice(std::move(config))};
     // The extra decode token shares the fourth page with token seven. Counting
     // it as a separately rounded page would incorrectly report only six.
     EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 7);
@@ -3813,7 +3842,7 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     cfg.cache_groups = {sliding};
 
     SetTestSnapshotPool(cfg);
-    Scheduler scheduler{std::move(cfg)};
+    Scheduler scheduler{WithHostPackingFromDevice(std::move(cfg))};
 
     // W=4, q=2 and a one-token decode reserve can require two cached
     // lookback pages plus a three-page phase-shifted remote tail, capped by
@@ -5948,7 +5977,7 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     // 12 candidates into 6 pairs.
     config_.host_allocator.total_pages = 13;
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));
@@ -5989,7 +6018,7 @@ TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
     // rest -- a partial op IS the contract when the pool fills mid-batch.
     config_.host_allocator.total_pages = 5;
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
@@ -6315,7 +6344,7 @@ TEST_F(SchedulerTestSuite, AHostWinOverADeviceTailLoadsMoreThanItGains) {
 // once, when it is admitted.
 TEST_F(SchedulerTestSuite, AFirstAdmissionWaitingForASlotCountsItsHitOnce) {
     config_.max_batch_size = 1;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(MakeRequestSpec("r0", /*num_pages=*/2));
     ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"r0"});
     SendForwardDone("r0", {42});

@@ -435,6 +435,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         speculative_num_draft_tokens=0,
         speculative_eagle_topk=1,
         speculative_draft_tree=False,
+        mamba_ssm_dtype="float32",
     )
 
     setup = prepare_cache_setup(
@@ -534,6 +535,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         speculative_eagle_topk=topk,
         speculative_draft_tree=topk > 1,
         enable_replay_ssm=replay_enabled,
+        mamba_ssm_dtype="float32",
     )
 
     setup = prepare_cache_setup(
@@ -604,6 +606,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         speculative_draft_tree=False,
         enable_replay_ssm=False,
         disaggregation_mode=role,
+        mamba_ssm_dtype="float32",
     )
     setup = prepare_cache_setup(
         family="qwen4_exp",
@@ -1224,6 +1227,7 @@ def _qwen_gdn_setup(
             speculative_eagle_topk=1,
             speculative_draft_tree=False,
             enable_replay_ssm=False,
+            mamba_ssm_dtype="float32",
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=SimpleNamespace()),

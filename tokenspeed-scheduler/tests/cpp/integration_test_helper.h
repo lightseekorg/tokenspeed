@@ -77,7 +77,7 @@ protected:
     }
 
     void SetUp() override {
-        config_ = MakeConfig();
+        config_ = WithHostPackingFromDevice(MakeConfig());
         scheduler_ = std::make_unique<Scheduler>(config_);
     }
 
