@@ -143,7 +143,7 @@ def tune_startup(tuner, kind, op):
 
 
 def round_trip_persisted_configs(tuner, kind, op, tmp_path):
-    """Persist the configs without the 768 bucket; a cached M1 call must fill only that hole."""
+    """Persist configs without the 768 bucket; a cached M1 call fills only that hole."""
     for key in list(tuner.profiling_cache):
         if key.custom_op == op and key.nearest_profile[0][-2] == 768:
             del tuner.profiling_cache[key]
