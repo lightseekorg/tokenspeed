@@ -46,8 +46,11 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _split_columns,
     _wave_maxima_unchanged,
     attention_layouts,
+    fp8_lse_shift,
+    fp8_probability_shift,
     max,
     maximum,
+    reject_block_scales,
     select_kv_splits,
 )
 
@@ -597,7 +600,8 @@ class ExtendProgram:
             invalid = m_new == -float("inf")
             m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
 
-        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+        p_shift = fp8_probability_shift(m_new_scaled, cfg.IS_FP8)
+        qk_shifted = qk * cfg.SM_SCALE - p_shift[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
         if HAS_INVALID:
@@ -615,7 +619,7 @@ class ExtendProgram:
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            l_i += gl.exp2(sink_log2 - m_i * cfg.SM_SCALE)
+            l_i += gl.exp2(sink_log2 - fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8))
         return l_i
 
     @gluon.jit
@@ -644,10 +648,11 @@ class ExtendProgram:
             offsets = ((self.seq_base + q_pos) * cfg.N_HEADS + q_head).to(gl.int32)
             mask = (q_pos < self.seq_len) & self.row_has_head(offs_m)
             lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
-            # Softmax runs in base-2 (exp2 hardware fast path), so m_i*SM_SCALE +
-            # log2(l_i) is the LSE in base-2 units. Convert to natural log (the
-            # public op contract / torch.logsumexp convention) by scaling by ln2.
-            lse = (m_i * cfg.SM_SCALE + gl.log2(lse_l_i)) * _LN2
+            # Softmax runs in base 2, so `fp8_lse_shift(m_i) + log2(l_i)` is
+            # the base-2 LSE; scale by ln 2 for the natural-log contract.
+            lse = (
+                fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8) + gl.log2(lse_l_i)
+            ) * _LN2
             cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
     @gluon.jit
@@ -656,7 +661,7 @@ class ExtendProgram:
     ):
         # Split-K partial store: mid_o[row, head, split] = acc / l_i (this
         # split's local softmax normalization) and mid_lse[row, head, split] =
-        # m_i * SM_SCALE + log2(l_i) in base-2 units, matching the decode
+        # fp8_lse_shift(m_i) + log2(l_i), the base-2 LSE, matching the decode
         # kernel's store_split so a shared reduce can merge splits. Rows whose
         # split saw no valid key (l_i == 0, e.g. a split entirely above the
         # causal diagonal) store a -inf lse / zero output so the reduce ignores
@@ -677,7 +682,8 @@ class ExtendProgram:
         part_o = acc * inv_l[:, None]
         part_lse = gl.where(
             has_kv,
-            m_i * cfg.SM_SCALE + gl.log2(gl.where(has_kv, l_i, 1.0)),
+            fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8)
+            + gl.log2(gl.where(has_kv, l_i, 1.0)),
             -float("inf"),
         )
         o_off = (
@@ -1527,6 +1533,9 @@ def launch_gluon_mha_extend_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    reject_block_scales(
+        "gluon_mha_extend_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
     return _extend(
         q,
         cu_seqlens_q,
@@ -1575,6 +1584,9 @@ def warmup_gluon_mha_extend_gfx950(
     server can compile them at startup. The batch shape of the arguments
     (lengths, request count) does not matter.
     """
+    reject_block_scales(
+        "gluon_mha_extend_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
     _extend(
         q,
         cu_seqlens_q,
