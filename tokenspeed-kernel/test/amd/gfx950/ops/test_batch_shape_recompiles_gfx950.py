@@ -170,8 +170,10 @@ def test_mha_prefill_token_stride_and_request_count(window):
         run([1], views=False)
 
 
+# FP8 caches run the products on the F8F6F4 MFMA, a separate set of variants.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("window", [-1, 127, 2047])
-def test_mha_extend_startup_warmup_covers_every_variant(window):
+def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
     from tokenspeed_kernel.numerics.torch.attention.mha import (
         gather_pages,
         torch_dense_attention,
@@ -181,13 +183,18 @@ def test_mha_extend_startup_warmup_covers_every_variant(window):
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
     heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 160, 80
-    k_cache = torch.randn(
-        1 + slots * width, page, kv_heads, dim, device=DEVICE, dtype=torch.bfloat16
-    )
-    v_cache = torch.randn_like(k_cache)
+    generator = torch.Generator(device=DEVICE).manual_seed(3)
+    cache_shape = (1 + slots * width, page, kv_heads, dim)
+    k_cache = torch.randn(cache_shape, device=DEVICE, generator=generator).to(dtype)
+    v_cache = torch.randn(cache_shape, device=DEVICE, generator=generator).to(dtype)
     tables = 1 + torch.arange(slots * width, dtype=torch.int32, device=DEVICE)
     tables = tables.view(slots, width)
-    queries_pool = torch.randn(8192, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    queries_pool = torch.randn(8192, heads, dim, device=DEVICE, generator=generator)
+    queries_pool = queries_pool.to(dtype)
+    # FP8 rounds the probabilities to 3 mantissa bits: on these inputs the
+    # worst output needs 0.02 where BF16 needs 0.002 (measured on MI350X).
+    # BF16 keeps the file's 2e-2; FP8 gets 3e-2 for headroom.
+    tol = 2e-2 if dtype == torch.bfloat16 else 3e-2
 
     def run(queries, prefix):
         lengths = [query + prefix for query in queries]
@@ -222,7 +229,7 @@ def test_mha_extend_startup_warmup_covers_every_variant(window):
                 sinks=None,
             )
             torch.testing.assert_close(
-                out[start:end].float(), expected, rtol=2e-2, atol=2e-2
+                out[start:end].float(), expected, rtol=tol, atol=tol
             )
 
     # Startup runs one extend shape; the launcher compiles the rest then.
