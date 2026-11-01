@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_prefill,
 )
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
+from tokenspeed_kernel.ops.tuning import is_warming_up
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
@@ -388,6 +389,12 @@ class MHAAttnBackend(PagedAttentionBackend):
             and metadata.max_extend_prefix_len == 0
             and extend_mode == "postwrite"
         ):
+            if is_warming_up():
+                # Startup warms kernels with a fresh prefill, which skips the
+                # cached-prefix kernel a later prefix-cache hit runs. Run that
+                # too, on the same rows, so it compiles its variants now; its
+                # output is not used.
+                self._forward_extend(q, layer, token_to_kv_pool, metadata, sinks)
             return self._forward_prefill(q, k, v, layer, metadata, sinks)
         return self._forward_extend(q, layer, token_to_kv_pool, metadata, sinks)
 
