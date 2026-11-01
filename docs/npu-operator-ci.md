@@ -44,6 +44,10 @@ The dedicated `npu` matrix group selects only `tokenspeed-npu-arm64`; AMD MI350,
 
 The `tests/` directory contains the registered operator scripts. Each `<operator>-test.py` runs by file path through the manifest or an explicit command and requires an NPU for accuracy and performance modes. The hyphenated names are executable script paths, not Python module import names.
 
+Coverage currently spans two index-space kernels (`scatter`, `virtual_slots_to_local`) and four per-layer compute paths: `rmsnorm` (including the fused add-residual form), `silu_and_mul` (SwiGLU, including the preallocated and empty-token paths), `rotary_embedding` (NeoX and interleaved layouts), and `mha` (causal prefill, paged extend, and paged decode).
+Each script compares against a CPU reference and asserts that preallocated output buffers and in-place residual updates are reused rather than replaced.
+`mha` covers only the FP16/BF16 families because the Ascend fused attention operator rejects FP32 inputs.
+
 The task has exactly two sequential commands: `bash test/ci_system/npu/run_step.sh accuracy "$NPU_CI_WORK"`, then the same entry point with `performance`. Accuracy tests for all operators finish before performance tests begin.
 The executor starts each manifest `script` with `--mode accuracy` or `--mode performance`; it has no operator-name branches.
 The standalone `--mode all` option is a convenience for one operator only. CI does not use it: CI preserves the global ordering of all accuracy tests before any performance test.
@@ -56,8 +60,12 @@ The interpreter path is fixed. Scripts use that interpreter with `-B -u`, and th
 | --- | --- | --- | --- |
 | scatter | 5 | 6 | 30 |
 | virtual_slots_to_local | 48 | 8 | 40 |
+| rmsnorm | 10 | 6 | 30 |
+| silu_and_mul | 10 | 6 | 30 |
+| rotary_embedding | 10 | 6 | 30 |
+| mha | 12 | 6 | 30 |
 
-The current suite has 53 accuracy cases, 14 performance configurations, and 70 samples.
+The current suite has 95 accuracy cases, 38 performance configurations, and 190 samples.
 Each configuration performs 10 warmup iterations, then collects 5 samples of 50 executions each.
 Median latency is the median of the five per-execution sample averages, measured in milliseconds.
 The `record_only` policy validates execution and sampling completeness only: `performance_verdict=not_evaluated` and `threshold_ms=null`.
