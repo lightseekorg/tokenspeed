@@ -1314,6 +1314,7 @@ if platform.is_nvidia:
         do_finalize: bool,
         enable_pdl: bool,
         routed: bool,
+        fp32_correction_bias: bool,
     ):
         spec = w._spec
         if x.shape[0] == 0:
@@ -1325,7 +1326,10 @@ if platform.is_nvidia:
             expert_weights = (
                 topk_weights
                 if topk_weights is not None
-                else x.new_empty((0, spec.top_k), dtype=torch.bfloat16)
+                else x.new_empty(
+                    (0, spec.top_k),
+                    dtype=torch.float32 if fp32_correction_bias else torch.bfloat16,
+                )
             )
             return output, expert_weights, x.new_empty((0,), dtype=torch.int32)
         x_fp8, x_scale = quantize_fp8_with_scale(x.contiguous(), granularity="token")
@@ -1349,7 +1353,10 @@ if platform.is_nvidia:
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
         if not routed:
-            result = trtllm_fp8_per_channel_scale_moe(
+            entrypoint = trtllm_fp8_per_channel_scale_moe
+            if fp32_correction_bias:
+                entrypoint = ispp64_launcher.trtllm_fp8_fp32_routing_bias_moe
+            result = entrypoint(
                 routing_logits=router_logits.to(w._routing_logits_dtype),
                 routing_bias=w._correction_bias,
                 n_group=w._n_group or None,
@@ -1363,7 +1370,7 @@ if platform.is_nvidia:
             if do_finalize:
                 return result
             gemm2_out, expert_weights, expanded_idx = result[:3]
-            if expert_weights.dtype == torch.float32:
+            if expert_weights.dtype == torch.float32 and not fp32_correction_bias:
                 # FP32 routing logits allocate an FP32 carrier the kernel
                 # fills with BF16 weights; keep its live BF16 prefix.
                 tokens, top_k = expert_weights.shape
@@ -1443,8 +1450,9 @@ if platform.is_nvidia:
         enable_pdl: bool = False,
     ):
         """FP8 per-channel experts routed in the kernel from ``router_logits``
-        (the layer's routing method, correction bias and routed scale); BF16
-        route weights. Explicitly supplied ``topk_weights`` and ``topk_ids``
+        (the layer's routing method, correction bias and routed scale); prepared
+        grouped FP32-bias routes keep FP32 weights, other routes use BF16.
+        Explicitly supplied ``topk_weights`` and ``topk_ids``
         run on those routes instead, as the routed variant does. Rounding
         points as in the section comment above."""
         if (topk_weights is None) != (topk_ids is None):
@@ -1458,7 +1466,12 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=topk_ids is not None,
+            fp32_correction_bias=plan.get("fp32_correction_bias", False),
         )
+
+    flashinfer_trtllm_fp8_channel_moe_apply._tokenspeed_fp32_correction_bias = (  # type: ignore[attr-defined]
+        ispp64_launcher.fp32_quantized_routing_ready
+    )
 
     @register_kernel(
         "moe",
@@ -1517,6 +1530,7 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+            fp32_correction_bias=False,
         )
 
 
@@ -3763,6 +3777,7 @@ if platform.is_nvidia:
         do_finalize: bool,
         enable_pdl: bool,
         routed: bool,
+        fp32_correction_bias: bool,
         activation_type: int | None = None,
         output: torch.Tensor | None = None,
         x_quantized: (
@@ -3794,7 +3809,10 @@ if platform.is_nvidia:
                 return output
             return (
                 output,
-                data.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
+                data.new_empty(
+                    (0, _spec.top_k),
+                    dtype=torch.float32 if fp32_correction_bias else torch.bfloat16,
+                ),
                 # moe_finalize_fuse_shared expects a 1-D [num_tokens * top_k] permute map.
                 data.new_empty((0,), dtype=torch.int32),
             )
@@ -3906,7 +3924,10 @@ if platform.is_nvidia:
             )
         else:
             _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
-            result = tokenspeed_trtllm_fp4_block_scale_moe(
+            entrypoint = tokenspeed_trtllm_fp4_block_scale_moe
+            if fp32_correction_bias:
+                entrypoint = ispp64_launcher.trtllm_fp4_fp32_routing_bias_moe
+            result = entrypoint(
                 routing_logits=router_logits.to(_routing_logits_dtype),
                 routing_bias=getattr(w, "_correction_bias", None),
                 n_group=getattr(w, "_n_group", 0),
@@ -3925,10 +3946,17 @@ if platform.is_nvidia:
         # Flashinfer's Python wrapper allocates expert_weights with
         # ``routing_logits.dtype`` (fp32 for DSv3), but the C++ routing
         # kernel writes bf16 contiguously for DeepSeekV3 routing
-        # into the buffer. Only the first half holds valid data; reading
+        # into the stock buffer. Only the private grouped FP32 path owns FP32 weights.
+        # Only the first half of the stock buffer holds valid data; reading
         # as fp32 interprets two adjacent bf16s as one fp32. Reinterpret
         # to bf16 and keep the live prefix.
-        if expert_weights.dtype == torch.float32:
+        fp32_routes = (
+            fp32_correction_bias
+            and _routing_logits_dtype == torch.float32
+            and getattr(w, "_routing_method_type", 0) == 2
+            and (getattr(w, "_n_group", 0) or 0) > 1
+        )
+        if expert_weights.dtype == torch.float32 and not fp32_routes:
             n, k = expert_weights.size()
             expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
         return (gemm2_out, expert_weights, expanded_idx)
@@ -3986,8 +4014,13 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=False,
+            fp32_correction_bias=plan.get("fp32_correction_bias", False),
             x_quantized=x_quantized,
         )
+
+    flashinfer_trtllm_nvfp4_moe_apply._tokenspeed_fp32_correction_bias = (  # type: ignore[attr-defined]
+        ispp64_launcher.fp32_quantized_routing_ready
+    )
 
     @register_kernel(
         "moe",
@@ -4047,6 +4080,7 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+            fp32_correction_bias=False,
             x_quantized=x_quantized,
             routing_prepared=routing_prepared,
         )
@@ -4141,6 +4175,7 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+            fp32_correction_bias=False,
             activation_type=ActivationType.Situ,
             output=out_buf,
         )
@@ -4195,6 +4230,7 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=False,
+            fp32_correction_bias=False,
             activation_type=ActivationType.Relu2,
         )
 
@@ -4251,6 +4287,7 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+            fp32_correction_bias=False,
             activation_type=ActivationType.Relu2,
         )
 

@@ -156,9 +156,13 @@ def test_vendor_routes_take_the_routed_scale_once(server):
     )
 
 
-def test_kernel_routed_layer_refuses_a_non_finite_checkpoint_bias(server):
+@pytest.mark.parametrize("fmt", [None, "nvfp4", "fp8_channel"])
+def test_kernel_routed_layer_refuses_a_non_finite_checkpoint_bias(server, fmt):
     server("flashinfer_trtllm", kernel_routing=True)
-    layer = _moe()
+    quant = ct() if fmt == "fp8_channel" else NVFP4 if fmt == "nvfp4" else None
+    layer = beam.BeamVendorMoE(
+        tiny_config(), Mapping(rank=0, world_size=1), 1, "model.layers.1.mlp", quant
+    )
     bias = layer.gate.e_score_correction_bias
     finite = torch.linspace(-1, 1, bias.numel(), dtype=torch.float32)
     bias.weight_loader(bias, finite)
@@ -828,11 +832,10 @@ LAYOUTS = {
 
 @pytest.mark.parametrize("layout", sorted(LAYOUTS))
 @pytest.mark.parametrize("fmt", ["fp8_channel", "nvfp4"])
-def test_plan_at_the_beam_geometry(server, fmt, layout):
-    """Rank 0's selected kernel: FP8 per-channel or NVFP4 SiLU experts on
-    precomputed top-k at TP8 (ispp 320), TP4 (640) and EP8 (32 whole experts of
-    2,560), none padded."""
-    server("flashinfer_trtllm")
+@pytest.mark.parametrize("ready", [False, True])
+def test_plan_at_the_beam_geometry(server, fmt, layout, ready):
+    """TP admits prepared FP32 selection; EP retains precomputed routing."""
+    server("flashinfer_trtllm", kernel_routing=ready)
     mapping, ispp, local, _ = LAYOUTS[layout]
     quant_config, policy, routed = {
         "fp8_channel": (ct(), beam.BEAM_MOE_FP8_POLICY, FP8_ROUTED),
@@ -845,10 +848,43 @@ def test_plan_at_the_beam_geometry(server, fmt, layout):
         "model.layers.1.mlp",
         quant_config,
     )
-    assert moe.experts.plan["apply_kernel_name"] == routed
+    fused = ready and layout != "ep8"
+    expected = routed.replace("_routed_moe", "_moe") if fused else routed
+    assert moe.experts.plan["apply_kernel_name"] == expected
+    assert moe.kernel_routing is fused
+    assert moe.topk.topk_config.output_format.is_bypassed() is fused
     assert moe.experts.plan["precision_policy"] == policy
     assert moe.experts.num_local_experts == local
     assert moe.experts.intermediate_size // moe.experts.tp_size == ispp
+
+
+@pytest.mark.parametrize("fmt", ["fp8_channel", "nvfp4"])
+@pytest.mark.parametrize("ready", [False, True])
+def test_quantized_explicit_precomputed_routing_is_preserved(server, fmt, ready):
+    server("flashinfer_trtllm", kernel_routing=ready)
+    moe = beam.BeamVendorMoE(
+        _config(**BEAM_GEOMETRY, moe_routing_mode="precomputed_topk"),
+        Mapping(rank=0, world_size=8),
+        1,
+        "model.layers.1.mlp",
+        ct() if fmt == "fp8_channel" else NVFP4,
+    )
+    assert not moe.kernel_routing
+    assert moe.route_scale == 2.5
+
+
+@pytest.mark.parametrize("fmt", ["fp8_channel", "nvfp4"])
+def test_quantized_single_group_keeps_the_reference_sigmoid(server, fmt):
+    server("flashinfer_trtllm", kernel_routing=True)
+    moe = beam.BeamVendorMoE(
+        _config(n_group=1, topk_group=1),
+        Mapping(rank=0, world_size=1),
+        1,
+        "model.layers.1.mlp",
+        ct() if fmt == "fp8_channel" else NVFP4,
+    )
+    assert not moe.kernel_routing
+    assert moe.experts.supports_precomputed_topk
 
 
 @pytest.mark.parametrize("rank", [0, 1])
