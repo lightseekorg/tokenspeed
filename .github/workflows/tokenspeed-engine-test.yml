@@ -1,68 +1,119 @@
-name: TokenSpeed Engine Rust Test
+name: Build TokenSpeed Engine Nightly Wheels
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
-      - ".github/workflows/tokenspeed-engine-test.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
-      - ".github/workflows/tokenspeed-engine-test.yml"
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Public main commit to build
+        required: true
+        type: string
+      version_date:
+        description: Nightly version date in YYYYMMDD format
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: tokenspeed-engine-test-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tokenspeed-engine
+  wheel:
+    name: Engine ${{ matrix.arch }} Python ${{ matrix.python }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
         with:
-          python-version: "3.12"
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
 
-      # ts-scheduler compiles the scheduler and its nanobind module into the
-      # binary, as the scheduler wheel build does.
-      - name: Install the C++ build dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare nightly metadata
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION_DATE: ${{ inputs.version_date }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev
-          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
-          echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"
+          python - <<'PYTHON'
+          import os
+          import re
+          import subprocess
+          import tomllib
+          from datetime import datetime
+          from pathlib import Path
 
-      - name: Install the Rust toolchain
+          source = Path('source')
+          expected = os.environ['SOURCE_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', expected):
+              raise ValueError('source_sha must be a full public commit SHA')
+          actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
+          if actual != expected:
+              raise ValueError(f'Unexpected source commit: {actual}')
+          subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], cwd=source, check=True)
+          date = os.environ['VERSION_DATE']
+          if not re.fullmatch(r'[0-9]{8}', date):
+              raise ValueError('version_date must be YYYYMMDD')
+          datetime.strptime(date, '%Y%m%d')
+          path = source / 'tokenspeed-engine/pyproject.toml'
+          original = path.read_text()
+          project = tomllib.loads(original)['project']
+          if project['name'] != 'tokenspeed-engine':
+              raise ValueError('Unexpected project')
+          version = f"{project['version']}.post{date}"
+          updated, count = re.subn(r'^version = "[^"\n]+"$', f'version = "{version}"', original, flags=re.MULTILINE)
+          if count != 1:
+              raise ValueError('Expected one project version')
+          path.write_text(updated)
+          print(f'Building tokenspeed-engine {version} from {actual}')
+          PYTHON
+
+      - name: Build and validate manylinux wheel
+        env:
+          WHEEL_ARCH: ${{ matrix.arch }}
+          WHEEL_PYTHON: ${{ matrix.python }}
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
+          mkdir -p dist
+          docker run --rm \
+            -e WHEEL_PYTHON \
+            -e CARGO_HOME=/tmp/engine-cargo \
+            -e RUSTUP_HOME=/tmp/engine-rustup \
+            -e CARGO_BUILD_JOBS=4 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=4 \
+            -v "$PWD/source:/source" \
+            -v "$PWD/dist:/output" \
+            "quay.io/pypa/manylinux_2_28_${WHEEL_ARCH}" \
+            bash -lc '
+              set -euo pipefail
+              dnf install -y openssl-devel
+              curl --proto "=https" --tlsv1.2 -sSfL https://sh.rustup.rs -o /tmp/engine-rustup.sh
+              sh /tmp/engine-rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path
+              tag="cp${WHEEL_PYTHON//./}"
+              export PATH="/opt/python/${tag}-${tag}/bin:/tmp/engine-cargo/bin:$PATH"
+              python -m pip install --upgrade "setuptools>=70" wheel build twine auditwheel \
+                "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1 "cmake>=3.22" "ninja>=1.11"
+              cd /source/tokenspeed-engine
+              python -m build --wheel --no-isolation --outdir /tmp/engine-wheels
+              auditwheel repair --wheel-dir /output /tmp/engine-wheels/*.whl
+              python -m twine check /output/*.whl
+              cd /tmp
+              python -m pip install --no-deps /output/*.whl
+              python -c "import subprocess, tokenspeed_engine; r = subprocess.run([str(tokenspeed_engine.host_binary())], capture_output=True, text=True, timeout=20); assert r.returncode == 1 and \"--python is required\" in r.stderr, (r.returncode, r.stdout, r.stderr); print(\"Native extension imports and ts-host executes\")"
+            '
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Lint
-        run: cargo clippy --all-targets --locked -- -D warnings
-
-      - name: Test
-        run: cargo test --locked
-
-      # The wheel the engine installs: the extension module and ts-host.
-      - name: Build the wheel
-        run: |
-          python -m pip wheel . --no-deps -w dist
-          python -m pip install --no-deps dist/tokenspeed_engine-*.whl
-          cd /tmp && python -c 'import os, tokenspeed_engine; assert os.access(tokenspeed_engine.host_binary(), os.X_OK)'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tokenspeed-engine-${{ matrix.arch }}-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error

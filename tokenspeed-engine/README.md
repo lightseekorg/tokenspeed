@@ -70,6 +70,16 @@ build instead, put `_native` on the Python path and point
 filter (`info` by default; `ts_control=debug` logs admissions and cache-op
 acknowledgments).
 
+## Nightly wheel build branch
+
+The `build/engine-nightly-20261101` branch provides a manual wheel job through
+**Build TokenSpeed Engine Nightly Wheels**. Supply the full public `main`
+commit as `source_sha` and the UTC `version_date` as `YYYYMMDD`. It builds
+Python 3.11–3.13 wheels on x86_64 and aarch64 in manylinux containers, checks
+the installed native extension and host executable, and retains the wheels
+as Actions artifacts. Only the dated package version changes; compiled sources
+come from the specified commit. Publication is separate.
+
 ## Releasing Rust crates
 
 Use **Release TokenSpeed Engine Crates** in GitHub Actions. Select `dry-run`
