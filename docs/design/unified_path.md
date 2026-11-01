@@ -1854,6 +1854,15 @@ plan shared across replay streams.
 Changes to this capacity contract require validation of full-model overlap,
 memory use and performance in addition to kernel correctness.
 
+## Empty attention TP shards
+
+In the RSAG layout, a rank can hold zero input rows while its attention TP
+peers hold tokens. MLA projection preparation must still join the token
+all-gather; attention emptiness is determined from the restored query rows,
+not the incoming shard. This applies to gated and ungated MLA in eager and
+CUDA-graph execution. Projection-TP Linear owns its own row restoration;
+those projections must not also run the ordinary attention all-gather.
+
 ## Query context parallelism
 
 `--query-context-parallel-size N` (`mapping.attn.qcp_*`, `N ==
