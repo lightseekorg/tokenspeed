@@ -561,9 +561,11 @@ public:
         // later. A copy written back on a Device eviction is stored with its
         // Device entry's epoch, which the request that last used or published
         // it there issued. KV blocks and State checkpoints apart
-        // (SampleAccessClock says how it is timed); every entry `blocks`
-        // counts but a flush's is observed once the scheduler has sampled the
-        // clock.
+        // (SampleAccessClock says how it is timed). An entry `blocks` counts
+        // is observed unless a flush evicted it or no sample times its epoch:
+        // epoch 0 (a superseded entry) and an epoch issued before a first
+        // sample younger than kAccessClockSpan, so `blocks` can exceed the
+        // two histograms' counts.
         BucketCounts<kHostIdleBoundsMs.size()> kv_idle_ms;
         BucketCounts<kHostIdleBoundsMs.size()> state_idle_ms;
         // Per first admission whose hit stopped at blocks the Host evicted
