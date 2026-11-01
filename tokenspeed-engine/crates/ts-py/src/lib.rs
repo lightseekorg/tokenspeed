@@ -432,6 +432,10 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
     dict.set_item("completion_tokens", chunk.completion_tokens)?;
     dict.set_item("cached_tokens", chunk.cached_tokens)?;
     dict.set_item("output_token_logprobs", chunk.output_token_logprobs)?;
+    dict.set_item(
+        "output_token_cumulative_probs",
+        chunk.output_token_cumulative_probs,
+    )?;
     dict.set_item("spec_verify_ct", chunk.spec_verify_ct)?;
     dict.set_item("accept_draft_tokens", chunk.accept_draft_tokens)?;
     dict.set_item("input_token_logprobs", chunk.input_token_logprobs)?;
