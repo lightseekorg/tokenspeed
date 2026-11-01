@@ -514,7 +514,9 @@ scheduler stats.
 Metric output plugins run in the node's metrics relay process
 (`metrics/relay.py`); the rank's `ts-metrics` hands them every update as an
 event and writes Prometheus' multiprocess files itself, so the loop never
-waits on a plugin. A full relay queue drops events and counts the drops.
+waits on a plugin. Those file writes buffer through the round — every
+written value is a cumulative total, so the newest buffered value per key
+is exact — and flush once, next to the KV event drain. A full relay queue drops events and counts the drops.
 Plugin discovery and creation happen outside the loop. The metrics adapter
 (`ts-metrics`) sends every value change and re-sends an unchanged gauge at
 most once a second; this policy belongs to the adapter, not the scheduler

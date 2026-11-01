@@ -454,6 +454,9 @@ pub struct Subsystems {
     pub grammars: Option<Grammars>,
     /// The L3 tier's metrics, with L3 and `--enable-metrics`.
     pub l3_metrics: Option<L3Metrics>,
+    /// The metrics exporter, whose buffered Prometheus writes the round's
+    /// end flushes (`--enable-metrics`).
+    pub exporter: Option<std::sync::Arc<ts_metrics::Exporter>>,
     /// With the L3 storage tier, this rank's executor: the replica agrees
     /// on the executors' reports every round, and flushes delete the tier's
     /// namespace. `None` without the tier.
@@ -471,6 +474,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     transfer: Option<Box<dyn TransferPeer + Send>>,
     embeddings: Option<Box<dyn EmbeddingReceiver + Send>>,
     metrics: Option<EngineMetrics>,
+    /// The metrics exporter: the round's end flushes its buffered writes.
+    exporter: Option<std::sync::Arc<ts_metrics::Exporter>>,
     kv_events: Option<KvEventPublisher>,
     eplb: Option<eplb::Controller>,
     grammars: Option<Grammars>,
@@ -543,6 +548,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             transfer: subsystems.transfer,
             embeddings: subsystems.embeddings,
             metrics: subsystems.metrics,
+            exporter: subsystems.exporter,
             kv_events: subsystems.kv_events,
             eplb: subsystems.eplb,
             grammars: subsystems.grammars,
@@ -669,6 +675,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.scheduler
                 .advance(&events)
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        }
+        // The round's buffered metric writes, once: one flush after the
+        // last recording of the round (commit counts, storage, snapshots).
+        if let Some(exporter) = &self.exporter {
+            exporter.flush();
         }
         // One drain per round, after its last scheduler mutation.
         if self.config.kv_events {

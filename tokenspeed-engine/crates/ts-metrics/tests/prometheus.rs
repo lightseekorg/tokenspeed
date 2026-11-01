@@ -83,6 +83,7 @@ fn run_scenario(directory: &Path) {
     transfer.record_timeout("bootstrapping");
     transfer.record_timeout("waiting_for_input");
     transfer.record_failure();
+    exporter.flush();
 }
 
 #[test]
@@ -200,6 +201,7 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
     metrics.record(&io, &scheduler);
     metrics.record(&io, &scheduler);
     drop(metrics);
+    exporter.flush();
     let Some(rendered) = render(&directory) else {
         return;
     };
@@ -310,4 +312,50 @@ fn a_relay_message_is_the_python_event_array() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(encoded, expected.trim());
+}
+
+#[test]
+fn buffered_writes_land_the_newest_value_per_key_on_flush() {
+    // The values a round buffers are cumulative totals, so the newest
+    // buffered value per key is exact, and nothing lands before the
+    // round's flush reads the files.
+    let directory = scratch_dir("buffered");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    engine.record_preemptions(2);
+    engine.record_preemptions(5);
+    engine.record_nan_abort();
+    if let Some(rendered) = render(&directory) {
+        assert!(
+            !rendered.contains("tokenspeed:num_preemptions_total"),
+            "buffered writes must not land before the flush:\n{rendered}"
+        );
+    }
+    exporter.flush();
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    let labels = r#"{app_key="",dp_rank="0",model_name="m"}"#;
+    assert!(rendered.contains(&format!("tokenspeed:num_preemptions_total{labels} 7.0")));
+    assert!(rendered.contains(&format!(
+        "tokenspeed:num_nan_aborted_requests_total{labels} 1.0"
+    )));
+    // A flush with nothing buffered writes nothing; the values stand.
+    exporter.flush();
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    assert!(rendered.contains(&format!("tokenspeed:num_preemptions_total{labels} 7.0")));
+    std::fs::remove_dir_all(&directory).unwrap();
 }

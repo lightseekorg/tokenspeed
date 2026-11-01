@@ -1398,6 +1398,7 @@ fn run_rank<F: Frontend>(
                 }) as Box<dyn EmbeddingReceiver + Send>
             }),
             metrics: None,
+            exporter: None,
             kv_events: None,
             eplb: eplb.map(|config| Controller::new(config(world, rank)).unwrap()),
             grammars: grammar.then(|| {
