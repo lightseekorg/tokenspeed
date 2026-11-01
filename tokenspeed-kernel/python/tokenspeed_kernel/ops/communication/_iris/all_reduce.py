@@ -1209,7 +1209,7 @@ def _mhc_post_words(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["NUM_PROGRAMS", "NUM_TILES"])
 def iris_pull_oneshot(
     input_sym_ptr,
     output_ptr,
@@ -1396,7 +1396,7 @@ def iris_pull_oneshot(
     )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["NUM_PROGRAMS", "NUM_TILES"])
 def iris_pull_twoshot(
     input_sym_ptr,
     scratch_sym_ptr,
@@ -1439,8 +1439,8 @@ def iris_pull_twoshot(
     Sum this rank's consecutive input partition in FP32 and store it in
     scratch_sym_ptr at the input dtype. Pull all peers' reduced partitions into
     output_ptr. ready_flags separate input readiness from partition readiness;
-    EXIT_BARRIER adds a final peer wait for callers that stage inputs before
-    launch. Both communication phases run in this one kernel.
+    EXIT_BARRIER adds a final peer wait, which input reuse does not need (see
+    the comment at its use). Both communication phases run in this one kernel.
     """
     SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
@@ -1617,13 +1617,14 @@ def iris_pull_twoshot(
         tile_id += NUM_PROGRAMS
 
     if EXIT_BARRIER:
-        # Callers that stage into the symmetric input before launching cannot
-        # rotate buffers safely: under graph capture the staging copy records a
-        # fixed address and replays it, so a rank one invocation ahead would
-        # overwrite an input its slower peers are still reducing. Holding the
-        # kernel until every peer has finished reading makes a single staging
-        # buffer correct by construction, at the price of one more rendezvous.
-        # Producer-direct callers own their input and pass False.
+        # Reusing the input does not need this wait: a workgroup passes the
+        # partitions-ready wait only after the same workgroup on every peer
+        # has finished reading the inputs, so once this kernel ends on a rank
+        # no peer reads its input, and a following copy or producer may
+        # overwrite it. Scratch is reused safely too, since the next launch's
+        # entry wait follows each peer workgroup's gather of the same tiles.
+        # The staged two-shot keeps this extra rendezvous; producer-direct
+        # callers and ProducerAllReduce.reduce_ordinary pass False.
         reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
         _iris_sync_rank_epoch(
             ready_flags,
@@ -1799,17 +1800,35 @@ class ProducerAllReduce:
     consumed and advances each tile's stage once; the next use of a tile, a
     later launch, observes both. Pull scratch is shared with the generic
     producer reduction; all uses and consumers must be stream ordered.
+    ``reduce_ordinary`` serves a backend's all-reduce of caller-owned tensors
+    with the same mailboxes, producer buffer and pull.
     """
 
     LAMPORT_MAX_ELEMENTS = 43 * 4096
     # The one-shot sends every peer the whole payload; from this size the
     # two-shot was faster in 8-rank MI355X graph replay. TP4 keeps push.
     LAMPORT_TWO_SHOT_MIN_ELEMENTS = 48 * 1024
-    LAMPORT_TWO_SHOT_MAX_ELEMENTS = 128 * 8192
+    # Covers 172 rows of 8192, the most rows a speculative verify step
+    # reduces; from 129 to 172 rows the two-shot took 11.7-14.7 us against
+    # 22.1-25.5 us for the producer pull. Its three-stage mailboxes cost
+    # 16.1 MiB of symmetric heap per rank, 4.1 MiB more than at 128 rows.
+    LAMPORT_TWO_SHOT_MAX_ELEMENTS = 172 * 8192
     # iris_lamport_twoshot_bf16_allreduce reduces one 128-element tile of every
     # shard per program.
     LAMPORT_TWO_SHOT_TILE = 128
     PUSH_MAX_ELEMENTS = 128 * 8192
+    # Largest payload reduce_ordinary takes from a caller that can fall back
+    # to RCCL. Measured on [rows, 8192] BF16 in MI355X graph replay and
+    # applied to any width: the producer pull beat RCCL up to 16 MiB at TP8
+    # and 4 MiB at TP4 (1024 and 256 rows); past that RCCL was as fast or
+    # faster.
+    ORDINARY_MAX_BYTES = {4: 4 << 20, 8: 16 << 20}
+    # Smallest payload for which reduce_ordinary uses the push at TP4: it
+    # beat the producer pull by 0.6-2.5 us from 64 to 128 rows of 8192 and
+    # lost by up to 1.1 us from 22 to 48 rows. TP8 never selects it.
+    ORDINARY_PUSH_MIN_BYTES = {4: 1 << 20}
+    # BF16 elements in 16 packed 8-byte words.
+    _ORDINARY_GRANULE = 64
 
     @staticmethod
     def _lamport_two_shot_capacity(
@@ -1944,6 +1963,112 @@ class ProducerAllReduce:
             self.lamport_two_shot_peer_addresses = tuple(
                 base + offset for base in peers.addresses
             )
+        self._symmetric_buffers = tuple(
+            buffer
+            for buffer in (
+                producer.data,
+                pull.scratch,
+                pull.ready_flags,
+                self.ready_flags,
+                self.push_inbox,
+                self.push_output,
+                self.lamport_region,
+                self.lamport_two_shot_region,
+            )
+            if buffer is not None
+        )
+
+    def _lamport_two_shot_serves(self, numel: int) -> bool:
+        return (
+            self.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            <= numel
+            <= self.lamport_two_shot_max_numel
+            and numel % (self.world_size * self.LAMPORT_TWO_SHOT_TILE) == 0
+        )
+
+    def _lamport_one_shot_serves(self, numel: int) -> bool:
+        return numel <= self.lamport_max_numel and numel % 512 == 0
+
+    def can_reduce_ordinary(self, tensor: torch.Tensor, *, rccl_fallback: bool) -> bool:
+        """Whether reduce_ordinary serves this caller-owned tensor.
+
+        With rccl_fallback, payloads past ORDINARY_MAX_BYTES are declined so
+        the caller hands them to RCCL; without it, payloads up to the
+        producer buffer's capacity are served.
+
+        The answer depends only on shape, dtype, device, 16-byte alignment
+        and whether the tensor overlaps this state's symmetric buffers, which
+        ranks share by building the same views; every rank must reach the
+        same decision or the group hangs.
+        """
+        numel = tensor.numel()
+        data = self.pull.producer.data
+        begin = tensor.data_ptr()
+        end = begin + numel * tensor.element_size()
+        return (
+            tensor.dtype == torch.bfloat16
+            and tensor.device == data.device
+            and tensor.is_contiguous()
+            # The pull stores packed 8-byte words, and Triton compiles separate
+            # kernels for pointers that are not 16-byte aligned.
+            and begin % 16 == 0
+            and 0 < numel <= data.numel()
+            # Each rank's share is whole 16-word groups. The pulls specialize
+            # their size arguments on divisibility by 16 (unspecializing them
+            # cost up to 2.5% at TP8), so admitted sizes share one compiled
+            # variant and a new batch shape cannot compile a second one.
+            and numel % (self.world_size * self._ORDINARY_GRANULE) == 0
+            and (
+                not rccl_fallback
+                or numel * tensor.element_size()
+                <= self.ORDINARY_MAX_BYTES[self.world_size]
+            )
+            # A view of state storage, such as a reduce-scatter result in pull
+            # scratch, would be overwritten while it is being reduced.
+            and not any(
+                begin < buffer.data_ptr() + buffer.numel() * buffer.element_size()
+                and buffer.data_ptr() < end
+                for buffer in self._symmetric_buffers
+            )
+        )
+
+    def reduce_ordinary(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Sum a caller-owned tensor across the group in place and return it.
+
+        The result lives in the caller's storage, never in this state's, so
+        later collectives cannot overwrite it and another stream may read it
+        once ordered after this call. Payloads within a Lamport window are
+        pushed through its mailboxes and summed in place; at TP4, payloads in
+        the push window are pushed and copied back. Other payloads are copied
+        into the producer buffer and reduced by the generic producer pull,
+        which beat run's two-shot pull at every size measured (21.5 vs 27.9 us
+        at 129 rows and 91 vs 118 us at 1024 rows of 8192, TP8). Callers must
+        not hold borrowed producer-buffer or pull-scratch views across this
+        call. Every rank must make the same call, on the stream that orders
+        this state's other uses.
+        """
+        # Uniform across ranks, so a violation fails on every rank alike.
+        assert self.can_reduce_ordinary(tensor, rccl_fallback=False)
+        flat = tensor.view(-1)
+        numel = flat.numel()
+        push_min_bytes = self.ORDINARY_PUSH_MIN_BYTES.get(self.world_size)
+        if self._lamport_two_shot_serves(numel) or self._lamport_one_shot_serves(numel):
+            self.run(flat, flat, numel)
+        elif (
+            push_min_bytes is not None
+            and push_min_bytes <= numel * flat.element_size()
+            and numel <= self.push_max_numel
+        ):
+            # Outside the Lamport windows run selects the push, whose result
+            # is borrowed push storage.
+            flat.copy_(self.run(flat, flat, numel)[:numel])
+        else:
+            # Like a producer writing its output here, the copy relies on
+            # every earlier use having waited for its peers' reads of this
+            # buffer before returning (see iris_pull_twoshot's EXIT_BARRIER).
+            self.pull.producer.data[:numel].copy_(flat)
+            self.pull.run(flat)
+        return tensor
 
     def run(
         self, input: torch.Tensor, output: torch.Tensor, numel: int
@@ -1952,12 +2077,7 @@ class ProducerAllReduce:
         assert 0 < numel <= self.pull.producer.data.numel()
         assert numel % (self.world_size * 8) == 0
         two_shot_tile = self.world_size * self.LAMPORT_TWO_SHOT_TILE
-        if (
-            self.LAMPORT_TWO_SHOT_MIN_ELEMENTS
-            <= numel
-            <= self.lamport_two_shot_max_numel
-            and numel % two_shot_tile == 0
-        ):
+        if self._lamport_two_shot_serves(numel):
             iris_lamport_twoshot_bf16_allreduce[(numel // two_shot_tile,)](
                 input,
                 self.lamport_two_shot_region,
@@ -1973,7 +2093,7 @@ class ProducerAllReduce:
                 num_warps=1,
             )
             return output
-        if numel <= self.lamport_max_numel and numel % 512 == 0:
+        if self._lamport_one_shot_serves(numel):
             iris_lamport_bf16_allreduce[(numel // 512,)](
                 input,
                 self.lamport_region,
