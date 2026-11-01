@@ -255,18 +255,20 @@ HostCacheStatsView host_cache_stats(const tokenspeed::Scheduler& scheduler) {
         .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
         .host_evictions = {},
     };
-    const tokenspeed::CacheCoordinator::HostEvictionStats& evictions = stats.host_evictions;
+    // Binding every member: a reason added to HostEvictionStats fails to
+    // compile here until it is exported.
+    const auto& [lru, duplicate, superseded, dead_entry, tail_cap, flush, duplicate_kv] = stats.host_evictions;
     const auto buckets = [](const auto& histogram) {
         return BucketView{.counts = to_rust(histogram.counts), .sums = to_rust(histogram.sums)};
     };
     for (const auto& [reason, counts] : {
-             std::pair{"lru", &evictions.lru},
-             std::pair{"duplicate", &evictions.duplicate},
-             std::pair{"superseded", &evictions.superseded},
-             std::pair{"dead_entry", &evictions.dead_entry},
-             std::pair{"tail_cap", &evictions.tail_cap},
-             std::pair{"flush", &evictions.flush},
-             std::pair{"duplicate_kv", &evictions.duplicate_kv},
+             std::pair{"lru", &lru},
+             std::pair{"duplicate", &duplicate},
+             std::pair{"superseded", &superseded},
+             std::pair{"dead_entry", &dead_entry},
+             std::pair{"tail_cap", &tail_cap},
+             std::pair{"flush", &flush},
+             std::pair{"duplicate_kv", &duplicate_kv},
          }) {
         view.host_evictions.push_back(HostEvictionView{
             .reason = reason,
