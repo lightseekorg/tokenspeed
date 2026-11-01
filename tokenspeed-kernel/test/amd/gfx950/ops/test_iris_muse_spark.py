@@ -1240,6 +1240,59 @@ def test_gather_lamport_polling_codegen():
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
+def test_column_routes_lamport_codegen():
+    """Every poll of the column-owned route completion rereads its words per retry.
+
+    Each retry issues all of its cache-bypassing mailbox reads before waiting
+    and branches on the subgroup's lane mask.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_lamport_column_routed_rmsnorm_sum as fn,
+    )
+
+    types = {
+        "routes": "*bf16",
+        "route_weights": "*fp32",
+        "norm_weight": "*bf16",
+        "output": "*bf16",
+        "region": "*i32",
+        "epochs": "*i32",
+        "regions": ("i64",) * 8,
+        "rows": "i32",
+    }
+    kernel = _compile_gfx950(
+        fn,
+        types,
+        {
+            "RANK": 5,
+            "MAX_ROWS": 43,
+            "EPS": 1e-6,
+            "WEIGHT_OFFSET": 1.0,
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        num_warps=1,
+        unspecialized=("rows",),
+    )
+    assembly = kernel.asm["amdgcn"]
+    cycles = polling_cycles(assembly)
+    # The completer polls seven peers' 16-byte packs; the finisher its
+    # eight routes' packs plus the sums of squares.
+    assert any(_batched_peer_reads(cycle, 7) for cycle in cycles)
+    assert any(
+        _batched_peer_reads(cycle, 8)
+        and any(
+            re.search(r"\bbuffer_load_dword\b", line) and "sc0 sc1" in line
+            for line in cycle
+        )
+        for cycle in cycles
+    )
+    assert all(votes_with_subgroup_mask(cycle) for cycle in cycles)
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
 @pytest.mark.parametrize("block_m", [1, 8])
 def test_moetail_lamport_codegen(block_m):
     """The fused tail pushes without waiting and its reducer votes per subgroup.
@@ -2249,9 +2302,23 @@ def _muse_tp_routes_worker(rank, world_size, device):
 
         if scattered:
             assert routes.data_ptr() == state.owned_route_input.data_ptr()
+        # Expert TP8 completes smaller canonical decode batches column-owned.
+        columned = (
+            canonical
+            and not owned
+            and state.can_reduce_column_routed_rmsnorm_sum(tokens)
+        )
+        stages = (
+            state.column_routes_epochs.clone()
+            if state.column_routes_epochs is not None
+            else None
+        )
         update(0)
         flags = state.owned_route_scatter_flags.clone()
         actual = run()
+        assert columned == (
+            stages is not None and not torch.equal(stages, state.column_routes_epochs)
+        )
         # Only owned rows and the decode window use the route reduce-scatter.
         assert scattered or owned or torch.equal(flags, state.owned_route_scatter_flags)
         assert not scattered or not torch.equal(flags, state.owned_route_scatter_flags)
@@ -2486,6 +2553,189 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
             torch.cuda.synchronize()
             check(captured, phase)
         dist.barrier()
+
+
+def _muse_tp_column_routes_worker(rank, world_size, device):
+    """Expert TP8 decode tokens complete their routes column-owned in one launch.
+
+    Every rank writes the same sums, within one BF16 unit of the Lamport
+    two-shot all-reduce plus the portable routed norm, and bit for bit when
+    each token weights a single route. One graph runs two layers back to back
+    at each of 1, 8, 9 and 43 tokens, interleaved with the generic Lamport
+    one-shot and two-shot reductions; a zero route and negative zeros travel
+    as data, one rank is delayed in each replay, and the stage counters start
+    at the last stage so the replays wrap them.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+        iris_lamport_bf16_allreduce,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_lamport_column_routed_rmsnorm_sum,
+    )
+    from tokenspeed_kernel.ops.moe import routed_input_scale_rmsnorm_sum
+    from utils import assert_no_triton_compile
+
+    torch.set_grad_enabled(False)
+    capacity = 256
+    state = prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=capacity * 8192,
+        enable_lamport=True,
+        owned_route_max_rows=capacity,
+        intermediate_gather_max_rows=0,
+        all_reduce=None,
+        device=device,
+    )
+    if world_size != 8:
+        assert not state.can_reduce_column_routed_rmsnorm_sum(8)
+        return
+    # It takes over every token count the two-shot route all-reduce served.
+    assert [
+        state.can_reduce_column_routed_rmsnorm_sum(rows) for rows in (0, 1, 43, 44)
+    ] == [False, True, True, False]
+    assert state.route_scatter_min_rows == 44
+    state.column_routes_epochs.fill_(2)
+    counts = (1, 8, 9, 16, 32, 43)
+    layers = 2
+    norms = [
+        (torch.randn(4096, generator=torch.Generator().manual_seed(layer)) * 0.1)
+        .bfloat16()
+        .to(device)
+        for layer in range(layers)
+    ]
+
+    def partial_routes(rows, peer, phase, layer):
+        generator = torch.Generator(device=device).manual_seed(
+            ((rows * 64 + peer) * 8 + phase) * 2 + layer
+        )
+        routes = torch.randn(rows * 8, 4096, generator=generator, device=device)
+        routes = (routes / 8).bfloat16()
+        # An all-zero route normalizes to zeros; negative zeros travel as zeros.
+        routes[3 % (rows * 8)] = 0
+        routes[-1, :64] = -0.0
+        return routes
+
+    def route_weights(rows, phase, layer):
+        generator = torch.Generator(device=device).manual_seed(
+            (rows * 8 + phase) * 2 + layer
+        )
+        weights = torch.rand(rows, 8, generator=generator, device=device)
+        if layer == 1:
+            # One unit weight per token: the sum is one normalized route, which
+            # any multiply-add order rounds alike, so the completed routes and
+            # inverse RMS must match bit for bit.
+            hot = weights.argmax(-1, keepdim=True)
+            return torch.zeros_like(weights).scatter_(-1, hot, 1.0)
+        return weights / weights.sum(-1, keepdim=True)
+
+    def reference(rows, phase, layer):
+        # FP32 in rank order, rounded once, as the owners sum the routes.
+        total = partial_routes(rows, 0, phase, layer).float()
+        for peer in range(1, world_size):
+            total += partial_routes(rows, peer, phase, layer).float()
+        return routed_input_scale_rmsnorm_sum(
+            total.bfloat16().view(rows, 8, 4096),
+            route_weights(rows, phase, layer),
+            norms[layer],
+            1e-6,
+            1.0,
+            False,
+            None,
+        )
+
+    routes = {
+        (rows, layer): torch.empty(rows * 8, 4096, dtype=torch.bfloat16, device=device)
+        for rows in counts
+        for layer in range(layers)
+    }
+    weights = {key: torch.empty(key[0], 8, device=device) for key in routes}
+    one_shot_input = torch.empty(3 * 4096, dtype=torch.bfloat16, device=device)
+    one_shot_output = torch.empty_like(one_shot_input)
+    two_shot = torch.empty(8 * 8 * 4096, dtype=torch.bfloat16, device=device)
+
+    def update(phase):
+        for (rows, layer), value in routes.items():
+            value.copy_(partial_routes(rows, rank, phase, layer))
+            weights[rows, layer].copy_(route_weights(rows, phase, layer))
+        one_shot_input.fill_((rank + 1) * (phase + 1) / 16)
+        two_shot.fill_((rank + 1) * (phase + 1) / 64)
+
+    def run(run_counts):
+        outputs = {}
+        for rows in run_counts:
+            for layer in range(layers):
+                outputs[rows, layer] = state.reduce_column_routed_rmsnorm_sum(
+                    routes[rows, layer],
+                    weights[rows, layer],
+                    norms[layer],
+                    1e-6,
+                    1.0,
+                )
+            iris_lamport_bf16_allreduce[(one_shot_input.numel() // 512,)](
+                one_shot_input,
+                state.reduction.lamport_region,
+                one_shot_output,
+                state.reduction.lamport_epochs,
+                state.reduction.lamport_peer_addresses[:world_size],
+                RANK=rank,
+                WORLD_SIZE=world_size,
+                total_elements=one_shot_input.numel(),
+                MAX_ELEMENTS=state.reduction.lamport_max_numel,
+                NUM_STAGES=3,
+                PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
+                num_warps=1,
+            )
+        state.reduce(two_shot)
+        return outputs
+
+    def check(outputs, phase):
+        for (rows, layer), output in outputs.items():
+            # Every rank writes every column the same way.
+            gathered = [torch.empty_like(output) for _ in range(world_size)]
+            dist.all_gather(gathered, output)
+            assert all(torch.equal(value, output) for value in gathered)
+            expected = reference(rows, phase, layer)
+            if layer == 1:
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+            else:
+                # Within one BF16 unit: the portable sum contracts its
+                # multiply-add in some specializations only. The floor covers
+                # sums that cancel.
+                torch.testing.assert_close(output, expected, atol=2**-14, rtol=2**-7)
+        sum_of_ranks = world_size * (world_size + 1) // 2
+        assert bool((one_shot_output == sum_of_ranks * (phase + 1) / 16).all())
+        assert bool((two_shot == sum_of_ranks * (phase + 1) / 64).all())
+
+    update(0)
+    check(run((8,)), 0)
+    # Token counts are runtime arguments: after one warm count, counts of one,
+    # multiples of 16 and others all reuse its variant.
+    update(1)
+    with assert_no_triton_compile(iris_fused_lamport_column_routed_rmsnorm_sum):
+        check(run(counts), 1)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(counts)
+    for phase in range(2, 6):
+        update(phase)
+        if rank == (phase * 3) % world_size:
+            torch.cuda._sleep(20000)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(captured, phase)
+    dist.barrier()
+    assert bool((state.column_routes_region == -(2**31)).all())
+    epochs = [torch.empty_like(state.column_routes_epochs) for _ in range(world_size)]
+    dist.all_gather(epochs, state.column_routes_epochs)
+    assert all(torch.equal(e, state.column_routes_epochs) for e in epochs)
 
 
 def _muse_intermediate_exchange_worker(rank, world_size, device):
@@ -3330,6 +3580,7 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
         ),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
         pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
+        pytest.param(_muse_tp_column_routes_worker, "nccl", id="tp_column_routes"),
         pytest.param(
             _muse_intermediate_exchange_worker, "nccl", id="intermediate_exchange"
         ),
