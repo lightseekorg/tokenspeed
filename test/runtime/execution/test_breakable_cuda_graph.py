@@ -89,6 +89,32 @@ class TestBreakableCudaGraph:
         # Two graph segments (before/after relu) + one eager break = 3.
         assert (cap.num_segments) == (3)
 
+    def test_capture_break_reads_the_recorded_producer_output(self):
+        """An eager break must not read leftovers from a reused graph pool."""
+        poison = BreakableCapture()
+        with poison:
+            previous = torch.full_like(self.x_static, -13.0)
+        poison.replay()
+        torch.cuda.synchronize()
+        del previous
+
+        observed = torch.empty_like(self.x_static)
+
+        def eager_break(value):
+            observed.copy_(value)
+            return value * 3
+
+        self.x_static.fill_(5)
+        cap = BreakableCapture(pool=poison.pool)
+        with cap:
+            produced = self.x_static + 2
+            output = break_here(eager_break, torch.empty_like(produced), produced)
+        torch.testing.assert_close(observed, torch.full_like(observed, 7))
+
+        self.x_static.fill_(9)
+        cap.replay()
+        torch.testing.assert_close(output, torch.full_like(output, 33))
+
     def test_replay_matches_eager(self):
         cap, captured_out = self._build_capture()
         for trial in range(5):

@@ -245,6 +245,8 @@ class _DenseFFN(nn.Module):
             torch.empty(config.hidden_size, config.hidden_size, dtype=torch.bfloat16)
         )
         self.shared_experts = None
+        self.gate = nn.Module()
+        self.gate.register_parameter("bias_vl", None)
         self.use_mega_moe = False
         self.owns_ep_communication = False
         self.use_gluon_petit = False
@@ -1745,6 +1747,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
         model.initialize_engram(_Tokenizer())
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
+    adapter.is_multimodal_active = False
     forwarded = adapter.prepare_model_kwargs(
         ctx, ids, {"engram_hash_ids": hashes, "engram_token_mask": mask}
     )
@@ -2812,6 +2815,253 @@ def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
     finally:
         # Release captured collectives before process-group teardown, even on failure.
         graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_multimodal_prefill_graph(monkeypatch, tmp_path):
+    """Image/text/chunk replay; torchrun with four ranks also exercises DP/EP."""
+    from copy import deepcopy
+    from test.runtime.test_cudagraph_capture_sizes import _config as graph_config
+    from test.runtime.test_deepseek_v41_vision import _item
+
+    from tokenspeed.runtime.distributed import Mapping
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.multimodal.inputs import (
+        MultimodalForwardContext,
+        MultimodalInputs,
+    )
+
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world not in (1, 4):
+        pytest.skip("run on one GPU or with torchrun --nproc_per_node=4")
+    rank, local_rank = int(os.environ.get("RANK", "0")), int(
+        os.environ.get("LOCAL_RANK", "0")
+    )
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(local_rank)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=1,
+        attn_dp_size=world,
+        dense_tp_size=1,
+        dense_dp_size=world,
+        moe_tp_size=1,
+        moe_ep_size=world,
+    )
+    if world > 1:
+        pg_manager.init_distributed(
+            mapping,
+            distributed_init_method="env://",
+            backend="nccl",
+            timeout=180,
+            device_id=torch.device(device),
+        )
+        pg_manager.init_process_group(mapping.moe.tp_ep_group, backend="nccl")
+    monkeypatch.setattr(
+        moe_utils, "MOE_BACKEND", MoeBackend.MEGA_MOE if world > 1 else MoeBackend.AUTO
+    )
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 256)
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", 2 * world)
+    graph = None
+    try:
+        text = _config()
+        text.vocab_size = 13
+        text.hidden_size = 512 if world > 1 else 256
+        text.moe_intermediate_size = 256
+        text.n_routed_experts = 32 if world > 1 else 4
+        text.num_attention_heads = text.o_groups = text.index_n_heads = 2
+        text.head_dim, text.index_head_dim = 512, 128
+        text.qk_rope_head_dim, text.q_lora_rank = 64, 128
+        config = v41.DeepseekV41Config(
+            text_config=vars(text),
+            vision_config=dict(
+                hidden_size=128,
+                intermediate_size=192,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                patch_size=2,
+                downsample_ratio=2,
+                rope_theta=10000,
+            ),
+        )
+        torch.manual_seed(41)
+        with torch.device(device), set_default_torch_dtype(torch.bfloat16):
+            adapter = DeepseekV41ForCausalLM(
+                config,
+                mapping,
+                _quant(),
+                is_multimodal_active=True,
+                mm_attention_backend="triton_attn",
+            )
+        weights = _checkpoint(text)
+        for name, value in weights.items():
+            if ".experts." in name and name.endswith(".scale"):
+                expert, projection, _ = name.split(".experts.")[1].split(".")
+                value.view(torch.uint8).fill_(
+                    120 + int(expert) % 4 + int(projection[-1])
+                )
+        for name, parameter in adapter.vision.named_parameters():
+            raw = name.replace(".attn.qkv_proj.", ".attn.wqkv.").replace(
+                ".attn.proj.", ".attn.wo."
+            )
+            weights[raw] = (
+                torch.ones_like(parameter, device="cpu")
+                if "norm" in name and name.endswith("weight")
+                else torch.randn_like(parameter, device="cpu") * 0.03
+            )
+        for layer in range(text.num_hidden_layers):
+            weights[f"layers.{layer}.ffn.gate.bias_vl"] = torch.linspace(
+                16, -16, text.n_routed_experts
+            )
+        adapter.load_weights(_bind_engram_tables(adapter, weights, tmp_path).items())
+        adapter.initialize_engram(_Tokenizer())
+        for module in adapter.vision.modules():
+            if isinstance(module, LinearBase):
+                module.quant_method.process_weights_after_loading(module)
+        backend, tables = _backend(device, 2), _tables(device)
+        buffers = InputBuffers(2, 256, 2, device=device)
+        buffers.init_ngram_buffers(
+            3, adapter.model.engram_hash.input_parameters, text.vocab_size
+        )
+        # Only the checkpoint-loading wrapper is omitted; model and caches are real.
+        runner = SimpleNamespace(
+            model=adapter,
+            is_generation=True,
+            model_config=SimpleNamespace(
+                requires_request_token_history=False, is_multimodal_active=True
+            ),
+        )
+        execution = replace(
+            graph_config([1, 2], max_num_seqs=2, max_capture=2),
+            device="cuda",
+            gpu_id=local_rank,
+            global_rank=rank,
+            context_len=512,
+            physical_context_len=513,
+            chunked_prefill_size=256,
+            vocab_size=text.vocab_size,
+            max_num_seqs=2 * world,
+            data_parallel_size=world,
+            world_size=world,
+            prefill_graph_capture_sizes=[64, 256],
+        )
+        graph = PrefillGraph(
+            runner, backend, backend.cache_pool, buffers, execution, num_warmup=2
+        )
+        graph.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+        # Only rank 0 has images; the chunked case also has empty decoder ranks.
+        for lengths, rounds, image_start in (
+            ([60] * world, [[(0, 60)] * world], 52),
+            ([40] * world, [[(0, 40)] * world], None),
+            (
+                [200, 40, 200, 100][:world],
+                [
+                    [(0, 72), (0, 40), (0, 72), (0, 100)][:world],
+                    [(72, 128), (0, 40), (72, 128), (0, 100)][:world],
+                ],
+                68,
+            ),
+        ):
+            length = lengths[rank]
+            prompt = torch.arange(length, device=device) % 7
+            history = torch.stack(
+                [
+                    torch.cat((torch.full((d,), -1, device=device), prompt[:-d]))
+                    for d in (1, 2, 3)
+                ],
+                dim=1,
+            )
+            full_mask = torch.zeros(length, device=device, dtype=torch.bool)
+            mm = None
+            if image_start is not None and rank == 0:
+                item = _item(4, 4)
+                end = image_start + item.offsets[0][1]
+                item.offsets = [(image_start, end)]
+                full_mask[image_start : end + 1] = True
+                mm = MultimodalInputs(mm_items=[item])
+            results = []
+            for replay in (False, True):
+                # Encoding consumes the image features; each run needs its own inputs.
+                mm_input = deepcopy(mm)
+                backend.cache_pool.arena.buffer.zero_()
+                outputs = []
+                for batch in rounds:
+                    start, count = batch[rank]
+                    meta = _extend(backend, tables, [count], [start], [0], [length])
+                    ids, image_mask = (
+                        prompt[start : start + count],
+                        full_mask[start : start + count],
+                    )
+                    buffers.input_ids_buf[:count].copy_(ids)
+                    buffers.positions_buf[:count].copy_(meta.positions)
+                    buffers.ngram_token_mask_buf[:count].copy_(~image_mask)
+                    buffers.ngram_token_mask_buf[count:].zero_()
+                    buffers.ngram_hash_ids_buf[:count].copy_(
+                        adapter.model.engram_hash(
+                            ids, history[start : start + count], ~image_mask
+                        )
+                    )
+                    buffers.ngram_hash_ids_buf[count:].copy_(buffers.ngram_padding_hash)
+                    ctx = ForwardContext(
+                        attn_backend=backend,
+                        token_to_kv_pool=backend.cache_pool,
+                        bs=1,
+                        num_extends=1,
+                        input_num_tokens=count,
+                        forward_mode=ForwardMode.EXTEND,
+                        output_layout=ForwardOutputLayout.from_prefill(
+                            prefix_lengths=[start],
+                            input_lengths=[count],
+                            prompt_lengths=[length],
+                            num_decodes=0,
+                            decode_width=1,
+                        ),
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        gather_ids=torch.tensor([count - 1], device=device),
+                        global_num_tokens=[n for _, n in batch] if world > 1 else None,
+                        global_bs=[1] * world if world > 1 else None,
+                        all_extend=True,
+                    )
+                    mm_context = (
+                        MultimodalForwardContext([mm_input], [start], [count], 256)
+                        if mm_input is not None
+                        else None
+                    )
+                    if replay:
+                        assert graph.can_run(ctx, mm_context)
+                        output = graph.replay(
+                            ctx, buffers.input_ids_buf[:count], mm_context
+                        )
+                        landed = graph._model_input_buffers["image_mask"]
+                        torch.testing.assert_close(landed[:count], image_mask)
+                        assert not landed[count : graph._select_bucket(ctx)].any()
+                    else:
+                        output = adapter(
+                            ctx=ctx,
+                            input_ids=ids,
+                            positions=meta.positions,
+                            multimodal_context=mm_context,
+                            **buffers.ngram_model_kwargs(count),
+                        )
+                    outputs.append(output.next_token_logits.clone())
+                results.append(outputs)
+            for expected, actual in zip(*results, strict=True):
+                assert torch.isfinite(actual).all()
+                torch.testing.assert_close(actual, expected, rtol=2**-6, atol=2**-7)
+                torch.testing.assert_close(actual.argmax(-1), expected.argmax(-1))
+    finally:
+        torch.cuda.synchronize()
+        if graph is not None:
+            graph.release_graphs()
+        if world > 1:
+            torch.distributed.destroy_process_group()
 
 
 def test_distributed_attention_tp4(monkeypatch, tmp_path):

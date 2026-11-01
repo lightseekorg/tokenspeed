@@ -26,7 +26,8 @@ Dummy batches balance tokens across the selected nonempty request count.
 The embedding lookup stays OUTSIDE
 the captured region: graphs start from a static input-embeds buffer, filled at
 replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
-embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
+embeddings. ``PrefillGraphInputModel`` also refreshes additional row inputs
+such as visual routing masks; embeds-only models keep their existing seam.
 Capture borrows the decode
 :class:`~tokenspeed.runtime.execution.forward_step.ForwardStepRunner`'s
 stream; buckets share one private mempool, deliberately not the decode graphs'
@@ -52,8 +53,9 @@ graphs per token bucket (``encoder_forward``) and decoder graphs per
 decoder-row bucket (``decoder_forward`` from a fixed-row static state). The
 decoder graphs depend only on their row count, so they are shared by every
 token bucket; a forward whose narrowed rows exceed the largest decoder bucket
-runs its decoder stage eager after the encoder replay. Under attention DP the
-narrowed row count is rank-local, so the split graph is disabled there.
+runs its decoder stage eager after the encoder replay. Under attention DP,
+replicated token and request counts bound the decoder rows on every rank, so
+all ranks select one decoder bucket even when their live row counts differ.
 """
 
 from __future__ import annotations
@@ -245,6 +247,19 @@ class NarrowedRowState(Protocol):
 
 
 @runtime_checkable
+class PrefillGraphInputModel(Protocol):
+    """Prepare all modalities eagerly for one graph, refreshing every row input."""
+
+    def allocate_prefill_graph_inputs(
+        self, max_num_tokens: int
+    ) -> dict[str, torch.Tensor]: ...
+
+    def prepare_prefill_graph_inputs(
+        self, input_ids: torch.Tensor, ctx: ForwardContext, multimodal_context
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]: ...
+
+
+@runtime_checkable
 class NarrowingPrefillModel(Protocol):
     """An inner model whose prefill row count drops once, at a fixed layer.
 
@@ -415,9 +430,16 @@ class PrefillGraph:
         graph_supported: bool = True,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
-        # Multimodal seam: models whose multimodal path is embeds-only expose
-        # multimodal_input_embeds; others (e.g. deepstack) replay text only.
+        # Additional row inputs extend the existing embeds-only seam.
         self._multimodal_input_embeds = getattr(model, "multimodal_input_embeds", None)
+        self._graph_input_model = (
+            model if isinstance(model, PrefillGraphInputModel) else None
+        )
+        self._supports_multimodal_inputs = (
+            self._graph_input_model is not None
+            or self._multimodal_input_embeds is not None
+        )
+        self._model_input_buffers: dict[str, torch.Tensor] = {}
         self.text_model, self.inner_model = text_and_inner_model(model)
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
         # read a static input-embeds buffer instead of gathering from input_ids.
@@ -458,30 +480,13 @@ class PrefillGraph:
             # The graph's embedding seam takes input_ids alone; an embedding
             # that reads request-token history stays eager.
             or model_runner.model_config.requires_request_token_history
-            # DP replay decisions must come from replicated state, and a
-            # forward's multimodal-ness is rank-local: one rank running its mm
-            # prefill eager while text-only peers replay desyncs the EP
-            # collectives. Until the DP metadata gather carries a multimodal
-            # flag, keep the graph off for multimodal models under DP.
-            or (config.data_parallel_size > 1 and model_runner.is_multimodal)
-            # The narrowed row count is rank-local (which prompts complete on
-            # this rank), so the decoder bucket -- and the collective shapes
-            # its graph bakes -- would differ across ranks; the stages also
-            # size their collectives from their own rows, which the DP
-            # gather does not carry. Until narrowed counts are exchanged,
-            # the split graph stays off under attention DP.
-            or (config.data_parallel_size > 1 and self._narrowing is not None)
-        )
-        if (
-            self._narrowing is not None
-            and config.data_parallel_size > 1
-            and not config.enforce_eager
-            and not config.disable_prefill_graph
-        ):
-            logger.info(
-                "Prefill CUDA graphs disabled: the narrowing prefill model's "
-                "decoder rows are rank-local under attention DP"
+            # Unsupported modalities would make graph admission rank-local.
+            or (
+                config.data_parallel_size > 1
+                and model_runner.model_config.is_multimodal_active
+                and not self._supports_multimodal_inputs
             )
+        )
 
         self.decoder_buckets: list[int] = (
             get_decoder_row_buckets(
@@ -558,6 +563,31 @@ class PrefillGraph:
             dtype=weight.dtype,
             device=weight.device,
         )
+        self._model_input_buffers = (
+            self._graph_input_model.allocate_prefill_graph_inputs(
+                max(self.capture_buckets)
+            )
+            if self._graph_input_model is not None
+            else {}
+        )
+        reserved = {
+            "input_ids",
+            "positions",
+            "input_embeds",
+            "inputs_embeds",
+            "pp_inbound",
+            "engram_hash_ids",
+            "engram_token_mask",
+        }
+        for name, buffer in self._model_input_buffers.items():
+            if name in reserved:
+                raise ValueError(f"prefill graph input {name!r} is runner-owned")
+            if (
+                buffer.ndim == 0
+                or buffer.shape[0] != max(self.capture_buckets)
+                or buffer.device != weight.device
+            ):
+                raise ValueError(f"invalid prefill graph input buffer {name!r}")
         # Seam: backends alloc static buffers or refuse capture; kept
         # outside inference mode (in-place refresh). Base default: no-op.
         self._captures.clear()
@@ -823,6 +853,7 @@ class PrefillGraph:
         self._handoff_storage = {}
         self._encoder_handoff_storage = {}
         self._outputs = None
+        self._model_input_buffers = {}
 
     def _capture_bucket(
         self,
@@ -975,6 +1006,10 @@ class PrefillGraph:
         model_kwargs = {
             "input_embeds": self._input_embeds_buf[:num_tokens],
             **ib.ngram_model_kwargs(num_tokens),
+            **{
+                name: buffer[:num_tokens]
+                for name, buffer in self._model_input_buffers.items()
+            },
         }
         prepare_kwargs = getattr(self.text_model, "prepare_model_kwargs", None)
         if prepare_kwargs is not None:
@@ -1018,6 +1053,23 @@ class PrefillGraph:
         self._input_embeds_buf[:num_tokens].copy_(embeds)
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
+
+    def _land_model_inputs(
+        self, inputs: dict[str, torch.Tensor], num_tokens: int, bucket: int
+    ) -> None:
+        """Refresh every declared input in place and clear its padded tail."""
+        if inputs.keys() != self._model_input_buffers.keys():
+            raise ValueError("prepared prefill graph inputs differ from their buffers")
+        for name, buffer in self._model_input_buffers.items():
+            value = inputs[name]
+            if (
+                value.shape != (num_tokens, *buffer.shape[1:])
+                or value.dtype != buffer.dtype
+                or value.device != buffer.device
+            ):
+                raise ValueError(f"prefill graph input {name!r} has an invalid layout")
+            buffer[:num_tokens].copy_(value)
+            buffer[num_tokens:bucket].zero_()
 
     def _dummy_group_tables(self, bs: int) -> dict[str, "torch.Tensor"]:
         """Build the capture batch's group tables: one row per fabricated
@@ -1238,11 +1290,10 @@ class PrefillGraph:
     def can_run(self, ctx: ForwardContext, multimodal_context=None) -> bool:
         """Whether this forward replays a captured graph (mirrors decode's can_run).
 
-        A forward carrying multimodal inputs replays only when the model
-        exposes the embeds-only ``multimodal_input_embeds`` seam; models with
-        extra per-layer inputs (deepstack) run eager.
+        A multimodal forward requires a complete input contract, either
+        embedding replacement alone or declared additional tensor inputs.
         """
-        if multimodal_context is not None and self._multimodal_input_embeds is None:
+        if multimodal_context is not None and not self._supports_multimodal_inputs:
             return False
         return self._replay_bucket(ctx) is not None
 
@@ -1256,9 +1307,9 @@ class PrefillGraph:
 
         The embedding runs eagerly here, outside the graph: a plain text
         prefill gathers ``embed_tokens(input_ids)`` into the static buffer; a
-        multimodal prefill builds the merged text+vision embeddings via the
-        model's ``multimodal_input_embeds`` seam (vision encoder included)
-        instead -- both replay the same graphs. Then the inner stack replays
+        multimodal prefill prepares merged text+vision embeddings and any
+        declared row inputs before replay. Both reuse the same graphs.
+        Then the inner stack replays
         over the padded bucket and the model's eager logits tail finishes on
         the real-token rows.
         """
@@ -1267,7 +1318,14 @@ class PrefillGraph:
         self._log_engaged_once(bucket, ctx, multimodal_context is not None)
         num_tokens = ctx.input_num_tokens
         input_embeds = None
-        if multimodal_context is not None:
+        if self._graph_input_model is not None:
+            input_embeds, model_inputs = (
+                self._graph_input_model.prepare_prefill_graph_inputs(
+                    input_ids, ctx, multimodal_context
+                )
+            )
+            self._land_model_inputs(model_inputs, num_tokens, bucket)
+        elif multimodal_context is not None:
             input_embeds = self._multimodal_input_embeds(
                 input_ids, ctx, multimodal_context
             )
@@ -1362,7 +1420,7 @@ class PrefillGraph:
                 bucket, ctx.bs, ctx.forward_mode, capture=False
             )
         rows = model.decoder_rows(ctx)
-        decoder_bucket = self._decoder_bucket(rows)
+        decoder_bucket = self._decoder_replay_bucket(ctx, rows)
         route = "decoder graph" if decoder_bucket is not None else "decoder eager"
         if route not in self._engaged_logged:
             self._engaged_logged.add(route)
@@ -1383,9 +1441,26 @@ class PrefillGraph:
             else:
                 decoder = self._decoders[decoder_bucket]
                 narrowed.land_into(decoder.statics)
-                decoder.capture.replay(valid_rows=rows)
+                # Even zero-row ranks must join the captured expert collectives.
+                with self._padded_to(ctx, decoder_bucket):
+                    decoder.capture.replay(valid_rows=rows)
                 hidden, captured = decoder.output.sliced(rows)
         return model.finish_forward(hidden, list(captured), ctx)
+
+    def _decoder_replay_bucket(self, ctx: ForwardContext, rows: int) -> int | None:
+        """Select a rank-uniform decoder capacity from existing DP metadata."""
+        capacity = rows
+        if self.dp_size > 1:
+            # Replicated counts bound local rows regardless of prompt completion.
+            capacity = max(
+                min(tokens, requests * self._narrowing.max_decoder_rows_per_request)
+                for tokens, requests in zip(
+                    ctx.global_num_tokens, ctx.global_bs, strict=True
+                )
+            )
+            if rows > capacity:
+                raise ValueError("prefill decoder rows exceed the gathered capacity")
+        return self._decoder_bucket(capacity)
 
     def _decoder_bucket(self, rows: int) -> int | None:
         """Smallest decoder bucket >= ``rows``, or ``None`` to run the decoder eager."""
@@ -1447,6 +1522,12 @@ class PrefillGraph:
         if ctx.draft_narrowing is not None:
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
+            return None
+        if (
+            self.dp_size > 1
+            and self._narrowing is not None
+            and (ctx.global_num_tokens is None or ctx.global_bs is None)
+        ):
             return None
         bucket = self._select_bucket(ctx)
         if bucket is None or not self._has_bucket(bucket):
