@@ -6226,18 +6226,14 @@ TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
     EXPECT_FALSE(FindWriteBack(finalize2).has_value()) << "already-indexed keys must not re-emit a write-back";
     // r1's finish found the Host pool fully in flight, so its tail never
-    // reached Host; r2's identical tail is the first store of that key and
-    // replaces two committed, unpinned entries in the 6-page pool.
+    // reached Host. r2's finish refreshes the six entries of the pages it
+    // read, which fill the pool, and dates its identical tail -- the end of
+    // what it leaves -- older than all of them: the tail takes no page's
+    // place (the last page would leave it unusable), so nothing is stored.
     ExecutionPlan finish2 = FinishAndReap("r2");
-    auto finish_wb2 = FindWriteBack(finish2);
-    ASSERT_TRUE(finish_wb2.has_value());
-    EXPECT_EQ(finish_wb2->src_pages.at(0).size(), 2u) << "the tail with token 9001, in both groups";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 2)
-        << "duplicate candidates are unpinned at drain; only the tail's sources are pinned";
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
-    SendWriteBackDone(finish_wb2->op_ids.at(0));
+    EXPECT_FALSE(FindWriteBack(finish2).has_value());
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "duplicate candidates are unpinned at drain";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {

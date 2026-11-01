@@ -618,6 +618,22 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{untouched, matched}));
 }
 
+// A refresh raises an entry's epoch and never lowers it: a request admitted
+// earlier that finishes later does not date back what a later one refreshed.
+TEST(PrefixCacheIndexEvictionOrderTest, ATouchRaisesAnEntryButNeverDatesItBack) {
+    BlockPool pool(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation touched = Cache(index, pool, "touched", /*access_epoch=*/10);
+    const CacheBlockLocation middle = Cache(index, pool, "middle", /*access_epoch=*/20);
+
+    EXPECT_TRUE(index.Touch(pool, KeyOf("touched"), /*access_epoch=*/30));
+    EXPECT_TRUE(index.Touch(pool, KeyOf("touched"), /*access_epoch=*/15));
+    EXPECT_FALSE(index.Touch(pool, KeyOf("absent"), /*access_epoch=*/40));
+
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{middle, touched}));
+    EXPECT_EQ(index.MetadataFor(pool, touched)->last_access_epoch, 30u);
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, EvictedEntriesLeaveTheOrder) {
     BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);

@@ -64,8 +64,18 @@ public:
     // gets the same guard. Boundary publication and finish drain with
     // kPinnedUntilAck; a retraction's stream-ordered L2 leg does not use the
     // queue -- StartRetractionStores builds it from the victim's tables.
-    // `cause` (kPublication or kFinish) only picks the counters.
-    std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause);
+    // `cause` (kPublication or kFinish) only picks the counters. A finish
+    // passes its final publication, nullopt for a live request's
+    // publications and a finish that computed nothing: the boundary it
+    // leaves is stored ahead of the queued candidates, and its Host copies
+    // -- already cached, carried by a store in flight that publishes them at
+    // its ACK, or stored now -- are dated by the batch's epochs
+    // (CacheCoordinator::TakeStoreEpochs); no other Host entry is refreshed.
+    // Its copies are placed newest first, each only in free capacity or in
+    // place of an older entry.
+    std::optional<WriteBackOperation> StartPendingStores(
+        StoreSourceGuard guard, HostStoreCause cause,
+        const std::optional<CacheCoordinator::FinalPublication>& publication);
     // Drains the segments this plan's admissions and restores recorded under
     // the write-back policy (CacheCoordinator::TakeEvictedSegments) into one
     // stream-ordered write-back op: their Device pages may be granted away
@@ -85,8 +95,9 @@ public:
     // A retraction image and the two store ops that fill it. The L2 leg is a
     // stream-ordered write-back of the published pages not yet on Host (keys
     // already Host-cached or carried by an in-flight store that publishes them
-    // at its ACK are pinned, not copied again); the tail leg is the snapshot
-    // store of every other data slot plus the slot-state blob.
+    // at its ACK are pinned, not copied again), dated like a finish's (the
+    // retraction's boundary, TakeRetractionEpochs); the tail leg is the
+    // snapshot store of every other data slot plus the slot-state blob.
     // pending_store_ops lists every op the image waits for -- both legs' own
     // ops and any earlier in-flight store carrying one of its keys.
     struct RetractionStores {
@@ -129,13 +140,22 @@ public:
     // BoundaryTree). Nothing is mutated or counted.
     RetractionImageSplit SplitRetractionImage(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                               std::vector<std::vector<ImageSlot>> published) const;
+    // The epochs a retraction's L2 leg dates its Host copies with: those of
+    // the victim's final publication (CacheCoordinator::TakeStoreEpochs),
+    // taken before its image is split, so the boundary's Host copies are
+    // refreshed before the plan picks Host victims, and the boundary keys an
+    // earlier store still carries are re-dated, so that store's ACK
+    // publishes them at these epochs. The refresh stands when the split then
+    // refuses the image. Nothing is dated without a Host pool.
+    CacheCoordinator::StoreEpochs TakeRetractionEpochs(const CacheCoordinator::FinalPublication& publication);
     // Takes the image of a quiescent victim's tables ([0, num_tokens) are its
     // computed tokens) as `split` planned it -- with no shortfall and nothing
     // changed since -- and starts both store legs: the Host takes the rows of
     // the first split.num_host_boundaries boundaries, evicting the victims
     // the plan chose, and the later rows ride the snapshot pool. The image
     // therefore fits; nullopt (the pool refusing it after all) is a safety
-    // net no plan reaches.
+    // net no plan reaches. The L2 leg's tickets are dated by `epochs`
+    // (TakeRetractionEpochs, taken before the split).
     // blob_slot is the slot-state blob's arena slot the tail leg exports into;
     // the store shares it with the Retracted state so an abort before the ACK
     // cannot hand the slot to a new victim while the export still writes it.
@@ -143,7 +163,14 @@ public:
                                                           std::int32_t request_pool_index,
                                                           std::shared_ptr<SnapshotSlotIndex> blob_slot,
                                                           std::span<const BlockTable> tables, std::int32_t num_tokens,
-                                                          RetractionImageSplit split);
+                                                          RetractionImageSplit split,
+                                                          CacheCoordinator::StoreEpochs epochs);
+    // Refreshes the Host copies of the boundary a request resumed from
+    // (CacheCoordinator::RefreshHostBoundary) and re-dates the ones an
+    // earlier store still carries, so its ACK publishes them no older than
+    // access_epoch.
+    void RefreshHostBoundary(std::span<const std::string> prefix_hashes, const std::optional<TailPublication>& tail,
+                             std::uint64_t access_epoch);
     // One restore op for both legs: load_pairs are the Host L2 rows (keyed),
     // snapshot_pairs the snapshot-pool rows. Both ends of every pair, the blob
     // slot (shared) and the request-pool row the blob is imported into
@@ -199,7 +226,9 @@ public:
     // scheduling decision reads them. What a drain takes lands in exactly one
     // outcome each (stored counts in blocks):
     // - StartPendingStores, per candidate: host_cached | in_flight |
-    //   evicted_before_drain | no_placement | stored.
+    //   evicted_before_drain | no_placement | stored. A final publication's
+    //   boundary blocks stored ahead of the candidates land in
+    //   no_placement | stored, as does the candidate queued for each.
     // - StartRetractionStores, per published slot: host_cached | in_flight |
     //   snapshot_fallback | stored.
     // - StartEvictionStores, per segment member: host_cached | in_flight |
@@ -238,15 +267,18 @@ public:
 
 private:
     // A store ticket always pins its Host destination; the ACK publishes that
-    // entry (CacheHostBlock), except on an eviction write-back, whose segments
-    // publish it. Whether it also pins the Device source is the op's
-    // StoreSourceGuard: kPinnedUntilAck keeps the source cached and unevictable
-    // until the ACK, kStreamOrdered leaves it empty and relies on the runtime
-    // ordering the copy ahead of any reuse.
+    // entry (CacheHostBlock) at access_epoch, the date its batch gave it (a
+    // later batch whose boundary holds the key re-dates it), except on an
+    // eviction write-back, whose segments publish it as its Device entry was.
+    // Whether it also pins the Device source is the op's StoreSourceGuard:
+    // kPinnedUntilAck keeps the source cached and unevictable until the ACK,
+    // kStreamOrdered leaves it empty and relies on the runtime ordering the
+    // copy ahead of any reuse.
     struct StoreTicket {
         CacheKey key;
         CacheBlockRef device_block_ref;
         CacheBlockRef host_block_ref;
+        std::uint64_t access_epoch{0};
     };
 
     struct InFlightWriteBack {
@@ -297,6 +329,13 @@ private:
     };
     using InFlightHostBlocks = std::unordered_map<CacheKey, InFlightHostBlock, CacheKeyHash>;
     InFlightHostBlocks inFlightHostBlocks() const;
+    // A boundary's keys Host does not hold, with their epochs.
+    using BoundaryEpochs = std::unordered_map<CacheKey, std::uint64_t, CacheKeyHash>;
+    // Re-dates the boundary keys an earlier store still carries, never back:
+    // its ACK publishes them no older than these epochs. An eviction
+    // write-back's tickets publish nothing at the ACK and are left as they
+    // are.
+    void redateInFlight(const BoundaryEpochs& boundary);
 
     CacheCoordinator& coordinator_;
     std::unordered_map<std::uint32_t, InFlightWriteBack> write_backs_;

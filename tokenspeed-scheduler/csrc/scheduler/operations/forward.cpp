@@ -191,6 +191,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
         _assert(cache_progress.state_checkpoint_tokens % prefix_granularity == 0,
                 "an in-forward State checkpoint sits at a page boundary");
         state_checkpoint_pages = cache_progress.state_checkpoint_tokens / prefix_granularity;
+        cache_progress.published_state_checkpoint_tokens = cache_progress.state_checkpoint_tokens;
         cache_progress.published_state_checkpoint_blocks = std::move(cache_progress.state_checkpoint_blocks);
         cache_progress.state_checkpoint_blocks.clear();
         cache_progress.state_checkpoint_tokens = 0;
@@ -607,6 +608,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
         .resumed_tail_hash = std::move(admission->resumed_tail_hash),
+        // A remote landing reads no local checkpoint at the hit.
+        .resume_tokens = source == fsm::PrefillSource::kLocal ? hit_tokens : 0,
     };
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
@@ -660,6 +663,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const bool ends_at_state_checkpoint = state_checkpoint > 0 && first_pos == state_checkpoint;
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
+    }
+    if (ends_at_state_checkpoint) {
+        cache_progress.published_state_checkpoint_tokens = state_checkpoint;
     }
     const RequestProgress progress = AdvanceRequestProgress(
         *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
@@ -1008,7 +1014,10 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
     // what the Device holds, which the publication adds to
     // (NumHostBoundariesThatFit); and under KV parallelism a slot it
     // re-points to the Device entry already holding its key rides the pool
-    // in that entry's bucket, not the one counted here. The split
+    // in that entry's bucket, not the one counted here. Nor does the probe
+    // see the refresh of the Host copies of what the victim used, which
+    // retractVictim makes before it splits the image and which can reorder
+    // the least recently used Host victims the plan ranks. The split
     // retractVictim makes after the publication can then refuse the image.
     // Nothing is mutated: a candidate that does not fit is left as it was,
     // and so is the Host.
@@ -1039,10 +1048,11 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
 // stream ahead of the plan's page reuse. A victim whose image cannot be held,
 // or with no blob slot free, is not retracted: the shortfall is returned
 // before anything is acquired or evicted for the image, and the publication
-// it did stands as its progress. Both callers then abort it rather than let
-// it run on: the publication registered blocks the victim would write again (a
-// partial page as a tail, and a State group's end state, which a decode step
-// writes in place).
+// it did stands as its progress (as does the refresh of the Host copies of
+// what it used). Both callers then abort it rather than let it run on: the
+// publication registered blocks the victim would write again (a partial page
+// as a tail, and a State group's end state, which a decode step writes in
+// place).
 std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuild& build,
                                                        std::vector<WriteBackOperation>& write_back_operations) {
     if (snapshot_slots_.AvailableSlots() == 0) {
@@ -1050,6 +1060,13 @@ std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuil
     }
     publishCompletedPrefix(victim);
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
+    // The Host copies of what the victim used -- the boundary it resumed
+    // from and the one it leaves, whose epochs date the image's L2 leg -- are
+    // refreshed before the split plans that leg, as a finish's store batch
+    // refreshes them before it picks Host victims.
+    refreshResumeBoundary(victim, victim.CacheProgressRef());
+    CacheCoordinator::StoreEpochs epochs =
+        tier_transfers_.TakeRetractionEpochs(finalPublication(victim, victim.CacheProgressRef()));
     TierTransferManager::RetractionImageSplit split = tier_transfers_.SplitRetractionImage(
         victim.BlockTablesRef(), num_computed_tokens,
         coordinator_.PublishedDataSlots(victim.BlockTablesRef(), num_computed_tokens));
@@ -1061,9 +1078,9 @@ std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuil
     // the restore that imports from it): an abort before either ACK leaves
     // the slot with the op until the copy is done.
     auto blob_slot = std::make_shared<SnapshotSlotIndex>(snapshot_slots_.Allocate());
-    std::optional<TierTransferManager::RetractionStores> stores =
-        tier_transfers_.StartRetractionStores(victim.Id(), victim.RequestPoolIndex(), blob_slot,
-                                              victim.BlockTablesRef(), num_computed_tokens, std::move(split));
+    std::optional<TierTransferManager::RetractionStores> stores = tier_transfers_.StartRetractionStores(
+        victim.Id(), victim.RequestPoolIndex(), blob_slot, victim.BlockTablesRef(), num_computed_tokens,
+        std::move(split), std::move(epochs));
     if (!stores) {
         return ImageShortfall::kSnapshotPool;  // unreachable: the split held the image
     }

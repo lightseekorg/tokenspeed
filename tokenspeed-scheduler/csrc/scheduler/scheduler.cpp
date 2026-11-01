@@ -535,7 +535,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // and the ticket pins them until the ACK, so the copy stays off the
         // forward's critical path.
         if (auto store =
-                tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication)) {
+                tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                                   /*publication=*/std::nullopt)) {
             write_back_operations.push_back(std::move(*store));
         }
     }

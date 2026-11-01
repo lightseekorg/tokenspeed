@@ -352,7 +352,8 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered, HostStoreCause::kPublication);
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered, HostStoreCause::kPublication,
+                                                   /*publication=*/std::nullopt);
     ASSERT_TRUE(write_back);
     EXPECT_FALSE(write_back->source_pinned);
     EXPECT_FALSE(transfers.HasPinnedStoresInFlight());
@@ -393,7 +394,8 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+                                                   /*publication=*/std::nullopt);
     ASSERT_TRUE(write_back);
     EXPECT_TRUE(write_back->source_pinned);
     EXPECT_TRUE(transfers.HasPinnedStoresInFlight());
@@ -443,7 +445,8 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     cache_device(first_key);
     const std::array first_hashes{first_key.content_hash};
     coordinator.QueueCachedBlocksForStore(first_hashes);
-    auto first = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
+    auto first = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt);
     ASSERT_TRUE(first);
     ASSERT_EQ(first->transfers.size(), 1u);
     const std::int32_t destination = first->transfers.front().destination_page;
@@ -452,7 +455,8 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     cache_device(second_key);
     const std::array second_hashes{second_key.content_hash};
     coordinator.QueueCachedBlocksForStore(second_hashes);
-    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication));
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt));
     const TierTransferManager::WriteBackStats& publication_stores =
         transfers.WriteBackStatsFor(HostStoreCause::kPublication);
     EXPECT_EQ(publication_stores.no_placement, 1u)
@@ -461,7 +465,8 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
 
     transfers.CompleteWriteBack(first->op_id);
     coordinator.QueueCachedBlocksForStore(second_hashes);
-    auto second = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
+    auto second = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                               /*publication=*/std::nullopt);
     ASSERT_TRUE(second);
     ASSERT_EQ(second->transfers.size(), 1u);
     EXPECT_EQ(second->transfers.front().destination_page, destination);
@@ -472,6 +477,516 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     EXPECT_EQ(publication_stores.host_cached + publication_stores.in_flight + publication_stores.evicted_before_drain +
                   publication_stores.no_placement + publication_stores.blocks[0],
               3u);
+}
+
+// A finish refreshes the Host copy of a page its table holds -- part of the
+// boundary it leaves -- instead of storing it again, so the next Host
+// allocation evicts the idle entry rather than the one in use; queueing the
+// page as a store candidate alone refreshes nothing.
+TEST(CacheOperationTest, OnlyTheFinishBoundaryRefreshesAHostCopy) {
+    for (const bool held : {false, true}) {
+        SCOPED_TRACE(held);
+        BlockPool device_pool{3, {1}};
+        BlockPool host_pool{2, {1}};
+        const std::array specs{CacheGroupSpec{
+            .attn_kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        }};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        TierTransferManager transfers{coordinator};
+        const CacheKey old_key{.group_id = 0, .content_hash = "old"};
+        const CacheKey new_key{.group_id = 0, .content_hash = "new"};
+        // Both pages are cached on Device and stored to Host, "old" first.
+        std::vector<CacheBlockRef> device_blocks;
+        for (const CacheKey& key : {old_key, new_key}) {
+            CacheBlockRef block = device_pool.AcquireBlock(key.group_id);
+            ASSERT_TRUE(block);
+            coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, /*access_epoch=*/1,
+                                                     /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                     /*newly_cached=*/nullptr);
+            const std::array hashes{key.content_hash};
+            coordinator.QueueCachedBlocksForStore(hashes);
+            auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck,
+                                                           HostStoreCause::kPublication, /*publication=*/std::nullopt);
+            ASSERT_TRUE(write_back);
+            transfers.CompleteWriteBack(write_back->op_id);
+            device_blocks.push_back(std::move(block));
+        }
+        ASSERT_TRUE(coordinator.ContainsHostCachedBlock(old_key));
+        ASSERT_TRUE(coordinator.ContainsHostCachedBlock(new_key));
+        const std::array hashes{old_key.content_hash};
+        coordinator.QueueCachedBlocksForStore(hashes);
+        std::vector<BlockTable> tables;
+        if (held) {
+            tables.push_back(BlockTable::FromBlocks({device_blocks.front()}, /*available_tokens=*/0));
+        }
+        EXPECT_FALSE(transfers.StartPendingStores(
+            StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+            held ? std::optional(CacheCoordinator::FinalPublication{.tables = tables, .num_tokens = 2}) : std::nullopt))
+            << "a copy already on Host is not stored again";
+
+        CacheBlockRef replacement = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+
+        ASSERT_TRUE(replacement);
+        EXPECT_EQ(coordinator.ContainsHostCachedBlock(old_key), held);
+        EXPECT_EQ(coordinator.ContainsHostCachedBlock(new_key), !held);
+    }
+}
+
+// One finish batch both refreshes a page it republishes, the oldest entry
+// on a full Host, and stores a new page, which needs a victim: the refresh
+// comes first, so the batch evicts the idle entry instead -- whether the new
+// page is in the request's table or only queued (and then read on the Device
+// after the idle entry was cached, so its copy is the newer of the two).
+TEST(CacheOperationTest, AFinishRefreshesWhatItLeavesBeforeItsBatchEvicts) {
+    for (const bool new_page_held : {true, false}) {
+        SCOPED_TRACE(new_page_held);
+        BlockPool device_pool{3, {1}};
+        BlockPool host_pool{2, {1}};
+        const std::array specs{CacheGroupSpec{
+            .attn_kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        }};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        TierTransferManager transfers{coordinator};
+        const CacheKey republished{.group_id = 0, .content_hash = "republished"};
+        const CacheKey idle{.group_id = 0, .content_hash = "idle"};
+        const CacheKey fresh{.group_id = 0, .content_hash = "fresh"};
+        std::vector<CacheBlockRef> device_blocks;
+        for (const CacheKey& key : {republished, idle, fresh}) {
+            CacheBlockRef block = device_pool.AcquireBlock(0);
+            ASSERT_TRUE(block);
+            coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, /*access_epoch=*/1,
+                                                     /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                     /*newly_cached=*/nullptr);
+            device_blocks.push_back(std::move(block));
+        }
+        // "republished" reaches Host first, then "idle": Host is full.
+        for (const CacheKey& key : {republished, idle}) {
+            const std::array hashes{key.content_hash};
+            coordinator.QueueCachedBlocksForStore(hashes);
+            auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                                      /*publication=*/std::nullopt);
+            ASSERT_TRUE(store);
+            transfers.CompleteWriteBack(store->op_id);
+        }
+        if (!new_page_held) {
+            const std::uint64_t read = coordinator.TakeStoreEpochs(/*publication=*/std::nullopt).base;
+            ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Touch(device_pool, fresh, read));
+        }
+        // A request holding "republished", and "fresh" when it is held, finishes.
+        const std::array hashes{republished.content_hash, fresh.content_hash};
+        coordinator.QueueCachedBlocksForStore(hashes);
+        std::vector<CacheBlockRef> held{device_blocks[0]};
+        if (new_page_held) {
+            held.push_back(device_blocks[2]);
+        }
+        const std::vector<BlockTable> tables{BlockTable::FromBlocks(held, /*available_tokens=*/0)};
+        auto finish = transfers.StartPendingStores(
+            StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+            CacheCoordinator::FinalPublication{.tables = tables, .num_tokens = new_page_held ? 4 : 2});
+        ASSERT_TRUE(finish);
+        ASSERT_EQ(finish->transfers.size(), 1u) << "only the new page is stored";
+        transfers.CompleteWriteBack(finish->op_id);
+
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(republished));
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(fresh));
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(idle));
+    }
+}
+
+// A finish also stores what its store scan finds on Device but not on Host.
+// The request did not use such an entry, so the copy keeps the Device
+// entry's date rather than looking recently used: the next Host victim is
+// that copy, ahead of an idle entry stored before the finish.
+TEST(CacheOperationTest, AFinishDatesACopyItDidNotUseByItsDeviceEntry) {
+    BlockPool device_pool{2, {1}};
+    BlockPool host_pool{3, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers{coordinator};
+    const CacheKey held{.group_id = 0, .content_hash = "held"};
+    const CacheKey unused{.group_id = 0, .content_hash = "unused"};
+    const CacheKey idle{.group_id = 0, .content_hash = "idle"};
+    std::vector<CacheBlockRef> device_blocks;
+    for (const CacheKey& key : {held, unused}) {
+        CacheBlockRef block = device_pool.AcquireBlock(0);
+        ASSERT_TRUE(block);
+        coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, /*access_epoch=*/1,
+                                                 /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                 /*newly_cached=*/nullptr);
+        device_blocks.push_back(std::move(block));
+    }
+    // "held" reaches Host, then an idle entry does.
+    const std::array held_hashes{held.content_hash};
+    coordinator.QueueCachedBlocksForStore(held_hashes);
+    auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt);
+    ASSERT_TRUE(store);
+    transfers.CompleteWriteBack(store->op_id);
+    {
+        CacheBlockRef block = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, idle, std::nullopt);
+    }
+    // A request holding "held" finishes; its store scan finds "unused" too.
+    const std::array hashes{held.content_hash, unused.content_hash};
+    coordinator.QueueCachedBlocksForStore(hashes);
+    const std::vector<BlockTable> tables{BlockTable::FromBlocks({device_blocks.front()}, /*available_tokens=*/0)};
+    auto finish = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+                                               CacheCoordinator::FinalPublication{.tables = tables, .num_tokens = 2});
+    ASSERT_TRUE(finish);
+    ASSERT_EQ(finish->transfers.size(), 1u) << "only the entry Host lacks is stored";
+    transfers.CompleteWriteBack(finish->op_id);
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(unused));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(idle));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(held));
+}
+
+// The same finish on a full Host: the copy of "unused" is dated by its Device
+// entry, read before the idle entry was cached or by the same access, so it
+// is not newer than any entry it could replace. It takes none's place and is
+// not stored -- the idle entry stays.
+TEST(CacheOperationTest, AFinishNeverEvictsAnEntryAsRecentAsTheCopy) {
+    for (const bool same_access : {false, true}) {
+        SCOPED_TRACE(same_access);
+        BlockPool device_pool{2, {1}};
+        BlockPool host_pool{2, {1}};
+        const std::array specs{CacheGroupSpec{
+            .attn_kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        }};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        TierTransferManager transfers{coordinator};
+        const CacheKey held{.group_id = 0, .content_hash = "held"};
+        const CacheKey unused{.group_id = 0, .content_hash = "unused"};
+        const CacheKey idle{.group_id = 0, .content_hash = "idle"};
+        std::vector<CacheBlockRef> device_blocks;
+        for (const CacheKey& key : {held, unused}) {
+            CacheBlockRef block = device_pool.AcquireBlock(0);
+            ASSERT_TRUE(block);
+            coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, /*access_epoch=*/1,
+                                                     /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                     /*newly_cached=*/nullptr);
+            device_blocks.push_back(std::move(block));
+        }
+        const std::array held_hashes{held.content_hash};
+        coordinator.QueueCachedBlocksForStore(held_hashes);
+        auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                                  /*publication=*/std::nullopt);
+        ASSERT_TRUE(store);
+        transfers.CompleteWriteBack(store->op_id);
+        std::uint64_t idle_epoch = 0;
+        {
+            CacheBlockRef block = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+            ASSERT_TRUE(block);
+            coordinator.CacheHostBlock(block, idle, std::nullopt);
+            idle_epoch = coordinator.GroupPrefixIndex(0).MetadataFor(host_pool, block->Location())->last_access_epoch;
+        }
+        if (same_access) {
+            ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Touch(device_pool, unused, idle_epoch));
+        }
+        ASSERT_EQ(coordinator.NumHostCachedBlocks(), 2);
+        const std::array hashes{held.content_hash, unused.content_hash};
+        coordinator.QueueCachedBlocksForStore(hashes);
+        const std::vector<BlockTable> tables{BlockTable::FromBlocks({device_blocks.front()}, /*available_tokens=*/0)};
+
+        EXPECT_FALSE(
+            transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+                                         CacheCoordinator::FinalPublication{.tables = tables, .num_tokens = 2}))
+            << "the copy is no newer than any entry it could replace";
+
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(unused));
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(idle));
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(held));
+    }
+}
+
+// A finish's copies of entries outside its boundary carry their Device
+// dates, and the batch places the newest first: on a Host with room for one
+// of them, the copy of "recent" takes the oldest entry's place, and the copy
+// of "stale", queued ahead of it but older than every entry left, is not
+// stored.
+TEST(CacheOperationTest, AFinishPlacesItsNewestCopiesFirst) {
+    BlockPool device_pool{3, {1}};
+    BlockPool host_pool{3, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers{coordinator};
+    const CacheKey held{.group_id = 0, .content_hash = "held"};
+    const CacheKey stale{.group_id = 0, .content_hash = "stale"};
+    const CacheKey recent{.group_id = 0, .content_hash = "recent"};
+    const CacheKey oldest{.group_id = 0, .content_hash = "oldest"};
+    const CacheKey middle{.group_id = 0, .content_hash = "middle"};
+    std::vector<CacheBlockRef> device_blocks;
+    for (const CacheKey& key : {held, stale, recent}) {
+        CacheBlockRef block = device_pool.AcquireBlock(0);
+        ASSERT_TRUE(block);
+        coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, /*access_epoch=*/1,
+                                                 /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                 /*newly_cached=*/nullptr);
+        device_blocks.push_back(std::move(block));
+    }
+    const std::array held_hashes{held.content_hash};
+    coordinator.QueueCachedBlocksForStore(held_hashes);
+    auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt);
+    ASSERT_TRUE(store);
+    transfers.CompleteWriteBack(store->op_id);
+    // In epoch order: "oldest" is cached, "stale" last read on the Device,
+    // "middle" cached, "recent" last read on the Device.
+    const auto cache_on_host = [&](const CacheKey& key) {
+        CacheBlockRef block = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, key, std::nullopt);
+    };
+    const auto read_on_device = [&](const CacheKey& key) {
+        const std::uint64_t epoch = coordinator.TakeStoreEpochs(/*publication=*/std::nullopt).base;
+        ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Touch(device_pool, key, epoch));
+    };
+    cache_on_host(oldest);
+    read_on_device(stale);
+    cache_on_host(middle);
+    read_on_device(recent);
+    ASSERT_EQ(coordinator.NumHostCachedBlocks(), 3);
+    const std::array hashes{held.content_hash, stale.content_hash, recent.content_hash};
+    coordinator.QueueCachedBlocksForStore(hashes);
+    const std::vector<BlockTable> tables{BlockTable::FromBlocks({device_blocks.front()}, /*available_tokens=*/0)};
+
+    auto finish = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+                                               CacheCoordinator::FinalPublication{.tables = tables, .num_tokens = 2});
+
+    ASSERT_TRUE(finish);
+    ASSERT_EQ(finish->transfers.size(), 1u);
+    EXPECT_EQ(finish->transfers.front().content_hash, recent.content_hash);
+    transfers.CompleteWriteBack(finish->op_id);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(recent));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(middle));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(held));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(stale));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(oldest));
+}
+
+// A finish dates the checkpoint it leaves with the page its frontier ends
+// in, the deepest page it leaves, instead of keeping the checkpoint newer
+// than the pages before it. So a State block that needs room takes the
+// checkpoint rather than that page: the two tie on date, and one child goes
+// before a whole parent.
+TEST(CacheOperationTest, AFinishDatesItsCheckpointWithItsLastPage) {
+    BlockPool device_pool{4, {1, 1}};
+    BlockPool host_pool{3, {1, 1}};
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers{coordinator};
+    // Four computed tokens: the pages h0 and h1, and the state after them in
+    // slot 1, published under h1.
+    std::vector<BlockTable> tables{
+        BlockTable::FromBlocks({device_pool.AcquireBlock(0), device_pool.AcquireBlock(0)}, /*available_tokens=*/0),
+        BlockTable::FromBlocks({CacheBlockRef{}, device_pool.AcquireBlock(1)}, /*available_tokens=*/0),
+    };
+    const std::vector<std::string> hashes{"h0", "h1"};
+    CacheCompletedBlocksForTest(coordinator, tables, hashes, /*access_epoch=*/1, /*first_new_prefix_page=*/0,
+                                /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/true);
+    coordinator.QueueCachedBlocksForStore(hashes);
+    auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt);
+    ASSERT_TRUE(store);
+    transfers.CompleteWriteBack(store->op_id);
+    ASSERT_EQ(coordinator.NumHostCachedBlocks(), 3);
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+                                              CacheCoordinator::FinalPublication{.tables = tables, .num_tokens = 4}))
+        << "the finish refreshes what it leaves and stores nothing";
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(1, /*bucket=*/0);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 1, .content_hash = "h1"}));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h1"}));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
+}
+
+// An L3 read can make a key canonical on Host while a store of it is in
+// flight; the store's ACK follows that entry and never dates it back.
+TEST(CacheOperationTest, AWriteBackAckNeverDatesACanonicalHostEntryBack) {
+    BlockPool device_pool{1, {1}};
+    BlockPool host_pool{3, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers{coordinator};
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    const CacheKey idle{.group_id = 0, .content_hash = "idle"};
+    CacheBlockRef device_block = device_pool.AcquireBlock(0);
+    ASSERT_TRUE(device_block);
+    coordinator.GroupPrefixIndex(0).Register(device_pool, device_block, key, /*access_epoch=*/1,
+                                             /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                             /*newly_cached=*/nullptr);
+    const std::array hashes{key.content_hash};
+    coordinator.QueueCachedBlocksForStore(hashes);
+    auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt);
+    ASSERT_TRUE(store);
+    for (const CacheKey& later : {idle, key}) {  // an idle entry, then the read of h0
+        CacheBlockRef block = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, later, std::nullopt);
+    }
+    transfers.CompleteWriteBack(store->op_id);  // the ticket's own block returns to the pool
+    CacheBlockRef filler = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+    ASSERT_TRUE(filler);
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key)) << "the read's entry keeps its date";
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(idle));
+}
+
+// The boundary a request resumed from is refreshed in flight as well: the
+// store still carrying it publishes it no older than its newest reader's
+// admission, in whatever order the readers leave. A reader admitted after an
+// idle entry was cached leaves first, then one admitted before it; the ACK
+// keeps the later date, so the idle entry is the next Host victim.
+TEST(CacheOperationTest, AResumeRefreshNeverDatesBackACopyInFlight) {
+    BlockPool device_pool{1, {1}};
+    BlockPool host_pool{2, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers{coordinator};
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    const CacheKey idle{.group_id = 0, .content_hash = "idle"};
+    CacheBlockRef device_block = device_pool.AcquireBlock(0);
+    ASSERT_TRUE(device_block);
+    coordinator.GroupPrefixIndex(0).Register(device_pool, device_block, key, /*access_epoch=*/1,
+                                             /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                             /*newly_cached=*/nullptr);
+    const std::array hashes{key.content_hash};
+    coordinator.QueueCachedBlocksForStore(hashes);
+    auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt);
+    ASSERT_TRUE(store);
+    // Epochs issued in this order, as the readers' admissions took theirs.
+    const std::uint64_t earlier_admission = coordinator.TakeStoreEpochs(/*publication=*/std::nullopt).base;
+    {
+        CacheBlockRef block = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, idle, std::nullopt);
+    }
+    const std::uint64_t later_admission = coordinator.TakeStoreEpochs(/*publication=*/std::nullopt).base;
+    transfers.RefreshHostBoundary(hashes, /*tail=*/std::nullopt, later_admission);
+    transfers.RefreshHostBoundary(hashes, /*tail=*/std::nullopt, earlier_admission);
+    transfers.CompleteWriteBack(store->op_id);
+    ASSERT_EQ(coordinator.NumHostCachedBlocks(), 2);
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(idle));
+}
+
+// A stream-ordered store pins no Device source, so the page it carries can
+// leave the Device before its ACK. A finish whose table holds a private copy
+// of that page (a restore's) still re-dates the store, the only copy left to
+// date, so its ACK publishes the page at the finish's date and an idle entry
+// cached before the finish is the next victim.
+TEST(CacheOperationTest, AFinishRedatesACopyInFlightAfterItsDeviceEntryLeft) {
+    BlockPool device_pool{2, {1}};
+    BlockPool host_pool{2, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers{coordinator};
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    const CacheKey idle{.group_id = 0, .content_hash = "idle"};
+    {
+        CacheBlockRef device_block = device_pool.AcquireBlock(0);
+        ASSERT_TRUE(device_block);
+        coordinator.GroupPrefixIndex(0).Register(device_pool, device_block, key, /*access_epoch=*/1,
+                                                 /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                 /*newly_cached=*/nullptr);
+    }
+    const std::vector<std::string> hashes{key.content_hash};
+    coordinator.QueueCachedBlocksForStore(hashes);
+    auto store = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered, HostStoreCause::kPublication,
+                                              /*publication=*/std::nullopt);
+    ASSERT_TRUE(store);
+    ASSERT_TRUE(coordinator.ClearDeviceCache());
+    {
+        CacheBlockRef block = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, idle, std::nullopt);
+    }
+    const std::vector<BlockTable> tables{
+        BlockTable::FromBlocks({device_pool.AcquireBlock(0)}, /*available_tokens=*/0)};  // the private copy
+    EXPECT_FALSE(transfers.StartPendingStores(
+        StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+        CacheCoordinator::FinalPublication{.tables = tables, .num_tokens = 2, .prefix_hashes = hashes}))
+        << "nothing is left to store";
+    transfers.CompleteWriteBack(store->op_id);
+    ASSERT_EQ(coordinator.NumHostCachedBlocks(), 2);
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(idle));
 }
 
 TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
@@ -499,7 +1014,8 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish));
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+                                              /*publication=*/std::nullopt));
     const TierTransferManager::WriteBackStats& finish_stores = transfers.WriteBackStatsFor(HostStoreCause::kFinish);
     EXPECT_EQ(finish_stores.no_placement, 1u);
     EXPECT_EQ(finish_stores.ops, 0u);
@@ -557,7 +1073,8 @@ TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
     const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
     coordinator.QueueCachedBlocksForStore(group_zero_hashes);
 
-    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                                   /*publication=*/std::nullopt);
 
     ASSERT_TRUE(write_back);
     // The first candidate reclaims the old parent across groups. Its new
@@ -611,14 +1128,16 @@ TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
     host_copy.reset();
 
     coordinator.QueueCachedBlocksForStore(std::array{travelling.content_hash});
-    const auto earlier = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
+    const auto earlier = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish,
+                                                      /*publication=*/std::nullopt);
     ASSERT_TRUE(earlier);
 
     coordinator.QueueCachedBlocksForStore(std::array{on_host.content_hash, stored.content_hash, stored.content_hash,
                                                      travelling.content_hash, evicted.content_hash});
     const CacheBlockLocation evicted_location = coordinator.GroupPrefixIndex(0).Find(device_pool, evicted)->Location();
     ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(device_pool, evicted_location));
-    const auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
+    const auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                                    /*publication=*/std::nullopt);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->transfers.size(), 1u);
     EXPECT_EQ(store->transfers.front().content_hash, stored.content_hash);
@@ -739,12 +1258,13 @@ TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
                                     /*publish_state=*/false);
         EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
-        EXPECT_FALSE(transfers.StartPendingStores(guard, HostStoreCause::kPublication));
+        EXPECT_FALSE(transfers.StartPendingStores(guard, HostStoreCause::kPublication, /*publication=*/std::nullopt));
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, CacheBoundaryKind::kEndpoint, true,
                                     /*publish_state=*/true);
         EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
         EXPECT_EQ(coordinator.GroupPrefixIndex(0).Find(pool, key), tables[0].Blocks()[1]) << "slot 1 is the checkpoint";
-        const auto store = transfers.StartPendingStores(guard, HostStoreCause::kPublication);
+        const auto store =
+            transfers.StartPendingStores(guard, HostStoreCause::kPublication, /*publication=*/std::nullopt);
         ASSERT_TRUE(store);
         ASSERT_EQ(store->transfers.size(), 1u);
         EXPECT_EQ(store->source_pinned, guard == StoreSourceGuard::kPinnedUntilAck);
