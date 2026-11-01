@@ -32,8 +32,14 @@ __all__ = ["DraftTreeQ", "TreeVerifyBatch", "accepted_path_rows"]
 @dataclass(frozen=True)
 class DraftTreeQ:
     """Each pool slot's draft distributions behind its next-round tree (sampled
-    trees): the q a sampled node's siblings were drawn from, for the verifier's
-    rejection sampling. Indexed by ``req_pool_idx``.
+    trees) or chain (DFlash2 under --enable-speculative-sampling): the q a
+    sampled node's siblings were drawn from, for the verifier's rejection
+    sampling. Indexed by ``req_pool_idx``.
+
+    A chain's node 0 is the anchor (slot ``-1``) and node ``i`` reads slot
+    ``i - 1``, the q of draft step ``i - 1``, at lane ``pos[:, i]``; a
+    request without a proposal has ``-1`` on every node. The DFlash2 walk
+    (``dflash2_sample_path``) writes its chains into these tables in place.
 
     Attributes:
         q: ``[rows, S, NC]`` fp32 q of each expanded row (slot) over its
