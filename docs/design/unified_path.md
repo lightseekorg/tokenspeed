@@ -1223,10 +1223,46 @@ Ragged grouping waits for PDL producers before reading request indices.
 Uniform and aligned grouping retain the internal waits before frontier reads
 and asynchronous Q copies.
 
-Portable Triton streaming also allocates only its output. Each program scans a
-group contained in an explicit uniform request run and keeps each row's running
-top-k locally, with no split/merge buffers. Triton ragged runs use group size one
-in that same kernel.
+Small Triton query grids can keep bounded candidates from independently scored
+tiles within the same explicit partial-workspace budget. Their merge compares the
+selection threshold with every tile's discarded-score upper bound; an
+insufficient candidate count or a larger discarded score triggers complete
+selection for that row. That selection runs inside the merge only when its
+proof fails. Short frontiers retain more local candidates within the same
+allocation and use bounded merge sizes selected from device counts, so a large
+cache capacity does not force a short row through the full-capacity merge.
+A monotone high-sixteen-bit histogram can compact complete candidate bins into
+a bounded shared pool; low-bit refinement preserves the exact FP32 boundary.
+Small boundary bins use a warp sort of their full score and ID keys. Large
+candidate arrays can first retain exact local selections in additional bounded
+scratch. Their discarded-score bounds join the original tile bounds, so the
+final merge still proves its result or performs complete selection. This extra
+scratch counts toward the same caller budget; short frontiers bypass it on
+device.
+Per-row count and proof metadata remains transient device scratch, not request
+state. A zero budget uses the local running selection instead.
+The portable Triton kernel shares K within an explicit uniform request run;
+ragged runs use one row per program. The NVIDIA Gluon specialization resolves
+ragged ownership on device and shares K across groups of up to sixteen rows,
+while keeping each row's frontier and selection. Its candidate scores retain
+all FP32 bits. Native prefill forms pruning bins directly from an integer
+prefix of those bits, avoiding a floating-point conversion. A monotone coarse
+score bin can discard only whole bins below the boundary; exact FP32 refinement
+handles the boundary and final selection.
+Large supported groups store logical IDs losslessly in a sixteen-bit plane
+when capacity is at most 65536 logical blocks, adding an eight-bit plane for
+larger bounds. Capacities beyond twenty-four bits use full-width IDs. Physical
+cache addressing independently selects 32-bit offsets only when the full tensor
+extent fits, and otherwise uses 64-bit offsets. Native asynchronous K copies
+require contiguous head dimensions and aligned cache rows; other views retain
+the portable implementation. Supported Blackwell page layouts copy one physical
+key page per hardware TMA transfer. The same two-stage producer retains ordinary
+asynchronous copies for other page sizes. Separate ready and consumed barriers
+join the producer and selector warps for each score slot; reuse waits for every
+reader, including between request-owner passes. Small native scoring tiles can
+pair two queries; K is reused only when their valid physical pages match.
+Otherwise separate K rows retain each query's own dot products and page mapping.
+Each row retains its complete-block frontier.
 
 For both implementations, candidate pruning must prove that discarded scores
 cannot enter the top-k, or perform a full-score fallback. Each row retains its
