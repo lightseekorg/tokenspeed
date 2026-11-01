@@ -607,6 +607,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
         .resumed_tail_hash = std::move(admission->resumed_tail_hash),
+        .resume_tokens = hit_tokens,
     };
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
@@ -761,13 +762,19 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // claimed. This delivers the preceding prefill's checkpoints; decode
     // never creates an in-forward checkpoint. Every later decode writes slot
     // 1 in place and lets slot 0 go. Restricted groups cannot publish that
-    // decode-produced live state at finish or retraction either.
+    // decode-produced live state at finish or retraction either. With
+    // drop_dead_state_checkpoints, a fused prompt end its pre-tail State
+    // checkpoint covers (promptEndIsCoveredByCheckpoint) is such a later
+    // decode instead: no tail and no prompt-end state are published, the
+    // partial page stays the owner's and the state is written in place.
     const bool first_decode = request->Is<fsm::PrefillDone>();
-    const bool prompt_end = first_decode && config_.role == Role::kFused && !config_.disable_prefix_cache;
+    fsm::CacheProgress& current_progress = request->CacheProgressRef();
+    const bool prompt_end =
+        first_decode && config_.role == Role::kFused && !config_.disable_prefix_cache &&
+        !(config_.drop_dead_state_checkpoints && promptEndIsCoveredByCheckpoint(*request, current_progress));
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};
-    fsm::CacheProgress& current_progress = request->CacheProgressRef();
     const bool completed_page = num_computed_tokens / coordinator_.PrefixGranularity() >
                                 static_cast<std::int32_t>(current_progress.prefix_hashes.size());
     const bool completed_checkpoint =

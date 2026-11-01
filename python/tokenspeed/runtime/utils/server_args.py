@@ -386,6 +386,14 @@ class ServerArgs:
     # the recurrent state there, where hybrid models publish a checkpoint;
     # no chunk is cut for it.
     enable_state_checkpoint_in_forward: bool = False
+    # Opt-in: hybrid models keep out of the prefix cache the recurrent-state
+    # checkpoints (and KV tails) a next turn that re-renders the end of the
+    # previous prompt and its reply cannot resume at: a long prompt's end
+    # inside the page whose start, its last prefix-page boundary before the
+    # replay tail (with a declared checkpoint_granularity, its last segment
+    # entrance), holds a cached state, and a fused finish past the prompt
+    # end (docs/design/scheduler.md section 1.2).
+    drop_dead_state_checkpoints: bool = False
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
     # special kv cache
@@ -1381,6 +1389,15 @@ class ServerArgs:
         )
 
     @property
+    def drops_dead_state_checkpoints(self) -> bool:
+        """Whether this engine's scheduler skips dead State checkpoints.
+
+        This is the flag, except on a decode server, which publishes its
+        finish as ever.
+        """
+        return self.drop_dead_state_checkpoints and self.disaggregation_mode != "decode"
+
+    @property
     def retraction_snapshot_pool_disabled(self) -> bool:
         """Whether no image can ever be taken, so a capacity block aborts.
 
@@ -2084,6 +2101,13 @@ class ServerArgs:
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
                 )
+        # A decode server takes the flag as a no-op, so a PD launcher may pass
+        # it to both roles while disabling prefix caching only on decode.
+        if self.drops_dead_state_checkpoints and not self.enable_prefix_caching:
+            raise ValueError(
+                "--drop-dead-state-checkpoints narrows what the prefix cache "
+                "publishes; it requires prefix caching"
+            )
         _require_choice(
             "--kvstore-write-policy",
             self.kvstore_write_policy,
@@ -2674,6 +2698,27 @@ class ServerArgs:
             "that boundary resumes there. No extra prefill round; that forward "
             "holds one more state block. Requires prefix caching. See "
             "docs/design/scheduler.md section 1.2.",
+        )
+        parser.add_argument(
+            "--drop-dead-state-checkpoints",
+            action="store_true",
+            dest="drop_dead_state_checkpoints",
+            default=ServerArgs.drop_dead_state_checkpoints,
+            help="Hybrid (recurrent-state) models: keep out of the prefix cache "
+            "the recurrent-state checkpoints, and their KV tails, that a next "
+            "turn re-rendering the end of the previous prompt and its reply "
+            "cannot resume at: the end of a prompt longer than the prefill "
+            "chunk budget, when it lies inside the page that starts at the "
+            "prompt's last prefix-page boundary before its replay tail and the "
+            "state at that boundary is cached (a resend or a longer prompt "
+            "resumes there; prefill and fused servers), and a finish past the "
+            "prompt end (fused servers). With a State group that declares "
+            "checkpoint_granularity, that boundary is the last segment entrance "
+            "of any prompt longer than one segment instead. A prompt that "
+            "repeats a previous reply verbatim resumes at an earlier checkpoint "
+            "instead. Requires prefix "
+            "caching; a decode server ignores it. See docs/design/scheduler.md "
+            "section 1.2.",
         )
 
         # KVStore

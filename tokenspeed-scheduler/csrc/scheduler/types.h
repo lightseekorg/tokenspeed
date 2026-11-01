@@ -118,6 +118,14 @@ struct SchedulerConfig {
     // into the third entry of every State group's row. Requires prefix
     // caching, except on the D role, which never computes a prompt.
     bool state_checkpoint_in_forward{false};
+    // Skip the State checkpoints, and their KV tails, that a next turn
+    // re-rendering the end of the previous prompt and its reply cannot resume
+    // at: a prompt end its pre-tail State checkpoint covers (P and fused
+    // roles) and a fused finish past the prompt end are published like chunk
+    // ends (docs/design/scheduler.md §1.2). A model without State groups is
+    // unaffected, and so is the D role. Requires prefix caching, except on
+    // the D role.
+    bool drop_dead_state_checkpoints{false};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

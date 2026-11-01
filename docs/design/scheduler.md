@@ -245,19 +245,21 @@ writes slot 1 — the row contract the runtime's `block_tables` carry. Every
 admission states what the pair does through the group's `StateStep`
 (`MakeGroupDemands` sets it for all State groups at once):
 
-- `kRotate` — a prefill chunk, or the first decode of a fused request: the
-  previous output becomes the input (slot 1 → slot 0) and a fresh block is
-  acquired for slot 1. The input it displaces is released, which only frees
-  it when nothing published it. On a prompt's first admission the pair is
-  shaped instead: slot 0 is the checkpoint the probe matched or, with none,
-  a **fresh zeroed block** — the zero state — and slot 1 is fresh. A request
-  therefore holds its two blocks from its first admission on, and every
-  later rotation swaps the released input for the fresh live slot; a pool
-  sized at two blocks per live request (§1.4) back-pressures at admission
-  instead of wedging at the first decode, when the rotation would otherwise
-  need a block the pool no longer has.
-- `kRelease` — every later decode step: slot 0 is let go and slot 1 is
-  written in place. Nothing is acquired, so a decode consumes no state
+- `kRotate` — a prefill chunk, or the first decode of a fused request whose
+  prompt end is a publication point: the previous output becomes the input
+  (slot 1 → slot 0) and a fresh block is acquired for slot 1. The input it
+  displaces is released, which only frees it when nothing published it. On a
+  prompt's first admission the pair is shaped instead: slot 0 is the
+  checkpoint the probe matched or, with none, a **fresh zeroed block** — the
+  zero state — and slot 1 is fresh. A request therefore holds its two blocks
+  from its first admission on, and every later rotation swaps the released
+  input for the fresh live slot; a pool sized at two blocks per live request
+  (§1.4) back-pressures at admission instead of wedging at the first decode,
+  when the rotation would otherwise need a block the pool no longer has.
+- `kRelease` — every later decode step, and a fused first decode whose
+  prompt end is not one (prefix caching off, or a prompt end
+  `drop_dead_state_checkpoints` skips, below): slot 0 is let go and slot 1
+  is written in place. Nothing is acquired, so a decode consumes no state
   capacity (`ConsumeReservedTokens` skips State groups; the in-place fast
   path releases the input through `ReleaseStateInputs`).
 - `kKeep` — a restore and the D role's first decode: the pair is left as it
@@ -271,15 +273,16 @@ stops writing it — the same `PublicationPoint` that publishes the KV tail
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
 junction (§1), and a finish or retraction on every role (`kFinal`: the P's
-transferred prompt, the D's and the fused engine's last decoded state). An
-ordinary chunk end or decode step publishes nothing for a State group
-(`CompletedPages::publish_state` is false). The key is the key of the exact
-token count `T`: the chain hash of the last page when `T` is a page multiple,
-otherwise the tail hash `hash@T` the KV groups use — so one key names a
-request's progress across every group kind (`cache-concepts.md`). A published
-state block is never written again: rotation moves it to slot 0, where it is
-read only, and the next step releases the request's reference while the
-cache keeps the block.
+transferred prompt, the D's and the fused engine's last decoded state),
+except the prompt ends and finishes `drop_dead_state_checkpoints` skips
+(below). An ordinary chunk end or decode step publishes nothing for a State
+group (`CompletedPages::publish_state` is false). The key is the key of the
+exact token count `T`: the chain hash of the last page when `T` is a page
+multiple, otherwise the tail hash `hash@T` the KV groups use — so one key
+names a request's progress across every group kind (`cache-concepts.md`). A
+published state block is never written again: rotation moves it to slot 0,
+where it is read only, and the next step releases the request's reference
+while the cache keeps the block.
 
 For State groups with `checkpoint_granularity > 1`, only prefill-produced
 states may become reusable checkpoints. Publication remains in the ordinary
@@ -310,7 +313,10 @@ third entry with the tokens before it (`extend_state_checkpoint_lens`), and
 the runtime stores every State group's state at that position into it. The
 request holds the block in `CacheProgress` until its next publication point --
 the next chunk's or first decode's admission, a finish or a retraction --
-which publishes it under the boundary's page hash, like a natural checkpoint.
+which publishes it under the boundary's page hash, like a natural checkpoint,
+with the sliding window behind it as the endpoint's window, even at a chunk
+end, never as an unproven boundary that eviction takes first
+(`cache-concepts.md`).
 A boundary a chunk ends on needs none (the chunk end's slot 1 is published
 there, as at a junction). The scan emits states only whole pages from a
 forward's start, and the budget a batch's decodes leave rarely ends on a page,
@@ -339,12 +345,46 @@ cannot fit drops its own optional hold before retrying, and retraction drops
 it before imaging the request. Neither an incomplete checkpoint nor a partial
 set of sliding-window dependencies is retained.
 
+**Dead checkpoints (opt-in).** A next turn that re-renders the end of the
+previous prompt and its reply resumes at neither that prompt end nor its
+finish. `drop_dead_state_checkpoints`
+(`--drop-dead-state-checkpoints`, off by default, requires prefix caching)
+skips both on a model with State groups, KV tails included. A prompt end `T`
+inside the page its pre-tail checkpoint `C` (`PrefillStateCheckpointTokens`)
+starts is published like a chunk end once `C` exists — pending from the
+request's final forward, which the same publication publishes, or cached in
+every State group, on either tier as the probe takes it
+(`promptEndIsCoveredByCheckpoint`); any other prompt end is published as
+before. A request that resumed from a tail beyond `C` keeps its prompt end: it
+extends an earlier prompt end in place, and its successor likely extends this
+one the same way. An identical prompt cannot resume at `T` (it replays the
+final token) and resumes at `C`; a longer prompt repeating `T`'s partial page
+resumes at `C` too, recomputing less than a page. The rule applies at the P
+role's finish (§3.1) and at the fused role's first decode, which is then an
+ordinary decode step: the partial page stays the owner's and the live slot is
+written in place (`kRelease`). A fused finish past the prompt end publishes
+like a chunk end as well — its completed full pages, no tail and no state
+(`finishCheckpointIsDead`) — and a finish at the prompt end follows the
+prompt-end rule. A prompt that repeats a previous reply verbatim therefore
+resumes at `C`, or at a prompt end the rule kept. The skipped entries occupy
+no cache block and never reach Host. A retraction still publishes its frontier
+(§2), the D role publishes as before, and a model without State groups keeps
+its tails: they are resume points there. With aligned State checkpoints
+(below), `C` is the prompt's last segment entrance -- for any prompt longer
+than one segment, whatever the chunk budget -- so the rule covers a prompt end
+in the first page past it. It never skips an aligned checkpoint: a covered
+prompt end is never a page boundary, and a finish past the prompt end holds a
+decode-produced state, which those groups keep private anyway. Their other
+unaligned prompt ends still publish a KV tail, although no hit resumes there
+either.
+
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
 `Finishing` and nothing else; after every batch of events,
 `settleFinishedRequests` publishes the frontier of each `Finishing` request
-with no forward in flight (`kFinal`: KV tail and state) and releases its
-pages (`ReleaseEvent`). One path for every schedule: a request that finished
+with no forward in flight (`kFinal`: KV tail and state, unless
+`drop_dead_state_checkpoints` skips them, above) and releases its pages
+(`ReleaseEvent`). One path for every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's
@@ -364,11 +404,11 @@ and the decode the overlap schedule dispatched behind that round runs the
 request as a padding row and reports no token. Whatever the schedule and
 however many tokens a round accepts, the finish frontier `T` is therefore the
 stop token's position (the last kept token's for a token limit): the state
-and KV before it, a prefix of the next turn's prompt whether or not its chat
-template keeps the stop token. A finish the device cannot decide (a stop
-string, a grammar, a client abort) reports every token the round kept
-instead, so the frontier still names the state the device holds
-(`cache-concepts.md`, "Recurrent state").
+and KV before it, a prefix of the next turn's prompt when its chat template
+keeps the reply verbatim, whether or not it keeps the stop token. A finish
+the device cannot decide (a stop string, a grammar, a client abort) reports
+every token the round kept instead, so the frontier still names the state
+the device holds (`cache-concepts.md`, "Recurrent state").
 
 **Hits.** The probe (§1, "What the probe may claim") resumes a hybrid model
 at the longest `T` with a published state checkpoint in every State group and
@@ -414,7 +454,10 @@ boundary -- a junction or an in-forward checkpoint, which other prompts
 resume at -- is never marked. On the fused role a turn also publishes its
 prompt end, at its first decode and at the same epoch: that one and the end
 state still rank level, since which of them the next turn resumes at depends
-on whether the client sends the reply back as it was generated.
+on whether the client sends the reply back as it was generated. A finish that
+publishes no end state (`drop_dead_state_checkpoints`, above) marks the input
+all the same: the prompt end, or the pre-tail checkpoint the next turn
+resumes at instead, was published or found cached earlier.
 
 **Aligned state checkpoints.** A State group can declare
 `checkpoint_granularity`, a multiple of the prefix-hash grain. Its published
@@ -990,7 +1033,9 @@ no overlap protection (no local decode is ever in flight).
 The transfer ACK (`pd::SucceededEvent`) publishes the prompt like a finish —
 its full pages, its partial page as a tail and each State group's prompt-end
 state (§1.2) — and releases request ownership; cached entries remain subject
-to normal eviction.
+to normal eviction. With `drop_dead_state_checkpoints` a prompt end its
+pre-tail State checkpoint covers is published like a chunk end instead
+(§1.2).
 
 **Host L2: write-back.** With `host_write_policy` `kWriteBack`
 (`--kvstore-write-policy write_back`; this role or the fused one (§3.3), no
@@ -1437,8 +1482,9 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
 - A published block is never written again: a tail's blocks are copied into
   the hitter's table (or loaded from Host into private pages), an owner that
   keeps writing past a publication point moves to fresh copies of the blocks
-  it published -- or, when the pool cannot fund the copies, publishes no
-  tail at that point and keeps writing its private block -- and a restore
+  it published -- or publishes no tail at that point and keeps writing its
+  private block, when the pool cannot fund the copies or
+  `drop_dead_state_checkpoints` skips the point (1.2) -- and a restore
   copies the imaged tail blocks instead of claiming them (1,
   cache-concepts.md).
 - A request whose admission prepaid its generation never needs a block it did
