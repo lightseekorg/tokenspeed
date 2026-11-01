@@ -106,6 +106,157 @@ def test_mha_extend_split_count():
             run(pages * page - 5)
 
 
+@pytest.mark.parametrize("window", [-1, 127])
+def test_mha_prefill_token_stride_and_request_count(window):
+    from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import prefill
+
+    heads, kv_heads, dim = 16, 2, 64
+    q_width, kv_width = heads * dim, kv_heads * dim
+    # One projection row holds Q, K, V and the output gate, so views into it
+    # step over the whole row while copies step over their own heads only.
+    packed = torch.randn(
+        1600, 2 * q_width + 2 * kv_width, device=DEVICE, dtype=torch.bfloat16
+    )
+    q_rows, k_rows, v_rows, _ = packed.split(
+        (q_width, kv_width, kv_width, q_width), dim=-1
+    )
+
+    def run(seqlens, views):
+        tokens = sum(seqlens)
+        q = q_rows[:tokens].view(tokens, heads, dim)
+        k = k_rows[:tokens].view(tokens, kv_heads, dim)
+        v = v_rows[:tokens].view(tokens, kv_heads, dim)
+        if not views:
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        cu = [0]
+        for length in seqlens:
+            cu.append(cu[-1] + length)
+        out = prefill.launch_gluon_mha_prefill_gfx950(
+            q,
+            k,
+            v,
+            torch.tensor(cu, dtype=torch.int32, device=DEVICE),
+            cu,
+            max(seqlens),
+            window_left=window,
+        )
+        for start, end in zip(cu, cu[1:]):
+            expected, _ = torch_dense_attention(
+                q[start:end],
+                k[start:end],
+                v[start:end],
+                scale=dim**-0.5,
+                causal_offset=0,
+                window_left=window if window >= 0 else None,
+                sinks=None,
+            )
+            torch.testing.assert_close(
+                out[start:end].float(), expected, rtol=2e-2, atol=2e-2
+            )
+
+    run([300], views=False)
+    with assert_no_triton_compile(
+        prefill.gluon_mha_prefill_gfx950, prefill.gluon_mha_prefill_sliding_gfx950
+    ):
+        # The packed views of a short prompt next to the copies of a long one
+        # are what a server sees from one model; then request counts of 6,
+        # 16 and 40 (past the 32 requests a full grid holds per round) and
+        # longest requests on and off multiples of 16.
+        run([300], views=True)
+        run([17, 250, 64, 5, 100, 33], views=True)
+        run([32] * 16, views=False)
+        run([40, 1] * 20, views=True)
+        run([1], views=False)
+
+
+@pytest.mark.parametrize("window", [-1, 127])
+def test_mha_extend_startup_warmup_covers_every_variant(window):
+    from tokenspeed_kernel.numerics.torch.attention.mha import (
+        gather_pages,
+        torch_dense_attention,
+    )
+    from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 32, 80
+    k_cache = torch.randn(
+        1 + slots * width, page, kv_heads, dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn_like(k_cache)
+    tables = 1 + torch.arange(slots * width, dtype=torch.int32, device=DEVICE)
+    tables = tables.view(slots, width)
+    queries_pool = torch.randn(8192, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+
+    def run(queries, prefix):
+        lengths = [query + prefix for query in queries]
+        cu_q, cu_kv = [0], [0]
+        for query, length in zip(queries, lengths):
+            cu_q.append(cu_q[-1] + query)
+            cu_kv.append(cu_kv[-1] + length)
+        q = queries_pool[: cu_q[-1]]
+        out = mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=DEVICE),
+            cu_seqlens_kv=torch.tensor(cu_kv, dtype=torch.int32, device=DEVICE),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=tables[: len(queries)],
+            cache_seqlens=torch.tensor(lengths, dtype=torch.int32, device=DEVICE),
+            max_seqlen_q=max(queries),
+            max_seqlen_k=max(lengths),
+            is_causal=True,
+            window_left=window,
+            solution="gluon",
+        )
+        for request, length in enumerate(lengths):
+            start, end = cu_q[request], cu_q[request + 1]
+            expected, _ = torch_dense_attention(
+                q[start:end],
+                gather_pages(k_cache, tables[request], length),
+                gather_pages(v_cache, tables[request], length),
+                scale=dim**-0.5,
+                causal_offset=prefix,
+                window_left=window if window >= 0 else None,
+                sinks=None,
+            )
+            torch.testing.assert_close(
+                out[start:end].float(), expected, rtol=2e-2, atol=2e-2
+            )
+
+    # Startup runs one extend shape; the launcher compiles the rest then.
+    with kernel_warmup(enabled=True):
+        run([100], 300)
+    with assert_no_triton_compile(
+        extend.gluon_mha_extend_gfx950,
+        extend.gluon_mha_extend_split_gfx950,
+        extend.gluon_mha_extend_reduce_gfx950,
+    ):
+        # Up to 64 queries take the 64-row tile (8 positions of the 8-head
+        # group), longer ones the 128-row tile (16 positions). Equal lengths
+        # take the per-request grid, mixed ones the ragged grid.
+        # Small grids split full attention 6 to 8 ways, or 16 ways over 2048
+        # cached tokens.
+        for queries in ([40], [100], [60, 30, 20], [100, 70, 200]):
+            run(queries, 300)
+        for queries in ([40], [100], [60, 30, 20], [100, 70]):
+            run(queries, 2048 - max(queries))
+        # From 512 work-groups (256 query blocks of 2 KV heads) nothing
+        # splits; 570 to 768 work-groups run single-buffered, 886 and 896
+        # pipeline.
+        for queries in (
+            [60] * 40,
+            [60] * 56,
+            [120] * 40,
+            [120] * 56,
+            [64] + [20] * 79,
+            [64] + [36] * 79,
+            [120] + [60] * 79,
+        ):
+            run(queries, 300)
+
+
 def test_mxfp8_gemm_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
 

@@ -516,6 +516,10 @@ Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional
 FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
+The dummy extend has no cached prefix, so the MHA backend, which sends such
+an extend to its prefill kernel, also runs its cached-prefix extend kernel on
+the same rows during this traversal; that kernel compiles every variant a
+later batch can pick.
 
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
