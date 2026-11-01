@@ -151,13 +151,14 @@ def _runner(
         torch.tensor([3, 1, 99, 99], dtype=torch.int32),
         None,
         None,
+        None,
     )
 
     def execute():
         events.append("execute")
         if fail_forward:
             raise RuntimeError("forward failed")
-        return result[0][:8], result[1][:2], None, None
+        return result[0][:8], result[1][:2], None, None, None
 
     wrapper._forward_func = lambda **kwargs: execute()
     wrapper.graphs = {4: SimpleNamespace(replay=execute)}
