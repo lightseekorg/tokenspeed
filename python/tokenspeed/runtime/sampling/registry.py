@@ -48,9 +48,9 @@ def _get_default_backend_name() -> str:
 def _is_sampling_backend_available(backend_name: str) -> bool:
     """Check if a sampling backend is available."""
     from tokenspeed_kernel.platform import current_platform
-    
+
     platform = current_platform()
-    
+
     if backend_name == "greedy":
         return True
     if backend_name == "flashinfer":
@@ -58,6 +58,7 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
             return False
         try:
             from tokenspeed.runtime.sampling.backends import flashinfer
+
             return True
         except ImportError:
             return False
@@ -66,6 +67,7 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
             return False
         try:
             from tokenspeed.runtime.sampling.backends import flashinfer_full
+
             return True
         except ImportError:
             return False
@@ -78,6 +80,7 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
             return False
         try:
             from tokenspeed.runtime.sampling.backends import ascend_full
+
             return True
         except ImportError:
             return False
