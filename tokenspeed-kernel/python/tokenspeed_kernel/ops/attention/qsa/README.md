@@ -5,6 +5,14 @@ full-cache slots, and attends to those slots. The block selector takes an
 explicit `auto`, `stream`, or `logits` path. Backend selection and overrides
 preserve the requested path.
 
+## PrimTS plan preparation
+
+The FlashInfer PrimTS adapter caches cluster occupancy by CUDA device, context,
+and cluster size. New eager layouts retain their own workspace plans and route
+offsets while sharing the hardware capacity query. This keeps CuTe's
+occupancy-query kernel compilation in startup and preserves the serving JIT
+checks when batch geometry changes.
+
 ## TMA gather sparse attention
 
 `thirdparty/cute_dsl/qsa_tma_gather.py` provides `TmaGatherSparseAttention`, an explicit,
