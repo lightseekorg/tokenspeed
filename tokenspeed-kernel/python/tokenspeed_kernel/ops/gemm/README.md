@@ -97,6 +97,21 @@ larger observed inputs and the enclosing native bucket. Native mappers,
 constraints, and caches are preserved. Explicit buckets and disabled profiling
 retain their semantics; small-M BF16 keeps its existing bound.
 
+## Blackwell small-M block-FP8
+
+On SM100 and SM103, `mm` selects `flashinfer_trtllm_mm_fp8_blockscale`
+(FlashInfer's TRT-LLM-Gen backend) for standard 128x128 block-FP8 GEMMs with
+at most `FLASHINFER_TRTLLM_FP8_BLOCKSCALE_MAX_M` (64) rows and K a multiple of
+256. The CUTLASS `flashinfer_mm_fp8_blockscale` serves larger M, where it is
+faster. Both read the same FP32 scales; the accumulation order differs.
+
+The TRT-LLM-Gen kernel reads MN-major activation scales: the `[M, K/128]`
+view with strides `(1, M)` that the `mn_major_scales` quantizer returns.
+Callers that quantize their own activations can ask
+`mm_fp8_blockscale_reads_mn_major_scales(m, k)` and request that feature to
+skip a per-call scale transpose. The kernel converts any other layout, so
+skipping the request costs only the copy.
+
 ## Hopper block-FP8 DeepGEMM
 
 `deepgemm_mm_fp8_blockscale` supports explicit `mm(..., override=...)` or

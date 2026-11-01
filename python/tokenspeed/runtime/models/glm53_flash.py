@@ -1347,6 +1347,30 @@ class Glm53FlashDecoderLayer(nn.Module):
                 requires_grad=False,
             )
 
+    def mhc_pre_norm(
+        self,
+        residual_streams: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """mHC pre-mapping followed by ``norm``, in one kernel where supported.
+
+        Returns the normed sublayer input, the post mix and the combine mix.
+        """
+        return mhc_pre(
+            residual_streams,
+            fn,
+            hc_scale,
+            hc_base,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+            self.config.hc_sinkhorn_iters,
+            norm_weight=norm.weight,
+            norm_eps=norm.variance_epsilon,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1360,18 +1384,13 @@ class Glm53FlashDecoderLayer(nn.Module):
 
         if self.mhc:
             residual_streams = hidden_states
-            hidden_states, post, comb = mhc_pre(
+            hidden_states, post, comb = self.mhc_pre_norm(
                 residual_streams,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                self.config.rms_norm_eps,
-                self.config.hc_eps,
-                self.config.hc_sinkhorn_iters,
-                norm_weight=None,
-                norm_eps=None,
+                self.input_layernorm,
             )
-            hidden_states = self.input_layernorm(hidden_states)
             if self.is_kda_layer:
                 hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
             else:
@@ -1396,18 +1415,13 @@ class Glm53FlashDecoderLayer(nn.Module):
             )
             hidden_states = mhc_post(hidden_states, residual_streams, post, comb)
             residual_streams = hidden_states
-            hidden_states, post, comb = mhc_pre(
+            hidden_states, post, comb = self.mhc_pre_norm(
                 residual_streams,
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
-                self.config.rms_norm_eps,
-                self.config.hc_eps,
-                self.config.hc_sinkhorn_iters,
-                norm_weight=None,
-                norm_eps=None,
+                self.post_attention_layernorm,
             )
-            hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
             if self.is_moe_layer:
                 hidden_states = self.mlp(
