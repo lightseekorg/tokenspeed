@@ -63,17 +63,14 @@ def test_min_p_stays_inclusive_at_zero():
 
 
 def test_temperature_rejects_negative():
-    # __post_init__ must leave a negative temperature for verify() to
-    # reject: coercing it to greedy also overwrites the caller's explicit
-    # top_k, and the check below was unreachable while it did.
+    # Coercing it to greedy would also drop the caller's top_k.
     params = SamplingParams(temperature=-0.5, top_k=40)
     with pytest.raises(ValueError, match=r"temperature must be non-negative"):
         params.verify(vocab_size=32)
 
 
 def test_temperature_zero_collapses_to_greedy():
-    # The near-zero shortcut still applies: temperature=0 asks for greedy,
-    # which pins the seed and forces top_k=1.
+    # Greedy pins the seed and forces top_k=1.
     params = SamplingParams(temperature=0.0, top_k=40, seed=7)
     assert (params.temperature, params.top_k, params.seed) == (1.0, 1, 0)
     params.verify(vocab_size=32)

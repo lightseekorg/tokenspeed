@@ -110,10 +110,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             self.stop_token_ids = None
 
-        # Process some special cases. Only a non-negative near-zero
-        # temperature collapses to greedy: a negative one is left for
-        # verify() to reject instead of being silently coerced (and, worse,
-        # overwriting the caller's explicit top_k).
+        # A near-zero temperature means greedy; verify() rejects a negative one.
         if 0.0 <= self.temperature < _SAMPLING_EPS:
             self.temperature = 1.0
             self.top_k = 1
