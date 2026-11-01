@@ -1087,7 +1087,9 @@ scores; no backend computes them. `docs/guides/sampling-calibration.md` is
 the contract: ordering, masking, supported configurations and cost.
 
 `sample()` and `verify()` land their outputs in each sampling backend's
-persistent output buffers, on eager and replay alike. The FlashInfer backend
+persistent output buffers, on eager and replay alike. The force-single-token
+epilogue updates the accepted lengths in place, so stop/state updates and
+asynchronous host copies consume the same sampler-owned storage. The FlashInfer backend
 packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 `get_packed_output_d2h` collapses the two device-to-host copies into one; the
 Triton backends return separate token and length buffers and take the
