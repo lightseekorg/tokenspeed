@@ -264,6 +264,52 @@ def _select_grouped_moe_config(
     )
 
 
+def package_prefill_row_families(
+    min_rows: int,
+    max_rows: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_experts: int,
+    top_k: int,
+    swiglu_args: tuple[float, float, float],
+) -> list[int]:
+    """One token count per package-prefill compilation in ``[min_rows, max_rows]``.
+
+    Covers all-local experts with precomputed routes and E2M1 activations, as
+    the sorted gate/up and down halves run them. Compile-time values follow
+    the grouped configuration, the sort's chunk width, and the divisibility
+    by 16 that Triton keys on for the runtime token and route counts.
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import route_chunks
+
+    first_rows: dict[tuple, int] = {}
+    for rows in range(min_rows, max_rows + 1):
+        config = _select_grouped_moe_config(
+            rows,
+            hidden_dim=hidden_dim,
+            inter_dim=inter_dim,
+            stage2_k=inter_dim,
+            num_local_experts=num_experts,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_format="e2m1",
+            do_finalize=False,
+            precomputed_routes=True,
+            swiglu_args=swiglu_args,
+            situ_linear_beta=None,
+        )
+        _, _, chunk = route_chunks(
+            rows * top_k,
+            num_experts,
+            use_minimum_route_chunks=config.use_minimum_route_chunks,
+            runtime_rows=config.runtime_rows,
+        )
+        key = (config, chunk, rows % 16 == 0, rows * top_k % 16 == 0)
+        first_rows.setdefault(key, rows)
+    return sorted(first_rows.values())
+
+
 def _effective_scale_load_mode(
     mode: str,
     block_m: int,

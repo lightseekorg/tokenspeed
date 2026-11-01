@@ -1344,9 +1344,18 @@ def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         gluon_mxfp4_fp8_precomputed_situ,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        gluon_mxfp4_sorted_down_gfx950 as _sorted_down_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        gluon_mxfp4_sorted_gate_up_gfx950 as _sorted_gate_up_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         gluon_mxfp_dynamic_mxfp4_fused_moe,
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
+        sorted_route_capacity,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp4_gemm import (
         launch_gluon_mxfp4_a4w4_moe_apply_gfx950,
@@ -1368,6 +1377,7 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx950_moe_weights,
+        preprocess_sorted_down_weight,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused as fused_mxfp_gfx1250
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
@@ -1772,6 +1782,133 @@ if platform.is_amd:
 
     gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
         _warmup_a4w4_ep_deferred
+    )
+
+    _GFX950 = CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    )
+
+    @register_kernel(
+        "moe",
+        "sorted_gate_up",
+        name="gluon_mxfp4_sorted_gate_up_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures("x", "dense", {torch.uint8}),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_sorted_gate_up_gfx950(
+        x_quantized: tuple[torch.Tensor, torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        w: torch.nn.Module,
+        intermediate: torch.Tensor,
+        intermediate_scale: torch.Tensor,
+    ) -> Any:
+        """gfx950 kernel of :func:`tokenspeed_kernel.ops.moe.moe_sorted_gate_up`."""
+        if w.num_local_experts != w.num_experts:
+            raise ValueError("sorted gate/up requires every expert to be local")
+        swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        return _sorted_gate_up_gfx950(
+            x_quantized,
+            topk_weights,
+            topk_ids,
+            w.w13_weight_triton_tensor,
+            intermediate=intermediate,
+            intermediate_scale=intermediate_scale,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
+        )
+
+    @register_kernel(
+        "moe",
+        "sorted_down",
+        name="gluon_mxfp4_sorted_down_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures("x", "dense", {torch.uint8}),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_sorted_down_gfx950(
+        intermediate: torch.Tensor,
+        intermediate_scale: torch.Tensor,
+        routes: Any,
+        weight: torch.Tensor,
+        deferred_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """gfx950 kernel of :func:`tokenspeed_kernel.ops.moe.moe_sorted_down`."""
+        return _sorted_down_gfx950(
+            intermediate,
+            intermediate_scale,
+            routes,
+            weight,
+            deferred_out=deferred_out,
+        )
+
+    def _warmup_sorted_prefill_gfx950(
+        w: torch.nn.Module, weight: torch.Tensor, min_rows: int, max_rows: int
+    ) -> None:
+        """Run both sorted halves once per compilation family in the row range."""
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
+            package_prefill_row_families,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+            empty_swizzled_cdna4_mxfp4_scale,
+        )
+
+        w13 = w.w13_weight_triton_tensor.gluon_package_prefill_weight
+        hidden = int(w13.shape[2]) * 2
+        inter = int(w13.shape[1]) // 2
+        width = int(weight.gluon_package_prefill_weight.shape[1])
+        k = int(weight.gluon_package_prefill_weight.shape[2]) * 2
+        device = w13.device
+        for rows in package_prefill_row_families(
+            min_rows,
+            max_rows,
+            hidden_dim=hidden,
+            inter_dim=inter,
+            num_experts=w.num_experts,
+            top_k=w.top_k,
+            swiglu_args=_swiglu_args(w),
+        ):
+            capacity = sorted_route_capacity(rows, w.num_experts, w.top_k)
+            panels = (capacity + 31) // 32 * 32
+            packed = torch.zeros((rows, hidden // 2), device=device, dtype=torch.uint8)
+            scales = empty_swizzled_cdna4_mxfp4_scale(rows, hidden // 32, device=device)
+            scales.fill_(127)
+            ids = torch.arange(rows * w.top_k, device=device, dtype=torch.int32)
+            ids = ids.remainder(w.num_experts).view(rows, w.top_k)
+            weights = torch.full(
+                (rows, w.top_k), 1.0 / w.top_k, device=device, dtype=torch.float32
+            )
+            routes = gluon_mxfp4_sorted_gate_up_gfx950(
+                (packed, scales),
+                weights,
+                ids,
+                w,
+                torch.empty((capacity, inter // 2), device=device, dtype=torch.uint8),
+                torch.empty((panels, inter // 32), device=device, dtype=torch.uint8),
+            )
+            gluon_mxfp4_sorted_down_gfx950(
+                torch.zeros((capacity, k // 2), device=device, dtype=torch.uint8),
+                torch.full((panels, k // 32), 127, device=device, dtype=torch.uint8),
+                routes,
+                weight,
+                torch.empty(
+                    (rows * w.top_k, width), device=device, dtype=torch.bfloat16
+                ),
+            )
+        torch.cuda.synchronize(device)
+
+    # Down weights and warmup belong to the selected down kernel's layout.
+    gluon_mxfp4_sorted_down_gfx950._tokenspeed_weight_preprocessor = (  # type: ignore[attr-defined]
+        preprocess_sorted_down_weight
+    )
+    gluon_mxfp4_sorted_down_gfx950._tokenspeed_warmup = (  # type: ignore[attr-defined]
+        _warmup_sorted_prefill_gfx950
     )
 
     @register_kernel(
