@@ -125,6 +125,8 @@ class FusedDSADecode:
             return torch.cat(outputs, 0)
 
         qb = gathered(layer.q_b_proj.weight).cpu().view(64, 192, 1536)
+        if layer.scale_q_lora:
+            qb = qb * math.sqrt(layer.hidden_size / layer.q_lora_rank)
         iqb = layer.indexer.wq_b.weight.detach().cpu().view(64, 128, 1536)
         self.qb = self.kernels.prepare_projection_weight(
             pack_qb_panels(torch.cat((qb, iqb), 1).reshape(20480, 1536)).npu()
@@ -145,7 +147,10 @@ class FusedDSADecode:
         self.gamma_kv = layer.kv_a_layernorm.weight.detach().contiguous()
         self.gamma_index = layer.indexer.k_norm.weight.detach().contiguous()
         self.score_weight = pack_score_fp32(
-            layer.indexer.weights_proj.weight.detach().float().contiguous()
+            (
+                layer.indexer.weights_proj.weight.detach().float()
+                * layer.indexer.weights_softmax_scale
+            ).contiguous()
         )
         self.w_vc = layer.w_vc.detach().contiguous()
         self.w_o = layer.o_proj.weight.detach().contiguous()
@@ -162,11 +167,7 @@ class FusedDSADecode:
                 raise ValueError("Fused DSA RoPE requires 64 adjacent-pair channels")
             self.cos_sin = self.rotary_emb.cos_sin_cache.float().contiguous().npu()
         else:
-            self.cos_sin = torch.zeros((1, 64), dtype=torch.float32, device="npu")
-        self.nope_positions = {
-            rows: torch.zeros(rows, dtype=torch.int64, device="npu")
-            for rows in (64, 128, 256, 512)
-        }
+            self.cos_sin = None
         self.window = None
         self.outputs = {
             rows: tuple(
@@ -175,8 +176,6 @@ class FusedDSADecode:
                     (8, rows, 8, 576),
                     (rows, 64, 128),
                     (rows, 64),
-                    (rows, 1536),
-                    (rows, 768),
                 )
             )
             for rows in (64, 128, 256, 512)
@@ -185,10 +184,7 @@ class FusedDSADecode:
     def prolog(self, hidden, positions, ctx):
         if self.window is None:
             raise RuntimeError("Initialize DSA transport before forward/capture")
-        query, index_query, score, all_qnorm, all_aux = self.outputs[hidden.shape[0]]
-        torch.npu.set_stream_limit(
-            torch.npu.current_stream(), cube_num=24, vector_num=48
-        )
+        query, index_query, score = self.outputs[hidden.shape[0]]
         pool = ctx.token_to_kv_pool
         placement = ctx.attn_backend.cache_placement(self.attention_layer)
         locations = ctx.attn_backend.write_locations(
@@ -217,7 +213,7 @@ class FusedDSADecode:
                 )
             positions = positions.to(dtype=torch.int64).contiguous()
         else:
-            positions = self.nope_positions[hidden.shape[0]]
+            positions = None
         self.kernels.fused_prolog(
             hidden.contiguous(),
             self.down,
@@ -228,25 +224,16 @@ class FusedDSADecode:
             self.qb,
             self.uk,
             self.window,
-            query,
-            index_query,
-            score,
             kv,
             index_k,
             slots,
-            all_qnorm,
-            all_aux,
-            "dsa_prolog_fused",
-            self.eps_q,
-            self.eps_kv,
-            self.eps_index,
-            self.rank * 8,
-            24,
-            0,
-            64,
-            0,
-            4,
-            rotary=(positions, self.cos_sin, self.rotary_mode),
+            eps_q=self.eps_q,
+            eps_kv=self.eps_kv,
+            eps_index=self.eps_index,
+            positions=positions,
+            cos_sin=self.cos_sin,
+            rotary_mode=self.rotary_mode,
+            out=(query, index_query, score),
         )
         return query, index_query, score
 
@@ -426,10 +413,8 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
 
     def process_weights_after_loading(self, _module=None):
         if not self._scales_prepared:
-            if self.scale_q_lora:
-                self.q_a_layernorm.weight.data.mul_(
-                    math.sqrt(self.hidden_size / self.q_lora_rank)
-                )
+            # The indexer consumes the unscaled normalized Q latent. Apply
+            # Q-LoRA scaling after the main projection, never to this shared norm.
             if self.scale_kv_lora:
                 self.kv_a_layernorm.weight.data.mul_(
                     math.sqrt(self.hidden_size / self.kv_lora_rank)
@@ -492,6 +477,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             ctx.forward_mode,
             ctx.bs,
             save_kv_cache=False,
+            record_kv_cache=False,
             fused=True,
             index_query=index_query,
             index_key=None,
@@ -555,11 +541,15 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         backend.start_prefill_index(self.layer_id, ik.contiguous())
         if hidden.shape[0]:
             # Index-K communication runs while the MLA query/latent are formed.
-            weights = indexer.weights_proj(hidden.float())[0]
+            weights = (
+                indexer.weights_proj(hidden.float())[0] * indexer.weights_softmax_scale
+            )
             kv = self.kv_a_proj_with_mqa(hidden)[0]
             q = F.linear(q_lora, qb).view(
                 -1, kc.shape[0], self.qk_nope_head_dim + self.qk_rope_head_dim
             )
+            if self.scale_q_lora:
+                q = q * math.sqrt(self.hidden_size / self.q_lora_rank)
             latent = self.kv_a_layernorm(kv[:, : self.kv_lora_rank].contiguous())
             query = torch.cat(
                 (
@@ -606,6 +596,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             ctx.bs,
             fused=False,
             save_kv_cache=False,
+            record_kv_cache=False,
             index_query=iq,
             prefill_latent=latent.contiguous(),
             index_weights=weights,
@@ -650,6 +641,8 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         q = self.q_b_proj(q_lora)[0].view(
             -1, self.num_local_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
         )
+        if self.scale_q_lora:
+            q = q * math.sqrt(self.hidden_size / self.q_lora_rank)
         latent = self.kv_a_layernorm(kv[:, : self.kv_lora_rank].contiguous())
         query = torch.cat(
             (
@@ -680,8 +673,9 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         )
         index_key = indexer.k_norm(indexer.wk(hidden_states)[0]).unsqueeze(1)
         index_query, index_key = self._rotate_indexer(positions, index_query, index_key)
-        index_weights = indexer.weights_proj(hidden_states.float())[0].to(
-            index_key.dtype
+        index_weights = (
+            indexer.weights_proj(hidden_states.float())[0]
+            * indexer.weights_softmax_scale
         )
         output = ctx.attn_backend.forward(
             query,
@@ -693,6 +687,8 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             ctx.bs,
             fused=False,
             save_kv_cache=False,
+            # The Ascend leaf publishes after writing its Index-K cache too.
+            record_kv_cache=False,
             index_query=index_query,
             index_key=index_key,
             prefill_latent=None,
@@ -747,7 +743,6 @@ class AscendDSARuntime:
         self.resources = prepare_dsa_resources(group=name, rank=rank)
         self.window = self.resources.window
         self.outputs = self.resources.outputs
-        self.tables = self.resources.tables
         self.backends = weakref.WeakSet()
         self.runtimes = []
         self.closed = False
@@ -784,8 +779,8 @@ class AscendDSARuntime:
                     raise ValueError("DSA model and cache backend groups differ")
                 node.configure_fused_decode(
                     group=self.group,
+                    ranks=self.ranks,
                     attention_outputs=self.outputs,
-                    peer_inputs=self.tables,
                 )
                 found = True
             pending.extend(node.child_backends())
@@ -806,7 +801,6 @@ class AscendDSARuntime:
         self.resources = None
         self.window = None
         self.outputs.clear()
-        self.tables.clear()
         self.runtimes.clear()
         self.backends.clear()
         self.closed = True

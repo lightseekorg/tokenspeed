@@ -1476,7 +1476,9 @@ class ModelExecutor:
         force_mask = self.input_buffers.force_single_token_verify_buf[
             row_offset : row_offset + row_count
         ]
-        return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
+        # Keep the sampler-owned storage for graph replay and asynchronous D2H.
+        accept_lengths.masked_fill_(force_mask, 1)
+        return accept_lengths
 
     def _decode_candidates(self, ctx: ForwardContext) -> torch.Tensor | None:
         """This step's decode-row candidate window: ``[num_decodes, N]``.

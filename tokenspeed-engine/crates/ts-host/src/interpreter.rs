@@ -29,7 +29,7 @@ use std::{
     ptr::addr_of_mut,
 };
 
-use pyo3::ffi;
+use pyo3::{ffi, prelude::*};
 
 /// Start the interpreter as the `executable` interpreter would start, with
 /// the scheduler's module built in, and release the GIL.
@@ -82,4 +82,34 @@ pub fn start(executable: &str) -> Result<(), String> {
         ffi::PyEval_SaveThread();
     }
     Ok(())
+}
+
+/// Keep the GIL held through the process's native static destructors.
+///
+/// Call only after serving has stopped and its forward thread has joined.
+/// Imported extensions can own Python types in native statics; their exit
+/// destructors need the same GIL as ordinary Python reference decrements.
+/// The interpreter remains alive, and this terminal acquisition is not released.
+pub fn hold_gil_for_process_exit() {
+    // SAFETY: this is the terminal main-thread operation. Initialization may
+    // have failed before Python started; no C API attachment is made then.
+    unsafe {
+        if ffi::Py_IsInitialized() != 0 {
+            ffi::PyGILState_Ensure();
+        }
+    }
+}
+
+/// Run Python's registered process-exit cleanup while the interpreter is alive.
+///
+/// Call after serving and its forward thread have stopped. Device backends
+/// register synchronization and process-group teardown with `atexit`; native
+/// process exit alone does not execute those Python callbacks.
+pub fn run_exit_hooks() -> Result<(), String> {
+    // SAFETY: initialization is queried before attaching to Python.
+    if unsafe { ffi::Py_IsInitialized() } == 0 {
+        return Ok(());
+    }
+    Python::attach(|py| py.import("atexit")?.call_method0("_run_exitfuncs").map(drop))
+        .map_err(|error| format!("running Python exit hooks: {error}"))
 }

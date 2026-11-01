@@ -136,6 +136,12 @@ before capture or task update and maps authoritative router slots once before
 the first Prolog. Its normalized FP32 partials use the same direct LSE merge as
 DSA, with empty-shard masking and layout conversion fused at that boundary.
 
+Layer-shared Ascend metadata compares retained Tensor storage views when reusing
+prepared results. Equivalent views reuse the result; replacement storage or an
+in-place storage rebind invalidates it. The retained views share allocations
+without copying data and are cleared at the forward boundary. Prefill keeps
+the same storage-view contract for each layer's prepared cache planes.
+
 DSA CP prepares its metadata before the first fused Prolog. One device launch
 expands request lengths into causal query rows, compacts owned pages, counts
 visible/initial/window tokens, writes the Indexer's grouped layout, and maps
@@ -168,6 +174,9 @@ additional storage for sanitization/layout conversion, TopK and LSE. At 16K
 rows and 64 heads these are 1.125 GiB for Q and 2 GiB per partial buffer.
 Plan the prefill chunk against this transient peak as well as resident weights
 and cache; the native fused bucket's memory plan does not bound this path.
+The persistent gather workspace also reserves the retained current rows used
+by attention after exchange, and budgets every transport and slot view with
+the workspace pool's 256-byte alignment.
 
 Single-rank decode uses the same preparation with identity page ownership:
 verify still needs one causal length and page-table row per candidate. Its
@@ -431,6 +440,12 @@ by a single per-bs builder shared by capture and refresh, cached per bs. A bs
 never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
+
+Kernel page tables retain int32 IDs. The router computes token write slots in
+int64 and publishes int64 decode, extend, mixed and padded views from the
+first allocation. A valid int32 page ID times its page size may exceed 2^31;
+neither eager refresh nor graph replay may narrow the resulting slot. Scratch
+write-location destinations also require int64.
 
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
@@ -1072,7 +1087,9 @@ scores; no backend computes them. `docs/guides/sampling-calibration.md` is
 the contract: ordering, masking, supported configurations and cost.
 
 `sample()` and `verify()` land their outputs in each sampling backend's
-persistent output buffers, on eager and replay alike. The FlashInfer backend
+persistent output buffers, on eager and replay alike. The force-single-token
+epilogue updates the accepted lengths in place, so stop/state updates and
+asynchronous host copies consume the same sampler-owned storage. The FlashInfer backend
 packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 `get_packed_output_d2h` collapses the two device-to-host copies into one; the
 Triton backends return separate token and length buffers and take the

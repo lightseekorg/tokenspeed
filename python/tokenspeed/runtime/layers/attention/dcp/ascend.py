@@ -45,7 +45,7 @@ def _prefill_workspace_sizes(
     history_rows = history_capacity_rows
     width = 576 + index_width
     return (
-        (history_rows + degree * send_rows) * width,
+        (history_rows + degree * send_rows + max_current_rows) * width,
         send_rows * width,
         history_rows * width,
     )
@@ -81,9 +81,9 @@ class AscendPrefillOptions:
         if local_rows < 1 or degree < 1 or index_width not in (0, 128):
             raise ValueError("Invalid native Prefill workspace geometry")
         return (
-            2
-            * sum(
-                _prefill_workspace_sizes(
+            sum(
+                -(-(size * torch.bfloat16.itemsize) // 256) * 256
+                for size in _prefill_workspace_sizes(
                     max_current_rows=self.max_current_rows,
                     history_capacity_rows=self.history_capacity_rows,
                     degree=degree,
@@ -677,6 +677,7 @@ class AscendDCPMetadata:
         self._indexer_metadata: AscendIndexerMetadata | None = None
         self._query_group_size: int | None = None
         self._write_slot_source: tuple | None = None
+        self._write_slot_tensor: torch.Tensor | None = None
 
     def clear_forward_metadata(self) -> None:
         """Invalidate layer-shared results before the next forward/capture."""
@@ -685,6 +686,7 @@ class AscendDCPMetadata:
         self._indexer_metadata = None
         self._query_group_size = None
         self._write_slot_source = None
+        self._write_slot_tensor = None
 
     def prepare_metadata(
         self,
@@ -701,9 +703,7 @@ class AscendDCPMetadata:
     ) -> None:
         sources = (seq_lens, page_table) + (() if slots is None else (slots,))
         key = (
-            tuple(
-                (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device) for t in sources
-            ),
+            tuple((t.shape, t.stride(), t.dtype, t.device) for t in sources),
             page_size,
             block_granularity,
             init_tokens,
@@ -711,7 +711,12 @@ class AscendDCPMetadata:
             query_width,
             query_group_size,
         )
-        if key == self._prepared_metadata_key:
+        if key == self._prepared_metadata_key and all(
+            previous.is_set_to(current)
+            for previous, current in zip(
+                self._metadata_sources[: len(sources)], sources, strict=True
+            )
+        ):
             return
         self.refresh_metadata(
             seq_lens=seq_lens,
@@ -724,7 +729,9 @@ class AscendDCPMetadata:
             query_group_size=query_group_size,
             slots=slots,
         )
-        self._metadata_sources = sources
+        # Separate view objects preserve storage identity if a caller rebinds
+        # its Tensor in place; detach shares the allocation without copying it.
+        self._metadata_sources = tuple(source.detach() for source in sources)
         self._prepared_metadata_key = key
 
     def prepare_write_slots(self, locations, placement):
@@ -735,14 +742,17 @@ class AscendDCPMetadata:
         is captured once in the graph, just as DSA's Prolog preparation is.
         """
         key = (
-            locations.data_ptr(),
             locations.shape,
             locations.stride(),
             locations.dtype,
             locations.device,
             placement,
         )
-        if key != self._write_slot_source:
+        if (
+            key != self._write_slot_source
+            or self._write_slot_tensor is None
+            or not self._write_slot_tensor.is_set_to(locations)
+        ):
             local, owned = resolve_cache_slots(locations, placement)
             self.write_slots = (
                 (local if owned is None else torch.where(owned, local, -1))
@@ -751,6 +761,7 @@ class AscendDCPMetadata:
             )
             self._metadata_sources += (locations,)
             self._write_slot_source = key
+            self._write_slot_tensor = locations.detach()
         return self.write_slots
 
     def bind_virtual_block_count(self, virtual_block_count: int) -> None:

@@ -184,7 +184,7 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     page = 128
     table = torch.tensor([[2, 5, 3], [6, 4, 1]], dtype=torch.int32)[: len(extends)]
     total = sum(extends)
-    slots = torch.empty((1, total), dtype=torch.int32)
+    slots = torch.empty((1, total), dtype=torch.int64)
     extend_write_locations(
         table[None],
         torch.tensor([page]),
@@ -687,8 +687,10 @@ def test_native_mla_backend_owns_commit_slots_until_transport_closes(
 def test_native_workspace_size_includes_history_current_and_send(degree, index_width):
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
-    # The backend's pool includes aligned int64 commit slots beside transport.
-    size = (4 * 128 + (degree + 1) * 128) * (576 + index_width) * 2 + 256
+    # Two history planes, gathered/send planes, and one retained current row.
+    # Each view is aligned to 256 bytes, including the int64 commit slots.
+    transport = (4 * 128 + (degree + 1) * 128 + 1) * (576 + index_width) * 2
+    size = -(-transport // 256) * 256 + 256
     exact = AscendPrefillOptions(1, 1)
     assert (
         exact.required_workspace(local_rows=128, degree=degree, index_width=index_width)
@@ -761,7 +763,7 @@ def test_bounded_workspace_size_does_not_follow_cache_capacity():
     options = AscendPrefillOptions(16384, 1024, 128)
     small = options.required_workspace(local_rows=128, degree=8, index_width=128)
     large = options.required_workspace(local_rows=1 << 20, degree=8, index_width=128)
-    assert small == large == 2 * 704 * (2 * 1025 * 128 + 9 * 2048) + 16384 * 8
+    assert small == large == 2 * 704 * (2 * 1025 * 128 + 9 * 2048 + 16384) + 16384 * 8
 
 
 @pytest.mark.parametrize("degree", [1, 2, 8])
@@ -783,7 +785,7 @@ def test_prefill_workspace_owns_buffers_apart_from_main_stream_scratch(
     assert pool.frozen
     assert (
         pool.capacity_bytes
-        == sum(x.numel() * x.element_size() for x in buffers)
+        == sum(-(-(x.numel() * x.element_size()) // 256) * 256 for x in buffers)
         == required
     )
     addresses = [x.data_ptr() for x in buffers if x.numel()]
@@ -798,3 +800,68 @@ def test_prefill_workspace_owns_buffers_apart_from_main_stream_scratch(
     del buffers
     with pytest.raises(RuntimeError, match="frozen"):
         pool.allocate(((required + 256,), torch.uint8))
+
+
+def test_mla_merge_packs_true_partials_and_uses_prepared_producer(monkeypatch):
+    from tokenspeed_kernel.ops.attention.mla.ascend import ascend_mla_merge
+    from tokenspeed_kernel_npu.ops import mla_dcp
+
+    class CpuPartialKernel:
+        # Supply the absent NPU kernel while retaining the real packer's checks.
+        def __getitem__(self, grid):
+            def run(partial, lse, visible, active, producer, maximum, rows, heads):
+                live = active & (visible > 0)
+                producer.copy_(partial.permute(1, 0, 2))
+                maximum.copy_(torch.where(live[:, None], lse, -2e38).unsqueeze(0))
+
+            return run
+
+    monkeypatch.setattr(mla_dcp, "_prepare_mla_partials", CpuPartialKernel())
+    library = torch.library.Library("custom", "FRAGMENT")
+    try:
+        try:
+            torch._C._dispatch_find_schema_or_throw(
+                "custom::npu_dsa_merge_lse_direct", ""
+            )
+        except RuntimeError:
+            library.define(
+                "npu_dsa_merge_lse_direct(Tensor attention_out, Tensor softmax_max, Tensor softmax_sum, str group, int rank_size) -> Tensor"
+            )
+
+        def cpu_merge(producer, maximum, total, group, rank_size):
+            # Model a prepared rank-0 producer with seven empty peer shards.
+            if group != "mla-merge-test" or rank_size != 8:
+                raise ValueError("Wrong prepared MLA communication group")
+            live = maximum[0, :, :8].T > -1e30
+            return torch.where(live[..., None], producer[:8], 0).bfloat16()
+
+        library.impl("npu_dsa_merge_lse_direct", cpu_merge, "CPU")
+        partial = (
+            torch.arange(64 * 64 * 512, dtype=torch.float32).reshape(64, 64, 512) / 1024
+        )
+        lse = torch.zeros(64, 64)
+        visible = torch.ones(64, dtype=torch.int32)
+        visible[::3] = 0
+        active = torch.ones(64, dtype=torch.bool)
+        active[::5] = False
+        producer = torch.empty(64, 64, 512)
+        maximum = torch.empty(1, 64, 64)
+        total = torch.ones_like(maximum)
+        for factor in (1.0, 0.5):
+            current = partial * factor
+            result = ascend_mla_merge(
+                current,
+                lse=lse,
+                visible=visible,
+                active=active,
+                producer=producer,
+                maximum=maximum,
+                total=total,
+                group="mla-merge-test",
+            )
+            expected = torch.where(
+                (active & (visible > 0))[None, :, None], current.permute(1, 0, 2)[:8], 0
+            )
+            assert torch.equal(result, expected.bfloat16())
+    finally:
+        library._destroy()

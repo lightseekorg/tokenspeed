@@ -49,7 +49,6 @@ class DSAResources:
 
     window: object
     outputs: dict
-    tables: dict
     release: Callable
 
 

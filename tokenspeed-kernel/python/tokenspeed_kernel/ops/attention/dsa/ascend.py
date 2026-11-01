@@ -89,8 +89,7 @@ def ascend_prepare_dsa_resources(*, group, rank):
         raise
     return DSAResources(
         window,
-        {rows: values[:3] for rows, values in prepared.items()},
-        {rows: values[3] for rows, values in prepared.items()},
+        prepared,
         release=torch.ops.custom.dsa_release_prolog_window,
     )
 

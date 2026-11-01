@@ -40,7 +40,7 @@ def compute_out_cache_loc_kernel(
     page_table_ptr,  # [batch_size, max_pages], batch-ordered
     cumsum_lengths_ptr,  # [batch_size] or None for uniform mode
     # Output pointer
-    out_cache_loc_ptr,  # [total_tokens]
+    out_cache_loc_ptr,  # [total_tokens] int64
     # Scalars
     uniform_input_length,  # used when input_lengths_ptr is None
     page_size: tl.constexpr,
@@ -75,15 +75,15 @@ def compute_out_cache_loc_kernel(
     none of which need a compile-time constant.
     """
     # Program ID represents which request we're processing
-    req_idx = tl.program_id(0)
+    req_idx = tl.program_id(0).to(tl.int64)
 
-    valid_cache_len = tl.load(cache_start_ptr + req_idx)
+    valid_cache_len = tl.load(cache_start_ptr + req_idx).to(tl.int64)
 
     if input_lengths_ptr is not None:
         input_length = tl.load(input_lengths_ptr + req_idx)
         # Always load from cumsum, use 0 index for first request to ensure type consistency
         offset_idx = tl.where(req_idx > 0, req_idx - 1, 0)
-        output_offset = tl.load(cumsum_lengths_ptr + offset_idx)
+        output_offset = tl.load(cumsum_lengths_ptr + offset_idx).to(tl.int64)
         # Zero out offset for first request
         output_offset = tl.where(req_idx > 0, output_offset, 0)
     else:
@@ -111,7 +111,7 @@ def compute_out_cache_loc_kernel(
 
         # Load page IDs from the batch-ordered page table.
         page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
-        page_ids = tl.load(page_ptrs, mask=mask, other=0)
+        page_ids = tl.load(page_ptrs, mask=mask, other=0).to(tl.int64)
 
         # Compute physical cache locations
         cache_locs = page_ids * page_size + offsets_in_page

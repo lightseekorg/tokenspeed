@@ -168,7 +168,6 @@ class AscendDSABackend(DSABackend):
         self._indexer_kernels = ascend_dsa_kernels()
         self._fused_group: str | None = None
         self._fused_attention_outputs: dict[int, tuple] = {}
-        self._fused_peer_inputs: dict[int, torch.Tensor] = {}
         self._collective_context: AscendDCPContext | None = None
         self._ascend_placement: _AscendCachePlacement | None = None
         if dcp.degree > 1:
@@ -412,19 +411,18 @@ class AscendDSABackend(DSABackend):
         self,
         *,
         group: str,
+        ranks: tuple[int, ...],
         attention_outputs: dict[int, tuple],
-        peer_inputs: dict[int, torch.Tensor],
     ) -> None:
         """Bind CP resources and stable producer outputs outside capture."""
         if self._dcp.degree <= 1 or not group:
             raise ValueError("DSA fusion requires a context-parallel communicator")
-        if not attention_outputs or set(attention_outputs) != set(peer_inputs):
-            raise ValueError("Fused DSA requires IPC-registered SFA outputs")
-        if any(table.shape != (self._dcp.degree,) for table in peer_inputs.values()):
-            raise ValueError("Fused DSA IPC tables must cover the CP group")
+        if tuple(ranks) != tuple(self._dcp.ranks):
+            raise ValueError("Fused DSA resources must cover the CP group ranks")
+        if not attention_outputs:
+            raise ValueError("Fused DSA requires prepared SFA producer outputs")
         self._fused_group = group
         self._fused_attention_outputs = attention_outputs
-        self._fused_peer_inputs = peer_inputs
 
     def _context_collectives(self) -> AscendDCPContext:
         """Use the existing device group for shapes without native fusion."""
@@ -562,8 +560,6 @@ class AscendDSABackend(DSABackend):
                 index_slots = torch.where(owned, local_slots, -1)
         if not kwargs.get("index_cache_written", False):
             kernels.scatter(kwargs["index_key"].contiguous(), index_cache, index_slots)
-        if self.step_counter is not None:
-            self.step_counter.record_cache()
         if not context_parallel or self._dcp.degree == 1:
             indices, valid_chunks = kernels.index(
                 kwargs["index_query"],
@@ -744,10 +740,7 @@ class AscendDSABackend(DSABackend):
                 "Initialize fused DSA resources before context-parallel execution"
             )
         rows = selection.query.shape[1]
-        if (
-            rows not in self._fused_attention_outputs
-            or rows not in self._fused_peer_inputs
-        ):
+        if rows not in self._fused_attention_outputs:
             raise ValueError("Fused DSA LSE requires a prepared [64,T,512] SFA shape")
         output, softmax_max, softmax_sum = kernels.attention_partial(
             selection.query,
@@ -767,10 +760,8 @@ class AscendDSABackend(DSABackend):
             output,
             softmax_max,
             softmax_sum,
-            self._fused_peer_inputs[rows],
             group=self._fused_group,
             rank_size=self._dcp.degree,
-            setup_mode=0,
         )
         return (
             result
@@ -814,27 +805,56 @@ class AscendDSABackend(DSABackend):
             )
             table = table[requests]
             q_ends = torch.arange(1, q.shape[0] + 1, device=q.device, dtype=torch.int32)
-        selection = self._select_indexed(
-            q,
-            k,
-            layer,
-            out_cache_loc,
-            token_to_kv_pool,
-            q_ends,
-            kv_lengths,
-            table,
-            kwargs,
-            fused=fused,
-            query_group_size=1,
-            context_parallel=context_parallel,
-            query_width=1,
-        )
-        return self._run_indexed_sparse_attention(
-            selection,
-            layer,
-            token_to_kv_pool,
-            head_major_output=head_major_output,
-            is_prefill=True,
+        # CP represents each causal query as an indexer sequence. Its native
+        # sequence-count limit is 1024, independent of the Prefill token budget.
+        chunk_rows = min(q.shape[0], 1024) if context_parallel else q.shape[0]
+        outputs = []
+        for start in range(0, q.shape[0], chunk_rows):
+            end = min(start + chunk_rows, q.shape[0])
+            inputs = kwargs
+            ends, lengths, pages, slots = q_ends, kv_lengths, table, out_cache_loc
+            if context_parallel:
+                inputs = {
+                    **kwargs,
+                    **{
+                        name: kwargs[name][start:end]
+                        for name in ("index_query", "index_key", "index_weights")
+                    },
+                }
+                ends = q_ends[: end - start]
+                lengths, pages = kv_lengths[start:end], table[start:end]
+                slots = out_cache_loc[start:end]
+            selection = self._select_indexed(
+                q[start:end],
+                k,
+                layer,
+                slots,
+                token_to_kv_pool,
+                ends,
+                lengths,
+                pages,
+                inputs,
+                fused=fused,
+                query_group_size=1,
+                context_parallel=context_parallel,
+                query_width=1,
+            )
+            # PD arms one step per layer, after KV and every Index-K chunk.
+            if end == q.shape[0] and self.step_counter is not None:
+                self.step_counter.record_cache()
+            outputs.append(
+                self._run_indexed_sparse_attention(
+                    selection,
+                    layer,
+                    token_to_kv_pool,
+                    head_major_output=head_major_output,
+                    is_prefill=True,
+                )
+            )
+        return (
+            outputs[0]
+            if len(outputs) == 1
+            else torch.cat(outputs, dim=1 if head_major_output else 0)
         )
 
     def forward_extend(
@@ -1030,6 +1050,8 @@ class AscendDSABackend(DSABackend):
             context_parallel=self._dcp.degree > 1,
             query_width=tokens_per_request,
         )
+        if self.step_counter is not None:
+            self.step_counter.record_cache()
         return self._run_indexed_sparse_attention(
             selection,
             layer,
