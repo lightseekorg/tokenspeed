@@ -1559,7 +1559,13 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enforce_eager=False,
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
-        mapping=SimpleNamespace(world_size=1, world_group=None, is_first_pp_rank=True),
+        device="cuda",
+        mapping=SimpleNamespace(
+            world_size=1,
+            world_group=None,
+            is_first_pp_rank=True,
+            attn=SimpleNamespace(has_kvp=False),
+        ),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
