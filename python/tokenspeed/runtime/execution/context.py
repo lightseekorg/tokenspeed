@@ -199,6 +199,8 @@ class ForwardContext:
     # The drafter's consumer of this target forward's captured taps, attached
     # by the drafter (prepare_target_forward) for the rounds it overlaps with
     # the target; None means the taps are only collected in aux_hidden_states.
+    # While attached, the forward returns no hidden capture: the sink has
+    # every tap.
     target_capture_sink: TargetCaptureSink | None = None
     # Context production carries behavior. Its accumulator stays in the model
     # forward or travels in PPStageState, never on ctx. A configured producer

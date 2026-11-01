@@ -236,7 +236,13 @@ class LogitsMetadata:
     def from_forward_context(cls, ctx: ForwardContext):
         return cls(
             forward_mode=ctx.forward_mode,
-            capture_hidden_mode=ctx.capture_hidden_mode,
+            # A drafter whose sink took every tap as the target produced it
+            # reads no hidden capture, so none is concatenated or stored.
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL
+                if ctx.target_capture_sink is not None
+                else ctx.capture_hidden_mode
+            ),
             gather_ids=ctx.gather_ids,
             logits_rows_selected=ctx.logits_rows_selected,
             input_logprob_rows=ctx.input_logprob_rows,
@@ -1153,7 +1159,9 @@ class LogitsProcessor(nn.Module):
             # GGUF models
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
 
-        if self.logit_scale is not None:
+        # With a softcap, the softcap kernel applies the scale after the
+        # gathers below: they only move rows, so the result is the same.
+        if self.logit_scale is not None and not self.final_logit_softcapping:
             logits.mul_(self.logit_scale)
 
         if lm_head_tp_row_counts is not None:
@@ -1243,7 +1251,11 @@ class LogitsProcessor(nn.Module):
         logits = logits[:, : self.config.vocab_size].contiguous()
 
         if self.final_logit_softcapping:
-            fused_softcap_generic(logits, self.final_logit_softcapping)
+            fused_softcap_generic(
+                logits,
+                self.final_logit_softcapping,
+                1.0 if self.logit_scale is None else self.logit_scale,
+            )
 
         return logits
 
@@ -1265,6 +1277,7 @@ class LogitsProcessor(nn.Module):
 @triton.jit
 def fused_softcap_kernel(
     full_logits_ptr,
+    logit_scale,
     softcapping_value,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
@@ -1276,6 +1289,10 @@ def fused_softcap_kernel(
 
     # Load values
     x = tl.load(full_logits_ptr + offsets, mask=mask).to(tl.float32)
+
+    # Scale and round to the logits' dtype first, exactly as an in-place
+    # multiply of the stored logits would.
+    x = (x * logit_scale).to(full_logits_ptr.dtype.element_ty).to(tl.float32)
 
     # Perform operations in-place
     x = x / softcapping_value
@@ -1289,13 +1306,25 @@ def fused_softcap_kernel(
     tl.store(full_logits_ptr + offsets, x, mask=mask)
 
 
-def fused_softcap(full_logits, final_logit_softcapping):
+def fused_softcap(full_logits, final_logit_softcapping, logit_scale):
+    """Scale, then softcap ``full_logits`` in place.
+
+    Args:
+        full_logits: Logits to update in place.
+        final_logit_softcapping: The softcap ``c`` in ``c * tanh(x / c)``.
+        logit_scale: Multiplier applied to each logit (rounded to the logits'
+            dtype) before the softcap; 1.0 for none.
+
+    Returns:
+        ``full_logits``.
+    """
     n_elements = full_logits.numel()
     BLOCK_SIZE = 1024
     grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)
 
     fused_softcap_kernel[grid](
         full_logits_ptr=full_logits,
+        logit_scale=logit_scale,
         softcapping_value=final_logit_softcapping,
         n_elements=n_elements,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -1303,5 +1332,5 @@ def fused_softcap(full_logits, final_logit_softcapping):
     return full_logits
 
 
-def fused_softcap_generic(full_logits, final_logit_softcapping):
-    return fused_softcap(full_logits, final_logit_softcapping)
+def fused_softcap_generic(full_logits, final_logit_softcapping, logit_scale):
+    return fused_softcap(full_logits, final_logit_softcapping, logit_scale)
