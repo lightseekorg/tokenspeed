@@ -266,3 +266,67 @@ def test_trailing_positional_still_raises():
     """Only the FIRST argument may be positional; later ones remain illegal."""
     with pytest.raises(ValueError, match="unexpected positional arg"):
         _split(["--host", "0.0.0.0", "stray-positional"])
+
+
+@pytest.mark.parametrize(
+    "flag,values",
+    [
+        (
+            "--cors-allowed-origins",
+            ["https://app.example.com", "https://admin.example.com"],
+        ),
+        ("--routing-key-headers", ["x-session-id", "x-user-id"]),
+        ("--access-log-fields", ["client_addr", "user_agent"]),
+    ],
+)
+def test_gateway_multi_value_flags_preserve_all_values(flag, values):
+    result = _split(["example/model", flag, *values, "--tp", "2", "--port", "8000"])
+    assert result.engine == ["--model", "example/model", "--tensor-parallel-size", "2"]
+    assert result.gateway == [
+        "--model",
+        "example/model",
+        flag,
+        *values,
+        "--port",
+        "8000",
+    ]
+
+
+def test_gateway_multi_value_flag_can_be_empty():
+    result = _split(["--cors-allowed-origins", "--port", "8000"])
+    assert result.gateway == ["--cors-allowed-origins", "--port", "8000"]
+    assert result.engine == []
+
+
+def test_engine_scalar_flag_still_rejects_extra_values():
+    with pytest.raises(ValueError, match="unexpected positional arg"):
+        _split(["--max-model-len", "4096", "8192"])
+
+
+@pytest.mark.parametrize("equals_form", [False, True])
+def test_gateway_cors_arguments_reach_smg_parser(equals_form):
+    pytest.importorskip("smg")
+    from smg.launch_router import parse_router_args
+
+    origins = ["https://app.example.com", "https://admin.example.com"]
+    cors_args = (
+        [f"--cors-allowed-origins={origins[0]}"]
+        if equals_form
+        else ["--cors-allowed-origins", *origins]
+    )
+    result = _split([*cors_args, "--port", "8100"])
+    parsed = parse_router_args(
+        ["--worker-urls", "http://127.0.0.1:30000", *result.gateway]
+    )
+    assert parsed.cors_allowed_origins == (origins[:1] if equals_form else origins)
+    assert parsed.port == 8100
+
+
+def test_gateway_parser_rejects_extra_values_for_scalar_flag():
+    pytest.importorskip("smg")
+    from smg.launch_router import parse_router_args
+
+    result = _split(["--policy", "passthrough", "extra"])
+    with pytest.raises(SystemExit) as error:
+        parse_router_args(["--worker-urls", "http://127.0.0.1:30000", *result.gateway])
+    assert error.value.code == 2
