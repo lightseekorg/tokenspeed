@@ -908,12 +908,14 @@ per-request finish counts are the frontend's: under `ts serve`, SMG's router
 metrics on its `--prometheus-port`.
 
 The prefix-cache counters `tokenspeed:prefix_cache_queries` and
-`tokenspeed:prefix_cache_hits` accumulate every released request's prompt
+`tokenspeed:prefix_cache_hits` accumulate every planned request's prompt
 tokens and its `cache_tokens` (the per-request stats line's fields), so
-their ratio is the token-level hit rate. Aborted requests contribute too:
-they queried the cache at admission. Each engine role counts its own view —
-under prefill/decode disaggregation the prefill node's counters hold the
-matching, the decode node's the tokens its remote prefills reported.
+their ratio is the token-level hit rate. A request that never scheduled —
+a pause-withheld abort, a grammar failure, a failed EPD receive — counts
+nothing: it never queried the cache. Each engine role counts its own
+view — under prefill/decode disaggregation the prefill node's counters
+hold the matching, the decode node's the tokens its remote prefills
+reported.
 
 The scheduler process exports `tokenspeed:num_preemptions_total`: requests
 preempted by a capacity retraction — suspended

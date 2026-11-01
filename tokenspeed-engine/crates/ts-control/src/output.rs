@@ -517,8 +517,10 @@ impl OutputProcessor {
         }
     }
 
-    /// A released request's prompt and cached tokens: every request leaving
-    /// the processor contributes both, whatever ended it.
+    /// A released request's prompt and cached tokens: every request the
+    /// scheduler planned contributes both, however it ended. A request that
+    /// never scheduled (a pause-withheld abort, a grammar failure, a failed
+    /// EPD receive) never queried the cache and counts nothing.
     fn record_prefix_cache(&mut self, state: &RequestState) {
         self.pending_prefix_cache.0 += state.prompt_len;
         self.pending_prefix_cache.1 += state.cached_tokens;
@@ -741,7 +743,8 @@ impl OutputProcessor {
 
     /// End a request that finished before it reached the scheduler (aborted
     /// while a pause withheld it): a pause's abort
-    /// notifies its client, a client's own abort does not.
+    /// notifies its client, a client's own abort does not. It never queried
+    /// the prefix cache, so it feeds no prefix-cache counts.
     pub fn reap_unscheduled(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {
@@ -751,13 +754,13 @@ impl OutputProcessor {
             state.finished_output = false;
             committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
         }
-        self.record_prefix_cache(&state);
         committed.released.push(rid.to_owned());
         committed
     }
 
     /// Fail a request that never reached the scheduler (an EPD receive that
-    /// failed): its client gets an abort with `reason`.
+    /// failed): its client gets an abort with `reason`. As above, it never
+    /// queried the prefix cache.
     pub fn fail_unscheduled(
         &mut self,
         rid: &str,
@@ -776,7 +779,6 @@ impl OutputProcessor {
             committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
         }
         self.log_end(rid, &state);
-        self.record_prefix_cache(&state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -1807,6 +1809,23 @@ mod tests {
         assert_eq!(p.take_prefix_cache(), (10, 4));
         // The drain takes: a second read is empty, not the totals again.
         assert_eq!(p.take_prefix_cache(), (0, 0));
+    }
+
+    #[test]
+    fn unscheduled_releases_feed_no_prefix_cache_counts() {
+        // Requests that never reached the scheduler never queried the
+        // cache; their prompt tokens must not deflate the hit rate.
+        let mut reaped = processor(None);
+        register(&mut reaped, "r", 10, 10, &[]);
+        let c = reaped.reap_unscheduled("r");
+        assert_eq!(c.released, ["r"]);
+        assert_eq!(reaped.take_prefix_cache(), (0, 0));
+
+        let mut failed = processor(None);
+        register(&mut failed, "f", 10, 10, &[]);
+        let c = failed.fail_unscheduled("f", "EPD receive failed", None);
+        assert_eq!(c.released, ["f"]);
+        assert_eq!(failed.take_prefix_cache(), (0, 0));
     }
 
     #[test]

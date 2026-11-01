@@ -1345,12 +1345,11 @@ fn run_rank<F: Frontend>(
         grammar,
         grammar_timeouts,
         epd_receive_enabled,
+        metrics_dir,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
-    let (metrics, _exporter) = setup
-        .metrics_dir
-        .clone()
+    let (metrics, _exporter) = metrics_dir
         .map(|base| {
             let dir = base.join(format!("rank{rank}"));
             std::fs::create_dir_all(&dir).unwrap();
@@ -1764,7 +1763,7 @@ fn render_metrics(dir: &std::path::Path) -> Option<String> {
         .unwrap_or_else(|_| "python3".to_owned());
     let generator = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../ts-metrics/tests/fixtures/generate.py");
-    let output = std::process::Command::new(python)
+    let output = std::process::Command::new(&python)
         .arg(generator)
         .arg("--render")
         .arg(dir)
@@ -1773,6 +1772,7 @@ fn render_metrics(dir: &std::path::Path) -> Option<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("No module named 'prometheus_client'") {
+            eprintln!("skipping: {python} has no prometheus_client");
             return None;
         }
         panic!("rendering failed:\n{stderr}");

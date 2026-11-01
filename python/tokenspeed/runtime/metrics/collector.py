@@ -210,9 +210,10 @@ class EngineMetrics:
         self.prefix_cache_queries = factory.counter(
             name="tokenspeed:prefix_cache_queries",
             documentation=(
-                "Prompt tokens of released requests — the prefix-match "
-                "denominator. Aborted requests count too: they queried the "
-                "cache at admission."
+                "Prompt tokens of requests the scheduler planned — the "
+                "prefix-match denominator. A request that never scheduled "
+                "(a pause-withheld abort, a grammar failure, a failed EPD "
+                "receive) counts nothing: it never queried the cache."
             ),
             labelnames=labelnames,
         )

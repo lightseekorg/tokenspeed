@@ -527,8 +527,9 @@ impl EngineMetrics {
             prefix_cache_queries: Metric::counter(
                 exporter,
                 "tokenspeed:prefix_cache_queries",
-                "Prompt tokens of released requests — the prefix-match denominator. Aborted \
-                 requests count too: they queried the cache at admission.",
+                "Prompt tokens of requests the scheduler planned — the prefix-match denominator. \
+                 A request that never scheduled (a pause-withheld abort, a grammar failure, a \
+                 failed EPD receive) counts nothing: it never queried the cache.",
                 names,
             ),
             prefix_cache_hits: Metric::counter(
