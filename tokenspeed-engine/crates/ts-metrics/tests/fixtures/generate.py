@@ -110,6 +110,8 @@ def _run_scenario() -> None:
     engine.record_preemptions(2)
     engine.observe_request_queue_time(0.4)
     engine.observe_request_queue_time(9000.0)
+    engine.record_prefix_cache(query_tokens=200, hit_tokens=64)
+    engine.record_prefix_cache(query_tokens=128, hit_tokens=128)
 
     transfer = KVTransferMetrics(
         labels={"model_name": "m", "app_key": ""},

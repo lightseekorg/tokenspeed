@@ -77,6 +77,8 @@ fn run_scenario(directory: &Path) {
     engine.record_preemptions(2);
     engine.observe_request_queue_time(0.4);
     engine.observe_request_queue_time(9000.0);
+    engine.record_prefix_cache(200, 64);
+    engine.record_prefix_cache(128, 128);
 
     let transfer = KvTransferMetrics::new(&exporter, "m", "");
     transfer.observe_latency(0.003);

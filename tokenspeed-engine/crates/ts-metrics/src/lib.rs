@@ -406,6 +406,8 @@ pub struct EngineMetrics {
     num_capacity_aborted_requests: Metric,
     num_preemptions: Metric,
     request_queue_time: Metric,
+    prefix_cache_queries: Metric,
+    prefix_cache_hits: Metric,
     /// Serving-time compile totals already exported.
     exported_compiles: u64,
     exported_compile_seconds: f64,
@@ -520,6 +522,23 @@ impl EngineMetrics {
                     60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0,
                 ],
             ),
+            // Both counters are in tokens; their ratio is the token-level
+            // prefix-cache hit rate.
+            prefix_cache_queries: Metric::counter(
+                exporter,
+                "tokenspeed:prefix_cache_queries",
+                "Prompt tokens of requests the scheduler planned — the prefix-match denominator. \
+                 A request that never scheduled (a pause-withheld abort, a grammar failure, a \
+                 failed EPD receive) counts nothing: it never queried the cache.",
+                names,
+            ),
+            prefix_cache_hits: Metric::counter(
+                exporter,
+                "tokenspeed:prefix_cache_hits",
+                "Prompt tokens served from the prefix cache: each released request's \
+                 cached_tokens (the per-request stats line's cache_tokens), accumulated.",
+                names,
+            ),
             exported_compiles: 0,
             exported_compile_seconds: 0.0,
         }
@@ -611,6 +630,17 @@ impl EngineMetrics {
     /// A request's wait from submission to its first forward.
     pub fn observe_request_queue_time(&self, seconds: f64) {
         self.request_queue_time.observe(&self.labels(), seconds);
+    }
+
+    /// A commit's released requests, by their prompt and cached tokens.
+    pub fn record_prefix_cache(&self, query_tokens: i64, hit_tokens: i64) {
+        let labels = self.labels();
+        if query_tokens > 0 {
+            self.prefix_cache_queries.inc(&labels, query_tokens as f64);
+        }
+        if hit_tokens > 0 {
+            self.prefix_cache_hits.inc(&labels, hit_tokens as f64);
+        }
     }
 }
 

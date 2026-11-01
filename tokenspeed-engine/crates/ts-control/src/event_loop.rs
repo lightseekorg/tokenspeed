@@ -677,6 +677,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 publisher.publish(&drained);
             }
         }
+        // The round's released requests, into the prefix-cache metrics:
+        // one drain, whatever path ended them (commit, PD handoff, abort).
+        let (prefix_query_tokens, prefix_hit_tokens) = self.outputs.take_prefix_cache();
+        if let Some(metrics) = &self.metrics {
+            metrics.record_prefix_cache(prefix_query_tokens, prefix_hit_tokens);
+        }
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
