@@ -729,7 +729,10 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
         projection = SimpleNamespace(iris_state=None)
     if moe is None:
         moe = SimpleNamespace(
-            iris_state=None, pre_expert_proj=None, post_expert_proj=None
+            iris_state=None,
+            pre_expert_proj=None,
+            post_expert_proj=None,
+            down_columns=None,
         )
     layer = SimpleNamespace(
         iris_state=None,
@@ -2150,6 +2153,7 @@ def _muse_tp_routes_worker(rank, world_size, device):
     moe.iris_state = None
     moe.pre_expert_proj = None
     moe.post_expert_proj = None
+    moe.down_columns = None
     moe.tp_group, moe.tp_size, moe.topk = group, world_size, topk
     moe.ep_group, moe.ep_size = (rank,), 1
     moe.post_expert_norm = MuseSparkRMSNorm(width, 1e-8, True, 1.0)
@@ -2694,8 +2698,16 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _muse_tp_owned_forward_worker(rank, world_size, device, *, quantized: bool):
-    """Exercise the real router/pool/gather/expert/unpool caller on uneven rows."""
+def _muse_tp_owned_forward_worker(
+    rank, world_size, device, *, quantized: bool, down_columns: bool
+):
+    """Exercise the real router/pool/gather/expert/unpool caller on uneven rows.
+
+    MXFP4 experts at expert TP8 build the column-split down copy. With
+    ``down_columns`` the owned rows take it (assembled from every rank's down
+    shard) and must agree with the full-row path within BF16 rounding; without
+    it the test drops the copy to check the full-row path.
+    """
     from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
     from tokenspeed.runtime.distributed import process_group_manager as pgm
     from tokenspeed.runtime.distributed.comm_backend.registry import (
@@ -2768,6 +2780,9 @@ def _muse_tp_owned_forward_worker(rank, world_size, device, *, quantized: bool):
     )
     with torch.device(device):
         moe = MuseSparkMoE(config, mapping, quant_config, 0, "model.layers.0.mlp", None)
+    assert (moe.down_columns is not None) == quantized
+    if not down_columns:
+        moe.down_columns = None
     torch.manual_seed(117)
     for parameter in moe.parameters():
         if parameter.is_floating_point():
@@ -2783,13 +2798,25 @@ def _muse_tp_owned_forward_worker(rank, world_size, device, *, quantized: bool):
         moe.experts.w2_weight.random_(0, 256)
         moe.experts.w13_weight_scale.random_(118, 124)
         moe.experts.w2_weight_scale.random_(118, 124)
+        if down_columns:
+            # Assemble the full down projection from every rank's K shard.
+            for local, scale in (
+                (moe.experts.w2_weight, False),
+                (moe.experts.w2_weight_scale, True),
+            ):
+                shards = [torch.empty_like(local) for _ in range(world_size)]
+                dist.all_gather(shards, local.data.contiguous())
+                moe.down_columns.load(
+                    torch.cat(shards, dim=-1), scale=scale, expert=None
+                )
+            moe.down_columns.process_weights_after_loading(moe.down_columns)
         moe.experts.process_weights_after_loading(moe.experts)
     else:
         moe.experts.w13_weight.normal_(0, 0.02)
         moe.experts.w2_weight.normal_(0, 0.02)
     moe.gate.process_weights_after_loading(moe.gate)
     _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
-    for rows in (192, 193):
+    for rows in (192, 193, 1029):
         local_rows = (rows + world_size - 1) // world_size
         first = rank * local_rows
         valid = min(local_rows, rows - first)
@@ -2836,6 +2863,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.iris_state = None
     moe.pre_expert_proj = None
     moe.post_expert_proj = None
+    moe.down_columns = None
     moe.ep_group, moe.ep_size, moe.topk = group, world_size, 8
     moe.tp_size = 1
     moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
@@ -3306,7 +3334,7 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
             _muse_intermediate_exchange_worker, "nccl", id="intermediate_exchange"
         ),
         pytest.param(
-            partial(_muse_tp_owned_forward_worker, quantized=False),
+            partial(_muse_tp_owned_forward_worker, quantized=False, down_columns=False),
             "nccl",
             id="tp_owned_forward",
         ),
@@ -3324,14 +3352,19 @@ def test_muse_collective_replay(check, backend, world_size):
     )
 
 
-def test_muse_tp8_owned_a4w4_forward():
+@pytest.mark.parametrize("down_columns", [False, True])
+def test_muse_tp8_owned_a4w4_forward(down_columns):
     _skip_if_unsupported(8, "Muse A4W4 owned forward")
     _spawn_and_collect(
         _communication_worker,
         (
             8,
             _get_open_port(),
-            partial(_muse_tp_owned_forward_worker, quantized=True),
+            partial(
+                _muse_tp_owned_forward_worker,
+                quantized=True,
+                down_columns=down_columns,
+            ),
             "nccl",
         ),
         8,
