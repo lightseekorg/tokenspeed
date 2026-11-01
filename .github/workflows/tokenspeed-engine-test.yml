@@ -27,7 +27,7 @@ jobs:
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
 
       - name: Prepare nightly metadata
         env:
@@ -79,38 +79,50 @@ jobs:
           print(f'Building tokenspeed-engine {version} from {actual}')
           PYTHON
 
-      - name: Build and validate manylinux wheel
-        env:
-          WHEEL_ARCH: ${{ matrix.arch }}
-          WHEEL_PYTHON: ${{ matrix.python }}
+      - name: Install native build tools
         run: |
-          mkdir -p dist
-          docker run --rm \
-            -e WHEEL_PYTHON \
-            -e CARGO_HOME=/tmp/engine-cargo \
-            -e RUSTUP_HOME=/tmp/engine-rustup \
-            -e CARGO_BUILD_JOBS=4 \
-            -e CMAKE_BUILD_PARALLEL_LEVEL=4 \
-            -v "$PWD/source:/source" \
-            -v "$PWD/dist:/output" \
-            "quay.io/pypa/manylinux_2_28_${WHEEL_ARCH}" \
-            bash -lc '
-              set -euo pipefail
-              dnf install -y openssl-devel
-              curl --proto "=https" --tlsv1.2 -sSfL https://sh.rustup.rs -o /tmp/engine-rustup.sh
-              sh /tmp/engine-rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path
-              tag="cp${WHEEL_PYTHON//./}"
-              export PATH="/opt/python/${tag}-${tag}/bin:/tmp/engine-cargo/bin:$PATH"
-              python -m pip install --upgrade "setuptools>=70" wheel build twine auditwheel \
-                "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1 "cmake>=3.22" "ninja>=1.11"
-              cd /source/tokenspeed-engine
-              python -m build --wheel --no-isolation --outdir /tmp/engine-wheels
-              auditwheel repair --wheel-dir /output /tmp/engine-wheels/*.whl
-              python -m twine check /output/*.whl
-              cd /tmp
-              python -m pip install --no-deps /output/*.whl
-              python -c "import subprocess, tokenspeed_engine; r = subprocess.run([str(tokenspeed_engine.host_binary())], capture_output=True, text=True, timeout=20); assert r.returncode == 1 and \"--python is required\" in r.stderr, (r.returncode, r.stdout, r.stderr); print(\"Native extension imports and ts-host executes\")"
-            '
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          python -m venv .engine-build-env
+          .engine-build-env/bin/python -m pip install --upgrade build twine
+
+      - name: Build and validate platform wheel
+        env:
+          CARGO_BUILD_JOBS: '4'
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: |
+          .engine-build-env/bin/python -m build source/tokenspeed-engine --wheel --outdir dist
+          .engine-build-env/bin/python -m twine check dist/*.whl
+          .engine-build-env/bin/python -m pip install --no-deps dist/*.whl
+          .engine-build-env/bin/python - <<'PYTHON'
+          import subprocess
+
+          import tokenspeed_engine
+
+          result = subprocess.run(
+              [str(tokenspeed_engine.host_binary())],
+              capture_output=True,
+              text=True,
+              timeout=20,
+          )
+          if result.returncode != 1 or '--python is required' not in result.stderr:
+              raise RuntimeError(f'Host execution failed: {result}')
+          listener = tokenspeed_engine.FrontendListener.bind(
+              handshake_address='tcp://127.0.0.1:0',
+              input_address='tcp://127.0.0.1:0',
+              output_address='tcp://127.0.0.1:0',
+              first_engine_index=0,
+              num_engines=1,
+              routing='round_robin',
+              handshake_timeout_s=1.0,
+              send_timeout_s=1.0,
+          )
+          if listener.handshake_address.endswith(':0'):
+              raise RuntimeError('Native frontend did not bind an available port')
+          print('Native frontend binds sockets and ts-host executes')
+          PYTHON
 
       - uses: actions/upload-artifact@v4
         with:

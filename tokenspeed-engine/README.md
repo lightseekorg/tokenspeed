@@ -75,8 +75,8 @@ acknowledgments).
 The `build/engine-nightly-20261101` branch provides a manual wheel job through
 **Build TokenSpeed Engine Nightly Wheels**. Supply the full public `main`
 commit as `source_sha` and the UTC `version_date` as `YYYYMMDD`. It builds
-Python 3.11–3.13 wheels on x86_64 and aarch64 in manylinux containers, checks
-the installed native extension and host executable, and retains the wheels
+Python 3.11–3.13 Linux wheels on Ubuntu 24.04 x86_64 and aarch64, checks
+the native frontend and host executable with shared CPython, and retains the wheels
 as Actions artifacts. Only the dated package version changes; compiled sources
 come from the specified commit. Publication is separate.
 
