@@ -80,7 +80,10 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
     gluon_route_supported,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
+    _ROUTE_TILE_MAX_M,
+    _RouteTileConfig,
     _select_grouped_moe_config,
+    _select_route_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
     _gluon_mxfp4_fp8_warp_decode_moe,
@@ -920,6 +923,178 @@ def gluon_mxfp_fused_moe(
     )
 
 
+def _launch_mxfp4_route_tiles(
+    q_hidden: torch.Tensor,
+    q_hidden_scale: torch.Tensor,
+    w13_runtime: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_runtime: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    q_inter: torch.Tensor,
+    q_inter_scale: torch.Tensor,
+    out: torch.Tensor | None,
+    *,
+    expert_start: int,
+    top_k: int,
+    config: _RouteTileConfig,
+) -> tuple[torch.Tensor, None, torch.Tensor]:
+    """Run the route-tiled A4W4 experts and return deferred token/slot rows.
+
+    Args:
+        q_hidden, q_hidden_scale: Packed E2M1 rows and CDNA4-swizzled scales.
+        w13_runtime, w13_scale, w2_runtime, w2_scale: gdot128-shuffled local
+            expert weights and swizzled scales.
+        topk_ids: Contiguous int32 global expert IDs ``[tokens, top_k]``.
+        q_inter, q_inter_scale: Token/slot-order intermediate scratch.
+        out: Optional BF16 ``[tokens * top_k, hidden]`` destination.
+        expert_start: First global expert ID owned by these weights.
+        top_k: Routes per token.
+        config: Schedule from ``_select_route_tile_config``.
+
+    Returns:
+        Unweighted route rows, no bias, and the route map (``-1`` marks routes
+        of other ranks, whose rows are left undefined).
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
+        gluon_mxfp4_moe_stage1_route_tiles_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
+        gluon_mxfp4_moe_stage2_route_tiles_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
+        gluon_mxfp4_moe_route_pack_gfx950,
+        gluon_mxfp4_moe_route_tiles_gfx950,
+    )
+
+    n_tokens = int(topk_ids.shape[0])
+    hidden_dim = int(q_hidden.shape[1]) * 2
+    inter_dim = int(q_inter.shape[1]) * 2
+    out_dim = int(getattr(w2_runtime, "original_n", int(w2_runtime.shape[2])))
+    device = q_hidden.device
+    if out is None:
+        out = torch.empty(
+            (n_tokens * top_k, out_dim), dtype=torch.bfloat16, device=device
+        )
+    expanded_idx = torch.empty((n_tokens * top_k,), dtype=torch.int32, device=device)
+    # Routes are grouped by expert (inside the GEMMs up to 16 rows, by the
+    # descriptor kernels above 16 rows); results retain token/slot order.
+    num_local_experts = int(w13_runtime.shape[0])
+    block_m = 16
+    routes_from_ids = config.route_capacity == block_m
+    if routes_from_ids:
+        if n_tokens > block_m:
+            raise ValueError(
+                "gluon_mxfp4_moe_stage1_route_tiles_gfx950: grouping routes from "
+                f"top-k IDs needs at most {block_m} rows, got {n_tokens}"
+            )
+        # Both GEMMs group the routes by expert from the top-k IDs; stage 1
+        # writes the route map into the descriptor argument, and group_count
+        # is an unused placeholder.
+        sorted_routes = topk_ids
+        descriptors = expanded_idx
+        group_count = expanded_idx
+    else:
+        max_rows = config.route_capacity
+        if n_tokens > max_rows:
+            raise ValueError(
+                "gluon_mxfp4_moe_route_pack_gfx950: per-expert route lists hold "
+                f"at most {max_rows} rows, got {n_tokens}"
+            )
+        group_count = torch.empty(1, dtype=torch.int32, device=device)
+        sorted_routes = torch.empty(
+            num_local_experts * max_rows, dtype=torch.int32, device=device
+        )
+        descriptors = torch.empty(
+            (num_local_experts * (max_rows // block_m), 3),
+            dtype=torch.int32,
+            device=device,
+        )
+        expert_counts = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+        gluon_mxfp4_moe_route_pack_gfx950[(num_local_experts,)](
+            topk_ids,
+            sorted_routes,
+            expert_counts,
+            expanded_idx,
+            n_tokens,
+            EXPERT_START=expert_start,
+            NUM_EXPERTS=num_local_experts,
+            TOPK=top_k,
+            MAX_ROWS=max_rows,
+            num_warps=4,
+        )
+        gluon_mxfp4_moe_route_tiles_gfx950[(1,)](
+            expert_counts,
+            descriptors,
+            group_count,
+            NUM_EXPERTS=num_local_experts,
+            BLOCK_M=block_m,
+            MAX_ROWS=max_rows,
+            num_warps=4,
+        )
+    gluon_mxfp4_moe_stage1_route_tiles_gfx950[(2048,)](
+        q_hidden,
+        q_hidden_scale,
+        w13_runtime,
+        w13_scale,
+        sorted_routes,
+        descriptors,
+        group_count,
+        q_inter,
+        q_inter_scale,
+        n_tokens,
+        HIDDEN=hidden_dim,
+        INTERMEDIATE=inter_dim,
+        TOPK=top_k,
+        X_ROW=q_hidden.stride(0),
+        XS0=q_hidden_scale.stride(0),
+        XS1=q_hidden_scale.stride(1),
+        WE=w13_runtime.stride(0),
+        SE=w13_scale.stride(0),
+        SS0=w13_scale.stride(1),
+        SS1=w13_scale.stride(2),
+        OS0=q_inter_scale.stride(0),
+        OS1=q_inter_scale.stride(1),
+        BLOCK_N=config.stage1.block_n,
+        BLOCK_K=config.stage1.block_k,
+        BLOCK_M=block_m,
+        PREFETCH_TILES=config.stage1.prefetch_tiles,
+        ROUTES_FROM_IDS=routes_from_ids,
+        EXPERT_START=expert_start,
+        NUM_EXPERTS=num_local_experts,
+        num_warps=config.stage1.num_warps,
+    )
+    gluon_mxfp4_moe_stage2_route_tiles_gfx950[(2048,)](
+        q_inter,
+        q_inter_scale,
+        w2_runtime,
+        w2_scale,
+        sorted_routes,
+        descriptors,
+        group_count,
+        out,
+        n_tokens,
+        INTERMEDIATE=inter_dim,
+        OUTPUT=out_dim,
+        XS0=q_inter_scale.stride(0),
+        XS1=q_inter_scale.stride(1),
+        WE=w2_runtime.stride(0),
+        SE=w2_scale.stride(0),
+        SS0=w2_scale.stride(1),
+        SS1=w2_scale.stride(2),
+        BLOCK_N=config.stage2.block_n,
+        BLOCK_K=config.stage2.block_k,
+        BLOCK_M=block_m,
+        PREFETCH_TILES=config.stage2.prefetch_tiles,
+        ROUTES_FROM_IDS=routes_from_ids,
+        TOPK=top_k,
+        EXPERT_START=expert_start,
+        NUM_EXPERTS=num_local_experts,
+        num_warps=config.stage2.num_warps,
+    )
+    return out, None, expanded_idx
+
+
 def _maybe_precomputed_mxfp4_direct_mfma_decode(
     hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     w13_weight: torch.Tensor,
@@ -946,8 +1121,9 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor] | None:
     """Select direct or route-tiled MFMA with token/slot intermediates.
 
-    ``max_m`` bounds direct execution; ``route_tile_max_m`` bounds the measured
-    EP4/EP8 route-tiled schedule. Both reuse gdot128-shuffled weights/scales
+    ``max_m`` bounds direct execution; ``route_tile_max_m`` caps the
+    route-tiled schedule, whose rows and tiles come from
+    ``_select_route_tile_config``. Both reuse gdot128-shuffled weights/scales
     and preserve the per-route gate/up, SwiGLU, quantization and W2 order.
     """
     n_tokens, hidden_dim, device, input_dtype = _mxfp4_input_metadata(hidden_states)
@@ -1037,14 +1213,23 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
             and top_k == 8
         )
     )
+    route_tile_config = (
+        _select_route_tile_config(
+            n_tokens,
+            hidden_dim=hidden_dim,
+            inter_dim=inter_dim,
+            num_local_experts=local_experts,
+            num_experts=global_num_experts,
+            top_k=top_k,
+        )
+        if not do_finalize
+        and global_num_experts is not None
+        and n_tokens <= route_tile_max_m
+        else None
+    )
     use_route_tiles = (
-        is_ep_deferred
-        and int(w13_runtime.shape[0]) in (32, 64)
-        and global_num_experts == 256
-        and hidden_dim == inter_dim == out_dim == 4096
-        and int(w2_runtime.shape[2]) == 4096
-        and top_k == 8
-        and 4 <= n_tokens <= min(route_tile_max_m, 48)
+        route_tile_config is not None
+        and int(w2_runtime.shape[2]) == out_dim
         and swiglu_alpha == 1.0
         and swiglu_limit == 0.0
         and swiglu_beta == 0.0
@@ -1072,11 +1257,9 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     )
 
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
-        gluon_mxfp4_moe_stage1_route_tiles_gfx950,
         invoke_stage1_mxfp4_mfma_decode_gluon,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
-        gluon_mxfp4_moe_stage2_route_tiles_gfx950,
         invoke_stage2_mxfp4_mfma_decode_gluon,
     )
 
@@ -1095,127 +1278,22 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         device=device,
     )
     if use_route_tiles:
-        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
-            gluon_mxfp4_moe_route_descriptors_gfx950,
-            gluon_mxfp4_moe_route_pack_gfx950,
-            gluon_mxfp4_moe_route_tiles_gfx950,
-        )
-
-        if out is None:
-            out = torch.empty(
-                (n_tokens * top_k, out_dim), dtype=out_dtype, device=device
-            )
-        expanded_idx = torch.empty(
-            (n_tokens * top_k,), dtype=torch.int32, device=device
-        )
-        # Descriptors group one expert's routes; results retain token/slot order.
-        num_local_experts = int(w13_runtime.shape[0])
-        block_m = 16
-        group_count = torch.empty(1, dtype=torch.int32, device=device)
-        if n_tokens <= 16:
-            sorted_routes = torch.empty(
-                block_m * top_k, dtype=torch.int32, device=device
-            )
-            descriptors = torch.empty(
-                (num_local_experts, 3), dtype=torch.int32, device=device
-            )
-            gluon_mxfp4_moe_route_descriptors_gfx950[(1,)](
-                topk_ids,
-                sorted_routes,
-                descriptors,
-                group_count,
-                expanded_idx,
-                n_tokens,
-                EXPERT_START=expert_start,
-                NUM_EXPERTS=num_local_experts,
-                TOPK=top_k,
-                MAX_ROWS=block_m,
-                num_warps=4,
-            )
-        else:
-            max_rows = 64
-            sorted_routes = torch.empty(
-                num_local_experts * max_rows, dtype=torch.int32, device=device
-            )
-            descriptors = torch.empty(
-                (num_local_experts * (max_rows // block_m), 3),
-                dtype=torch.int32,
-                device=device,
-            )
-            expert_counts = torch.empty(
-                num_local_experts, dtype=torch.int32, device=device
-            )
-            gluon_mxfp4_moe_route_pack_gfx950[(num_local_experts,)](
-                topk_ids,
-                sorted_routes,
-                expert_counts,
-                expanded_idx,
-                n_tokens,
-                EXPERT_START=expert_start,
-                NUM_EXPERTS=num_local_experts,
-                TOPK=top_k,
-                MAX_ROWS=max_rows,
-                num_warps=4,
-            )
-            gluon_mxfp4_moe_route_tiles_gfx950[(1,)](
-                expert_counts,
-                descriptors,
-                group_count,
-                NUM_EXPERTS=num_local_experts,
-                BLOCK_M=block_m,
-                MAX_ROWS=max_rows,
-                num_warps=4,
-            )
-        gluon_mxfp4_moe_stage1_route_tiles_gfx950[(2048,)](
+        assert route_tile_config is not None
+        return _launch_mxfp4_route_tiles(
             q_hidden,
             q_hidden_scale,
             w13_runtime,
             w13_scale,
-            sorted_routes,
-            descriptors,
-            group_count,
-            q_inter,
-            q_inter_scale,
-            HIDDEN=hidden_dim,
-            INTERMEDIATE=inter_dim,
-            TOPK=top_k,
-            X_ROW=q_hidden.stride(0),
-            XS0=q_hidden_scale.stride(0),
-            XS1=q_hidden_scale.stride(1),
-            WE=w13_runtime.stride(0),
-            SE=w13_scale.stride(0),
-            SS0=w13_scale.stride(1),
-            SS1=w13_scale.stride(2),
-            OS0=q_inter_scale.stride(0),
-            OS1=q_inter_scale.stride(1),
-            BLOCK_N=64,
-            BLOCK_K=128,
-            BLOCK_M=block_m,
-            num_warps=4,
-        )
-        gluon_mxfp4_moe_stage2_route_tiles_gfx950[(2048,)](
-            q_inter,
-            q_inter_scale,
             w2_runtime,
             w2_scale,
-            sorted_routes,
-            descriptors,
-            group_count,
+            topk_ids,
+            q_inter,
+            q_inter_scale,
             out,
-            INTERMEDIATE=inter_dim,
-            OUTPUT=out_dim,
-            XS0=q_inter_scale.stride(0),
-            XS1=q_inter_scale.stride(1),
-            WE=w2_runtime.stride(0),
-            SE=w2_scale.stride(0),
-            SS0=w2_scale.stride(1),
-            SS1=w2_scale.stride(2),
-            BLOCK_N=16,
-            BLOCK_K=256 if n_tokens <= 8 else 128,
-            BLOCK_M=block_m,
-            num_warps=1,
+            expert_start=expert_start,
+            top_k=top_k,
+            config=route_tile_config,
         )
-        return out, None, expanded_idx
 
     stage1_block_n = 64
     invoke_stage1_mxfp4_mfma_decode_gluon(
@@ -2223,7 +2301,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         w2_bias=w2_bias,
         out_dtype=out_dtype,
         max_m=direct_max_m,
-        route_tile_max_m=0 if do_finalize else 48,
+        route_tile_max_m=0 if do_finalize else _ROUTE_TILE_MAX_M,
         precomputed_topk_weights=topk_weights,
         precomputed_topk_ids=topk_ids,
         swiglu_alpha=swiglu_alpha,

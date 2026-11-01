@@ -71,6 +71,130 @@ _GROUPED_MOE_CONFIGS = {
 }
 
 
+class _RouteTileStage(NamedTuple):
+    """One route-tiled GEMM's output and K tile widths, how many K tiles'
+    loads it keeps in flight ahead of the MFMA (``PREFETCH_TILES``) and its
+    waves per program."""
+
+    block_n: int
+    block_k: int
+    prefetch_tiles: int
+    num_warps: int
+
+
+class _RouteTileConfig(NamedTuple):
+    """Route-tiled A4W4 expert schedule (deferred, token/slot-order outputs).
+
+    ``route_capacity`` is the per-expert route-list length. 16 groups at
+    most 16 tokens' routes by expert inside each GEMM, straight from the
+    top-k IDs (a token's top-k expert IDs are distinct, so an expert gets at
+    most one route per row and one 16-row tile per expert). Larger values
+    select the per-expert pack plus tile split and must be at least the
+    call's row count. It is a compile-time bound, so it is bucketed to powers
+    of two.
+    """
+
+    route_capacity: int
+    stage1: _RouteTileStage
+    stage2: _RouteTileStage
+
+
+_DECODE_STAGE1 = _RouteTileStage(64, 128, 0, 4)
+_WIDE_STAGE1 = _RouteTileStage(128, 256, 1, 4)
+# At EP1, overlapping the next K tile's loads did not help (pipelined time
+# 1.00-1.01x unpipelined on average at 17-128 rows), so pipelining is off.
+_EP1_STAGE = _RouteTileStage(128, 256, 0, 4)
+_EP1_STAGE2 = _RouteTileStage(128, 256, 0, 1)
+# Grouping routes in the GEMMs leaves one program per expert and 64-column
+# slice, fewer than one per route, so each keeps up to eight K tiles of loads
+# in flight to keep HBM busy.
+_ID_GROUPS_STAGE = _RouteTileStage(64, 128, 8, 4)
+
+# Key: hidden width, intermediate width, local experts, global experts, top-k.
+# Entries: inclusive row bounds and the route-tile schedule. Rows outside every
+# entry fall through to the direct decode or grouped (staged package) path,
+# which produce bitwise-identical results.
+#
+# Measured on MI355X against the direct decode or staged package path: one MoE
+# layer per call in graph replay, rotating over four weight copies so weights
+# come from HBM. The 17+ row entries used uniform and Zipf(1.0) expert routing,
+# three random routing samples each; each upper row bound is the largest
+# power-of-two route capacity below the row count from which samples are
+# consistently slower than the package path, isolated outliers noted per entry.
+# The <= 16 row entries (routes grouped from the top-k IDs) used top-k IDs
+# recorded in serving (speculative verify and plain decode, busiest EP8 rank)
+# and uniform routing, three samples each.
+#
+# EP8 (32 local experts), 4-16 rows: 0.84-0.92x the time of the route-descriptor
+# kernel plus route tiles it replaces (43.4 -> 38.6 us at 8 verify rows, 55.8 ->
+# 51.1 at 16; 57.3 -> 51.0 and 73.6 -> 63.5 with plain decode routing). The
+# EP4 4-16 row entries were not re-measured.
+_ID_ROUTE_TILES = ((4, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),)
+_DECODE_ROUTE_TILES = _ID_ROUTE_TILES + (
+    (17, 48, _RouteTileConfig(64, _DECODE_STAGE1, _RouteTileStage(16, 128, 0, 1))),
+)
+# EP8 (32 local experts), 49-256 rows: 0.77-0.84x the staged package's time
+# with uniform routing (201 -> 156 us at 128 rows) and 0.67-0.91x with Zipf,
+# except one very skewed 224-row sample at 1.03x. Zipf samples are slower from
+# 384 rows, so the bound is 256. EP8 17-64 rows: 0.83-0.96x the time of the
+# _DECODE_ROUTE_TILES schedule over four samples (146 -> 124 us at 48 rows,
+# uniform routing); in the down projection (stage 2), a 256-wide K tile is
+# within ~2% of a 128-wide one at 49-64 rows.
+_EP8_ROUTE_TILES = _ID_ROUTE_TILES + (
+    (17, 64, _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1))),
+    (65, 128, _RouteTileConfig(128, _WIDE_STAGE1, _RouteTileStage(64, 128, 1, 1))),
+    # More routes per expert favor the longer down-projection K tile.
+    (129, 256, _RouteTileConfig(256, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1))),
+)
+_ROUTE_TILE_CONFIGS = {
+    (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
+    (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
+    # EP1 (TP8 intermediate shard), 14-16 rows: 0.78-0.87x the direct decode's
+    # time with recorded routing (59.9 -> 46.3 us at 16 verify rows, 66.7 ->
+    # 55.3 with plain decode routing), 1.01x with uniform routing. Below 14
+    # rows grouping won on average but lost up to 3.5 us on samples with few
+    # repeated experts, and at 8 rows it only broke even, so direct decode
+    # keeps them. 17-128 rows: 0.92-0.99x the staged package's time (113 -> 107
+    # us at 32 rows); with both uniform and Zipf routing it breaks even at 160
+    # rows.
+    (4096, 512, 256, 256, 8): (
+        (14, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),
+        (17, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
+        (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE2)),
+    ),
+}
+assert all(
+    config.route_capacity & (config.route_capacity - 1) == 0
+    and (config.route_capacity == 16 or config.route_capacity >= max_rows)
+    and (config.route_capacity != 16 or max_rows <= 16)
+    for entries in _ROUTE_TILE_CONFIGS.values()
+    for _, max_rows, config in entries
+)
+
+# Largest row count any route-tile entry serves; callers that do not want
+# route tiles pass 0 instead.
+_ROUTE_TILE_MAX_M = max(
+    max_rows for entries in _ROUTE_TILE_CONFIGS.values() for _, max_rows, _ in entries
+)
+
+
+def _select_route_tile_config(
+    num_tokens: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+) -> _RouteTileConfig | None:
+    """Return the route-tile schedule for this shape and row count, if any."""
+    shape = (hidden_dim, inter_dim, num_local_experts, num_experts, top_k)
+    for min_rows, max_rows, config in _ROUTE_TILE_CONFIGS.get(shape, ()):
+        if min_rows <= num_tokens <= max_rows:
+            return config
+    return None
+
+
 def _select_grouped_moe_block_m(
     num_tokens: int,
     top_k: int,
