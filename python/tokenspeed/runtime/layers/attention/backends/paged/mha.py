@@ -95,6 +95,10 @@ class MHAExtendMetadata:
     extend_seq_lens_cpu: list[int]
     cu_extend_seq_lens_cpu: list[int]
     max_extend_seq_len: int
+    # Bound on seq_lens for the cached-prefix kernel, which may size its work
+    # (e.g. split counts) from it: the longest request when every length is
+    # known on the host, else the context limit.
+    max_seqlen_k: int
     # Mixed target queries are cache-backed even when the leading prefills
     # have no prefix; the fresh-prefill path must not discard decode history.
     is_mixed: bool
@@ -229,6 +233,18 @@ class MHAAttnBackend(PagedAttentionBackend):
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
             (1, 0),
         )
+        # Mixed batches keep the context limit: their decode lengths live only
+        # on the device.
+        max_seqlen_k = self.max_context_len
+        if not is_mixed:
+            max_seqlen_k = int(
+                (
+                    extend_prefix_lens_cpu[:num_extends]
+                    + extend_seq_lens_cpu[:num_extends]
+                )
+                .max()
+                .item()
+            )
         self.forward_extend_metadata = MHAExtendMetadata(
             page_table=page_table[:bs],
             seq_lens=seq_lens,
@@ -239,6 +255,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             extend_seq_lens_cpu=query_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             max_extend_seq_len=max(query_lens_cpu),
+            max_seqlen_k=max_seqlen_k,
             is_mixed=is_mixed,
             # Only prefills have a host prefix mirror. Mixed batches always
             # use cached attention, without reading decode lengths back to CPU.
@@ -452,7 +469,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
-            max_seqlen_k=self.max_context_len,
+            max_seqlen_k=metadata.max_seqlen_k,
             is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,

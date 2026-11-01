@@ -170,7 +170,7 @@ def test_mha_prefill_token_stride_and_request_count(window):
         run([1], views=False)
 
 
-@pytest.mark.parametrize("window", [-1, 127])
+@pytest.mark.parametrize("window", [-1, 127, 2047])
 def test_mha_extend_startup_warmup_covers_every_variant(window):
     from tokenspeed_kernel.numerics.torch.attention.mha import (
         gather_pages,
@@ -180,7 +180,7 @@ def test_mha_extend_startup_warmup_covers_every_variant(window):
     from tokenspeed_kernel.ops.tuning import kernel_warmup
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
-    heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 32, 80
+    heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 160, 80
     k_cache = torch.randn(
         1 + slots * width, page, kv_heads, dim, device=DEVICE, dtype=torch.bfloat16
     )
@@ -255,6 +255,22 @@ def test_mha_extend_startup_warmup_covers_every_variant(window):
             [120] + [60] * 79,
         ):
             run(queries, 300)
+        # The 8-wave tile (32 positions): under full attention from 8192
+        # cached keys, split for small grids and unsplit from 256 query
+        # blocks; under a 2047-key window from a window of cached keys and a
+        # work-group for every CU.
+        if window < 0:
+            for queries in (
+                [100],
+                [1024],
+                [600, 70, 400],
+                [512] * 8,
+                [512] * 7 + [300],
+            ):
+                run(queries, 9000)
+        if window == 2047:
+            for queries in ([1024] * 4, [4096, 100]):
+                run(queries, 2100)
 
 
 def test_mxfp8_gemm_row_count():
