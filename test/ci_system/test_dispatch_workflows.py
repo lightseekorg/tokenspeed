@@ -409,8 +409,8 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
 
 
 def test_kernel_ut_tasks_cover_every_test_once_per_runner():
-    # NVIDIA runners split the kernel suite across part-i and part-ii; AMD
-    # runs it in a single task.
+    # NVIDIA runners split the kernel suite across part-i, part-ii and the
+    # post-submit task; AMD runs it in a single task.
     root = REPO_ROOT / "tokenspeed-kernel/test"
     files = {
         path
@@ -420,7 +420,7 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
     assert files
     tasks = [
         load_yaml(REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel{suffix}.yaml")
-        for suffix in ("-part-i", "-part-ii", "")
+        for suffix in ("-part-i", "-part-ii", "-post-submit", "")
     ]
     labels = {label for task in tasks for label in task["runner"]["labels"]}
     # Pin the runner set so dropping a runner from every task fails here.
