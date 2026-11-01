@@ -56,13 +56,16 @@ def _dflash2_sample_path_kernel(
     top_k_pool_ptr,
     top_p_pool_ptr,
     seed_pool_ptr,
-    draft_offsets_ptr,
+    valid_cache_lengths_ptr,
+    table_rows_ptr,
     tokens_ptr,
     q_ptr,
     q_ids_ptr,
     pos_ptr,
     slot_ptr,
     tokens_row_stride,
+    offset_scale,
+    max_token_id,
     NUM_STEPS: tl.constexpr,
     TOP_K: tl.constexpr,
     K_PAD: tl.constexpr,
@@ -71,13 +74,19 @@ def _dflash2_sample_path_kernel(
     DRAFT_SALT: tl.constexpr,
 ):
     req = tl.program_id(0).to(tl.int64)
-    pool_idx = tl.load(req_pool_indices_ptr + req)
+    pool_idx = tl.load(req_pool_indices_ptr + req).to(tl.int64)
     raw_temperature = tl.load(temperature_pool_ptr + pool_idx).to(tl.float32)
     temperature = tl.maximum(raw_temperature, 1.0e-20)
     top_k = tl.load(top_k_pool_ptr + pool_idx)
     top_p = tl.load(top_p_pool_ptr + pool_idx).to(tl.float32)
     seed = tl.load(seed_pool_ptr + pool_idx).to(tl.int64)
-    draft_offset = tl.load(draft_offsets_ptr + req).to(tl.int64) + DRAFT_SALT
+    draft_offset = (
+        tl.load(valid_cache_lengths_ptr + pool_idx).to(tl.int64) * offset_scale
+        + DRAFT_SALT
+    )
+    # The chain tables are written at the request's table row, which need not
+    # be its batch row.
+    table_row = tl.load(table_rows_ptr + req).to(tl.int64)
 
     # Greedy requests take the best lane. So do requests served by top-p
     # alone: the verifier has no exact target distribution for them and falls
@@ -87,13 +96,15 @@ def _dflash2_sample_path_kernel(
     proposal = sampled
 
     tokens_base = req * tokens_row_stride
-    tl.store(tokens_ptr + tokens_base, tl.load(anchor_ptr + req).to(tl.int32))
+    anchor = tl.load(anchor_ptr + req).to(tl.int32)
+    tl.store(tokens_ptr + tokens_base, tl.minimum(tl.maximum(anchor, 0), max_token_id))
 
     lanes = tl.arange(0, K_PAD)
     lane_ok = lanes < TOP_K
     previous = 0
     for step in tl.static_range(NUM_STEPS):
         step_base = (req * NUM_STEPS + step) * TOP_K
+        table_base = (table_row * NUM_STEPS + step) * TOP_K
         row = tl.load(
             scores_ptr + (step_base + previous) * TOP_K + lanes,
             mask=lane_ok,
@@ -135,16 +146,19 @@ def _dflash2_sample_path_kernel(
             lane = best_lane
             q_out = tl.where(lanes == best_lane, 1.0, 0.0)
 
-        tl.store(q_ptr + step_base + lanes, q_out, mask=lane_ok)
-        tl.store(q_ids_ptr + step_base + lanes, ids, mask=lane_ok)
-        tl.store(pos_ptr + req * (NUM_STEPS + 1) + step + 1, lane.to(tl.int32))
+        tl.store(q_ptr + table_base + lanes, q_out, mask=lane_ok)
+        tl.store(q_ids_ptr + table_base + lanes, ids, mask=lane_ok)
+        tl.store(pos_ptr + table_row * (NUM_STEPS + 1) + step + 1, lane.to(tl.int32))
         token = tl.load(candidate_ids_ptr + step_base + lane).to(tl.int32)
-        tl.store(tokens_ptr + tokens_base + step + 1, token)
+        tl.store(
+            tokens_ptr + tokens_base + step + 1,
+            tl.minimum(tl.maximum(token, 0), max_token_id),
+        )
         previous = lane
 
     # The anchor (node 0) has no q and no lane. Node l + 1 reads q row l when
     # the request proposes; otherwise every node is -1 (the target-only rule).
-    node_base = req * (NUM_STEPS + 1)
+    node_base = table_row * (NUM_STEPS + 1)
     tl.store(pos_ptr + node_base, 0)
     tl.store(slot_ptr + node_base, -1)
     for step in tl.static_range(NUM_STEPS):
@@ -160,8 +174,11 @@ def dflash2_sample_path(
     top_k_pool: torch.Tensor,
     top_p_pool: torch.Tensor,
     seed_pool: torch.Tensor,
-    draft_offsets: torch.Tensor,
+    valid_cache_lengths: torch.Tensor,
+    offset_scale: int,
+    vocab_size: int,
     tokens: torch.Tensor,
+    table_rows: torch.Tensor,
     q: torch.Tensor,
     q_ids: torch.Tensor,
     pos: torch.Tensor,
@@ -172,35 +189,42 @@ def dflash2_sample_path(
     Step ``l`` reads the scores out of the previous step's lane (lane 0 for
     step 0). A sampled request draws the lane from ``softmax(scores /
     temperature)`` with Gumbel noise from seed ``seed`` at offset
-    ``DRAFT_SAMPLE_OFFSET_SALT + draft_offsets[b] + l``, keyed by the
-    candidate's token id. Greedy requests (``top_k == 1`` or temperature 0),
-    requests with top-p but no top-k, and requests that meet a non-finite
-    score row take the lowest-index best lane, record a one-hot ``q`` for
-    such steps, and propose nothing.
+    ``DRAFT_SAMPLE_OFFSET_SALT + valid_cache_lengths[pool] * offset_scale +
+    l``, keyed by the candidate's token id. Greedy requests (``top_k == 1``
+    or temperature 0), requests with top-p but no top-k, and requests that
+    meet a non-finite score row take the lowest-index best lane, record a
+    one-hot ``q`` for such steps, and propose nothing.
 
-    ``q``, ``q_ids``, ``pos`` and ``slot`` are the request's chain in the
-    verifier's draft-q layout: node 0 is the anchor (slot -1, pos 0) and node
+    ``q``, ``q_ids``, ``pos`` and ``slot`` are tables in the verifier's
+    draft-q layout, and request ``b`` writes its chain to row
+    ``table_rows[b]`` of each: node 0 is the anchor (slot -1, pos 0) and node
     ``l + 1`` (draft token ``l + 1``) reads q row ``l`` at lane ``pos``. A
-    request that proposes nothing has slot -1 on every node.
+    request that proposes nothing has slot -1 on every node. Other table rows
+    are left untouched.
 
     Args:
         candidate_ids: ``[bs, L, K]`` int32/int64 candidate token ids.
         scores: ``[bs, L, K, K]`` predecessor-conditioned edge weights.
         anchor_token_ids: ``[bs]`` token each request's walk starts from.
-        req_pool_indices: ``[bs]`` int32 pool slot of each request.
+        req_pool_indices: ``[bs]`` int64 pool slot each request reads its
+            sampling parameters and cache length at.
         temperature_pool: ``[pool]`` fp32 temperature.
         top_k_pool: ``[pool]`` int32 top-k (``TOP_K_DISABLED`` when off).
         top_p_pool: ``[pool]`` fp32 top-p.
         seed_pool: ``[pool]`` int64 seed.
-        draft_offsets: ``[bs]`` int64 per-request offset base (the verify
-            window's start position times its width); the kernel adds the
-            draft salt and the step.
+        valid_cache_lengths: ``[pool]`` int32 each slot's valid cache length
+            (the verify window's start position).
+        offset_scale: The verify window's width; the noise offset base is the
+            window's start position times it.
+        vocab_size: Tokens are clamped into ``[0, vocab_size)``.
         tokens: ``[bs, L + 1]`` int32 output; column 0 receives the anchor
             and column ``l + 1`` the step-``l`` token.
-        q: ``[bs, L, K]`` fp32 output; each step's lane probabilities.
-        q_ids: ``[bs, L, K]`` int32 output; each step's candidate ids.
-        pos: ``[bs, L + 1]`` int32 output; each node's lane (0 for node 0).
-        slot: ``[bs, L + 1]`` int32 output; each node's q row, or -1.
+        table_rows: ``[bs]`` int64 row of the tables each request's chain is
+            written to.
+        q: ``[rows, L, K]`` fp32 table; each step's lane probabilities.
+        q_ids: ``[rows, L, K]`` int32 table; each step's candidate ids.
+        pos: ``[rows, L + 1]`` int32 table; each node's lane (0 for node 0).
+        slot: ``[rows, L + 1]`` int32 table; each node's q row, or -1.
 
     Returns:
         ``tokens``, filled in place.
@@ -220,38 +244,54 @@ def dflash2_sample_path(
     for name, tensor, shape in (
         ("anchor_token_ids", anchor_token_ids, (batch_size,)),
         ("req_pool_indices", req_pool_indices, (batch_size,)),
-        ("draft_offsets", draft_offsets, (batch_size,)),
+        ("table_rows", table_rows, (batch_size,)),
         ("tokens", tokens, (batch_size, num_steps + 1)),
-        ("q", q, (batch_size, num_steps, top_k)),
-        ("q_ids", q_ids, (batch_size, num_steps, top_k)),
-        ("pos", pos, (batch_size, num_steps + 1)),
-        ("slot", slot, (batch_size, num_steps + 1)),
     ):
         if tensor.shape != shape:
             raise ValueError(f"{name} shape {tuple(tensor.shape)} must be {shape}")
+    for name, tensor, shape in (
+        ("q", q, (num_steps, top_k)),
+        ("q_ids", q_ids, (num_steps, top_k)),
+        ("pos", pos, (num_steps + 1,)),
+        ("slot", slot, (num_steps + 1,)),
+    ):
+        if tensor.shape[1:] != shape:
+            raise ValueError(f"{name} rows {tuple(tensor.shape[1:])} must be {shape}")
     for name, tensor, dtype in (
         ("tokens", tokens, torch.int32),
         ("q", q, torch.float32),
         ("q_ids", q_ids, torch.int32),
         ("pos", pos, torch.int32),
         ("slot", slot, torch.int32),
-        ("req_pool_indices", req_pool_indices, torch.int32),
+        ("req_pool_indices", req_pool_indices, torch.int64),
+        ("table_rows", table_rows, torch.int64),
         ("top_k_pool", top_k_pool, torch.int32),
         ("seed_pool", seed_pool, torch.int64),
-        ("draft_offsets", draft_offsets, torch.int64),
+        ("valid_cache_lengths", valid_cache_lengths, torch.int32),
     ):
         if tensor.dtype != dtype:
             raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
     if not all(
         tensor.is_contiguous()
-        for tensor in (candidate_ids, scores, q, q_ids, pos, slot, draft_offsets)
+        for tensor in (
+            candidate_ids,
+            scores,
+            q,
+            q_ids,
+            pos,
+            slot,
+            req_pool_indices,
+            table_rows,
+        )
     ):
         raise ValueError(
-            "candidate_ids, scores, q, q_ids, pos, slot and draft_offsets must "
-            "be contiguous"
+            "candidate_ids, scores, q, q_ids, pos, slot, req_pool_indices and "
+            "table_rows must be contiguous"
         )
     if tokens.stride(1) != 1:
         raise ValueError("tokens rows must be contiguous")
+    if vocab_size <= 0:
+        raise ValueError(f"vocab_size must be positive, got {vocab_size}")
     tensors = (
         candidate_ids,
         scores,
@@ -261,8 +301,9 @@ def dflash2_sample_path(
         top_k_pool,
         top_p_pool,
         seed_pool,
-        draft_offsets,
+        valid_cache_lengths,
         tokens,
+        table_rows,
         q,
         q_ids,
         pos,
@@ -282,13 +323,16 @@ def dflash2_sample_path(
         top_k_pool,
         top_p_pool,
         seed_pool,
-        draft_offsets,
+        valid_cache_lengths,
+        table_rows,
         tokens,
         q,
         q_ids,
         pos,
         slot,
         tokens.stride(0),
+        offset_scale,
+        vocab_size - 1,
         NUM_STEPS=num_steps,
         TOP_K=top_k,
         K_PAD=triton.next_power_of_2(top_k),
