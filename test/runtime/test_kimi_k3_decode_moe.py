@@ -158,22 +158,29 @@ def test_only_single_group_tp8_blackwell_binds_the_chain(
 
 
 @pytest.mark.parametrize(
-    "algorithm,width,captured,rows",
+    "algorithm,width,captured,padding,rows",
     [
-        (None, None, [1, 2, 4], {1, 2, 4}),
-        ("DSPARK", 8, [1, 2, 4], {8, 16, 32}),
-        ("EAGLE3", 3, [1, 2], {3, 6}),
-        (None, None, None, set()),
+        (None, None, [1, 2, 4], False, {1, 2, 4}),
+        ("DSPARK", 8, [1, 2, 4], False, {8, 16, 32}),
+        ("EAGLE3", 3, [1, 2], False, {3, 6}),
+        # No explicit ladder: the executor's default one at 16 sequences (it adds
+        # max_num_seqs - 1 and max_num_seqs below its larger default entries).
+        (None, None, None, False, {1, 2, 4, 8, 15, 16}),
+        ("DSPARK", 8, None, True, {8 * b for b in range(1, 17)}),
     ],
-    ids=["decode", "dspark-verify", "eagle3-verify", "no-graphs"],
+    ids=["decode", "dspark-verify", "eagle3-verify", "default", "default-unpadded"],
 )
-def test_decode_graph_rows_count_every_verify_token(
-    monkeypatch, algorithm, width, captured, rows
+def test_decode_graph_rows_follow_the_executor_ladder(
+    monkeypatch, algorithm, width, captured, padding, rows
 ):
     args = kimi_k3.global_server_args_dict
     monkeypatch.setitem(args, "speculative_algorithm", algorithm)
     monkeypatch.setitem(args, "speculative_num_draft_tokens", width)
     monkeypatch.setitem(args, "cudagraph_capture_sizes", captured)
+    monkeypatch.setitem(args, "max_num_seqs", 16)
+    monkeypatch.setitem(args, "max_cudagraph_capture_size", 16)
+    monkeypatch.setitem(args, "disable_cuda_graph_padding", padding)
+    monkeypatch.setitem(args, "mapping", _mapping())
     assert kimi_k3._decode_graph_rows() == rows
 
 
@@ -254,6 +261,10 @@ def _bindable(monkeypatch, layers, *, multicast=True):
     monkeypatch.setitem(args, "speculative_algorithm", None)
     monkeypatch.setitem(args, "speculative_num_draft_tokens", None)
     monkeypatch.setitem(args, "cudagraph_capture_sizes", [1, 8, 12])
+    monkeypatch.setitem(args, "max_num_seqs", 64)
+    monkeypatch.setitem(args, "max_cudagraph_capture_size", 64)
+    monkeypatch.setitem(args, "disable_cuda_graph_padding", False)
+    monkeypatch.setitem(args, "mapping", _mapping())
     return SimpleNamespace(
         mapping=_mapping(),
         model=SimpleNamespace(layers=layers),

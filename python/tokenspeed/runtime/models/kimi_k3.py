@@ -58,6 +58,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -840,15 +841,26 @@ def _apply_attn_res(
 
 
 def _decode_graph_rows() -> set[int]:
-    """Token rows of each captured decode graph; speculative verify runs the verify
-    width per request."""
+    """Token rows of each decode graph the executor captures (its resolved batch
+    ladder); speculative verify runs the verify width per request."""
+    from tokenspeed.runtime.execution.forward_step import get_batch_sizes_to_capture
+
+    args = global_server_args_dict
     per_request = (
-        int(global_server_args_dict["speculative_num_draft_tokens"])
-        if global_server_args_dict["speculative_algorithm"]
+        int(args["speculative_num_draft_tokens"])
+        if args["speculative_algorithm"]
         else 1
     )
-    captured = global_server_args_dict["cudagraph_capture_sizes"] or ()
-    return {batch * per_request for batch in captured}
+    ladder = get_batch_sizes_to_capture(
+        SimpleNamespace(
+            cudagraph_capture_sizes=args["cudagraph_capture_sizes"],
+            max_num_seqs=args["max_num_seqs"],
+            data_parallel_size=args["mapping"].attn.dp_size,
+            disable_cuda_graph_padding=args["disable_cuda_graph_padding"],
+            max_cudagraph_capture_size=args["max_cudagraph_capture_size"],
+        )
+    )
+    return {batch * per_request for batch in ladder}
 
 
 def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
