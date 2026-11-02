@@ -4063,7 +4063,7 @@ class ServerArgs:
             "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
             "trainer's vocab-parallel cross-entropy order (row max, shift, "
             "sum(exp) over fixed 32768-wide vocab blocks folded in block "
-            "order, logp = -(log(sum_exp) - target)); requests asking for "
+            "order, logp = target - log(sum_exp)); requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
             "logprobs only, never the sampled tokens. Folded to megatron by "
             "--numerics rl-bitwise.",
