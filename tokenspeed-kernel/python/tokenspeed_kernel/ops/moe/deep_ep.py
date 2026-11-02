@@ -847,6 +847,7 @@ def marlin_mxfp4_deepep_moe_apply(
 # ===-----------------------------------------------------------------------===#
 
 
+# These kernels need both DeepEP buffers and FlashInfer quantizers.
 if platform.is_nvidia and importlib.util.find_spec("deep_ep") is not None:
     from flashinfer import (
         scaled_fp4_grouped_quantize,

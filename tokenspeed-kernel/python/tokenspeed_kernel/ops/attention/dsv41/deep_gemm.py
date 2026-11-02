@@ -90,6 +90,7 @@ if platform.is_hopper:
     from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select as row_select
 
 
+@lru_cache(maxsize=1)
 def is_native_indexer_available() -> bool:
     """Whether the current platform supports packed DeepGEMM MQA scoring."""
     return platform.is_blackwell and importlib.util.find_spec("deep_gemm") is not None
@@ -406,6 +407,7 @@ _INDEX_ROW_BYTES = _LAYOUTS["index_v4"][3]
 _INDEX_VALUE_BYTES = _LAYOUTS["index_v4"][2]
 
 
+@lru_cache(maxsize=1)
 def is_hopper_indexer_available() -> bool:
     """Whether this platform scores FP8 index rows with DeepGEMM."""
     return platform.is_hopper and importlib.util.find_spec("deep_gemm") is not None

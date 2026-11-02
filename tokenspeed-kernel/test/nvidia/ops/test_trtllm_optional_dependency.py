@@ -42,3 +42,17 @@ def test_fused_a_projection_reports_missing_optional_extension():
 def test_trtllm_quantization_reports_missing_optional_extension():
     with pytest.raises(RuntimeError, match="compatible trtllm_kernel package"):
         _per_token_group_quant_8bit(torch.ones(1, 128), 128, False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashinfer_fp8_prepacking_falls_back_without_optional_extension():
+    from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
+        flashinfer_fp8_blockscale_quantize_prepacked,
+    )
+
+    # Aligned BF16 rows would select TRT-LLM if it were available.
+    x = torch.ones(4, 128, dtype=torch.bfloat16, device="cuda")
+    quantized, scales = flashinfer_fp8_blockscale_quantize_prepacked(x)
+    torch.testing.assert_close(
+        quantized.float() * scales.t(), x.float(), atol=1e-6, rtol=0
+    )

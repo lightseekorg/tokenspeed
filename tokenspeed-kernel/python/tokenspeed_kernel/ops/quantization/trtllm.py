@@ -27,7 +27,7 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
@@ -44,7 +44,8 @@ def _per_token_group_quant_8bit(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not _HAS_TRTLLM_KERNEL:
         raise RuntimeError(
-            "TRT-LLM FP8 quantization requires a compatible trtllm_kernel package"
+            "TRT-LLM FP8 quantization requires a compatible trtllm_kernel package "
+            "and deep_ep"
         )
     if group_size != 128:
         raise ValueError(
@@ -178,6 +179,3 @@ if _HAS_TRTLLM_KERNEL:
         "trtllm_fp8_token_group_128",
         "trtllm_fp8_token",
     ]
-else:
-    # Keep FlashInfer's existing Triton fallback available.
-    _per_token_group_quant_8bit = error_fn
