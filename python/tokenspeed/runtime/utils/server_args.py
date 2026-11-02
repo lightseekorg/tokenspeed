@@ -36,6 +36,7 @@ from tokenspeed.runtime.configs.numerics import (
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
     LOGPROB_ORDERS,
+    MEGATRON_LOGPROB_BLOCKS,
     MLA_LORA_SCALES,
     MOE_COMBINE_ORDERS,
     NUMERICS_ENVELOPES,
@@ -1934,7 +1935,10 @@ class ServerArgs:
         # The trainer's router is softmax + topk(scores + bias) in torch.
         self.router_topk = "torch"
         # The trainer's logprobs come from its vocab-parallel cross-entropy.
-        self.logprob_order = "megatron"
+        # Keep an explicitly selected trainer shard width. Serving TP does
+        # not determine the trainer's logprob reduction contract.
+        if self.logprob_order not in MEGATRON_LOGPROB_BLOCKS:
+            self.logprob_order = "megatron"
         # The trainer's grouped MLP applies the router weight inside the
         # activation and folds a token's slots in fp32 slot order.
         self.moe_combine_order = "slot"
@@ -4142,10 +4146,12 @@ class ServerArgs:
             "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
             "trainer's vocab-parallel cross-entropy order (row max, shift, "
             "sum(exp) over fixed 32768-wide vocab blocks folded in block "
-            "order, logp = target - log(sum_exp)); requests asking for "
+            "order, logp = target - log(sum_exp)). 'megatron-16384': "
+            "the same operations with 16384-wide blocks. Set the trainer's "
+            "shard width, independently of serving TP. Requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
-            "logprobs only, never the sampled tokens. Folded to megatron by "
-            "--numerics rl-bitwise.",
+            "logprobs only, never the sampled tokens. rl-bitwise defaults "
+            "to megatron and preserves an explicit Megatron block order.",
         )
         parser.add_argument(
             "--moe-combine-order",

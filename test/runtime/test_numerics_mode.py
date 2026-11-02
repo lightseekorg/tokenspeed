@@ -720,3 +720,16 @@ def test_failed_policy_registration_restores_imported_views():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+@pytest.mark.parametrize("order", ["megatron", "megatron-16384"])
+@pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+def test_explicit_trainer_logprob_block_order_survives_resolution(order, numerics):
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    args = ServerArgs(model="x", numerics=numerics, logprob_order=order)
+    assert args.logprob_order == order
+    cli = prepare_server_args(
+        ["--model", "x", "--numerics", numerics, "--logprob-order", order]
+    )
+    assert cli.logprob_order == order

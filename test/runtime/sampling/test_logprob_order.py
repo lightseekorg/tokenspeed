@@ -55,33 +55,42 @@ def _logits(rows: int) -> torch.Tensor:
     return torch.randn(rows, VOCAB, generator=torch.Generator().manual_seed(1)) * 3
 
 
-def test_gather_dispatches_on_the_order():
+@pytest.mark.parametrize(
+    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+)
+def test_gather_dispatches_on_the_order(order, block):
     logits = _logits(3)
     tokens = torch.tensor([5, 60000, 123], dtype=torch.int32)
     torch_order = gather_token_logprobs(logits, tokens, logprob_order="torch")
-    megatron = gather_token_logprobs(logits, tokens, logprob_order="megatron")
+    megatron = gather_token_logprobs(logits, tokens, logprob_order=order)
     assert torch.equal(
         torch_order,
         torch.log_softmax(logits, -1).gather(1, tokens.long()[:, None]).squeeze(1),
     )
     assert torch.equal(
         megatron,
-        vocab_parallel_logprobs(logits, tokens, vocab_block=MEGATRON_VOCAB_BLOCK),
+        vocab_parallel_logprobs(logits, tokens, vocab_block=block),
     )
     torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_megatron_order_preserves_positive_zero(dtype):
+@pytest.mark.parametrize(
+    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+)
+def test_megatron_order_preserves_positive_zero(dtype, order, block):
     logits = torch.full((2, VOCAB), -float("inf"), dtype=dtype)
-    tokens = torch.tensor([3, MEGATRON_VOCAB_BLOCK + 3], dtype=torch.int32)
+    tokens = torch.tensor([3, block + 3], dtype=torch.int32)
     logits.scatter_(1, tokens.long()[:, None], 0)
-    got = gather_token_logprobs(logits, tokens, logprob_order="megatron")
+    got = gather_token_logprobs(logits, tokens, logprob_order=order)
     expected = torch.zeros(2, dtype=torch.float32)
     assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
 
 
-def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
+@pytest.mark.parametrize(
+    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+)
+def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch, order, block):
     def fake_gumbel(logits, req_pool_indices, *pools, min_p_pool=None, **_):
         out = pools[-1]
         out[: logits.shape[0]].copy_(torch.tensor([7, 60001], dtype=torch.int32))
@@ -103,7 +112,7 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
             sampling_stream="per-request",
-            logprob_order="megatron",
+            logprob_order=order,
             enable_output_logprobs=True,
             max_bs=2,
             max_draft_tokens_per_req=1,
@@ -133,7 +142,7 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
     assert sampled.tolist() == [7, 60001]
     assert torch.equal(
         output.next_token_logprobs,
-        vocab_parallel_logprobs(logits, sampled, vocab_block=MEGATRON_VOCAB_BLOCK),
+        vocab_parallel_logprobs(logits, sampled, vocab_block=block),
     )
 
 
@@ -159,7 +168,10 @@ def _prompt_rows(rows: list[int], targets: list[int], *, num_input_rows: int):
     )
 
 
-def test_prompt_logprobs_follow_the_order(monkeypatch):
+@pytest.mark.parametrize(
+    "order, block", [("megatron", 32768), ("megatron-16384", 16384)]
+)
+def test_prompt_logprobs_follow_the_order(monkeypatch, order, block):
     # Prompt rows take the sampler's gather in the launch's order, so a
     # token's prompt and output logprobs are the same number under either.
     hidden = torch.randn(4, 8, generator=torch.Generator().manual_seed(2))
@@ -185,9 +197,9 @@ def test_prompt_logprobs_follow_the_order(monkeypatch):
 
     torch_order = run("torch")
     assert torch.equal(torch_order, gather_token_logprobs_torch(logits, ids))
-    megatron = run("megatron")
+    megatron = run(order)
     assert torch.equal(
-        megatron, vocab_parallel_logprobs(logits, ids, vocab_block=MEGATRON_VOCAB_BLOCK)
+        megatron, vocab_parallel_logprobs(logits, ids, vocab_block=block)
     )
     torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
 
@@ -255,3 +267,21 @@ def test_megatron_order_dispatches_to_a_registered_vendor_leaf():
     # The torch order never consults the leaf.
     gather_token_logprobs(logits, tokens, logprob_order="torch")
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("order", ["megatron", "megatron-16384"])
+def test_trainer_block_order_is_invariant_to_row_batch(order):
+    logits = _logits(12)
+    targets = logits.argmax(-1)
+    batch = gather_token_logprobs(logits, targets, logprob_order=order)
+    for row in range(12):
+        solo = gather_token_logprobs(
+            logits[row : row + 1], targets[row : row + 1], logprob_order=order
+        )
+        assert torch.equal(solo[0], batch[row])
+    other = "megatron-16384" if order == "megatron" else "megatron"
+    # Positive values summed through different shard folds need not have the
+    # same FP32 denominator. This prevents accidentally collapsing both modes.
+    assert not torch.equal(
+        batch, gather_token_logprobs(logits, targets, logprob_order=other)
+    )

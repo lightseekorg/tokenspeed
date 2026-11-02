@@ -132,8 +132,15 @@ ROUTER_TOPKS = ("fused", "torch")
 # ``--logprob-order``: the selected-token log-softmax behind every returned
 # logprob — ``torch.log_softmax``, or Megatron's vocab-parallel cross-entropy
 # order over fixed ``MEGATRON_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
-LOGPROB_ORDERS = ("torch", "megatron")
 MEGATRON_VOCAB_BLOCK = 32768
+# These widths describe the trainer's sum-exp shards, independently of the
+# serving topology. A left fold of eight 16384-wide partials is not the same
+# FP32 arithmetic as a left fold of four 32768-wide partials.
+MEGATRON_LOGPROB_BLOCKS = {
+    "megatron": MEGATRON_VOCAB_BLOCK,
+    "megatron-16384": 16384,
+}
+LOGPROB_ORDERS = ("torch", *MEGATRON_LOGPROB_BLOCKS)
 
 # ``--moe-combine-order``: how a token's routed-expert contributions meet
 # across the MoE TP-EP group — ``rank``: per-rank partials summed by the
@@ -212,6 +219,7 @@ __all__ = [
     "LAYER_BOUNDARY_NORMS",
     "LOGPROB_ORDERS",
     "MEGATRON_VOCAB_BLOCK",
+    "MEGATRON_LOGPROB_BLOCKS",
     "MLA_LORA_SCALES",
     "MOE_COMBINE_ORDERS",
     "NUMERICS_ENVELOPES",

@@ -182,6 +182,16 @@ setting is fixed in each expert plan before warmup and CUDA graph capture.
 
 ## alignment.trainer
 
+`--logprob-order megatron` retains the 32768-wide sum-exp blocks.
+`megatron-16384` instead folds 16384-wide block partials from left to right;
+`rl-bitwise` preserves either explicit choice. Select the trainer's actual
+vocabulary-shard width, independently of serving TP. For a 131072-token
+vocabulary with per-shard sum-exp, TP4 uses 32768 and TP8 uses 16384. Pairing
+two narrow shards before folding changes FP32 rounding, so one order does
+not promise alignment to both trainers. Prompt and output logprobs share
+the chosen operation; logits and sampled tokens are unchanged. The model's
+existing rl-bitwise vocabulary eligibility remains a multiple of 32768.
+
 The invariance layers make a deployment agree with itself. Trainer alignment
 makes it agree with a different program: the training framework's forward,
 whose arithmetic was never written to match an inference engine. Each switch
@@ -671,11 +681,10 @@ registers `("sampling", "block_sumexp")` with the signature
 `leaf(shifted, *, block_size)` with the fp32 `[rows, vocab]` logits already
 shifted by the row max, and returns fp32 `[rows, vocab // block_size]` block
 partials in vocabulary order, each block reduced in its own fixed tree. The
-op folds the columns left to right in fp32 — Megatron's rank-ordered
-reduction of the per-shard partials; a shard narrower than a block pairs
-back into the block's tree at its top level, so one full-vocabulary call
-equals the trainer's sharded sum bitwise when the in-block tree is pairwise
-over its tiles. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
+op folds the columns left to right in fp32 — the trainer's rank-ordered
+reduction when the selected block width is its shard width. Pairing narrower
+shards first is a different reduction tree; do not infer cross-TP agreement
+from the leaf's pairwise in-block tree. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
 the vendor leaf registers above it (any higher band), so plain selection
 takes it wherever it is installed and no host code names the vendor.
 The final subtraction is `target - log(sum_exp)`, preserving positive zero

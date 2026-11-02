@@ -46,7 +46,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
-    MEGATRON_VOCAB_BLOCK,
+    MEGATRON_LOGPROB_BLOCKS,
 )
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import (
@@ -342,16 +342,14 @@ class LogitsProcessor(nn.Module):
 
         # --logprob-order: the log-softmax behind input (prompt) logprobs.
         self.logprob_order: str = global_server_args_dict["logprob_order"]
-        if (
-            self.logprob_order == "megatron"
-            and config.vocab_size % MEGATRON_VOCAB_BLOCK != 0
-        ):
+        vocab_block = MEGATRON_LOGPROB_BLOCKS.get(self.logprob_order)
+        if vocab_block is not None and config.vocab_size % vocab_block != 0:
             # The logits every logprob reads are sliced to config.vocab_size
             # (_get_logits), and the trainer's sum(exp) folds fixed-width
             # blocks of them; refuse at construction, not on the forward thread.
             raise ValueError(
-                "--logprob-order megatron folds sum(exp) over fixed "
-                f"{MEGATRON_VOCAB_BLOCK}-wide vocabulary blocks and needs a "
+                f"--logprob-order {self.logprob_order} folds sum(exp) over fixed "
+                f"{vocab_block}-wide vocabulary blocks and needs a "
                 f"vocab_size that is a multiple of it; got {config.vocab_size}"
             )
 
