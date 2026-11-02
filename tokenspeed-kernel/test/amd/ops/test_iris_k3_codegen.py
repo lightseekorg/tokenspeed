@@ -68,10 +68,37 @@ _K3_KERNELS = {
     "attn_push_gather": {},
     "attnres_push_oneshot": {},
 }
+# The K3LaunchConfig tile, warp and grid fields each row-sharded launch reads.
+_LAUNCH_FIELDS = {
+    "moe_pull_scatter": ("reduce_block", "reduce_warps", "reduce_programs"),
+    "attn_pull_scatter": ("reduce_block", "reduce_warps", "reduce_programs"),
+    "moe_push_gather": ("gather_block", "gather_warps", "gather_programs"),
+    "attn_push_gather": ("gather_block", "gather_warps", "plain_gather_programs"),
+}
 
 
-def _compile_k3(kind, rank):
-    """Compile one K3 kernel for gfx1250 as ``rank`` of eight."""
+def _k3_cases():
+    """Every row-sharded kernel at each gfx1250 launch row, plus the AttnRes push."""
+    try:
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+            _K3_LAUNCHES,
+        )
+    except ImportError:
+        return []
+    rows = range(len(_K3_LAUNCHES[ArchVersion(12, 5)]))
+    return [
+        pytest.param(kind, row, id=f"{kind}-row{row}")
+        for kind in _LAUNCH_FIELDS
+        for row in rows
+    ] + [pytest.param("attnres_push_oneshot", None, id="attnres_push_oneshot")]
+
+
+def _compile_k3(kind, rank, row):
+    """Compile one K3 kernel for gfx1250 as ``rank`` of eight.
+
+    Row-sharded kernels take the tile, warps and grid of gfx1250 launch row
+    ``row``; the AttnRes push has one launch shape.
+    """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris import all_reduce as ar
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
@@ -99,18 +126,15 @@ def _compile_k3(kind, rank):
         )
     else:
         fn = getattr(sharded, f"iris_k3{kind}")
-        constexprs["BLOCK_ELEMENTS"] = 2048
-        reduce_programs, gather_programs = sharded._max_programs(ArchVersion(12, 5))
+        launch = sharded._K3_LAUNCHES[ArchVersion(12, 5)][row][1]
+        block, num_warps, programs = (
+            getattr(launch, field) for field in _LAUNCH_FIELDS[kind]
+        )
+        constexprs.update(BLOCK_ELEMENTS=block, NUM_PROGRAMS=programs)
         if "pull" in kind:
-            constexprs.update(
-                NUM_PROGRAMS=reduce_programs,
-                PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
-            )
+            constexprs["PEER_PAYLOAD_LOAD_CACHE"] = policy.peer_payload_load
         else:
-            constexprs.update(
-                NUM_PROGRAMS=gather_programs,
-                PEER_PAYLOAD_STORE_CACHE=policy.peer_payload_store,
-            )
+            constexprs["PEER_PAYLOAD_STORE_CACHE"] = policy.peer_payload_store
     constexprs["NUM_WARPS"] = num_warps
     for wait in ("wait_vmem", "wait_stores"):
         if wait.upper() in fn.arg_names:
@@ -145,16 +169,16 @@ def _compile_k3(kind, rank):
 
 
 @pytest.mark.parametrize("rank", (0, 7))
-@pytest.mark.parametrize("kind", tuple(_K3_KERNELS))
-def test_iris_k3_codegen_gfx1250(kind, rank, tmp_path):
+@pytest.mark.parametrize("kind,row", _k3_cases())
+def test_iris_k3_codegen_gfx1250(kind, row, rank, tmp_path):
     """The K3 fusions build for wave32 and publish with system-scope releases.
 
     Peer payloads move as plain 16-byte accesses, the only non-temporal loads
     are flag polls on their retry loops, and gathers drain their peer stores
     before the release that publishes them.
     """
-    assembly = _compile_k3(kind, rank).asm["amdgcn"]
-    (tmp_path / f"{kind}-rank{rank}.amdgcn").write_text(assembly)
+    assembly = _compile_k3(kind, rank, row).asm["amdgcn"]
+    (tmp_path / f"{kind}-row{row}-rank{rank}.amdgcn").write_text(assembly)
     lines = assembly.splitlines()
     assert "vmcnt" not in assembly
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
