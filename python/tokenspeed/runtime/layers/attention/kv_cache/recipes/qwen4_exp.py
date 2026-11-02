@@ -31,6 +31,7 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -43,10 +44,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    pipeline_cache_ownership,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_name,
-    cache_field_layer_id,
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
@@ -368,34 +371,45 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                     ):
                         wider_than_k_page.append(len(groups))
             groups.append((spec, fields if compatible else _own_planes(spec, fields)))
-        # A pipeline stage allocates each plane its own layers' fields touch,
+        # A pipeline stage allocates every plane its layers' fields touch,
         # whole (CacheMemoryPlan.narrow_to_layers), so a side field on a plane
-        # that its layer's decoder fields do not use costs that layer's stage
-        # the whole plane, which can exceed the plane of its own that sharing
-        # saves. A group that fits one K page per plane keeps the layout it
-        # always had. A wider one shares only if no stage of a single layer
-        # then holds more bytes; a stage of several layers then holds no more
-        # either, whatever the split, so every stage plans the same layout.
+        # its stage does not otherwise hold costs that stage the whole plane,
+        # which can exceed the plane of its own that sharing saves. A group
+        # that fits one K page per plane keeps the layout it always had; a
+        # wider one shares only if no stage of this engine then holds more
+        # bytes. Without PP, the one stage holds every plane anyway.
         for index in wider_than_k_page:
             spec, fields = groups[index]
             separate = groups.copy()
             separate[index] = (spec, _own_planes(spec, fields))
-            layers = sorted({cache_field_layer_id(field.field_id) for field in fields})
             if any(
                 shared > own
                 for shared, own in zip(
-                    self._single_layer_stage_bytes(groups, layers),
-                    self._single_layer_stage_bytes(separate, layers),
-                    strict=True,
+                    self._stage_bytes(groups), self._stage_bytes(separate), strict=True
                 )
             ):
                 groups = separate
         return tuple(groups)
 
-    def _single_layer_stage_bytes(
-        self, groups: Sequence[CacheGroupDeclaration], layers: Sequence[int]
-    ) -> list[int]:
-        """Bytes per parent that a stage of just one layer holds, per ``layers``."""
+    @cached_property
+    def _stage_cache_windows(self) -> tuple[tuple[int, int], ...]:
+        """Each pipeline stage's resident cache layers, as the runtime assigns them.
+
+        The last stage also holds the draft layers. Every rank derives the same
+        windows, so all ranks plan one layout.
+        """
+        num_target_layers = len(self.layer_types) - self.num_draft_layers
+        owners = pipeline_cache_ownership(
+            num_target_layers,
+            self.num_draft_layers,
+            pp_target_cache_windows(
+                self.server_args.mapping, self.model_config, num_target_layers
+            ),
+        )
+        return tuple(owner.resident_cache_window for owner in owners)
+
+    def _stage_bytes(self, groups: Sequence[CacheGroupDeclaration]) -> list[int]:
+        """Bytes per parent that each pipeline stage of this engine holds."""
         parent = pack(
             groups,
             prefix_granularity=self.prefix_granularity,
@@ -404,8 +418,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             max_padding_fraction=self.max_padding_fraction,
         ).bind(1)
         return [
-            parent.narrow_to_layers(layer, layer + 1).resident_block_bytes
-            for layer in layers
+            parent.narrow_to_layers(*window).resident_block_bytes
+            for window in self._stage_cache_windows
         ]
 
     @override

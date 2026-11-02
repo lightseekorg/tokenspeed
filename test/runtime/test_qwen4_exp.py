@@ -2294,6 +2294,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         speculative_num_draft_tokens=0,
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
+        mapping=Mapping(rank=0, world_size=1),
     )
     return prepare_cache_setup(
         family="qwen4_exp",

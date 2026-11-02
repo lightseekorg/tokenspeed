@@ -17,6 +17,7 @@ from tokenspeed.runtime.cache.transfer.layout import (
     select_layer_fields,
 )
 from tokenspeed.runtime.configs.qwen4_exp_config import Qwen4ExpTextConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
@@ -682,6 +683,7 @@ def _qwen4_exp_fp8_kv_recipe(
     draft_num_kv_heads: int | None,
     verify_width: int,
     max_bs: int,
+    pp_size: int,
     cache_budget_bytes: int,
     device: str,
 ) -> CacheRecipe:
@@ -690,7 +692,8 @@ def _qwen4_exp_fp8_kv_recipe(
     ``ple_layer_ids`` are the checkpoint's 1-based ids: the layer before each
     holds ``4 * hidden_size`` rows of nine bf16 PLE values, beside one shared
     int64[2] n-gram context. ``draft_num_kv_heads`` adds one nextn MTP layer
-    with that many KV heads; None leaves the model without a drafter.
+    with that many KV heads; None leaves the model without a drafter. The
+    engine splits the layers evenly into ``pp_size`` pipeline stages.
     """
     qsa_config = (
         {"indexer_n_heads": 4, "indexer_head_dim": 128, "indexer_compress_ratio": 4}
@@ -745,11 +748,14 @@ def _qwen4_exp_fp8_kv_recipe(
             enable_replay_ssm=False,
             disaggregation_mode="null",
             mamba_ssm_dtype=mamba_ssm_dtype,
+            mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config),
             hf_text_config=text_config,
             num_attention_layers=len(layer_types),
+            num_hidden_layers=len(layer_types),
+            model_profile=None,
         ),
         attn_config=attn_config,
         draft_model_config=draft_model_config,
@@ -761,8 +767,8 @@ def _qwen4_exp_fp8_kv_recipe(
     )
 
 
-def _wide_draft_ple_backend(device: str) -> Qwen4ExpPLEBackend:
-    """The target's PLE backend over a new arena, as the runtime binds it.
+def _wide_draft_ple_recipe(*, pp_size: int, device: str) -> CacheRecipe:
+    """A Qwen4-Exp recipe whose PLE layers' pages sit at different strides.
 
     Three PLE layers (512 x 9 bf16 state) beside two recurrent layers, one
     attention layer and a drafter four times as wide: whether PLE shares the
@@ -770,7 +776,7 @@ def _wide_draft_ple_backend(device: str) -> Qwen4ExpPLEBackend:
     plane) or keeps planes of its own (the first also holding the n-gram
     context), its layers' pages sit at different strides.
     """
-    recipe = _qwen4_exp_fp8_kv_recipe(
+    return _qwen4_exp_fp8_kv_recipe(
         layer_types=(LINEAR_ATTENTION, LINEAR_ATTENTION, FULL_ATTENTION),
         ple_layer_ids=[1, 2, 3],
         hidden_size=128,
@@ -790,9 +796,15 @@ def _wide_draft_ple_backend(device: str) -> Qwen4ExpPLEBackend:
         draft_num_kv_heads=4,
         verify_width=3,
         max_bs=2,
+        pp_size=pp_size,
         cache_budget_bytes=8 << 20,
         device=device,
     )
+
+
+def _wide_draft_ple_backend(device: str) -> Qwen4ExpPLEBackend:
+    """The target's PLE backend over a new arena, as the runtime binds it."""
+    recipe = _wide_draft_ple_recipe(pp_size=1, device=device)
     setup = recipe.setup()
     config = recipe.attn_config
     arena = create_cache_arena(setup.spec, device=device, enable_memory_saver=False)
@@ -871,10 +883,25 @@ def test_qwen4_exp_ple_commit_writes_each_layer_at_its_page_stride() -> None:
     assert torch.equal(arena.buffer, poisoned)
 
 
-def test_qwen4_exp_ple_sharing_never_grows_a_pipeline_stage() -> None:
-    # One recurrent layer and three attention layers in two pipeline stages,
-    # every plane 512 KiB: one fp32 recurrent state, or eight 64 KiB FP8 K or
-    # V pages. The PLE state (16,384 x 9 bf16) sits on layer 2, in stage 1.
+@pytest.mark.parametrize(
+    "pp_size,resident,parent_limits",
+    (
+        # One stage holds every plane, so the PLE state shares layer 0's
+        # recurrent-state plane for free: six planes per parent.
+        (1, {(0, 4): 6 * (512 << 10)}, [169]),
+        # Shared, the PLE state would cost stage 1 that plane whole: five
+        # planes per parent, 203 parents. Its own plane (295,168 bytes with
+        # the n-gram context) costs less.
+        (2, {(0, 2): 3 * (512 << 10), (2, 4): 4 * (512 << 10) + 295_168}, [340, 223]),
+    ),
+    ids=("one_stage", "two_stages"),
+)
+def test_qwen4_exp_ple_shares_planes_unless_a_pipeline_stage_grows(
+    pp_size: int, resident: dict[tuple[int, int], int], parent_limits: list[int]
+) -> None:
+    # One recurrent layer and three attention layers, every plane 512 KiB:
+    # one fp32 recurrent state, or eight 64 KiB FP8 K or V pages. The PLE
+    # state (16,384 x 9 bf16) sits on layer 2.
     recipe = _qwen4_exp_fp8_kv_recipe(
         layer_types=(LINEAR_ATTENTION,) + (FULL_ATTENTION,) * 3,
         ple_layer_ids=[3],
@@ -895,6 +922,7 @@ def test_qwen4_exp_ple_sharing_never_grows_a_pipeline_stage() -> None:
         draft_num_kv_heads=None,
         verify_width=1,
         max_bs=2,
+        pp_size=pp_size,
         cache_budget_bytes=512 << 20,
         device="cpu",
     )
@@ -902,28 +930,55 @@ def test_qwen4_exp_ple_sharing_never_grows_a_pipeline_stage() -> None:
         window: recipe.setup_for_layers(
             resident_cache_window=window, synchronize_capacity=local_cache_capacity
         )
-        for window in ((0, 2), (2, 4))
+        for window in resident
     }
-    resident = {
+    assert {
         window: setup.spec.memory_plan.narrow_to_layers(*window).resident_block_bytes
         for window, setup in stages.items()
-    }
-    # Shared, the PLE state would take layer 0's recurrent-state plane, which
-    # stage 1 would then hold whole: five planes per parent, 203 parents. Its
-    # own plane (295,168 bytes with the n-gram context) costs less.
-    assert resident == {(0, 2): 3 * (512 << 10), (2, 4): 4 * (512 << 10) + 295_168}
-    assert [setup.local_parent_limit for setup in stages.values()] == [340, 223]
+    } == resident
+    assert [setup.local_parent_limit for setup in stages.values()] == parent_limits
 
 
-@pytest.mark.parametrize("ple_layer_ids", ([2], [3]), ids=("served", "moved"))
-def test_qwen4_exp_served_shape_ple_state_costs_no_parents(ple_layer_ids) -> None:
+@pytest.mark.parametrize(
+    "pp_size,resident",
+    (
+        (1, {(0, 4): 331_776}),
+        (3, {(0, 1): 34_816, (1, 2): 34_816, (2, 4): 327_680}),
+    ),
+    ids=("one_stage", "three_stages"),
+)
+def test_qwen4_exp_ple_sharing_counts_the_drafter_on_the_last_stage(
+    pp_size: int, resident: dict[tuple[int, int], int]
+) -> None:
+    # The third PLE layer's state shares the drafter's wider K plane. A stage
+    # of that layer alone would hold the plane just for it, but the last stage
+    # also holds the drafter, so sharing costs no stage anything. Planes of
+    # PLE's own would make these 387,328 bytes, or 53,504, 53,248 and 346,112.
+    plan = (
+        _wide_draft_ple_recipe(pp_size=pp_size, device="cpu").setup().spec.memory_plan
+    )
+    assert {
+        window: plan.narrow_to_layers(*window).resident_block_bytes
+        for window in resident
+    } == resident
+
+
+@pytest.mark.parametrize(
+    "ple_layer_ids,parents",
+    (([2], 4_743), ([3], 4_743), (list(range(2, 49, 4)), 4_742)),
+    ids=("served", "moved", "every_fourth_layer"),
+)
+def test_qwen4_exp_served_shape_ple_state_costs_no_parents(
+    ple_layer_ids: list[int], parents: int
+) -> None:
     # Qwen3.8-Flash-Next at TP1 as served: FP8 KV, bf16 recurrent state, QSA
     # and one nextn MTP layer verifying four tokens, with a 194.3 GB cache
     # budget as on a GB300. Served, the PLE state is on layer 1; "moved" puts
-    # it on layer 2, which does not use the plane PLE shares.
+    # it on layer 2, which does not use the plane PLE shares; the last case
+    # puts it on every fourth layer, most of them sharing other layers' planes.
     layer_types = ((LINEAR_ATTENTION,) * 3 + (FULL_ATTENTION,)) * 12
 
-    def setup(ple_layer_ids):
+    def setup(ple_layer_ids, pp_size):
         return _qwen4_exp_fp8_kv_recipe(
             layer_types=layer_types,
             ple_layer_ids=ple_layer_ids,
@@ -948,23 +1003,23 @@ def test_qwen4_exp_served_shape_ple_state_costs_no_parents(ple_layer_ids) -> Non
             draft_num_kv_heads=2,
             verify_width=4,
             max_bs=1,
+            pp_size=pp_size,
             cache_budget_bytes=194_300_000_000,
             device="cpu",
         ).setup()
 
-    with_ple = setup(ple_layer_ids).spec.memory_plan
-    without_ple = setup([]).spec.memory_plan
+    with_ple = setup(ple_layer_ids, 1).spec.memory_plan
+    without_ple = setup([], 1).spec.memory_plan
     # Thirteen K/V layer pairs on 26 planes of one 1.5 MiB recurrent state each.
-    # The 180 KiB PLE state packs onto them instead of a 22.5 MiB plane of its
-    # own, which made parents 64,489,472 bytes: 3,007 of them in this budget.
+    # The 180 KiB PLE states pack onto them instead of planes of their own,
+    # which made parents 64,489,472 bytes with one PLE layer: 3,007 of them in
+    # this budget. Twelve PLE layers stage 10 MB more verify rows, which costs
+    # one parent here.
     assert with_ple.lcm_block_bytes == without_ple.lcm_block_bytes == 26 * (3 << 19)
-    assert with_ple.num_lcm_blocks == without_ple.num_lcm_blocks == 4_743
-    # A pipeline stage holds no more for the PLE state either.
-    for window in ((0, 24), (24, 49)):
-        assert (
-            with_ple.narrow_to_layers(*window).resident_block_bytes
-            == without_ple.narrow_to_layers(*window).resident_block_bytes
-        )
+    assert (with_ple.num_lcm_blocks, without_ple.num_lcm_blocks) == (parents, 4_743)
+    # Two pipeline stages share the same planes: no stage would hold less with
+    # planes of PLE's own.
+    assert setup(ple_layer_ids, 2).spec.memory_plan == with_ple
 
 
 def test_parent_is_its_planes_whatever_the_group_packings() -> None:
