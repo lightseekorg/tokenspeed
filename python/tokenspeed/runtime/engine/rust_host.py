@@ -437,6 +437,10 @@ class HostConfig:
         kv_events_publisher: Where this rank publishes them (the ZMQ
             publisher's fields), on the attention-TP group's first rank; else
             None.
+        otlp_traces_endpoint: ``--otlp-traces-endpoint``, the OTLP/HTTP
+            receiver finished requests trace to.
+        trace_sample_ratio: ``--trace-sample-ratio``, the share of requests
+            it keeps.
         l3: With the L3 storage tier, what the host starts its executor
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
@@ -493,6 +497,8 @@ class HostConfig:
     log_request_stats: bool
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
+    otlp_traces_endpoint: str | None
+    trace_sample_ratio: float
     l3: L3Settings | None
     l3_metrics: bool
     attn_tp_rank: int
@@ -1288,6 +1294,8 @@ class HostBootstrap:
                     and kv_events_config.publisher in (None, "zmq")
                     else None
                 ),
+                otlp_traces_endpoint=server_args.otlp_traces_endpoint,
+                trace_sample_ratio=server_args.trace_sample_ratio,
                 epd_receive_enabled=(
                     (
                         server_args.disaggregation_mode == "prefill"

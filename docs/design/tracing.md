@@ -42,14 +42,17 @@ session carry no attribute; conversation branches
 (`session_params.rid`) linking to the request they continue is a later
 refinement.
 
-Attributes follow the GenAI semantic conventions where they apply
-(`gen_ai.system`, `gen_ai.request.model`, prompt and completion tokens,
-finish reason), so Langfuse, Datadog and the Jaeger UIs render the spans
+Attributes follow the GenAI semantic conventions exactly
+(`gen_ai.system` and `gen_ai.request.model` on the resource;
+`gen_ai.response.id`, `gen_ai.usage.input_tokens` and
+`gen_ai.usage.output_tokens`, and `gen_ai.response.finish_reasons` as an
+array, on the span), so Langfuse, Datadog and the Jaeger UIs read them
 natively; TokenSpeed-specific facts (cached prompt tokens, preemption
-count and seconds) carry `tokenspeed.` prefixes. The lifecycle points ride
-as time-stamped events (`tokenspeed.request.scheduled`,
-`…prefill_done`, `…first_token`) between the span's start (received) and
-end (finished).
+count and seconds) carry `tokenspeed.` prefixes. The span is a SERVER
+span; an aborted or transfer-failed request carries the error status. The
+lifecycle points ride as time-stamped events
+(`tokenspeed.request.scheduled`, `…prefill_done`, `…first_token`)
+between the span's start (received) and end (finished).
 
 ## What stays out
 

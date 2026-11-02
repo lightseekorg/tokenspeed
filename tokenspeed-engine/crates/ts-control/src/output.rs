@@ -544,7 +544,7 @@ impl OutputProcessor {
         let Some(trace) = &self.trace else {
             return;
         };
-        if !trace.sampled() {
+        if !trace.sampled(rid) {
             return;
         }
         let (scheduled, prefill_done, first_token, preempt_count, preempt_seconds) = state

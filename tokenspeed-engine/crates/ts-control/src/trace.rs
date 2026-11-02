@@ -37,6 +37,7 @@ use std::{
     },
     thread,
     time::Duration,
+    time::Instant,
 };
 
 use serde_json::{json, Value};
@@ -49,23 +50,38 @@ const CHANNEL_SPANS: usize = 4096;
 const BATCH_SPANS: usize = 128;
 const BATCH_WAIT: Duration = Duration::from_millis(100);
 
+/// One drop warning per this many dropped spans: visible, not noisy.
+const DROPPED_WARN_EVERY: u64 = 1024;
+
 /// One finished request, as a span's whole content: wall-clock seconds
 /// (`wall_seconds`), zero until the point was reached.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceRecord {
+    /// The request's id, the span's `gen_ai.response.id`.
     pub rid: String,
     /// The continual-prompting session, when the request named one.
     pub session: Option<String>,
+    /// Received: the span's start.
     pub created: f64,
+    /// First dispatched into a forward batch.
     pub scheduled: f64,
+    /// The prompt's last chunk committed.
     pub prefill_done: f64,
+    /// The first output token committed.
     pub first_token: f64,
+    /// Finished or aborted: the span's end.
     pub finish: f64,
+    /// The prompt's tokens.
     pub prompt_tokens: i64,
+    /// The prompt's prefix-cache hit tokens.
     pub cached_tokens: i64,
+    /// The generated tokens.
     pub output_tokens: i64,
+    /// The finish reason's wire name.
     pub finish_reason: &'static str,
+    /// Rounds the request's decode waited behind other requests' prefill.
     pub preempt_count: i64,
+    /// Their seconds.
     pub preempt_seconds: f64,
 }
 
@@ -74,7 +90,6 @@ pub struct TraceRecord {
 pub struct TracePublisher {
     sender: SyncSender<TraceRecord>,
     sample_ratio: f64,
-    sampled: AtomicU64,
     dropped: AtomicU64,
     /// The export thread's endpoint and model, when it has one.
     endpoint: Option<(String, String)>,
@@ -105,24 +120,22 @@ impl TracePublisher {
         Arc::new(Self {
             sender,
             sample_ratio: sample_ratio.clamp(0.0, 1.0),
-            sampled: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             endpoint,
         })
     }
 
-    /// Whether this request is in the sample. The draw happens once, here,
-    /// before the caller builds the record.
-    pub fn sampled(&self) -> bool {
+    /// Whether this request is in the sample. The rid decides, the way
+    /// OTel's TraceIdRatioBased decides, so both roles of a disaggregated
+    /// request reach the same verdict and re-running draws the same.
+    pub fn sampled(&self, rid: &str) -> bool {
         if self.sample_ratio >= 1.0 {
             return true;
         }
         if self.sample_ratio <= 0.0 {
             return false;
         }
-        // A cheap per-publisher sequence mix; span ids use the same mixer.
-        let draw = mix(u128::from(self.sampled.fetch_add(1, Ordering::Relaxed)));
-        // The mix is uniform over its top bits; compare the fraction.
+        let draw = mix(rid_hash(rid, 0xd6e8_feb8_6659_fd93));
         ((draw >> 64) as f64 / u64::MAX as f64) < self.sample_ratio
     }
 
@@ -131,10 +144,14 @@ impl TracePublisher {
     pub fn emit(&self, record: TraceRecord) {
         match self.sender.try_send(record) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                if self.dropped.fetch_add(1, Ordering::Relaxed) % DROPPED_WARN_EVERY
+                    == DROPPED_WARN_EVERY - 1
+                {
+                    let dropped = self.dropped.load(Ordering::Relaxed);
+                    tracing::warn!(dropped, "trace spans dropped: the export queue is full");
+                }
             }
-            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -167,8 +184,13 @@ fn export_loop(receiver: Receiver<TraceRecord>, endpoint: String, model_name: St
             Err(_) => return,
         };
         let mut batch = vec![first];
+        let deadline = Instant::now() + BATCH_WAIT;
         while batch.len() < BATCH_SPANS {
-            match receiver.recv_timeout(BATCH_WAIT) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match receiver.recv_timeout(left) {
                 Ok(record) => batch.push(record),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
@@ -236,11 +258,16 @@ fn span(record: &TraceRecord) -> Value {
         }
     }
     let mut attributes = vec![
-        string_attribute("gen_ai.request_id", &record.rid),
-        int_attribute("gen_ai.prompt_tokens", record.prompt_tokens),
+        string_attribute("gen_ai.response.id", &record.rid),
+        int_attribute("gen_ai.usage.input_tokens", record.prompt_tokens),
+        int_attribute("gen_ai.usage.output_tokens", record.output_tokens),
         int_attribute("tokenspeed.prompt_cached_tokens", record.cached_tokens),
-        int_attribute("gen_ai.completion_tokens", record.output_tokens),
-        string_attribute("gen_ai.response.finish_reason", record.finish_reason),
+        json!({
+            "key": "gen_ai.response.finish_reasons",
+            "value": {"arrayValue": {"values": [
+                {"stringValue": record.finish_reason}
+            ]}}
+        }),
         int_attribute("tokenspeed.preempt_count", record.preempt_count),
         double_attribute("tokenspeed.preempt_seconds", record.preempt_seconds),
     ];
@@ -249,16 +276,23 @@ fn span(record: &TraceRecord) -> Value {
         // tracing UI, each request its own trace.
         attributes.push(string_attribute("session.id", session));
     }
+    // A request the engine serves is a SERVER span, and one that aborted
+    // or failed its transfer is an error trace the UI surfaces.
+    let error = matches!(record.finish_reason, "abort" | "unknown");
     json!({
         "traceId": trace_id(&record.rid),
         "spanId": span_id(&record.rid),
         "name": "tokenspeed.request",
-        "kind": 1,
+        "kind": 2,
         "startTimeUnixNano": nanos(record.created),
         "endTimeUnixNano": nanos(record.finish),
         "attributes": attributes,
         "events": events,
-        "status": {},
+        "status": if error {
+            json!({"code": 2, "message": record.finish_reason})
+        } else {
+            json!({})
+        },
     })
 }
 
@@ -348,14 +382,20 @@ mod tests {
     fn a_record_becomes_a_genai_conventioned_span() {
         let span = span(&record());
         assert_eq!(span["name"], "tokenspeed.request");
+        assert_eq!(span["kind"], 2);
+        assert_eq!(span["status"], serde_json::json!({}));
         assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
         assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
         assert_eq!(span["startTimeUnixNano"], "1700000000000000000");
         assert_eq!(span["endTimeUnixNano"], "1700000002000000000");
         let attrs = span["attributes"].as_array().unwrap();
-        assert!(attrs.contains(&string_attribute("gen_ai.response.finish_reason", "stop")));
+        assert!(attrs.contains(&json!({
+            "key": "gen_ai.response.finish_reasons",
+            "value": {"arrayValue": {"values": [{"stringValue": "stop"}]}}
+        })));
         assert!(attrs.contains(&string_attribute("session.id", "sess-7")));
-        assert!(attrs.contains(&int_attribute("gen_ai.prompt_tokens", 100)));
+        assert!(attrs.contains(&int_attribute("gen_ai.usage.input_tokens", 100)));
+        assert!(attrs.contains(&int_attribute("gen_ai.usage.output_tokens", 8)));
         let events = span["events"].as_array().unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0]["name"], "tokenspeed.request.scheduled");
@@ -405,19 +445,23 @@ mod tests {
     }
 
     #[test]
-    fn sampling_keeps_a_deterministic_share() {
+    fn sampling_decides_by_the_request_id() {
         let (sender, _) = sync_channel(CHANNEL_SPANS);
         let off = TracePublisher::with_sender(None, 0.0, sender.clone());
-        assert!(!off.sampled());
+        assert!(!off.sampled("chatcmpl-1"));
         let all = TracePublisher::with_sender(None, 1.0, sender.clone());
-        for _ in 0..100 {
-            assert!(all.sampled());
+        for index in 0..100 {
+            assert!(all.sampled(&format!("r{index}")));
         }
-        // A ratio between: the count stays within its share plus slack.
+        // A ratio between: the kept share holds, and one request's verdict
+        // is stable — both roles of a disaggregated request agree.
         let (sender, _) = sync_channel(CHANNEL_SPANS);
         let half = TracePublisher::with_sender(None, 0.5, sender);
-        let kept: usize = (0..1000).filter(|_| half.sampled()).count();
+        let kept: usize = (0..1000)
+            .filter(|index| half.sampled(&format!("r{index}")))
+            .count();
         assert!((350..=650).contains(&kept), "kept {kept} of 1000");
+        assert_eq!(half.sampled("chatcmpl-1"), half.sampled("chatcmpl-1"));
     }
 
     /// The full export path against a real socket: the export thread, its
@@ -435,11 +479,12 @@ mod tests {
             let mut buffer = [0u8; 8192];
             let mut head = Vec::new();
             let mut read = 0usize;
-            // Read until the header's end.
+            // Read until the header's end; a peer that closes early fails
+            // the test instead of hanging it.
             while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                read += stream.read(&mut buffer).expect("read the head");
+                read = stream.read(&mut buffer).expect("read the head");
+                assert!(read > 0, "the peer closed before the header ended");
                 head.extend_from_slice(&buffer[..read]);
-                read = 0;
             }
             let head = String::from_utf8_lossy(&head).to_string();
             let length: usize = head
@@ -479,10 +524,13 @@ mod tests {
         let spans = &batch["resourceSpans"][0]["scopeSpans"][0]["spans"];
         let span = &spans[0];
         assert_eq!(span["name"], "tokenspeed.request");
+        assert_eq!(span["kind"], 2);
+        assert_eq!(span["status"], serde_json::json!({}));
         assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
         let attributes = span["attributes"].as_array().unwrap();
-        assert!(attributes.contains(&string_attribute("gen_ai.request_id", "chatcmpl-1")));
-        assert!(attributes.contains(&int_attribute("gen_ai.prompt_tokens", 100)));
+        assert!(attributes.contains(&string_attribute("gen_ai.response.id", "chatcmpl-1")));
+        assert!(attributes.contains(&int_attribute("gen_ai.usage.input_tokens", 100)));
+        assert!(attributes.contains(&int_attribute("gen_ai.usage.output_tokens", 8)));
         let resource = &batch["resourceSpans"][0]["resource"]["attributes"];
         assert!(resource
             .as_array()

@@ -150,13 +150,13 @@ fn parse_args() -> Result<Args, HostError> {
     })
 }
 
-/// What `rust_host.HostConfig` carries.
 /// OTLP tracing as the Python server args carry it.
 struct TraceConfig {
     endpoint: String,
     sample_ratio: f64,
 }
 
+/// What `rust_host.HostConfig` carries.
 struct HostConfig {
     handshake_address: String,
     engine_index: u16,
@@ -619,13 +619,29 @@ fn serve(args: &Args) -> Result<(), HostError> {
     }
     let data_plane =
         PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
-    let trace = config.trace.as_ref().map(|trace| {
-        ts_control::trace::TracePublisher::new(
-            trace.endpoint.clone(),
-            trace.sample_ratio,
-            config.metrics.labels.model_name.clone(),
-        )
-    });
+    let trace = config
+        .trace
+        .as_ref()
+        .filter(|trace| {
+            if trace.sample_ratio <= 0.0 {
+                tracing::warn!(
+                    endpoint = %trace.endpoint,
+                    "--otlp-traces-endpoint without --trace-sample-ratio traces nothing"
+                );
+            }
+            trace.sample_ratio > 0.0
+        })
+        .and_then(|trace| {
+            // The reporting rank alone traces: the finish line's rank, so a
+            // replicated engine exports one span per request, not one per rank.
+            (config.finish_log.enabled).then(|| {
+                ts_control::trace::TracePublisher::new(
+                    trace.endpoint.clone(),
+                    trace.sample_ratio,
+                    config.metrics.labels.model_name.clone(),
+                )
+            })
+        });
     let outputs = OutputProcessor::new(
         config.spec_num_tokens,
         config.stream_interval,
