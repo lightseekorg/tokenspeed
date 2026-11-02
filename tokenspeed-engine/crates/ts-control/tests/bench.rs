@@ -45,6 +45,10 @@ use ts_wire::{
     TokenizedGenerateReqInput,
 };
 
+/// The benchmarks allocate as `ts-host` does.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const NO_FINISH_LOG: FinishLog = FinishLog {
     enabled: false,
     request_stats: false,
