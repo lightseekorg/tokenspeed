@@ -1252,8 +1252,10 @@ def test_mla_project_value_amd_batches(
     torch.testing.assert_close(out, expected, atol=0.125, rtol=0.05)
 
 
-def test_mla_project_value_nvidia_fallback_writes_projection_directly(
+@pytest.mark.parametrize("vendor", ["nvidia", "cdna5"])
+def test_mla_project_value_fallback_writes_projection_directly(
     monkeypatch: pytest.MonkeyPatch,
+    vendor: str,
 ) -> None:
     import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
@@ -1278,7 +1280,9 @@ def test_mla_project_value_nvidia_fallback_writes_projection_directly(
     monkeypatch.setattr(
         attention_ops,
         "current_platform",
-        lambda: SimpleNamespace(is_nvidia=True),
+        lambda: SimpleNamespace(
+            is_nvidia=vendor == "nvidia", is_cdna5=vendor == "cdna5"
+        ),
     )
     monkeypatch.setattr(torch, "bmm", record_bmm)
     attention = torch.randn(2, 3, 4)
@@ -1289,45 +1293,6 @@ def test_mla_project_value_nvidia_fallback_writes_projection_directly(
 
     assert bmm_out is not None
     torch.testing.assert_close(output, expected)
-
-
-@pytest.mark.parametrize("batch", [1, 848, 8192])
-def test_mla_project_value_cdna5_fallback_projects_strided_heads(
-    device: str,
-    batch: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """GLM-5.3-Flash's prefill value projection (no registered kernel): the
-    head-strided bmm writes the output in place, bit for bit the projection
-    of contiguous head-major copies."""
-    if not platform.is_cdna5:
-        pytest.skip("the strided AMD fallback runs on CDNA5")
-    import tokenspeed_kernel.ops.attention.mla as attention_ops
-
-    heads, latent, value = 16, 512, 256
-    generator = torch.Generator(device=device).manual_seed(batch)
-    attention = torch.randn(
-        batch, heads, latent, device=device, generator=generator
-    ).bfloat16()
-    weight = (
-        0.05 * torch.randn(heads, value, latent, device=device, generator=generator)
-    ).bfloat16()
-    weight = weight.contiguous().transpose(1, 2)
-    expected = torch.bmm(attention.transpose(0, 1).contiguous(), weight)
-    expected = expected.transpose(0, 1).reshape(batch, heads * value)
-
-    original_bmm = torch.bmm
-    bmm_out = []
-
-    def record_bmm(input, mat2, *, out=None):
-        bmm_out.append(out)
-        return original_bmm(input, mat2, out=out)
-
-    monkeypatch.setattr(torch, "bmm", record_bmm)
-    output = attention_ops.mla_project_value(attention, weight)
-
-    assert len(bmm_out) == 1 and bmm_out[0] is not None
-    assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
 
 
 def test_mla_normalize_project_query_cuda_fallback(

@@ -286,16 +286,19 @@ def test_dsa_plan_returns_none_without_kernel(device: str) -> None:
     assert dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="missing") is None
 
 
-def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_dsa_workspace_topk_to_global_slots(
+    device: str, slot_dtype: torch.dtype
+) -> None:
     workspace_indices = torch.tensor(
         [[2, -1, 0], [1, 3, -1]],
         device=device,
         dtype=torch.int32,
     )
     kv_workspace_slots = torch.tensor(
-        [10, 20, 30, 40],
+        [10, 20, 2**31 - 2, 40],
         device=device,
-        dtype=torch.int64,
+        dtype=slot_dtype,
     )
     out = torch.empty_like(workspace_indices)
 
@@ -306,7 +309,7 @@ def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
     )
 
     expected = torch.tensor(
-        [[30, -1, 10], [20, 40, -1]],
+        [[2**31 - 2, -1, 10], [20, 40, -1]],
         device=device,
         dtype=torch.int32,
     )
@@ -335,27 +338,6 @@ def test_dsa_workspace_conversion_reads_unsigned_int16_indices(device: str) -> N
             workspace_indices=indices.to(torch.int16),
             kv_workspace_slots=torch.zeros(65535, device=device, dtype=torch.int64),
         )
-
-
-def test_dsa_workspace_topk_int32_slots_match_int64_slots(device: str) -> None:
-    generator = torch.Generator(device=device).manual_seed(9)
-    slots = torch.randint(
-        -1, 2**31 - 1, (4096,), device=device, generator=generator, dtype=torch.int32
-    )
-    workspace_indices = torch.randint(
-        -1, 4096, (64, 2051), device=device, generator=generator, dtype=torch.int32
-    )
-
-    expected = dsa_workspace_topk_to_global_slots(
-        workspace_indices=workspace_indices,
-        kv_workspace_slots=slots.long(),
-    )
-    actual = dsa_workspace_topk_to_global_slots(
-        workspace_indices=workspace_indices,
-        kv_workspace_slots=slots,
-    )
-
-    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("total", [1, 255, 256, 257, 513])
