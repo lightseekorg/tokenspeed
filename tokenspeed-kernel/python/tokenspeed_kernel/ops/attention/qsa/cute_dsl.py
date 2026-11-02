@@ -235,6 +235,7 @@ def _supported_stream_topk_tensors(
         query.shape[1:] != (4, 128)
         or key_cache.shape[0] < 64
         or key_cache.shape[0] % 64
+        # Slot ids must fit int32 for the kernels and the int32 page table.
         or key_cache.shape[0] >= 2**31
         or key_cache.shape[1:] != (1, 128)
     ):
