@@ -7,6 +7,9 @@ triggers:
   - manual
 runner:
   labels:
+    - h100-1gpu
+    - b200-1gpu
+    - gb200-1gpu
     - amd-mi355-1gpu
 env:
   CI: "true"
