@@ -365,7 +365,7 @@ mod ffi {
     /// (`Scheduler::ProbePrefillGate`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct PrefillGateProbe {
-        /// Prefill work the rank could schedule now, below the watermark.
+        /// A resident chunk, or new prefill work at or below the watermark.
         wants_prefill: bool,
         /// Decode work the round would otherwise run.
         has_decode_work: bool,
@@ -430,6 +430,7 @@ mod ffi {
         fn next_execution_plan(
             scheduler: Pin<&mut Scheduler>,
             allow_prefill: bool,
+            apply_prefill_watermark: bool,
         ) -> UniquePtr<ExecutionPlan>;
         fn advance(scheduler: Pin<&mut Scheduler>, events: &[ForwardEvent]) -> Result<()>;
         fn advance_head(
@@ -584,9 +585,19 @@ impl Scheduler {
     }
 
     /// Plan the next round. `allow_prefill` gates the fused role's prefill
-    /// work (see `docs/design/prefill-delay.md`); the PD roles ignore it.
-    pub fn next_execution_plan(&mut self, allow_prefill: bool) -> ExecutionPlan {
-        ExecutionPlan(ffi::next_execution_plan(self.pinned(), allow_prefill))
+    /// work; `apply_prefill_watermark` checks pressure before new admissions
+    /// when delay is enabled. Resident chunks ignore pressure, and PD roles
+    /// ignore both options (see `docs/design/prefill-delay.md`).
+    pub fn next_execution_plan(
+        &mut self,
+        allow_prefill: bool,
+        apply_prefill_watermark: bool,
+    ) -> ExecutionPlan {
+        ExecutionPlan(ffi::next_execution_plan(
+            self.pinned(),
+            allow_prefill,
+            apply_prefill_watermark,
+        ))
     }
 
     /// Feed forward results back. Fails, applying none of `events`' later

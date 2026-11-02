@@ -52,7 +52,7 @@ struct PrefixHitView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler,
-                                                               bool allow_prefill);
+                                                               bool allow_prefill, bool apply_prefill_watermark);
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events);
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,

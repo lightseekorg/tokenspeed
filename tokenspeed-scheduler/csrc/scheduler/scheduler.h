@@ -107,15 +107,18 @@ public:
         // decode work is unaffected. The P role (prompt-only) and the D role
         // (whose prompts are the peer's work) ignore it.
         bool allow_prefill;
+        // Delay enabled: check the watermark before each new admission,
+        // including after a resident chunk. Resident chunks ignore pressure.
+        // False preserves ordinary admission when delay is disabled.
+        bool apply_prefill_watermark;
     };
     ExecutionPlan NextExecutionPlan(PlanOptions options);
 
     // What the control plane's prefill-delay vote reads from every
     // attention-DP rank before deciding a plan. Read-only.
     struct PrefillGateProbe {
-        // Prefill work this rank could schedule now and the Device pool can
-        // take: a resident chunk or an admitted prompt, below the prefill
-        // watermark.
+        // A resident chunk regardless of pressure, or a new prompt at or
+        // below the watermark. Actual admission still checks cache demands.
         bool wants_prefill;
         // Decode work this rank's round would otherwise run: a first decode
         // or a decoding request. A rank with none has nothing to protect
@@ -124,10 +127,8 @@ public:
     };
     PrefillGateProbe ProbePrefillGate() const;
 
-    // Hold prefill back while the Device pool is this full, whether or not a
-    // vote admits it: admission at this pressure would retract a decoding
-    // victim, and the gates exist to batch prefills, not to trade them for
-    // decodes.
+    // Above this pressure hold new prompts back when delay is enabled.
+    // Resident chunks must be able to consume their own reservations.
     static constexpr float kPrefillWatermark = 0.9F;
 
     void Advance(const ExecutionEvent& event);
@@ -445,9 +446,10 @@ private:
     // sees this struct -- it receives build.plan and an AdmissionFeedback --
     // so batch and budget accounting stay behind pushOperation.
     struct PlanBuild {
-        explicit PlanBuild(ExecutionPlan& output_plan) : plan{output_plan} {}
+        PlanBuild(ExecutionPlan& output_plan, PlanOptions plan_options) : plan{output_plan}, options{plan_options} {}
 
         ExecutionPlan& plan;
+        PlanOptions options;
         std::vector<ForwardOperation> operations;
         std::vector<ForwardOperation> remote_decode;
         std::vector<ForwardOperation> remote_prefill;
@@ -642,11 +644,13 @@ private:
     void buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations);
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                        std::vector<WriteBackOperation>& write_back_operations, bool allow_prefill);
+                        std::vector<WriteBackOperation>& write_back_operations);
     // True when a local-prefill candidate has been held back by the
     // prefill/decode interval for prefill_decode_interval rounds in total
     // (docs/design/scheduler.md §3.3).
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
+    bool belowPrefillWatermark() const;
+    bool prefillAllowed(const Request& request, const PlanBuild& build) const;
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);

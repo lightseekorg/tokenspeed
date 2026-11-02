@@ -751,7 +751,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.commit_down_to(0, &mut events, &mut outputs, &mut released)?;
             // Cache and storage work still progresses: the tick forbade
             // forwards, so the plan carries nothing else.
-            let plan = self.scheduler.next_execution_plan(false);
+            let plan = self
+                .scheduler
+                .next_execution_plan(false, self.config.prefill_delay.is_some());
             if let Some(l3) = &self.l3 {
                 l3.submit(&plan)?;
             }
@@ -845,7 +847,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         released: &mut Vec<String>,
         allow_prefill: bool,
     ) -> Result<(), LoopError> {
-        let plan = self.scheduler.next_execution_plan(allow_prefill);
+        let plan = self
+            .scheduler
+            .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Some(batch) = plan.remote_prefill() {
                 tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
@@ -2273,7 +2277,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let open = if any_point {
             // Anti-starvation: one rank's backlog opens the group's gate, so
-            // no prefill waits longer than `any_interval` rounds.
+            // eligible prefill waits at most `any_interval` rounds. New
+            // prompts above the watermark must also wait for capacity.
             self.dp_wants_prefill.iter().any(|want| *want)
         } else {
             // ALL: a rank with nothing to decode protects nothing, so only a
@@ -2303,12 +2308,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// publication.
     ///
     /// A window its peers open must not drag a rank into an admission it
-    /// does not want: a resident chunk or an admitted prompt below the
-    /// watermark is the same condition the vote publishes, and a rank that
-    /// has none of it plans no prefill. In particular a rank whose Device
-    /// pool sits at the watermark never prefills on another rank's ANY
-    /// point, so such a window cannot make it retract a decoding victim for
-    /// a prefill it was holding back on purpose.
+    /// does not want: a resident chunk, or a new prompt at or below the
+    /// watermark, is the same condition the vote publishes. A resident
+    /// chunk must be able to consume its own reservation above the watermark;
+    /// the scheduler independently checks pressure before any new admission
+    /// in that window, including after the resident's final chunk.
     fn prefill_delay_allows_prefill(&self) -> bool {
         if self.config.prefill_delay.is_none() {
             return true;

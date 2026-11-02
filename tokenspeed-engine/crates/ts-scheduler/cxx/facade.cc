@@ -66,9 +66,11 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
     scheduler.SubmitRequests(converted);
 }
 
-std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill) {
+std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill,
+                                                            bool apply_prefill_watermark) {
     return std::make_unique<tokenspeed::ExecutionPlan>(
-        scheduler.NextExecutionPlan(tokenspeed::Scheduler::PlanOptions{.allow_prefill = allow_prefill}));
+        scheduler.NextExecutionPlan(tokenspeed::Scheduler::PlanOptions{
+            .allow_prefill = allow_prefill, .apply_prefill_watermark = apply_prefill_watermark}));
 }
 
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events) {

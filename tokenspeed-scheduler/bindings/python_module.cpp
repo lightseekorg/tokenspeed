@@ -684,7 +684,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(
             "next_execution_plan",
             [](tokenspeed::Scheduler& s) {
-                return s.NextExecutionPlan(tokenspeed::Scheduler::PlanOptions{.allow_prefill = true});
+                return s.NextExecutionPlan(
+                    tokenspeed::Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))

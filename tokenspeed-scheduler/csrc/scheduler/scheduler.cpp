@@ -554,21 +554,27 @@ Scheduler::PrefillGateProbe Scheduler::ProbePrefillGate() const {
         return probe;
     }
     bool pending_prefill = false;
+    bool resident_prefill = false;
     for (const auto& request : requests_) {
-        // Prefetching is an admitted prompt waiting on its storage read: it
-        // holds no schedulable chunk yet, but it is prefill work the rank
-        // wants, and its arrival is what the gate batches around.
-        if (request->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::Prefilling>()) {
+        // Storage preparation has not admitted Device pages yet. Resident
+        // chunks, however, must be able to consume their own reservations.
+        if (request->Is<fsm::Prefilling>()) {
+            resident_prefill = true;
+        } else if (request->IsAnyOf<fsm::Submitted, fsm::Prefetching>()) {
             pending_prefill = true;
         } else if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>()) {
             probe.has_decode_work = true;
         }
     }
+    probe.wants_prefill = resident_prefill || (pending_prefill && belowPrefillWatermark());
+    return probe;
+}
+
+bool Scheduler::belowPrefillWatermark() const {
     const std::int32_t total_pages = coordinator_.TotalLcmBlocks();
     const float used_ratio =
         total_pages > 0 ? static_cast<float>(ActiveLcmBlocks()) / static_cast<float>(total_pages) : 0.0F;
-    probe.wants_prefill = pending_prefill && used_ratio <= kPrefillWatermark;
-    return probe;
+    return used_ratio <= kPrefillWatermark;
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {

@@ -1345,6 +1345,9 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     offered.reserve(candidates.size());
 
     while (true) {
+        if (blocker->IsAnyOf<fsm::Submitted, fsm::Prefilling>() && !prefillAllowed(*blocker, build)) {
+            return;
+        }
         // No room left for the grant -- the batch full or the token budget
         // spent: a victim retracted now would serve nobody, and its pages
         // would wait for whoever asks first next round. (An empty round is
@@ -1408,20 +1411,23 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // empty round has no completion to wait for, and its decodes take
             // the freed pages first (below): there the victim is retracted
             // whenever a decode is left to serve.
-            const auto blocked = std::ranges::find_if(feedback.capacity_blocked, [victim](Request* request) {
-                // An earlier iteration may have retracted one of them.
-                return request != victim &&
-                       request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>();
+            const auto blocked =
+                std::ranges::find_if(feedback.capacity_blocked, [this, &build, victim](Request* request) {
+                    // An earlier iteration may have retracted one of them.
+                    return request != victim &&
+                           (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>() ||
+                            (request->IsAnyOf<fsm::Submitted, fsm::Prefilling>() && prefillAllowed(*request, build)));
+                });
+            const auto waiting = std::ranges::find_if(candidates, [this, &build, victim](Request* request) {
+                return request != victim && request->Is<fsm::Submitted>() && prefillAllowed(*request, build);
             });
-            const auto waiting = std::ranges::find_if(
-                candidates, [victim](Request* request) { return request != victim && request->Is<fsm::Submitted>(); });
             // When the victim is a prefill, its chunk failed admission and the
             // head-of-line rule kept every resident prefill behind it from
             // trying this round (a forced victim sitting the round out is
             // marked scheduled and stays out).
-            const auto held_back = std::ranges::find_if(candidates, [&build, victim](Request* request) {
+            const auto held_back = std::ranges::find_if(candidates, [this, &build, victim](Request* request) {
                 return victim->Is<fsm::Prefilling>() && request != victim && request->Is<fsm::Prefilling>() &&
-                       !build.Scheduled(*request);
+                       !build.Scheduled(*request) && prefillAllowed(*request, build);
             });
             const bool decode_left = std::ranges::any_of(candidates, [victim](Request* request) {
                 return request != victim && request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
@@ -1828,6 +1834,12 @@ void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
     std::rotate(holder, holder + 1, build.operations.end());
 }
 
+bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) const {
+    return config_.role != Role::kFused ||
+           (build.options.allow_prefill &&
+            (request.Is<fsm::Prefilling>() || !build.options.apply_prefill_watermark || belowPrefillWatermark()));
+}
+
 // Local prefill phases shared by the P and fused grammars: resident chunks
 // (they hold pages), then new prompts. One loop per tier so the order is
 // visible.
@@ -1900,6 +1912,11 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             if ((resident ? !request->Is<fsm::Prefilling>() : !request->Is<fsm::Submitted>()) ||
                 build.Scheduled(*request)) {
                 continue;
+            }
+            if (!prefillAllowed(*request, build)) {
+                // Recheck after every admission: a resident's final chunk or
+                // an earlier newcomer may have crossed the watermark.
+                return;
             }
             // Whether this chunk may hold the head of line: a resident's rest
             // past the budget, or a new prompt that could not finish it even
@@ -2082,16 +2099,18 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // prompt held back N rounds suspends the interval, and the round runs as if
 // none were owed.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                               std::vector<WriteBackOperation>& write_back_operations, bool allow_prefill) {
+                               std::vector<WriteBackOperation>& write_back_operations) {
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
     const bool interval_owes_decodes = prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates);
     if (config_.enable_mixed_prefill_decode) {
-        // A prefill held by either policy joins no decode, so decodes keep its reserve.
+        // The decode batch's prefill reserve exists to protect a prefill that
+        // may ride beside it; with the delay gate closed no prefill can, so
+        // the decodes take the whole budget.
         const bool has_local_prefill =
-            allow_prefill && !interval_owes_decodes && std::ranges::any_of(candidates, [](const Request* request) {
-                return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
+            !interval_owes_decodes && std::ranges::any_of(candidates, [this, &build](const Request* request) {
+                return request->IsAnyOf<fsm::Prefilling, fsm::Submitted>() && prefillAllowed(*request, build);
             });
         build.pending_prefill_reserve = has_local_prefill ? MinPrefillChunkTokens(coordinator_) : 0;
         scheduleDecodeBatch(feedback, build, candidates);
@@ -2100,7 +2119,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
     }
 
     const bool prefill_phases_skipped = interval_owes_decodes && build.pushed_decode;
-    if (allow_prefill && !prefill_phases_skipped) {
+    if (build.options.allow_prefill && !prefill_phases_skipped) {
         // Resident chunks are held back with the fresh prompts: a chunk that
         // keeps extending every round would keep the whole attention-DP group
         // out of its decode path for exactly as long, which is what batching
@@ -2152,7 +2171,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     // The candidates arrive in submission order (requests_ is the FIFO),
     // identical on every rank -- so within a phase, older requests win.
     AdmissionFeedback feedback;
-    PlanBuild build{plan};
+    PlanBuild build{plan, options};
     build.token_budget = config_.max_scheduled_tokens;
     build.kv_page_budget = config_.max_kv_page_num;
     switch (config_.role) {
@@ -2163,7 +2182,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
             buildDecodeWorkerPlan(feedback, build, candidates, write_back_operations);
             break;
         case Role::kFused:
-            buildFusedPlan(feedback, build, candidates, write_back_operations, options.allow_prefill);
+            buildFusedPlan(feedback, build, candidates, write_back_operations);
             break;
     }
 

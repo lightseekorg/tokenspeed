@@ -26,7 +26,7 @@ scheduler half is `Scheduler::PlanOptions::allow_prefill` and
 ## 1. The two attempt points
 
 The gate counts rounds since the last round that scheduled prefill work
-(`rounds_since_prefill`, the analogue of DeepInfer's `decode_step`):
+(`rounds_since_prefill`):
 
 | Point | When | Opens when |
 | --- | --- | --- |
@@ -58,31 +58,23 @@ disaggregated launch.
 
 `Scheduler::ProbePrefillGate` answers two questions, read once per round:
 
-* `wants_prefill`: a resident chunk or an admitted prompt is waiting **and**
-  the Device pool is at most `kPrefillWatermark` (0.9) full. An admitted
-  prompt still waiting on its storage read counts: it holds no schedulable
-  chunk yet, but it is the prefill work the gate batches around. Above the
-  watermark an admission would retract a decoding victim, and the gate exists
-  to batch prefills, not to trade them for decodes.
+* `wants_prefill`: a resident chunk is waiting, **or** a new prompt is
+  waiting and the Device pool is at most `kPrefillWatermark` (0.9) full. A
+  prompt still waiting on its storage read counts as new work: it holds no
+  schedulable chunk or Device reservation yet.
 * `has_decode_work`: the round would otherwise run a first decode or a
   decoding request.
 
 A rank with no decode work protects nothing, so the ALL point does not treat
 it as a blocker: `open = all(want || !decodes)`. A strict `all(want)` would
 hold a prompt in an otherwise idle engine for a whole `any_interval`, and
-would stall the first ranks of a batch whose peers already finished. This is
-the one deliberate difference from DeepInfer, whose ranks cannot decode while
-another rank extends and so must all want prefill for the group to make
-progress.
+would stall the first ranks of a batch whose peers already finished.
 
-The watermark is part of the vote, so it also bounds what ANY can open: a
-rank above 0.9 does not open the group's gate, and its backlog then waits for
-the pool to drain below the watermark rather than for `any_interval`. That is
-the intended trade — the watermark exists to keep prefill from retracting
-decodes, and a forced prefill above it would do exactly that. Such a rank's
-wait is then bounded by its workload rather than by `any_interval`: the
-backlog is admitted once the pool falls back below the watermark, which is
-the soonest an admission would not cost a decode.
+For new prompts the watermark also bounds what ANY can open: a rank above
+0.9 with no resident chunk does not vote to open the group's gate. Its new
+backlog waits for occupancy to fall to the watermark or below, so its wait
+depends on the workload, not only `any_interval`. Resident chunks remain
+eligible at high occupancy and can finish to release their reservations.
 
 ## 3. Agreement without a second collective
 
@@ -105,13 +97,10 @@ with nothing to schedule plans exactly as a closed one.
 The vote is the group's *permission*, not an order to every rank. A rank
 plans prefill only when the vote opens **and** its own `wants_prefill` is
 true, read fresh from the scheduler at plan time rather than from the
-gathered copy. The two differ when a rank holds prefill back on purpose: at
-the watermark it publishes `want=false`, and at an ANY point its peers'
-backlog opens the group's window regardless. Without the local half, that
-window would drag it into an admission it was holding back on purpose — the
-prefill it would retract a decode for. With it, the window batches the same
-prefills for the ranks that do want them, and the rank that does not keeps
-decoding through it.
+gathered copy. Above the watermark a rank with only new prompts publishes
+`want=false`, even if its peers open an ANY window. A resident chunk makes
+the local vote true regardless of pressure, but the scheduler still checks
+the watermark before admitting new prompts in that plan.
 
 Without attention DP there is no group to agree with: the same gate runs on
 the rank's own probe, and only its batching effect remains.
