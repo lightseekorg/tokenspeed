@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import gc
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -108,7 +109,20 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
-def get_batch_sizes_to_capture(config: ModelExecutorConfig):
+@dataclasses.dataclass(frozen=True)
+class DecodeLadderArgs:
+    """The executor config fields the decode graph ladder is built from
+    (``get_batch_sizes_to_capture``), as ``ModelExecutorConfig.from_server_args``
+    takes them."""
+
+    cudagraph_capture_sizes: list[int] | None
+    max_num_seqs: int
+    data_parallel_size: int
+    disable_cuda_graph_padding: bool
+    max_cudagraph_capture_size: int
+
+
+def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
     effective_max = min(config.max_cudagraph_capture_size, max_bs)

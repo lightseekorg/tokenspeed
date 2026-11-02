@@ -90,6 +90,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import multicast_backend_available
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
@@ -109,6 +110,8 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.forward_step import (
+    DecodeLadderArgs,
+    get_batch_sizes_to_capture,
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -200,6 +203,7 @@ from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoELayer
 
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.multimodal.encoder_cudagraph import (
@@ -835,6 +839,27 @@ def _apply_attn_res(
         num_valid_blocks=num_valid_blocks,
         block_write_idx=block_write_idx,
     )
+
+
+def _decode_graph_rows() -> set[int]:
+    """Token rows of each decode graph the executor captures (its resolved batch
+    ladder); speculative verify runs the verify width per request."""
+    args = global_server_args_dict
+    per_request = (
+        int(args["speculative_num_draft_tokens"])
+        if args["speculative_algorithm"]
+        else 1
+    )
+    ladder = get_batch_sizes_to_capture(
+        DecodeLadderArgs(
+            cudagraph_capture_sizes=args["cudagraph_capture_sizes"],
+            max_num_seqs=args["max_num_seqs"],
+            data_parallel_size=args["mapping"].attn.dp_size,
+            disable_cuda_graph_padding=args["disable_cuda_graph_padding"],
+            max_cudagraph_capture_size=args["max_cudagraph_capture_size"],
+        )
+    )
+    return {batch * per_request for batch in ladder}
 
 
 def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
@@ -2159,6 +2184,8 @@ class KimiLinearMoE(nn.Module):
             activation_situ_linear_beta=situ_linear_beta,
         )
         self.packed_input_projection_weight: torch.Tensor | None = None
+        # TP8 decode chain over Lamport mailboxes; bound by prepare_communication_runtime.
+        self.decode_moe: KimiK3DecodeMoELayer | None = None
 
         if mapping.attn.dp_size > 1:
             self.moe_alltoall = None
@@ -2820,6 +2847,14 @@ class KimiLinearMoE(nn.Module):
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
             return prefix_sum
+        if (
+            self.decode_moe is not None
+            and ctx is not None
+            and ctx.forward_mode.is_decode()
+            and not prefix_is_sharded
+            and num_tokens in self.decode_moe.owner.batches
+        ):
+            return self.decode_moe.run(hidden_states, prefix_sum)
 
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
@@ -3929,7 +3964,91 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     moe_comm = moe.comm
         if moe_comm is not None:
             prepared = moe_comm.prepare(max_num_tokens) or prepared
+        prepared = self._prepare_decode_moe() or prepared
         return bool(shared_mlps) or prepared
+
+    def _prepare_decode_moe(self) -> bool:
+        """Bind the TP8 decode MoE chain to every MoE layer it can serve."""
+        mapping = self.mapping
+        if not (
+            current_platform().is_blackwell
+            and mapping.attn.dp_size == 1
+            and mapping.pp_size == 1
+            and mapping.attn.tp_size == 8
+            and mapping.moe.tp_size == 8
+            and mapping.moe.ep_size == 1
+            and mapping.attn.tp_group == mapping.moe.tp_ep_group
+        ):
+            return False
+        layers = [
+            layer
+            for layer in self.model.layers
+            if isinstance(layer, KimiLinearDecoderLayer) and layer.is_moe_layer
+        ]
+        # The tail rotates three mailbox parities, which 3k + 1 MoE layers collide on.
+        if (
+            not layers
+            or len(layers) % 3 == 1
+            or not all(
+                isinstance(moe, KimiLinearMoE)
+                and moe.execution_plan.use_trtllm
+                and moe.experts.plan["weight_dtype"] == "mxfp4"
+                and moe.routed_expert_down_proj.narrowed
+                and moe.routed_expert_up_proj.narrowed
+                and moe.routed_expert_norm is not None
+                and moe.shared_experts.shared_parallel is None
+                for moe in (layer.block_sparse_moe for layer in layers)
+            )
+        ):
+            return False
+        from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
+            BATCHES,
+            KimiK3DecodeMoE,
+        )
+
+        batches = tuple(sorted(_decode_graph_rows() & set(BATCHES)))
+        if not batches:
+            return False
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        group = pg_manager.get_device_process_group(mapping.moe.tp_ep_group)
+        if not multicast_backend_available(group):
+            return False
+        beta, linear_beta = _situ_betas(self.config)
+        owner = KimiK3DecodeMoE(
+            group=group,
+            batches=batches,
+            moe_layers=len(layers),
+            beta=beta,
+            linear_beta=linear_beta,
+        )
+        for ordinal, layer in enumerate(layers):
+            moe = layer.block_sparse_moe
+            norm = moe.routed_expert_norm
+            moe.decode_moe = owner.layer(
+                ordinal=ordinal,
+                layer_idx=layer.layer_id,
+                router=moe.gate.weight,
+                correction_bias=moe.gate.e_score_correction_bias,
+                routed_scaling_factor=moe.routed_scaling_factor,
+                renormalize=self.config.moe_renormalize,
+                down_shard=moe.routed_expert_down_proj.weight,
+                shared_gate_up=moe.shared_experts.gate_up_proj.weight,
+                shared_down=moe.shared_experts.down_proj.weight,
+                w13=moe.experts.w13_weight,
+                w13_scale=moe.experts.w13_weight_scale,
+                w2=moe.experts.w2_weight,
+                w2_scale=moe.experts.w2_weight_scale,
+                norm_weight=norm.weight,
+                norm_eps=norm.variance_epsilon,
+                up_shard=moe.routed_expert_up_proj.weight,
+            )
+        logger.info(
+            f"K3 decode MoE chain bound to {len(layers)} layers for batches {batches}"
+        )
+        return True
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
