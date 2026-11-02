@@ -97,6 +97,10 @@ if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
             csrc
     )
 
+    install(FILES third_party/folly/LICENSE third_party/folly/NOTICE.md
+        DESTINATION tokenspeed_scheduler/third_party/folly
+    )
+
     install(TARGETS tokenspeed_scheduler_ext
         LIBRARY DESTINATION tokenspeed_scheduler
     )
@@ -137,6 +141,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_pending_prefix_store.cpp
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_capacity_model.cpp
+        tests/cpp/test_admission_order.cpp
         tests/cpp/test_shadow_occupancy.cpp
         tests/cpp/test_closed_loop_random.cpp
     )
@@ -156,6 +161,11 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
 
     include(GoogleTest)
     gtest_discover_tests(tokenspeed_scheduler_tests)
+
+    add_executable(tokenspeed_scheduler_admission_order_benchmark
+        tests/cpp/benchmark_admission_order.cpp
+    )
+    target_link_libraries(tokenspeed_scheduler_admission_order_benchmark PRIVATE tokenspeed_scheduler_core)
 
     # Not registered with CTest: it reports timings on stdout rather than
     # asserting, so it is built on demand and read by a human.

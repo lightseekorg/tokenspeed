@@ -1511,6 +1511,25 @@ erased, or re-keyed during traversal. Commit-time index mutations happen after
 the planner is destroyed. A full traversal costs O(N), including pinned entries,
 without a separate tree lookup per epoch.
 
+Within one group and access epoch, `NextEvictionEpoch` emits physical locations
+in `(lcm_block_id, slot_index)` order. Filtering preserves that order. For at
+least 128 candidates all in the closed-prefix tier, admission uses a stable
+32-bit radix sort of position rank; stability preserves the physical-location
+tie-break. Its key maps `[-INT32_MAX, 0]` monotonically to unsigned integers,
+so nearby suffix positions share upper bytes. Each pass has 256 buckets and
+skips uniform bytes; workspace grows with candidate count, not position range.
+Smaller sets and mixed tiers retain the full tuple comparison sort. The victim
+policy and cross-group merge order are unchanged. The radix path allocates
+one candidate-sized temporary buffer per epoch; the comparison path remains
+in-place.
+
+A CPU-only sorter benchmark is built with
+`cmake --build <build-dir> --target tokenspeed_scheduler_admission_order_benchmark`
+when `TOKENSPEED_SCHEDULER_BUILD_TESTS=ON`. Use a Release build and run that
+executable to obtain paired comparison/radix timings for dense, sparse, equal
+and mixed-tier keys. Vector preparation is outside the timed region; this
+benchmark does not measure complete admission or serving latency.
+
 ## The cache pipeline: layers → group → pack → bind
 
 Every model family's cache is built by the same four-stage pipeline, and the
