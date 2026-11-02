@@ -2701,8 +2701,10 @@ class ServerArgs:
             default=ServerArgs.prefill_decode_interval,
             help="After a round that runs a prefill chunk, run this many decode "
             "rounds before the next prefill round, unless no decode can run. "
-            "Every chunk starts a new interval. Trades TTFT for fewer decode "
-            "stalls. Aggregated serving only. 0 (the default) is off.",
+            "Every chunk starts a new interval, but no prompt is held back "
+            "more than this many decode rounds in total. Trades TTFT for "
+            "fewer decode stalls. Aggregated serving only. 0 (the default) is "
+            "off.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",

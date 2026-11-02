@@ -1671,13 +1671,16 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // the running decodes N decode rounds: until they have run, decodes are
 // scheduled first, and a round that scheduled any skips the prefill phases.
 // A round with no decode to schedule runs prefill work as usual, so the
-// engine never idles to honour the interval.
+// engine never idles to honour the interval. No prompt is held back more
+// than N rounds in total, across its chunks and other prompts' intervals: a
+// prompt held back N rounds suspends the interval, and the round runs as if
+// none were owed.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
-    const bool defer_prefill = prefill_deferral_rounds_left_ > 0;
+    const bool defer_prefill = prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates);
     if (config_.enable_mixed_prefill_decode) {
         // A deferred prefill joins no decode, so the decodes keep its reserve.
         const bool has_local_prefill = !defer_prefill && std::ranges::any_of(candidates, [](const Request* request) {
@@ -1689,7 +1692,8 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    if (!(defer_prefill && build.pushed_decode)) {
+    const bool prefill_deferred = defer_prefill && build.pushed_decode;
+    if (!prefill_deferred) {
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
     }
 
@@ -1697,14 +1701,36 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
+    // The prompts this round held back, taken before a retraction can make
+    // one of them its victim: that one sat the round out all the same.
+    std::vector<Request*> held_back;
+    if (prefill_deferred) {
+        std::ranges::copy_if(candidates, std::back_inserter(held_back), [](const Request* request) {
+            return request->IsAnyOf<fsm::Submitted, fsm::Prefilling>();
+        });
+    }
+
     maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
 
-    // A retraction's grant may have scheduled the prefill, so count last.
+    // A retraction's grant may have scheduled the prefill, so count last; a
+    // prompt the grant scheduled was not held back.
+    for (Request* request : held_back) {
+        if (!build.Scheduled(*request)) {
+            request->NotePrefillDeferred();
+        }
+    }
     if (build.pushed_prefill) {
         prefill_deferral_rounds_left_ = config_.prefill_decode_interval;
     } else if (build.pushed_decode && prefill_deferral_rounds_left_ > 0) {
         --prefill_deferral_rounds_left_;
     }
+}
+
+bool Scheduler::prefillDeferralExhausted(std::span<Request* const> candidates) const {
+    return std::ranges::any_of(candidates, [this](const Request* request) {
+        return request->IsAnyOf<fsm::Submitted, fsm::Prefilling>() &&
+               request->PrefillDeferredRounds() >= config_.prefill_decode_interval;
+    });
 }
 
 Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,

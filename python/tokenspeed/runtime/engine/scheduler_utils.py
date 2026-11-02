@@ -165,8 +165,8 @@ def make_config(
             tier holds retraction images only.
         prefill_decode_interval: ``--prefill-decode-interval``: decode rounds
             owed to the running decodes after each round that schedules a
-            prefill chunk, unless no decode can run; 0 is off. Fused role
-            only.
+            prefill chunk, unless no decode can run, and the most rounds it
+            holds any one prompt back in total; 0 is off. Fused role only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request

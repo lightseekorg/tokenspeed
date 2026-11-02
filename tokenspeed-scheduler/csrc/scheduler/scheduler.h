@@ -468,6 +468,10 @@ private:
                                std::vector<WriteBackOperation>& write_back_operations);
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
+    // True when a local-prefill candidate has been held back by the
+    // prefill/decode interval for prefill_decode_interval rounds in total
+    // (docs/design/scheduler.md §3.3).
+    bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
