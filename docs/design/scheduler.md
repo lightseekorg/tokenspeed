@@ -1024,7 +1024,7 @@ how a segment is recorded, placed, published or dropped is in [Cache
 concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator).
 A plan that grants the evicted pages away in place — a request's own reclaim,
 a restore, or the capacity retraction's grant retry and its empty-round
-decode batch (§3.2, `AdmissionDeferPolicy::kEvictInPlace`) — rides the
+decode batch (§2, `AdmissionDeferPolicy::kEvictInPlace`) — rides the
 stream-ordered lane, like the image's legs: the runtime orders the copy ahead
 of the plan's page reuse. A plan funding itself only by
 evicting cache blocks defers instead: the eviction runs, the stores pin the

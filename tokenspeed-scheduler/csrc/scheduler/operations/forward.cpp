@@ -1194,8 +1194,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     // sacrificed. Pages this round's deferred evictions still pin
     // (EvictedBlock::device_ref) gate the same way: the drain right after
     // this build moves them into such a ticket. (Stream-ordered stores --
-    // both legs of an image, and eviction write-backs -- hold nothing and
-    // gate nothing; an in-flight restore gates nothing because its request
+    // both legs of an image, and an in-place plan's eviction write-backs --
+    // hold nothing and gate nothing; an in-flight restore gates nothing because its request
     // is Restoring, invisible to chooseVictim.)
     if (tier_transfers_.HasLoadBacksInFlight() || tier_transfers_.HasPinnedStoresInFlight() ||
         coordinator_.HasDeferredEvictionPages()) {
