@@ -22,11 +22,11 @@
 
 import itertools
 import math
-import socket
 
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+from tokenspeed_kernel.ops.communication.fabric import _host_identity
 from tokenspeed_kernel.platform import current_platform
 
 with redirect_triton_to_tokenspeed_triton():
@@ -77,10 +77,10 @@ def _gather_through_store(name: str, value: str) -> list[str]:
 
 
 def _job_spans_hosts() -> bool:
-    """Whether the world spans hosts."""
+    """Whether the world spans hosts, told apart by boot id rather than hostname."""
     if dist.get_world_size() == 1:
         return False
-    return len(set(_gather_through_store("hostname", socket.gethostname()))) > 1
+    return len(set(_gather_through_store("host", str(_host_identity())))) > 1
 
 
 def world_in_one_fabric_domain() -> bool:

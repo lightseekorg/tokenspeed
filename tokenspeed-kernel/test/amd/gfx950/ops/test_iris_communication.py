@@ -176,6 +176,34 @@ def test_context_picks_vmem_chunked_only_for_gfx1250_across_hosts(
     assert created == [expected]
 
 
+def _host_span_worker_fn(rank, world_size, port, distinct_hosts, error_dict):
+    try:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        from tokenspeed_kernel.ops.communication import _iris
+
+        # Every rank shares this machine's hostname, so only the host identity
+        # can tell the ranks apart.
+        _iris._host_identity = lambda: rank if distinct_hosts else 7
+        assert _iris._job_spans_hosts() is distinct_hosts
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("distinct_hosts", [True, False])
+def test_hosts_are_told_apart_by_identity_not_hostname(distinct_hosts):
+    _spawn_and_collect(
+        _host_span_worker_fn, (2, _get_open_port(), distinct_hosts), world_size=2
+    )
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------

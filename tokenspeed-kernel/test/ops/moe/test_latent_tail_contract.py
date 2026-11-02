@@ -301,7 +301,7 @@ def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
             mock.patch.object(
                 fabric,
                 "current_platform",
-                return_value=mock.Mock(is_nvidia=False),
+                return_value=mock.Mock(is_nvidia=False, is_cdna5=False),
             ),
             mock.patch.object(
                 fabric.torch.distributed, "get_world_size", return_value=8
@@ -317,9 +317,56 @@ def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
             # Distinct hosts, so every span declines rather than being admitted
             # as node-local on a platform that has no fabric to map.
             assert fabric.group_host_span([0, 1]) == 2
+            assert fabric.world_in_one_fabric_domain() is False
     finally:
         fabric._fabric_map = None
         fabric._host_map = None
+
+
+@pytest.mark.parametrize("one_domain", [True, False])
+def test_gfx1250_records_whether_the_world_is_in_one_fabric_domain(
+    one_domain: bool,
+) -> None:
+    """gfx1250 records Iris's fabric-domain verdict at the same initialization.
+
+    Iris and a process group are replaced, since the verdict itself needs
+    fabric hardware across hosts.
+    """
+    import sys
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication as communication
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    fake_iris = mock.Mock(world_in_one_fabric_domain=lambda: one_domain)
+    fabric._fabric_map = None
+    try:
+        with (
+            mock.patch.object(
+                fabric,
+                "current_platform",
+                return_value=mock.Mock(is_nvidia=False, is_cdna5=True),
+            ),
+            mock.patch.dict(
+                sys.modules,
+                {"tokenspeed_kernel.ops.communication._iris": fake_iris},
+            ),
+            mock.patch.object(communication, "_iris", fake_iris, create=True),
+            mock.patch.object(
+                fabric.torch.distributed, "get_world_size", return_value=8
+            ),
+            mock.patch.object(
+                fabric.torch.distributed,
+                "all_gather",
+                side_effect=AssertionError("no NCCL gather off NVIDIA"),
+            ),
+        ):
+            assert fabric.gather_fabric_map() == [False] * 8
+            assert fabric.world_in_one_fabric_domain() is one_domain
+    finally:
+        fabric._fabric_map = None
+        fabric._host_map = None
+        fabric._one_fabric_domain = False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the gather needs a device")
