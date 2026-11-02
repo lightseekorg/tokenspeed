@@ -1067,7 +1067,7 @@ Its responsibilities:
   Equal epochs prefer
   evicting one child; group and physical location break remaining ties. A
   prefix hit refreshes its access epoch -- a Device hit those of the Host
-  copies of what it hits, too (its pages, its tail and its checkpoint), so
+  copies of what it hits, too (its pages, its tail, and its checkpoint), so
   the Host ages a prefix by its use, not by when it was stored -- and earlier
   reuse grants no
   additional protection. Pinned entries, partially pinned foreign parents,

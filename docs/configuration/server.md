@@ -993,13 +993,13 @@ With `--enable-metrics`, the rank that reports the scheduler's metrics (the
 first attention-TP rank of each attention-DP rank) also exports how the
 prefix cache served each request's first admission and what Host L2
 evicted. They are the C++ scheduler's cumulative counters, sampled at most
-once a second, with the `model_name`, `app_key` and `dp_rank` labels; a
+once a second, with the `model_name`, `app_key`, and `dp_rank` labels; a
 series appears once it first grows.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `tokenspeed:prefix_cache_prompt_tokens_total` | Counter | `tier` | Prompt tokens of first admissions by the tier that served them: `device` (GPU prefix-cache hits), `host` (the KV Host L2 loads; a hit that a Host L2 State checkpoint extends over GPU KV counts as `device`) and `none` (computed, the always-recomputed last prompt token included). On a decode node, `none` is what the prefill node sends. |
-| `tokenspeed:l2_evicted_blocks_total` | Counter | `reason` | Host L2 entries evicted, as blocks over every cache group: `lru` (least recently used, to make room), `duplicate`, `duplicate_kv` and `superseded` (`write_back`: a copy of what the GPU resumes from, a KV block the GPU also holds, a prompt-end checkpoint its request continued past on the GPU), `dead_entry` (nothing can resume from it any more), `tail_cap` (the oldest of more than 8 prompt ends cached inside one page), `flush`. |
+| `tokenspeed:prefix_cache_prompt_tokens_total` | Counter | `tier` | Prompt tokens of first admissions by the tier that served them: `device` (GPU prefix-cache hits), `host` (the KV Host L2 loads; a hit that a Host L2 State checkpoint extends over GPU KV counts as `device`), and `none` (computed, the always-recomputed last prompt token included). On a decode node, `none` is what the prefill node sends. |
+| `tokenspeed:l2_evicted_blocks_total` | Counter | `reason` | Host L2 entries evicted, as blocks over every cache group: `lru` (least recently used, to make room), `duplicate`, `duplicate_kv`, and `superseded` (`write_back`: a copy of what the GPU resumes from, a KV block the GPU also holds, a prompt-end checkpoint its request continued past on the GPU), `dead_entry` (nothing can resume from it any more), `tail_cap` (the oldest of more than 8 prompt ends cached inside one page), `flush`. |
 | `tokenspeed:l2_evicted_then_needed_tokens` | Histogram | `reason` | First admissions whose hit stopped at blocks Host L2 evicted recently (below). `_count` counts them and `_sum` their prompt tokens past the hit (buckets 1 Ki to 1 Mi tokens), under the reason the first of those blocks was evicted for. Never on a decode node, whose prompt the prefill node computes. |
 | `tokenspeed:l2_evicted_block_idle_seconds` | Histogram | `kind` (`kv`, `state`), `reason` | Per entry evicted (not flushed), how long it had gone unused as Host LRU sees it: the time since its access epoch was issued (buckets 0.5 s to 1 h), by its store on Host L2 or by the last admission that used it on either tier, whichever was later. A copy `write_back` makes when the GPU evicts a page is stored with its GPU entry's epoch, which the request that last used or published it there issued: a page published after a long decode counts from that request's admission. The epoch's time is known to within 0.1 s plus one scheduler step; an entry over an hour old is observed at a lower bound of at least an hour. An entry re-dated to epoch 0 (a superseded State input) is counted in `l2_evicted_blocks_total` but not observed here, and so, during the first hour, is one whose epoch predates the clock's first sample. |
 
@@ -1018,10 +1018,10 @@ more often. It says where the hit
 stopped, not what keeping those blocks would have saved: a hybrid model may
 also need a checkpoint further on. Nothing past that page is looked at, so a
 sliding-window model's window published further on is missed, as are the
-full-page checkpoints of a model without KV groups and all but the last four
+full-page checkpoints of a model without KV groups and all but the last 4
 prompt ends evicted inside one page.
 
-Under `write_through` only `lru`, `tail_cap` and `flush` occur. The prefix
+Under `write_through` only `lru`, `tail_cap`, and `flush` occur. The prefix
 hit rate, and the share of computed prompt tokens in admissions a recent
 Host eviction stopped:
 
