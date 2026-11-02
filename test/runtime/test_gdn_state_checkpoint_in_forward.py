@@ -491,6 +491,15 @@ class TestGdnStateCheckpointInForward:
             recurrent[resumed] = resumed_recurrent
             return backend, conv, recurrent
 
+        def inputs(tokens):
+            # Each round reads its own copy: a verify whose kernel takes the
+            # projection by stride runs its conv update in place over it.
+            return dict(
+                mixed_qkv=raw.clone()[tokens],
+                a=a.clone()[tokens],
+                b=b.clone()[tokens],
+            )
+
         def forward(backend, bs, forward_mode, tokens):
             return backend.forward_extend(
                 None,
@@ -501,10 +510,8 @@ class TestGdnStateCheckpointInForward:
                 token_to_kv_pool=backend.kv_pool,
                 bs=bs,
                 forward_mode=forward_mode,
-                mixed_qkv=raw[tokens],
-                a=a[tokens],
-                b=b[tokens],
                 seq_len=tokens.stop - tokens.start,
+                **inputs(tokens),
                 **self.common,
             )
 
@@ -544,9 +551,7 @@ class TestGdnStateCheckpointInForward:
             out_cache_loc=None,
             token_to_kv_pool=verify.kv_pool,
             bs=2,
-            mixed_qkv=raw[prefill_tokens:],
-            a=a[prefill_tokens:],
-            b=b[prefill_tokens:],
+            **inputs(slice(prefill_tokens, total)),
             **self.common,
         )
         verify.commit_state_after_acceptance(
@@ -557,18 +562,15 @@ class TestGdnStateCheckpointInForward:
         # The EXTEND stores both checkpoints, into blocks 3 and 6.
         assert extend_conv[[3, 6]].abs().amax().item() > 0
         assert extend_recurrent[[3, 6]].abs().amax().item() > 0
-        # The extend rows, their blocks and their checkpoints match the EXTEND.
+        # The extend rows, their blocks and their checkpoints match the EXTEND;
+        # the verify rows and their blocks match the verify round.
         tokens = extend_output[0].shape[0]
         assert torch.equal(output[:tokens], extend_output[0])
         assert torch.equal(conv[:7], extend_conv[:7])
         assert torch.equal(recurrent[:7], extend_recurrent[:7])
-        # The verify rows match a separate verify round for an FP32 State only:
-        # with a BF16 State the two rounds' verify paths already diverge
-        # before this change, which is not what this test covers.
-        if state_dtype == torch.float32:
-            assert torch.equal(output[tokens:], verify_output[0])
-            assert torch.equal(conv[7:], verify_conv[7:])
-            assert torch.equal(recurrent[7:], verify_recurrent[7:])
+        assert torch.equal(output[tokens:], verify_output[0])
+        assert torch.equal(conv[7:], verify_conv[7:])
+        assert torch.equal(recurrent[7:], verify_recurrent[7:])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
