@@ -573,8 +573,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                 group. Under a shard every vocab shard must see every row's
                 id, so the ids are all-gathered to the span, the partial
                 lookup runs over the span and the sum is reduce-scattered
-                back to the shard's rows: the same bytes as the replicated
-                all-reduce, the rows this rank holds.
+                back to the shard's rows (the gather and the reduce-scatter
+                share the shard's gather order, so no permutation is
+                needed): the same bytes as the replicated all-reduce, the
+                rows this rank holds.
 
         Returns:
             The output tensor.

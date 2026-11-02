@@ -1116,7 +1116,7 @@ class PrefillGraph:
         On a query-sharding engine (``config.query_shard_size > 1``) the
         dummy carries the shard plan a real extend of these rows would, so the
         one extend form the engine runs is what startup tunes on; the model
-        then takes ``ctx.query_shard.local_slice`` of the span, as
+        then takes ``ctx.query_shard.local_row_ids`` of the span, as
         ``ModelExecutor._run_target_forward`` does. (Query sharding refuses
         the prefill graph, so this serves the autotune alone.)
         """
@@ -1163,6 +1163,7 @@ class PrefillGraph:
                 input_lengths=seq_lens,
                 size=self.config.query_shard_size,
                 rank=self.config.query_shard_rank,
+                device=self.config.device,
             )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,

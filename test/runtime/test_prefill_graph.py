@@ -820,6 +820,8 @@ class TestDummyGroupTablesTest:
         one, so the autotune's dummy carries the plan a real extend of these
         rows would -- on the context and in the metadata hand-off -- and an
         engine that does not shard carries none."""
+        import torch
+
         from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
         spec = _spec("full_attention", block_granularity=64)
@@ -832,16 +834,16 @@ class TestDummyGroupTablesTest:
             query_shard=(4, 3),
         )
         plan = seen["ctx"].query_shard
-        assert (plan) == (
-            QueryShardPlan.from_forward(
-                total_tokens=1737, input_lengths=[869, 868], size=4, rank=3
-            )
+        expected = QueryShardPlan.from_forward(
+            total_tokens=1737, input_lengths=[869, 868], size=4, rank=3, device="cpu"
         )
+        assert plan.rank == 3 and plan.row_counts == expected.row_counts
+        assert torch.equal(plan.local_row_ids, expected.local_row_ids)
         assert (seen["query_shard"]) is (plan)
         assert (sum(plan.row_counts)) == (1737)
         assert (plan.local_rows) == (plan.row_counts[3])
         # The whole span still fills the buffers and the metadata; the model
-        # takes its slice (ModelExecutor.autotune).
+        # takes its rows (ModelExecutor.autotune).
         assert (seen["num_tokens"]) == (1737)
         assert (seen["extend_seq_lens_cpu"].tolist()) == ([869, 868])
         unsharded = self._dummy_batch_probe(

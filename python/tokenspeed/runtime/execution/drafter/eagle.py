@@ -298,10 +298,10 @@ class Eagle(BaseDrafter):
         The first-step input shape matches the base model's: ragged
         ``[prefill_part || decode_part]`` under MIXED, full prefill chunks
         under EXTEND, ``base_model_output`` directly under DECODE. Under a
-        query shard the ids are the shard's slice of the shifted prefill
-        ids while ``gather_ids`` keep the batch's full layout, as on the
-        target's forward: the draft model's exit cuts them to its shard
-        through ``QueryShardPlan.local_sampled_ids`` when it gathers the
+        query shard the ids are the shard's rows of the shifted prefill
+        ids (``QueryShardPlan.local_row_ids``) while ``gather_ids`` keep the batch's full layout, as on the
+        target's forward: the draft model's exit selects the shard's rows
+        with ``QueryShardPlan.local_sampled_index`` when it gathers the
         sampled rows across the group.
         """
         num_extends = draft_input.num_extends
@@ -344,7 +344,7 @@ class Eagle(BaseDrafter):
                     raise RuntimeError(
                         "a query-sharded draft step runs pure extend rounds"
                     )
-                input_ids = input_ids[plan.local_slice]
+                input_ids = input_ids[plan.local_row_ids]
         else:
             input_ids = draft_input.base_model_output
             gather_ids = (
@@ -417,7 +417,7 @@ class Eagle(BaseDrafter):
         rows = (
             slice(0, input_num_tokens)
             if draft_input.query_shard is None
-            else draft_input.query_shard.local_slice
+            else draft_input.query_shard.local_row_ids
         )
 
         dsa_topk = draft_input.dsa_topk
@@ -446,7 +446,6 @@ class Eagle(BaseDrafter):
                     input_start_offsets=buffers.input_start_offsets_buf[: bs + 1],
                     active_request_mask=buffers.active_request_mask_buf[:bs],
                     committed_lengths=self.runtime_states.valid_cache_lengths,
-                    row_offset=rows.start,
                 )
             )
         logits_output = self.draft_model_runner.forward(
@@ -560,7 +559,6 @@ class Eagle(BaseDrafter):
                             self.input_buffers.active_request_mask_buf[:bs]
                         ),
                         committed_lengths=self.draft_history_lengths_buf,
-                        row_offset=0,
                     )
                 )
             with nvtx_range("draft_forward", color="red"):

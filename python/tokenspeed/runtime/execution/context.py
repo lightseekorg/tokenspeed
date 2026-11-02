@@ -104,11 +104,14 @@ class InputLogprobRows:
     it belongs to (for per-request NaN flags) -- the whole plan's, in row
     order, on every rank, since every rank scores every row: the head is
     vocab-sharded, so a row's logits need every rank. Under a query shard
-    ``rows`` are the plan's rows inside the shard, re-based to it, and
+    ``rows`` are the plan's rows inside the shard, as indices into it,
     ``rows_per_rank`` is the plan's row count on every rank of the group,
     the split of the activation gather that puts the whole plan's rows on
-    every rank; without a shard it is ``None`` and ``rows`` are already the
-    whole plan's. All index tensors are int64 on the device. ``chunk_tokens``
+    every rank, and ``gathered_to_rows`` puts the gathered rows (rank by
+    rank) back in row order (``QueryShardPlan.split_rows``); without a shard
+    both must be passed explicitly as ``None`` and ``rows`` are already the
+    whole plan's. All index
+    tensors are int64 on the device. ``chunk_tokens``
     bounds how many rows the processor pushes through the LM head at once (a
     memory knob, not a numerics one: log-softmax is row-local).
     """
@@ -119,6 +122,7 @@ class InputLogprobRows:
     num_input_rows: int
     chunk_tokens: int
     rows_per_rank: tuple[int, ...] | None
+    gathered_to_rows: torch.Tensor | None
     # The plan's ``top_k``: how many most likely next tokens every row also
     # returns (0 for none).
     top_k: int = 0
@@ -164,8 +168,8 @@ class ForwardContext:
     all_decode_or_idle: bool = False
     all_extend: bool = False
     # --- query context parallelism ---
-    # The rows this rank computes of a sharded extend forward (plain host
-    # integers); None means every rank computes every row. ``input_num_tokens``
+    # The rows this rank computes of a sharded extend forward (its zigzag
+    # segments of every request); None means every rank computes every row. ``input_num_tokens``
     # and ``global_num_tokens`` keep the scheduler's full-chunk meaning, the
     # model's row axis is the shard.
     query_shard: QueryShardPlan | None = None

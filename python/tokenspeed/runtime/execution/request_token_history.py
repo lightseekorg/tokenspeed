@@ -34,7 +34,10 @@ class RequestTokenHistoryView:
     A model whose profile declares ``request_token_history`` receives this as
     its ``request_token_history`` forward argument. Every tensor is a view of
     a persistent buffer, so a captured graph reads the same storage on every
-    replay.
+    replay. ``input_start_offsets`` describe the whole packed batch; under
+    query context parallelism the model's ``input_ids`` are its shard of it
+    (``ctx.query_shard``), and a model that reads the history gathers its
+    ids to the whole span first.
 
     Attributes:
         history_token_ids: ``[pool + 1, capacity]`` int32. Row ``s`` holds
@@ -49,12 +52,6 @@ class RequestTokenHistoryView:
             request's inputs in the forward's ``input_ids``.
         active_request_mask: ``[bs]`` bool; False rows are graph padding and
             must neither read nor append history.
-        row_offset: Batch-global row of the forward's first local input row.
-            ``input_start_offsets`` describe the whole packed batch; under
-            query context parallelism the model's ``input_ids`` are the shard
-            ``[row_offset, row_offset + local_rows)`` of it, so local row ``j``
-            is global row ``row_offset + j``. Zero when every rank computes
-            every row.
     """
 
     history_token_ids: torch.Tensor
@@ -62,7 +59,6 @@ class RequestTokenHistoryView:
     req_pool_indices: torch.Tensor
     input_start_offsets: torch.Tensor
     active_request_mask: torch.Tensor
-    row_offset: int
 
 
 __all__ = ["RequestTokenHistoryView"]

@@ -183,8 +183,9 @@ rows but may own pages of rows another rank computed, so the write gathers
 before it stores: `latent_prologue(..., key_rows=QueryShardGather(plan,
 group))` runs `mla_prologue(cache=None)` over the local rows — the composite's
 rotation with no store, returning the rotated latent — all-gathers that
-latent over the query group with the plan's per-rank row counts into the
-whole span (every rank holds the span's slots), and stores it through the
+latent over the query group with the plan's per-rank row counts, puts the
+gathered rows in span order (`plan.to_span_order`; every rank holds the
+span's slots), and stores it through the
 same `resolve_cache_slots` target with `latent_store`, the composite's store
 step on its own. Rotation and store round once each way, so the stored rows
 and the query are byte-equal to the fused one-launch write of both the

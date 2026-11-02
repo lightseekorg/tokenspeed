@@ -72,7 +72,7 @@ KV_DIM = 8
 INDEX_HEAD_DIM = 128
 WORLD = 4
 # Three requests: prefix + chunk rows. The chunk rows (extend lengths) make a
-# 10-row span sharded [3, 3, 2, 2] over four ranks.
+# 10-row span sharded [3, 2, 2, 3] over four ranks.
 EXTEND = [4, 1, 5]
 PREFIX = [2, 4, 0]
 HISTORY = [p + e for p, e in zip(PREFIX, EXTEND)]  # [6, 5, 5]
@@ -136,7 +136,11 @@ def _page_table() -> torch.Tensor:
 
 def _plan(rank: int) -> QueryShardPlan:
     return QueryShardPlan.from_forward(
-        total_tokens=sum(EXTEND), input_lengths=EXTEND, size=WORLD, rank=rank
+        total_tokens=sum(EXTEND),
+        input_lengths=EXTEND,
+        size=WORLD,
+        rank=rank,
+        device="cpu",
     )
 
 
@@ -177,13 +181,11 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     assert [g.requests for g in meta.groups] == [slice(0, 1), slice(1, 3)]
     assert [g.rows for g in meta.groups] == [6, 10]
     assert [g.row_base for g in meta.groups] == [0, 6]
-    # Query rows 0-3 belong to the first group, 4-9 to the second; each
-    # rank's slice is its shard intersected with the group's span.
-    start, end = plan.local_start, plan.local_end
+    # Balanced history groups contain span rows 0-3 and 4-9; each rank's
+    # zigzag rows remain ascending within their request groups.
+    local = plan.local_row_ids.tolist()
     for group, (lo, hi) in zip(meta.groups, ((0, 4), (4, 10))):
-        expected = slice(
-            min(max(lo, start), end) - start, min(max(hi, start), end) - start
-        )
+        expected = slice(sum(r < lo for r in local), sum(r < hi for r in local))
         assert group.local_query == expected
     # One owner (no KVP): the gather is local and holds every history row.
     for group in meta.groups:
@@ -343,7 +345,7 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(
     topk = torch.full((local_rows, 4), tail_slot, dtype=torch.int32)
     for group in meta.groups:
         for j in range(group.local_query.start, group.local_query.stop):
-            first = (plan.local_start + j) % group.rows
+            first = int(plan.local_row_ids[j]) % group.rows
             selected = [first, group.rows - 1, first]
             if slot_order == "sorted":
                 selected.sort()
