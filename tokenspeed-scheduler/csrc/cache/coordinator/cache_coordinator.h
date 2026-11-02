@@ -556,11 +556,11 @@ public:
         std::uint64_t blocks{0};
         std::uint64_t device_resident{0};
         // Per evicted entry, how long it had gone unused as the Host's LRU
-        // sees it: how long ago its access epoch was issued, by its store or
-        // by the last admission that used it on either tier, whichever was
-        // later. A copy written back on a Device eviction is stored with its
-        // Device entry's epoch, which the request that last used or published
-        // it there issued. KV blocks and State checkpoints apart
+        // sees it: how long ago its Host access epoch was issued, the one its
+        // store on the Host gave it or, when a later access re-dated it
+        // there, that access's. A copy written back on a Device eviction is
+        // stored with its Device entry's epoch, which the request that last
+        // used or published it there issued. KV blocks and State checkpoints apart
         // (SampleAccessClock says how it is timed). An entry `blocks` counts
         // is observed unless a flush evicted it or no sample times its epoch:
         // epoch 0 (a superseded entry) and an epoch issued before a first
