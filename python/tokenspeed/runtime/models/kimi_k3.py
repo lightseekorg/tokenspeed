@@ -1734,7 +1734,11 @@ def prepare_k3_all_reduce_buffers(
     max_num_tokens: int,
     states: dict[tuple[int, ...], "K3IrisState"],
 ) -> bool:
-    """Prepare and retain each node-local group's Iris buffers before capture."""
+    """Prepare and retain each Iris-reachable group's buffers before capture.
+
+    A group is reachable when it is node-local, or when it spans gfx1250 nodes
+    whose Iris heap maps each other in one fabric domain.
+    """
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
         return False

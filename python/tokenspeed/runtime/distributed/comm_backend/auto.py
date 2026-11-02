@@ -350,6 +350,9 @@ class AutoBackend(CommBackend):
     # ---- Public CommBackend interface ----
 
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        # Unlike the all-reduce gates, gathers keep spanning groups on NCCL even
+        # where Iris maps other nodes: the column gather is unvalidated across
+        # the gfx1250 fabric.
         if (
             not (current_platform().is_cdna4 or current_platform().is_cdna5)
             or len(group) not in (4, 8)
@@ -583,6 +586,7 @@ class AutoBackend(CommBackend):
             and tensor.dim() == 2
             and dim in (-1, tensor.dim() - 1)
         ):
+            # Spanning groups stay off Iris here too; see get_prepared_all_gather.
             if (
                 (current_platform().is_cdna4 or current_platform().is_cdna5)
                 and not self._group_spans_nodes(group)
