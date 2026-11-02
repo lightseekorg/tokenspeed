@@ -554,7 +554,7 @@ symmetric memory instead of NCCL collectives:
    chosen experts and combine them into a weighted latent partial.
 4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
    this rank's up-projection rows, adds the shared expert (run on a side
-   stream) and multicasts the output row.
+   stream), and multicasts the output row.
 5. A ring kernel adds that row to the residual.
 
 Activations enter the experts as MXFP8, as in the TRT-LLM MoE. The routed SiTU
@@ -569,9 +569,9 @@ allows it for one tensor-parallel group shared by attention and MoE on
 Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
 `cutlass` import, so any platform can ask) declares what the kernels serve: TP8
 MXFP4 experts behind an ungrouped sigmoid top-16 router over 896 experts, a
-linear SiTU cap, a BF16 router, PDL enabled and no batch-invariant reduction.
+linear SiTU cap, a BF16 router, PDL enabled, and no batch-invariant reduction.
 The model then binds it where both hold for every MoE layer, the node decodes
-(not a prefill-only disaggregated role), the group has multicast and the
+(not a prefill-only disaggregated role), the group has multicast, and the
 decode graphs run a supported row count. Under speculative decoding the
 shared expert uses the splits tuned for verify steps. Each MoE layer keeps a contiguous copy
 of its router rows and latent-down shard (about 7.7 MiB per layer at TP8)

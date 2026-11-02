@@ -133,9 +133,18 @@ class KimiK3DecodeMoE:
         beta: float,
         linear_beta: float,
     ) -> None:
-        """Args: ``batches`` are the token row counts the chain serves;
-        ``verify_width`` is the rows per request of every decode forward (1
-        without speculative decoding), which picks the shared expert's splits."""
+        """Allocate the mailboxes and scratch and compile the residual ring.
+
+        Args:
+            group: The MoE TP8 process group the mailboxes span.
+            batches: The token row counts the chain serves (from ``BATCHES``).
+            verify_width: Rows per request of every decode forward (1 without
+                speculative decoding); picks the shared expert's splits.
+            moe_layers: The model's MoE layer count; the tail rotates its
+                mailbox parities over it.
+            beta: SiTU's gate cap.
+            linear_beta: SiTU's linear cap.
+        """
         tp = dist.get_world_size(group)
         if tp != 8:
             raise ValueError(f"the K3 decode MoE chain serves TP8, got TP{tp}")
@@ -176,12 +185,16 @@ class KimiK3DecodeMoE:
         norm_eps: float,
         up_shard: torch.Tensor,
     ) -> "KimiK3DecodeMoELayer":
-        """One MoE layer's chain; ``ordinal`` counts MoE layers from zero and
-        ``layer_idx`` is the decoder layer's model index.
+        """One MoE layer's chain.
 
         Args:
+            ordinal: The layer's position among the MoE layers, from zero.
+            layer_idx: The decoder layer's model index (selects the front
+                mailbox parity).
             router: [896, 7168] BF16 router weight (every expert).
             correction_bias: [896] FP32 routing bias.
+            routed_scaling_factor: Scale of the routed expert weights.
+            renormalize: Whether the top-16 weights are renormalized to sum to 1.
             down_shard: [448, 7168] BF16 rows of the latent-down weight this
                 rank owns.
             shared_gate_up: [1536, 7168] BF16 gate then up rows of this rank's
@@ -190,6 +203,7 @@ class KimiK3DecodeMoE:
             w13, w13_scale, w2, w2_scale: routed MXFP4 experts in the
                 TRT-LLM-gen serving layout.
             norm_weight: [3584] BF16 latent RMSNorm weight.
+            norm_eps: The latent RMSNorm epsilon.
             up_shard: [896, 3584] BF16 rows of the up-projection this rank owns.
         """
         return KimiK3DecodeMoELayer(
