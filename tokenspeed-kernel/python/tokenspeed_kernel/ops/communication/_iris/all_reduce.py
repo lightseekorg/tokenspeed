@@ -527,6 +527,7 @@ class ProducerLamport:
         ``inputs`` is read only locally and may be ``out`` itself. Both must be
         contiguous and 16-byte aligned.
         """
+        assert self.can_run(out.numel())
         assert inputs.data_ptr() % self.TRANSACTION_BYTES == 0
         assert out.data_ptr() % self.TRANSACTION_BYTES == 0
         iris_lamport_allreduce[(out.numel() // self.BLOCK_ELEMENTS,)](
@@ -535,9 +536,9 @@ class ProducerLamport:
             out,
             self.epochs,
             *self.peer_mailboxes,
+            out.numel(),
             RANK=self.peers.rank,
             WORLD_SIZE=self.peers.world_size,
-            TOTAL_ELEMENTS=out.numel(),
             MAX_ELEMENTS=self.max_numel,
             NUM_STAGES=self.NUM_STAGES,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
@@ -882,9 +883,9 @@ def iris_lamport_allreduce(
     region_5,
     region_6,
     region_7,
+    total_elements,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    TOTAL_ELEMENTS: gl.constexpr,
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
@@ -895,10 +896,10 @@ def iris_lamport_allreduce(
     local mailbox contains every peer's contribution. Sum in FP32 rank order
     and write BF16 output_ptr. Clear consumed mailboxes and advance the tile's
     counter; negative zero is replaced with zero to preserve the empty marker.
+    ``total_elements`` is a runtime multiple of 512, at most ``MAX_ELEMENTS``,
+    so every payload size shares one binary.
     """
     gl.static_assert(WORLD_SIZE == 2 or WORLD_SIZE == 4 or WORLD_SIZE == 8)
-    gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
-    gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
     gl.static_assert(NUM_STAGES >= 3)
     SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     # Each lane owns 64 / SUBGROUP_SIZE consecutive 16-byte packs of the tile.
@@ -908,7 +909,7 @@ def iris_lamport_allreduce(
     pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
     offsets = pack[:, None] * 8 + element[None, :]
-    mask = offsets < TOTAL_ELEMENTS
+    mask = offsets < total_elements
     generation = (
         gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
     )
@@ -943,7 +944,7 @@ def iris_lamport_allreduce(
         region_sym_ptr,
         generation,
         offsets,
-        pack * 8 < TOTAL_ELEMENTS,
+        pack * 8 < total_elements,
         RANK,
         WORLD_SIZE,
         MAX_ELEMENTS,

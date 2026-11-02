@@ -445,12 +445,20 @@ def _ar_worker_main(
 
 
 def _check_lamport_dispatch(state, rank: int, world_size: int, device) -> None:
-    """CDNA5 reduces staged and producer payloads of whole tiles with Lamport."""
+    """CDNA5 reduces staged and producer payloads of whole tiles with Lamport.
+
+    Payload sizes follow the batch, so after one warm-up every size reuses the
+    same Lamport binary.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_lamport_allreduce,
+    )
     from tokenspeed_kernel.ops.communication.iris import (
         iris_acquire_outputs,
         iris_all_reduce,
         iris_all_reduce_symmetric,
     )
+    from utils import assert_no_triton_compile
 
     lamport = state.lamport
     assert lamport is not None
@@ -472,12 +480,17 @@ def _check_lamport_dispatch(state, rank: int, world_size: int, device) -> None:
     reduce_and_check_epochs(
         lambda: (iris_all_reduce(state, local, safe=False),), local.numel()
     )
-    outputs = iris_acquire_outputs(state, ((4, 7168), (4, 3584)))
-    for output in outputs:
-        output.fill_(rank + 1)
-    reduce_and_check_epochs(
-        lambda: iris_all_reduce_symmetric(state, outputs), 4 * (7168 + 3584)
-    )
+    with assert_no_triton_compile(iris_lamport_allreduce):
+        local = torch.full((3, 7168), rank + 1, dtype=torch.bfloat16, device=device)
+        reduce_and_check_epochs(
+            lambda: (iris_all_reduce(state, local, safe=False),), local.numel()
+        )
+        outputs = iris_acquire_outputs(state, ((4, 7168), (4, 3584)))
+        for output in outputs:
+            output.fill_(rank + 1)
+        reduce_and_check_epochs(
+            lambda: iris_all_reduce_symmetric(state, outputs), 4 * (7168 + 3584)
+        )
 
 
 def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:

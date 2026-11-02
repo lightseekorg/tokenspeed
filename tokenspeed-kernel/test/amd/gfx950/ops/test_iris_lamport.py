@@ -58,20 +58,20 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
         name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
     }
     signature.update({name: "i64" for name in fn.arg_names[4:12]})
+    signature["total_elements"] = "i32"
     source = gluon._runtime.GluonASTSource(
         fn,
         signature,
         constexprs={
             "RANK": rank,
             "WORLD_SIZE": 8,
-            "TOTAL_ELEMENTS": 6 * 10752,
             "MAX_ELEMENTS": 6 * 10752,
             "NUM_STAGES": 3,
             "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
         },
-        attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
+        attrs={(index,): [["tt.divisibility", 16]] for index in range(13)},
     )
     kernel = triton.compile(
         source,
@@ -260,6 +260,30 @@ def _new_state(rank, device, capacity, dtype):
     )
 
 
+def _check_lamport_compiles_once(rank, device):
+    """Every row count reuses the binary the first reduction compiled."""
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_lamport_allreduce,
+    )
+    from utils import assert_no_triton_compile
+
+    state = _new_state(rank, device, 6 * 10752, torch.bfloat16)
+
+    def reduce(rows):
+        inputs = state.all_reduce.acquire_outputs(((rows, 7168), (rows, 3584)))
+        for tensor in inputs:
+            tensor.fill_(rank + 1)
+        for output in state.reduce_moe(inputs):
+            torch.testing.assert_close(
+                output, torch.full_like(output, 36), atol=0, rtol=0
+            )
+
+    reduce(1)
+    with assert_no_triton_compile(iris_lamport_allreduce):
+        reduce(2)
+        reduce(6)
+
+
 def _check_lamport_state(rank, device):
 
     state = _new_state(rank, device, 8 * 10752, torch.bfloat16)
@@ -395,6 +419,7 @@ def _lamport_worker(rank, port):
         timeout=timedelta(seconds=180),
     )
     try:
+        _check_lamport_compiles_once(rank, torch.device(f"cuda:{rank}"))
         _check_lamport_state(rank, torch.device(f"cuda:{rank}"))
     finally:
         dist.destroy_process_group()

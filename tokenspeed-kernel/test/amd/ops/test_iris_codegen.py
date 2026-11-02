@@ -215,18 +215,18 @@ def test_iris_lamport_codegen_gfx1250(world_size, tmp_path):
         name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
     }
     signature.update({name: "i64" for name in fn.arg_names[4:12]})
+    signature["total_elements"] = "i32"
     source = gluon._runtime.GluonASTSource(
         fn,
         signature,
         constexprs={
             "RANK": world_size - 1,
             "WORLD_SIZE": world_size,
-            "TOTAL_ELEMENTS": 6 * 10752,
             "MAX_ELEMENTS": 6 * 10752,
             "NUM_STAGES": ar.ProducerLamport.NUM_STAGES,
             "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
         },
-        attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
+        attrs={(index,): [["tt.divisibility", 16]] for index in range(13)},
     )
     kernel = triton.compile(
         source,
