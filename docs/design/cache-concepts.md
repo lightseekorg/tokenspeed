@@ -624,7 +624,9 @@ Perception rules per directory:
   while two complete descendant checkpoint sets remain in the same tier along
   one observed continuation chain. Forks stop that walk. Metadata for vanished
   boundaries is pruned; unary paths are compressed while preserving any forgotten
-  fork as a barrier. Metadata contains no owning cache references and cannot pin
+  fork as a barrier. A prune revisits only checkpoints whose state was evicted
+  since the last one, so its cost follows evictions, not the tree's size.
+  Metadata contains no owning cache references and cannot pin
   storage. Immutable hashed prefix segments are shared across checkpoint
   paths and reference-counted independently of physical cache blocks. Metadata
   scales with the union of indexed prefixes, not the sum of conversation turns.

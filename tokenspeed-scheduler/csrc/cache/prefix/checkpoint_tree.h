@@ -61,7 +61,7 @@ public:
         const auto full_tokens = completed.prefix_hashes.size() * static_cast<std::size_t>(prefix_granularity_);
         node.tail.assign(completed.tokens.begin() + full_tokens, completed.tokens.end());
         node.parent = FindParent(completed);
-        auto& siblings = node.parent.empty() ? roots_ : nodes_.at(node.parent).children;
+        auto& siblings = node.parent.empty() ? roots_[completed.tokens.front()] : nodes_.at(node.parent).children;
         std::vector<ContentHash> adopted;
         for (const auto& child_hash : siblings) {
             if (IsPrefix(hash, node, nodes_.at(child_hash))) {
@@ -85,7 +85,19 @@ public:
         if (!node.tail.empty()) {
             tails_by_prior_[Prior(node)].insert(hash);
         }
+        prune_candidates_.insert(hash);
+        if (!node.parent.empty() && adopted.size() > 1) prune_candidates_.insert(node.parent);
         nodes_.emplace(hash, std::move(node));
+    }
+
+    template <typename Visit>
+    void ForEachAncestor(const ContentHash& hash, const Visit& visit) const {
+        auto it = nodes_.find(hash);
+        while (it != nodes_.end() && !it->second.parent.empty()) {
+            const ContentHash parent = it->second.parent;
+            visit(parent);
+            it = nodes_.find(parent);
+        }
     }
 
     template <typename IsResident>
@@ -130,6 +142,38 @@ public:
         for (const auto& [hash, node] : nodes_) {
             if (!resident(hash)) pending.push_back(hash);
         }
+        prunePending(resident, std::move(pending));
+        prune_candidates_.clear();
+    }
+
+    // A checkpoint whose cached state may be gone.
+    void MarkVanished(const ContentHash& hash) {
+        if (nodes_.contains(hash)) prune_candidates_.insert(hash);
+    }
+
+    // Prune's result, visiting only checkpoints that can have become removable:
+    // those marked vanished and those whose children an Observe took.
+    template <typename IsResident>
+    void PruneVanished(const IsResident& resident) {
+        std::vector<ContentHash> pending{prune_candidates_.begin(), prune_candidates_.end()};
+        prune_candidates_.clear();
+        prunePending(resident, std::move(pending));
+    }
+
+    void Clear() {
+        nodes_.clear();
+        roots_.clear();
+        tails_by_prior_.clear();
+        prefixes_.clear();
+        prune_candidates_.clear();
+    }
+    std::size_t Size() const { return nodes_.size(); }
+    std::size_t PrefixSegments() const { return prefixes_.size(); }
+    bool Contains(const ContentHash& hash) const { return nodes_.contains(hash); }
+
+private:
+    template <typename IsResident>
+    void prunePending(const IsResident& resident, std::vector<ContentHash> pending) {
         while (!pending.empty()) {
             ContentHash hash = std::move(pending.back());
             pending.pop_back();
@@ -137,7 +181,8 @@ public:
             if (it == nodes_.end() || resident(hash) || it->second.children.size() > 1) continue;
             Node& node = it->second;
             const ContentHash parent = node.parent;
-            auto& siblings = parent.empty() ? roots_ : nodes_.at(parent).children;
+            const std::int32_t first_token = parent.empty() ? FirstToken(node) : 0;
+            auto& siblings = parent.empty() ? roots_.at(first_token) : nodes_.at(parent).children;
             if (node.children.empty() && siblings.size() > 1) {
                 const auto parent_depth = parent.empty() ? 0 : nodes_.at(parent).num_tokens;
                 for (const ContentHash& sibling_hash : siblings) {
@@ -161,6 +206,7 @@ public:
                 if (node.was_branch) child.branch_points.insert(node.num_tokens);
                 siblings.insert(child_hash);
             }
+            if (parent.empty() && siblings.empty()) roots_.erase(first_token);
             if (!node.tail.empty()) {
                 auto tails = tails_by_prior_.find(Prior(node));
                 tails->second.erase(hash);
@@ -172,17 +218,6 @@ public:
         }
     }
 
-    void Clear() {
-        nodes_.clear();
-        roots_.clear();
-        tails_by_prior_.clear();
-        prefixes_.clear();
-    }
-    std::size_t Size() const { return nodes_.size(); }
-    std::size_t PrefixSegments() const { return prefixes_.size(); }
-    bool Contains(const ContentHash& hash) const { return nodes_.contains(hash); }
-
-private:
     struct PrefixSegment {
         ContentHash hash;
         std::vector<std::int32_t> tokens;
@@ -202,6 +237,10 @@ private:
         // Historical fork positions between this node and its parent.
         std::set<std::int32_t> branch_points{};
     };
+
+    static std::int32_t FirstToken(const Node& node) {
+        return node.full_prefix == nullptr ? node.tail.front() : SegmentAt(node, 1)->tokens.front();
+    }
 
     static ContentHash Prior(const Node& node) {
         return node.full_prefix == nullptr ? ContentHash{} : node.full_prefix->hash;
@@ -319,8 +358,11 @@ private:
 
     std::int32_t prefix_granularity_;
     std::unordered_map<ContentHash, Node> nodes_;
-    std::unordered_set<ContentHash> roots_;
+    // Checkpoints without an ancestor, by first token: only those that start
+    // alike can share a prefix or fork from each other.
+    std::unordered_map<std::int32_t, std::unordered_set<ContentHash>> roots_;
     std::unordered_map<ContentHash, std::unordered_set<ContentHash>> tails_by_prior_;
+    std::unordered_set<ContentHash> prune_candidates_;
     std::unordered_map<ContentHash, std::unique_ptr<PrefixSegment>> prefixes_;
 };
 

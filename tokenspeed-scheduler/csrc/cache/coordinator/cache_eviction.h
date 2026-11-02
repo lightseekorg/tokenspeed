@@ -77,9 +77,11 @@ public:
         ContentHash hash;
     };
 
+    // A planned victim can only end its ancestors' demotion; a restore may bring
+    // demotions back and recomputes them all.
     void refreshDemotions() {
         if (demotions_version_ == checkpoint_priority_version_) return;
-        demoted_checkpoints_ = checkpoints_.DemotedHashes([&](const ContentHash& hash) {
+        const auto resident = [&](const ContentHash& hash) {
             if (removed_checkpoints_.contains(hash)) return false;
             for (const CacheGroup& group : groups_) {
                 if (group.Spec().attn_kind == AttnKind::kState &&
@@ -87,27 +89,52 @@ public:
                     return false;
             }
             return true;
-        });
+        };
+        if (recompute_demotions_) {
+            demoted_checkpoints_ = checkpoints_.DemotedHashes(resident);
+            recompute_demotions_ = false;
+        } else {
+            for (const ContentHash& removed : newly_removed_checkpoints_) {
+                checkpoints_.ForEachAncestor(removed, [&](const ContentHash& ancestor) {
+                    if (demoted_checkpoints_.contains(ancestor) && !checkpoints_.Demoted(ancestor, resident)) {
+                        demoted_checkpoints_.erase(ancestor);
+                    }
+                });
+            }
+        }
+        newly_removed_checkpoints_.clear();
         demotions_version_ = checkpoint_priority_version_;
     }
 
-    auto evictionKey(const VictimCandidate& candidate) const {
+    int retentionClass(const VictimCandidate& candidate) const {
         const bool demoted = groups_[candidate.group_id].Spec().attn_kind == AttnKind::kState &&
                              demoted_checkpoints_.contains(candidate.hash);
-        const int retention_class = candidate.last_access_epoch == 0 ? 0 : (demoted ? 1 : 2);
+        return candidate.last_access_epoch == 0 ? 0 : (demoted ? 1 : 2);
+    }
+
+    static auto evictionKey(const VictimCandidate& candidate, int retention_class) {
         return std::tuple{
             retention_class,    candidate.last_access_epoch,     candidate.eviction_tier,      candidate.position_rank,
             candidate.group_id, candidate.location.lcm_block_id, candidate.location.slot_index};
     }
 
     bool shouldEvictFirst(const VictimCandidate& lhs, const VictimCandidate& rhs) const {
-        return evictionKey(lhs) < evictionKey(rhs);
+        return evictionKey(lhs, retentionClass(lhs)) < evictionKey(rhs, retentionClass(rhs));
     }
+
+    // Orders a min-heap of (class it was ranked under, candidate).
+    struct RequeuedLater {
+        bool operator()(const std::pair<int, VictimCandidate>& lhs, const std::pair<int, VictimCandidate>& rhs) const {
+            return evictionKey(rhs.second, rhs.first) < evictionKey(lhs.second, lhs.first);
+        }
+    };
 
     struct CacheGroupVictimCandidates {
         explicit CacheGroupVictimCandidates(std::uint32_t id) : group_id{id} {}
 
-        const VictimCandidate& CurrentCandidate() const { return candidates[next_candidate_index]; }
+        const VictimCandidate& CurrentCandidate() const {
+            return current_requeued ? requeued.front().second : candidates[next_candidate_index];
+        }
 
         std::uint32_t group_id;
         bool index_exhausted{false};
@@ -115,7 +142,12 @@ public:
         PrefixCacheIndex::EvictionCursor index_cursor;
         std::vector<VictimCandidate> candidates;
         std::size_t next_candidate_index{0};
-        std::uint64_t priority_version{0};
+        // State groups: the retention class each remaining candidate was
+        // sorted under, and a min-heap of candidates whose class rose since.
+        std::vector<int> ranked_classes;
+        std::vector<std::pair<int, VictimCandidate>> requeued;
+        bool current_requeued{false};
+        bool needs_sort{false};
     };
 
     VictimCandidate makeVictimCandidate(std::uint32_t group_id, CacheBlockLocation location,
@@ -168,17 +200,9 @@ public:
                     }
                 }
                 group.index_exhausted = true;
+                group.needs_sort = true;
             }
-            if (group.next_candidate_index == group.candidates.size()) {
-                return false;
-            }
-            if (group.priority_version != checkpoint_priority_version_) {
-                auto first = group.candidates.begin() + group.next_candidate_index;
-                std::sort(first, group.candidates.end(),
-                          [&](const auto& a, const auto& b) { return shouldEvictFirst(a, b); });
-                group.priority_version = checkpoint_priority_version_;
-            }
-            return true;
+            return settleStateCandidates(group);
         }
         if (group.next_candidate_index < group.candidates.size()) {
             return true;
@@ -248,7 +272,13 @@ public:
             return std::nullopt;
         }
         const VictimCandidate candidate = selected_group->CurrentCandidate();
-        ++selected_group->next_candidate_index;
+        if (selected_group->current_requeued) {
+            std::ranges::pop_heap(selected_group->requeued, RequeuedLater{});
+            selected_group->requeued.pop_back();
+            selected_group->current_requeued = false;
+        } else {
+            ++selected_group->next_candidate_index;
+        }
         return candidate;
     }
 
@@ -261,6 +291,7 @@ public:
             if (const auto metadata = groups_[group_id].Index().MetadataFor(pool_, location);
                 metadata && checkpoints_.Contains(metadata->content_hash)) {
                 if (++removed_checkpoints_[metadata->content_hash] == 1) {
+                    newly_removed_checkpoints_.push_back(metadata->content_hash);
                     ++checkpoint_priority_version_;
                 }
             }
@@ -298,6 +329,8 @@ public:
                 if (--removed->second == 0) {
                     removed_checkpoints_.erase(removed);
                     ++checkpoint_priority_version_;
+                    recompute_demotions_ = true;
+                    for (CacheGroupVictimCandidates& group : cache_group_candidates_) group.needs_sort = true;
                 }
             }
         }
@@ -346,6 +379,46 @@ public:
     std::size_t Candidates() const { return candidates_; }
 
 private:
+    // Sorted once: removals only raise a State candidate's class, so one is
+    // re-ranked when it reaches the front, which is then the true minimum.
+    bool settleStateCandidates(CacheGroupVictimCandidates& group) {
+        refreshDemotions();
+        auto& candidates = group.candidates;
+        std::size_t& next = group.next_candidate_index;
+        if (group.needs_sort) {
+            for (auto& [ranked, candidate] : group.requeued) candidates.push_back(std::move(candidate));
+            group.requeued.clear();
+            std::sort(candidates.begin() + static_cast<std::ptrdiff_t>(next), candidates.end(),
+                      [&](const auto& a, const auto& b) { return shouldEvictFirst(a, b); });
+            group.ranked_classes.resize(candidates.size());
+            for (std::size_t i = next; i < candidates.size(); ++i) {
+                group.ranked_classes[i] = retentionClass(candidates[i]);
+            }
+            group.needs_sort = false;
+        }
+        while (next < candidates.size()) {
+            const int current = retentionClass(candidates[next]);
+            if (current == group.ranked_classes[next]) break;
+            group.requeued.emplace_back(current, std::move(candidates[next]));
+            std::ranges::push_heap(group.requeued, RequeuedLater{});
+            ++next;
+        }
+        while (!group.requeued.empty()) {
+            const int current = retentionClass(group.requeued.front().second);
+            if (current == group.requeued.front().first) break;
+            std::ranges::pop_heap(group.requeued, RequeuedLater{});
+            group.requeued.back().first = current;
+            std::ranges::push_heap(group.requeued, RequeuedLater{});
+        }
+        const bool has_sorted = next < candidates.size();
+        if (!has_sorted && group.requeued.empty()) return false;
+        group.current_requeued =
+            !group.requeued.empty() &&
+            (!has_sorted || evictionKey(group.requeued.front().second, group.requeued.front().first) <
+                                evictionKey(candidates[next], group.ranked_classes[next]));
+        return true;
+    }
+
     const std::vector<CacheGroup>& groups_;
     const BlockPool& pool_;
     const CheckpointTree& checkpoints_;
@@ -353,6 +426,8 @@ private:
     std::unordered_map<ContentHash, std::int32_t> removed_checkpoints_;
     std::uint64_t checkpoint_priority_version_{1};
     std::uint64_t demotions_version_{0};
+    bool recompute_demotions_{true};
+    std::vector<ContentHash> newly_removed_checkpoints_;
     std::unordered_set<ContentHash> demoted_checkpoints_;
     std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
     std::vector<std::vector<std::int64_t>> local_free_slots_by_bucket_;

@@ -45,6 +45,9 @@ struct CacheCoordinatorTestAccess {
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
 
+    static const std::vector<CacheGroup>& Groups(const CacheCoordinator& coordinator) { return coordinator.groups_; }
+    static const CheckpointTree& Checkpoints(const CacheCoordinator& coordinator) { return coordinator.checkpoints_; }
+
     // The planner's Device eviction of one entry, with its tail cascade.
     static bool EvictCachedBlock(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location) {
         return coordinator.evictCachedBlock(group_id, location);

@@ -1162,6 +1162,7 @@ bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockL
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
+    if (GroupIsState(group_id)) checkpoints_.MarkVanished(removed->content_hash);
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
 }
@@ -1174,6 +1175,7 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
+    if (GroupIsState(group_id)) checkpoints_.MarkVanished(removed->content_hash);
     if (const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(removed->content_hash)) {
         evictTailEntries(removed->content_hash, *tail_tokens);
     } else if (!GroupIsState(group_id)) {
@@ -1199,6 +1201,7 @@ bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLo
         return false;
     }
     if (demoted) ++host_demoted_victims_;
+    if (GroupIsState(group_id)) checkpoints_.MarkVanished(removed->content_hash);
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
 }
@@ -1272,7 +1275,7 @@ void CacheCoordinator::recordPublication(const CompletedPages& completed) {
     if (completed.publish_state && std::ranges::any_of(groups_, [](const CacheGroup& group) {
             return group.Spec().attn_kind == AttnKind::kState;
         })) {
-        checkpoints_.Prune([&](const ContentHash& hash) { return checkpointPresent(hash); });
+        checkpoints_.PruneVanished([&](const ContentHash& hash) { return checkpointPresent(hash); });
         checkpoints_.Observe(completed);
     }
     if (!completed.tail) {

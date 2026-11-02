@@ -21,9 +21,11 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <numeric>
+#include <random>
 #include <unordered_set>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "cache/coordinator/cache_eviction.h"
 #include "cache/prefix/checkpoint_tree.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache_test_access.h"
@@ -279,6 +281,68 @@ TEST(CheckpointRetention, MissingOneStateGroupPreventsDemotion) {
     cache.Free(incoming);
 }
 
+// Every victim the plan picks is the one a full re-rank of the remaining
+// candidates would pick, as demotions end while victims are removed.
+TEST(CheckpointRetention, VictimOrderMatchesAFullRerankAfterEveryRemoval) {
+    BlockPool device(200, {1, 1});
+    auto cache = MakeCoordinator(StateSpecs(), 4, device, false, nullptr, nullptr, false);
+    std::mt19937 random(7);
+    std::vector<Checkpoint> points;
+    for (std::int32_t conversation = 0; conversation < 10; ++conversation) {
+        std::vector<std::int32_t> tokens = Sequence(40);
+        for (std::int32_t& token : tokens) token += 1000 * (conversation + 1);
+        for (std::int32_t turn = 1; turn <= 6; ++turn) {
+            const auto length = 4 * turn + static_cast<std::int32_t>(random() % 3);
+            points.emplace_back(std::vector<std::int32_t>(tokens.begin(), tokens.begin() + length));
+        }
+    }
+    std::vector<std::size_t> order(points.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::ranges::shuffle(order, random);
+    for (const std::size_t i : order) Publish(cache, points[i]);
+    for (std::size_t i = 0; i < 20; ++i) Publish(cache, points[random() % points.size()]);
+
+    const auto& groups = CacheCoordinatorTestAccess::Groups(cache);
+    const auto& checkpoints = CacheCoordinatorTestAccess::Checkpoints(cache);
+    CacheEvictionPlan plan{groups, device, checkpoints, /*history_eviction_drops_checkpoint=*/false};
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> removed;
+    std::unordered_set<ContentHash> removed_hashes;
+    std::int32_t demotion_changes = 0;
+    std::size_t previous_demoted = 0;
+    for (std::int32_t step = 0; step < 100; ++step) {
+        const auto demoted = checkpoints.DemotedHashes([&](const ContentHash& hash) {
+            return !removed_hashes.contains(hash) && std::ranges::all_of(groups, [&](const CacheGroup& group) {
+                return group.Index().Contains(device, CacheKey{.group_id = group.Id(), .content_hash = hash});
+            });
+        });
+        if (step > 0 && demoted.size() != previous_demoted) ++demotion_changes;
+        previous_demoted = demoted.size();
+        std::optional<CacheEvictionPlan::VictimCandidate> expected;
+        auto expected_key = CacheEvictionPlan::evictionKey(CacheEvictionPlan::VictimCandidate{}, 0);
+        for (const CacheGroup& group : groups) {
+            for (const auto& entry : group.Index().EvictableCandidates(device)) {
+                if (removed.contains(entry.location)) continue;
+                const auto candidate = plan.makeVictimCandidate(group.Id(), entry.location, entry.metadata);
+                const int retention_class =
+                    candidate.last_access_epoch == 0 ? 0 : (demoted.contains(candidate.hash) ? 1 : 2);
+                const auto key = CacheEvictionPlan::evictionKey(candidate, retention_class);
+                if (!expected || key < expected_key) {
+                    expected = candidate;
+                    expected_key = key;
+                }
+            }
+        }
+        const auto actual = plan.Next();
+        ASSERT_EQ(actual.has_value(), expected.has_value());
+        if (!actual) break;
+        ASSERT_EQ(actual->location, expected->location) << "step " << step;
+        plan.Remove(actual->group_id, actual->location);
+        removed.insert(actual->location);
+        removed_hashes.insert(actual->hash);
+    }
+    EXPECT_GT(demotion_changes, 0);
+}
+
 TEST(CheckpointRetention, HostUsesItsOwnCompleteDescendants) {
     BlockPool device(16, {1, 1});
     BlockPool host(8, {1, 1});
@@ -379,6 +443,57 @@ TEST(CheckpointRetention, HybridTailEvictionPreservesLongerReusableCheckpoints) 
     EXPECT_EQ(cache.CheckpointRetentionStats().device_demoted_victims, 0);
     EXPECT_EQ(cache.CheckpointRetentionStats().checkpoint_nodes, 0);
     EXPECT_EQ(cache.CheckpointRetentionStats().prefix_segments, 0);
+}
+
+// Pruning only what vanished leaves the same tree as scanning every node.
+TEST(CheckpointRetention, PruningVanishedMatchesAFullPrune) {
+    for (std::uint32_t seed = 0; seed < 20; ++seed) {
+        SCOPED_TRACE(seed);
+        std::mt19937 random(seed);
+        CheckpointTree full{4}, incremental{4};
+        std::vector<Checkpoint> points;
+        std::unordered_set<ContentHash> resident;
+        const auto exists = [&](const ContentHash& hash) { return resident.contains(hash); };
+        const auto ancestors = [](const CheckpointTree& tree, const ContentHash& hash) {
+            std::vector<ContentHash> chain;
+            tree.ForEachAncestor(hash, [&](const ContentHash& ancestor) { chain.push_back(ancestor); });
+            return chain;
+        };
+        for (std::int32_t step = 0; step < 400; ++step) {
+            const auto action = random() % 3;
+            if (action == 0 || points.empty()) {
+                std::vector<std::int32_t> tokens;
+                if (!points.empty()) {
+                    const auto& base = points[random() % points.size()].tokens;
+                    tokens.assign(base.begin(),
+                                  base.begin() + static_cast<std::ptrdiff_t>(random() % (base.size() + 1)));
+                }
+                const auto extra = 1 + random() % 9;
+                for (std::uint32_t i = 0; i < extra; ++i) tokens.push_back(1 + static_cast<std::int32_t>(random() % 3));
+                points.emplace_back(tokens);
+                resident.insert(points.back().Hash());
+                full.Prune(exists);
+                incremental.PruneVanished(exists);
+                full.Observe(points.back().Publication());
+                incremental.Observe(points.back().Publication());
+            } else if (action == 1) {
+                const ContentHash hash = points[random() % points.size()].Hash();
+                if (resident.erase(hash) != 0) incremental.MarkVanished(hash);
+            } else {
+                resident.insert(points[random() % points.size()].Hash());
+            }
+            ASSERT_EQ(full.Size(), incremental.Size());
+            ASSERT_EQ(full.PrefixSegments(), incremental.PrefixSegments());
+            for (const Checkpoint& point : points) {
+                const ContentHash hash = point.Hash();
+                ASSERT_EQ(full.Contains(hash), incremental.Contains(hash));
+                ASSERT_EQ(ancestors(full, hash), ancestors(incremental, hash));
+                ASSERT_EQ(full.Demoted(hash, exists), incremental.Demoted(hash, exists));
+                ASSERT_EQ(full.Demoted(hash, [](const ContentHash&) { return true; }),
+                          incremental.Demoted(hash, [](const ContentHash&) { return true; }));
+            }
+        }
+    }
 }
 
 TEST(CheckpointRetention, CheckpointsSharePrefixMetadata) {
