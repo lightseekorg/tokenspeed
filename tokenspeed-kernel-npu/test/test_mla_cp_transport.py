@@ -75,6 +75,7 @@ def bounded_transport(rank, degree, scratch_pool):
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
     results = []
+    runtimes = []
     for has_index in (False, True):
         capacity = AscendPrefillOptions(
             4096 if degree == 2 else 2048,
@@ -95,6 +96,7 @@ def bounded_transport(rank, degree, scratch_pool):
             max_current_rows=capacity.max_current_rows,
             history_null_rows=capacity.kv_page_size,
         )
+        runtimes.append(runtime)
         assert runtime.workspace_bytes == 0
         pending = []
         for case in range(17 if degree == 2 else 16):
@@ -276,6 +278,10 @@ def bounded_transport(rank, degree, scratch_pool):
             )
         for actual, expected in pending:
             exact(actual, expected)
+    # Keep both groups alive through the suite. Torch's local-synchronization
+    # group names depend on the number of live groups; destroy/recreate would
+    # reuse the first group's store keys and stale HCCL root info.
+    for runtime in runtimes:
         runtime.close()
     return results
 
