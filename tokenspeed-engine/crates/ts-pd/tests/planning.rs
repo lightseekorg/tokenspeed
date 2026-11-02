@@ -631,8 +631,7 @@ fn v41_pd_page_ownership_with_and_without_dspark() {
     // Existing V4.1 recipe fixtures, without and with DSpark window fields.
     for key in ["446091a9025dc611", "b03d4ab8e942c299"] {
         let make_contract = |kvp: i64| {
-            let mut wire: Value =
-                serde_json::from_str(fixtures[key].as_str().unwrap()).unwrap();
+            let mut wire: Value = serde_json::from_str(fixtures[key].as_str().unwrap()).unwrap();
             for group in wire["group_specs"].as_array_mut().unwrap() {
                 if matches!(
                     group["group_id"].as_str(),
