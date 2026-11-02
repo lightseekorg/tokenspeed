@@ -515,10 +515,9 @@ class HostCacheExecutor:
             self._warmup_restore_transfers()
 
     def _warmup_restore_transfers(self) -> None:
-        # Restore uses unflagged H2D, unlike layerwise L2 loads. Warm it
-        # before serving by round-tripping one block, preserving Device
-        # bytes. Host blocks are still unassigned; use only one group so
-        # different groups cannot overwrite the same compact Host parent.
+        """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
+        # Host blocks must still be unassigned for this scratch round trip.
+        # Use one group so compact Host-parent writes cannot overlap.
         group_index = next(
             i for i, group in enumerate(self.layout.groups) if group.fields
         )
