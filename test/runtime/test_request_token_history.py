@@ -43,8 +43,10 @@ from tokenspeed.runtime.execution.types import RequestHistorySeeds
 def test_seeds_must_be_aligned() -> None:
     with pytest.raises(ValueError, match="equal lengths"):
         RequestHistorySeeds(slots=(1, 2), prefix_lengths=(0,), tokens=((),))
-    with pytest.raises(ValueError, match="3 tokens for a 4-token prefix"):
-        RequestHistorySeeds(slots=(1,), prefix_lengths=(4,), tokens=((1, 2, 3),))
+    with pytest.raises(ValueError, match="5 tokens for a 4-token prefix"):
+        RequestHistorySeeds(slots=(1,), prefix_lengths=(4,), tokens=((1,) * 5,))
+    with pytest.raises(ValueError, match="-1-token prefix"):
+        RequestHistorySeeds(slots=(1,), prefix_lengths=(-1,), tokens=((),))
 
 
 def _runtime_states(capacity: int) -> RuntimeStates:
@@ -172,6 +174,78 @@ def test_seeding_shifts_the_draft_stream_by_one() -> None:
     )
     assert states.request_token_history_ids[1, :4].tolist() == [7, 8, 9, 10]
     assert states.draft_request_token_history_ids[1, :3].tolist() == [8, 9, 10]
+
+
+def test_a_tail_seed_lands_at_the_end_of_its_prefix() -> None:
+    # A bounded-lookback model receives only the prefix's last tokens; they
+    # end at the prefix length and leave the earlier positions untouched.
+    states = _draft_states()
+    states.init_draft_request_token_history(16)
+    states.request_token_history_ids.fill_(-1)
+    states.draft_request_token_history_ids.fill_(-1)
+    states.seed_request_token_history(
+        RequestHistorySeeds(slots=(1,), prefix_lengths=(9,), tokens=((7, 8, 9),))
+    )
+    assert states.request_token_history_ids[1, :10].tolist() == [-1] * 6 + [
+        7,
+        8,
+        9,
+        -1,
+    ]
+    assert states.draft_request_token_history_ids[1, :9].tolist() == [-1] * 6 + [
+        8,
+        9,
+        -1,
+    ]
+
+
+@pytest.mark.parametrize("prefix", [0, 1, 3, 9, 16])
+@pytest.mark.parametrize("lookback", [0, 1, 3, 16])
+def test_bounded_seed_matches_full_seed_for_every_readable_position(
+    prefix: int, lookback: int
+) -> None:
+    full, bounded = _draft_states(), _draft_states()
+    for states in (full, bounded):
+        states.init_draft_request_token_history(16)
+        # Poison recycled slots so a missing copy cannot pass as a zero.
+        states.request_token_history_ids.fill_(-99)
+        states.draft_request_token_history_ids.fill_(-99)
+    tokens = tuple(range(10, 10 + prefix))
+    tail = tokens[max(0, prefix - lookback) :]
+    full.seed_request_token_history(
+        RequestHistorySeeds(slots=(1,), prefix_lengths=(prefix,), tokens=(tokens,))
+    )
+    bounded.seed_request_token_history(
+        RequestHistorySeeds(slots=(1,), prefix_lengths=(prefix,), tokens=(tail,))
+    )
+    for position in range(max(0, prefix - lookback), prefix):
+        assert bounded.request_token_history_ids[1, position] == tokens[position]
+        assert (
+            bounded.draft_request_token_history_ids[1, position]
+            == full.draft_request_token_history_ids[1, position]
+        )
+    assert bounded.request_token_history_ids[0].tolist() == [-99] * 16
+    assert bounded.request_token_history_ids[4].tolist() == [-99] * 16
+
+
+def test_packed_tails_keep_offsets_and_reseed_reused_slots() -> None:
+    states = _draft_states()
+    states.init_draft_request_token_history(16)
+    states.seed_request_token_history(
+        RequestHistorySeeds(
+            slots=(0, 1, 2),
+            prefix_lengths=(9, 3, 2),
+            tokens=((6, 7, 8), (), (20, 21)),
+        )
+    )
+    assert states.request_token_history_ids[0, 6:9].tolist() == [6, 7, 8]
+    assert states.request_token_history_ids[2, :2].tolist() == [20, 21]
+    assert states.draft_request_token_history_ids[2, :1].tolist() == [21]
+    states.seed_request_token_history(
+        RequestHistorySeeds(slots=(0,), prefix_lengths=(9,), tokens=((30, 31, 32),))
+    )
+    assert states.request_token_history_ids[0, 6:9].tolist() == [30, 31, 32]
+    assert states.draft_request_token_history_ids[0, 6:8].tolist() == [31, 32]
 
 
 def test_draft_table_requires_capacity_and_enablement() -> None:

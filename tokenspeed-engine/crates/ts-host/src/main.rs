@@ -184,6 +184,7 @@ struct HostConfig {
     spec_num_tokens: Option<usize>,
     ngram_context_len: usize,
     request_token_history: bool,
+    request_token_history_lookback: Option<usize>,
     physical_context_len: i64,
     kv_total_pages: i64,
     rank: usize,
@@ -399,6 +400,9 @@ impl HostConfig {
             spec_num_tokens: config.getattr("spec_num_tokens")?.extract()?,
             ngram_context_len: config.getattr("ngram_context_len")?.extract()?,
             request_token_history: config.getattr("request_token_history")?.extract()?,
+            request_token_history_lookback: config
+                .getattr("request_token_history_lookback")?
+                .extract()?,
             physical_context_len: config.getattr("physical_context_len")?.extract()?,
             kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
             rank: config.getattr("rank")?.extract()?,
@@ -638,6 +642,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         kv_total_pages: config.kv_total_pages,
         ngram_context_len: config.ngram_context_len,
         request_token_history: config.request_token_history,
+        request_token_history_lookback: config.request_token_history_lookback,
         controls: config.controls.clone(),
         batch_log: config.batch_log.clone(),
         kv_events: config.kv_events,

@@ -1222,6 +1222,7 @@ struct Setup {
     logprobs: bool,
     /// The model reads request token history.
     request_token_history: bool,
+    request_token_history_lookback: Option<usize>,
     /// L3 (`Tiers::L3`): the leading keys of a get that land on each rank;
     /// all of them when unset.
     l3_landed_keys: Option<fn(usize) -> usize>,
@@ -1277,6 +1278,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         kv_total_pages: 512,
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
+        request_token_history_lookback: setup.request_token_history_lookback,
         controls: ControlConfig {
             memory_saver: true,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
@@ -2035,28 +2037,32 @@ async fn prompt_logprobs_reach_the_frontend_from_the_last_stage() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_histories_are_seeded_where_the_row_lost_them() {
-    for depth in [0, 1] {
-        let engine = start_ranks_with(
-            Layout::Single,
-            depth,
-            Tiers::DeviceOnly,
-            Setup {
-                request_token_history: true,
-                ..Setup::default()
-            },
-        )
-        .await;
-        // A fresh request starts its row at position 0, and its decodes
-        // keep extending it: nothing to seed.
-        run(&engine.client, request("first", 40, budget(3))).await;
-        assert!(engine.ranks[0].history.lock().unwrap().is_empty());
-        // The same prompt again hits the prefix cache: its prefill starts
-        // past position 0, so it seeds the cached prefix.
-        run(&engine.client, request("second", 40, budget(3))).await;
-        let seeds = engine.ranks[0].history.lock().unwrap().clone();
-        assert_eq!(seeds.len(), 1, "depth {depth}: {seeds:?}");
-        assert_eq!(seeds[0].1, (1..=32).collect::<Vec<i32>>());
-        drop(engine);
+    for lookback in [None, Some(0), Some(3)] {
+        for depth in [0, 1] {
+            let engine = start_ranks_with(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    request_token_history: true,
+                    request_token_history_lookback: lookback,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            // A fresh request starts its row at position 0, and its decodes
+            // keep extending it: nothing to seed.
+            run(&engine.client, request("first", 40, budget(3))).await;
+            assert!(engine.ranks[0].history.lock().unwrap().is_empty());
+            // The same prompt again hits the prefix cache: its prefill starts
+            // past position 0, so it seeds the cached prefix.
+            run(&engine.client, request("second", 40, budget(3))).await;
+            let seeds = engine.ranks[0].history.lock().unwrap().clone();
+            assert_eq!(seeds.len(), 1, "depth {depth}: {seeds:?}");
+            let start = lookback.map_or(0, |n| 32_usize.saturating_sub(n));
+            assert_eq!(seeds[0].1, (start as i32 + 1..33).collect::<Vec<i32>>());
+            drop(engine);
+        }
     }
 }
 

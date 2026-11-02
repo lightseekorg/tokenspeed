@@ -451,6 +451,9 @@ pub struct LoopConfig {
     /// The model reads each request's committed token history, which the
     /// forwards seed into the history rows.
     pub request_token_history: bool,
+    /// Committed tokens behind the frontier the model reads, which bounds
+    /// the seeds; None reads the whole prefix.
+    pub request_token_history_lookback: Option<usize>,
     /// The control operations' settings.
     pub controls: ControlConfig,
     /// The batch log's settings.
@@ -567,7 +570,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Self {
             controls: Controls::new(config.controls.clone()),
             batch_logger: BatchLogger::new(config.batch_log.clone()),
-            history: config.request_token_history.then(HistoryRows::default),
+            history: config
+                .request_token_history
+                .then(|| HistoryRows::new(config.request_token_history_lookback)),
             l3: subsystems.l3.map(Tier::new),
             l3_metrics: subsystems.l3_metrics,
             scheduler,

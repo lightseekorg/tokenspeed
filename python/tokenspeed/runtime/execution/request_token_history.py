@@ -38,7 +38,8 @@ class RequestTokenHistoryView:
 
     Attributes:
         history_token_ids: ``[pool + 1, capacity]`` int32. Row ``s`` holds
-            slot ``s``'s committed tokens in ``[0, committed_lengths[s])``;
+            slot ``s``'s committed tokens in ``[0, committed_lengths[s])``
+            (only the declared lookback is guaranteed after a bounded seed);
             the model's kernels append the forward's inputs past that
             frontier. The last row serves graph padding.
         committed_lengths: ``[pool + 1]`` int32 committed token count per

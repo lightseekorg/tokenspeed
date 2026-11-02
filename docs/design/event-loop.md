@@ -740,6 +740,34 @@ on both paths: the capturable path's host node runs it inside the forward
 and advances the matchers there; the eager path runs it before the forward
 and the commit advances them.
 
+## Request-token history seeds
+
+The control plane owns each request's committed token list. `HistoryRows`
+tracks slot ownership by admission, not by client request id, and seeds a
+new owner's prefix before its first forward. Consecutive chunks on the
+same owned row append their inputs without reseeding. Prefix-cache hits,
+PD landings, slot reuse and recovery into another slot use this same path.
+
+A model profile may declare `request_token_history_lookback`: the maximum
+number of committed tokens it reads behind its write frontier. Omission
+(`None`) preserves full-prefix seeds; zero permits an empty seed. The host
+uses the maximum bound across target and draft history readers, or full
+history if either reader declares no bound. A finite bound is a model
+correctness contract, not a serving knob: every history read must stay
+within it, including resumed and speculative forwards.
+
+For a prefix of length P and bound L, the seed carries tokens
+`[max(0, P-L), P)`, retaining P as `prefix_lengths`. The Python executor
+places them at their original absolute positions, never at position zero.
+The draft row keeps its existing one-token-left shift: source positions
+`[start+1, P)` populate draft positions `[start, P-1)`. The final draft position is not
+provided by the seed, just as with full-prefix seeding; the model/drafter
+must supply any boundary token it reads. Earlier row contents are
+unspecified and must not be read. This reduces copied and uploaded tokens,
+not the context-sized history allocation or KV-cache storage. Token history
+remains token-derived state, reconstructed rather than included in
+retraction snapshots.
+
 ## Anatomy of a round
 
 For orientation, one `EventLoop::round`:
