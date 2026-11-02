@@ -1977,20 +1977,26 @@ The contract a model (in tree or a plugin) implements:
   `forward_sparse_prefill(topk_slots=<workspace rows>)` the local rows;
   the arm gathers every group's KV (`gather_history_kv`, a collective every
   rank joins even without rows in the group) and attends the local rows with
-  every head, `return_lse=False`, no combine. The gathered buffer handed to
+  every head, `return_lse=False`, no combine. Latent KV stays in the padded
+  rank-major layout of the equal-share history gather: position `p` lives at
+  `gathered_index[p]`. The arm maps each nonnegative top-k workspace row within `topk_lens`
+  through `gathered_index[row - group.row_base]`, retaining the emitted order
+  and the `-1` sentinel. Index-K remains in position order for causal scoring.
+  The position-to-row map and padded send slots belong to `HistoryGatherPlan`;
+  this requires the equal-share history-gather planner. The mapped indices
+  must not be sorted by physical row: sparse cores preserve the supplied
+  selection order, including when `slot_order="sorted"` denotes position order.
+  The gathered buffer handed to
   `dsa_prefill` as a flat `[slots, dim]` cache is a whole number of kernel
   pages (the workspace rows are padded by
   `dsa_history_gather_workspace_rows`), so the paged solutions' view of it
   holds too and no solution is wrong at runtime; the padding rows are never
-  selected. The history gathers move any row dtype (uint8 index-K rows
-  packed in the plane's format -- FP8 bytes then fp32 scales, or bf16 key
-  bytes -- fp32 scales, fp8 latent) as their bytes, in the layout of the
-  prefix-chunk windows (`HistoryGatherPlan`): every owner sends the largest
-  owner's row count (its own rows, then a null-page tail), one equal-share
-  all-gather lands them rank-major, and one row gather
-  (`gathered_index`) writes them into the workspace in position order, so
-  no pad, strip or scatter copy runs between the collective and the
-  workspace; the workspace
+  selected. Its capacity covers `degree * send_rows` rounded to kernel pages;
+  if owner padding exceeds the reserved workspace, the latent gather uses a
+  temporary buffer of that size for the group. Latent rows move as uint8 bytes
+  directly into that buffer, without a position-order read-back. The index-K
+  history gather remains separate. Both gathers preserve row bytes, including
+  FP8 latent values and packed index-K keys with their scales. The workspace
   (`HistoryGatherWorkspace`, `index_k_format` recorded, rows of
   `index_k_row_bytes(head_dim, format)`) is sized by the recipe and
   allocated by the leaf from the same formula; the recipe refuses a draft

@@ -268,6 +268,54 @@ def gather_history_rows(
     return target
 
 
+def all_gather_history_rows(
+    plan: HistoryGatherPlan,
+    send_rows: torch.Tensor,
+    *,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """A request group's history rows in the all-gather's rank-major layout.
+
+    :func:`gather_history_rows` without the read-back: row ``i`` of the
+    group's history is row ``plan.gathered_index[i]`` of the result, so a
+    consumer that reads rows by index maps its indices instead of moving the
+    rows. The rows travel as their bytes, as there.
+
+    Args:
+        plan: The group's gather plan.
+        send_rows: ``[plan.send_rows, width]`` rows this rank sends; any
+            dtype.
+        out: ``[>= len(plan.group) * plan.send_rows, width]`` destination of
+            ``send_rows``' dtype.
+
+    Returns:
+        ``out[:len(plan.group) * plan.send_rows]``.
+    """
+    gathered_rows = len(plan.group) * plan.send_rows
+    if send_rows.dim() != 2 or send_rows.shape[0] != plan.send_rows:
+        raise ValueError(
+            f"rank {plan.rank} sends {plan.send_rows} rows, got "
+            f"{tuple(send_rows.shape)}"
+        )
+    if (
+        out.dim() != 2
+        or out.shape[0] < gathered_rows
+        or out.shape[1] != send_rows.shape[1]
+        or out.dtype != send_rows.dtype
+    ):
+        raise ValueError(
+            f"history destination {tuple(out.shape)} {out.dtype} does not hold "
+            f"{gathered_rows} rows of {send_rows.shape[1]} {send_rows.dtype}"
+        )
+    target = out[:gathered_rows]
+    payload = send_rows.contiguous().view(torch.uint8)
+    if len(plan.group) == 1:
+        target.view(torch.uint8).copy_(payload)
+    else:
+        all_gather_single(target.view(torch.uint8), payload, plan.group)
+    return target
+
+
 # Consecutive prefix-chunk loops one history all-gather covers. A gather costs
 # a fixed host launch whatever it moves, so one per layer serves a typical
 # multi-turn history; the window still bounds the transient buffer, at about

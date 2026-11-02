@@ -55,6 +55,7 @@ from tokenspeed.runtime.layers.attention.configs.dsa import (
 from tokenspeed.runtime.layers.attention.dcp.cache import (
     HistoryGatherPlan,
     HistoryGatherWorkspace,
+    all_gather_history_rows,
     gather_history_rows,
     plan_history_gather,
 )
@@ -850,24 +851,37 @@ class DSABackend(PagedAttentionBackend):
 
     def gather_history_kv(
         self, layer, token_to_kv_pool, group: QueryShardHistoryGroup
-    ) -> torch.Tensor:
-        """Assemble one group's latent rows in position order.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather one group's latent rows, rank-major, without reordering.
 
-        Returns a ``[pages * kernel_page_size, kv_cache_dim]`` view of the
-        gather workspace (valid until the next group's gather) whose leading
-        ``group.rows`` rows are the history: a whole number of kernel pages, so
-        every ``dsa_prefill`` solution's view of a flat ``[slots, dim]`` cache
-        holds, paged or not; the padding rows are never selected. A collective
-        over the page owners: every rank calls it for every group.
+        The sparse core reads rows by index, so the rows stay where the
+        all-gather put them and the caller maps the selected positions
+        instead, avoiding a full history copy. The tradeoff is mapping
+        ``[local_query_rows, topk]`` indices for the selected rows.
+
+        Returns ``(kv, rows)``: a ``[pages * kernel_page_size, kv_cache_dim]``
+        view of the gather workspace (valid until the next group's gather) --
+        a whole number of kernel pages, so every ``dsa_prefill`` solution's
+        view of a flat ``[slots, dim]`` cache holds, paged or not; the padding
+        rows are never selected -- and the ``[group.rows]`` int32 row of
+        ``kv`` holding each history position. A collective over the page
+        owners: every rank calls it for every group.
         """
         if self._history_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_flat = kv_cache.reshape(-1, kv_cache.shape[-1])
         local = kv_flat.index_select(0, group.gather.send_slots)
-        gather_history_rows(group.gather, local, out=self._history_workspace.kv)
         page = self.kernel_page_size
-        return self._history_workspace.kv[: -(-group.rows // page) * page]
+        rows = len(group.gather.group) * group.gather.send_rows
+        paged_rows = -(-rows // page) * page
+        out = self._history_workspace.kv
+        if paged_rows > out.shape[0]:
+            # The owners' send padding pushed a full workspace's group past
+            # its capacity.
+            out = out.new_empty((paged_rows, out.shape[1]))
+        all_gather_history_rows(group.gather, local, out=out)
+        return out[:paged_rows], group.gather.gathered_index
 
     def gather_history_index_k(
         self, layer_id: int, token_to_kv_pool, group: QueryShardHistoryGroup
@@ -1245,12 +1259,19 @@ class DSABackend(PagedAttentionBackend):
         for group in meta.groups:
             # Every rank joins every group's gather; the collective does not
             # know which ranks have query rows in the group.
-            kv_group = self.gather_history_kv(layer, token_to_kv_pool, group)
+            kv_group, kv_rows = self.gather_history_kv(layer, token_to_kv_pool, group)
             rows = group.local_query
             if rows.stop <= rows.start:
                 continue
             slots = topk_slots[rows]
-            slots = torch.where(slots >= 0, slots - group.row_base, -1)
+            # The selected positions, mapped to the rows of the rank-major
+            # gather; the order (the reduction order) is unchanged.
+            # Workspace tails can contain stale slots outside this history.
+            # Mask them before indexing, not only inside the attention kernel.
+            columns = torch.arange(slots.shape[1], device=slots.device)
+            valid = (slots >= 0) & (columns < topk_lens[rows, None])
+            positions = torch.where(valid, slots - group.row_base, 0).to(torch.int64)
+            slots = torch.where(valid, kv_rows[positions], -1)
             # This call mirrors the unsharded arm's: every kernel facade
             # option the unsharded call passes (the slot-order selection
             # included) must be passed here too.

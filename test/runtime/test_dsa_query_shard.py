@@ -31,7 +31,9 @@ workspace reservation agreeing with the recipe's plan in either format.
 
 from __future__ import annotations
 
+import sys
 from itertools import product
+from pathlib import Path
 from test.runtime.dsa_index_k_test_utils import (
     expected_index_k_rows,
     index_k_pool,
@@ -51,10 +53,19 @@ from tokenspeed.runtime.layers.attention.configs.dsa import (
     dsa_index_k_row_bytes,
     index_k_row_bytes,
 )
+from tokenspeed.runtime.layers.attention.dcp import cache as history_cache
 from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
+from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
+
 
 PAGE = 2
 KV_DIM = 8
@@ -302,8 +313,13 @@ def test_a_sharded_init_needs_the_host_table_and_the_workspace():
 
 
 @pytest.mark.parametrize("rank", range(WORLD))
-def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, rank):
+@pytest.mark.parametrize("slot_order", ["selection", "sorted"])
+@pytest.mark.parametrize("tail_slot", [-1, 1_000_000])
+def test_the_sharded_arm_attends_gathered_groups_with_full_heads(
+    monkeypatch, rank, slot_order, tail_slot
+):
     backend = _backend(rank, workspace_rows=11, index_k_format="fp8_scaled")
+    backend.slot_order = slot_order
     plan = _plan(rank)
     _init(backend, plan)
     meta = backend.require_query_shard_metadata()
@@ -322,11 +338,17 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
     )
     local_rows = plan.local_rows
     q = torch.randn(local_rows, 2 * KV_DIM, dtype=torch.bfloat16)
-    # Workspace rows: history rows numbered request-major over all requests.
-    topk = torch.full((local_rows, 4), -1, dtype=torch.int32)
-    for j in range(local_rows):
-        topk[j, 0] = plan.local_start + j  # some absolute workspace row
-    topk_lens = torch.ones(local_rows, dtype=torch.int32)
+    # Workspace rows: history rows numbered request-major over all requests;
+    # each row selects several positions, including a repeat and an invalid tail.
+    topk = torch.full((local_rows, 4), tail_slot, dtype=torch.int32)
+    for group in meta.groups:
+        for j in range(group.local_query.start, group.local_query.stop):
+            first = (plan.local_start + j) % group.rows
+            selected = [first, group.rows - 1, first]
+            if slot_order == "sorted":
+                selected.sort()
+            topk[j, :3] = torch.tensor(selected) + group.row_base
+    topk_lens = torch.full((local_rows,), 3, dtype=torch.int32)
     kv_seq_lens = torch.full((local_rows,), 3, dtype=torch.int32)
 
     calls = []
@@ -365,25 +387,91 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
     for call, group in zip(calls, attended):
         rows = group.local_query
         assert call["return_lse"] is False
+        assert call["slot_order"] == slot_order
         # The buffer is a whole number of kernel pages (every dsa_prefill
-        # solution's flat view holds) holding the group's history in
-        # position order in its leading rows.
-        padded = -(-group.rows // PAGE) * PAGE
+        # solution's flat view holds) holding the group's history where the
+        # all-gather put it: history position i at row gathered_index[i].
+        gathered = len(group.gather.group) * group.gather.send_rows
+        padded = -(-gathered // PAGE) * PAGE
         assert call["kv_cache"].shape == (padded, KV_DIM)
-        assert padded % PAGE == 0 and group.rows <= padded < group.rows + PAGE
         expected = plane[group.gather.virtual_slots, 0]
-        torch.testing.assert_close(
-            call["kv_cache"][: group.rows], expected, rtol=0, atol=0
-        )
-        # Top-k rows are re-based to the group's buffer, -1 stays -1.
-        expected_slots = topk[rows].clone()
-        expected_slots[:, 0] -= group.row_base
+        kv_rows = group.gather.gathered_index.to(torch.int64)
+        torch.testing.assert_close(call["kv_cache"][kv_rows], expected, rtol=0, atol=0)
+        # Top-k positions are re-based to the group and mapped to the
+        # buffer's rows, in their order; -1 stays -1.
+        positions = topk[rows].to(torch.int64) - group.row_base
+        expected_slots = torch.full_like(topk[rows], -1)
+        expected_slots[:, :3] = group.gather.gathered_index[positions[:, :3]]
         assert torch.equal(call["topk_slots"], expected_slots)
+        # The selected row holds the selected position's latent.
+        torch.testing.assert_close(
+            call["kv_cache"][call["topk_slots"][:, :3].to(torch.int64)],
+            expected[positions[:, :3]],
+            rtol=0,
+            atol=0,
+        )
         assert torch.equal(call["topk_lens"], topk_lens[rows])
         assert torch.equal(call["kv_seq_lens"], kv_seq_lens[rows])
         assert call["q"].shape[0] == rows.stop - rows.start
     if local_rows == 0:
         assert not calls
+
+
+@pytest.mark.parametrize("rank", range(3))
+@pytest.mark.parametrize("workspace_rows", [6, 16])
+def test_rank_major_kv_handles_owner_padding_and_workspace_overflow(
+    monkeypatch, rank, workspace_rows
+):
+    backend = _backend(rank, workspace_rows=workspace_rows, index_k_format="bf16")
+    # Six logical rows: rank 0 owns A,C,D,F; rank 1 owns B,E; rank 2 is empty.
+    logical = torch.arange(10, 16, dtype=torch.bfloat16)[:, None].repeat(1, KV_DIM)
+    owned_positions = ([0, 2, 3, 5], [1, 4], [])
+    plane = torch.zeros((5, 1, KV_DIM), dtype=torch.bfloat16)
+    mine = owned_positions[rank]
+    plane[1 : 1 + len(mine), 0] = logical[mine]
+    send_slots = torch.zeros(4, dtype=torch.int64)
+    send_slots[: len(mine)] = torch.arange(1, 1 + len(mine))
+    mapping = torch.tensor([0, 4, 1, 2, 5, 3], dtype=torch.int32)
+    plan = history_cache.HistoryGatherPlan(
+        virtual_slots=torch.arange(6),
+        send_slots=send_slots,
+        gathered_index=mapping,
+        owned_rows_per_rank=(4, 2, 0),
+        group=(0, 1, 2),
+        rank=rank,
+    )
+    group = dsa.QueryShardHistoryGroup(
+        requests=slice(0, 1),
+        row_base=9,
+        rows=6,
+        local_query=slice(0, 0),
+        gather=plan,
+    )
+    pool = object.__new__(MLATokenToKVPool)
+    pool.layerwise_load_tracker = None
+    pool.kv_buffer = [plane]
+    pool.quant_method = "none"
+    pool.dtype = pool.store_dtype = torch.bfloat16
+    layer = object.__new__(PagedAttention)
+    layer.layer_id = 0
+    gathered = torch.zeros((12, KV_DIM), dtype=torch.bfloat16)
+    for owner, positions in enumerate(owned_positions):
+        gathered[owner * 4 : owner * 4 + len(positions)] = logical[positions]
+
+    def collective(output, payload, ranks):
+        # Only the unavailable process group is replaced. Production gather,
+        # byte transport views, buffer sizing and pool reads still execute.
+        assert ranks == (0, 1, 2)
+        assert torch.equal(payload, plane[send_slots, 0].view(torch.uint8))
+        output.copy_(gathered.view(torch.uint8))
+
+    monkeypatch.setattr(history_cache, "all_gather_single", collective)
+    result, rows = backend.gather_history_kv(layer, pool, group)
+    assert result.shape == (12, KV_DIM)
+    assert torch.equal(result[rows.long()].view(torch.uint8), logical.view(torch.uint8))
+    assert (result.data_ptr() == backend._history_workspace.kv.data_ptr()) == (
+        workspace_rows >= 12
+    )
 
 
 def test_the_sharded_arm_refuses_a_query_carrying_the_tp_slice():

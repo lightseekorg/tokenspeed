@@ -51,6 +51,7 @@ import torch.multiprocessing as mp
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
 
 from tokenspeed.runtime.layers.attention.dcp.cache import (
+    all_gather_history_rows,
     gather_history_rows,
     plan_history_gather,
 )
@@ -228,6 +229,22 @@ def _run(rank: int, port: int) -> None:
         )
         out = gather_history_rows(plan, local, out=workspace)
         torch.testing.assert_close(out, _reference(virtual_slots), rtol=0, atol=0)
+        # Without the read-back the rows stay rank-major: position i is row
+        # gathered_index[i] of the all-gather output.
+        rank_major = all_gather_history_rows(
+            plan,
+            plane.index_select(0, plan.send_slots),
+            out=torch.empty(
+                (len(plan.group) * plan.send_rows + 1, DIM), dtype=local.dtype
+            ),
+        )
+        assert rank_major.shape[0] == len(plan.group) * plan.send_rows
+        torch.testing.assert_close(
+            rank_major[plan.gathered_index.to(torch.int64)],
+            _reference(virtual_slots),
+            rtol=0,
+            atol=0,
+        )
         if requests == slice(2, 3):
             assert counts[2] == 0 and counts[3] == 0
 
@@ -250,6 +267,15 @@ def _run(rank: int, port: int) -> None:
             )
             assert out.dtype == dtype and out.shape == (rows, width)
             assert torch.equal(out.view(torch.uint8), full.view(torch.uint8))
+            rank_major = all_gather_history_rows(
+                plan,
+                _typed_rows(plane.index_select(0, plan.send_slots), dtype, width),
+                out=torch.empty((len(plan.group) * plan.send_rows, width), dtype=dtype),
+            )
+            assert torch.equal(
+                rank_major.view(torch.uint8)[plan.gathered_index.to(torch.int64)],
+                full.view(torch.uint8),
+            )
         with pytest.raises(ValueError, match="sends"):
             gather_history_rows(
                 plan,
@@ -269,6 +295,38 @@ def _typed_rows(rows: torch.Tensor, dtype: torch.dtype, width: int) -> torch.Ten
     width_bytes = width * torch.tensor([], dtype=dtype).element_size()
     repeats = -(-width_bytes // raw.shape[1])
     return raw.repeat(1, repeats)[:, :width_bytes].contiguous().view(dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.uint8])
+@pytest.mark.parametrize("rows", [0, 1, 5])
+def test_rank_major_history_preserves_single_owner_bytes(dtype, rows):
+    plan = plan_history_gather(
+        torch.arange(rows), placement=None, owned_rows_per_rank=[rows]
+    )
+    width = 4
+    row_bytes = width * torch.empty((), dtype=dtype).element_size()
+    # Raw bytes exercise NaNs and signed zero without numerical comparison.
+    pattern = torch.tensor([0, 128, 255, 127], dtype=torch.uint8)
+    payload = pattern.repeat((rows * row_bytes + 3) // 4)[: rows * row_bytes]
+    local = payload.reshape(rows, row_bytes).view(dtype)
+    out = torch.empty((rows + 1, width), dtype=dtype)
+    out.view(torch.uint8).fill_(37)
+    result = all_gather_history_rows(plan, local, out=out)
+    assert result.shape == (rows, width)
+    assert torch.equal(result.view(torch.uint8), local.view(torch.uint8))
+    assert torch.all(out[rows:].view(torch.uint8) == 37)
+
+
+@pytest.mark.parametrize("invalid", ["send_rows", "capacity", "width", "dtype"])
+def test_rank_major_history_rejects_invalid_buffers(invalid):
+    plan = plan_history_gather(torch.arange(3), placement=None, owned_rows_per_rank=[3])
+    local = torch.zeros((2 if invalid == "send_rows" else 3, 4))
+    out = torch.empty(
+        (2 if invalid == "capacity" else 3, 5 if invalid == "width" else 4),
+        dtype=torch.int32 if invalid == "dtype" else torch.float32,
+    )
+    with pytest.raises(ValueError):
+        all_gather_history_rows(plan, local, out=out)
 
 
 def test_history_gather_rebuilds_every_group_in_position_order():
