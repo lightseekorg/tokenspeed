@@ -223,9 +223,18 @@ def get_chunks_paged(prefix_lens, prefix_lens_cpu, page_table, page_size):
     batch_size = len(prefix_lens_cpu)
     chunks_cpu = plan_prefix_chunks(prefix_lens_cpu, get_max_chunk_capacity())
     num_chunks = chunks_cpu.starts.shape[0]
-    arrays = torch.stack(
-        (chunks_cpu.starts, chunks_cpu.ends, chunks_cpu.len_in_chunk)
-    ).to(device=device)
+    # Stage the host plan in pinned memory so the device copy is asynchronous:
+    # prefill planning must not synchronize (a copy from pageable memory
+    # would), and fresh pinned storage cannot be refilled under an in-flight
+    # copy.
+    host_arrays = torch.empty(
+        (3, num_chunks, batch_size), dtype=torch.int32, pin_memory=True
+    )
+    torch.stack(
+        (chunks_cpu.starts, chunks_cpu.ends, chunks_cpu.len_in_chunk),
+        out=host_arrays,
+    )
+    arrays = host_arrays.to(device=device, non_blocking=True)
     chunks = Chunks(*arrays.unbind(0))
 
     num_tokens_per_forward = chunks_cpu.len_in_chunk.sum(dim=1).tolist()
