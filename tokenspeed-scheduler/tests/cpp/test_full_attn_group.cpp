@@ -634,10 +634,10 @@ TEST(FullAttnManagerLcmTest, LocationBasedEvictionIsScopedToItsPool) {
     std::uint64_t next_access_epoch = 0;
     mgr.Index().Register(device_pool, device, device_key, ++next_access_epoch, /*logical_block_index=*/-1,
                          CacheBoundaryKind::kChunk,
-                         /*newly_cached=*/nullptr);
+                         /*newly_cached=*/nullptr, /*session=*/nullptr);
     mgr.Index().Register(host_pool, host, host_key, ++next_access_epoch, /*logical_block_index=*/-1,
                          CacheBoundaryKind::kChunk,
-                         /*newly_cached=*/nullptr);
+                         /*newly_cached=*/nullptr, /*session=*/nullptr);
     device.reset();
     host.reset();
 

@@ -143,3 +143,16 @@ def test_logprobs_refuse_misshaped_inputs():
         vocab_parallel_logprobs(logits, targets.float(), vocab_block=BLOCK)
     with pytest.raises(ValueError, match=r"logits must be \[rows, vocab\]"):
         vocab_parallel_logprobs(logits[0], targets[:1], vocab_block=BLOCK)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_certain_token_has_positive_zero_logprob(dtype):
+    logits = torch.full((2, VOCAB), -1000.0, dtype=dtype)
+    targets = torch.tensor([0, BLOCK], dtype=torch.int64)
+    logits[torch.arange(2), targets] = 0.0
+    actual = vocab_parallel_logprobs(
+        logits, targets, vocab_block=BLOCK, solution="torch"
+    )
+    # Float equality cannot distinguish +0.0 from -0.0; the trainer's
+    # target - log(sum_exp) yields the all-zero FP32 bit pattern.
+    assert torch.equal(actual.view(torch.int32), torch.zeros(2, dtype=torch.int32))

@@ -193,6 +193,7 @@ fn generate_text() {
             multimodal_inputs: None,
             validation_error: Some(s("rejected")),
             data_parallel_rank: Some(1),
+            cache_session_id: Some(s("cache-session")),
         },
     );
 }
