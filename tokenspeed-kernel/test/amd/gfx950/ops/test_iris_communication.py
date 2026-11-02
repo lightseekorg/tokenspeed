@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 
-import inspect
 import math
 import os
 import socket
@@ -166,9 +165,11 @@ def test_context_picks_vmem_chunked_only_for_gfx1250_across_hosts(
     )
     monkeypatch.setattr(_iris, "_job_spans_hosts", lambda: spans_hosts)
     monkeypatch.setattr(
-        _iris,
-        "_create_context",
-        lambda size, allocator, device: created.append(allocator),
+        _iris.iris,
+        "iris",
+        lambda heap_size, device, **options: created.append(
+            options.get("allocator_type")
+        ),
     )
 
     _iris.get_or_create_context(heap_size=1 << 20)
@@ -958,8 +959,11 @@ def _check_placed_all_reduce(rank: int, world_size: int, gpu: int) -> None:
         _check_all_reduce(state, rank, world_size, shape, device)
 
 
-def _partial_placement_worker_fn(rank, world_size, port, base_gpu, error_dict):
+def _partial_placement_worker_fn(
+    rank, world_size, port, base_gpu, allocator_type, error_dict
+):
     try:
+        os.environ["IRIS_ALLOCATOR"] = allocator_type
         dist.init_process_group(
             backend="gloo",
             init_method=f"tcp://localhost:{port}",
@@ -974,42 +978,15 @@ def _partial_placement_worker_fn(rank, world_size, port, base_gpu, error_dict):
             dist.destroy_process_group()
 
 
-def test_iris_all_reduce_on_gpus_past_the_rank_index():
+@pytest.mark.parametrize("allocator_type", ["torch", "vmem", "vmem_chunked"])
+def test_iris_all_reduce_on_gpus_past_the_rank_index(allocator_type):
     """Two ranks on GPUs 2-3 of four, as with a base GPU offset of 2."""
     _skip_if_unsupported(4, "Iris partial-placement tests")
-    _spawn_and_collect(_partial_placement_worker_fn, (2, _get_open_port(), 2), 2)
-
-
-def _vmem_placement_worker_fn(rank, world_size, port, error_dict):
-    from tokenspeed_kernel.ops.communication._iris import get_or_create_context
-
-    try:
-        os.environ["IRIS_ALLOCATOR"] = "vmem"
-        dist.init_process_group(
-            backend="gloo",
-            init_method=f"tcp://localhost:{port}",
-            rank=rank,
-            world_size=world_size,
-        )
-        # Only rank 1 is misplaced, but both ranks must fail rather than hang.
-        torch.cuda.set_device((0, 2)[rank])
-        with pytest.raises(RuntimeError, match="cannot place rank 1 on GPU 2"):
-            get_or_create_context(heap_size=1 << 20)
-    except BaseException:
-        error_dict[rank] = traceback.format_exc()
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-def test_iris_vmem_refuses_a_gpu_past_the_rank_index():
-    """Without ``device=``, Iris's vmem heap would fault on GPU 2 for rank 1."""
-    _skip_if_unsupported(3, "Iris vmem placement tests")
-    from tokenspeed_kernel.ops.communication._iris import iris
-
-    if "device" in inspect.signature(iris.iris).parameters:
-        pytest.skip("this Iris places the heap itself")
-    _spawn_and_collect(_vmem_placement_worker_fn, (2, _get_open_port()), 2)
+    _spawn_and_collect(
+        _partial_placement_worker_fn,
+        (2, _get_open_port(), 2, allocator_type),
+        2,
+    )
 
 
 # ---------------------------------------------------------------------------

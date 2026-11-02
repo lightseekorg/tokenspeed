@@ -20,12 +20,9 @@
 
 """One process-wide Iris heap; operations retain their own group and buffers."""
 
-import inspect
 import itertools
 import math
-import os
 import socket
-from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -34,7 +31,6 @@ from tokenspeed_kernel.platform import current_platform
 
 with redirect_triton_to_tokenspeed_triton():
     import iris
-    import iris.host.iris as iris_host
     from iris.host.distributed.topology import TopologyDiscovery
 
 MIN_HEAP_BYTES = 256 << 20
@@ -100,73 +96,6 @@ def world_in_one_fabric_domain() -> bool:
     return len(domains) == 1 and "" not in domains
 
 
-@contextmanager
-def _build_heap_on(device: int):
-    """Build the heap on ``device``; Iris without ``device=`` uses rank % GPUs.
-
-    The device context is left for the caller to build once ``ctx.device`` is
-    corrected, so nothing is allocated on GPU rank % GPUs.
-    """
-    heap = iris_host.SymmetricHeap
-    saved = iris_host.set_device, heap, iris_host.Iris._build_device_context
-
-    def build_heap(size, gpu_id, rank, world_size, allocator_type="torch"):
-        allocator = os.environ.get("IRIS_ALLOCATOR", allocator_type).lower()
-        if allocator == "vmem":
-            # Without device=, VMemAllocator grants access to GPUs 0..world_size-1.
-            # Every rank raises, so none waits in Iris's setup for a rank that failed.
-            placements = _gather_through_store("gpu", f"{device},{gpu_id}")
-            for misplaced, placement in enumerate(placements):
-                placed, expected = placement.split(",")
-                if placed != expected:
-                    raise RuntimeError(
-                        f"Iris's vmem allocator cannot place rank {misplaced} on "
-                        f"GPU {placed}: this Iris has no device= argument. Use the "
-                        "torch or vmem_chunked allocator, or an Iris that accepts "
-                        "device=."
-                    )
-        return heap(size, device, rank, world_size, allocator_type)
-
-    iris_host.set_device = lambda gpu_id: None
-    iris_host.SymmetricHeap = build_heap
-    iris_host.Iris._build_device_context = lambda self: None
-    try:
-        yield
-    finally:
-        (
-            iris_host.set_device,
-            iris_host.SymmetricHeap,
-            iris_host.Iris._build_device_context,
-        ) = saved
-
-
-def _create_context(size: int, allocator_type: str | None, device: int):
-    """Create the Iris context with its heap and device context on ``device``.
-
-    An Iris that accepts ``device=`` places everything itself. Otherwise the
-    context is built through the ``_build_heap_on`` shim, and its ``gpu_id`` and
-    ``device`` are corrected before its device context is built.
-
-    Args:
-        size: Heap capacity in bytes.
-        allocator_type: Iris allocator name, or None for Iris's default.
-        device: Index of the GPU this rank runs on.
-
-    Returns:
-        The Iris context, with ``gpu_id`` equal to ``device``.
-    """
-    options = {} if allocator_type is None else {"allocator_type": allocator_type}
-    if "device" in inspect.signature(iris.iris).parameters:
-        return iris.iris(heap_size=size, device=device, **options)
-    # TODO: Remove this fallback and _build_heap_on once the tokenspeed-iris pin
-    # includes ROCm/iris#584, which adds device=.
-    with _build_heap_on(device):
-        ctx = iris.iris(heap_size=size, **options)
-    ctx.gpu_id, ctx.device = device, f"cuda:{device}"
-    ctx._build_device_context()
-    return ctx
-
-
 def get_or_create_context(*, heap_size: int):
     """Create the shared context at its initial capacity, or return it unchanged.
 
@@ -187,7 +116,10 @@ def get_or_create_context(*, heap_size: int):
             # Only vmem_chunked maps peers on other hosts, and only gfx1250
             # routes groups across hosts to Iris.
             allocator_type = "vmem_chunked"
-        _context = _create_context(size, allocator_type, torch.cuda.current_device())
+        options = {} if allocator_type is None else {"allocator_type": allocator_type}
+        _context = iris.iris(
+            heap_size=size, device=torch.cuda.current_device(), **options
+        )
     return _context
 
 
