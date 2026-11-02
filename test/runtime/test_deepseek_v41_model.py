@@ -1166,6 +1166,7 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
 
     class Layer(SimpleNamespace):
         _forward_ffn = DeepseekV41DecoderLayer._forward_ffn
+        _ffn_context = DeepseekV41DecoderLayer._ffn_context
 
     layer = Layer(
         layer_id=0,
