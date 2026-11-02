@@ -1688,11 +1688,13 @@ Standard target decode is a one-token verify window. Both standard and
 speculative decode follow verify, acceptance, and commit. Verify retains
 the Gluon fused convolution, LDS vectors and batched value-split selection.
 GFX950 uses 32-row state panels for one-token windows with a bounded gate
-and no value split. GFX1250 uses 64-row panels whenever a program owns a
-whole head (no value split, from 16 requests), which cuts its serial panel
-steps from eight to two. Other cases use 16-row panels. Verify preserves
-committed FP32 or BF16 state and widens it to FP32. It saves correction U
-in FP32, and unnormalized K and raw gate in the activation dtype.
+and no value split; its other cases use 16-row panels. GFX1250 gives each
+value split one panel of its share of the head (16, 32 or 64 rows for 8, 4
+or 2 splits) and walks two 64-row panels when a program owns a whole head
+(from 16 requests). Its record, output and correction stores are buffer
+stores, whose masks do not branch. Verify preserves committed FP32 or BF16
+state and widens it to FP32. It saves correction U in FP32, and
+unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
 the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
@@ -1701,13 +1703,20 @@ A null destination leaves retention to the caller. Padding pages do not write
 retained rows. When the caller supplies low-rank gate inputs, GFX950 projects
 inside verify for up to 64 total input rows and uses a separate GEMM above that.
 MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
-GFX1250 projects inside verify at every row count. A supplied raw gate is used
-directly. Both save the gate used by verify. On both targets, each value split
-starts its first checkpoint-panel load before preparing the token vectors.
+GFX1250 projects inside verify at every row count. Its split programs load
+the gate rows of a dense window before the query boundaries arrive, so the
+projection overlaps the state loads; other boundaries reload the rows. A
+supplied raw gate is used directly. Both save the gate used by verify. On
+both targets, each value split starts its first checkpoint-panel load
+before preparing the token vectors.
 Without value splits, one-token verify keeps 64 state rows in flight after
 preparation.
 GFX950 recovery uses 64-row panels for one-token windows with a bounded gate.
 Other windows keep 16-row panels, with two in flight for one-token softplus.
+GFX1250 recovery loads a head's whole checkpoint into LDS with one
+tensor-data-mover load, loads the records before the stamp check, and
+updates 16-row panels whose waves span whole 128-key rows. It still
+normalizes K over 16-lane rows, as verify does.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against
