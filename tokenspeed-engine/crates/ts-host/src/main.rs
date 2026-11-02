@@ -151,6 +151,12 @@ fn parse_args() -> Result<Args, HostError> {
 }
 
 /// What `rust_host.HostConfig` carries.
+/// OTLP tracing as the Python server args carry it.
+struct TraceConfig {
+    endpoint: String,
+    sample_ratio: f64,
+}
+
 struct HostConfig {
     handshake_address: String,
     engine_index: u16,
@@ -172,6 +178,8 @@ struct HostConfig {
     metrics: Metrics,
     batch_log: BatchLogConfig,
     finish_log: FinishLog,
+    /// OTLP tracing: the endpoint and sample ratio, when tracing is on.
+    trace: Option<TraceConfig>,
     /// The scheduler records KV cache events.
     kv_events: bool,
     /// Where this rank publishes them, if it does.
@@ -422,6 +430,16 @@ impl HostConfig {
                 enabled: config.getattr("finish_log")?.extract()?,
                 request_stats: config.getattr("log_request_stats")?.extract()?,
             },
+            trace: match config
+                .getattr("otlp_traces_endpoint")?
+                .extract::<Option<String>>()?
+            {
+                Some(endpoint) => Some(TraceConfig {
+                    endpoint,
+                    sample_ratio: config.getattr("trace_sample_ratio")?.extract()?,
+                }),
+                None => None,
+            },
             kv_events: config.getattr("kv_events")?.extract()?,
             kv_events_publisher: {
                 let publisher = config.getattr("kv_events_publisher")?;
@@ -601,12 +619,20 @@ fn serve(args: &Args) -> Result<(), HostError> {
     }
     let data_plane =
         PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
+    let trace = config.trace.as_ref().map(|trace| {
+        ts_control::trace::TracePublisher::new(
+            trace.endpoint.clone(),
+            trace.sample_ratio,
+            config.metrics.labels.model_name.clone(),
+        )
+    });
     let outputs = OutputProcessor::new(
         config.spec_num_tokens,
         config.stream_interval,
         Some(config.physical_context_len),
         role,
         config.finish_log,
+        trace,
     );
     let loop_config = LoopConfig {
         in_flight_depth: config.in_flight_depth,

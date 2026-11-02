@@ -1,0 +1,407 @@
+// Copyright (c) 2026 LightSeek Foundation
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+//! OTLP trace export: one span per request, built retrospectively at its
+//! release.
+//!
+//! The timestamps a trace needs are the request stats' own — when it was
+//! received, scheduled, prefilled, first tokened and finished — so the span
+//! is assembled once, when the request leaves the processor, and handed to
+//! the export thread over a bounded channel. The serving loop never blocks:
+//! a full channel drops the span and counts it, the metrics relay's policy.
+//! Trace ids derive from the request id (the same request traces to the same
+//! id, so logs and traces cross-reference), span ids from a process counter.
+
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
+
+use serde_json::{json, Value};
+
+/// How many spans may wait for the export thread.
+const CHANNEL_SPANS: usize = 4096;
+
+/// How many spans one OTLP request carries at most, and how long the
+/// export thread waits to fill a batch.
+const BATCH_SPANS: usize = 128;
+const BATCH_WAIT: Duration = Duration::from_millis(100);
+
+/// One finished request, as a span's whole content: wall-clock seconds
+/// (`wall_seconds`), zero until the point was reached.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceRecord {
+    pub rid: String,
+    pub created: f64,
+    pub scheduled: f64,
+    pub prefill_done: f64,
+    pub first_token: f64,
+    pub finish: f64,
+    pub prompt_tokens: i64,
+    pub cached_tokens: i64,
+    pub output_tokens: i64,
+    pub finish_reason: &'static str,
+    pub preempt_count: i64,
+    pub preempt_seconds: f64,
+}
+
+/// Sends request spans to an OTLP/HTTP endpoint on a thread of its own.
+#[derive(Debug)]
+pub struct TracePublisher {
+    sender: SyncSender<TraceRecord>,
+    sample_ratio: f64,
+    sampled: AtomicU64,
+    dropped: AtomicU64,
+    /// The export thread's endpoint and model, when it has one.
+    endpoint: Option<(String, String)>,
+}
+
+impl TracePublisher {
+    /// Export to `endpoint` (an OTLP/HTTP receiver, e.g. a collector's
+    /// `/v1/traces`), keeping `sample_ratio` of requests — 0 disables.
+    pub fn new(endpoint: String, sample_ratio: f64, model_name: String) -> Arc<Self> {
+        let (sender, receiver) = sync_channel(CHANNEL_SPANS);
+        let publisher = Self::with_sender(Some((endpoint, model_name)), sample_ratio, sender);
+        if let Some((endpoint, model_name)) = publisher.endpoint.clone() {
+            thread::Builder::new()
+                .name("ts-trace".to_owned())
+                .spawn(move || export_loop(receiver, endpoint, model_name))
+                .expect("spawning the trace export thread");
+        }
+        publisher
+    }
+
+    /// The publisher over a caller-made channel; the test path (and the
+    /// constructor's). `endpoint` starts the export thread only when set.
+    fn with_sender(
+        endpoint: Option<(String, String)>,
+        sample_ratio: f64,
+        sender: SyncSender<TraceRecord>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            sender,
+            sample_ratio: sample_ratio.clamp(0.0, 1.0),
+            sampled: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            endpoint,
+        })
+    }
+
+    /// Whether this request is in the sample. The draw happens once, here,
+    /// before the caller builds the record.
+    pub fn sampled(&self) -> bool {
+        if self.sample_ratio >= 1.0 {
+            return true;
+        }
+        if self.sample_ratio <= 0.0 {
+            return false;
+        }
+        // A cheap per-publisher sequence mix; span ids use the same mixer.
+        let draw = mix(u128::from(self.sampled.fetch_add(1, Ordering::Relaxed)));
+        // The mix is uniform over its top bits; compare the fraction.
+        ((draw >> 64) as f64 / u64::MAX as f64) < self.sample_ratio
+    }
+
+    /// Hand one span to the export thread, dropping it when the channel is
+    /// full — a trace is best effort, never a delay.
+    pub fn emit(&self, record: TraceRecord) {
+        match self.sender.try_send(record) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// A publisher over a channel the caller reads, with no export
+    /// thread: the tests' path.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        sample_ratio: f64,
+    ) -> (Arc<Self>, std::sync::mpsc::Receiver<TraceRecord>) {
+        let (sender, receiver) = sync_channel(CHANNEL_SPANS);
+        (Self::with_sender(None, sample_ratio, sender), receiver)
+    }
+
+    /// Spans the export thread could not take.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// The export loop: batch what arrived, POST one OTLP/HTTP JSON request,
+/// repeat. A failed POST logs and drops its batch; traces never queue up
+/// behind an unreachable collector.
+fn export_loop(receiver: Receiver<TraceRecord>, endpoint: String, model_name: String) {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build();
+    loop {
+        let first = match receiver.recv() {
+            Ok(record) => record,
+            Err(_) => return,
+        };
+        let mut batch = vec![first];
+        while batch.len() < BATCH_SPANS {
+            match receiver.recv_timeout(BATCH_WAIT) {
+                Ok(record) => batch.push(record),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    export(&agent, &endpoint, &model_name, &batch);
+                    return;
+                }
+            }
+        }
+        export(&agent, &endpoint, &model_name, &batch);
+    }
+}
+
+/// One POST. The body is OTLP/HTTP JSON — every OTLP/HTTP receiver takes
+/// it — so the export needs no protobuf or opentelemetry dependency.
+fn export(agent: &ureq::Agent, endpoint: &str, model_name: &str, batch: &[TraceRecord]) {
+    let body = match serde_json::to_vec(&otlp_request(model_name, batch)) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(%error, "encoding a trace batch failed");
+            return;
+        }
+    };
+    if let Err(error) = agent
+        .post(endpoint)
+        .set("Content-Type", "application/json")
+        .send_bytes(&body)
+    {
+        tracing::warn!(%error, endpoint, "exporting a trace batch failed");
+    }
+}
+
+/// The `ExportTraceServiceRequest` one batch becomes. Integers are strings
+/// and ids hex, as protobuf's JSON mapping writes 64-bit and bytes fields.
+fn otlp_request(model_name: &str, batch: &[TraceRecord]) -> Value {
+    let spans: Vec<Value> = batch.iter().map(|record| span(record)).collect();
+    json!({
+        "resourceSpans": [{
+            "resource": {"attributes": [
+                string_attribute("service.name", "tokenspeed"),
+                string_attribute("gen_ai.system", "tokenspeed"),
+                string_attribute("gen_ai.request.model", model_name),
+            ]},
+            "scopeSpans": [{
+                "scope": {"name": "tokenspeed"},
+                "spans": spans,
+            }],
+        }],
+    })
+}
+
+/// One request as a span: the lifecycle points become time-stamped events,
+/// the counts become GenAI-conventioned attributes.
+fn span(record: &TraceRecord) -> Value {
+    let mut events = Vec::new();
+    for (name, at) in [
+        ("tokenspeed.request.scheduled", record.scheduled),
+        ("tokenspeed.request.prefill_done", record.prefill_done),
+        ("tokenspeed.request.first_token", record.first_token),
+    ] {
+        if at > 0.0 {
+            events.push(json!({
+                "name": name,
+                "timeUnixNano": nanos(at),
+            }));
+        }
+    }
+    json!({
+        "traceId": trace_id(&record.rid),
+        "spanId": span_id(&record.rid),
+        "name": "tokenspeed.request",
+        "kind": 1,
+        "startTimeUnixNano": nanos(record.created),
+        "endTimeUnixNano": nanos(record.finish),
+        "attributes": [
+            string_attribute("gen_ai.request_id", &record.rid),
+            int_attribute("gen_ai.prompt_tokens", record.prompt_tokens),
+            int_attribute("tokenspeed.prompt_cached_tokens", record.cached_tokens),
+            int_attribute("gen_ai.completion_tokens", record.output_tokens),
+            string_attribute("gen_ai.response.finish_reason", record.finish_reason),
+            int_attribute("tokenspeed.preempt_count", record.preempt_count),
+            double_attribute("tokenspeed.preempt_seconds", record.preempt_seconds),
+        ],
+        "events": events,
+        "status": {},
+    })
+}
+
+fn string_attribute(key: &str, value: &str) -> Value {
+    json!({"key": key, "value": {"stringValue": value}})
+}
+
+fn int_attribute(key: &str, value: i64) -> Value {
+    json!({"key": key, "value": {"intValue": value.to_string()}})
+}
+
+fn double_attribute(key: &str, value: f64) -> Value {
+    json!({"key": key, "value": {"doubleValue": value}})
+}
+
+/// Wall-clock seconds as nanoseconds since the epoch, the string proto
+/// JSON gives 64-bit fields.
+fn nanos(seconds: f64) -> String {
+    (seconds.max(0.0) * 1e9).round().to_string()
+}
+
+/// The request's trace id: 32 hex characters from a 128-bit mix of the rid,
+/// so the same request id traces to the same id across ranks and logs.
+fn trace_id(rid: &str) -> String {
+    let mut out = String::with_capacity(32);
+    for half in [mix(rid_hash(rid, 1)), mix(rid_hash(rid, 2))] {
+        out.push_str(&format!("{:016x}", half as u64));
+    }
+    out
+}
+
+/// The request's span id, 16 hex characters: the same mix over the rid and
+/// the process counter, so every span differs.
+fn span_id(rid: &str) -> String {
+    format!(
+        "{:016x}",
+        (mix(rid_hash(rid, 3) ^ u128::from(SPANS.fetch_add(1, Ordering::Relaxed))) as u64)
+    )
+}
+
+/// `rid` folded to 128 bits; `domain` separates the id derivations.
+fn rid_hash(rid: &str, domain: u8) -> u128 {
+    let mut hash: u128 = 0x243f_6a88_85a3_08d3_1319_8a2e_0370_7344 ^ (u128::from(domain) << 120);
+    for byte in rid.as_bytes() {
+        hash ^= u128::from(*byte);
+        hash = hash.wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834);
+    }
+    hash
+}
+
+/// The final scramble (splitmix64's, over 128 bits).
+fn mix(value: u128) -> u128 {
+    let mut z = value.wrapping_add(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9_b495_b30f_b1d3_0a7e);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb_8c9f_b3d9_c764_51a3);
+    z ^ (z >> 31)
+}
+
+/// The process-wide span counter.
+static SPANS: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> TraceRecord {
+        TraceRecord {
+            rid: "chatcmpl-1".to_owned(),
+            created: 1_700_000_000.0,
+            scheduled: 1_700_000_000.5,
+            prefill_done: 1_700_000_001.0,
+            first_token: 1_700_000_001.25,
+            finish: 1_700_000_002.0,
+            prompt_tokens: 100,
+            cached_tokens: 64,
+            output_tokens: 8,
+            finish_reason: "stop",
+            preempt_count: 1,
+            preempt_seconds: 0.25,
+        }
+    }
+
+    #[test]
+    fn a_record_becomes_a_genai_conventioned_span() {
+        let span = span(&record());
+        assert_eq!(span["name"], "tokenspeed.request");
+        assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
+        assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
+        assert_eq!(span["startTimeUnixNano"], "1700000000000000000");
+        assert_eq!(span["endTimeUnixNano"], "1700000002000000000");
+        let attrs = span["attributes"].as_array().unwrap();
+        assert!(attrs.contains(&string_attribute("gen_ai.response.finish_reason", "stop")));
+        assert!(attrs.contains(&int_attribute("gen_ai.prompt_tokens", 100)));
+        let events = span["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["name"], "tokenspeed.request.scheduled");
+        assert_eq!(events[0]["timeUnixNano"], "1700000000500000000");
+    }
+
+    #[test]
+    fn unreached_points_emit_no_events() {
+        let mut record = record();
+        record.scheduled = 0.0;
+        record.prefill_done = 0.0;
+        record.first_token = 0.0;
+        let span = span(&record);
+        assert_eq!(span["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_same_rid_traces_to_the_same_id() {
+        assert_eq!(trace_id("chatcmpl-1"), trace_id("chatcmpl-1"));
+        assert_ne!(trace_id("chatcmpl-1"), trace_id("chatcmpl-2"));
+        assert_ne!(trace_id("chatcmpl-1"), span_id("chatcmpl-1"));
+    }
+
+    #[test]
+    fn a_full_channel_drops_instead_of_blocking() {
+        let (sender, receiver) = sync_channel(1);
+        let publisher = TracePublisher::with_sender(None, 1.0, sender);
+        publisher.emit(record());
+        publisher.emit(record());
+        assert_eq!(publisher.dropped(), 1);
+        assert!(receiver.recv_timeout(Duration::from_millis(10)).is_ok());
+    }
+
+    #[test]
+    fn sampling_keeps_a_deterministic_share() {
+        let (sender, _) = sync_channel(CHANNEL_SPANS);
+        let off = TracePublisher::with_sender(None, 0.0, sender.clone());
+        assert!(!off.sampled());
+        let all = TracePublisher::with_sender(None, 1.0, sender.clone());
+        for _ in 0..100 {
+            assert!(all.sampled());
+        }
+        // A ratio between: the count stays within its share plus slack.
+        let (sender, _) = sync_channel(CHANNEL_SPANS);
+        let half = TracePublisher::with_sender(None, 0.5, sender);
+        let kept: usize = (0..1000).filter(|_| half.sampled()).count();
+        assert!((350..=650).contains(&kept), "kept {kept} of 1000");
+    }
+
+    #[test]
+    fn the_request_wraps_spans_in_one_resource() {
+        let body = otlp_request("m", &[record()]);
+        let resource = &body["resourceSpans"][0]["resource"]["attributes"];
+        assert!(resource
+            .as_array()
+            .unwrap()
+            .contains(&string_attribute("gen_ai.request.model", "m")));
+        let spans = &body["resourceSpans"][0]["scopeSpans"][0]["spans"];
+        assert_eq!(spans.as_array().unwrap().len(), 1);
+    }
+}

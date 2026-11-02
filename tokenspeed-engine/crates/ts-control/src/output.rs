@@ -21,6 +21,7 @@
 //! Committing a forward's results: request state, the scheduler's feedback
 //! events and the frontend's outputs.
 
+use std::sync::Arc;
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
@@ -467,6 +468,9 @@ pub struct OutputProcessor {
     last_commit_at: f64,
     /// Requests registered so far, numbering each admission.
     admissions: u64,
+    /// The OTLP trace exporter, when tracing is on. Presence also widens
+    /// the request-stats clock: the trace needs the same timestamps.
+    trace: Option<Arc<crate::trace::TracePublisher>>,
 }
 
 impl OutputProcessor {
@@ -479,6 +483,7 @@ impl OutputProcessor {
         physical_context_len: Option<i64>,
         role: Role,
         finish_log: FinishLog,
+        trace: Option<Arc<crate::trace::TracePublisher>>,
     ) -> Self {
         Self {
             states: HashMap::new(),
@@ -490,6 +495,7 @@ impl OutputProcessor {
             finish_log,
             last_commit_at: 0.0,
             admissions: 0,
+            trace,
         }
     }
 
@@ -502,7 +508,7 @@ impl OutputProcessor {
 
     /// Stamp the first dispatch of `rids`, for the request stats.
     pub fn mark_scheduled(&mut self, rids: &[String]) {
-        if !self.finish_log.request_stats {
+        if !(self.finish_log.request_stats || self.trace.is_some()) {
             return;
         }
         let now = wall_seconds();
@@ -530,6 +536,38 @@ impl OutputProcessor {
                 )
             );
         }
+    }
+
+    /// Trace one released request: the span the request's own timestamps
+    /// assemble, handed to the export thread when the sample keeps it.
+    fn trace_end(&self, rid: &str, state: &RequestState) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        if !trace.sampled() {
+            return;
+        }
+        let (scheduled, prefill_done, first_token, preempt_count, preempt_seconds) = state
+            .timings
+            .as_ref()
+            .map_or((0.0, 0.0, 0.0, 0, 0.0), |timings| timings.trace_points());
+        trace.emit(crate::trace::TraceRecord {
+            rid: rid.to_owned(),
+            created: state.created_time,
+            scheduled,
+            prefill_done,
+            first_token,
+            finish: crate::request_stats::wall_seconds(),
+            prompt_tokens: state.prompt_len,
+            cached_tokens: state.cached_tokens,
+            output_tokens: state.output_ids.len() as i64,
+            finish_reason: state
+                .finished_reason
+                .as_ref()
+                .map_or("unknown", FinishReason::wire_type),
+            preempt_count,
+            preempt_seconds,
+        });
     }
 
     /// The engine's role.
@@ -578,7 +616,7 @@ impl OutputProcessor {
             // The prompt was computed on the prefill node.
             state.computed_length = state.prompt_len;
         }
-        if self.finish_log.request_stats {
+        if self.finish_log.request_stats || self.trace.is_some() {
             state.timings = Some(RequestTimings::default());
         }
         self.states.insert(rid, state);
@@ -603,6 +641,7 @@ impl OutputProcessor {
                     .collect();
         }
         self.log_end(rid, &state);
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -675,6 +714,7 @@ impl OutputProcessor {
             }
         }
         self.log_end(rid, &state);
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -701,6 +741,7 @@ impl OutputProcessor {
                     .into_iter()
                     .collect();
         }
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -794,6 +835,7 @@ impl OutputProcessor {
                     .collect();
         }
         self.log_end(rid, &state);
+        self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -827,6 +869,7 @@ impl OutputProcessor {
                 ));
             }
             self.log_end(&abort.request_id, &state);
+            self.trace_end(&abort.request_id, &state);
             committed.released.push(abort.request_id.clone());
         }
         committed
@@ -1011,18 +1054,19 @@ impl OutputProcessor {
 
         // The request stats' clock: a decode step lasts from the previous
         // commit, and a round with prefill rows interrupts the decodes in it.
-        let (stats_now, step, prefilling_others) = if self.finish_log.request_stats {
-            let now = wall_seconds();
-            let step = if self.last_commit_at > 0.0 {
-                now - self.last_commit_at
+        let (stats_now, step, prefilling_others) =
+            if self.finish_log.request_stats || self.trace.is_some() {
+                let now = wall_seconds();
+                let step = if self.last_commit_at > 0.0 {
+                    now - self.last_commit_at
+                } else {
+                    0.0
+                };
+                self.last_commit_at = now;
+                (now, step, batch.num_extends > 0)
             } else {
-                0.0
+                (0.0, 0.0, false)
             };
-            self.last_commit_at = now;
-            (now, step, batch.num_extends > 0)
-        } else {
-            (0.0, 0.0, false)
-        };
 
         if let Some(plan) = input_logprobs {
             self.record_input_logprobs(batch, plan, result)?;
@@ -1310,6 +1354,7 @@ impl OutputProcessor {
     fn release(&mut self, rid: &str, committed: &mut Committed) {
         if let Some(state) = self.states.remove(rid) {
             self.log_end(rid, &state);
+            self.trace_end(rid, &state);
             committed.released.push(rid.to_owned());
         }
     }
@@ -1401,6 +1446,7 @@ impl OutputProcessor {
             if state.finished() {
                 let (_, state) = self.states.remove_entry(rid).expect("present above");
                 self.log_end(rid, &state);
+                self.trace_end(rid, &state);
                 released.push(rid.to_owned());
             }
         }
@@ -1449,7 +1495,14 @@ mod tests {
     };
 
     fn processor(spec_num_tokens: Option<usize>) -> OutputProcessor {
-        OutputProcessor::new(spec_num_tokens, 1, Some(4096), Role::Plain, NO_FINISH_LOG)
+        OutputProcessor::new(
+            spec_num_tokens,
+            1,
+            Some(4096),
+            Role::Plain,
+            NO_FINISH_LOG,
+            None,
+        )
     }
 
     fn register(p: &mut OutputProcessor, rid: &str, prompt: i64, max_new: i64, stop: &[i32]) {
@@ -1742,7 +1795,7 @@ mod tests {
 
     #[test]
     fn the_decode_role_ships_no_prompt_logprobs() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, None);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
         p.remote_prefill_done("r", 9, 0, Some(-0.25));
@@ -1762,7 +1815,7 @@ mod tests {
 
     #[test]
     fn a_bootstrap_token_without_a_cumulative_probability_keeps_the_column_aligned() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, None);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
@@ -1801,7 +1854,7 @@ mod tests {
 
     #[test]
     fn the_prefill_role_ships_its_prompt_logprobs_with_its_final_output() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, None);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, true);
         let prompt = batch(&[("r", 3, 0, 3)], 1);
         let plan = p.logprob_plan(&prompt).input.unwrap();
@@ -1819,7 +1872,7 @@ mod tests {
 
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, None);
         p.register(
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
@@ -1864,6 +1917,51 @@ mod tests {
             assert_eq!(ForwardResult::from_bytes(&bytes).as_ref(), Some(&result));
             assert_eq!(ForwardResult::from_bytes(&bytes[..bytes.len() - 1]), None);
         }
+    }
+
+    #[test]
+    fn a_finished_request_traces_its_lifecycle() {
+        // The span one request becomes: its own tokens, its finish reason,
+        // and the timestamps its timings kept — which tracing alone, without
+        // the stats log, is enough to switch on.
+        let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
+        let mut p =
+            OutputProcessor::new(None, 1, Some(4096), Role::Plain, NO_FINISH_LOG, Some(trace));
+        register(&mut p, "r", 4, 10, &[2]);
+        p.mark_scheduled(&["r".to_owned()]);
+        let c = p
+            .commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        assert!(c.outputs[0].finish_reason.is_none());
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[2], &[1]))
+            .unwrap();
+        assert_eq!(c.released, ["r"]);
+        let record = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the finished request traced");
+        assert_eq!(
+            (
+                record.rid.as_str(),
+                record.prompt_tokens,
+                record.output_tokens
+            ),
+            ("r", 4, 2)
+        );
+        assert_eq!(record.finish_reason, "stop");
+        assert!(record.scheduled > 0.0, "tracing stamps the schedule point");
+        assert!(record.first_token >= record.scheduled);
+        assert!(record.finish >= record.first_token);
+        // Unsampled requests build no record at all.
+        let (trace, received) = crate::trace::TracePublisher::for_tests(0.0);
+        let mut p =
+            OutputProcessor::new(None, 1, Some(4096), Role::Plain, NO_FINISH_LOG, Some(trace));
+        register(&mut p, "r", 4, 10, &[2]);
+        p.commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[2], &[1]))
+            .unwrap();
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
     }
 
     #[test]
@@ -2076,7 +2174,7 @@ mod tests {
     fn a_verify_step_past_the_physical_extent_is_an_engine_error() {
         // A 4-token verify window over buffers holding 8 tokens: a request
         // at 4 committed tokens fits one more window exactly, not two.
-        let mut p = OutputProcessor::new(Some(4), 1, Some(8), Role::Plain, NO_FINISH_LOG);
+        let mut p = OutputProcessor::new(Some(4), 1, Some(8), Role::Plain, NO_FINISH_LOG, None);
         register(&mut p, "r", 3, 100, &[]);
         p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[1], &[1]))
             .unwrap();

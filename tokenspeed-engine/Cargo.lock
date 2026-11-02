@@ -1282,6 +1282,7 @@ dependencies = [
  "tokenspeed-wire",
  "tokio",
  "tracing",
+ "ureq",
  "zeromq",
 ]
 

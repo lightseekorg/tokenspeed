@@ -1354,6 +1354,7 @@ fn run_rank<F: Frontend>(
             enabled: true,
             request_stats: true,
         },
+        None,
     );
     let transfer = pd.map(|pd| {
         Box::new(FakePeer {
