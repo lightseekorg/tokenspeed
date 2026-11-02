@@ -123,6 +123,10 @@ public:
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
     std::int32_t AvailableLcmBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    std::int32_t FreeRequestSlots() const { return req_pool_allocator_.AvailableSlots(); }
+    std::int32_t TotalRequestSlots() const { return req_pool_allocator_.Size(); }
+    std::int32_t TotalLcmBlocks() const { return block_pool_.NumLcmBlocks(); }
+    std::vector<std::int64_t> AdmissionCapacityCurve(std::int32_t token_step) const;
     // Per-step gauges: empty parents are O(1), active parents walk the live
     // requests' block tables. Parents resident only as cache are
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
@@ -152,6 +156,11 @@ public:
     std::int32_t HostPoolTotalBlocks() const { return host_pool_.NumLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
+    std::size_t DemoteSession(const std::string& id, bool ended) { return coordinator_.DemoteSession(id, ended); }
+    std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended) {
+        return coordinator_.DemoteSessions(ids, ended);
+    }
+
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
