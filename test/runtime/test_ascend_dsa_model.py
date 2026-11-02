@@ -31,7 +31,9 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAAttention
 
 
-def make_attention(*, nope, separate, independent, native_prefill=False, scale_q=False):
+def make_attention(
+    *, nope, separate, independent, prefill_enabled=False, scale_q=False
+):
     config = PretrainedConfig(
         rms_norm_eps=1e-6,
         mla_use_nope=nope,
@@ -59,7 +61,7 @@ def make_attention(*, nope, separate, independent, native_prefill=False, scale_q
         lora_norm_eps=1e-6,
         separate_mla_projections=separate,
         independent_selection=independent,
-        native_prefill=native_prefill,
+        prefill_enabled=prefill_enabled,
     )
 
 
@@ -144,15 +146,15 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
 
 
 @pytest.mark.parametrize("role", [None, "prefill", "decode"])
-@pytest.mark.parametrize("native_prefill", [False, True])
+@pytest.mark.parametrize("prefill_enabled", [False, True])
 def test_prefill_weight_preparation_follows_model_opt_in(
-    monkeypatch, role, native_prefill
+    monkeypatch, role, prefill_enabled
 ):
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     monkeypatch.setitem(global_server_args_dict, "disaggregation_mode", role)
     attention = make_attention(
-        nope=True, separate=True, independent=True, native_prefill=native_prefill
+        nope=True, separate=True, independent=True, prefill_enabled=prefill_enabled
     )
     with torch.no_grad():
         for index, parameter in enumerate(attention.parameters()):
@@ -162,7 +164,7 @@ def test_prefill_weight_preparation_follows_model_opt_in(
                 )
             )
     attention.process_weights_after_loading()
-    if not native_prefill:
+    if not prefill_enabled:
         assert attention._prefill_weights is None
     else:
         weights = attention._prefill_weights
@@ -192,7 +194,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         MLAPrologueOutput,
     )
 
-    from tokenspeed.runtime.layers import paged_attention
     from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
         AscendDSABackend,
     )
@@ -202,6 +203,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
+    from tokenspeed.runtime.layers.attention.dsa import ascend
     from tokenspeed.runtime.layers.dense import unquant
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -213,11 +215,17 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
             self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64)
             self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64)
 
+    @dataclass
+    class QuerySpan:
+        row_start: int = 0
+        row_end: int = rows
+
     class CpuIndexWriter(AscendDSABackend):
         # The device SFA/index kernels are unavailable. This leaf writes a real
         # index-cache tensor and publishes when its device work would finish.
         def __init__(self):
             self._prefill_options = None
+            self._prefill_plan = QuerySpan()
             self.step_counter = None
             self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
             self.counter_before_index = None
@@ -233,6 +241,9 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
             self.query = q.clone()
             self.index_query = kwargs["index_query"].clone()
             self.index_weights = kwargs["index_weights"].clone()
+            pool.latent.index_copy_(
+                0, slots.long(), kwargs["prefill_latent"].unsqueeze(1)
+            )
             self.index_cache.index_copy_(0, slots.long(), kwargs["index_key"])
             self.step_counter.record_cache()
             return q[..., :4].transpose(0, 1).contiguous()
@@ -240,6 +251,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     @dataclass
     class Pool:
         latent: torch.Tensor
+        latent_write_sanitizes: bool = False
 
         def kv_write_target(self, layer_id, slots, owned):
             return LatentKVCache(self.latent, False, slots, owned)
@@ -252,7 +264,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         bs: int = 1
 
     def cpu_prologue(query, q_pe, latent, *, cache, **kwargs):
-        cache.kv_cache.index_copy_(0, cache.slots.long(), latent.unsqueeze(1))
+        assert cache is None
         return MLAPrologueOutput(query=query, key=None, value=None, latent=latent)
 
     def cpu_rmsnorm(x, weight, eps, **kwargs):
@@ -260,7 +272,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
             x.float(), (x.shape[-1],), weight.float(), eps
         ).to(x.dtype)
 
-    monkeypatch.setattr(paged_attention, "mla_prologue", cpu_prologue)
+    monkeypatch.setattr(ascend, "mla_prologue", cpu_prologue)
     monkeypatch.setattr(
         unquant,
         "kernel_mm",
@@ -269,7 +281,11 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         ),
     )
     attention = make_attention(
-        nope=True, separate=True, independent=True, scale_q=scale_q
+        nope=True,
+        separate=True,
+        independent=True,
+        scale_q=scale_q,
+        prefill_enabled=True,
     )
     attention.to(dtype=torch.bfloat16)
     attention.indexer.weights_proj.to(dtype=torch.float32)

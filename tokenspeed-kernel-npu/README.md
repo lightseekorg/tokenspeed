@@ -151,71 +151,43 @@ PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kern
     python -m tokenspeed.runtime.entrypoints.engine --help
 ```
 
-### Native DSA transport boundary
+### DSA/MLA Prefill transport
 
-DSA/MLA prefill uses official HCCL collectives and the `flash_ops`
-`custom::dsa_cp_patch` ACLNN adapter. Each multi-rank transport owns an
-isolated framework process group; single-device patching needs no communicator. Bounded history
-packs referenced cache rows with `index_select` into owned send storage, then
-uses the official `torch_npu.distributed.all_gather_into_tensor_uneven` API to
-write the compact workspace slice. Split sizes count rows, not elements.
-An isolated HCCL process group is created collectively by its cache owners
-during transport construction and destroyed by the transport after draining.
-The default `async_op=False` joins the internal HCCL stream onto the caller's
-communication stream before recording readiness or repacking the next plane;
-no explicit `Work.wait()` is needed. It does not force a CPU completion wait
-unless blocking wait is configured. An all-empty history skips communication.
-Unbounded full-cache history uses official `all_gather_into_tensor`.
-Current KV/Index-K rows are copied on the producer stream into owned send
-planes, without zero padding. Aligned equal contributions use AllGather;
-uneven contributions use official uneven HCCL into a reserved compact plane,
-then copy into page-aligned receive offsets. The receive gaps are neither
-initialized nor transmitted. The cache budget includes the compact plane's
-`max_current_rows * (576 + index_width) * 2` bytes.
+Prefill uses official HCCL collectives and the `flash_ops`
+`custom::dsa_cp_patch` ACLNN adapter. The transport owns an isolated HCCL group
+for cache owners, with no additional user-managed communication stream.
+Synchronous submissions order HCCL's internal stream before subsequent work
+on the fixed execution stream; they need no application-owned Work handles.
+This does not force CPU completion unless blocking wait is configured.
 
-The explicitly selected collective DCP path packs selected local IDs using
-tensor operations and merges already gathered normalized partials with FP32
-natural-log LSE weights. Empty-shard values are masked, including all-empty
-rows. Prepared fused decode keeps the current `npu_dcp_merge_topk` and
-`npu_dsa_merge_lse_direct` communication operators. Their errors propagate;
-execution does not retry through the collective path.
+History gathers only the actual referenced pages, deduplicated by owner.
+Each history/current phase gathers one packet: DSA packs Indexer-K128 and KV576
+channels into704 BF16 values per row; MLA carries only KV576. Output split
+sizes count rows. Current receive regions are128-row aligned per owner, with
+only actual rows transmitted. `dsa_cp_patch` writes owner caches and compact
+boundary pages; complete current pages can be read from the receive region.
+Cache inputs accept contiguous `[rows,width]` and `[rows,1,width]`.
 
-Workspace allocation is optional and separate from transport construction.
-Call `transport.allocate_workspace()` before the first `prefetch` to allocate
-receive, current-send and history-pack buffers at the scheduling row limits
-supplied to the constructor. Repeated calls return the same buffers. Passing
-an explicit `workspace` at construction also enables reuse, as the serving
-backends already do with `AscendPrefillOptions.allocate_workspace()`.
+Receive planes, packets, and commit slots are temporary. Prefetch may be called
+at KDA; the attention entry ensures it was submitted once for the same batch
+and layer. Concurrent consumption by another batch/layer is rejected. Tensor
+references and `record_stream` preserve storage through HCCL, unpacking,
+patching and attention. `finish` releases references after the final queued
+consumer. Shutdown drains execution before releasing the group. The transport
+records its peak owned buffer bytes; serving acceptance also measures device
+allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
+admission and never enables transport or fixes its buffer size.
 
-Without either preparation, every `prefetch` creates fresh target and send
-Tensors for that layer. They use the same capacity and native page layout as
-preallocated buffers, and remain owned through `finish`; no allocation from
-an earlier layer becomes the next layer's target. Before the first allocation,
-`workspace_bytes` is zero.
+Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
+directory. It covers compact shared history pages, empty/uneven owners, both
+cache planes, natural singleton-head cache shapes, boundary commits, repeated
+history ensures, and temporary-buffer release. CPU buffer checks substitute
+only unavailable NPU stream and process-group operations; they are not hardware
+acceptance.
 
-Each layer's cache references are retained from its first prefetch.
-A per-forward dictionary holds metadata through consumption. Prefetch,
-producers, patch and finish must use the same compute stream; finish joins all
-communication before the next forward can reuse storage or release metadata.
-This stream ordering is required in addition to owning Tensor references.
-Temporary history slots register their communication-stream use with
-`record_stream`; current inputs and patch metadata register compute-stream
-use. This keeps the allocator from recycling storage allocated on another
-stream before those reads finish. Callers must still order input production
-before prefetch/copy and must not mutate inputs while they are being read.
-The receive views are borrowed until the next prefetch: queue every attention
-read before `finish`. `record_stream` protects allocator reuse, while the
-consumed event prevents an active workspace from being overwritten. Shutdown
-drains both streams before destroying the process group and dropping references.
-Schemas declare cache/workspace mutations and returned aliases.
-
-Run `test/test_mla_cp_transport.py` with `torchrun` at world sizes 1 and 2 and
-set `TEST_OUTPUT` to an existing result directory. It covers bounded/unbounded
-history, uneven/empty owners, both KV planes and queued workspace reuse.
-It also checks fresh default targets and explicit allocation reuse for both
-planes with bounded and full-cache history over successive forwards.
-The history-only rounds use a separate compute stream, wait via readiness
-events, and reuse both planes and packing storage without per-round CPU waits.
+Prepared fused Decode retains the current `npu_dcp_merge_topk` and
+`npu_dsa_merge_lse_direct` communication operators. Errors propagate without
+retrying through another implementation.
 
 Variable-length MLA converts FIA's empty-KV LSE sentinel to the partial-state
 identity before returning it through the registry: the request's query rows
