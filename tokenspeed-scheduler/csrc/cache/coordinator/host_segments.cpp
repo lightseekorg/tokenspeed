@@ -471,7 +471,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // Device keeps that one longest -- then the shallower boundary, keeping
     // the longer frontier as Device eviction does, then the candidate
     // node's first Host entry. A Host-only checkpoint that is not a leaf ranks
-    // as CheckpointAging says, the larger distance first.
+    // as CheckpointAging says: the larger distance first, then the older.
     enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kHostOnly };
     struct Candidate {
         const BoundaryTree::Node* candidate_node{nullptr};
@@ -480,6 +480,9 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         // goes first.
         std::uint64_t epoch_sort_key{0};
         std::int32_t aged_distance{0};
+        // An aged checkpoint's own State epoch, which its rank at the cutoff
+        // hides; 0 otherwise.
+        std::uint64_t aged_epoch{0};
         std::int32_t boundary_tokens{0};
         CacheBlockLocation first_entry_location;
         HostEvictionCounts HostEvictionStats::*reason{nullptr};
@@ -488,11 +491,13 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         return std::tuple{lhs.victim_class,
                           lhs.epoch_sort_key,
                           -lhs.aged_distance,
+                          lhs.aged_epoch,
                           lhs.boundary_tokens,
                           lhs.first_entry_location.lcm_block_id,
                           lhs.first_entry_location.slot_index} > std::tuple{rhs.victim_class,
                                                                             rhs.epoch_sort_key,
                                                                             -rhs.aged_distance,
+                                                                            rhs.aged_epoch,
                                                                             rhs.boundary_tokens,
                                                                             rhs.first_entry_location.lcm_block_id,
                                                                             rhs.first_entry_location.slot_index};
@@ -571,6 +576,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                     candidate.aged_distance = aging.tree->NonLeafDistance(*node.hash, CacheTier::kHost);
                     if (candidate.aged_distance != 0) {
                         candidate.epoch_sort_key = aging.cutoff_epoch;
+                        candidate.aged_epoch = state_epoch;
                     }
                 }
             } else {

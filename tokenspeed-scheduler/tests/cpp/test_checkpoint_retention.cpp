@@ -337,6 +337,39 @@ TEST(CheckpointRetention, HostPlacementRanksNonLeafCheckpoints) {
     }
 }
 
+TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
+    for (const int placement : {0, 1, 2}) {
+        SCOPED_TRACE(placement);
+        BlockPool device(16, {1, 1});
+        BlockPool host(16, {1, 1});
+        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false,
+                                     /*checkpoint_retention_requests=*/1000);
+        // A is older and deeper than B; each has one newer checkpoint after it.
+        const Checkpoint a{{10, 11, 12, 13, 14, 15, 16, 17}}, a_next{{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}};
+        const Checkpoint b{{50, 51, 52, 53}}, b_next{{50, 51, 52, 53, 54, 55, 56, 57}};
+        for (const Checkpoint* point : {&a, &a_next, &b, &b_next}) {
+            Publish(cache, *point);
+            for (std::uint32_t group : {0u, 1u}) {
+                CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                ASSERT_TRUE(block);
+                cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()}, std::nullopt);
+            }
+        }
+        ASSERT_TRUE(cache.ClearDeviceCache());
+        std::vector<CacheBlockRef> pins;
+        while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
+        const std::array<std::uint32_t, 1> groups{0};
+        const std::array<std::int32_t, 1> buckets{0};
+        const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+        const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
+                            : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
+                                             : cache.AcquireHostSegments(groups, buckets, boundaries);
+        ASSERT_EQ(result.stats.allocated, 1u);
+        EXPECT_FALSE(Holds(cache, host, a));
+        EXPECT_TRUE(Holds(cache, host, b));
+    }
+}
+
 TEST(CheckpointRetention, ResumeGapCountsNewRequestsSinceTheCheckpointsLastUse) {
     BlockPool device(32, {1, 1});
     auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
