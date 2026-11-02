@@ -2710,13 +2710,14 @@ class ServerArgs:
             "a later request that resends the prompt or diverges from it after "
             "that boundary resumes there. No extra prefill round; that forward "
             "holds one more state block. The prompt end in the page that "
-            "boundary starts and a finish past the prompt end then publish no "
-            "recurrent state and no KV tail to the prefix cache, since a next "
-            "turn that re-renders the end of the previous prompt and its reply "
-            "cannot resume there; a next turn that repeats the previous reply "
-            "verbatim resumes at an earlier checkpoint instead and recomputes "
-            "the reply. Requires prefix caching; a decode server ignores it. See "
-            "docs/design/scheduler.md section 1.2.",
+            "boundary starts (while the state there is cached) and every finish "
+            "past the prompt end then publish no recurrent state and no KV tail "
+            "to the prefix cache, since a next turn that re-renders the end of "
+            "the previous prompt and its reply cannot resume there; a next turn "
+            "that repeats the previous reply verbatim resumes at an earlier "
+            "checkpoint instead and recomputes the reply. Requires prefix "
+            "caching; a decode server ignores it. See docs/design/scheduler.md "
+            "section 1.2.",
         )
         parser.add_argument(
             "--checkpoint-retention-requests",

@@ -356,30 +356,32 @@ the in-forward checkpoint's boundary) starts is published like a chunk end
 once `C` exists — pending from the request's final forward, which the same
 publication publishes, or cached in every State group, on either tier as the
 probe takes it (`promptEndIsCoveredByCheckpoint`); any other prompt end is
-published as before. A request that resumed from a tail beyond `C` keeps its
-prompt end: it extends an earlier prompt end in place, and its successor
-likely extends this one the same way. An identical prompt cannot resume at
-`T` (it replays the final token) and resumes at `C`; a longer prompt
-repeating `T`'s partial page resumes at `C` too, recomputing less than a page.
-The rule applies at the P role's finish (§3.1) and at the fused role's first
-decode, which is then an ordinary decode step: the partial page stays the
-owner's and the live slot is written in place (`kRelease`). A fused finish
-past the prompt end publishes like a chunk end as well — its completed full
-pages, no tail and no state (`finishCheckpointIsDead`) — and a finish at the
-prompt end follows the prompt-end rule. A next turn that repeats the previous
-reply verbatim therefore resumes at `C`, or at a prompt end the rule kept, and
-recomputes the reply it would resume past at the finish without the
-in-forward checkpoint. The skipped entries occupy no cache block and never
-reach Host. A retraction still publishes its frontier (§2), the D role
-publishes as before, and a model without State groups keeps its tails: they
-are resume points there. With aligned State checkpoints (below), which
-require the in-forward checkpoint, `C` is the prompt's last segment entrance
--- for any prompt longer than one segment, whatever the chunk budget -- so
-the rule covers a prompt end in the first page past it. It never skips an
-aligned checkpoint: a covered prompt end is never a page boundary, and a
-finish past the prompt end holds a decode-produced state, which those groups
-keep private anyway. Their other unaligned prompt ends still publish a KV
-tail, although no hit resumes there either.
+published as before. The request's own hold on a cached `C` is optional
+(above): once an admission lets it go and evicts `C`, `T` is published. A
+request that resumed from a tail beyond `C` keeps its prompt end: it extends
+an earlier prompt end in place, and its successor likely extends this one
+the same way. An identical prompt cannot resume at `T` (it replays the final
+token) and resumes at `C`; a longer prompt repeating `T`'s partial page
+resumes at `C` too, recomputing less than a page. The rule applies at the P
+role's finish (§3.1) and at the fused role's first decode, which is then an
+ordinary decode step: the partial page stays the owner's and the live slot is
+written in place (`kRelease`). A fused finish past the prompt end publishes
+like a chunk end as well, whether or not the prompt has a pre-tail checkpoint
+— its completed full pages, no tail and no state (`finishCheckpointIsDead`)
+— and a finish at the prompt end follows the prompt-end rule. A next turn
+that repeats the previous reply verbatim therefore resumes at `C`, or at a
+prompt end the rule kept, and recomputes the reply (without the in-forward
+checkpoint it would resume at the finish). The skipped entries occupy no
+cache block and never reach Host. A retraction still publishes its frontier
+(§2), the D role publishes as before, and a model without State groups keeps
+its tails: they are resume points there. With aligned State checkpoints
+(below), which require the in-forward checkpoint, `C` is the prompt's last
+segment entrance -- for any prompt longer than one segment, whatever the
+chunk budget -- so the rule covers a prompt end in the first page past it.
+It never skips an aligned checkpoint: a covered prompt end is never a page
+boundary, and a finish past the prompt end holds a decode-produced state,
+which those groups keep private anyway. Their other unaligned prompt ends
+still publish a KV tail, although no hit resumes there either.
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
