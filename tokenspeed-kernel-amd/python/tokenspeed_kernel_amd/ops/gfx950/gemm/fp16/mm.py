@@ -1583,6 +1583,24 @@ _DECODE_CONFIGS: dict[
         16: (32, 32, 256, 2, 2, 3, 1, 8),
         32: (32, 32, 256, 2, 2, 3, 1, 8),
     },
+    # 8192-hidden projections at TP8 (8192 -> 2048 and 1280 columns, and a
+    # 256-column one), 8 and 16 rows. Split K four or eight ways to occupy
+    # the CUs. Against hipBLASLt at 8 / 16 rows in graph replay on MI355X,
+    # us: 12.0 / 12.8 -> 11.2 / 11.2, 11.2 / 12.1 -> 9.9 / 9.9 and
+    # 8.5 / 11.5 -> 6.0 / 6.1. The GEMV is faster at 8 rows on the first two
+    # but slower at 16, and its 5-16 row bucket would take both.
+    (2048, 8192): {
+        8: (32, 32, 256, 2, 2, 3, 4, 1),
+        16: (32, 32, 256, 2, 2, 3, 4, 1),
+    },
+    (1280, 8192): {
+        8: (32, 32, 256, 2, 2, 3, 4, 1),
+        16: (32, 32, 256, 2, 2, 3, 4, 1),
+    },
+    (256, 8192): {
+        8: (16, 16, 512, 2, 2, 4, 4, 8),
+        16: (32, 16, 256, 2, 2, 4, 8, 1),
+    },
     # Muse TP8 attention output. All K tiles in flight per output tile; from 17
     # rows (speculative verify) one tile covers every row of a bucket.
     (8192, 1024): {
