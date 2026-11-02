@@ -2311,6 +2311,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 optional_epi_args=optional_epi_args,
                 token_comm_args=token_comm_args,
             )
+            if cutlass.const_expr(self.epilogue.fc2_use_bulk):
+                # Per-subtile read waits protect scratch reuse. The tail release
+                # also needs every bulk destination write to have completed.
+                cute.arch.cp_async_bulk_wait_group(0)
             cute.arch.fence_acq_rel_sys()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem.retrieve_ptr(self.acc_dtype), self.num_tmem_alloc_cols)
