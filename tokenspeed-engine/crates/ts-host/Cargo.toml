@@ -28,7 +28,7 @@ ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-
 ts-mooncake = { package = "tokenspeed-mooncake", version = "0.1.0", path = "../ts-mooncake" }
 ts-pd = { package = "tokenspeed-pd", version = "0.1.0", path = "../ts-pd" }
 ts-scheduler = { package = "tokenspeed-scheduler", version = "0.1.0", path = "../ts-scheduler" }
-ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
+ts-wire = { package = "tokenspeed-wire", version = "0.2.0", path = "../ts-wire" }
 zeromq.workspace = true
 
 [lints]

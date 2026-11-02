@@ -15,7 +15,7 @@ name = "ts_metrics"
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
-ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
+ts-wire = { package = "tokenspeed-wire", version = "0.2.0", path = "../ts-wire" }
 zeromq.workspace = true
 
 [lints]

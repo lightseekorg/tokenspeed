@@ -1,7 +1,7 @@
 [package]
 name = "tokenspeed-client"
 description = "Frontend client for TokenSpeed engines over the msgpack ZMQ wire"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,7 +14,7 @@ name = "ts_client"
 [dependencies]
 bytes.workspace = true
 thiserror.workspace = true
-ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
+ts-wire = { package = "tokenspeed-wire", version = "0.2.0", path = "../ts-wire" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 zeromq.workspace = true
