@@ -143,9 +143,33 @@ def virtual_slots_to_local(
     return out, owner_mask
 
 
+@triton.jit(do_not_specialize=["COUNT"])
+def _count_slots_by_owner(
+    Slots,
+    Counts,
+    # The row count follows the forward's history; runtime so every history
+    # shares one binary.
+    COUNT,
+    ROWS: tl.constexpr,
+    DEGREE: tl.constexpr,
+    OWNERS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Counts[b, o]: rows of block b that owner o holds.
+    block = tl.program_id(0)
+    offsets = block.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < COUNT
+    slot = tl.load(Slots + offsets, mask=active, other=ROWS).to(tl.int64)
+    owner = ((slot // ROWS - 1) % DEGREE).to(tl.int32)
+    owners = tl.arange(0, OWNERS)
+    hit = (owner[:, None] == owners[None, :]) & active[:, None]
+    tl.store(Counts + block * OWNERS + owners, tl.sum(hit.to(tl.int32), axis=0))
+
+
 @triton.jit(do_not_specialize=["COUNT", "SEND_ROWS"])
 def _split_slots_by_owner(
     Slots,
+    Carry,
     GatheredIndex,
     Fetch,
     # The row count follows the forward's history and the send width its
@@ -158,28 +182,31 @@ def _split_slots_by_owner(
     RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # One program walks the rows in order, carrying each owner's running row
-    # count across blocks.
+    # Each program places one block of rows; Carry[b, o] is owner o's row
+    # count in the blocks before b.
+    block = tl.program_id(0)
     owners = tl.arange(0, OWNERS)
-    carry = tl.zeros((OWNERS,), dtype=tl.int32)
-    for start in range(0, COUNT, BLOCK):
-        offsets = start + tl.arange(0, BLOCK)
-        active = offsets < COUNT
-        slot = tl.load(Slots + offsets, mask=active, other=ROWS).to(tl.int64)
-        previous = slot // ROWS - 1
-        owner = (previous % DEGREE).to(tl.int32)
-        hit = (owner[:, None] == owners[None, :]) & active[:, None]
-        hits = hit.to(tl.int32)
-        running = tl.cumsum(hits, axis=0) + carry[None, :]
-        within = tl.sum(tl.where(hit, running, 0), axis=1) - 1
-        tl.store(GatheredIndex + offsets, owner * SEND_ROWS + within, mask=active)
-        local = (previous // DEGREE + 1) * ROWS + slot % ROWS
-        tl.store(
-            Fetch + within,
-            local.to(Fetch.dtype.element_ty),
-            mask=active & (owner == RANK),
-        )
-        carry += tl.sum(hits, axis=0)
+    # A single tile has no preceding rows. Keep the grid check at runtime
+    # so crossing the one-tile boundary does not compile a new binary.
+    if tl.num_programs(0) == 1:
+        carry = tl.zeros((OWNERS,), dtype=tl.int32)
+    else:
+        carry = tl.load(Carry + block * OWNERS + owners)
+    offsets = block.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < COUNT
+    slot = tl.load(Slots + offsets, mask=active, other=ROWS).to(tl.int64)
+    previous = slot // ROWS - 1
+    owner = (previous % DEGREE).to(tl.int32)
+    hit = (owner[:, None] == owners[None, :]) & active[:, None]
+    running = tl.cumsum(hit.to(tl.int32), axis=0) + carry[None, :]
+    within = tl.sum(tl.where(hit, running, 0), axis=1) - 1
+    tl.store(GatheredIndex + offsets, owner * SEND_ROWS + within, mask=active)
+    local = (previous // DEGREE + 1) * ROWS + slot % ROWS
+    tl.store(
+        Fetch + within,
+        local.to(Fetch.dtype.element_ty),
+        mask=active & (owner == RANK),
+    )
 
 
 def split_slots_by_owner(
@@ -229,15 +256,37 @@ def split_slots_by_owner(
     if slots.numel() == 0:
         return
     if slots.is_cuda:
-        _split_slots_by_owner[(1,)](
+        # Count each block's rows per owner, scan the counts across blocks,
+        # then place every block in parallel from its owners' carried counts.
+        owners = triton.next_power_of_2(degree)
+        blocks = triton.cdiv(slots.numel(), 1024)
+        # The one-tile kernel does not read Carry; reuse an int32 output
+        # pointer to keep the same signature without allocating scratch.
+        carry = gathered_index
+        if blocks > 1:
+            counts = torch.empty(
+                (blocks, owners), dtype=torch.int32, device=slots.device
+            )
+            _count_slots_by_owner[(blocks,)](
+                slots,
+                counts,
+                slots.numel(),
+                ROWS=block_granularity,
+                DEGREE=degree,
+                OWNERS=owners,
+                BLOCK=1024,
+            )
+            carry = torch.cumsum(counts, dim=0, dtype=torch.int32).sub_(counts)
+        _split_slots_by_owner[(blocks,)](
             slots,
+            carry,
             gathered_index,
             fetch,
             slots.numel(),
             send_rows,
             ROWS=block_granularity,
             DEGREE=degree,
-            OWNERS=triton.next_power_of_2(degree),
+            OWNERS=owners,
             RANK=rank,
             BLOCK=1024,
         )

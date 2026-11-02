@@ -312,9 +312,8 @@ def plan_prefix_history_gather(
 
     Consecutive loops share a window (``PREFIX_HISTORY_WINDOW_LOOPS``); every
     MLA layer reuses the plan. The owned-row counts come from the host page
-    table, so nothing waits on the device; one kernel per window
-    (``split_slots_by_owner``) gives every row its all-gather output row and
-    this rank's rows their physical slots.
+    table, so nothing waits on the device; ``split_slots_by_owner`` gives
+    every row its all-gather output row and this rank's rows their physical slots.
 
     Args:
         chunk_kv_indices_list: Each loop's ``[rows]`` virtual slots, position
@@ -349,7 +348,7 @@ def plan_prefix_history_gather(
                 f"{slots.numel()} rows"
             )
         send_rows = max(owned)
-        # One launch splits the rows by owner. Every rank sends send_rows
+        # Split the rows by owner. Every rank sends send_rows
         # rows: its own first, then local slot 0 -- a row of the null page --
         # for the tail no gathered_index entry reads.
         fetch = slots.new_zeros(send_rows)

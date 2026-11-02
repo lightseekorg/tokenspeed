@@ -1,5 +1,25 @@
 # KV cache kernels
 
+## Stable owner splitting
+
+`split_slots_by_owner` maps contiguous valid virtual slots to a rank-major
+all-gather layout. Each owner keeps rows in input order, including duplicate
+slots. `fetch` receives only the calling rank's physical slots; the caller
+initializes any send padding, which the split leaves untouched. Empty inputs
+leave both outputs untouched.
+
+CUDA and ROCm count each owner's rows in parallel 1024-row tiles, scan the
+counts across tiles, then place each tile independently. A row's destination
+within its owner is the exclusive count of earlier tiles plus its inclusive
+count inside the tile, minus one. This preserves stable order without atomics
+or a serial walk through the history. The two temporary int32 tables each
+have `ceil(rows / 1024) * next_power_of_2(degree)` entries. Row counts and send
+widths remain runtime kernel arguments; fixed ownership geometry determines
+specialization. A single tile has no preceding rows, so it skips counting
+and scanning and uses zero carry in the same placement kernel. The runtime
+grid check does not add a shape specialization or allocate scratch for that
+case. The CPU fallback keeps the same layout contract.
+
 ## Range clearing
 
 `kvcache.zero_byte_ranges` dispatches by physical placement. Device allocations

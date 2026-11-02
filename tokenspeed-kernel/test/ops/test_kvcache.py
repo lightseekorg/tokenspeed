@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     zero_page_fields,
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    _count_slots_by_owner,
     _local_visible_lengths,
     _split_slots_by_owner,
     kvp_local_visible_lengths,
@@ -106,10 +107,9 @@ def test_split_slots_by_owner_matches_the_per_row_layout(
         send_rows = int(counts.max()) + 5
         # The per-row reference: each owner's rows in order.
         expected_index = torch.empty(rows, dtype=torch.int64)
-        seen = [0] * degree
-        for i, o in enumerate(owner.tolist()):
-            expected_index[i] = o * send_rows + seen[o]
-            seen[o] += 1
+        for o in range(degree):
+            positions = torch.nonzero(owner == o).flatten()
+            expected_index[positions] = o * send_rows + torch.arange(positions.numel())
         mine = owner == rank
         previous = slots.to(torch.int64) // rows_per_block - 1
         expected_fetch = (
@@ -135,15 +135,53 @@ def test_split_slots_by_owner_matches_the_per_row_layout(
         )
         assert (fetch.cpu()[own:] == -7).all()
 
-    # Several 1024-row blocks and a partial one carry each owner's count.
+    # Several 1024-row blocks and a partial one carry each owner's count;
+    # a history-sized row count spans more than a thousand blocks.
     for rank in {0, degree // 2, degree - 1}:
         run(3000, rank)
+    run(1_200_007, degree - 1)
     # A rank is fixed per process; row counts and send widths follow the
     # history, and one binary serves them all.
-    with assert_no_triton_compile(_split_slots_by_owner):
-        run(5, degree - 1)
-        run(1024, degree - 1)
-        run(4099, degree - 1)
+    with assert_no_triton_compile(_count_slots_by_owner, _split_slots_by_owner):
+        for rows in (0, 1, 5, 1023, 1024, 1025, 4099):
+            run(rows, degree - 1)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_split_slots_by_owner_preserves_order_and_padding(
+    device: str, dtype: torch.dtype, rank: int
+) -> None:
+    # Owner 1 has no rows. The other owners are unevenly interleaved across
+    # two full tiles and a tail; repeated slots must remain separate rows.
+    rows = 2051
+    positions = torch.arange(rows)
+    owner = torch.where(positions % 5 == 0, 2, 0)
+    local = 128 + positions % 128
+    # Exercise int64 slot arithmetic above the signed int32 range too.
+    local_block = 1 if dtype == torch.int32 else 1 << 25
+    local += (local_block - 1) * 128
+    slots = ((local_block - 1) * 3 + owner + 1) * 128 + positions % 128
+    send_rows = int((owner == 0).sum()) + 5
+    gathered = torch.full((rows,), -1, dtype=torch.int32, device=device)
+    fetch = torch.full((send_rows,), -7, dtype=dtype, device=device)
+    split_slots_by_owner(
+        slots.to(device=device, dtype=dtype),
+        block_granularity=128,
+        degree=3,
+        rank=rank,
+        send_rows=send_rows,
+        gathered_index=gathered,
+        fetch=fetch,
+    )
+    expected = torch.empty(rows, dtype=torch.int32)
+    for o in range(3):
+        indices = torch.nonzero(owner == o).flatten()
+        expected[indices] = (o * send_rows + torch.arange(indices.numel())).int()
+    torch.testing.assert_close(gathered.cpu(), expected, rtol=0, atol=0)
+    owned = local[owner == rank].to(dtype)
+    torch.testing.assert_close(fetch.cpu()[: owned.numel()], owned, rtol=0, atol=0)
+    assert (fetch.cpu()[owned.numel() :] == -7).all()
 
 
 @pytest.mark.parametrize("extra_ranges", [0, 60])
