@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TP8 contracts for the Kimi-K3 decode MoE chain against a dense reference.
+"""TP8 contracts for the Kimi-K3 decode chain (MoE layers, AttnRes entries and
+o-projection exits) against dense references.
 
 Run on eight GPUs, e.g. two four-GPU nodes:
 ``torchrun --nnodes 2 --nproc-per-node 4 ... -m pytest <this file>``.
@@ -245,7 +246,7 @@ def chain(request):
         )
         for ordinal, w in enumerate(weights)
     ]
-    yield weights, layers, device
+    yield weights, layers, device, owner
     dist.barrier()
 
 
@@ -281,7 +282,7 @@ def _check_step(weights, x, residual, outputs):
 
 @pytest.mark.parametrize("batch", BATCHES)
 def test_chain_matches_the_reference_eagerly(chain, batch):
-    weights, layers, device = chain
+    weights, layers, device, _ = chain
     x, residual = _inputs(batch, device, 100 * batch)
     outputs = _step(layers, x, residual)
     torch.cuda.synchronize()
@@ -297,7 +298,7 @@ assert any(a > 8 >= b for a, b in zip(SEQUENCE, SEQUENCE[1:]))
 
 
 def test_chain_follows_changing_row_counts_eagerly(chain):
-    weights, layers, device = chain
+    weights, layers, device, _ = chain
     for step, batch in enumerate(SEQUENCE):
         x, residual = _inputs(batch, device, 2000 + step)
         outputs = _step(layers, x, residual)
@@ -309,7 +310,7 @@ def test_chain_follows_changing_row_counts_in_cuda_graphs(chain):
     """One graph per row count, replayed in the same mixed order with fresh inputs:
     every layer re-arms what it read, and the first one also what the last layer
     may have published at the largest row count."""
-    weights, layers, device = chain
+    weights, layers, device, _ = chain
     graphs = {}
     for batch in BATCHES:
         x, residual = _inputs(batch, device, batch)
@@ -331,3 +332,295 @@ def test_chain_follows_changing_row_counts_in_cuda_graphs(chain):
         graph.replay()
         torch.cuda.synchronize()
         _check_step(weights, x, residual, outputs)
+
+
+# Per-rank o-projection input width (12 heads of 128) and the input projections.
+K_ATTN, MLA_ROWS, KDA_ROWS = 1536, 3648, 6288
+
+
+def _decoder(device, seed, *, layer_idx, prev_valid_blocks, write, rows):
+    """A decoder layer's AttnRes and projection weights, every rank's o-proj shard."""
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    def randn(*shape, std):
+        return torch.randn(shape, device=device, generator=g) * std
+
+    def norm():
+        weight = (1 + randn(HIDDEN, std=0.1)).bfloat16()
+        return types.SimpleNamespace(weight=weight, variance_epsilon=1e-6)
+
+    def proj():
+        return types.SimpleNamespace(weight=randn(1, HIDDEN, std=0.05).bfloat16())
+
+    o_proj = [randn(HIDDEN, K_ATTN, std=0.02).bfloat16() for _ in range(TP)]
+    return types.SimpleNamespace(
+        self_attention_res_norm=norm(),
+        self_attention_res_proj=proj(),
+        input_layernorm=norm(),
+        mlp_res_norm=norm(),
+        mlp_res_proj=proj(),
+        post_attention_layernorm=norm(),
+        self_attn=types.SimpleNamespace(
+            o_proj=types.SimpleNamespace(weight=o_proj[dist.get_rank()])
+        ),
+        o_proj_shards=o_proj,
+        in_proj=randn(rows, HIDDEN, std=0.02).bfloat16(),
+        layer_idx=layer_idx,
+        prev_valid_blocks=prev_valid_blocks,
+        is_block_write_layer=write,
+        block_write_idx=prev_valid_blocks if write else -1,
+    )
+
+
+def _attn_res(prefix, blocks, nb, norm, proj, out_norm, *, delta=None, write=-1):
+    """Reference AttnRes on token-major ``blocks``; returns (out, prefix, blocks)."""
+    from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
+
+    prefix, block_major = prefix.clone(), blocks.transpose(0, 1).contiguous()
+    out = torch_attn_res_fwd(
+        layer_residual=prefix,
+        block_residual=block_major,
+        res_weight=proj.weight.reshape(-1),
+        rms_weight=norm.weight,
+        eps=norm.variance_epsilon,
+        out_norm_weight=out_norm.weight,
+        out_norm_eps=out_norm.variance_epsilon,
+        delta=delta,
+        num_valid_blocks=nb,
+        block_write_idx=write,
+    )
+    return out, prefix, block_major.transpose(0, 1)
+
+
+def _locals(batch, device, seed):
+    """Every rank's o-projection input for one layer (the attention core's output)."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    return [
+        (torch.randn(batch, K_ATTN, device=device, generator=g) * 0.5).bfloat16()
+        for _ in range(TP)
+    ]
+
+
+def _close(actual, expected, rows, what, tol=0.02):
+    error = (actual.float() - expected.float()).norm(dim=-1)
+    error = error / expected.float().norm(dim=-1).clamp(min=1e-6)
+    worst = error[rows].max().item()
+    assert worst < tol, f"{what}: row relative error {worst:.4f}"
+
+
+# (prev_valid_blocks, writes a snapshot, input projection rows) per decoder layer:
+# the first writes block 0, the fourth block 1; KDA and MLA projections alternate.
+DECODERS = (
+    (0, True, KDA_ROWS),
+    (1, False, MLA_ROWS),
+    (1, False, KDA_ROWS),
+    (1, True, MLA_ROWS),
+    (2, False, KDA_ROWS),
+)
+NUM_BLOCKS = 2
+
+
+@pytest.fixture(scope="module")
+def layer_chain(chain):
+    """One decoder layer before each MoE layer (the first block-write, the rest
+    ring-fed), and the closing AttnRes."""
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeAttention
+
+    weights, moe_layers, device, owner = chain
+    attention = KimiK3DecodeAttention(
+        group=dist.group.WORLD, batches=BATCHES, moe=owner
+    )
+    decoders = tuple(
+        _decoder(
+            device,
+            21 + i,
+            layer_idx=i,
+            prev_valid_blocks=nb,
+            write=write,
+            rows=rows,
+        )
+        for i, (nb, write, rows) in enumerate(DECODERS)
+    )
+    layers = [
+        attention.layer(
+            decoder,
+            layer_idx=decoder.layer_idx,
+            mla=decoder.in_proj.shape[0] == MLA_ROWS,
+            first=decoder.layer_idx == 0,
+            projection_weight=decoder.in_proj,
+        )
+        for decoder in decoders
+    ]
+    final = _decoder(device, 29, layer_idx=5, prev_valid_blocks=2, write=False, rows=8)
+    closing = attention.final(
+        res_norm=final.self_attention_res_norm,
+        res_proj=final.self_attention_res_proj,
+        out_norm=final.input_layernorm,
+        num_blocks=NUM_BLOCKS,
+    )
+    return weights, moe_layers, device, decoders, layers, (final, closing)
+
+
+def _layer_step(layer_chain, embedding, step):
+    """One decode step through every layer; checks every stage against the
+    reference fed with the chain's own previous outputs and returns the closing
+    output and every layer's input projection."""
+    weights, moe_layers, device, decoders, layers, (final, closing) = layer_chain
+    batch = embedding.shape[0]
+    prefix = torch.empty_like(embedding)
+    blocks = embedding.new_empty(batch, NUM_BLOCKS, HIDDEN)
+    entry, feed = torch.empty_like(embedding), torch.empty_like(embedding)
+    rows = torch.ones(batch, dtype=torch.bool, device=device)
+    delta, ring_expected, projections = embedding, None, []
+    for i, (decoder, layer, moe) in enumerate(zip(decoders, layers, moe_layers)):
+        nb, write = decoder.prev_valid_blocks, decoder.block_write_idx
+        prefix_before, blocks_before = prefix.clone(), blocks.clone()
+        if i == 0:
+            h = layer.enter(delta, prefix, blocks, entry, ring=False)
+            expected = _attn_res(
+                delta,
+                blocks_before,
+                nb,
+                decoder.self_attention_res_norm,
+                decoder.self_attention_res_proj,
+                decoder.input_layernorm,
+                write=write,
+            )
+        else:
+            h = layer.enter(None, prefix, blocks, entry, ring=True)
+            torch.cuda.synchronize()
+            # The ring row carries the MoE chain's own error; mix what was summed.
+            summed = prefix_before.float() + ring_expected
+            _close(prefix, summed, rows, f"layer {i} ring sum")
+            expected = _attn_res(
+                prefix,
+                blocks_before,
+                nb,
+                decoder.self_attention_res_norm,
+                decoder.self_attention_res_proj,
+                decoder.input_layernorm,
+                write=write,
+            )
+        torch.cuda.synchronize()
+        _close(h, expected[0], rows, f"layer {i} entry")
+        _close(prefix, expected[1], rows, f"layer {i} prefix")
+        if write >= 0:
+            _close(blocks[:, write], expected[2][:, write], rows, f"layer {i} snapshot")
+
+        projected = layer.project(h)
+        _close(projected, h.float() @ decoder.in_proj.float().T, rows, "projection")
+        projections.append(projected)
+
+        shards = _locals(batch, device, 1000 * step + i)
+        local = shards[dist.get_rank()]
+        reduced = sum(
+            x.float() @ w.float().T for x, w in zip(shards, decoder.o_proj_shards)
+        )
+        prefix_before, blocks_before = prefix.clone(), blocks.clone()
+        x = layer.leave(local, prefix, blocks, feed)
+        torch.cuda.synchronize()
+        start = torch.zeros_like(prefix_before) if write >= 0 else prefix_before
+        expected = _attn_res(
+            start,
+            blocks_before,
+            nb + decoder.is_block_write_layer,
+            decoder.mlp_res_norm,
+            decoder.mlp_res_proj,
+            decoder.post_attention_layernorm,
+            delta=reduced.bfloat16(),
+        )
+        _close(x, expected[0], rows, f"layer {i} exit")
+        _close(prefix, expected[1], rows, f"layer {i} reduced prefix")
+
+        moe.publish(x)
+        ring_expected, clear = _reference(weights[i], x)
+        rows = rows & clear
+    out = torch.empty_like(embedding)
+    prefix_before = prefix.clone()
+    closing.run_ring(prefix, blocks, out)
+    torch.cuda.synchronize()
+    assert rows.any(), "every token tied at the 16th expert"
+    _close(prefix, prefix_before.float() + ring_expected, rows, "closing ring sum")
+    expected = _attn_res(
+        prefix,
+        blocks,
+        NUM_BLOCKS,
+        final.self_attention_res_norm,
+        final.self_attention_res_proj,
+        final.input_layernorm,
+    )
+    _close(out, expected[0], rows, "closing AttnRes")
+    return out, projections
+
+
+@pytest.mark.parametrize("batch", BATCHES)
+def test_layer_chain_matches_the_reference_eagerly(layer_chain, batch):
+    embedding, _ = _inputs(batch, layer_chain[2], 50 * batch)
+    _layer_step(layer_chain, embedding, 0)
+
+
+def _run(layer_chain, embedding, shards):
+    """One decode step through every layer with this rank's o-projection inputs;
+    returns the closing output and every layer's input projection."""
+    _, moe_layers, _, _, layers, (_, closing) = layer_chain
+    prefix = torch.empty_like(embedding)
+    blocks = embedding.new_empty(embedding.shape[0], NUM_BLOCKS, HIDDEN)
+    entry, feed = torch.empty_like(embedding), torch.empty_like(embedding)
+    projections = []
+    for i, (layer, moe) in enumerate(zip(layers, moe_layers)):
+        h = layer.enter(embedding, prefix, blocks, entry, ring=i > 0)
+        projections.append(layer.project(h))
+        moe.publish(layer.leave(shards[i], prefix, blocks, feed))
+    out = closing.run_ring(prefix, blocks, torch.empty_like(embedding))
+    return out, projections
+
+
+def _shards(batch, device, step):
+    """This rank's o-projection input of every layer, as ``_layer_step`` draws them."""
+    rank = dist.get_rank()
+    return [_locals(batch, device, 1000 * step + i)[rank] for i in range(len(DECODERS))]
+
+
+# Row counts of consecutive layer-chain steps: every count, crossing the
+# experts' B<=8 / B>8 modes and the o-projection's two-shot (B>32) both ways.
+LAYER_SEQUENCE = (64, 1, 32, 64, 8, 16, 2, 3, 64, 4, 5, 6, 7, 32, 16, 64, 1)
+assert set(LAYER_SEQUENCE) == set(BATCHES)
+for limit in (8, 32):
+    pairs = list(zip(LAYER_SEQUENCE, LAYER_SEQUENCE[1:]))
+    assert any(a <= limit < b for a, b in pairs)
+    assert any(a > limit >= b for a, b in pairs)
+
+
+def test_layer_chain_follows_changing_row_counts_in_cuda_graphs(layer_chain):
+    """The eager chain over a mixed row-count sequence, checked stage by stage;
+    then one graph per row count replayed in the same order with the same inputs
+    matches every eager step bit for bit."""
+    device = layer_chain[2]
+    eager = [
+        _layer_step(layer_chain, _inputs(batch, device, 4000 + step)[0], step)
+        for step, batch in enumerate(LAYER_SEQUENCE)
+    ]
+    graphs = {}
+    for batch in BATCHES:
+        embedding, shards = _inputs(batch, device, batch)[0], _shards(batch, device, 0)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            _run(layer_chain, embedding, shards)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = _run(layer_chain, embedding, shards)
+        graphs[batch] = graph, embedding, shards, outputs
+    for step, batch in enumerate(LAYER_SEQUENCE):
+        graph, embedding, shards, (out, projections) = graphs[batch]
+        embedding.copy_(_inputs(batch, device, 4000 + step)[0])
+        for shard, fresh in zip(shards, _shards(batch, device, step)):
+            shard.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        eager_out, eager_projections = eager[step]
+        assert torch.equal(out, eager_out), f"step {step} ({batch} rows): output"
+        for i, (p, q) in enumerate(zip(projections, eager_projections)):
+            assert torch.equal(p, q), f"step {step} ({batch} rows): projection {i}"
