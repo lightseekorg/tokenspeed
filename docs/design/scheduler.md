@@ -230,7 +230,8 @@ prompts queued behind it start in that round, not the next.
 before the prefill phases and takes its token budget first (§3.3), so a round
 is *all decodes + the completing prefills + at most one truncated prefill*.
 Outside mixed mode, prefill and decode never share a round at all — decodes
-get the round only when no prefill scheduled — so head-of-line only ever
+get the round only when no prefill scheduled, or ahead of the prefills while
+a prefill/decode interval is owed (§3.3) — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
 
 ### 1.2 State groups: two slots, natural checkpoints
@@ -1115,6 +1116,20 @@ that failed for capacity seals new-prompt admission for the round
 **Phases, non-mixed:** after the restore, the prefill phases run first and
 alone; decodes get the round only when no prefill scheduled. No prefill
 reserve is needed — scheduling order is the capacity priority.
+
+**Prefill/decode interval** (`prefill_decode_interval` N, either mode; 0 is
+off): a round that schedules a local prefill chunk owes the running decodes
+N decode rounds. Until they have run, decodes are scheduled first, and a
+round that scheduled any skips the prefill phases. Every chunk of a prompt
+starts a new interval, so a prompt of k chunks waits up to k × N decode
+steps. A round with no decode to schedule runs prefill work as usual, so the
+engine never idles for the interval. A deferred prefill tries no admission,
+so it never blocks on capacity; a deferred resident chunk holds its pages
+idle and is the first victim (§2) when a decode blocks. A capacity grant
+that admits a prompt (mixed mode) still runs and starts a new interval. The
+counter follows the plans alone, so mirrored ranks agree; under attention DP
+each replica counts its own rounds. The P and D roles refuse the knob:
+neither runs local prefill and decode on one engine.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is

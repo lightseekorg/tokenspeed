@@ -506,6 +506,10 @@ private:
     std::int64_t plan_calls_{0};
     std::string forced_victim_id_;
 
+    // prefill_decode_interval: reset by a prefill round, counted down by a
+    // decode round. Derived from the plans alone, so mirrored ranks agree.
+    std::int32_t prefill_deferral_rounds_left_{0};
+
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work or leaves work in flight.
     std::int64_t stalled_rounds_{0};

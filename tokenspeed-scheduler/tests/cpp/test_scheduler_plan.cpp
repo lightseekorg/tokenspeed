@@ -21,6 +21,7 @@
 #include "integration_test_helper.h"
 
 #include <algorithm>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -782,6 +783,123 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     for (std::int32_t i = 0; i < 3; ++i) {
         const auto& row = reuse->block_tables.at("linear_attention_" + std::to_string(i)).at(0);
         EXPECT_GT(row.at(0), 0) << "the junction checkpoint is the chunk's input";
+    }
+}
+
+// prefill_decode_interval: after a round that schedules a prefill chunk, the
+// next N rounds that can schedule a decode run decodes alone.
+class PrefillDecodeIntervalSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.prefill_decode_interval = 2;
+        // Two pages per chunk: a 6-page prompt takes three prefill rounds.
+        cfg.max_scheduled_tokens = 4;
+        return cfg;
+    }
+
+    // Plans one round, lands its forward and returns what the round ran:
+    // "P:<ids>" when it scheduled a prefill chunk, "D:<ids>" for decodes only,
+    // "-" for no forward. `chunking` names prompts whose chunk this round
+    // leaves incomplete (an intermediate chunk produces no token).
+    std::string Round(const std::set<std::string>& chunking = {}) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->request_ids.empty()) {
+            return "-";
+        }
+        std::string ran = batch->NumExtends() > 0 ? "P:" : "D:";
+        for (const std::string& id : batch->request_ids) {
+            ran += id;
+            SendForwardDone(id, chunking.contains(id) ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{7});
+        }
+        return ran;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalSuite, ANewPromptWaitsForTheIntervalsDecodeRounds) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    EXPECT_EQ(Round(), "D:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");  // the second decode round owed since a's prefill
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, EveryChunkOfAPromptStartsANewInterval) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:b");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, APromptRunsAtOnceWhenNoDecodeIsRunning) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    SendFinish("a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    // Two decode rounds are owed, but nothing can decode: the engine would
+    // idle, so the prefill runs.
+    EXPECT_EQ(Round(), "P:b");
+}
+
+class MixedPrefillDecodeIntervalSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        cfg.max_scheduled_tokens = 64;
+        return cfg;
+    }
+};
+
+TEST_F(MixedPrefillDecodeIntervalSuite, ADeferredPromptJoinsNoDecodeRound) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:ba");  // the mixed round: prefill rows first
+}
+
+TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole) {
+    const auto config = [](Role role, std::int32_t interval) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.prefill_decode_interval = interval;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, 4).Validate());
+    for (const auto& [role, interval] : {std::pair{Role::kP, 4}, std::pair{Role::kD, 4}, std::pair{Role::kFused, -1}}) {
+        try {
+            config(role, interval).Validate();
+            ADD_FAILURE() << "prefill_decode_interval " << interval << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("prefill_decode_interval"), std::string::npos) << error.what();
+        }
     }
 }
 
