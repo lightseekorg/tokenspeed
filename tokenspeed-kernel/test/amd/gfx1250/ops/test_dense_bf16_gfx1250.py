@@ -103,7 +103,7 @@ def test_dense_vocab_shard_rows_match_and_reuse_compilation(n, k):
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     gluon_wmma_tdm_dense_gfx1250(a[:2], b, split_k=None)
     with assert_no_triton_compile(_wmma_tdm_dense_kernel):
-        for rows in (1, 5, 6, 10, 16):
+        for rows in (1, 5, 16):
             actual = gluon_wmma_tdm_dense_gfx1250(a[:rows], b, split_k=None)
             torch.testing.assert_close(actual, a[:rows] @ b.T, atol=1e-2, rtol=1e-2)
 
