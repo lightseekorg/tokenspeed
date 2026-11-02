@@ -121,7 +121,7 @@ class _Nvfp4InputStageKernel:
                 expert = cutlass.Int64(ids[row, tid])
                 score = cutlass.Float32(scores[row, tid])
             ids_out[row, tid] = expert.to(ids_out.element_type)
-            scores_out[row, tid] = score
+            scores_out[row, tid] = score.to(scores_out.element_type)
 
 
 def _view(tensor: torch.Tensor, alignment: int):
@@ -140,7 +140,16 @@ class Nvfp4InputStage:
 
     def run(self, x, input_scale, ids, scores, q_out, sf_out, ids_out, scores_out):
         """Write live quantized rows and masked tail routes into caller-owned buffers."""
-        key = (x.dtype, input_scale.dtype, ids.dtype, scores.dtype, ids_out.dtype)
+        key = (
+            x.dtype,
+            input_scale.dtype,
+            ids.dtype,
+            scores.dtype,
+            q_out.dtype,
+            sf_out.dtype,
+            ids_out.dtype,
+            scores_out.dtype,
+        )
         arguments = (
             _view(x, 16),
             _view(input_scale, 4),

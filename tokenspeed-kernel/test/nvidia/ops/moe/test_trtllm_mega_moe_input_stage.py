@@ -20,9 +20,11 @@
 
 """Check the fused stager against FlashInfer quantization and captured reuse."""
 
+from contextlib import nullcontext
+
 import pytest
 import torch
-from utils import is_nvidia
+from utils import assert_no_cute_compile, is_nvidia
 
 if not is_nvidia():
     pytest.skip("NVIDIA GPU required", allow_module_level=True)
@@ -118,3 +120,53 @@ def test_input_stage_reuses_compiled_routes_by_output_dtype():
         stager.run(x, scale, ids, scores, q, sf, routes, weights)
         torch.testing.assert_close(routes[:3], ids.to(dtype), atol=0, rtol=0)
         assert (routes[3:] == -1).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("output", ["q", "sf", "scores"])
+def test_input_stage_switches_output_dtype(output):
+    stager = Nvfp4InputStage(128, 2)
+    x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+    scale = torch.ones(1, device="cuda")
+    ids = torch.tensor([[1, 5], [7, 2], [3, 0]], device="cuda")
+    scores = torch.rand(3, 2, device="cuda")
+    expected_q, expected_sf = fp4_quantize(
+        x, scale, is_sf_swizzled_layout=False, enable_pdl=False
+    )
+    for iteration, alternate in enumerate((False, True, False)):
+        q = torch.empty(
+            16,
+            64,
+            device="cuda",
+            dtype=torch.int8 if alternate and output == "q" else torch.uint8,
+        )
+        sf = torch.empty(
+            16,
+            8,
+            device="cuda",
+            dtype=(
+                torch.float32 if alternate and output == "sf" else torch.float8_e4m3fn
+            ),
+        )
+        weights = torch.empty(
+            16,
+            2,
+            device="cuda",
+            dtype=torch.bfloat16 if alternate and output == "scores" else torch.float32,
+        )
+        routes = torch.empty(16, 2, device="cuda", dtype=torch.int32)
+        with assert_no_cute_compile() if iteration == 2 else nullcontext():
+            stager.run(x, scale, ids, scores, q, sf, routes, weights)
+        torch.testing.assert_close(q[:3].view(torch.uint8), expected_q, atol=0, rtol=0)
+        torch.testing.assert_close(
+            sf[:3].float(),
+            expected_sf.view(torch.float8_e4m3fn).float(),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(routes[:3], ids.int(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            weights[:3], scores.to(weights.dtype), atol=0, rtol=0
+        )
+        assert (routes[3:] == -1).all()
+        assert (weights[3:] == 0).all()
