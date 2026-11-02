@@ -494,6 +494,10 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
+With kernel IO and snapshots enabled, startup warms each Host tier's unflagged
+H2D restore variant while preserving Device bytes. Layerwise L2 loads do not
+warm this variant.
+
 Mapped Host field copies use word accesses when both byte addresses and the
 payload size are 16-byte aligned. Other fields retain byte accesses, including
 packed children whose offsets lose that alignment. Masked copies preserve
@@ -790,6 +794,11 @@ it — no subclasses. It moves `CacheBlock`s between the `BlockPool` and
 page ids, and executes retention (`ReclaimExpired` punches the first *N*
 slots to null holes). It is deliberately token-free: every token quantity is
 converted to block counts before it reaches the manager.
+
+Dense `Acquire` appends insert the new references as one range, letting the
+vector amortize host storage growth. Spare capacity does not add logical
+slots or acquire cache blocks. With nonthrowing reference moves, a
+host-allocation failure leaves the table unchanged for the whole batch.
 
 The conversion is `GroupGeometry` in the coordinator layer:
 

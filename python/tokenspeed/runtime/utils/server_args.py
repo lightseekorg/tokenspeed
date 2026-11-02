@@ -615,6 +615,8 @@ class ServerArgs:
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
+    # Optional diagnostics over the same distribution as output logprobs.
+    enable_output_cumulative_probs: bool = False
     # Sizing knob for prompt (input) logprobs: prompt rows pushed through the
     # LM head per chunk, bounding the transient [rows, vocab] logits
     # (chunk x vocab x (2 + 2 + 4) bytes: bf16 shard, bf16 gathered, fp32
@@ -770,7 +772,39 @@ class ServerArgs:
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
+        self.validate_output_cumulative_probs()
         self.validate()
+
+    def validate_output_cumulative_probs(self):
+        from tokenspeed.runtime.utils.env import envs
+
+        if not self.enable_output_cumulative_probs:
+            return
+        if not self.enable_output_logprobs:
+            raise ValueError(
+                "--enable-output-cumulative-probs requires --enable-output-logprobs"
+            )
+        # Synthetic acceptance needs no check here: resolve_speculative_decoding
+        # already refuses it with --enable-output-logprobs.
+        if envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get():
+            raise ValueError(
+                "--enable-output-cumulative-probs does not support "
+                "TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN"
+            )
+        if self.speculative_draft_tree:
+            raise ValueError(
+                "--enable-output-cumulative-probs currently supports chain "
+                "verification only, without draft trees or EAGLE-Harness"
+            )
+        if self.dp_sampling or self.mapping.has_attn_dp:
+            raise ValueError(
+                "--enable-output-cumulative-probs currently requires DP1 without DP sampling"
+            )
+        if self.pipeline_parallel_size != 1 or self.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-output-cumulative-probs currently requires one pipeline stage "
+                "and aggregated serving"
+            )
 
     def resolve_basic_defaults(self):
         resolve_metrics_options(self)
@@ -2382,6 +2416,24 @@ class ServerArgs:
 
         self.validate_model_update_options()
 
+        if (
+            self.speculative_algorithm is not None
+            and self.disaggregation_mode != "prefill"
+            and self.max_num_seqs is not None
+        ):
+            dp_size = self.mapping.attn.dp_size
+            tp_size = self.mapping.attn.tp_size
+            # Draft startup uses one request per TP peer, even when tactic
+            # profiling is disabled. Clamping would leave empty tuning peers;
+            # exceeding this capacity would overrun per-request decode state.
+            if self.max_num_seqs // dp_size < tp_size:
+                raise ValueError(
+                    "Speculative decode warmup requires max_num_seqs // "
+                    "data_parallel_size >= attn_tp_size, got "
+                    f"{self.max_num_seqs} // {dp_size} < {tp_size}. "
+                    f"Set --max-num-seqs to at least {dp_size * tp_size}."
+                )
+
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
                 raise ValueError(
@@ -3522,6 +3574,17 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_output_logprobs,
             help="Enable per-token sampled-token logprobs. OFF by default; enabling extends the captured CUDA-graph footprint. Requests asking for logprobs on a server without this flag receive empty logprobs.",
+        )
+        parser.add_argument(
+            "--enable-output-cumulative-probs",
+            action="store_true",
+            default=ServerArgs.enable_output_cumulative_probs,
+            help="Return probability mass preceding each sampled token, ordered by "
+            "descending probability and then ascending token ID, for sampling "
+            "calibration. Requires output logprobs. Every sampling step keeps a "
+            "copy of the score logits plus bounded temporaries; prefill and mixed "
+            "steps sample outside any CUDA graph, so this memory comes from "
+            "runtime headroom (leave room with --gpu-memory-utilization).",
         )
         parser.add_argument(
             "--input-logprob-chunk-tokens",

@@ -3328,19 +3328,20 @@ TEST(CacheCoordinatorHostReplacement, SingleGroupBatchUsesChildrenWithoutParentC
     HostPut(coordinator, host_pool, "old-1", 0);
     HostPut(coordinator, host_pool, "old-2", 0);
     HostPut(coordinator, host_pool, "old-3", 0);
+    HostHit(coordinator, host_pool, Key("old-3", 0), std::numeric_limits<std::uint64_t>::max());
 
-    const std::array<std::uint32_t, 3> groups{0, 0, 0};
-    const std::array<std::int32_t, 3> buckets{0, 0, 0};
+    const std::array<std::uint32_t, 4> groups{0, 0, 0, 0};
+    const std::array<std::int32_t, 4> buckets{0, 0, 0, 0};
     CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
 
     ASSERT_EQ(batch.blocks.size(), groups.size());
     EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
-    EXPECT_EQ(batch.stats.requested, 3u);
-    EXPECT_EQ(batch.stats.allocated, 3u);
+    EXPECT_EQ(batch.stats.requested, 4u);
+    EXPECT_EQ(batch.stats.allocated, 4u);
     EXPECT_EQ(batch.stats.unallocated, 0u);
     EXPECT_EQ(batch.stats.group_scans, 1u);
     EXPECT_EQ(batch.stats.parent_candidates, 0u);
-    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 4u);
     EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 0u);
 }
 
@@ -6732,6 +6733,26 @@ protected:
     CacheCoordinator coordinator_;
     std::vector<std::string> hashes_;
 };
+
+TEST_F(TailPublicationTest, BoundaryKeyEnumerationPreservesBorrowedKeysAndNamespaces) {
+    CacheKey boundary{.namespace_id = 7, .group_id = 99, .content_hash = std::string(64, 'h'), .page_offset = 99};
+    const CacheKey original = boundary;
+    std::vector<CacheKey> borrowed;
+    coordinator_.ForEachBoundaryKey(boundary, /*tail_tokens=*/3, [&](std::size_t group, const CacheKey& key) {
+        EXPECT_EQ(key.group_id, group);
+        EXPECT_EQ(key.namespace_id, original.namespace_id);
+        EXPECT_EQ(key.content_hash, original.content_hash);
+        borrowed.push_back(key);
+    });
+    EXPECT_EQ(boundary, original);
+    ASSERT_FALSE(borrowed.empty());
+
+    std::vector<CacheKey> temporary;
+    coordinator_.ForEachBoundaryKey(
+        CacheKey{.namespace_id = original.namespace_id, .content_hash = original.content_hash}, /*tail_tokens=*/3,
+        [&](std::size_t, const CacheKey& key) { temporary.push_back(key); });
+    EXPECT_EQ(temporary, borrowed);
+}
 
 TEST_F(TailPublicationTest, PublishesThePartialPageUnderHashAtT) {
     std::vector<BlockTable> tables(3);

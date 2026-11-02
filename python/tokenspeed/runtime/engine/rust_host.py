@@ -777,6 +777,7 @@ class HostDataPlane:
         tuple[int, float] | None,
         list[int] | None,
         tuple | None,
+        list[float] | None,
     ]:
         """Wait for a forward's host copies to land (the control thread: the
         event wait releases the interpreter lock), and return its sampled
@@ -817,6 +818,11 @@ class HostDataPlane:
             ),
             resolve_grammar_completion(results),
             _logprob_lists(results),
+            (
+                results.output_token_cumulative_probs.tolist()
+                if results.output_token_cumulative_probs is not None
+                else None
+            ),
         )
 
     def note_committed(self, dispatched: _Dispatched) -> None:

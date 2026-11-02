@@ -40,6 +40,9 @@ from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry imp
 from tokenspeed.runtime.layers.attention.backends.paged.mha import (  # noqa: E402
     MHAAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.qsa import (  # noqa: E402
+    QSAAttnBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.router import (  # noqa: E402
     CacheGroupRouter,
 )
@@ -72,6 +75,13 @@ def _trtllm(kv_cache_dtype=torch.bfloat16):
     leaf = object.__new__(TRTLLMMHAAttnBackend)
     leaf.kv_cache_dtype = kv_cache_dtype
     leaf.dtype = torch.bfloat16
+    return leaf
+
+
+def _mha(cls=MHAAttnBackend, kv_cache_dtype=torch.bfloat16):
+    leaf = object.__new__(cls)
+    leaf.kv_cache_dtype = kv_cache_dtype
+    leaf.qkv_dtype = torch.bfloat16
     return leaf
 
 
@@ -114,6 +124,10 @@ def test_trtllm_router_supports_verify_and_lanes(kv_cache_dtype):
     )
 
 
+def test_mha_router_supports_verify_and_lanes():
+    resolve_tree_support(_router(_mha()), _router(_mha()))
+
+
 @pytest.mark.parametrize("cls", [TRTLLMMLABackend, CuteDSLMLABackend])
 @pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_mla_routers_support_verify_and_lanes(cls, kv_cache_dtype):
@@ -152,7 +166,11 @@ def test_draft_with_linear_layers_is_refused():
 @pytest.mark.parametrize(
     "target, blocker",
     [
-        (lambda: _router(MHAAttnBackend.__new__(MHAAttnBackend)), "MHAAttnBackend"),
+        (
+            lambda: _router(_mha(kv_cache_dtype=torch.float8_e4m3fn)),
+            "MHAAttnBackend .* kv_cache_dtype",
+        ),
+        (lambda: _router(_mha(QSAAttnBackend)), "QSAAttnBackend has no tree verify"),
         (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),
         (
             lambda: _router(_trtllm(), _trtllm(), attn_kind="sliding_window"),

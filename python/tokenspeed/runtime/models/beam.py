@@ -59,10 +59,9 @@ from tokenspeed_kernel.ops.quantization import (
     silu_and_mul_quantize_fp8,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
 
-from tokenspeed.runtime.configs.model_config import beam_default_platform
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -133,10 +132,13 @@ BEAM_MOE_FP8_POLICY = "fp8ch_vendor_fp32_route"
 
 
 def beam_kernels() -> bool:
-    """Whether Beam's Triton kernels serve its calls: NVIDIA SM100 to SM103, where
-    each was checked byte for byte against the Torch statements it replaces
-    (``beam_default_platform``). Elsewhere Beam runs the statements."""
-    return not beam_default_platform()
+    """Whether Beam's Triton kernels serve its calls: NVIDIA SM90 to SM103, where
+    each was checked byte for byte against the Torch statements it replaces.
+    Elsewhere Beam runs the statements. Beam's vendor defaults
+    (``beam_default_platform``) keep their own SM100 to SM103 range."""
+    platform = current_platform()
+    in_range = ArchVersion(9, 0) <= platform.arch_version <= ArchVersion(10, 3)
+    return platform.is_nvidia and in_range
 
 
 # The hidden size the residual boundary's one-launch kernel was checked at.
@@ -815,7 +817,7 @@ class BeamRouter(ReplicatedLinear):
         # Keep the exact parameter already referenced by TopK and MoELayer.
         self.e_score_correction_bias = correction_bias
         # BF16 pieces of the FP32 weight, made once after loading where a
-        # registered mv kernel takes them (SM100 to SM103).
+        # registered mv kernel takes them (SM90 to SM103).
         self.register_buffer("weight_split", None, persistent=False)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:

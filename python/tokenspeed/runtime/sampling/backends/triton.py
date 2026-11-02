@@ -99,6 +99,7 @@ class TritonSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     supports_tree_verify = True
+    _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
