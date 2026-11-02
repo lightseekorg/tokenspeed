@@ -91,6 +91,35 @@ def test_zero_coin_does_not_accept_zero_probability():
     assert idx.tolist() == [[0, -1]] and length.tolist() == [0]
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires GPU"
+            ),
+        ),
+    ],
+)
+def test_empty_residual_draws_from_target(device):
+    # p == q accepts the proposal with probability one, so the residual
+    # max(p - q, 0) is empty. A coin of exactly one still rejects it (the
+    # rounding case); the replacement must follow p, never token 0.
+    out, idx, length = run(
+        [[[0, 0.5, 0.5, 0], [0.25, 0.25, 0.25, 0.25]]],
+        [[[0, 0.5, 0.5, 0], [0, 0, 0, 0]]],
+        [[0, 1]],
+        [[1.0, 1.0]],
+        [0.75],
+        device,
+    )
+    assert length.tolist() == [0]
+    assert idx.tolist() == [[0, -1]]
+    assert out[0].item() == 2
+
+
 def test_one_hot_laws_keep_greedy_prefix_and_target_replacement():
     out, idx, length = run(
         [[[0, 1], [1, 0], [0, 1]]],

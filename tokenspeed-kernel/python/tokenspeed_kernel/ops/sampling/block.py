@@ -153,9 +153,9 @@ def torch_block_verify(
                 ratios[accepted] * target_probs[b, accepted] - draft_probs[b, accepted]
             ).clamp_min(0)
             if float(law.sum()) <= 0:
-                raise RuntimeError(
-                    "positive-probability block rejection has empty residual"
-                )
+                # Zero-probability rejection reached through fp32 rounding:
+                # the residual is empty, so draw from the target law.
+                law = target_probs[b, accepted]
         cdf = law.double().cumsum(0)
         coin = float(uniform_samples_for_final_sampling[b]) * float(cdf[-1])
         token = min(int(torch.searchsorted(cdf, coin, right=True)), vocab - 1)

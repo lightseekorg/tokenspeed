@@ -60,6 +60,7 @@ def _residual_mass(
     R,
     K,
     M,
+    PM,
     N: tl.constexpr,
     V: tl.constexpr,
     C: tl.constexpr,
@@ -75,6 +76,7 @@ def _residual_mass(
     r = tl.load(R + b * N + i)
     mass = tl.where(i < k, tl.maximum(r * p - q, 0.0), p)
     tl.store(M + (b * N + i) * C + c, tl.sum(mass, 0))
+    tl.store(PM + (b * N + i) * C + c, tl.sum(p, 0))
 
 
 @triton.jit(do_not_specialize=["coin_stride", "final_stride", "candidate_stride"])
@@ -82,6 +84,7 @@ def _select_prefix(
     R,
     K,
     M,
+    PM,
     U,
     F,
     Candidates,
@@ -90,6 +93,7 @@ def _select_prefix(
     Length,
     Chunk,
     Goal,
+    Fallback,
     coin_stride,
     final_stride,
     candidate_stride,
@@ -111,6 +115,12 @@ def _select_prefix(
             coin = tl.load(U + b * coin_stride + i)
             accepted = tl.where(coin < h, i + 1, accepted)
     mass = tl.load(M + (b * N + accepted) * C + chunks, chunks < C, 0.0)
+    # fp32 rounding can leave a rejection with no positive residual although
+    # its exact probability is zero; draw from the target law instead of
+    # emitting an arbitrary token (the torch oracle does the same).
+    empty = tl.sum(mass, 0) <= 0.0
+    target_mass = tl.load(PM + (b * N + accepted) * C + chunks, chunks < C, 0.0)
+    mass = tl.where(empty, target_mass, mass)
     cumulative = tl.cumsum(mass, 0)
     total = tl.sum(mass, 0)
     goal = tl.minimum(tl.load(F + b * final_stride), 0.99999994) * total
@@ -122,6 +132,7 @@ def _select_prefix(
     tl.store(Chunk + b, chosen)
     tl.store(Goal + b, tl.maximum(goal - before, 0.0))
     tl.store(Length + b, accepted)
+    tl.store(Fallback + b, empty.to(tl.int32))
     pos = tl.arange(0, PAD_N)
     token = tl.load(Candidates + b * candidate_stride + pos + 1, pos < accepted, 0)
     tl.store(Out + b * N + pos, token, pos < accepted)
@@ -137,6 +148,7 @@ def _sample_residual(
     Length,
     Chunk,
     Goal,
+    Fallback,
     Out,
     N: tl.constexpr,
     V: tl.constexpr,
@@ -150,7 +162,8 @@ def _sample_residual(
     p = tl.load(P + (b * N + i) * V + x, x < V, 0.0)
     q = tl.load(Q + (b * N + i) * V + x, x < V, 0.0)
     ratio = tl.load(R + b * N + i)
-    mass = tl.where(i < k, tl.maximum(ratio * p - q, 0.0), p)
+    residual = (i < k) & (tl.load(Fallback + b) == 0)
+    mass = tl.where(residual, tl.maximum(ratio * p - q, 0.0), p)
     cumulative = tl.cumsum(mass, 0)
     goal = tl.load(Goal + b)
     token = tl.min(tl.where((x < V) & (cumulative > goal), x, 2147483647), 0)
@@ -186,8 +199,10 @@ def triton_block_verify(
     ratios = torch.empty((bs, n), device=target_probs.device, dtype=torch.float32)
     valid = torch.empty((bs,), device=target_probs.device, dtype=torch.int32)
     mass = torch.empty((bs, n, chunks), device=target_probs.device, dtype=torch.float32)
+    target_mass = torch.empty_like(mass)
     chosen = torch.empty_like(valid)
     goals = torch.empty_like(valid, dtype=torch.float32)
+    fallback = torch.empty_like(valid)
     _prefix_ratios[(bs,)](
         target_probs,
         draft_probs,
@@ -200,12 +215,22 @@ def triton_block_verify(
         V=v,
     )
     _residual_mass[(bs, n, chunks)](
-        target_probs, draft_probs, ratios, valid, mass, N=n, V=v, C=chunks, BLOCK=block
+        target_probs,
+        draft_probs,
+        ratios,
+        valid,
+        mass,
+        target_mass,
+        N=n,
+        V=v,
+        C=chunks,
+        BLOCK=block,
     )
     _select_prefix[(bs,)](
         ratios,
         valid,
         mass,
+        target_mass,
         uniform_samples,
         uniform_samples_for_final_sampling,
         candidates,
@@ -214,6 +239,7 @@ def triton_block_verify(
         accept_token_num,
         chosen,
         goals,
+        fallback,
         uniform_samples.stride(0),
         uniform_samples_for_final_sampling.stride(0),
         candidates.stride(0),
@@ -230,6 +256,7 @@ def triton_block_verify(
         accept_token_num,
         chosen,
         goals,
+        fallback,
         predicts,
         N=n,
         V=v,
