@@ -662,6 +662,59 @@ class _ModelConfigDouble:
     quantization: str | None
 
 
+@pytest.mark.parametrize("tp,dp,max_num_seqs", [(8, 1, 4), (2, 4, 4), (2, 4, 7)])
+@pytest.mark.parametrize("disable_autotune", [False, True])
+@pytest.mark.parametrize("role", ["null", "decode"])
+def test_speculative_warmup_rejects_capacity_below_attention_tp(
+    tp, dp, max_num_seqs, disable_autotune, role
+):
+    with pytest.raises(ValueError, match=f"Set --max-num-seqs to at least {tp * dp}"):
+        ServerArgs(
+            model="x",
+            dtype="bfloat16",
+            world_size=tp * dp,
+            attn_tp_size=tp,
+            data_parallel_size=dp,
+            ep_size=tp * dp,
+            max_num_seqs=max_num_seqs,
+            speculative_algorithm="MTP",
+            disable_autotune=disable_autotune,
+            disaggregation_mode=role,
+        )
+
+
+@pytest.mark.parametrize(
+    "tp,dp,max_num_seqs", [(8, 1, 8), (2, 4, 8), (2, 4, 9), (1, 8, 8)]
+)
+def test_speculative_warmup_accepts_capacity_covering_attention_tp(
+    tp, dp, max_num_seqs
+):
+    args = ServerArgs(
+        model="x",
+        dtype="bfloat16",
+        world_size=tp * dp,
+        attn_tp_size=tp,
+        data_parallel_size=dp,
+        ep_size=tp * dp,
+        max_num_seqs=max_num_seqs,
+        speculative_algorithm="MTP",
+    )
+    assert args.max_num_seqs == max_num_seqs
+
+
+@pytest.mark.parametrize("algorithm,role", [(None, "null"), ("MTP", "prefill")])
+def test_small_capacity_without_draft_decode_warmup_is_preserved(algorithm, role):
+    args = ServerArgs(
+        model="x",
+        dtype="bfloat16",
+        attn_tp_size=8,
+        max_num_seqs=4,
+        speculative_algorithm=algorithm,
+        disaggregation_mode=role,
+    )
+    assert args.max_num_seqs == 4
+
+
 def test_pipeline_stages_share_shape_keyed_cache_identity():
     # Real args: attn_tp_size=2 infers world_size=2 and resolves dense/moe/
     # linear-attention widths to the same 2 with moe ep/dp and pp at 1.

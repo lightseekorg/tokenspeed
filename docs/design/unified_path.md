@@ -2272,4 +2272,10 @@ sequence-parallel router projections have nonempty, equal local row counts.
 A single-request TP warmup can skip a GEMM on an empty peer while another
 peer waits in distributed tactic selection. The draft remains in the same
 autotune context as the target. Serving batches and graph capture sizes are
-unchanged.
+unchanged. A speculative decode service must reserve at least one request
+per attention TP peer: `max_num_seqs // data_parallel_size >= attn_tp_size`.
+Server-argument validation rejects smaller capacities before allocating
+buffers or running a forward, including with `--disable-autotune` (which
+disables profiling, not startup warmup). Increase `--max-num-seqs` to at
+least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
+this draft decode warmup and are exempt.
