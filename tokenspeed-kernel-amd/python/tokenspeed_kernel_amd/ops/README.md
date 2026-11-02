@@ -807,7 +807,8 @@ a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_qtile_gfx950` when all
 queries of a tile share one page-table row, otherwise
 `gluon_dsv41_index_topk_gfx950`, then `gluon_dsv41_index_topk_select_gfx950`),
-and gfx1250 does the same (`gluon_dsv41_index_topk_gfx1250`, then
+and gfx1250 does the same (`gluon_dsv41_index_qtile_gfx1250` for Full
+scoring, `gluon_dsv41_index_topk_gfx1250` for candidate rows, then
 `gluon_dsv41_index_topk_select_gfx1250`). gfx950 selects candidate blocks with
 `gluon_dsv41_index_block_max_gfx950` followed by its row selector; gfx1250
 uses the portable Triton radix select (`tokenspeed_kernel`
@@ -820,11 +821,11 @@ Visible lengths are bounded by the block table's row capacity in each consumer,
 before narrowing int64 inputs to int32. The adapter passes dense raw lengths
 without a separate clamp launch. Candidate-block selection uses the same table
 bound, including when compact candidate logits have a smaller width, so forcing
-the newest visible block preserves its logical position. The gfx950 scorers
-write every column the selections read, -inf where no row is scored: each
-query's columns through the end of its last visible 8-row block (block
-selection reads whole blocks), and every candidate column. Their logits are
-therefore not pre-filled; the gfx1250 launcher fills its logits with -inf.
+the newest visible block preserves its logical position. The gfx950 and
+gfx1250 scorers write every column the selections read, -inf where no row is
+scored: each query's columns through the end of its last visible 8-row block
+(block selection reads whole blocks), and every candidate column. Their
+logits are therefore not pre-filled.
 Histogram scratch is zeroed before its atomic sums.
 The gfx950 and gfx1250 row selectors read live-width strides directly, including
 broadcast limits and strided single-row tail tiles. Such tails retain their stride
@@ -858,7 +859,10 @@ model-fixed selection capacities retain the existing launch policy.
   per chunk (64 or fewer queries) or 128; in Full mode the chunk is a
   multiple of 32 or a divisor of 64, so a chunk never straddles a 64-row
   page. Its grid is bounded, and each CTA strides over the chunks of a
-  capacity-wide row.
+  capacity-wide row. The gfx1250 Full scorer rounds the chunk down to whole
+  64-row pages and, with at least 32 CTA rows, scores two chunks per CTA;
+  chunks below one page, and query planes that are not contiguous, use the
+  per-query scorer.
 - Full selection writes finite logits only for each query's visible rows, so
   row selection reads just that prefix of the capacity-wide row (the
   per-query visible length, read on device).
@@ -884,9 +888,20 @@ compiled without FP contraction, so they produce the same bits.
   columns to pages through the candidate ids and page table. Two tiles are in
   flight. A chunk bound that is not a multiple of 32 masks its last tile.
 
-The gfx1250 scorer follows the
-same steps with E2M1 scaled wave32 WMMA: all 32 heads form one WMMA tile, and
-its four warps split each 64-column key tile, so no warp loads another's keys.
+The gfx1250 scorers use E2M1 scaled wave32 WMMA with the 32 heads on the M
+axis. The non-transposed result layout keeps a key column's head partials in
+one lane pair, so the weighted head sum is in-lane plus one cross-lane add,
+and the four warps split each 64-column tile without loading each other's
+keys.
+
+- The Full scorer reads one 64-row page per tile: a CTA loads its chunk's
+  page ids once into registers, so key loads never wait on a table read, and
+  keeps two tiles in flight. Two queries that share a broadcast table row
+  stack on the M axis and share each key tile; per-query tables (decode) use
+  one query per CTA.
+- The candidate scorer maps columns to pages through the candidate ids and
+  page table. It scores its whole chunk as one tile, so the dependent id,
+  page and key loads are issued once per CTA.
 
 The gfx950 selector runs one 16-warp workgroup per query in a single launch
 and reads the row twice:
@@ -2344,55 +2359,80 @@ four branches across waves, so the gate tensor never reaches memory.
 ### gfx1250 mHC mixes projection
 
 `gluon_mhc_mixes_gfx1250` computes the hc=4 prenorm mixing coefficients for
-BF16 residual streams. It shares split selection with `triton_mhc_mixes` and
-replaces both of its kernels: the projection `x @ fn.T` with its row sums of
-squares, and the reduction that runs normalization and the Sinkhorn
+BF16 residual streams in two kernels: the projection `x @ fn.T` with its row
+sums of squares, and the reduction that runs normalization and the Sinkhorn
 iterations. `gluon_mhc_pre_gfx1250` runs the same two kernels for `mhc_pre`
-at every token count, then collapses the streams with the portable kernel.
+at every token count, then collapses the streams with the portable kernel,
+or with the gfx1250 kernel below when RMSNorm is fused.
 
 #### Contract
 
 - `x` is contiguous BF16 `[T, K]` (the four flattened streams) and `fn` is
   contiguous FP32 `[24, K]`. The projection writes FP32 partials
   `[splits, T, 24]` and `[splits, T]`.
-- The WMMA projection runs when `K` splits into whole 128- or 64-wide K tiles
-  that fill the TDM pipeline in every partition; other `K` uses the portable
-  Triton projection.
+- The WMMA projection runs when `K` splits into at least four 64-wide K
+  tiles; other `K` uses the portable Triton projection.
+- Results are deterministic; the split partials are summed in split order.
 
 #### Algorithm
 
-The FP32 weight tile splits into a BF16 rounding and two BF16 remainders that
-sum back to it exactly. BF16 products are exact in FP32, so three BF16 WMMAs
-give the FP32 projection up to accumulation order. Each program covers 64 rows
-and one K partition, pipelines K tiles through three or four TDM buffers, and
-pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
-partition are runtime arguments.
+The FP32 weight tile splits into two 8-bit truncations and a remainder of at
+most 8 significant bits, three BF16 terms that sum back to it exactly. BF16
+products are exact in FP32, so three BF16 WMMAs give the FP32 projection up
+to accumulation order. The split masks the FP32 bits: widening BF16 back to
+FP32 lowers to VOPD pairs that rematerialize their mask in an SGPR, a scalar
+stall per pair that made the VALU-bound tile 20% slower.
 
-The reduction is the gfx950 kernel on 32-lane waves: sixteen lanes own a
-token's 4x4 matrix, so a wave covers two tokens when the splits stay in
-registers and one when they also spread over lanes.
+Each program covers a row tile and a K partition and pipelines 64-wide K
+tiles through four TDM buffers. Decode (up to 128 tokens) uses 16-row tiles
+with one wave per 16-wide mix tile, so no wave splits weights for rows that
+do not exist. Larger batches use 64-row (up to 2048 tokens) or 128-row tiles
+with four waves over the rows; each wave splits a quarter of the weight tile
+and the BF16 terms are shared through LDS. The partition count is the
+smallest divisor of the K tiles that gives 512 programs, capped at four
+tiles per partition (80 for DeepSeek V4.1 and 64 for GLM-5.3 decode, 8 for
+8192-token prefill chunks). The token count and tiles per partition are
+runtime arguments.
 
-### gfx1250 mHC stream collapse with FP8 output
+The reduction gives four lanes a token's 4x4 matrix, one row of four
+contiguous FP32 per lane, so each split is one 16-byte load and the Sinkhorn
+row sums stay in registers (column sums are two-step lane reductions).
+Prefill keeps up to eight splits in registers; more splits also spread over
+lane groups, and decode spreads them over every wave so a single pass loads
+all of them.
 
-`gluon_mhc_apply_pre_fp8_group32_gfx1250` serves `mhc_apply_pre_fp8_group32`
-for DeepSeek V4.1: the gfx950 stream collapse with RMSNorm that also writes
-the group-32 FP8 input of the next projection.
+### gfx1250 mHC stream collapse and post-mapping
+
+`gluon_mhc_apply_pre_gfx1250` serves `mhc_apply_pre` with a fused RMSNorm,
+and also `mhc_apply_pre_fp8_group32` for DeepSeek V4.1, where it also writes
+the group-32 FP8 input of the next projection. `gluon_mhc_post_gfx1250`
+serves `mhc_post` above 256 tokens; the portable kernel's smaller tiles are
+faster for decode.
 
 #### Contract
 
-- Contiguous BF16 residual `[T, 4, H]` with `H` divisible by 32 and fewer
-  than 2^31 elements, FP32 pre coefficients `[T, 4]` and a BF16 or FP32 norm
-  weight `[H]`.
-- Returns the BF16 layer input `[T, H]`, numerically the gfx950 normalized
-  collapse, with E4M3 codes `[T, H]` and uint8 UE8M0 scales `[T, H / 32]`
-  bit-identical to `gluon_quantize_fp8_group32_ue8m0_gfx1250` reading it.
+- Contiguous BF16 residual `[T, 4, H]` with fewer than 2^31 elements, FP32
+  pre coefficients `[T, 4]` and a BF16 or FP32 norm weight `[H]` (`H`
+  divisible by 32 to quantize).
+- The collapse returns the BF16 layer input `[T, H]`: the plain collapse
+  rounds each product like the portable kernel; with RMSNorm, the stream sum
+  is rounded to BF16 first and only the RMS reduction order differs (a rare
+  one-ulp difference). E4M3 codes `[T, H]` and uint8 UE8M0 scales
+  `[T, H / 32]` are bit-identical to
+  `gluon_quantize_fp8_group32_ue8m0_gfx1250` reading the BF16 output.
+- Post returns the updated BF16 streams, bit-identical to the portable
+  kernel.
 
 #### Algorithm
 
-One four-wave CTA owns a token, so RMSNorm reduces the row once; each lane
-moves eight contiguous BF16 values, and four lanes hold one quantization
-group. The BF16-rounded result is quantized from registers, which saves the
-quantizer's launch and its re-read of the row.
+Every lane moves eight contiguous BF16 values (16-byte accesses). The
+collapse runs one four-wave CTA per token, so RMSNorm reduces the row once,
+and four lanes hold one quantization group; the BF16-rounded result is
+quantized from registers (the power-of-two scale is applied as an exact
+reciprocal), which saves the quantizer's launch and its re-read of the row.
+Post runs one token per CTA so its twenty coefficients are scalar loads;
+above 2048 tokens adjacent CTAs take adjacent hidden blocks of one token and
+all vector accesses are non-temporal.
 
 ## Quantization
 

@@ -37,8 +37,8 @@ from tokenspeed_kernel.ops.residual.gluon import (  # noqa: E402
     gluon_mhc_pre_gfx1250,
 )
 from tokenspeed_kernel.ops.residual.triton import (  # noqa: E402
-    compute_mhc_num_splits,
     triton_mhc_apply_pre,
+    triton_mhc_post,
 )
 from tokenspeed_kernel.selection import select_kernel  # noqa: E402
 from tokenspeed_kernel.signature import (  # noqa: E402
@@ -48,7 +48,10 @@ from tokenspeed_kernel.signature import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.mhc import (  # noqa: E402
     gluon_mhc_mixes_project_gfx1250,
     gluon_mhc_mixes_reduce_gfx1250,
+    launch_gluon_mhc_apply_pre_gfx1250,
     launch_gluon_mhc_mixes_project_gfx1250,
+    launch_gluon_mhc_post_gfx1250,
+    mhc_mixes_project_splits,
     use_gluon_mhc_mixes_project_gfx1250,
 )
 
@@ -92,31 +95,23 @@ def _assert_matches_reference(actual, residual, weight, scale, base) -> None:
         torch.testing.assert_close(got.double(), want, atol=1e-4, rtol=1e-4)
 
 
-def _splits(tokens: int, hidden: int) -> int:
-    return compute_mhc_num_splits(
-        torch.device("cuda"), 64, 4 * hidden, max(1, -(-tokens // 64))
-    )
-
-
-# On 256 CUs these token counts reach 80, 64, 32 and fewer K splits, so both
-# 64-wide K tiles (64 or more splits) and 128-wide ones run; 320 is the
-# cheapest 128-wide case. 4 * 1000 does not tile into 64-wide K tiles, so that
-# width keeps the Triton GEMM.
+# These token counts cover the 16-row (decode), 64-row and 128-row projection
+# tiles, 80 down to 8 K splits, and every reduction layout. 4 * 1000 does not
+# tile into 64-wide K tiles, so that width keeps the Triton GEMM.
 @pytest.mark.parametrize("tokens", [1, 96, 192, 320, 2048, 8192])
 @pytest.mark.parametrize("hidden", [5120, 1000])
 def test_mhc_mixes_matches_reference(tokens: int, hidden: int) -> None:
     operands = _operands(tokens, hidden, seed=tokens + hidden)
-    splits = _splits(tokens, hidden)
-    assert use_gluon_mhc_mixes_project_gfx1250(4 * hidden, splits) == (hidden != 1000)
+    assert use_gluon_mhc_mixes_project_gfx1250(4 * hidden) == (hidden != 1000)
     _assert_matches_reference(_run(*operands), *operands)
 
 
-def test_projection_matches_fp64() -> None:
-    tokens = 2048
+@pytest.mark.parametrize("tokens", [6, 2048, 8192])
+def test_projection_matches_fp64(tokens: int) -> None:
     residual, weight, _, _ = _operands(tokens, 5120, seed=tokens)
     x = residual.view(tokens, -1)
-    splits = _splits(tokens, 5120)
-    assert use_gluon_mhc_mixes_project_gfx1250(x.shape[1], splits)
+    splits = mhc_mixes_project_splits(tokens, x.shape[1])
+    assert splits
     out_mul = torch.empty(splits, tokens, 24, device="cuda")
     out_sqrsum = torch.empty(splits, tokens, device="cuda")
     launch_gluon_mhc_mixes_project_gfx1250(x, weight, out_mul, out_sqrsum, splits)
@@ -141,7 +136,7 @@ def test_mhc_mixes_selects_gfx1250_kernel() -> None:
     assert kernel.name == "gluon_mhc_mixes_gfx1250"
 
 
-@pytest.mark.parametrize("tokens", [1, 96, 2048])
+@pytest.mark.parametrize("tokens", [1, 4, 64, 96, 2048, 8192])
 def test_mhc_pre_matches_reference(tokens: int) -> None:
     residual, weight, scale, base = _operands(tokens, 4096, seed=tokens)
     layer_input, post, comb = gluon_mhc_pre_gfx1250(
@@ -201,6 +196,81 @@ def test_mhc_apply_pre_quantize_fp8_matches_unfused(tokens: int) -> None:
     assert torch.equal(scales, expected_scales)
 
 
+@pytest.mark.parametrize("tokens", [1, 6, 96, 848, 8192])
+@pytest.mark.parametrize("hidden", [5120, 4096])
+def test_mhc_post_matches_portable(tokens: int, hidden: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(tokens + hidden)
+    x = torch.randn(tokens, hidden, device="cuda", generator=generator).bfloat16()
+    residual = torch.randn(
+        tokens, 4, hidden, device="cuda", generator=generator
+    ).bfloat16()
+    post = torch.rand(tokens, 4, 1, device="cuda", generator=generator) * 2
+    comb = torch.rand(tokens, 4, 4, device="cuda", generator=generator)
+    assert torch.equal(
+        launch_gluon_mhc_post_gfx1250(x, residual, post, comb),
+        triton_mhc_post(x, residual, post, comb),
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+@pytest.mark.parametrize("norm", [False, True])
+def test_mhc_apply_pre_matches_portable(tokens: int, norm: bool) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(tokens)
+    residual = torch.randn(
+        tokens, 4, 5120, device="cuda", generator=generator
+    ).bfloat16()
+    pre = torch.rand(tokens, 4, device="cuda", generator=generator)
+    weight = torch.rand(5120, device="cuda", generator=generator).bfloat16()
+    kwargs = (
+        {"norm_weight": weight, "norm_eps": _RMS_EPS}
+        if norm
+        else {
+            "norm_weight": None,
+            "norm_eps": None,
+        }
+    )
+    out = launch_gluon_mhc_apply_pre_gfx1250(
+        residual, pre, kwargs["norm_weight"], kwargs["norm_eps"], quantize=False
+    )
+    expected = triton_mhc_apply_pre(residual, pre, **kwargs)
+    if not norm:
+        assert torch.equal(out, expected)
+        return
+    # The RMS reduction order differs, which moves a rare value by one ulp.
+    torch.testing.assert_close(out, expected, atol=0, rtol=2**-7)
+    assert (out != expected).double().mean().item() < 1e-3
+
+
+def test_mhc_post_and_apply_pre_select_gfx1250_kernels() -> None:
+    post = select_kernel(
+        "residual",
+        "mhc_post",
+        format_signature(
+            hidden_states=dense_tensor_format(torch.bfloat16),
+            residual=dense_tensor_format(torch.bfloat16),
+            post=dense_tensor_format(torch.float32),
+            comb=dense_tensor_format(torch.float32),
+        ),
+        traits={
+            "num_tokens": 8192,
+            "buffer_offsets_fit_int32": True,
+            "hc_mult": 4,
+            "hidden_size": 5120,
+        },
+    )
+    assert post.name == "gluon_mhc_post_gfx1250"
+    apply_pre = select_kernel(
+        "residual",
+        "mhc_apply_pre",
+        format_signature(
+            residual=dense_tensor_format(torch.bfloat16),
+            pre=dense_tensor_format(torch.float32),
+        ),
+        traits={"buffer_offsets_fit_int32": True, "fused_norm": True, "hc_mult": 4},
+    )
+    assert apply_pre.name == "gluon_mhc_apply_pre_gfx1250"
+
+
 def test_mhc_apply_pre_fp8_selects_gfx1250_kernel() -> None:
     kernel = select_kernel(
         "residual",
@@ -232,13 +302,14 @@ def test_projection_varying_tokens_reuse_compiled_kernels() -> None:
     def run(tokens: int) -> None:
         _run(_operands(tokens, 5120, seed=tokens)[0], weight, scale, base)
 
-    # Warm both tile widths (64-wide K tiles at 64 or more splits, 128-wide
-    # below) and the three reduction layouts (splits in registers, also over
-    # lanes beyond 256 tokens, and also over waves at or below).
-    for tokens in (1, 848, 8192):
+    # Warm the three projection tilings (16, 64 and 128 rows) and the four
+    # reduction layouts this width uses: 80 decode splits over lanes and
+    # waves, 40 or 64 and up to 32 splits beyond 256 tokens, and 8 splits in
+    # registers.
+    for tokens in (1, 848, 2048, 8192):
         run(tokens)
     with assert_no_triton_compile(
         gluon_mhc_mixes_project_gfx1250, gluon_mhc_mixes_reduce_gfx1250
     ):
-        for tokens in (6, 192, 600, 2048, 4097):
+        for tokens in (6, 192, 600, 1500, 4097):
             run(tokens)

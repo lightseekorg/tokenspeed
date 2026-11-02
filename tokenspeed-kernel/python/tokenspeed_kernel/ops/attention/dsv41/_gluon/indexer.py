@@ -329,8 +329,6 @@ def launch_gfx1250_logits(
         dsv41_index_logits_gfx1250,
     )
 
-    # The gfx1250 scorer writes scored columns only.
-    logits.fill_(-float("inf"))
     dsv41_index_logits_gfx1250(
         values,
         scales,

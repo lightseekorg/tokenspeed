@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.residual.triton import (
     _mhc_mixes_impl,
     _mhc_pre_impl,
+    _mhc_pre_layer_triton_kernel,
     _mhc_prenorm_gemm_triton,
 )
 from tokenspeed_kernel.platform import (
@@ -491,23 +492,12 @@ if current_platform().is_amd:
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.mhc import (
-        launch_gluon_mhc_apply_pre_fp8_group32_gfx1250,
-        launch_gluon_mhc_mixes_project_gfx1250,
+        launch_gluon_mhc_apply_pre_gfx1250,
+        launch_gluon_mhc_mixes_gfx1250,
         launch_gluon_mhc_mixes_reduce_gfx1250,
+        launch_gluon_mhc_post_gfx1250,
         use_gluon_mhc_mixes_project_gfx1250,
     )
-
-    def _mhc_prenorm_gemm_gfx1250(
-        x: torch.Tensor,
-        fn: torch.Tensor,
-        out_mul: torch.Tensor,
-        out_sqrsum: torch.Tensor,
-        n_splits: int,
-    ) -> None:
-        if use_gluon_mhc_mixes_project_gfx1250(x.shape[1], n_splits):
-            launch_gluon_mhc_mixes_project_gfx1250(x, fn, out_mul, out_sqrsum, n_splits)
-        else:
-            _mhc_prenorm_gemm_triton(x, fn, out_mul, out_sqrsum, n_splits)
 
     _GFX1250 = CapabilityRequirement(
         min_arch_version=ArchVersion(12, 5),
@@ -545,7 +535,43 @@ if current_platform().is_amd:
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the hc=4 prenorm projection and reduction on GFX1250 Gluon."""
+        """Run the hc=4 mixes and stream collapse on GFX1250 Gluon.
+
+        The plain collapse stays on the portable kernel, which is as fast and
+        keeps its rounding; a fused RMSNorm uses the Gluon collapse.
+        """
+        hidden_size = residual.shape[-1]
+        if residual.is_contiguous() and use_gluon_mhc_mixes_project_gfx1250(
+            4 * hidden_size
+        ):
+            outer_shape = residual.shape[:-2]
+            flat = residual.view(-1, 4, hidden_size)
+            pre, post, comb = launch_gluon_mhc_mixes_gfx1250(
+                flat, fn, hc_scale, hc_base, rms_eps, hc_eps, sinkhorn_iters
+            )
+            if norm_weight is not None:
+                layer_input = launch_gluon_mhc_apply_pre_gfx1250(
+                    flat, pre, norm_weight, norm_eps, quantize=False
+                )
+            else:
+                layer_input = residual.new_empty((flat.shape[0], hidden_size))
+                if flat.shape[0]:
+                    _mhc_pre_layer_triton_kernel[
+                        (flat.shape[0], (hidden_size + 1023) // 1024)
+                    ](
+                        pre,
+                        flat,
+                        layer_input,
+                        hidden_size=hidden_size,
+                        hc_mult=4,
+                        block_h=1024,
+                        num_warps=4,
+                    )
+            return (
+                layer_input.view(*outer_shape, hidden_size),
+                post.view(*outer_shape, 4, 1),
+                comb.view(*outer_shape, 4, 4),
+            )
         return _mhc_pre_impl(
             residual,
             fn,
@@ -554,7 +580,7 @@ if current_platform().is_amd:
             rms_eps,
             hc_eps,
             sinkhorn_iters,
-            _mhc_prenorm_gemm_gfx1250,
+            _mhc_prenorm_gemm_triton,
             norm_weight,
             norm_eps,
             pre_mix_impl=launch_gluon_mhc_mixes_reduce_gfx1250,
@@ -581,6 +607,10 @@ if current_platform().is_amd:
         sinkhorn_iters: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the hc=4 prenorm projection and reduction on GFX1250 Gluon."""
+        if use_gluon_mhc_mixes_project_gfx1250(4 * residual.shape[-1]):
+            return launch_gluon_mhc_mixes_gfx1250(
+                residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters
+            )
         return _mhc_mixes_impl(
             residual,
             weight,
@@ -589,7 +619,7 @@ if current_platform().is_amd:
             rms_eps,
             hc_eps,
             sinkhorn_iters,
-            _mhc_prenorm_gemm_gfx1250,
+            _mhc_prenorm_gemm_triton,
             launch_gluon_mhc_mixes_reduce_gfx1250,
         )
 
@@ -615,6 +645,73 @@ if current_platform().is_amd:
     )
     def gluon_mhc_apply_pre_fp8_group32_gfx1250(residual, pre, norm_weight, norm_eps):
         """Collapse four streams with RMSNorm and also emit group-32 E4M3 codes."""
-        return launch_gluon_mhc_apply_pre_fp8_group32_gfx1250(
-            residual, pre, norm_weight, norm_eps
+        return launch_gluon_mhc_apply_pre_gfx1250(
+            residual, pre, norm_weight, norm_eps, quantize=True
         )
+
+    @register_kernel(
+        "residual",
+        "mhc_apply_pre",
+        name="gluon_mhc_apply_pre_gfx1250",
+        solution="gluon",
+        capability=_GFX1250,
+        signatures=frozenset(
+            {
+                format_signature(
+                    residual=dense_tensor_format(torch.bfloat16),
+                    pre=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={
+            "buffer_offsets_fit_int32": frozenset({True}),
+            # The portable plain collapse is as fast.
+            "fused_norm": frozenset({True}),
+            "hc_mult": frozenset({4}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_apply_pre_gfx1250(
+        residual: torch.Tensor,
+        pre: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
+    ) -> torch.Tensor:
+        """Collapse four streams with ``pre`` and optional fused RMSNorm."""
+        return launch_gluon_mhc_apply_pre_gfx1250(
+            residual, pre, norm_weight, norm_eps, quantize=False
+        )
+
+    @register_kernel(
+        "residual",
+        "mhc_post",
+        name="gluon_mhc_post_gfx1250",
+        solution="gluon",
+        capability=_GFX1250,
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    residual=dense_tensor_format(torch.bfloat16),
+                    post=dense_tensor_format(torch.float32),
+                    comb=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={
+            "buffer_offsets_fit_int32": frozenset({True}),
+            "hc_mult": frozenset({4}),
+            # The portable kernel's smaller tiles are faster for decode.
+            "num_tokens_min": frozenset({257}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_post_gfx1250(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the vectorized GFX1250 hc=4 post-mapping."""
+        return launch_gluon_mhc_post_gfx1250(hidden_states, residual, post, comb)
