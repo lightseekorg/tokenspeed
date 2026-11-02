@@ -66,7 +66,7 @@ from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 _is_blackwell = current_platform().is_blackwell
 
@@ -300,6 +300,31 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.use_deepep = get_all2all_backend().is_deepep() and (
             moe_backend.is_flashinfer_cutedsl() or moe_backend.is_deep_gemm()
         )
+        self.use_mega_moe = moe_backend.is_mega_moe()
+        if self.use_mega_moe:
+            if mapping.moe.ep_size <= 1:
+                raise ValueError("Qwen3.5 MegaMoE requires EP>1")
+            if not get_all2all_backend().is_none():
+                raise ValueError(
+                    "Qwen3.5 MegaMoE owns dispatch/combine and requires "
+                    "--all2all-backend none"
+                )
+            if (
+                global_server_args_dict.get("enable_eplb", False)
+                or global_server_args_dict.get("ep_num_redundant_experts", 0)
+                or global_server_args_dict.get("init_expert_location", "trivial")
+                not in (None, "trivial")
+            ):
+                raise ValueError(
+                    "Qwen3.5 MegaMoE requires trivial expert placement without "
+                    "EPLB or redundant experts"
+                )
+            if mapping.attn.tp_size == mapping.moe.tp_ep_size:
+                raise ValueError(
+                    "Qwen3.5 MegaMoE requires scattered MoE rows: attention TP must "
+                    "differ from MoE TP*EP; TP8/EP8 is unsupported. Use DP4/TP2/EP8 "
+                    "or DP8/TP1/EP8."
+                )
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_index,
@@ -338,6 +363,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 "routing_method_type": RoutingMethodType.RenormalizeNaive,
                 "normalize_topk_weights": config.norm_topk_prob,
             },
+            routing_mode="precomputed_topk" if self.use_mega_moe else None,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -354,14 +380,14 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
-                # The DeepEP path runs the whole block on this rank's token
+                # DeepEP and MegaMoE run the whole block on this rank's token
                 # shard, so the shared expert is data parallel over those rows:
                 # replicated weights, no cross-rank reduction. Sharding it
                 # instead would reduce partial products belonging to different
                 # tokens. It also lifts the dense-TP ceiling that a small
                 # shared_expert_intermediate_size imposes under block-quantized
                 # FP8 (a shard must stay >= the quantization block).
-                replicate_weights=self.use_deepep,
+                replicate_weights=self.use_deepep or self.use_mega_moe,
                 parallelism="moe_shared",
             )
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
@@ -388,6 +414,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
     ) -> torch.Tensor:
+        if self.use_mega_moe:
+            return self._forward_mega_moe(
+                hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
+            )
         if self.use_deepep:
             return self._forward_deepep(
                 hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
@@ -395,6 +425,59 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         return self._forward_tp(
             hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
         )
+
+    def _forward_mega_moe(
+        self,
+        hidden_states: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Route already-scattered rows, including empty collective owners."""
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > 0:
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            router_logits = hidden_states.new_empty((0, self.experts.num_experts))
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+
+        shared_output = None
+        # Fork after the router GEMM: shared GEMMs may reuse its dense scratch,
+        # while routed MegaMoE owns a separate workspace.
+        with self.stream_fork.scope(
+            enable=(
+                self.shared_expert is not None
+                and num_tokens > 0
+                and get_is_cuda_graph_phase()
+            ),
+            overlap=get_is_capture_mode(),
+        ) as fork:
+            with fork.branch():
+                if self.shared_expert is not None and num_tokens > 0:
+                    shared_output = self.shared_expert(hidden_states)
+
+            # Empty owners must still enter the collective. The result is
+            # complete for local rows and aliases the reusable workspace.
+            output = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                num_global_tokens=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=True,
+            )
+        if shared_output is not None:
+            fused_gate_sigmoid_mul_add(
+                hidden_states,
+                self.shared_expert_gate.weight.squeeze(0),
+                shared_output,
+                output,
+            )
+        return output
 
     def _forward_tp(
         self,

@@ -485,6 +485,25 @@ public:
         return match;
     }
 
+    // Present source blocks refresh matching entries without pinning or inserting them.
+    void TouchExisting(const BlockPool& pool, std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks,
+                       std::uint64_t access_epoch) {
+        _assert(blocks.size() <= keys.size(), "source block span exceeds key span");
+        CacheEntries* entries = findCacheEntries(pool);
+        if (entries == nullptr) {
+            return;
+        }
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            if (!blocks[i]) {
+                continue;
+            }
+            auto entry = findEntry(*entries, keys[i]);
+            if (entry != entries->entries.end()) {
+                touchEntry(*entries, entry, std::max(entry->last_access_epoch, access_epoch));
+            }
+        }
+    }
+
     std::vector<CacheBlockLocation> MatchedLocations(const BlockPool& pool, std::span<const CacheKey> keys,
                                                      std::int32_t begin_blocks, const GroupPrefixProbe& probe) const {
         _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
