@@ -543,10 +543,10 @@ def torch_grouped_bf16_projection(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Preserve the original batched projection and its BF16 rounding."""
-    result = torch.einsum("tgd,grd->tgr", x, weight)
     if out is None:
-        return result
-    out.copy_(result)
+        out = x.new_empty((x.shape[0], weight.shape[0], weight.shape[1]))
+    # The batched GEMM writes token-major rows directly, so callers flatten without a copy.
+    torch.bmm(x.transpose(0, 1), weight.transpose(1, 2), out=out.transpose(0, 1))
     return out
 
 
