@@ -2616,6 +2616,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
 // the Host, or without one starts over.
 TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersInputUnmarked) {
     device_pages_ = 15;
+    host_pages_ = 32;  // Keep Host LRU pressure out of this Device input-lifetime test.
     for (const auto& [policy, host_cache] : {std::pair{SchedulerConfig::HostWritePolicy::kWriteBack, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, false}}) {
@@ -2673,6 +2674,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersI
             AckWriteBacks(plan);
             SendAbortEvent("f1");
             AckWriteBacks(PlanOnce());
+            EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
             const Resume again = Probe("g-again", g);
             const bool from_host = g_finishes && !write_back && host_cache;
             EXPECT_EQ(again.prefix_tokens, g_finishes && !from_host ? 0 : 22);

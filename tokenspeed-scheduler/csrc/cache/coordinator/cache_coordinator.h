@@ -580,7 +580,7 @@ public:
         std::size_t group_scans{0};
         // Unpinned entries visited while collecting replacement candidates.
         std::size_t block_candidates{0};
-        // Distinct touched parents checked for whole-parent reclamation.
+        // Distinct parents whose occupancy was simulated during replacement.
         std::size_t parent_candidates{0};
     };
     struct HostAllocationBatch {
@@ -593,20 +593,11 @@ public:
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
     std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
-    // One Host block per (group, bucket) entry, in the bucket of the Device
-    // block it will mirror -- under page-cyclic sharding the owner of a Host
-    // page must be the owner of its Device page, so a copy's two ends select
-    // the same rows on every rank. Free capacity first, then global LRU over
-    // compatible children and fully evictable parents of any group. A parent
-    // is ranked by its newest child; equal epochs prefer one child. A
-    // shortfall leaves an empty reference. Evicting a State checkpoint takes
-    // the other State groups' at its hash along; every block retries free
-    // capacity before it picks a victim, so it places in the room such a
-    // cascade freed before another victim goes. Block by block: it serves
-    // publication and finish stores and L3 prefetches. A retraction image's
-    // Host blocks come from AcquireHostBoundaries, whose per-block plan ranks
-    // victims as this does (change the two together), and the Host blocks of
-    // what an eviction writes back from AcquireHostSegments.
+    // One Host block per (group, bucket), with free capacity assigned first
+    // in input order. The shared eviction plan funds remaining rows globally;
+    // failed rows and unnecessary tentative victims evict nothing. A State
+    // checkpoint takes its unpinned State siblings at the same boundary along.
+    // A shortfall leaves an empty reference, without blocking later rows.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     // One segment of an AcquireHostSegments batch, or one boundary of a
@@ -659,12 +650,9 @@ public:
     // covering the rows in order, the shallowest first -- the Host can take
     // whole from the first on, each row in its Device block's bucket. Nothing
     // is evicted or acquired; AcquireHostBoundaries carries out the same plan.
-    // It plans block by block with AcquireHostBlocks' victim ranking against
-    // a shadow of the Host, which does not know which parent the pool gives
-    // each row, so where several parents have room the victims can
-    // differ from those AcquireHostBlocks would take. The write-back policy
-    // places by segments first and never places fewer boundaries than block
-    // by block (docs/design/scheduler.md §2).
+    // Uses AcquireHostBlocks' planner, accepting whole boundaries instead of
+    // individual rows. The write-back policy first tries its segment plan,
+    // without placing fewer boundaries than the block plan alone would.
     std::size_t NumHostBoundariesThatFit(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries) const;
@@ -920,10 +908,8 @@ private:
     HostAllocationBatch acquireHostPlacement(const HostPlacementPlan& plan, std::span<const std::uint32_t> group_ids,
                                              std::span<const std::int32_t> buckets,
                                              std::span<const HostSegmentRows> segments);
-    // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
-    // carries out; by whole segments first with place_by_segments (the
-    // write-back policy), else block by block alone. Its per-block victim
-    // ranking is AcquireHostBlocks'; change the two together.
+    // Shared block planning with whole-boundary acceptance. The write-back
+    // policy first tries its segment plan when place_by_segments is set.
     HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
@@ -1142,15 +1128,6 @@ private:
     // and level with the blocks no entry holds, until an acquisition or a
     // publication touches it again.
     static constexpr std::uint64_t kSupersededAccessEpoch{0};
-    struct HostParentCandidate {
-        std::uint64_t newest_access_epoch{0};
-        std::int32_t evictable_children{0};
-        bool allocated{false};
-    };
-    // Reuse the direct-indexed scratch buffer; reset only the parents touched
-    // by the previous replacement batch, never the whole Host arena per call.
-    std::vector<HostParentCandidate> host_parent_candidates_;
-    std::vector<std::int32_t> host_touched_parents_;
     TailTable tails_;
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.

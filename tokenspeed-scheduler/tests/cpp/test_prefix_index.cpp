@@ -674,6 +674,76 @@ TEST(PrefixCacheIndexEvictionOrderTest, MatchesTheEvictableSetSeenByAFullScan) {
 }  // namespace tokenspeed::test
 
 namespace tokenspeed::test {
+TEST(PrefixCacheSessionTest, TouchExistingMergesOwnershipBeforeRefreshingDemotedCopies) {
+    for (const bool demoted : {false, true}) {
+        for (const std::string visitor_id : {"first", "second", ""}) {
+            SCOPED_TRACE(demoted);
+            SCOPED_TRACE(visitor_id);
+            BlockPool device(1, {1});
+            BlockPool host(1, {1});
+            PrefixCacheIndex index(kGroupId);
+            auto owner = std::make_shared<SessionCacheTag>();
+            owner->id = "first";
+            SessionCacheOwner visitor;
+            if (visitor_id == "first") {
+                visitor = owner;
+            } else if (!visitor_id.empty()) {
+                visitor = std::make_shared<SessionCacheTag>();
+                visitor->id = visitor_id;
+            }
+            const std::vector<CacheKey> keys{KeyOf("entry")};
+            auto host_block = host.AcquireBlock(kGroupId);
+            index.Register(host, host_block, keys[0], 10, 0, CacheBoundaryKind::kChunk, nullptr, owner);
+            host_block.reset();
+            if (demoted) {
+                owner->demoted = true;
+                ASSERT_EQ(index.DemoteSession(host, owner), 1u);
+            }
+            const std::vector<CacheBlockRef> sources{device.AcquireBlock(kGroupId)};
+            index.TouchExisting(host, keys, sources, 20, visitor);
+            const auto entry = index.Inspect(host, keys[0]);
+            ASSERT_TRUE(entry);
+            EXPECT_FALSE(entry->pinned);
+            EXPECT_EQ(entry->metadata.session, visitor == owner ? owner : nullptr);
+            EXPECT_EQ(entry->metadata.last_access_epoch, demoted && visitor == owner ? 0u : 20u);
+            EXPECT_EQ(index.DemoteSession(host, owner), !demoted && visitor == owner ? 1u : 0u);
+            if (visitor != owner) {
+                EXPECT_EQ(index.Inspect(host, keys[0])->metadata.last_access_epoch, 20u);
+            }
+        }
+    }
+}
+
+TEST(PrefixCacheSessionTest, TouchExistingKeepsNewerEpochsAndDoesNotInsertPinOrTouchMissingSources) {
+    BlockPool device(2, {1});
+    BlockPool host(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    auto owner = std::make_shared<SessionCacheTag>();
+    owner->id = "first";
+    const std::vector<CacheKey> keys{KeyOf("present"), KeyOf("no-source"), KeyOf("absent")};
+    for (std::size_t i = 0; i < 2; ++i) {
+        auto block = host.AcquireBlock(kGroupId);
+        index.Register(host, block, keys[i], 30, 0, CacheBoundaryKind::kChunk, nullptr, owner);
+    }
+    const std::vector<CacheBlockRef> sources{device.AcquireBlock(kGroupId), {}, device.AcquireBlock(kGroupId)};
+    index.TouchExisting(host, keys, sources, 20, /*session=*/nullptr);
+    const auto present = index.Inspect(host, keys[0]);
+    const auto skipped = index.Inspect(host, keys[1]);
+    ASSERT_TRUE(present);
+    ASSERT_TRUE(skipped);
+    EXPECT_EQ(present->metadata.last_access_epoch, 30u);
+    EXPECT_FALSE(present->metadata.session);
+    EXPECT_EQ(skipped->metadata.last_access_epoch, 30u);
+    EXPECT_EQ(skipped->metadata.session, owner);
+    EXPECT_FALSE(index.Contains(host, keys[2]));
+    EXPECT_EQ(host.NumEmptyLcmBlocks(), 1);
+    EXPECT_FALSE(present->pinned);
+    EXPECT_FALSE(skipped->pinned);
+    EXPECT_FALSE(present->metadata.was_acquired);
+    EXPECT_EQ(sources[0].use_count(), 1);
+    EXPECT_EQ(sources[2].use_count(), 1);
+}
+
 TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAndActiveBlocks) {
     BlockPool pool(5, {1});
     PrefixCacheIndex index(kGroupId);
