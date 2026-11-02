@@ -2495,8 +2495,10 @@ def _try_gluon_largem_gfx1250(
 ) -> torch.Tensor | None:
     """Run the CDNA5 large-M kernel, or return None when the call is ineligible.
 
-    Named K3 APIs and BF16 ``UnquantizedLinearMethod`` layers use this instead
-    of registering the kernel on generic ``mm()``.
+    Named K3 APIs, BF16 ``UnquantizedLinearMethod`` layers, and BF16 prefill
+    projections that call ``F.linear`` directly use this instead of
+    registering the kernel on generic ``mm()``. The activation may be a column
+    slice of a wider tensor whose rows start on 16-byte boundaries.
     """
 
     if (
@@ -2508,7 +2510,11 @@ def _try_gluon_largem_gfx1250(
         or not activation.is_cuda
         or not weight.is_cuda
         or weight.device != activation.device
-        or not activation.is_contiguous()
+        or activation.stride(1) != 1
+        or (
+            not activation.is_contiguous()
+            and (activation.stride(0) % 8 or activation.data_ptr() % 16)
+        )
         or not weight.is_contiguous()
         or (
             out is not None

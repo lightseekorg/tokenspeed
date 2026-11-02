@@ -28,10 +28,14 @@ if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
 from tokenspeed_kernel import compile_monitor
+from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+    _wmma_tdm_dense_kernel,
+    _wmma_tdm_dense_largem_kernel,
     _wmma_tdm_dense_largem_warp_pipeline_kernel,
     gluon_mm_a16w16_gfx1250,
     gluon_mm_a16w16_largem_gfx1250,
+    use_gluon_largem_gfx1250,
 )
 
 
@@ -88,6 +92,101 @@ def test_largem_warp_pipeline_compiles_under_compile_monitor():
     finally:
         compile_monitor.uninstall_compile_monitor()
     torch.testing.assert_close(actual, a @ b.T, atol=1e-2, rtol=1e-2)
+
+
+# GLM-5.3-Flash attention TP4 prefill projections (M, K, N) at an 8192-token
+# chunk, a 5376-token tail and an 848-token tail, and shapes left to hipBLASLt.
+@pytest.mark.parametrize(
+    "m,k,n,selected",
+    [
+        (8192, 4096, 6416, True),  # KDA q/k/v/beta/f_a/g_a, tail peeled
+        (8192, 512, 2304, True),  # peeling the tail saves a CU round
+        (8192, 2048, 4096, True),  # KDA output
+        (8192, 1536, 4096, True),  # indexer wq_b
+        (8192, 128, 2048, True),  # KDA f_b and g_b
+        (8192, 4096, 288, True),  # MoE router
+        (8192, 4096, 128, True),  # indexer wk, KPool gate
+        (8192, 4096, 32, True),  # indexer weights
+        (5376, 4096, 288, True),
+        (848, 4096, 288, True),
+        (848, 4096, 128, True),
+        (8192, 4096, 160, False),  # fused wk + weights: no one-wave tile
+        (5376, 2048, 4096, False),  # 2x2 clusters leave a third of rounds idle
+        (8192, 4096, 1536, False),  # 75% of the round busy
+        (8192, 21504, 7168, False),  # K past the measured range
+        (848, 2048, 4096, False),  # short wide problems stay on hipBLASLt
+        (8192, 4096, 1024, False),
+        (511, 4096, 288, False),
+        (8192, 4096, 6400 + 8, False),  # N must be a multiple of 16
+        (8192, 4096 + 64, 4096, False),  # K must be a multiple of 128
+    ],
+)
+def test_largem_selection_outside_k3_shapes(m, k, n, selected):
+    assert use_gluon_largem_gfx1250(m, k, n) is selected
+
+
+def _cold_kernel(kernel):
+    kernel.device_caches.clear()
+    return kernel
+
+
+# Narrow outputs: one wave of 64 x 32 (router at 848 rows, weights), 64 x 64
+# (wk, KPool gate) dense tiles, and the 128 x 128 large-M tile when no dense
+# tile divides N within one wave (router at 8192 rows).
+@pytest.mark.parametrize(
+    "m,n,k,kernel",
+    [
+        (848, 288, 4096, _wmma_tdm_dense_kernel),
+        (8192, 32, 4096, _wmma_tdm_dense_kernel),
+        (8192, 128, 4096, _wmma_tdm_dense_kernel),
+        (5377, 128, 4096, _wmma_tdm_dense_kernel),
+        (8192, 288, 4096, _wmma_tdm_dense_largem_kernel),
+    ],
+)
+def test_largem_narrow_outputs_match_torch(m, n, k, kernel):
+    torch.manual_seed(m + n)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    _cold_kernel(kernel)
+    actual = _project(a, b)
+    assert kernel.device_caches
+    expected = (a.float() @ b.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("m,n,k", [(8192, 2304, 512), (4096, 4352, 256)])
+def test_largem_warp_pipeline_peels_column_tail(m, n, k):
+    # The columns past the last 512-wide cluster column would add a CU round
+    # to the warp pipeline grid, so 128 x 64 large-M tiles cover them.
+    torch.manual_seed(n + k)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    _cold_kernel(_wmma_tdm_dense_largem_warp_pipeline_kernel)
+    _cold_kernel(_wmma_tdm_dense_largem_kernel)
+    actual = _project(a, b)
+    assert _wmma_tdm_dense_largem_warp_pipeline_kernel.device_caches
+    assert _wmma_tdm_dense_largem_kernel.device_caches
+    expected = (a.float() @ b.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_largem_row_strided_a_matches_torch():
+    # KDA f_b/g_b read their 128-wide input columns out of the fused
+    # q/k/v/beta/f_a/g_a projection rows.
+    m, k, n = 8192, 128, 2048
+    torch.manual_seed(6416)
+    projected = torch.randn(m, 6416, device="cuda", dtype=torch.bfloat16)
+    g_a = projected[:, 6288:]
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    _cold_kernel(_wmma_tdm_dense_largem_warp_pipeline_kernel)
+    actual = _try_gluon_largem_gfx1250(g_a, b)
+    assert actual is not None
+    assert _wmma_tdm_dense_largem_warp_pipeline_kernel.device_caches
+    torch.testing.assert_close(actual, g_a @ b.T, atol=1e-2, rtol=1e-2)
+    # A row stride or offset off 16 bytes stays on torch.
+    assert _try_gluon_largem_gfx1250(projected[:, 6287:6415], b) is None
+    odd = torch.empty(m, k + 4, device="cuda", dtype=torch.bfloat16)[:, :k]
+    assert _try_gluon_largem_gfx1250(odd, b) is None
 
 
 def test_largem_warp_pipeline_fp32_output_row_strided_a():
