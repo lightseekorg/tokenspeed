@@ -337,6 +337,41 @@ def test_acquire_all_reduce_outputs_amd_uses_base_when_iris_is_ineligible(
     backend._iris.acquire_all_reduce_outputs.assert_not_called()
 
 
+@pytest.mark.parametrize("maps_other_nodes", [True, False])
+def test_acquire_all_reduce_outputs_across_nodes_follows_iris_reach(
+    backend, monkeypatch, maps_other_nodes
+):
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+    monkeypatch.setattr(
+        AutoBackend, "_iris_maps_other_nodes", staticmethod(lambda: maps_other_nodes)
+    )
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    # TP8 over two four-GPU nodes.
+    monkeypatch.setitem(
+        global_server_args_dict, "mapping", SimpleNamespace(nprocs_per_node=4)
+    )
+    backend._trtllm_ar.has_trtllm_ar.return_value = False
+    expected = (torch.empty(1, 7168), torch.empty(1, 3584))
+    backend._iris.acquire_all_reduce_outputs.return_value = expected
+    like = torch.empty(1, 3584, dtype=torch.bfloat16)
+    shapes = ((1, 7168), (1, 3584))
+    group = tuple(range(8))
+
+    eligible = backend.can_acquire_all_reduce_outputs(shapes, like, group)
+    result = backend.acquire_all_reduce_outputs(shapes, like, group)
+
+    assert eligible is maps_other_nodes
+    if maps_other_nodes:
+        assert result is expected
+    else:
+        assert tuple(output.shape for output in result) == shapes
+        backend._iris.can_acquire_outputs.assert_not_called()
+        backend._iris.acquire_all_reduce_outputs.assert_not_called()
+
+
 def test_acquire_all_reduce_outputs_non_amd_keeps_existing_delegation(
     backend, monkeypatch
 ):

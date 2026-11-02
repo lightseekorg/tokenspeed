@@ -536,7 +536,7 @@ class AutoBackend(CommBackend):
         if (
             self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or (self._group_spans_nodes(group) and not self._iris_maps_other_nodes())
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return False
@@ -557,7 +557,7 @@ class AutoBackend(CommBackend):
         if (
             self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or (self._group_spans_nodes(group) and not self._iris_maps_other_nodes())
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
