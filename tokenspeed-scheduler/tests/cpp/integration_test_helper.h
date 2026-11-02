@@ -95,7 +95,10 @@ protected:
 
     void Submit(const std::vector<RequestSpec>& specs) { scheduler_->SubmitRequests(specs); }
 
-    ExecutionPlan PlanOnce() { return scheduler_->NextExecutionPlan(Scheduler::PlanOptions{.allow_prefill = true}); }
+    ExecutionPlan PlanOnce() {
+        return scheduler_->NextExecutionPlan(
+            Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+    }
 
     static std::vector<CacheOperation> ExtractCacheOps(const ExecutionPlan& plan) {
         std::vector<CacheOperation> result;

@@ -48,7 +48,7 @@ use ts_control::{
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, SlotMoves},
     event_loop::{
         DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig,
-        LoopError, Ranks, Subsystems,
+        LoopError, PrefillDelay, Ranks, Subsystems,
     },
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
@@ -127,7 +127,12 @@ enum Tiers {
 /// shard, so the Device keeps 512 usable Full blocks (64 on
 /// `HostL2WriteBackForcedRetraction`) and a tier with Host pages 1024, the
 /// counts the tests' numbers rely on.
-fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize) -> Scheduler {
+fn new_scheduler(
+    tiers: Tiers,
+    role: Role,
+    kv_shard_count: usize,
+    device_pages: usize,
+) -> Scheduler {
     interpreter();
     let role = match role {
         Role::Plain => "Fused",
@@ -178,10 +183,10 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
-cfg.num_device_pages = 512 // {kv_shard_count} + 1
+cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
-                                        total_pages=513, attn_kind=ts.AttnKind.Full,
+                                        total_pages={device_pages}, attn_kind=ts.AttnKind.Full,
                                         cache_blocks_per_lcm_block={kv_shard_count},
                                         shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
@@ -1205,6 +1210,10 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// Override the Device pool size for capacity-pressure scenarios.
+    device_pages: Option<usize>,
+    /// Batch prefill in windows, with pressure checks for fresh admissions.
+    prefill_delay: Option<PrefillDelay>,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1273,7 +1282,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
                 computes_prompt_logprobs: pd.is_none_or(|pd| pd.role != Role::Decode),
             },
         },
-        kv_total_pages: 512,
+        kv_total_pages: setup.device_pages.map_or(512, |pages| pages as i64 - 1),
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
         controls: ControlConfig {
@@ -1284,7 +1293,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         batch_log: BatchLogConfig {
             enabled: true,
             decode_log_interval: 40,
-            num_total_pages: 512,
+            num_total_pages: setup.device_pages.map_or(512, |pages| pages as i64 - 1),
             spec_num_steps: 0,
             dp_rank: 0,
             disaggregated: pd.is_some(),
@@ -1296,7 +1305,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         // The fake device fills bitmasks from the committed matcher state,
         // as the eager path does.
         eager_grammar: setup.grammar,
-        prefill_delay: None,
+        prefill_delay: setup.prefill_delay.clone(),
     }
 }
 
@@ -1338,6 +1347,7 @@ fn run_rank<F: Frontend>(
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
     let frontend = frontend();
     let Setup {
+        device_pages,
         pd,
         eplb,
         grammar,
@@ -1382,7 +1392,7 @@ fn run_rank<F: Frontend>(
         _ => 1,
     };
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role, kv_shard_count),
+        new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
         device,
         frontend,
         outputs,
@@ -1813,6 +1823,37 @@ async fn a_long_prompt_is_prefilled_in_chunks() {
     .await;
     // The garbage tokens of the incomplete chunks never reach the client.
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_long_prefill_completes_above_the_watermark() {
+    for layout in [Layout::Single, Layout::Dp(2)] {
+        for depth in [0, 1] {
+            let engine = start_ranks_with(
+                layout,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    device_pages: Some(49),
+                    prefill_delay: Some(PrefillDelay {
+                        attempt_interval: 2,
+                        any_interval: 4,
+                    }),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            // 736 prompt tokens + four output slots reserve 47 of 48 usable
+            // pages on the first 256-token chunk. Later chunks must drain
+            // through the actual local vote and (for DP) group collectives.
+            let chunks = run(&engine.client, request("long", 736, budget(4))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003]);
+            assert_eq!(
+                chunks.last().unwrap().finish_reason.as_deref(),
+                Some("length")
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
