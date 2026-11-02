@@ -38,8 +38,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
+import tokenspeed.runtime.layers.moe.latent as latent
 import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearForCausalLM, KimiLinearMoE
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
@@ -132,29 +134,40 @@ def _mapping(**overrides):
 
 
 @pytest.mark.parametrize(
-    "blackwell,overrides",
+    "blackwell,backend,overrides,allowed",
     [
-        (False, {}),
-        (True, {"dp": 2}),
-        (True, {"pp": 2}),
-        (True, {"attn_tp": 4}),
-        (True, {"moe_tp": 4}),
-        (True, {"ep": 2}),
-        (True, {"shared_group": False}),
+        (True, MoeBackend.FLASHINFER_TRTLLM, {}, True),
+        (True, MoeBackend.AUTO, {}, True),
+        (False, MoeBackend.FLASHINFER_TRTLLM, {}, False),
+        (True, MoeBackend.MARLIN, {}, False),
+        (True, MoeBackend.FLASHINFER_TRTLLM, {"dp": 2}, False),
+        (True, MoeBackend.FLASHINFER_TRTLLM, {"pp": 2}, False),
+        (True, MoeBackend.FLASHINFER_TRTLLM, {"moe_tp": 4}, False),
+        (True, MoeBackend.FLASHINFER_TRTLLM, {"ep": 2}, False),
+        (True, MoeBackend.FLASHINFER_TRTLLM, {"shared_group": False}, False),
     ],
-    ids=["hopper", "attn-dp", "pp", "attn-tp4", "moe-tp4", "ep", "split-groups"],
+    ids=[
+        "trtllm",
+        "auto",
+        "hopper",
+        "marlin",
+        "attn-dp",
+        "pp",
+        "moe-tp-differs",
+        "ep",
+        "split-groups",
+    ],
 )
-def test_only_single_group_tp8_blackwell_binds_the_chain(
-    monkeypatch, blackwell, overrides
+def test_the_plan_allows_the_chain_for_one_shared_tp_group_on_blackwell_trtllm(
+    monkeypatch, blackwell, backend, overrides, allowed
 ):
     monkeypatch.setattr(
-        kimi_k3,
-        "current_platform",
-        lambda: SimpleNamespace(is_blackwell=blackwell),
+        latent, "current_platform", lambda: SimpleNamespace(is_blackwell=blackwell)
     )
-    # Gating precedes any layer access, so a model without layers suffices.
-    model = SimpleNamespace(mapping=_mapping(**overrides), model=None, config=_config())
-    assert KimiLinearForCausalLM._prepare_decode_moe(model) is False
+    monkeypatch.setattr(latent, "native_latent_moe_available", lambda: False)
+    monkeypatch.setattr(latent, "_marlin_moe_available", lambda: False)
+    plan = latent.Kimi3MoEExecutionPlan.build(_mapping(**overrides), backend, None)
+    assert plan.decode_chain is allowed
 
 
 @pytest.mark.parametrize(
@@ -211,7 +224,8 @@ def _decoder(layer_id: int, *, moe: bool):
     block = object.__new__(KimiLinearMoE)
     torch.nn.Module.__init__(block)
     tag = f"layer{layer_id}"
-    block.execution_plan = SimpleNamespace(use_trtllm=True)
+    block.execution_plan = SimpleNamespace(use_trtllm=True, decode_chain=True)
+    block.mapping, block.routed_hidden = _mapping(), 3584
     block.experts = SimpleNamespace(
         plan={"weight_dtype": "mxfp4"},
         w13_weight=f"{tag}.w13",
@@ -246,6 +260,7 @@ class _Weight(str):
 
 def _config(**overrides):
     config = SimpleNamespace(
+        hidden_size=7168,
         hidden_act="situ",
         activation_situ_beta=4.0,
         activation_situ_linear_beta=25.0,
@@ -263,15 +278,13 @@ def _config(**overrides):
 
 def _bindable(monkeypatch, layers, *, multicast=True, pdl=True, **arg_overrides):
     _Owner.built.clear()
-    monkeypatch.setattr(
-        kimi_k3, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
-    )
     monkeypatch.setattr(kimi_k3, "pdl_enabled", lambda: pdl)
     monkeypatch.setattr(kimi_k3, "multicast_backend_available", lambda g: multicast)
-    monkeypatch.setitem(
-        sys.modules,
-        "tokenspeed_kernel.ops.moe._cute_dsl.k3_decode",
-        SimpleNamespace(BATCHES=(*range(1, 9), 16, 32, 64), KimiK3DecodeMoE=_Owner),
+    # The real op module's row counts and envelope; only construction is recorded.
+    monkeypatch.setattr(
+        importlib.import_module("tokenspeed_kernel.ops.moe._cute_dsl.k3_decode"),
+        "KimiK3DecodeMoE",
+        _Owner,
     )
     manager = importlib.import_module(
         "tokenspeed.runtime.distributed.process_group_manager"
@@ -410,3 +423,15 @@ def test_speculative_decoding_hands_the_chain_its_verify_width(monkeypatch):
     # Verify graphs of 1 and 8 requests run 8 and 64 rows.
     assert owner.kwargs["verify_width"] == 8
     assert owner.kwargs["batches"] == (8, 64)
+
+
+def test_a_layer_whose_plan_excludes_the_chain_keeps_every_layer_unbound(
+    monkeypatch,
+):
+    layers = [_decoder(i, moe=True) for i in range(2)]
+    layers[1].block_sparse_moe.execution_plan = SimpleNamespace(
+        use_trtllm=True, decode_chain=False
+    )
+    model = _bindable(monkeypatch, layers)
+    assert KimiLinearForCausalLM._prepare_decode_moe(model) is False
+    assert not _Owner.built

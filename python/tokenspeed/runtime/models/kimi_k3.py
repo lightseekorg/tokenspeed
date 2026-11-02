@@ -3973,57 +3973,59 @@ class KimiLinearForCausalLM(BaseCausalLM):
         return bool(shared_mlps) or prepared
 
     def _prepare_decode_moe(self) -> bool:
-        """Bind the TP8 decode MoE chain to every MoE layer it can serve."""
-        mapping, config, args = self.mapping, self.config, global_server_args_dict
-        if not (
-            current_platform().is_blackwell
-            and mapping.attn.dp_size == 1
-            and mapping.pp_size == 1
-            and mapping.attn.tp_size == 8
-            and mapping.moe.tp_size == 8
-            and mapping.moe.ep_size == 1
-            and mapping.attn.tp_group == mapping.moe.tp_ep_group
-            # A prefill-only role never decodes.
-            and args["disaggregation_mode"] != "prefill"
-            # The chain always launches with PDL and reduces in its own order.
-            and pdl_enabled()
-            and not args["force_deterministic_rsag"]
-            and not args["batch_invariant_collectives"]
-            # The kernels are specialized to this routing and activation.
-            and config.num_experts == 896
-            and config.num_experts_per_token == 16
-            and config.num_expert_group == config.topk_group == 1
-            and config.moe_router_activation_func == "sigmoid"
-            and config.activation_situ_linear_beta is not None
-        ):
-            return False
+        """Bind the decode MoE chain where every MoE layer's execution plan allows it
+        and its kernels serve the layer; other layers keep their plan's path."""
+        config, args = self.config, global_server_args_dict
         layers = [
             layer
             for layer in self.model.layers
             if isinstance(layer, KimiLinearDecoderLayer) and layer.is_moe_layer
         ]
-        # The tail rotates three mailbox parities, which 3k + 1 MoE layers collide on.
+        moes = [layer.block_sparse_moe for layer in layers]
+        # A prefill-only role never decodes. The tail rotates three mailbox
+        # parities, which 3k + 1 MoE layers collide on.
         if (
-            not layers
-            or len(layers) % 3 == 1
+            args["disaggregation_mode"] == "prefill"
+            or not moes
+            or len(moes) % 3 == 1
             or not all(
-                isinstance(moe, KimiLinearMoE)
-                and moe.execution_plan.use_trtllm
-                and moe.experts.plan["weight_dtype"] == "mxfp4"
-                and moe.routed_expert_down_proj.narrowed
-                and moe.routed_expert_up_proj.narrowed
-                and moe.routed_expert_norm is not None
-                and moe.shared_experts.shared_parallel is None
-                and moe.gate.weight.dtype == torch.bfloat16
-                for moe in (layer.block_sparse_moe for layer in layers)
+                isinstance(moe, KimiLinearMoE) and moe.execution_plan.decode_chain
+                for moe in moes
             )
         ):
             return False
         from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
             BATCHES,
             KimiK3DecodeMoE,
+            supports,
         )
 
+        if not all(
+            # The chain reads narrowed latent shards, a routed norm and a local
+            # shared expert.
+            moe.routed_expert_down_proj.narrowed
+            and moe.routed_expert_up_proj.narrowed
+            and moe.routed_expert_norm is not None
+            and moe.shared_experts.shared_parallel is None
+            and supports(
+                tp_size=moe.mapping.moe.tp_size,
+                hidden_size=config.hidden_size,
+                latent_size=moe.routed_hidden,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_token,
+                num_groups=config.num_expert_group,
+                topk_groups=config.topk_group,
+                scoring_func=config.moe_router_activation_func,
+                linear_beta=config.activation_situ_linear_beta,
+                router_dtype=moe.gate.weight.dtype,
+                expert_dtype=moe.experts.plan["weight_dtype"],
+                pdl=pdl_enabled(),
+                batch_invariant=args["force_deterministic_rsag"]
+                or args["batch_invariant_collectives"],
+            )
+            for moe in moes
+        ):
+            return False
         batches = tuple(sorted(_decode_graph_rows() & set(BATCHES)))
         if not batches:
             return False
@@ -4031,7 +4033,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
             process_group_manager as pg_manager,
         )
 
-        group = pg_manager.get_device_process_group(mapping.moe.tp_ep_group)
+        group = pg_manager.get_device_process_group(self.mapping.moe.tp_ep_group)
         if not multicast_backend_available(group):
             return False
         beta, linear_beta = _situ_betas(self.config)

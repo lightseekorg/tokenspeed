@@ -483,10 +483,14 @@ CUDA graph. Every rank must run the same batches, since each mailbox is shared
 by the group. Other row counts and every non-decode forward keep the TRT-LLM
 MoE.
 
-The model binds the chain only where its kernels apply: 896 experts with
-ungrouped sigmoid top-16 routing, a linear SiTU cap, a BF16 router, PDL
-enabled, no deterministic or batch-invariant reduction mode, and not on a
-prefill-only disaggregated node. Under speculative decoding the shared expert
-uses the splits tuned for verify steps. Each MoE layer keeps a contiguous copy
+Three places decide where the chain runs. The Kimi-K3 MoE execution plan
+allows it for one tensor-parallel group shared by attention and MoE on
+Blackwell TRT-LLM. `supports()` here declares what the kernels serve: TP8
+MXFP4 experts behind an ungrouped sigmoid top-16 router over 896 experts, a
+linear SiTU cap, a BF16 router, PDL enabled and no batch-invariant reduction.
+The model then binds it where both hold for every MoE layer, the node decodes
+(not a prefill-only disaggregated role), the group has multicast and the
+decode graphs run a supported row count. Under speculative decoding the
+shared expert uses the splits tuned for verify steps. Each MoE layer keeps a contiguous copy
 of its router rows and latent-down shard (about 7.7 MiB per layer at TP8)
 beside the mailboxes and scratch.
