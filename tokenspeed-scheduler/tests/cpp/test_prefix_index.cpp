@@ -547,6 +547,30 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
     });
 }
 
+TEST(PrefixCacheIndexEvictionOrderTest, OneEpochUsesPhysicalOrderAfterPinFiltering) {
+    BlockPool pool(40, {4});
+    PrefixCacheIndex index(kGroupId);
+    std::vector<CacheBlockRef> blocks;
+    for (int i = 0; i < 160; ++i) {
+        blocks.push_back(pool.AcquireBlock(kGroupId));
+        ASSERT_TRUE(blocks.back());
+    }
+    std::vector<CacheBlockLocation> expected;
+    // Register in reverse physical order and leave every fifth block pinned.
+    for (int i = 159; i >= 0; --i) {
+        index.Register(pool, blocks[i], KeyOf("epoch-" + std::to_string(i)), 42,
+                       /*logical_block_index=*/i, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+        if (i % 5 != 0) {
+            expected.push_back(blocks[i]->Location());
+            blocks[i].reset();
+        }
+    }
+    std::ranges::sort(expected, {}, [](const CacheBlockLocation& location) {
+        return std::tuple{location.lcm_block_id, location.slot_index};
+    });
+    EXPECT_EQ(DrainEvictionOrder(index, pool), expected);
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextEpoch) {
     BlockPool pool(5, {1});
     PrefixCacheIndex index(kGroupId);

@@ -74,6 +74,18 @@ class BuildPyWithRust(build_py):
         release = _cargo_build("tokenspeed-host", extension_module=False)
         (package / "bin").mkdir(exist_ok=True)
         shutil.copy2(release / "ts-host", package / "bin" / "ts-host")
+        # ts-host statically embeds the scheduler's Folly-derived radix sorter.
+        notices = package / "third_party" / "folly"
+        notices.mkdir(parents=True, exist_ok=True)
+        for filename in ("LICENSE", "NOTICE.md"):
+            source = (
+                ROOT.parent
+                / "tokenspeed-scheduler"
+                / "third_party"
+                / "folly"
+                / filename
+            )
+            shutil.copy2(source, notices / filename)
 
 
 class BinaryDistribution(Distribution):

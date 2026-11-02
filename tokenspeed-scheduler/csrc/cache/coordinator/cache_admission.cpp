@@ -20,6 +20,7 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 
+#include "cache/coordinator/admission_order.h"
 #include "cache/coordinator/group_geometry.h"
 #include "cache/coordinator/shadow_occupancy.h"
 
@@ -492,28 +493,11 @@ private:
     // entries then compare request access epoch, followed within one epoch by
     // the tier order below. Position keeps the deeper unproven non-closed
     // boundary, while a closed prefix is reclaimed from its suffix.
-    enum class EvictionTier {
-        kUncached,  // physically allocated, but owned only by the request table
-        kProbationaryBoundary,
-        kEstablishedBoundary,
-        kClosedPrefix,
-    };
-
-    struct VictimCandidate {
-        std::uint32_t group_id;
-        CacheBlockLocation location;
-        std::uint64_t last_access_epoch;
-        EvictionTier eviction_tier;
-        std::int64_t position_rank;
-    };
-
-    static auto evictionKey(const VictimCandidate& candidate) {
-        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier,         candidate.position_rank,
-                          candidate.group_id,          candidate.location.lcm_block_id, candidate.location.slot_index};
-    }
+    using EvictionTier = AdmissionEvictionTier;
+    using VictimCandidate = AdmissionVictimCandidate;
 
     static bool shouldEvictFirst(const VictimCandidate& lhs, const VictimCandidate& rhs) {
-        return evictionKey(lhs) < evictionKey(rhs);
+        return AdmissionEvictionKey(lhs) < AdmissionEvictionKey(rhs);
     }
 
     struct CacheGroupVictimCandidates {
@@ -926,7 +910,7 @@ private:
             group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
         }
         // The entire epoch participates in boundary and position tie-breaks.
-        std::ranges::sort(group.candidates, shouldEvictFirst);
+        SortAdmissionGroupEpoch(group.candidates);
     }
 
     std::optional<VictimCandidate> nextVictimCandidate() {
