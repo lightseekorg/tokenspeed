@@ -3099,29 +3099,107 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruProtectsAParentWithARecentSibling
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("hot-sibling", 0)));
 }
 
-TEST(CacheCoordinatorHostReplacement, GlobalLruPrefersOneChildWhenAccessEpochsTie) {
-    BlockPool device_pool(2, {2, 1});
-    BlockPool host_pool(2, {2, 1});
-    const std::array specs{
-        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
-        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-    };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
-    const std::uint64_t epoch = NextTestAccessEpoch();
-    CacheBoundaryForGroup(coordinator, host_pool, "other-0", 0, epoch, -1);
-    CacheBoundaryForGroup(coordinator, host_pool, "other-1", 0, epoch, -1);
-    const CacheBlockLocation own = CacheBoundaryForGroup(coordinator, host_pool, "own", 1, epoch, -1);
+TEST(CacheCoordinatorHostReplacement, EqualEpochParentsRankByTheirMostProtectedChild) {
+    for (const bool by_boundary : {false, true}) {
+        for (const bool parent_has_prefix : {false, true}) {
+            SCOPED_TRACE(by_boundary);
+            SCOPED_TRACE(parent_has_prefix);
+            BlockPool device_pool(2, {2, 1});
+            BlockPool host_pool(2, {2, 1});
+            const std::array specs{
+                CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+                CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            };
+            CacheCoordinator coordinator =
+                MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                /*snapshot_pool=*/nullptr,
+                                /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+            const std::uint64_t epoch = NextTestAccessEpoch();
+            const CacheBlockLocation other =
+                CacheBoundaryForGroup(coordinator, host_pool, "other-0", 0, epoch, parent_has_prefix ? 0 : 2);
+            CacheBoundaryForGroup(coordinator, host_pool, "other-1", 0, epoch, 3);
+            const CacheBlockLocation own = CacheBoundaryForGroup(coordinator, host_pool, "own", 1, epoch, 1);
+            const std::array<std::uint32_t, 1> group_ids{1};
+            const std::array<std::int32_t, 1> buckets{0};
+            const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
 
-    CacheBlockRef replacement = coordinator.AcquireHostBlock(1, /*bucket=*/0);
+            EXPECT_EQ(coordinator.NumHostBoundariesThatFit(group_ids, buckets, boundaries), 1u);
+            auto batch = by_boundary ? coordinator.AcquireHostBoundaries(group_ids, buckets, boundaries)
+                                     : coordinator.AcquireHostBlocks(group_ids, buckets);
 
-    ASSERT_TRUE(replacement);
-    EXPECT_EQ(replacement->Location(), own);
-    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("own", 1)));
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("other-0", 0)));
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("other-1", 0)));
+            ASSERT_EQ(batch.stats.allocated, 1u);
+            EXPECT_EQ(batch.blocks.front()->Location().lcm_block_id,
+                      parent_has_prefix ? own.lcm_block_id : other.lcm_block_id);
+            EXPECT_EQ(coordinator.ContainsHostCachedBlock(Key("own", 1)), !parent_has_prefix);
+            EXPECT_EQ(coordinator.ContainsHostCachedBlock(Key("other-0", 0)), parent_has_prefix);
+            EXPECT_EQ(coordinator.ContainsHostCachedBlock(Key("other-1", 0)), parent_has_prefix);
+        }
+    }
+}
+
+TEST(CacheCoordinatorHostReplacement, HostAndDeviceEvictEqualEpochPrefixesFromTheSuffix) {
+    for (const bool by_boundary : {false, true}) {
+        SCOPED_TRACE(by_boundary);
+        BlockPool device_pool(3, {1});
+        BlockPool host_pool(3, {1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        const std::uint64_t epoch = NextTestAccessEpoch();
+        for (std::int32_t position = 0; position < 3; ++position) {
+            const std::string hash = "page-" + std::to_string(position);
+            CacheBoundaryForGroup(coordinator, device_pool, hash, 0, epoch, position);
+            CacheBoundaryForGroup(coordinator, host_pool, hash, 0, epoch, position);
+        }
+
+        std::vector<BlockTable> tables(1);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, 2));
+        EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(device_pool, Key("page-0", 0)));
+        EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(device_pool, Key("page-2", 0)));
+
+        const std::array<std::uint32_t, 1> group_ids{0};
+        const std::array<std::int32_t, 1> buckets{0};
+        const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+        auto batch = by_boundary ? coordinator.AcquireHostBoundaries(group_ids, buckets, boundaries)
+                                 : coordinator.AcquireHostBlocks(group_ids, buckets);
+        ASSERT_EQ(batch.stats.allocated, 1u);
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("page-0", 0)));
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("page-2", 0)));
+    }
+}
+
+TEST(CacheCoordinatorHostReplacement, EqualEpochUnprovenCheckpointsLeaveBeforeEstablishedCheckpointsAndPrefixes) {
+    for (const bool by_boundary : {false, true}) {
+        SCOPED_TRACE(by_boundary);
+        BlockPool device_pool(3, {1, 1});
+        BlockPool host_pool(3, {1, 1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        };
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        const std::uint64_t epoch = NextTestAccessEpoch();
+        CacheBoundaryForGroup(coordinator, host_pool, "prefix", 0, epoch, 0);
+        CacheBoundaryForGroup(coordinator, host_pool, "established", 1, epoch, 0, CacheBoundaryKind::kEndpoint);
+        CacheBoundaryForGroup(coordinator, host_pool, "unproven", 1, epoch, 1, CacheBoundaryKind::kChunk);
+        const std::array<std::uint32_t, 1> group_ids{0};
+        const std::array<std::int32_t, 1> buckets{0};
+        const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+
+        auto batch = by_boundary ? coordinator.AcquireHostBoundaries(group_ids, buckets, boundaries)
+                                 : coordinator.AcquireHostBlocks(group_ids, buckets);
+
+        ASSERT_EQ(batch.stats.allocated, 1u);
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("prefix", 0)));
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("established", 1)));
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("unproven", 1)));
+    }
 }
 
 TEST(CacheCoordinatorHostReplacement, GlobalLruSkipsPinnedParentsWithoutFallingBackToSameGroup) {
@@ -3153,7 +3231,7 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruSkipsPinnedParentsWithoutFallingB
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("cold-sibling", 0)));
 }
 
-TEST(CacheCoordinatorHostReplacement, GlobalLruBatchSkipsReboundEntriesAndProtectsNewAllocations) {
+TEST(CacheCoordinatorHostReplacement, JointBatchRestoresVictimsTheAcceptedRowsDoNotNeed) {
     BlockPool device_pool(2, {2, 1});
     BlockPool host_pool(2, {2, 1});
     const std::array specs{
@@ -3173,18 +3251,21 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruBatchSkipsReboundEntriesAndProtec
     CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
 
     ASSERT_TRUE(batch.blocks[0]);
-    EXPECT_EQ(batch.blocks[0]->Location().lcm_block_id, older_parent);
+    EXPECT_EQ(batch.blocks[0]->Location().lcm_block_id, newer_parent);
     ASSERT_TRUE(batch.blocks[1]);
-    EXPECT_EQ(batch.blocks[1]->Location().lcm_block_id, newer_parent);
-    EXPECT_EQ(host_pool.BoundGroup(older_parent), 1u);
-    EXPECT_EQ(host_pool.BoundGroup(newer_parent), 0u);
+    EXPECT_EQ(batch.blocks[1]->Location().lcm_block_id, older_parent);
+    EXPECT_EQ(host_pool.BoundGroup(older_parent), 0u);
+    EXPECT_EQ(host_pool.BoundGroup(newer_parent), 1u);
     EXPECT_FALSE(batch.blocks[2]);
     EXPECT_EQ(batch.stats.allocated, 2u);
     EXPECT_EQ(batch.stats.unallocated, 1u);
-    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 1);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-1", 0)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("newer", 1)));
 }
 
-TEST(CacheCoordinatorHostReplacement, GlobalLruMixesChildAndParentVictimsAcrossBuckets) {
+TEST(CacheCoordinatorHostReplacement, JointBatchReusesCompatibleHolesAcrossGroups) {
     BlockPool device_pool(3, {4, 4});
     BlockPool host_pool(3, {4, 4});
     const std::array specs{
@@ -3218,18 +3299,17 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruMixesChildAndParentVictimsAcrossB
     first_group.clear();
     second_group.clear();
 
-    // Child eviction first, then whole-parent eviction opens holes in both
-    // buckets. Later requests reuse those holes and skip rebound candidates.
+    // Joint planning retains each parent's group and evicts only five entries.
     const std::array<std::uint32_t, 5> groups{0, 1, 1, 0, 0};
     const std::array<std::int32_t, 5> buckets{0, 1, 0, 1, 0};
     CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
 
     ASSERT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
     EXPECT_EQ(batch.blocks[0]->Location(), cold_child);
-    EXPECT_EQ(batch.blocks[1]->Location().lcm_block_id, cold_parent);
-    EXPECT_EQ(batch.blocks[2]->Location().lcm_block_id, cold_parent);
-    EXPECT_EQ(batch.blocks[3]->Location().lcm_block_id, middle_parent);
-    EXPECT_EQ(batch.blocks[4]->Location().lcm_block_id, middle_parent);
+    EXPECT_EQ(batch.blocks[1]->Location().lcm_block_id, middle_parent);
+    EXPECT_EQ(batch.blocks[2]->Location().lcm_block_id, middle_parent);
+    EXPECT_EQ(batch.blocks[3]->Location().lcm_block_id, cold_parent);
+    EXPECT_EQ(batch.blocks[4]->Location().lcm_block_id, cold_parent);
     for (std::size_t i = 0; i < groups.size(); ++i) {
         EXPECT_EQ(host_pool.BoundGroup(batch.blocks[i]->Location().lcm_block_id), groups[i]);
         EXPECT_EQ(coordinator.Allocator(static_cast<std::int32_t>(groups[i])).BucketOf(batch.blocks[i]->Location()),
@@ -3239,12 +3319,13 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruMixesChildAndParentVictimsAcrossB
     for (int i = 1; i < 4; ++i) {
         EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("first-" + std::to_string(i), 0)));
     }
-    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 3);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 7);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 5u);
     EXPECT_EQ(batch.stats.group_scans, 2u);
     EXPECT_EQ(batch.stats.parent_candidates, 3u);
 }
 
-TEST(CacheCoordinatorHostReplacement, GlobalLruRefreshesParentScratchBetweenBatches) {
+TEST(CacheCoordinatorHostReplacement, RepeatedBatchesReadCurrentOccupancy) {
     for (const std::uint32_t first_group : {0u, 1u}) {
         SCOPED_TRACE(first_group);
         BlockPool device_pool(2, {1, 1});
@@ -3312,7 +3393,7 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruComparesOnlyChildrenInTheRequeste
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("other-1", 1)));
 }
 
-TEST(CacheCoordinatorHostReplacement, SingleGroupBatchUsesChildrenWithoutParentCandidates) {
+TEST(CacheCoordinatorHostReplacement, SingleGroupBatchEvictsOnlyTheRequiredChildren) {
     BlockPool device_pool(4, {2});
     BlockPool host_pool(2, {2});
     const std::array specs{CacheGroupSpec{
@@ -3340,7 +3421,7 @@ TEST(CacheCoordinatorHostReplacement, SingleGroupBatchUsesChildrenWithoutParentC
     EXPECT_EQ(batch.stats.allocated, 4u);
     EXPECT_EQ(batch.stats.unallocated, 0u);
     EXPECT_EQ(batch.stats.group_scans, 1u);
-    EXPECT_EQ(batch.stats.parent_candidates, 0u);
+    EXPECT_EQ(batch.stats.parent_candidates, 2u);
     EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 4u);
     EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 0u);
 }
@@ -3366,7 +3447,7 @@ TEST(CacheCoordinatorHostReplacement, BoundedHistoryScanPreservesGlobalLruAndRep
     auto first = coordinator.AcquireHostBlocks(groups, buckets);
     ASSERT_TRUE(first.blocks[0]);
     EXPECT_EQ(first.blocks[0]->Location().lcm_block_id, donor_parent);
-    EXPECT_EQ(first.stats.block_candidates, 3u);
+    EXPECT_EQ(first.stats.block_candidates, 2u);
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("donor-0", 1)));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("donor-1", 1)));
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
@@ -3536,7 +3617,7 @@ TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) 
     EXPECT_EQ(host_pool.BoundGroup(batch.blocks[0]->Location().lcm_block_id), 1u);
     EXPECT_EQ(host_pool.BoundGroup(batch.blocks[2]->Location().lcm_block_id), 0u);
     EXPECT_NE(batch.blocks[0]->Location().lcm_block_id, batch.blocks[2]->Location().lcm_block_id);
-    EXPECT_EQ(batch.stats.group_scans, 2u);
+    EXPECT_EQ(batch.stats.group_scans, 1u);
     EXPECT_EQ(batch.stats.parent_candidates, 2u);
     EXPECT_EQ(batch.stats.allocated, 3u);
     EXPECT_EQ(batch.stats.unallocated, 0u);
@@ -13704,18 +13785,9 @@ TEST(RetractionImageSplitTest, ARefusedImageLeavesTheHostAsItWas) {
     coordinator.Free(tables);
 }
 
-// A Full group of four blocks per parent and a State group. The Host's two
-// parents both hold Full entries: X four unpinned ones, the oldest, and Y one
-// pinned and three unpinned. The image needs a Full block and a State block
-// at its one page. Freeing every unpinned entry would make room for both --
-// the Full block in Y, X emptied for the State block -- but the allocator
-// takes the oldest Full entry, in X, for the Full block, which keeps X, and
-// Y never empties: the State block has no parent. The Host takes no
-// boundary, and keeps every entry: with a snapshot pool for the State
-// group's working slot alone, the split refuses the image on the Host's
-// account; with one that holds both rows as well, the retraction takes the
-// image and evicts nothing for the boundary the Host does not take.
-TEST(RetractionImageSplitTest, AnImageFitsOnlyWhereTheAllocatorWouldPlaceIt) {
+// Plan the Full row in the pinned parent's freeable slot, leaving the other
+// parent available for State; choosing a placement before planning would block it.
+TEST(RetractionImageSplitTest, JointPlanningPlacesTheImageBesidePinnedHistory) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
@@ -13756,21 +13828,19 @@ TEST(RetractionImageSplitTest, AnImageFitsOnlyWhereTheAllocatorWouldPlaceIt) {
         ASSERT_EQ(split.boundaries.size(), 1u);
         EXPECT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 1}))
             << "one boundary: the Full row, then the State row";
-        EXPECT_EQ(split.num_host_boundaries, 0u);
-        if (snapshot_parents == 1) {
-            EXPECT_EQ(split.shortfall, ImageShortfall::kHostL2);
-        } else {
-            ASSERT_FALSE(split.shortfall.has_value());
-            std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
-                "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-                /*num_tokens=*/2, std::move(split));
-            ASSERT_TRUE(stores.has_value());
-            EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kRetraction).snapshot_fallback, 2u);
+        ASSERT_EQ(split.num_host_boundaries, 1u);
+        ASSERT_FALSE(split.shortfall.has_value());
+        const auto stores = transfers.StartRetractionStores(
+            "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+            /*num_tokens=*/2, std::move(split));
+        ASSERT_TRUE(stores.has_value());
+        ASSERT_TRUE(stores->host_store.has_value());
+        EXPECT_EQ(stores->host_store->transfers.size(), 2u);
+        EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kRetraction).snapshot_fallback, 0u);
+        for (std::size_t i = 0; i < cached.size(); ++i) {
+            EXPECT_EQ(coordinator.ContainsHostCachedBlock(Key(cached[i], 0)), i == 4 || i >= 6) << i;
         }
-        for (const std::string& hash : cached) {
-            EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
-        }
-        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 0u);
+        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 5u);
         coordinator.Free(tables);
     }
 }
@@ -13828,15 +13898,9 @@ TEST(RetractionImageSplitTest, ACheckpointVictimFreesItsStateSiblingInThePlan) {
     coordinator.Free(tables);
 }
 
-// A Full group of two blocks per parent and a State group. The Host's
-// parents hold, oldest first, a Full entry c, a State checkpoint w, a second
-// Full entry beside c and a State checkpoint q. The image's two pages need a
-// Full block each and a State block at the second. The first Full block
-// takes c's place, which keeps c's parent from going whole, as in
-// AcquireHostBlocks; the second Full block takes w's parent, whose other
-// slot could hold the first Full block as well, and still the State block
-// takes q, not c's parent: the second Full entry stays.
-TEST(RetractionImageSplitTest, ARowsChildVictimKeepsItsParentFromGoingWhole) {
+// Reconsidering tentative placements lets the older Full parent leave for State
+// while both image pages share the other freed parent. The newer checkpoint stays.
+TEST(RetractionImageSplitTest, JointPlacementPreservesTheNewerCheckpoint) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
@@ -13878,8 +13942,8 @@ TEST(RetractionImageSplitTest, ARowsChildVictimKeepsItsParentFromGoingWhole) {
     ASSERT_TRUE(stores.has_value());
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[0]));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[1]));
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(host_keys[2])) << "the second Full entry is no victim";
-    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[3]));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[2]));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(host_keys[3]));
     coordinator.Free(tables);
 }
 
@@ -14854,22 +14918,9 @@ TEST(ImageSegmentsThenBlocksTest, TheFallbackPlansOnTheHostTheSegmentsLeave) {
     coordinator.Free(tables);
 }
 
-// Where the two steps place fewer boundaries than the per-block plan alone,
-// the per-block plan stands: the image comes before the cache, and the
-// write-back policy places it as write-through does. A Full group of two
-// blocks per parent and two State groups. The Host's five parents hold other
-// prompts' entries, oldest first: Full entries z and x in one parent; x's
-// checkpoint in the second State group, pinned; a Full entry y beside a free
-// slot; a checkpoint w in the first State group; y's checkpoint in that
-// group. The image's four pages need a Full block each, its last page a
-// block of each State group too, and the snapshot pool holds the State
-// groups' working slots alone. Block by block the Host takes all four
-// boundaries, evicting z, x and y for Full blocks and w and y's checkpoint
-// for the State blocks. By segments w alone, a dead entry, makes room for the
-// first three pages; the fallback then finds no parent for the last page's
-// second State block -- z's parent keeps the Full block that takes z's place,
-// y's the free slot the rows need -- and the image would be refused.
-TEST(ImageSegmentsThenBlocksTest, TheBlockByBlockPlanStandsWhereTheStepsPlaceFewer) {
+// Both Host policies fit the complete image while protecting the pinned checkpoint.
+// The segment policy can reclaim its dead checkpoint before the shared block plan.
+TEST(ImageSegmentsThenBlocksTest, BothPoliciesPlaceTheWholeImageWithAPinnedCheckpoint) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
@@ -14927,25 +14978,15 @@ TEST(ImageSegmentsThenBlocksTest, TheBlockByBlockPlanStandsWhereTheStepsPlaceFew
             EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key)) << key.content_hash << " " << key.group_id;
         }
         EXPECT_TRUE(coordinator.ContainsHostCachedBlock(x_checkpoint));
-        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 5u);
+        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, write_back_evictions ? 4u : 5u);
+        EXPECT_EQ(coordinator.HostEvictions().dead_entry.blocks, write_back_evictions ? 1u : 0u);
         coordinator.Free(tables);
     }
 }
 
-// The segment step can place more boundaries than the per-block plan alone.
-// A Full group of two blocks per parent and two State groups, under each Host
-// write policy. The Host's three parents hold other prompts' entries,
-// oldest first: a Full entry x, pinned; a checkpoint v in the first State
-// group; w's checkpoint in that group; w's Full entry, beside x. The image's
-// one page needs a Full block and a block of each State group, and the
-// snapshot pool holds the State groups' working slots alone. Block by block
-// the Full row takes v's parent whole, older than w's Full entry, the first
-// State row w's checkpoint, and the second State row finds no parent left:
-// the image would be refused. By segments v and w, dead checkpoint boundaries
-// (neither has the second State group's checkpoint), go whole, w's Full entry
-// with its checkpoint, and the three rows fit: the Full row in w's slot, each
-// State row in a parent.
-TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesABoundaryTheBlockByBlockPlanCannot) {
+// The pinned Full entry stays; both policies place Full beside it and reserve
+// the two empty parents for the State rows.
+TEST(ImageSegmentsThenBlocksTest, BothPoliciesPlaceABoundaryWithPinnedHistory) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
@@ -14986,12 +15027,6 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesABoundaryTheBlockByBlockPl
 
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
-        if (!write_back_evictions) {
-            EXPECT_EQ(split.num_host_boundaries, 0u);
-            EXPECT_EQ(split.shortfall, ImageShortfall::kHostL2);
-            coordinator.Free(tables);
-            continue;
-        }
         ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 1, 2}));
         ASSERT_EQ(split.num_host_boundaries, 1u);
         ASSERT_FALSE(split.shortfall.has_value());
@@ -15006,23 +15041,15 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesABoundaryTheBlockByBlockPl
             EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key)) << key.content_hash << " " << key.group_id;
         }
         EXPECT_TRUE(coordinator.ContainsHostCachedBlock(x));
-        EXPECT_EQ(coordinator.HostEvictions().dead_entry.blocks, 3u);
-        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 0u);
+        EXPECT_EQ(coordinator.HostEvictions().dead_entry.blocks, write_back_evictions ? 3u : 0u);
+        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, write_back_evictions ? 0u : 3u);
         coordinator.Free(tables);
     }
 }
 
-// The segment step places more boundaries than the per-block plan also where
-// that plan places some. The previous test's groups and Host, and a fourth
-// parent holding a pinned Full entry y beside a free slot; the image's first
-// page needs a Full block, its second a Full block and a block of each State
-// group. Block by block the first page's row takes the free slot beside y,
-// and the second page's rows fall short as the previous test's do: the Full
-// row takes v's parent whole, the first State row w's checkpoint, and the
-// second State row finds no parent left. By segments v and w go whole as
-// before, and both pages fit: the Full rows beside y and in w's slot, each
-// State row in a parent.
-TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesMoreBoundariesThanTheBlockByBlockPlanDoes) {
+// An earlier image page uses an existing hole; the remaining page and its
+// State rows still fit without evicting either pinned Full entry.
+TEST(ImageSegmentsThenBlocksTest, BothPoliciesPlaceMultipleBoundariesWithPinnedHistory) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
@@ -15065,12 +15092,6 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesMoreBoundariesThanTheBlock
 
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/4, coordinator.PublishedDataSlots(tables, 4));
-        if (!write_back_evictions) {
-            EXPECT_EQ(split.num_host_boundaries, 1u);
-            EXPECT_EQ(split.shortfall, ImageShortfall::kHostL2);
-            coordinator.Free(tables);
-            continue;
-        }
         ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 0, 1, 2}));
         ASSERT_EQ(split.num_host_boundaries, 2u);
         ASSERT_FALSE(split.shortfall.has_value());
@@ -15086,8 +15107,8 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesMoreBoundariesThanTheBlock
         }
         EXPECT_TRUE(coordinator.ContainsHostCachedBlock(x));
         EXPECT_TRUE(coordinator.ContainsHostCachedBlock(y));
-        EXPECT_EQ(coordinator.HostEvictions().dead_entry.blocks, 3u);
-        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 0u);
+        EXPECT_EQ(coordinator.HostEvictions().dead_entry.blocks, write_back_evictions ? 3u : 0u);
+        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, write_back_evictions ? 0u : 3u);
         coordinator.Free(tables);
     }
 }
