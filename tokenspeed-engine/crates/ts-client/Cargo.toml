@@ -17,7 +17,7 @@ thiserror.workspace = true
 ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
-zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
+zeromq.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
