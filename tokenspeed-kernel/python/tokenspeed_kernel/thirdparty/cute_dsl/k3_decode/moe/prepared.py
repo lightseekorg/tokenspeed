@@ -27,12 +27,16 @@ class MoEScratch:
             self.front += (empty((cap, 7168)), self.latent)
             self.expanded = empty((cap * 16, 3584))
             self.experts = expert_scratch(tp, self.device)
+            # B>8 (pregrouped, stealing) experts leave workspace state that B<=8
+            # experts misread on their first call: each regime keeps its own.
+            self.small_experts = expert_scratch(tp, self.device)
             # The experts' plan (MXFP8 x), written by the routing kernel at B>8.
             self.plan = self.experts["plan"]
             self.shared = shared_scratch(self.device)  # fused shared-expert counters
         self.views = {}
         for b in batches:
-            self.views[b] = (self.latent[:b], self.expanded[: b * 16], self.experts)
+            experts = self.experts if b > 8 else self.small_experts
+            self.views[b] = (self.latent[:b], self.expanded[: b * 16], experts)
 
 
 # TP8 B16: the experts start beside the split gate/up half (+1% E2E).

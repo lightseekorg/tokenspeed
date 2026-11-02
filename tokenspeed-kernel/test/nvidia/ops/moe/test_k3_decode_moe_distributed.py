@@ -25,6 +25,7 @@ Run on eight GPUs, e.g. two four-GPU nodes:
 """
 
 import os
+import random
 import types
 
 import pytest
@@ -274,13 +275,27 @@ def test_chain_matches_the_reference_eagerly(chain, batch):
     _check_step(weights, x, residual, outputs)
 
 
-def test_chain_replays_cuda_graphs_of_changing_row_counts(chain):
-    """Steps of 64, 1 and 16 rows in mixed order, each a graph replay with fresh
-    inputs: every layer re-arms what it read, and the first one also what the
-    last layer may have published at the largest row count."""
+# Row counts of 40 consecutive steps: every count, crossing the experts' B<=8 /
+# B>8 modes in both directions.
+SEQUENCE = random.Random(7).choices(BATCHES, k=40)
+
+
+def test_chain_follows_changing_row_counts_eagerly(chain):
+    weights, layers, device = chain
+    for step, batch in enumerate(SEQUENCE):
+        x, residual = _inputs(batch, device, 2000 + step)
+        outputs = _step(layers, x, residual)
+        torch.cuda.synchronize()
+        _check_step(weights, x, residual, outputs)
+
+
+def test_chain_follows_changing_row_counts_in_cuda_graphs(chain):
+    """One graph per row count, replayed in the same mixed order with fresh inputs:
+    every layer re-arms what it read, and the first one also what the last layer
+    may have published at the largest row count."""
     weights, layers, device = chain
     graphs = {}
-    for batch in (64, 1, 16):
+    for batch in BATCHES:
         x, residual = _inputs(batch, device, batch)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -292,9 +307,9 @@ def test_chain_replays_cuda_graphs_of_changing_row_counts(chain):
         with torch.cuda.graph(graph):
             outputs = _step(layers, x, residual)
         graphs[batch] = graph, x, residual, outputs
-    for step, batch in enumerate((64, 1, 64, 16, 1, 16)):
+    for step, batch in enumerate(SEQUENCE):
         graph, x, residual, outputs = graphs[batch]
-        fresh_x, fresh_residual = _inputs(batch, device, 1000 + step)
+        fresh_x, fresh_residual = _inputs(batch, device, 3000 + step)
         x.copy_(fresh_x)
         residual.copy_(fresh_residual)
         graph.replay()
