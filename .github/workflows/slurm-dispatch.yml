@@ -80,6 +80,7 @@ on:
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-post-submit.yaml
       runners:
         description: "Logical bulk runners; GB300 maps B200/GB200 labels to matching GB300 runners"
         required: true

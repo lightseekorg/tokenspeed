@@ -22,6 +22,7 @@
 
 Run directly with torchrun; WORLD_SIZE=16 uses all 896 K3 experts.
 Pass --autotune to sweep all tactics before checking eager and graph results.
+Pass --intermediate-size 3072 for the full K3 shape. Pytest uses 192.
 """
 
 from __future__ import annotations
@@ -84,21 +85,21 @@ def _requant(x, scale):
     )
 
 
-def _weights(plan, activation):
+def _weights(plan, activation: str, intermediate: int):
     w = torch.nn.Module()
     w.tp_size = 1
     w.num_experts = LOCAL_EXPERTS * dist.get_world_size()
     w.num_local_experts = LOCAL_EXPERTS
     w.hidden_size = HIDDEN
-    w.intermediate_size = INTERMEDIATE
+    w.intermediate_size = intermediate
     w.top_k = TOP_K
     w.activation_situ_beta = 4.0 if activation == "situ" else None
     w.activation_situ_linear_beta = 25.0 if activation == "situ" else None
     one = torch.ones(1, device="cuda")
     reference = []
     for name, rows, cols, amplitude, global_scale in (
-        ("w13", 2 * INTERMEDIATE, HIDDEN, 0.25, 0.8),
-        ("w2", HIDDEN, INTERMEDIATE, 0.04, 0.6),
+        ("w13", 2 * intermediate, HIDDEN, 0.25, 0.8),
+        ("w2", HIDDEN, intermediate, 0.04, 0.6),
     ):
         raw = (
             torch.randn(LOCAL_EXPERTS * rows, cols, device="cuda") * amplitude
@@ -193,7 +194,7 @@ def _reference(x, ids, weights, reference, capacity, activation):
         w1, scale1 = reference[0]
         w2, scale2 = reference[1]
         gate, up = ((hidden[rows] @ w1[local_expert].T) * (0.75 * scale1)).split(
-            INTERMEDIATE, dim=-1
+            w1.shape[1] // 2, dim=-1
         )
         if activation == "silu":
             activated = torch.nn.functional.silu(gate) * up
@@ -231,7 +232,13 @@ def _check(output, expected, label):
 
 
 def run_correctness(
-    capacity: int, live_tokens: int, tune: bool, activation: str, *, prequantized: bool
+    capacity: int,
+    live_tokens: int,
+    tune: bool,
+    activation: str,
+    intermediate: int,
+    *,
+    prequantized: bool,
 ):
     torch.manual_seed(713 + dist.get_rank())
     plan = moe_plan(
@@ -242,7 +249,7 @@ def run_correctness(
         routing_mode="precomputed_topk",
         a2a_backend="none",
         ep_size=dist.get_world_size(),
-        ispp=INTERMEDIATE,
+        ispp=intermediate,
         fp8_scale_block_shape=None,
         internal_activation_dtype="input",
         with_bias=False,
@@ -258,7 +265,7 @@ def run_correctness(
         combine_order="rank",
         features=frozenset(),
     )
-    w, ref = _weights(plan, activation)
+    w, ref = _weights(plan, activation, intermediate)
     tokens = live_tokens if dist.get_rank() == 0 else max(1, live_tokens - 2)
     x, ids, weights = _inputs(tokens, w.num_experts, prequantized=prequantized)
 
@@ -283,6 +290,21 @@ def run_correctness(
     def run():
         return apply(x)
 
+    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
+
+    external_inputs = x, ids, weights
+    runner = get_runner(plan, w, prequantized=prequantized)
+    if prequantized:
+        values_out, scales_out, ids_out, weights_out = runner.input_buffers(
+            tokens, capacity
+        )
+        values_out.copy_(x[0])
+        scales_out[:tokens].copy_(x[1].view(torch.uint8))
+        ids_out.copy_(ids)
+        weights_out.copy_(weights)
+        x, ids, weights = (values_out, scales_out[:tokens]), ids_out, weights_out
+    # A cold tune must preserve real producer data while it profiles synthetic data.
+    AutoTuner.get().clear_cache()
     expected = _reference(x, ids, weights, ref, capacity, activation)
     cached_profiles = set(AutoTuner.get().profiling_cache)
     print(f"rank={dist.get_rank()} launching eager", flush=True)
@@ -303,36 +325,9 @@ def run_correctness(
         output = run()
     torch.cuda.synchronize()
     _check(output, expected, "eager")
-    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
-
-    runner = get_runner(plan, w, prequantized=prequantized)
-    if prequantized:
-        staged_x, staged_sf, staged_ids, staged_weights = runner.input_buffers(
-            x[0].shape[0], capacity
-        )
-        staged_x.copy_(x[0])
-        staged_sf[: x[0].shape[0]].copy_(x[1].view(torch.uint8))
-        staged_ids.copy_(ids)
-        staged_weights.copy_(weights)
-        _check(
-            runner.run(
-                (staged_x, staged_sf),
-                staged_ids,
-                staged_weights,
-                (
-                    w.w13_weight,
-                    w.w13_weight_scale,
-                    w.w2_weight,
-                    w.w2_weight_scale,
-                    w.mega_fc1_alpha,
-                    w.mega_fc2_alpha,
-                    w.mega_fc1_norm,
-                ),
-                capacity,
-            ),
-            _reference(x, ids, weights, ref, capacity, activation),
-            "direct producer input buffers",
-        )
+    # Later capacity changes overwrite producer views. Keep each graph's
+    # source inputs independent so every replay stages its own data again.
+    x, ids, weights = external_inputs
     if not prequantized and not tune:
         torch.testing.assert_close(output, apply(_quantized(x)), atol=0, rtol=0)
     if tune:
@@ -401,7 +396,9 @@ def run_correctness(
         arena.output.data_ptr(),
     )
     maximum = get_autotune_max_num_tokens()
-    capacity = capacity // 2 if capacity == maximum else min(maximum, capacity * 2)
+    # Alternate single-token and wider buckets on one arena. On SM100/SM103 EP16,
+    # this also tests the single-token tactic with the full K3 shape.
+    capacity = 1 if capacity > 1 else min(maximum, 2)
     tokens = min(capacity, live_tokens + 1)
     tokens = tokens if dist.get_rank() == 0 else max(1, tokens - 2)
     x, ids, weights = _inputs(tokens, w.num_experts, prequantized=prequantized)
@@ -412,8 +409,15 @@ def run_correctness(
         other_output = run()
     second_graph = (other_graph, other_output, expected, x, ids, weights)
     outputs = []
-    # Replay different capacities back-to-back on the same arena, without host resets.
-    for saved in (first_graph, second_graph, first_graph, second_graph):
+    # Use an odd replay count to exercise the persistent grid-barrier phase.
+    # A delayed rank must not let another rank reuse live workspace state.
+    for replay in range(17):
+        if (
+            dist.get_world_size() > 1
+            and dist.get_rank() == replay % dist.get_world_size()
+        ):
+            torch.cuda._sleep(100000)
+        saved = (first_graph, second_graph)[replay % 2]
         saved[0].replay()
         outputs.append((saved[1].clone(), saved[2]))
     torch.cuda.synchronize()
@@ -442,7 +446,7 @@ def test_nvfp4_megamoe(tune, activation, prequantized, monkeypatch):
         monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
     else:
         monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
-    if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("requires SM100/SM103")
     with tempfile.TemporaryDirectory() as tmp:
         dist.init_process_group(
@@ -458,23 +462,103 @@ def test_nvfp4_megamoe(tune, activation, prequantized, monkeypatch):
                 MegaMoERunner,
             )
 
-            # Cover both tile widths and schedulers; torchrun uses the full sweep.
+            # Cover all tile widths and both schedulers; torchrun uses the full sweep.
             with patch.object(
                 MegaMoERunner,
                 "TACTICS",
                 (
+                    (64, 512, "static", "epi_warps", 1),
                     (128, 512, "static", "epi_warps", 1),
                     (256, 1024, "atomic_counter", "epi_warps", 8),
                 ),
             ):
                 set_autotune_process_group(dist.group.WORLD)
-                run_correctness(4, 4, tune, activation, prequantized=prequantized)
+                run_correctness(
+                    4, 4, tune, activation, INTERMEDIATE, prequantized=prequantized
+                )
                 if not tune and activation == "silu":
                     # Larger live batches, then idle ranks and alternating
                     # graphs that retain the full-capacity arena.
                     run_correctness(
-                        512, 300, False, activation, prequantized=prequantized
+                        512,
+                        300,
+                        False,
+                        activation,
+                        INTERMEDIATE,
+                        prequantized=prequantized,
                     )
+
+                import cuda.bindings.driver as cuda
+                import cutlass.cute as cute
+                import cutlass.torch as cutlass_torch
+                from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.token_comm import (
+                    CombineFormat,
+                )
+                from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.topk_reduce import (
+                    TopkReduce,
+                )
+
+                terms = torch.randn(3, TOP_K, HIDDEN, device="cuda").bfloat16()
+                expected = terms[:, 0].float()
+                for k in range(1, TOP_K):
+                    expected.add_(terms[:, k].float())
+                # Every worker width must store its whole slice for both
+                # output widths the reducer can be asked for.
+                for hidden_per_thread in (2, 8):
+                    for out_dtype in (torch.bfloat16, torch.float32):
+                        output = torch.empty(3, HIDDEN, device="cuda", dtype=out_dtype)
+                        reducer = TopkReduce(
+                            HIDDEN,
+                            TOP_K,
+                            CombineFormat.parse("bf16"),
+                            bf16_hidden_per_thread=hidden_per_thread,
+                        )
+                        inputs = dict(
+                            combine_quant=cutlass_torch.from_dlpack(
+                                terms, assumed_align=16
+                            ),
+                            combine_sf=None,
+                            reduced_output=cutlass_torch.from_dlpack(
+                                output, assumed_align=16
+                            ),
+                            topk_score=None,
+                            stream=cuda.CUstream(
+                                torch.cuda.current_stream().cuda_stream
+                            ),
+                        )
+                        cute.compile(reducer, **inputs)(**inputs)
+                        torch.testing.assert_close(
+                            output, expected.to(out_dtype), atol=0, rtol=0
+                        )
+                # mxfp8 reducer: small integers are exact in e4m3, and a unit
+                # e8m0 scale (byte 127) keeps the sum exact.
+                codes = torch.randint(-4, 5, (3, TOP_K, HIDDEN), device="cuda")
+                expected = codes.sum(dim=1).float()
+                combine_quant = codes.to(torch.float8_e4m3fn)
+                combine_sf = torch.full(
+                    (3, TOP_K, HIDDEN // 32), 127, device="cuda", dtype=torch.uint8
+                ).view(torch.float8_e8m0fnu)
+                # The runner always reduces into bf16 (see MegaMoERunner.output).
+                output = torch.empty(3, HIDDEN, device="cuda", dtype=torch.bfloat16)
+                reducer = TopkReduce(
+                    HIDDEN,
+                    TOP_K,
+                    CombineFormat.parse("32e4m3xe8m0"),
+                    bf16_hidden_per_thread=8,
+                )
+                inputs = dict(
+                    combine_quant=cutlass_torch.from_dlpack(
+                        combine_quant, assumed_align=16
+                    ),
+                    combine_sf=cutlass_torch.from_dlpack(combine_sf, assumed_align=16),
+                    reduced_output=cutlass_torch.from_dlpack(output, assumed_align=16),
+                    topk_score=None,
+                    stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+                )
+                cute.compile(reducer, **inputs)(**inputs)
+                torch.testing.assert_close(
+                    output, expected.to(torch.bfloat16), atol=0, rtol=0
+                )
         finally:
             set_autotune_process_group(None)
             dist.destroy_process_group()
@@ -492,6 +576,7 @@ if __name__ == "__main__":
         parser.add_argument("--autotune", action="store_true")
         parser.add_argument("--activation", choices=("situ", "silu"), required=True)
         parser.add_argument("--input-format", choices=("bf16", "nvfp4"), required=True)
+        parser.add_argument("--intermediate-size", type=int, required=True)
         args = parser.parse_args()
         os.environ["MEGAMOE_TACTIC_AUTOTUNE"] = "1" if args.autotune else "0"
         set_autotune_max_num_tokens(args.capacity)
@@ -501,6 +586,7 @@ if __name__ == "__main__":
             args.tokens,
             args.autotune,
             args.activation,
+            args.intermediate_size,
             prequantized=args.input_format == "nvfp4",
         )
     finally:

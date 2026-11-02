@@ -91,6 +91,7 @@ class _RouterCase(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * 2
         leaf.kernel_page_size = 2
         leaf.device = "cpu"
+        leaf.tree_verify = None
         router = CacheGroupRouter(
             None,
             is_draft=False,

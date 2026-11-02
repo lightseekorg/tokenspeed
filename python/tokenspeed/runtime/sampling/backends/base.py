@@ -92,6 +92,10 @@ class SamplingBackendConfig:
     # start / graph capture time so the fast path has zero extra compute.
     # Enabling any of these enlarges the captured graph footprint.
     enable_output_logprobs: bool = False
+    # Consumed by the common Engine sampling boundary. Backends keep their
+    # existing token and logprob computation and need no diagnostic hooks;
+    # they only declare _SUPPORTS_OUTPUT_CUMULATIVE_PROBS.
+    enable_output_cumulative_probs: bool = False
 
     # Recorded draft probabilities above this are the "no proposal yet"
     # sentinel; only read under enable_speculative_sampling.
@@ -135,6 +139,7 @@ class SamplingBackendConfig:
             logprob_order=server_args.logprob_order,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
+            enable_output_cumulative_probs=server_args.enable_output_cumulative_probs,
             # Trees verify against their draft q tables, not recorded draft probs.
             enable_speculative_sampling=(
                 server_args.enable_speculative_sampling
@@ -179,6 +184,12 @@ class SamplingBackend(ABC):
     _HAS_POOL_STATE: bool = False
     _SUPPORTS_DP_VERIFY: bool = False
     _SUPPORTS_SYNTHETIC_ACCEPTANCE: bool = False
+    # The common diagnostic boundary (sampling/diagnostics.py) needs sample()
+    # and verify() to return one token per score row, in output order, and to
+    # write next_token_logprobs aligned with them on every route. A backend
+    # declares that it does; the engine refuses the diagnostic at startup
+    # otherwise, rather than at the first live step that breaks it.
+    _SUPPORTS_OUTPUT_CUMULATIVE_PROBS: bool = False
 
     constant_slot_state: tuple[str, ...] = ()
     # Recomputed from the current frontier before every consumer; no restore.
@@ -187,6 +198,15 @@ class SamplingBackend(ABC):
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         self.config = config
+        if (
+            config.enable_output_cumulative_probs
+            and not self._SUPPORTS_OUTPUT_CUMULATIVE_PROBS
+        ):
+            raise ValueError(
+                f"{type(self).__name__} does not declare aligned output logprobs "
+                "(_SUPPORTS_OUTPUT_CUMULATIVE_PROBS), which "
+                "--enable-output-cumulative-probs requires"
+            )
 
         self._synthetic_generator: torch.Generator | None = None
         self._synthetic_lengths: torch.Tensor | None = None

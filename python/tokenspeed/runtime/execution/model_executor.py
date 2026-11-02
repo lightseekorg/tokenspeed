@@ -122,11 +122,15 @@ from tokenspeed.runtime.layers.paged_attention import (
     check_block_drafter_storage,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+from tokenspeed.runtime.sampling.diagnostics import sample_with_diagnostics
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
     setup_dp_sampling,
 )
-from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+from tokenspeed.runtime.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+    request_vocab_mask,
+)
 from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
@@ -157,10 +161,10 @@ def _sampling_info_for_requests(
     """Select original request parameters and their token-indexed masks."""
     info = sampling_info[requests]
     if mask_width is not None and sampling_info.vocab_mask is not None:
-        mask = sampling_info.vocab_mask[
-            requests.start * mask_width : requests.stop * mask_width
-        ]
-        info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
+        mask = request_vocab_mask(
+            sampling_info.vocab_mask, requests, mask_width=mask_width, prefill=prefill
+        )
+        info.vocab_mask = mask.contiguous() if prefill else mask
     return info
 
 
@@ -1516,12 +1520,26 @@ class ModelExecutor:
         ends it: an accepted width is cut at the request's stop token or
         token limit before anything reads it (the state commit, the accepted
         frontier, the drafter, the reported tokens)."""
-        output_tokens, accept_lengths = self._sample_and_verify(
-            logits_output, sampling_info, ctx, candidates
+        drafter = self.drafter
+        output_tokens, accept_lengths = sample_with_diagnostics(
+            logits_output,
+            sampling_info,
+            ctx.output_layout,
+            lambda: self._sample_and_verify(
+                logits_output, sampling_info, ctx, candidates
+            ),
+            enabled=self.sampling_backend.config.enable_output_cumulative_probs,
+            # The drafter rewrites its verify outputs before anything reads
+            # them, the diagnostic included; the stop conditions below cut
+            # what the drafter has the round commit.
+            finalize=(
+                None
+                if drafter is None
+                else lambda tokens, lengths: drafter.rewrite_verify_outputs(
+                    ctx, tokens, lengths
+                )
+            ),
         )
-        if self.drafter is not None:
-            # The stop conditions cut what the drafter has the round commit.
-            self.drafter.rewrite_verify_outputs(ctx, output_tokens, accept_lengths)
         ib = self.input_buffers
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
@@ -1818,11 +1836,11 @@ class ModelExecutor:
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
 
-        output_logprobs = logits_output.next_token_logprobs
         return (
             output_tokens,
             accept_lengths,
-            output_logprobs,
+            logits_output.next_token_logprobs,
+            logits_output.next_token_cumulative_probs,
             ForwardLogprobs.of(logits_output),
         )
 
@@ -2404,6 +2422,7 @@ class ModelExecutor:
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
+                output_cumulative_probs = None
                 if input_logprob_plan is not None:
                     raise RuntimeError(
                         "prompt logprobs planned for a forward without input rows"
@@ -2550,6 +2569,7 @@ class ModelExecutor:
                         output_tokens,
                         output_lengths,
                         output_logprobs,
+                        output_cumulative_probs,
                         forward_logprobs,
                     ) = self.forward_step(
                         bs=bs,
@@ -2649,6 +2669,10 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                if output_cumulative_probs is not None:
+                    output_cumulative_probs = output_cumulative_probs.to(
+                        "cpu", non_blocking=True
+                    )
                 if forward_logprobs is not None:
                     forward_logprobs = forward_logprobs.to_host()
                 else:
@@ -2703,6 +2727,7 @@ class ModelExecutor:
             input_top_logprobs_idx=forward_logprobs.input_top_logprobs_idx,
             output_top_logprobs_val=forward_logprobs.output_top_logprobs_val,
             output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
+            output_token_cumulative_probs=output_cumulative_probs,
         )
 
     def _input_logprob_rows(
