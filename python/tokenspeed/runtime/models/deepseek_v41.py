@@ -887,6 +887,8 @@ class DeepseekV41Attention(nn.Module):
         self.mapping = mapping
         self.head_dim = config.head_dim
         self.n_local_heads = config.num_attention_heads // mapping.attn.tp_size
+        # FlashMLA decode takes 64 or 128 query heads.
+        self.n_kernel_heads = 64 if self.n_local_heads <= 64 else 128
         self.n_local_groups = config.o_groups // mapping.attn.tp_size
         self.o_lora_rank = config.o_lora_rank
         self.compress_ratio = config.compress_ratios[layer_id]
@@ -970,14 +972,15 @@ class DeepseekV41Attention(nn.Module):
             self._padded_attn_sink[: self.n_local_heads].copy_(param)
 
     def _kernel_attn_sink(self):
-        padded = 64 if self.n_local_heads <= 64 else 128
-        if not self.attn_sink.is_cuda or padded == self.n_local_heads:
+        if not self.attn_sink.is_cuda or self.n_kernel_heads == self.n_local_heads:
             return self.attn_sink
         if self._padded_attn_sink is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up attention sink before graph capture")
             self._padded_attn_sink = F.pad(
-                self.attn_sink, (0, padded - self.n_local_heads), value=-float("inf")
+                self.attn_sink,
+                (0, self.n_kernel_heads - self.n_local_heads),
+                value=-float("inf"),
             )
         return self._padded_attn_sink
 
@@ -1192,7 +1195,12 @@ class DeepseekV41Attention(nn.Module):
                 output_dtype=qr.dtype if q_scale is not None else None,
             )
             q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-            if q.is_cuda and mode.is_decode() and self.head_dim == 512:
+            if (
+                q.is_cuda
+                and mode.is_decode()
+                and self.head_dim == 512
+                and self.n_local_heads != self.n_kernel_heads
+            ):
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
             else:
                 q = self.rotary_emb.apply_owned(q, positions, False)
