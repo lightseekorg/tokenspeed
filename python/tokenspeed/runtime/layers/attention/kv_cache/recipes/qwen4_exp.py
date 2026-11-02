@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import replace
 from fractions import Fraction
 from functools import cached_property
@@ -30,6 +31,7 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -42,9 +44,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    pipeline_cache_ownership,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_name,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
     QwenGDNRecipe,
@@ -55,6 +61,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
+
+
+def _own_planes(
+    spec: CacheGroupSpec, fields: tuple[CacheFieldSpec, ...]
+) -> tuple[CacheFieldSpec, ...]:
+    """Move a side group's fields from the decoder planes onto planes of its own."""
+    return tuple(
+        replace(field, plane_id=f"{spec.group_id}.{field.plane_id}") for field in fields
+    )
 
 
 class Qwen4ExpRecipe(QwenGDNRecipe):
@@ -314,7 +329,18 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             if spec.group_id == FULL_ATTENTION
             for field in fields
         }
-        shared_extras = []
+        # A parent belongs to one cache group at a time, so a side group can
+        # use a whole plane, and every plane holds at least its largest decoder
+        # field. A recurrent state is many FP8 K pages wide.
+        plane_capacity: dict[str, int] = {}
+        for _, fields in decoder_groups:
+            for field in fields:
+                plane_capacity[field.plane_id] = max(
+                    plane_capacity.get(field.plane_id, 0), field.payload_bytes
+                )
+        groups = list(decoder_groups)
+        # Indices in groups of shared side groups wider than a K page somewhere.
+        wider_than_k_page = []
         for spec, fields in extras:
             plane_bytes: dict[str, int] = {}
             for field in sorted(fields, key=lambda field: field.field_id):
@@ -336,16 +362,65 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                     compatible = len(ratios) == 1
                 else:
                     compatible = all(
-                        size <= attention_plane_bytes[plane]
+                        size <= plane_capacity[plane]
                         for plane, size in plane_bytes.items()
                     )
-            if not compatible:
-                fields = tuple(
-                    replace(field, plane_id=f"{spec.group_id}.{field.plane_id}")
-                    for field in fields
+                    if compatible and any(
+                        size > attention_plane_bytes[plane]
+                        for plane, size in plane_bytes.items()
+                    ):
+                        wider_than_k_page.append(len(groups))
+            groups.append((spec, fields if compatible else _own_planes(spec, fields)))
+        # A pipeline stage allocates every plane its layers' fields touch,
+        # whole (CacheMemoryPlan.narrow_to_layers), so a side field on a plane
+        # its stage does not otherwise hold costs that stage the whole plane,
+        # which can exceed the plane of its own that sharing saves. A group
+        # that fits one K page per plane keeps the layout it always had; a
+        # wider one shares only if no stage of this engine then holds more
+        # bytes. Without PP, the one stage holds every plane anyway.
+        for index in wider_than_k_page:
+            spec, fields = groups[index]
+            separate = groups.copy()
+            separate[index] = (spec, _own_planes(spec, fields))
+            if any(
+                shared > own
+                for shared, own in zip(
+                    self._stage_bytes(groups), self._stage_bytes(separate), strict=True
                 )
-            shared_extras.append((spec, fields))
-        return decoder_groups + tuple(shared_extras)
+            ):
+                groups = separate
+        return tuple(groups)
+
+    @cached_property
+    def _stage_cache_windows(self) -> tuple[tuple[int, int], ...]:
+        """Each pipeline stage's resident cache layers, as the runtime assigns them.
+
+        The last stage also holds the draft layers. Every rank derives the same
+        windows, so all ranks plan one layout.
+        """
+        num_target_layers = len(self.layer_types) - self.num_draft_layers
+        owners = pipeline_cache_ownership(
+            num_target_layers,
+            self.num_draft_layers,
+            pp_target_cache_windows(
+                self.server_args.mapping, self.model_config, num_target_layers
+            ),
+        )
+        return tuple(owner.resident_cache_window for owner in owners)
+
+    def _stage_bytes(self, groups: Sequence[CacheGroupDeclaration]) -> list[int]:
+        """Bytes per parent that each pipeline stage of this engine holds."""
+        parent = pack(
+            groups,
+            prefix_granularity=self.prefix_granularity,
+            cache_blocks_per_lcm_block=self.packing(groups),
+            alignment=self.alignment,
+            max_padding_fraction=self.max_padding_fraction,
+        ).bind(1)
+        return [
+            parent.narrow_to_layers(*window).resident_block_bytes
+            for window in self._stage_cache_windows
+        ]
 
     @override
     def _verify_workspace_field_suffixes(self) -> tuple[str, ...]:

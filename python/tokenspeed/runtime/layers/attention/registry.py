@@ -1362,35 +1362,14 @@ def create_attn_components(
     )
     num_draft_cache_layers = recipe.num_draft_layers
     num_target_cache_layers = len(recipe.layer_types) - num_draft_cache_layers
-    if server_args.mapping.has_pp:
-        from tokenspeed.runtime.distributed.pp_stage import (
-            pp_stage_cache_windows,
-            pp_stage_windows,
-        )
+    from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
 
-        # Stage windows partition execution blocks; cache ownership speaks
-        # cache-layer IDs, one per attention instance. A model's profile says
-        # how many instances each block owns (LongCat's paired layout: two);
-        # the in-tree PP targets K3 and V4 declare no profile and own one.
-        # Cache ownership itself does not partition execution blocks.
-        profile = model_config.model_profile
-        target_cache_windows = pp_stage_cache_windows(
-            pp_stage_windows(
-                model_config.num_hidden_layers,
-                server_args.mapping.pp_size,
-                server_args.mapping.pp_layer_partition,
-            ),
-            cache_layers_per_execution_layer=(
-                profile.attention_instances_per_layer if profile is not None else 1
-            ),
-            num_target_cache_layers=num_target_cache_layers,
-        )
-    else:
-        target_cache_windows = [(0, num_target_cache_layers)]
     owners = pipeline_cache_ownership(
         num_target_cache_layers,
         num_draft_cache_layers,
-        target_cache_windows,
+        pp_target_cache_windows(
+            server_args.mapping, model_config, num_target_cache_layers
+        ),
     )
     layer_ownership = owners[server_args.mapping.pp_rank]
     from tokenspeed.runtime.distributed.process_group_manager import (

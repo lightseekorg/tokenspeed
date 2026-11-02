@@ -32,10 +32,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING
 
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.model_config import ModelConfig
 
 
 def pp_stage_windows(
@@ -140,6 +144,42 @@ def pp_stage_cache_windows(
             f"not cover the {num_target_cache_layers} target cache layers"
         )
     return windows
+
+
+def pp_target_cache_windows(
+    mapping: Mapping, model_config: ModelConfig, num_target_cache_layers: int
+) -> list[tuple[int, int]]:
+    """All stages' target cache-layer windows; one complete window without PP.
+
+    Stage windows partition execution blocks; cache ownership speaks
+    cache-layer IDs, one per attention instance. A model's profile says how
+    many instances each block owns (LongCat's paired layout: two); the in-tree
+    PP targets K3 and V4 declare no profile and own one. Without PP the window
+    covers the complete cache namespace, with no per-block arithmetic.
+
+    Args:
+        mapping: The engine's parallel mapping (``pp_size``, partition).
+        model_config: The target model config (``num_hidden_layers``,
+            ``model_profile``), read only under PP.
+        num_target_cache_layers: Cache layers the target recipe declared.
+
+    Returns:
+        One ``[start, end)`` target cache-layer window per stage, in order.
+    """
+    if not mapping.has_pp:
+        return [(0, num_target_cache_layers)]
+    profile = model_config.model_profile
+    return pp_stage_cache_windows(
+        pp_stage_windows(
+            model_config.num_hidden_layers,
+            mapping.pp_size,
+            mapping.pp_layer_partition,
+        ),
+        cache_layers_per_execution_layer=(
+            profile.attention_instances_per_layer if profile is not None else 1
+        ),
+        num_target_cache_layers=num_target_cache_layers,
+    )
 
 
 def pp_layer_window(num_hidden_layers: int, mapping: Mapping) -> tuple[int, int]:
