@@ -229,12 +229,14 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         return tuple(compressed_fields), tuple(recent_fields)
 
     @cached_property
+    @override
     def qsa_bf16_scratch_plan(self) -> QSABf16ScratchPlan | None:
         """The QSA BF16 prefill scratch this engine reserves, or None.
 
         ``--enable-qsa-prefill-bf16-scratch`` reserves it for the target's
-        QSA layers over an FP8 cache. The decode role, whose prompts arrive by
-        transfer, runs no prefill and reserves nothing.
+        QSA layers over an FP8 cache, sized by the prefill chunk. The decode
+        role, whose prompts arrive by transfer, runs no prefill and reserves
+        nothing.
         """
         server_args = self.server_args
         if (
@@ -244,6 +246,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             return None
         # Imported here: the QSA package imports the attention backends.
         from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+            MIN_ROWS,
             plan_qsa_bf16_scratch,
         )
 
@@ -256,11 +259,17 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             raise ValueError(
                 "--enable-qsa-prefill-bf16-scratch needs --kv-cache-dtype fp8_e4m3"
             )
-        spec = config.component(SoftmaxAttnConfig)
         chunk = int(server_args.chunked_prefill_size)
+        if chunk <= 0:
+            # The scratch holds the rows of one prefill chunk.
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch needs chunked prefill: set "
+                f"--chunked-prefill-size to at least {MIN_ROWS}"
+            )
+        spec = config.component(SoftmaxAttnConfig)
         return plan_qsa_bf16_scratch(
             context_len=config.context_len,
-            max_rows=chunk if chunk > 0 else int(server_args.max_prefill_tokens),
+            max_rows=chunk,
             # The full-attention group's block span, which its leaf runs at.
             page_size=config.kernel_page_size or self.prefix_granularity,
             kv_heads=max(spec.num_kv_heads // spec.attn_tp_size, 1),

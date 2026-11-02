@@ -3521,15 +3521,20 @@ class ServerArgs:
             action="store_true",
             dest="enable_qsa_prefill_bf16_scratch",
             default=ServerArgs.enable_qsa_prefill_bf16_scratch,
-            help="QSA sparse-attention models with an FP8 E4M3 KV cache "
-            "(SM100 to SM107): a target prefill call of at least 2048 rows "
-            "copies the FP8 KV pages it can read into a BF16 scratch and runs "
-            "the CuTe kernel's BF16 path there; smaller calls, decode and "
-            "drafts keep the FP8 path, and the cache stays FP8. The scratch "
+            help="QSA sparse-attention models (Qwen4-Exp) with --kv-cache-dtype "
+            "fp8_e4m3 on SM100 to SM107: a target prefill call of at least "
+            "2048 rows copies the FP8 KV pages it can read into a BF16 scratch "
+            "and attends there with the CuTe kernel's BF16 path instead of the "
+            "FP8 prefill kernel. Smaller and mixed calls, calls whose context "
+            "exceeds the scratch or 128 cache tokens per row, decode, verify "
+            "and drafts keep the FP8 path; the cache stays FP8. The scratch "
             "holds one maximum-length context plus one --chunked-prefill-size "
             "chunk, with that chunk's remapped slots and attention output, and "
             "is reserved from the KV cache budget before the pool is sized. "
-            "The decode role, which runs no prefill, ignores it.",
+            "Startup fails for a model without QSA layers, another KV cache "
+            "dtype (mxfp8 included), chunked prefill below 2048 tokens or "
+            "disabled, or a GPU without the CuTe QSA kernel. The decode role, "
+            "which runs no prefill, reserves no scratch.",
         )
         parser.add_argument(
             "--sampling-backend",

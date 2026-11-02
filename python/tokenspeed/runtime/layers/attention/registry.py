@@ -68,9 +68,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
     cache_field_placement,
     pipeline_cache_ownership,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
-    Qwen4ExpRecipe,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
@@ -1407,16 +1404,9 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
         probe_batch_rows=probe_batch_rows,
     )
-    if isinstance(recipe, Qwen4ExpRecipe):
-        # Reserved from the budget by the recipe, allocated below.
-        qsa_bf16_scratch = recipe.qsa_bf16_scratch_plan
-    elif server_args.enable_qsa_prefill_bf16_scratch:
-        raise ValueError(
-            "--enable-qsa-prefill-bf16-scratch serves QSA sparse-attention "
-            f"models; this model's cache family is {cache_family!r}"
-        )
-    else:
-        qsa_bf16_scratch = None
+    # Reserved from the budget by the recipe, allocated below; a family
+    # without QSA layers refuses --enable-qsa-prefill-bf16-scratch here.
+    qsa_bf16_scratch = recipe.qsa_bf16_scratch_plan
     num_draft_cache_layers = recipe.num_draft_layers
     num_target_cache_layers = len(recipe.layer_types) - num_draft_cache_layers
     from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows

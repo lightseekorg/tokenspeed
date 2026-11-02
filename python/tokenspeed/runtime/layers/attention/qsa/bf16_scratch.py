@@ -23,11 +23,12 @@
 With ``--enable-qsa-prefill-bf16-scratch``, a large target prefill/extend call
 of a QSA sparse-attention layer over an FP8 E4M3 cache copies every cache page
 its requests' contexts span into a BF16 scratch, rewrites its selected slots to
-the scratch (``qsa_bf16_kv_scratch``) and runs the CuTe kernel's BF16 path
-there instead of its FP8 path. The conversion is exact and the FP8 path reads
-the cache at unit scale, so attention sees the same K/V values; the BF16
-path's asynchronous copy ring replaces the FP8 path's synchronous gather and
-in-register conversion. The cache itself stays FP8.
+the scratch (``qsa_bf16_kv_scratch``) and attends there with the direct-slot
+CuTe kernel's BF16 path, one query row at a time, instead of the FP8 prefill
+kernel ``qsa_sparse_attention`` selects (FlashInfer FA2 on NVIDIA; the CuTe
+kernel's FP8 path serves decode only). The conversion is exact and the FP8
+path reads the cache at unit scale, so both kernels read the same K/V values
+and differ only in rounding. The cache itself stays FP8.
 
 A call keeps the FP8 path unless it is a pure extend of the target with
 ``MIN_ROWS`` to ``max_rows`` query rows whose context fits the scratch and
@@ -40,7 +41,8 @@ KV cache budget before the pool is sized, and the target's QSA leaf allocates
 exactly that plan at startup. Serving takes views of it only: BF16 K and V of
 ``capacity_pages`` pages, and the remapped slots and attention output of
 ``max_rows`` rows. The page map from cache pages to scratch pages lives in the
-output buffer: a call's copy writes every entry its remap reads, and the
+output buffer: a call's copy writes every entry its remap reads (the device
+``seq_lens`` it copies by match the host lengths it was sized from), and the
 attention writes the output after the remap has read them.
 """
 
@@ -304,10 +306,11 @@ class QSABf16PrefillScratch:
             scale: Softmax scale.
 
         Returns:
-            A view of the scratch output holding the attention, or None. Under
-            startup warm-up a call that qualifies runs this path, compiling
-            its kernels, and still returns None, so the FP8 path that serves
-            the other calls warms on it too.
+            A view of the scratch output holding the attention, or None. The
+            next call (the next QSA layer) overwrites the view, so it must be
+            consumed first. Under startup warm-up a call that qualifies runs
+            this path, compiling its kernels, and still returns None, so the
+            FP8 path that serves the other calls warms on it too.
         """
         plan = self.plan
         rows = q.shape[0]

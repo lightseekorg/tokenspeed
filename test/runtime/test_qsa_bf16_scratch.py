@@ -26,6 +26,7 @@ import importlib.util
 import os
 import sys
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
     Qwen4ExpRecipe,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import QwenGDNRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.qsa import bf16_scratch
 from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
@@ -69,7 +71,7 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, suite="runtime-1gpu")
+register_cuda_ci(est_time=150, suite="runtime-1gpu")
 
 FP8 = torch.float8_e4m3fn
 CONTEXT_LEN = 4096
@@ -80,6 +82,19 @@ _GROUPS = {
     QWEN4_EXP_QSA_CACHE_GROUP: PAGE,
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP: 64,
 }
+
+
+def _cute_qsa_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    spec = KernelRegistry.get().get_by_name("cute_dsl_blackwell_qsa_sparse_attention")
+    return spec is not None and spec.capability.satisfied_by(current_platform())
+
+
+requires_cute_qsa = pytest.mark.skipif(
+    not _cute_qsa_available(),
+    reason="requires the CuTe DSL QSA kernel (SM100 to SM107)",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +154,24 @@ def test_plan_rejects_geometry_the_scratch_cannot_serve(overrides, message):
         plan_qsa_bf16_scratch(**kwargs)
 
 
-def _recipe(*, enabled, role="null", kv_cache_dtype=FP8, chunk=2048, budget=512 << 20):
-    """A real Qwen4-Exp recipe: two QSA full-attention layers, 24/2 heads."""
+def _recipe(
+    *,
+    enabled,
+    role="null",
+    speculative=False,
+    kv_cache_dtype=FP8,
+    chunk=2048,
+    indexer_heads=1,
+    budget=512 << 20,
+    recipe_class=Qwen4ExpRecipe,
+):
+    """A real cache recipe: two QSA full-attention layers with 24/2 heads and,
+    with ``speculative``, one QSA draft layer verifying three tokens."""
     layer_types = (FULL_ATTENTION, FULL_ATTENTION)
+    width = 3 if speculative else 1
     text_config = SimpleNamespace(
         ple_layer_ids=(),
-        indexer_n_heads=1,
+        indexer_n_heads=indexer_heads,
         indexer_head_dim=8,
         indexer_compress_ratio=4,
     )
@@ -167,18 +194,27 @@ def _recipe(*, enabled, role="null", kv_cache_dtype=FP8, chunk=2048, budget=512 
         context_len=CONTEXT_LEN,
         max_bs=2,
         pd_disaggregation_enabled=role != "null",
-        speculative_num_steps=0,
-        speculative_num_draft_tokens=1,
+        speculative_num_steps=2 if speculative else 0,
+        speculative_num_draft_tokens=width,
         is_draft=False,
         draft_block_decode=False,
         components=(spec,),
     )
-    return Qwen4ExpRecipe(
+    draft_config = (
+        replace(
+            config,
+            is_draft=True,
+            components=(replace(spec, cache_layer_types=(FULL_ATTENTION,)),),
+        )
+        if speculative
+        else None
+    )
+    return recipe_class(
         server_args=SimpleNamespace(
             kv_offload_config=None,
             block_size=64,
             max_total_tokens=None,
-            speculative_num_draft_tokens=1,
+            speculative_num_draft_tokens=width,
             speculative_eagle_topk=1,
             speculative_draft_tree=False,
             enable_replay_ssm=False,
@@ -186,7 +222,6 @@ def _recipe(*, enabled, role="null", kv_cache_dtype=FP8, chunk=2048, budget=512 
             disaggregation_mode=role,
             enable_qsa_prefill_bf16_scratch=enabled,
             chunked_prefill_size=chunk,
-            max_prefill_tokens=8192,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config),
@@ -194,8 +229,12 @@ def _recipe(*, enabled, role="null", kv_cache_dtype=FP8, chunk=2048, budget=512 
             num_attention_layers=len(layer_types),
         ),
         attn_config=config,
-        draft_model_config=None,
-        draft_attn_config=None,
+        draft_model_config=(
+            SimpleNamespace(num_attention_layers=1, hf_text_config=text_config)
+            if speculative
+            else None
+        ),
+        draft_attn_config=draft_config,
         cache_budget_bytes=budget,
         probe_batch_rows=None,
         decode_input_tokens=1,
@@ -203,9 +242,28 @@ def _recipe(*, enabled, role="null", kv_cache_dtype=FP8, chunk=2048, budget=512 
     )
 
 
-def test_recipe_reserves_the_scratch_before_sizing_the_pool():
+@pytest.mark.parametrize(
+    "role,speculative",
+    [
+        ("null", False),
+        # Speculative decoding adds the QSA verify staging to the workspace.
+        ("null", True),
+        # The PD prefill role stages no verify, with or without a draft.
+        ("prefill", False),
+        ("prefill", True),
+    ],
+)
+def test_recipe_reserves_the_scratch_before_sizing_the_pool(role, speculative):
     budget = 512 << 20
-    plan = _recipe(enabled=True).qsa_bf16_scratch_plan
+
+    def setup(*, enabled, budget):
+        return _recipe(
+            enabled=enabled, role=role, speculative=speculative, budget=budget
+        ).setup()
+
+    plan = _recipe(
+        enabled=True, role=role, speculative=speculative
+    ).qsa_bf16_scratch_plan
     assert plan == plan_qsa_bf16_scratch(
         context_len=CONTEXT_LEN,
         max_rows=2048,
@@ -214,13 +272,15 @@ def test_recipe_reserves_the_scratch_before_sizing_the_pool():
         head_dim=256,
         q_heads=24,
     )
-    with_scratch = _recipe(enabled=True, budget=budget).setup()
-    without = _recipe(enabled=False, budget=budget).setup()
-    # The scratch is the whole fixed workspace of this engine, and the pool
-    # is sized as if the budget were that much smaller.
-    assert with_scratch.fixed_workspace_bytes == plan.nbytes
-    assert without.fixed_workspace_bytes == 0
-    smaller_budget = _recipe(enabled=False, budget=budget - plan.nbytes).setup()
+    with_scratch = setup(enabled=True, budget=budget)
+    without = setup(enabled=False, budget=budget)
+    assert (without.fixed_workspace_bytes > 0) == (speculative and role == "null")
+    # The scratch joins the engine's other fixed workspaces, and the pool is
+    # sized as if the budget were that much smaller.
+    assert with_scratch.fixed_workspace_bytes == (
+        without.fixed_workspace_bytes + plan.nbytes
+    )
+    smaller_budget = setup(enabled=False, budget=budget - plan.nbytes)
     plan_with = with_scratch.spec.memory_plan
     assert plan_with.num_lcm_blocks == smaller_budget.spec.memory_plan.num_lcm_blocks
     assert plan_with.num_lcm_blocks < without.spec.memory_plan.num_lcm_blocks
@@ -238,11 +298,24 @@ def test_recipe_reserves_nothing_on_the_decode_role_or_when_off():
     [
         ({"kv_cache_dtype": torch.bfloat16}, "fp8_e4m3"),
         ({"chunk": 1024}, "chunked-prefill-size"),
+        ({"chunk": -1}, "needs chunked prefill"),
+        # A Qwen4-Exp checkpoint without an indexer has no QSA layers.
+        ({"indexer_heads": None}, "needs a model with QSA layers"),
     ],
 )
 def test_recipe_rejects_a_scratch_that_cannot_serve(overrides, message):
     with pytest.raises(ValueError, match=message):
         _recipe(enabled=True, **overrides).workspace_bytes()
+
+
+def test_families_without_qsa_layers_refuse_the_scratch():
+    # Startup reads the plan of every family's recipe; a Qwen3.5 GDN model
+    # has no QSA layers.
+    with pytest.raises(ValueError, match="serves QSA sparse-attention models"):
+        _recipe(enabled=True, recipe_class=QwenGDNRecipe).qsa_bf16_scratch_plan
+    assert (
+        _recipe(enabled=False, recipe_class=QwenGDNRecipe).qsa_bf16_scratch_plan is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +439,10 @@ def _plan(*, max_rows=4096, context_len=CONTEXT_LEN):
     )
 
 
-def _root(config):
-    """Composite backend over a real QSA router; the pool is a stand-in."""
+def _root(config, backend_name="qsa"):
+    """Composite backend over a real router; the pool is a stand-in."""
     router = attention_registry.create_paged_router(
-        config, AttentionArch.MHA, backend_name="qsa"
+        config, AttentionArch.MHA, backend_name=backend_name
     )
     pool = SimpleNamespace(
         field_layer_range=range(2),
@@ -486,10 +559,41 @@ def test_leaf_refuses_a_plan_it_cannot_serve(kernels, config, plan_page, message
         root.preallocate_qsa_bf16_scratch(plan)
 
 
-class _Forward:
-    """One extend round through the real router and the QSA leaf."""
+def test_full_attention_without_a_qsa_leaf_refuses_the_scratch(kernels):
+    # Serving the QSA layers through another backend leaves no leaf to own it.
+    root, router = _root(_config(), backend_name="mha")
+    assert router.leaves and not any(
+        isinstance(leaf, qsa_leaf.QSAAttnBackend) for leaf in router.leaves.values()
+    )
+    with pytest.raises(RuntimeError, match="needs one QSA attention leaf, found 0"):
+        root.preallocate_qsa_bf16_scratch(_plan())
 
-    def __init__(self, router, requests, *, pool_pages=96, seed=0, decode=False):
+
+@pytest.mark.skipif(
+    _cute_qsa_available(), reason="this platform has the CuTe DSL QSA kernel"
+)
+def test_a_platform_without_the_cute_kernel_refuses_the_scratch():
+    with pytest.raises(ValueError, match="needs the CuTe DSL QSA sparse-attention"):
+        QSABf16PrefillScratch(_plan(), device="cpu")
+
+
+class _Forward:
+    """One forward through the real router and the QSA leaf.
+
+    ``requests`` are ``(cached prefix, new tokens)``; a MIXED forward's
+    ``num_extends`` leading requests extend and the others decode one token.
+    """
+
+    def __init__(
+        self,
+        router,
+        requests,
+        *,
+        pool_pages=96,
+        seed=0,
+        mode=ForwardMode.EXTEND,
+        num_extends=None,
+    ):
         generator = torch.Generator().manual_seed(seed)
         self.router = router
         self.leaf = router.leaves[FULL_ATTENTION]
@@ -507,36 +611,39 @@ class _Forward:
             blocks[row, :width] = torch.tensor([free.pop() for _ in range(width)])
         self.seq_lens = torch.tensor(lengths, dtype=torch.int32)
         new_tokens = torch.tensor([new for _, new in requests], dtype=torch.int32)
-        if decode:
+        if mode.is_decode():
             router.refresh_decode_metadata(
                 bs,
                 bs,
                 torch.arange(1, bs + 1, dtype=torch.int32),
                 self.seq_lens,
-                forward_mode=ForwardMode.DECODE,
+                forward_mode=mode,
                 block_tables={group: blocks for group in _GROUPS},
                 num_extends=0,
                 for_graph_replay=False,
             )
         else:
+            # Only extend requests have host lengths.
+            extends = bs if mode.is_extend() else num_extends
+            prefix_lens = self.seq_lens - new_tokens
             router.init_forward_metadata(
                 bs,
-                bs,
+                extends,
                 torch.arange(1, bs + 1, dtype=torch.int32),
                 self.seq_lens,
-                ForwardMode.EXTEND,
+                mode,
                 block_tables={group: blocks for group in _GROUPS},
-                extend_seq_lens=new_tokens,
-                extend_seq_lens_cpu=new_tokens,
-                extend_prefix_lens=self.seq_lens - new_tokens,
-                extend_prefix_lens_cpu=self.seq_lens - new_tokens,
-                extend_replay_lens_cpu=torch.zeros_like(self.seq_lens),
-                extend_prompt_lens_cpu=self.seq_lens,
+                extend_seq_lens=new_tokens[:extends],
+                extend_seq_lens_cpu=new_tokens[:extends],
+                extend_prefix_lens=prefix_lens[:extends],
+                extend_prefix_lens_cpu=prefix_lens[:extends],
+                extend_replay_lens_cpu=torch.zeros(extends, dtype=torch.int32),
+                extend_prompt_lens_cpu=self.seq_lens[:extends],
                 extend_with_prefix=True,
                 query_shard=None,
                 block_tables_cpu={},
             )
-        self.mode = ForwardMode.DECODE if decode else ForwardMode.EXTEND
+        self.mode = mode
         table = router.group_view(FULL_ATTENTION, bs).page_table
         positions = torch.cat(
             [torch.arange(prefix, prefix + new) for prefix, new in requests]
@@ -706,23 +813,23 @@ def test_long_contexts_for_few_rows_keep_the_fp8_path(kernels):
 
 
 @pytest.mark.parametrize(
-    "requests,decode",
+    "requests,mode",
     [
         # Fewer rows than MIN_ROWS.
-        ([(2000, MIN_ROWS - 1)], False),
+        ([(2000, MIN_ROWS - 1)], ForwardMode.EXTEND),
         # More rows than the plan's chunk.
-        ([(0, 4096), (0, 1)], False),
+        ([(0, 4096), (0, 1)], ForwardMode.EXTEND),
         # Decode keeps the FP8 path.
-        ([(3000, 1)] * 4, True),
+        ([(3000, 1)] * 4, ForwardMode.DECODE),
     ],
 )
-def test_other_calls_keep_the_fp8_path(kernels, requests, decode):
+def test_other_calls_keep_the_fp8_path(kernels, requests, mode):
     root, router = _root(_config())
     root.preallocate_qsa_bf16_scratch(_plan())
-    forward = _Forward(router, requests, seed=3, decode=decode)
+    forward = _Forward(router, requests, seed=3, mode=mode)
     output = forward.run(root)
     assert kernels.copy.count == 0 and kernels.fp8_path.count == 1
-    if not decode:
+    if not mode.is_decode():
         assert torch.equal(output, forward.fp8_reference())
 
 
@@ -745,35 +852,22 @@ def test_contexts_at_and_past_the_capacity(kernels):
     assert torch.equal(output, forward.fp8_reference())
 
 
-def test_mixed_batches_have_no_host_lengths(kernels):
+def test_mixed_batches_keep_the_fp8_path(kernels):
     root, router = _root(_config())
-    leaf = router.leaves[FULL_ATTENTION]
     root.preallocate_qsa_bf16_scratch(_plan())
-    seq_lens = torch.tensor([2600, 900], dtype=torch.int32)
-    new = torch.tensor([2500], dtype=torch.int32)
-    router.init_forward_metadata(
-        2,
-        1,
-        torch.tensor([1, 2], dtype=torch.int32),
-        seq_lens,
-        ForwardMode.MIXED,
-        block_tables={
-            group: torch.tensor([[1] * 11, [12] * 11], dtype=torch.int32)
-            for group in _GROUPS
-        },
-        extend_seq_lens=new,
-        extend_seq_lens_cpu=new,
-        extend_prefix_lens=seq_lens[:1] - new,
-        extend_prefix_lens_cpu=seq_lens[:1] - new,
-        extend_replay_lens_cpu=torch.zeros(1, dtype=torch.int32),
-        extend_prompt_lens_cpu=seq_lens[:1],
-        extend_with_prefix=True,
-        query_shard=None,
-        block_tables_cpu={},
+    # The prefill's 2500 rows would qualify alone, but the decode request in
+    # the same forward has no host lengths to size a copy by.
+    mixed = _Forward(
+        router, [(100, 2500), (900, 1)], seed=6, mode=ForwardMode.MIXED, num_extends=1
     )
-    assert leaf._extend_lengths is None
-    _Forward(router, [(100, 2500), (0, 600)], seed=6)
-    assert leaf._extend_lengths == QSAExtendLengths(seq_lens=(2600, 600), rows=3100)
+    output = mixed.run(root)
+    assert kernels.copy.count == 0 and kernels.fp8_path.count == 1
+    assert torch.equal(output, mixed.fp8_reference())
+    # The next pure extend sizes its copy by its own lengths again.
+    forward = _Forward(router, [(100, 2500), (0, 600)], seed=7)
+    output = forward.run(root)
+    assert kernels.copy.count == 1 and kernels.fp8_path.count == 1
+    assert torch.equal(output, forward.fp8_reference())
 
 
 def test_warmup_runs_both_paths_on_one_call(kernels):
@@ -788,21 +882,9 @@ def test_warmup_runs_both_paths_on_one_call(kernels):
 
 
 # ---------------------------------------------------------------------------
-# GPU: the scratch against the BF16 kernel over the dequantized cache
+# GPU: the scratch against the FP8 prefill path it replaces and the BF16
+# kernel over the dequantized cache
 # ---------------------------------------------------------------------------
-
-
-def _cute_qsa_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    spec = KernelRegistry.get().get_by_name("cute_dsl_blackwell_qsa_sparse_attention")
-    return spec is not None and spec.capability.satisfied_by(current_platform())
-
-
-requires_cute_qsa = pytest.mark.skipif(
-    not _cute_qsa_available(),
-    reason="requires the CuTe DSL QSA kernel (SM100 to SM107)",
-)
 
 
 def _kernel_test_utils():
@@ -820,19 +902,29 @@ def _kernel_test_utils():
 
 
 class _GpuCall:
-    """A prefill call over an FP8 cache with real QSA selections."""
+    """A prefill call over an FP8 cache with real QSA selections.
 
-    def __init__(self, requests, *, page_size, pool_pages, seed):
+    ``heads`` are the query and KV heads per rank; request 1 starts with
+    request 0's first ``shared`` pages, as after a prefix-cache hit.
+    """
+
+    def __init__(
+        self, requests, *, page_size, pool_pages, seed, heads=(24, 2), shared=0
+    ):
         from tokenspeed_kernel.ops.attention.qsa.triton import (
             qwen4_exp_qsa_selected_slots,
         )
 
         device = "cuda"
+        q_heads, kv_heads = heads
+        self.page_size = page_size
         generator = torch.Generator(device=device).manual_seed(seed)
         lengths = [prefix + new for prefix, new in requests]
         widths = [-(-length // page_size) for length in lengths]
         values = torch.rand(
-            (2, pool_pages * page_size, 2, 256), generator=generator, device=device
+            (2, pool_pages * page_size, kv_heads, 256),
+            generator=generator,
+            device=device,
         )
         self.k, self.v = (values * 8 - 4).to(FP8).unbind(0)
         free = torch.randperm(pool_pages - 1, generator=generator, device=device) + 1
@@ -841,8 +933,11 @@ class _GpuCall:
         )
         start = 0
         for row, width in enumerate(widths):
-            table[row, :width] = free[start : start + width].to(torch.int32)
-            start += width
+            share = min(shared, width, widths[0]) if row == 1 else 0
+            table[row, :share] = table[0, :share]
+            fresh = width - share
+            table[row, share:width] = free[start : start + fresh].to(torch.int32)
+            start += fresh
         self.table = table
         self.seq_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
         positions = torch.cat(
@@ -852,6 +947,11 @@ class _GpuCall:
             torch.arange(len(requests), dtype=torch.int32, device=device),
             torch.tensor([n for _, n in requests], device=device),
         )
+        self.positions, self.owners = positions, owners
+        offsets = [0]
+        for _, new in requests:
+            offsets.append(offsets[-1] + new)
+        self.offsets = tuple(offsets)
         complete = ((positions + 1) // 4).to(torch.int32)
         scores = torch.rand(
             (positions.numel(), int(complete.max()) + 1),
@@ -868,6 +968,7 @@ class _GpuCall:
         selected_blocks[:, :top] = torch.where(
             chosen.values >= 0, chosen.indices, -1
         ).to(torch.int32)
+        self.selected_blocks = selected_blocks
         self.selected = qwen4_exp_qsa_selected_slots(
             selected_blocks,
             complete,
@@ -879,10 +980,14 @@ class _GpuCall:
             2048,
             enable_pdl=False,
         )
-        self.selected[0, 9] = 0
-        self.selected[-1, 11] = -12345
+        # Every non-positive flavour of padding, where the selection pads, so
+        # the slots still match their logical blocks.
+        for row, value in ((0, 0), (-1, -12345)):
+            padded = (self.selected[row] == -1).nonzero()
+            if padded.numel():
+                self.selected[row, int(padded[0, 0])] = value
         self.q = torch.randn(
-            (positions.numel(), 24, 256), generator=generator, device=device
+            (positions.numel(), q_heads, 256), generator=generator, device=device
         ).to(torch.bfloat16)
         self.lengths = QSAExtendLengths(
             seq_lens=tuple(lengths), rows=sum(n for _, n in requests)
@@ -898,6 +1003,40 @@ class _GpuCall:
             seq_lens=self.seq_lens,
             lengths=self.lengths,
             scale=0.0625,
+        )
+
+    def fp8_prefill(self):
+        """The call through the FP8 prefill path the scratch replaces, as the
+        QSA leaf makes it: ragged rows, logical metadata, unit scales."""
+        from tokenspeed_kernel.ops.attention.qsa import (
+            QSASparseMetadata,
+            QSAWorkspace,
+            qsa_sparse_attention,
+        )
+
+        return qsa_sparse_attention(
+            self.q,
+            self.k,
+            self.v,
+            self.selected,
+            scale=0.0625,
+            max_seqlen_q=None,
+            metadata_capacity_rows=None,
+            k_scale=1.0,
+            v_scale=1.0,
+            override=None,
+            solution=None,
+            sparse_metadata=QSASparseMetadata(
+                selected_blocks=self.selected_blocks,
+                block_table=self.table,
+                token_to_request=self.owners,
+                query_positions=self.positions,
+                query_start_loc=self.offsets,
+                page_size=self.page_size,
+                block_size=4,
+                workspace=QSAWorkspace(),
+                seq_lens=self.seq_lens,
+            ),
         )
 
     def bf16_reference(self):
@@ -918,34 +1057,68 @@ class _GpuCall:
         )
 
 
-def _gpu_plan():
+def _gpu_plan(heads=(24, 2)):
     # 1 + ceil((8192 + 4096) / 64) + 64 = 257 pages of 64 tokens.
+    q_heads, kv_heads = heads
     return plan_qsa_bf16_scratch(
         context_len=8192,
         max_rows=4096,
         page_size=64,
-        kv_heads=2,
+        kv_heads=kv_heads,
         head_dim=256,
-        q_heads=24,
+        q_heads=q_heads,
     )
+
+
+# Several requests per chunk, rows at request starts, positions below 2048 and
+# a long prefix.
+_SEVERAL_REQUESTS = [(0, 700), (3000, 900), (17, 500), (1200, 300)]
+# Query and KV heads per rank at attention TP 1, 2 and 4: each runs its own
+# CuTe kernel configuration.
+_HEADS = [(24, 2), (12, 1), (6, 1)]
+
+
+@requires_cute_qsa
+@pytest.mark.parametrize("heads", _HEADS)
+def test_scratch_matches_the_fp8_prefill_path(heads):
+    scratch = QSABf16PrefillScratch(_gpu_plan(heads), device="cuda")
+    call = _GpuCall(
+        _SEVERAL_REQUESTS, page_size=64, pool_pages=320, seed=11, heads=heads
+    )
+    output = call.scratch(scratch)
+    assert output is not None
+    # The scratch replaces this path for the call; both kernels read the same
+    # K/V values and differ only in rounding.
+    torch.testing.assert_close(output, call.fp8_prefill(), atol=1e-2, rtol=1e-2)
 
 
 @requires_cute_qsa
 @pytest.mark.parametrize(
-    "requests",
+    "requests,heads,shared",
     [
-        # Several requests per chunk, rows at request starts, positions
-        # below 2048 and a long prefix.
-        [(0, 700), (3000, 900), (17, 500), (1200, 300)],
+        *((_SEVERAL_REQUESTS, heads, 0) for heads in _HEADS),
         # One request whose rows all sit below 2048 (mostly padding).
-        [(0, 2048)],
+        ([(0, 2048)], (24, 2), 0),
         # Exactly at the capacity: 256 context pages plus page 0.
-        [(4096 - 512, 512)] * 4,
+        ([(4096 - 512, 512)] * 4, (24, 2), 0),
+        # Two requests share their first 20 pages: the copy writes each of
+        # them twice, and either copy may serve the slots.
+        ([(3000, 900), (1500, 1300)], (24, 2), 20),
+        ([(3000, 900), (1500, 1300)], (6, 1), 20),
     ],
 )
-def test_scratch_matches_the_bf16_kernel_on_the_dequantized_cache(requests):
-    scratch = QSABf16PrefillScratch(_gpu_plan(), device="cuda")
-    call = _GpuCall(requests, page_size=64, pool_pages=320, seed=len(requests))
+def test_scratch_matches_the_bf16_kernel_on_the_dequantized_cache(
+    requests, heads, shared
+):
+    scratch = QSABf16PrefillScratch(_gpu_plan(heads), device="cuda")
+    call = _GpuCall(
+        requests,
+        page_size=64,
+        pool_pages=320,
+        seed=len(requests),
+        heads=heads,
+        shared=shared,
+    )
     output = call.scratch(scratch)
     assert output is not None
     assert torch.equal(output, call.bf16_reference())
