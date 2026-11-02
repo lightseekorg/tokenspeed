@@ -540,7 +540,7 @@ and routes directly into views of this full-capacity symmetric allocation.
 ## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
 
 On Blackwell with one TP8 group shared by attention and MoE, a decode forward
-(speculative verify included) of 1-8, 16, 32 or 64 token rows that a captured
+(speculative verify included) of 1-8, 16, 32, or 64 token rows that a captured
 decode graph runs takes every MoE layer through one chain of vendored CuTe DSL
 kernels (`thirdparty/cute_dsl/k3_decode`).
 The kernels hand rows to each other through Lamport mailboxes in multicast
