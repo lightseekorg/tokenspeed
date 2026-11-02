@@ -189,8 +189,8 @@ class KimiK3DecodeMoE:
 
         Args:
             ordinal: The layer's position among the MoE layers, from zero.
-            layer_idx: The decoder layer's model index (selects the front
-                mailbox parity).
+            layer_idx: The decoder layer's model index; it keys the chain's
+                next-attention prefetch, which this integration does not set.
             router: [896, 7168] BF16 router weight (every expert).
             correction_bias: [896] FP32 routing bias.
             routed_scaling_factor: Scale of the routed expert weights.
