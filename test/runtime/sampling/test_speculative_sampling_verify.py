@@ -40,13 +40,13 @@ from tokenspeed.runtime.sampling.backends import flashinfer_full as ff
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 POOL, VOCAB, MAX_BS, N = 6, 16, 4, 3
 
 
 def _config(enable: bool) -> SamplingBackendConfig:
     return SamplingBackendConfig(
-        enable_block_rejection=False,
         synthetic_acceptance_length=None,
         enable_speculative_sampling=enable,
         sampling_stream="batch",
@@ -155,12 +155,10 @@ def test_verify_gathers_recorded_rows_and_selects_the_draft_prob_rule(
     assert seen["use_draft_prob"] is False and seen["draft_probs"] is None
 
 
-def _block_synthetic_config(al: float | None) -> SamplingBackendConfig:
-    return replace(
-        _config(enable=True),
-        enable_block_rejection=True,
-        synthetic_acceptance_length=al,
-    )
+def _block_synthetic_config(monkeypatch, al: float | None) -> SamplingBackendConfig:
+    # Block verification is read from the server args, like ``numerics``.
+    monkeypatch.setitem(global_server_args_dict, "enable_block_rejection", True)
+    return replace(_config(enable=True), synthetic_acceptance_length=al)
 
 
 def _block_kernel_must_not_run(**kwargs):
@@ -174,7 +172,7 @@ def test_block_rejection_synthetic_runs_the_draft_prob_rule_then_forces_lengths(
     seen: dict = {}
     _fake_kernels(monkeypatch, fi, seen)
     monkeypatch.setattr(fi, "block_speculative_sampling", _block_kernel_must_not_run)
-    backend = fi.FlashInferSamplingBackend(_block_synthetic_config(al))
+    backend = fi.FlashInferSamplingBackend(_block_synthetic_config(monkeypatch, al))
 
     torch.manual_seed(0)
     recorded = _recorded_draft_probs()
@@ -212,11 +210,11 @@ def test_block_rejection_synthetic_runs_the_draft_prob_rule_then_forces_lengths(
         assert observed == allowed
 
 
-def test_flashinfer_refuses_synthetic_acceptance_without_block_rejection():
+def test_flashinfer_refuses_synthetic_acceptance_without_block_rejection(monkeypatch):
     config = replace(_config(enable=True), synthetic_acceptance_length=2.0)
     with pytest.raises(ValueError, match="requires block rejection"):
         fi.FlashInferSamplingBackend(config)
-    fi.FlashInferSamplingBackend(_block_synthetic_config(2.0))
+    fi.FlashInferSamplingBackend(_block_synthetic_config(monkeypatch, 2.0))
 
 
 def test_verify_refuses_draft_probs_on_a_backend_built_without_the_flag(monkeypatch):

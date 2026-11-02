@@ -52,7 +52,6 @@ class _BufferBackend(SamplingBackend):
 
 def _config(al, bs, width, device):
     return SamplingBackendConfig(
-        enable_block_rejection=False,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -71,7 +70,6 @@ def test_config_requires_explicit_synthetic_acceptance():
         SamplingBackendConfig()
     for length in (None, 2.6):
         config = SamplingBackendConfig(
-            enable_block_rejection=False,
             synthetic_acceptance_length=length,
             enable_speculative_sampling=False,
             sampling_stream="batch",
@@ -317,16 +315,17 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("al", [1.0, 2.6, 4.0])
-def test_block_rejection_synthetic_verify_and_cuda_graph_replay(al):
+def test_block_rejection_synthetic_verify_and_cuda_graph_replay(monkeypatch, al):
     """Probabilistic-draft synthetic mode on the real flashinfer verify path."""
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends import flashinfer as fi
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.utils.env import global_server_args_dict
 
+    monkeypatch.setitem(global_server_args_dict, "enable_block_rejection", True)
     pool, width, vocab = 6, 4, 512
     config = SamplingBackendConfig(
-        enable_block_rejection=True,
         enable_speculative_sampling=True,
         sampling_stream="batch",
         logprob_order="torch",

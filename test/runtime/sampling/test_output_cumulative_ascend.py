@@ -58,7 +58,6 @@ def test_verify_scores_the_final_tp_token_once(monkeypatch):
         SamplingBackendConfig(
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
-            enable_block_rejection=False,
             sampling_stream="batch",
             logprob_order="torch",
             enable_output_logprobs=True,

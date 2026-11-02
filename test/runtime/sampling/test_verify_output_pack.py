@@ -37,7 +37,6 @@ MAX_BS, MAX_N = 4, 6
 def _backend(device: str) -> GreedySamplingBackend:
     return GreedySamplingBackend(
         SamplingBackendConfig(
-            enable_block_rejection=False,
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
             sampling_stream="batch",

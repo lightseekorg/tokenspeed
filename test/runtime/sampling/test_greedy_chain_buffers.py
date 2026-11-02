@@ -47,7 +47,6 @@ from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 def test_verify_refreshes_complete_accepted_path(device, bs, width):
     backend = GreedySamplingBackend(
         SamplingBackendConfig(
-            enable_block_rejection=False,
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
             sampling_stream="batch",

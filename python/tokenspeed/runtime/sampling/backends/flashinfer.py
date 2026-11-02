@@ -181,9 +181,13 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
-        if config.synthetic_acceptance_length is not None and not (
-            config.enable_block_rejection and config.enable_speculative_sampling
-        ):
+        # Block verification is a server-wide choice read from the server
+        # args like ``numerics``; it only applies under speculative sampling.
+        self._block_rejection = (
+            global_server_args_dict["enable_block_rejection"]
+            and config.enable_speculative_sampling
+        )
+        if config.synthetic_acceptance_length is not None and not self._block_rejection:
             raise ValueError(
                 "synthetic acceptance on a flashinfer backend requires block "
                 "rejection with speculative sampling; otherwise use the greedy "
@@ -836,7 +840,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 else None
             )
             synthetic = self.config.synthetic_acceptance_length is not None
-            if self.config.enable_block_rejection and draft_probs is None:
+            if self._block_rejection and draft_probs is None:
                 raise RuntimeError(
                     "block verification requires recorded draft probabilities"
                 )
@@ -844,7 +848,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             # "synthetic": the standard draft-probability chain rule below runs
             # for its cost, then the forced lengths replace its outcome. The
             # block verifier is a different rejection method and is not run.
-            if self.config.enable_block_rejection and not synthetic:
+            if self._block_rejection and not synthetic:
                 block_speculative_sampling(
                     predicts=predict,
                     accept_index=accept_index,
