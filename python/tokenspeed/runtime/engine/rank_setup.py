@@ -270,4 +270,11 @@ def scheduler_config_from_args(
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         checkpoint_retention_requests=server_args.checkpoint_retention_requests,
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
+        frequent_state_checkpoints=server_args.writes_frequent_state_checkpoints,
+        # The cap is unset (None) without the mode; the binding takes 0.
+        max_unproven_state_checkpoints=(
+            server_args.max_unproven_state_checkpoints
+            if server_args.writes_frequent_state_checkpoints
+            else 0
+        ),
     )

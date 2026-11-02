@@ -129,6 +129,8 @@ def make_config(
     max_kv_page_num: int = 0,
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
+    frequent_state_checkpoints: bool = False,
+    max_unproven_state_checkpoints: int = 0,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -196,6 +198,16 @@ def make_config(
             ``--checkpoint-retention-leaf-distance``: checkpoints within this
             many later requests of the newest on their branch rank as it does. None keeps the
             scheduler's default, 0.
+        frequent_state_checkpoints:
+            ``--enable-frequent-state-checkpoints``: prefill chunk ends on a
+            prefix page inside the prompt also publish the State groups' live
+            slot, as unproven checkpoints.
+            Requires prefix caching, except on the decode role, which ignores
+            it.
+        max_unproven_state_checkpoints:
+            ``--max-unproven-state-checkpoints``: the most unproven frequent
+            checkpoints the Device cache keeps. Positive exactly when
+            ``frequent_state_checkpoints`` is on, 0 otherwise.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -215,6 +227,14 @@ def make_config(
         )
     if (storage_config is not None) != enable_l3_storage:
         raise ValueError("storage_config is required exactly when L3 is enabled")
+    if (
+        max_unproven_state_checkpoints > 0
+    ) != frequent_state_checkpoints or max_unproven_state_checkpoints < 0:
+        raise ValueError(
+            "max_unproven_state_checkpoints caps the frequent State checkpoints: "
+            f"positive exactly with them; got {max_unproven_state_checkpoints} with "
+            f"frequent_state_checkpoints={frequent_state_checkpoints}."
+        )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
@@ -243,6 +263,10 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if frequent_state_checkpoints:
+        # Set only when on, for the same reason.
+        cfg.frequent_state_checkpoints = True
+        cfg.max_unproven_state_checkpoints = max_unproven_state_checkpoints
     if checkpoint_retention_requests is not None:
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.

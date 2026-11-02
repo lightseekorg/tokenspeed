@@ -438,7 +438,13 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                     continue;
                 }
                 groups_[i].Index().ForEachEntry(pool_, [&](const CacheKey& key,
-                                                           const PrefixCacheIndex::CachedBlockSnapshot&) {
+                                                           const PrefixCacheIndex::CachedBlockSnapshot& entry) {
+                    // An unproven checkpoint may leave the Device at any
+                    // publication (the cap) and never reaches the Host: it
+                    // continues nothing.
+                    if (IsUnprovenStateCheckpoint(i, entry.metadata)) {
+                        return;
+                    }
                     const BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
                     if (node != nullptr && node->has_checkpoint[BoundaryTree::kDevice] && indexed.insert(node).second) {
                         device_checkpoints_by_epoch[node->latest_state_access_epoch].push_back(node);
@@ -473,7 +479,10 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // Device keeps that one longest -- then the shallower boundary, keeping
     // the longer frontier as Device eviction does, then the candidate
     // node's first Host entry. An aged Host-only checkpoint ranks as
-    // CheckpointAging says: the larger distance first, then the older.
+    // CheckpointAging says: the larger distance first, then the older. An
+    // unproven Device checkpoint (IsUnprovenStateCheckpoint) neither covers
+    // nor continues a Host one: the cap may evict it at any publication, and
+    // it is never written back.
     enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kHostOnly };
     struct Candidate {
         const BoundaryTree::Node* candidate_node{nullptr};
@@ -553,7 +562,8 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
             candidate.victim_class = VictimClass::kDead;
             candidate.epoch_sort_key = *newest_epoch(*host_pool_, node, /*kv_only=*/false);
             candidate.reason = &HostEvictionStats::dead_entry;
-        } else if ((num_state_groups_ == 0 || node.has_checkpoint[BoundaryTree::kDevice]) &&
+        } else if ((num_state_groups_ == 0 ||
+                    (node.has_checkpoint[BoundaryTree::kDevice] && !HoldsUnprovenStateCheckpoint(*node.hash))) &&
                    DeviceBoundaryResidency(CacheKey{.content_hash = *node.hash}, node.tail_tokens) ==
                        BoundaryResidency::kComplete) {
             candidate.victim_class = VictimClass::kCoveredByDevice;

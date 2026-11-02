@@ -291,6 +291,19 @@ public:
         return metadataOf(*entry_it);
     }
 
+    // The same snapshot by key, without taking a reference to the block.
+    std::optional<CachedBlockMetadata> MetadataFor(const BlockPool& pool, const CacheKey& key) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
+        if (entry_it == cache_index->entries.end()) {
+            return std::nullopt;
+        }
+        return metadataOf(*entry_it);
+    }
+
     // The next potentially evictable epoch. Entries known to be pinned have
     // already left available_order and rejoin it when their last owner leaves.
     // Reading the order key does not inspect owners or advance the cursor.

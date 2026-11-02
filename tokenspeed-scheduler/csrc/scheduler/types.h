@@ -140,6 +140,26 @@ struct SchedulerConfig {
         return checkpoint_retention_requests.value_or(
             std::min<std::int64_t>(std::int64_t{16} * max_batch_size, kMaxCheckpointRetentionRequests));
     }
+    // Publish more State checkpoints than the natural points: a local
+    // prefill chunk end on a page inside the prompt -- the start of its last
+    // chunk included (FrequentStateCheckpointAt) -- publishes every State
+    // group's slot 1 there at the next chunk's admission
+    // (PublicationPoint::kFrequentStateCheckpoint), and a chunk that would end
+    // past a page at least one chunk budget (max_scheduled_tokens) before the
+    // prompt end ends on it instead (ChunkEndingOnFrequentStateCheckpoint). A
+    // junction or in-forward boundary a chunk ends on stays a natural
+    // checkpoint. Each one is unproven until a hit claims it or an endpoint
+    // republishes it: ranked by its access epoch like any cache entry (first
+    // within it), kept off Host, and capped by max_unproven_state_checkpoints.
+    // Requires prefix caching, except on the D role, which never computes a
+    // prompt and ignores it.
+    bool frequent_state_checkpoints{false};
+    // The most unproven frequent State checkpoints the Device cache keeps,
+    // pinned ones included: each admission that publishes one evicts the
+    // unpinned ones beyond it, oldest access epoch first, then shallowest.
+    // Required (>= 1) with frequent_state_checkpoints, and 0 without: no
+    // silent default.
+    std::int32_t max_unproven_state_checkpoints{0};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

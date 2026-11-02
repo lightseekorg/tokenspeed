@@ -191,11 +191,28 @@ private:
                    !request_reclaim_locations_.contains(entry.location);
         };
         // The Device checkpoint boundaries at or under a node that no selected
-        // set takes whole: every one while candidates last, then those staying.
+        // set takes whole: while candidates last every one but the unproven
+        // State checkpoints already selected, then those staying.
         const auto num_staying_checkpoint_boundaries = [&](const BoundaryTree::Node& node) {
             const auto it = leaving_checkpoint_boundary_counts_.find(&node);
             return node.checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] -
                    (it == leaving_checkpoint_boundary_counts_.end() ? 0 : it->second);
+        };
+        // Counts a checkpoint boundary every Device checkpoint of which the
+        // selected sets take as leaving, once, in it and every ancestor.
+        const auto note_leaving_checkpoint_boundary = [&](const BoundaryTree::Node& checkpoint_node) {
+            if (leaving_checkpoint_boundaries_.contains(&checkpoint_node) ||
+                !std::ranges::all_of(coordinator_.NodeEntries(pool_, checkpoint_node), [&](const NodeEntry& entry) {
+                    return !coordinator_.GroupIsState(entry.group_id) ||
+                           set_member_by_location_.contains(entry.location);
+                })) {
+                return;
+            }
+            leaving_checkpoint_boundaries_.insert(&checkpoint_node);
+            for (const BoundaryTree::Node* ancestor = &checkpoint_node; ancestor != nullptr;
+                 ancestor = ancestor->parent) {
+                ++leaving_checkpoint_boundary_counts_[ancestor];
+            }
         };
         bool candidates_ran_out = false;
         std::size_t next_deferred_shared_page = 0;
@@ -214,7 +231,7 @@ private:
                     // it.
                     if (!candidates_ran_out) {
                         candidates_ran_out = true;
-                        std::pmr::unordered_set<const BoundaryTree::Node*> counted{&scratch_};
+                        std::pmr::unordered_set<const BoundaryTree::Node*> examined{&scratch_};
                         for (const VictimSet& set : victims_) {
                             for (const VictimSet::Member& member : set.members) {
                                 if (!coordinator_.GroupIsState(member.group_id)) {
@@ -224,17 +241,8 @@ private:
                                     groups_[member.group_id].Index().KeyOf(pool_, member.location);
                                 const BoundaryTree::Node* checkpoint_node =
                                     key ? boundary_tree_.Find(key->content_hash) : nullptr;
-                                if (checkpoint_node == nullptr || !counted.insert(checkpoint_node).second ||
-                                    !std::ranges::all_of(coordinator_.NodeEntries(pool_, *checkpoint_node),
-                                                         [&](const NodeEntry& entry) {
-                                                             return !coordinator_.GroupIsState(entry.group_id) ||
-                                                                    set_member_by_location_.contains(entry.location);
-                                                         })) {
-                                    continue;
-                                }
-                                for (const BoundaryTree::Node* ancestor = checkpoint_node; ancestor != nullptr;
-                                     ancestor = ancestor->parent) {
-                                    ++leaving_checkpoint_boundary_counts_[ancestor];
+                                if (checkpoint_node != nullptr && examined.insert(checkpoint_node).second) {
+                                    note_leaving_checkpoint_boundary(*checkpoint_node);
                                 }
                             }
                         }
@@ -273,6 +281,8 @@ private:
                         candidate_node = boundary_tree_.Find(key->content_hash);
                     }
                 }
+                const bool unproven_state_checkpoint =
+                    candidate_node != nullptr && isUnprovenStateCheckpoint(*candidate);
                 const bool sliding =
                     !groups_[group_id].Matcher().IsPrefixClosed() && !coordinator_.GroupIsState(group_id);
                 if (candidate_node == nullptr || (sliding && !set.is_request_reclaim)) {
@@ -293,13 +303,19 @@ private:
                         }
                     }
                 } else if (blocks_alone ? coordinator_.GroupIsState(group_id)
-                                        : num_staying_checkpoint_boundaries(*candidate_node) >= 2) {
+                                        : num_staying_checkpoint_boundaries(*candidate_node) >= 2 ||
+                                              unproven_state_checkpoint) {
                     // Deeper checkpoint boundaries still read this page. A nested
                     // checkpoint leaves alone, every State group's at once; the
                     // page leaves with the last checkpoint boundary under it, or is
                     // tried again once the candidates run out. Block by block, every
                     // checkpoint leaves so; at a tail its eviction takes the tail's
                     // other unpinned blocks along (evictCachedBlock), uncounted here.
+                    // An unproven State checkpoint always leaves so: its segment
+                    // would take its own page, which a request still prefilling or
+                    // decoding past it holds, and the whole set would be passed
+                    // over. The pages only it read leave after it, by their own
+                    // epochs (it no longer counts for them once selected, below).
                     if (!coordinator_.GroupIsState(group_id)) {
                         (candidates_ran_out ? passed_over_ : deferred_shared_pages_).push_back(*candidate);
                         continue;
@@ -510,6 +526,15 @@ private:
                 if (segment_top != nullptr) {
                     segment_at_[segment_top] = set_index;
                 }
+                // Once an unproven State checkpoint's set is selected the pages
+                // above it no longer serve it for the candidates that follow, so
+                // the chain under them still leaves whole with its next checkpoint
+                // boundary, by its pages' epochs, rather than once the candidates
+                // run out. An established checkpoint boundary keeps its pages until
+                // then.
+                if (unproven_state_checkpoint) {
+                    note_leaving_checkpoint_boundary(*candidate_node);
+                }
                 return true;
             }
         });
@@ -517,6 +542,23 @@ private:
         if (!fits) return false;
         eviction_plan_.Minimize(victims_, shape_need_, blocks_needed_, pair_need_);
         return true;
+    }
+
+    // Whether a candidate is an unproven frequent State checkpoint
+    // (CacheCoordinator::IsUnprovenStateCheckpoint). That shapes its victim
+    // set, never the order: CacheEvictionCandidates ranks it as the
+    // probationary boundary it is, so it leads its own epoch, the shallowest
+    // first, and no class sets it before older epochs -- the Device is full
+    // in steady state, and such a class would hand it to the very next
+    // admission that needs room, long before a sibling arrives.
+    // TrimUnprovenStateCheckpoints bounds how many stay.
+    bool isUnprovenStateCheckpoint(const VictimCandidate& candidate) const {
+        if (!coordinator_.FrequentStateCheckpoints() || !coordinator_.GroupIsState(candidate.group_id)) {
+            return false;
+        }
+        const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
+            groups_[candidate.group_id].Index().MetadataFor(pool_, candidate.location);
+        return metadata && coordinator_.IsUnprovenStateCheckpoint(candidate.group_id, *metadata);
     }
 
     void initializeCapacity() {
@@ -979,8 +1021,11 @@ private:
     // run out too.
     std::vector<VictimCandidate> passed_over_;
     // Per tree node: how many checkpoint boundaries at or under it have every
-    // Device checkpoint in a selected set, counted once the candidates run out.
+    // Device checkpoint in a selected set, counted once the candidates run out
+    // (an unproven one's as soon as its set is selected).
     std::pmr::unordered_map<const BoundaryTree::Node*, std::int32_t> leaving_checkpoint_boundary_counts_{&scratch_};
+    // The checkpoint boundaries counted there, each once.
+    std::pmr::unordered_set<const BoundaryTree::Node*> leaving_checkpoint_boundaries_{&scratch_};
 };
 
 std::optional<AdmissionPlan> planAdmission(

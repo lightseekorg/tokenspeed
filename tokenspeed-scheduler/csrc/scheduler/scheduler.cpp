@@ -122,6 +122,16 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
+
+    bool has_state_group = false;
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        has_state_group = has_state_group || coordinator_.GroupIsState(static_cast<std::size_t>(i));
+    }
+    // Frequent State checkpoints need a State group to checkpoint and a prefix
+    // cache to reuse them; the D role computes no prompt and takes the flag as
+    // a no-op (Validate allows it there without prefix caching).
+    coordinator_.SetFrequentStateCheckpoints(config_.frequent_state_checkpoints && has_state_group &&
+                                             !config_.disable_prefix_cache && config_.role != Role::kD);
 }
 
 Request* Scheduler::findRequest(const std::string& request_id) {
@@ -439,6 +449,7 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .host_evictions = coordinator_.HostEvictions(),
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
+        .unproven_entries_not_written_back = coordinator_.UnprovenEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };

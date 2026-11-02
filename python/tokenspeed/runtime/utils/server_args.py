@@ -397,6 +397,12 @@ class ServerArgs:
     # Checkpoints within this many later requests of the newest on their
     # branch rank as it does. None is the scheduler's default, 0.
     checkpoint_retention_leaf_distance: int | None = None
+    # Opt-in: hybrid models also publish the recurrent state at prefill chunk
+    # ends that lie on a prefix page inside the prompt, as unproven checkpoints
+    # capped by max_unproven_state_checkpoints (required with the flag, refused
+    # without it).
+    enable_frequent_state_checkpoints: bool = False
+    max_unproven_state_checkpoints: int | None = None
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
     # special kv cache
@@ -1400,6 +1406,16 @@ class ServerArgs:
         )
 
     @property
+    def writes_frequent_state_checkpoints(self) -> bool:
+        """Whether this engine's prefill chunk ends publish frequent State
+        checkpoints: the flag, off on a decode server, whose prompts arrive by
+        transfer."""
+        return (
+            self.enable_frequent_state_checkpoints
+            and self.disaggregation_mode != "decode"
+        )
+
+    @property
     def retraction_snapshot_pool_disabled(self) -> bool:
         """Whether no image can ever be taken, so a capacity block aborts.
 
@@ -2142,6 +2158,28 @@ class ServerArgs:
                     "--kvstore-write-policy write_back does not support "
                     f"{', '.join(unsupported)}"
                 )
+        # The cap has no default: it trades Device capacity against reuse.
+        if self.enable_frequent_state_checkpoints:
+            if self.max_unproven_state_checkpoints is None:
+                raise ValueError(
+                    "--enable-frequent-state-checkpoints requires "
+                    "--max-unproven-state-checkpoints"
+                )
+            if self.max_unproven_state_checkpoints < 1:
+                raise ValueError(
+                    "--max-unproven-state-checkpoints must be at least 1; got "
+                    f"{self.max_unproven_state_checkpoints}"
+                )
+        elif self.max_unproven_state_checkpoints is not None:
+            raise ValueError(
+                "--max-unproven-state-checkpoints belongs to "
+                "--enable-frequent-state-checkpoints"
+            )
+        if self.writes_frequent_state_checkpoints and not self.enable_prefix_caching:
+            raise ValueError(
+                "--enable-frequent-state-checkpoints publishes checkpoints only "
+                "the prefix cache can reuse; it requires prefix caching"
+            )
 
     def validate_weight_memory_policy(self):
         """Memory saving chooses its weight semantics explicitly."""
@@ -2745,6 +2783,33 @@ class ServerArgs:
             "does under --checkpoint-retention-requests. 0 protects only the "
             "newest request's checkpoints; 1 also the previous turn's. From 0 "
             "to 4. Default: 0.",
+        )
+        parser.add_argument(
+            "--enable-frequent-state-checkpoints",
+            action="store_true",
+            dest="enable_frequent_state_checkpoints",
+            default=ServerArgs.enable_frequent_state_checkpoints,
+            help="Hybrid (recurrent-state) models: also publish the recurrent "
+            "state at every prefill chunk end that lies on a prefix page inside "
+            "the prompt, the start of its last chunk included (a chunk passing a "
+            "page at least one chunk before the prompt end ends on it), so a "
+            "later request diverging before that resumes within a chunk of its "
+            "divergence. Each one costs a block per state group and is unproven "
+            "until a request hits it: evicted by its age like any cache entry, "
+            "never written to Host, and capped by "
+            "--max-unproven-state-checkpoints. Requires prefix caching. See "
+            "docs/design/scheduler.md section 1.2.",
+        )
+        parser.add_argument(
+            "--max-unproven-state-checkpoints",
+            type=int,
+            default=ServerArgs.max_unproven_state_checkpoints,
+            metavar="N",
+            help="The most unproven frequent State checkpoints the Device cache "
+            "keeps, counting those in-flight prefills hold; more are evicted "
+            "oldest request first, shallowest first. Required (>= 1) with "
+            "--enable-frequent-state-checkpoints, refused without it. See "
+            "docs/design/scheduler.md section 1.2.",
         )
 
         # KVStore

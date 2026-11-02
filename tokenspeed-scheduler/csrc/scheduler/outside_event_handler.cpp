@@ -190,9 +190,12 @@ std::int32_t Scheduler::promptEndCheckpoint(const Request& request, std::int32_t
 // there -- needs to skip T: the request's final forward wrote C and it is
 // still pending (the publication at T then publishes it), or every State
 // group's state at C is cached, on either tier (the KV below C is the
-// request's own). Once an admission lets the request's optional hold on C go
-// and evicts it, such a finish publishes T. The caller passes the progress
-// before the publication at T, the request's computed frontier.
+// request's own) -- not as an unproven frequent checkpoint, which the cap may
+// evict at any publication (HoldsStateCheckpoint) and which would leave T
+// unpublished for a C soon gone. Once an admission lets the request's
+// optional hold on C go and evicts it, such a finish publishes T. The caller
+// passes the progress before the publication at T, the request's computed
+// frontier.
 bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const {
     const std::int32_t checkpoint = promptEndCheckpoint(request, progress.resume_tokens);
     if (checkpoint == 0) {

@@ -405,7 +405,10 @@ public:
     // Those data slots whose Device block is a published prefix entry, with
     // the key it is published under: they can ride Host L2 as that entry
     // (ImageSlot::block is the Device block here; the transfer manager
-    // swaps in the Host block). Everything else goes to the snapshot pool.
+    // swaps in the Host block). Everything else goes to the snapshot pool, an
+    // unproven State checkpoint (IsUnprovenStateCheckpoint) included: it stays
+    // off Host until a hit promotes it. A proven one is imaged as an endpoint
+    // checkpoint, so a restore that republishes it keeps it established.
     std::vector<std::vector<ImageSlot>> PublishedDataSlots(std::span<const BlockTable> tables,
                                                            std::int32_t num_tokens) const;
     // The same slots once `progress` has been published as well: the entries
@@ -656,8 +659,47 @@ public:
     };
     // Queue every already-published non-state Device cache entry under these
     // content hashes (chain hashes and tail hashes alike) for D2H Store.
-    // Missing keys and an absent Host tier are silently skipped.
+    // Missing keys and an absent Host tier are silently skipped, and so are
+    // unproven State checkpoints (IsUnprovenStateCheckpoint), which stay on
+    // the Device until a hit promotes them.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
+    // SchedulerConfig::frequent_state_checkpoints is in effect (a State group,
+    // prefix caching, not the D role): the scheduler sets it once, at
+    // construction. Off, no entry is an unproven State checkpoint and nothing
+    // below treats one apart.
+    void SetFrequentStateCheckpoints(bool enabled) { frequent_state_checkpoints_ = enabled; }
+    bool FrequentStateCheckpoints() const noexcept { return frequent_state_checkpoints_; }
+    // Whether group_index's Device entry with this metadata is an unproven
+    // State checkpoint: with frequent State checkpoints on, one a frequent
+    // chunk end published (kChunk at its page depth) that no hit has acquired
+    // and no endpoint has republished, which would have raised its kind. The
+    // admission planner ranks these at their own access epoch, each first
+    // within it (a probationary boundary, the shallowest first), and takes one
+    // alone, every State group's block at once, never as a segment of its
+    // pages; TrimUnprovenStateCheckpoints bounds how many stay. They never
+    // reach the Host: no store queues them, a retraction image takes them into
+    // the snapshot pool, and an eviction under the write-back policy drops them
+    // (UnprovenEntriesNotWrittenBack). So the Host holds none (its entries
+    // carry no acquisition and are never asked), and a Host segment plan never
+    // takes a Host copy for a duplicate of an unproven Device checkpoint.
+    bool IsUnprovenStateCheckpoint(std::size_t group_index,
+                                   const PrefixCacheIndex::CachedBlockMetadata& device_metadata) const {
+        return frequent_state_checkpoints_ && GroupIsState(group_index) &&
+               device_metadata.boundary_kind == CacheBoundaryKind::kChunk && !device_metadata.was_acquired &&
+               device_metadata.logical_block_index >= 0;
+    }
+    // Whether some State group's Device checkpoint under the chain hash
+    // content_hash is unproven (IsUnprovenStateCheckpoint).
+    bool HoldsUnprovenStateCheckpoint(const ContentHash& content_hash) const;
+    // Bounds the unproven State checkpoints on the Device to `limit`, counting
+    // pinned ones: while more are cached, evicts the unpinned ones, oldest
+    // access epoch first, then shallowest, each with its blocks in every
+    // State group, dropped under either Host write policy. Counted over the
+    // first State group (every State group publishes a checkpoint together);
+    // returns how many were evicted.
+    std::int32_t TrimUnprovenStateCheckpoints(std::int32_t limit);
+    // Checkpoints TrimUnprovenStateCheckpoints has evicted since start.
+    std::int64_t UnprovenStateCheckpointTrims() const { return unproven_state_checkpoint_trims_; }
     std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     // One Host block per (group, bucket), with free capacity assigned first
@@ -771,6 +813,13 @@ public:
     // them on the Host (a tail whose hint is gone, a boundary with no
     // checkpoint boundary at or under it).
     std::uint64_t DeadEntriesNotWrittenBack() const { return dead_entries_not_written_back_; }
+    // The unproven State checkpoints (IsUnprovenStateCheckpoint) an eviction
+    // under the write-back policy dropped instead of recording them, whatever
+    // evicted them: a victim, a request's own released slot (counted in
+    // request_reclaim_for_write_back too) or a stranded suffix. Like the dead
+    // ones, they count under the eviction's cause, so beside the drain's
+    // outcomes they add up to those evictions.
+    std::uint64_t UnprovenEntriesNotWrittenBack() const { return unproven_entries_not_written_back_; }
 
     // Device entries evicted for one reason, each also counted as
     // host_resident when the Host index still held its key (never without a
@@ -805,8 +854,12 @@ public:
         // The collection of dead prefix entries, which like the tail cap evicts
         // every block it drops itself; only when evicting by segments.
         DeviceEvictionCounts dead_entry_collection;
+        // TrimUnprovenStateCheckpoints, which like the tail cap evicts every
+        // block it drops itself.
+        DeviceEvictionCounts unproven_state_checkpoint_trim;
         // Subset of request_reclaim considered for write-back, including
-        // entries later dropped as dead. Superseded inputs are excluded.
+        // entries later dropped as dead or as unproven State checkpoints.
+        // Superseded inputs are excluded.
         std::uint64_t request_reclaim_for_write_back{0};
     };
     // Cumulative, never reset (accounting only).
@@ -841,7 +894,9 @@ public:
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes
     // each from whichever tier holds it (false for a model without State
-    // groups).
+    // groups). An unproven Device checkpoint (IsUnprovenStateCheckpoint) does
+    // not count: the cap may evict it at any publication, and it never
+    // reaches the Host.
     bool HoldsStateCheckpoint(const ContentHash& content_hash) const;
     // The cache keys one boundary holds in each group that publishes it:
     // BlocksPerBoundary of them for a chain hash (tail_tokens 0), a tail's
@@ -1065,10 +1120,13 @@ private:
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
+    // Registers table slots [first_cache_block, first_cache_block +
+    // keys.size()) at logical blocks from first_logical_block on.
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
-                                 std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+                                 std::int32_t first_cache_block, std::int32_t first_logical_block,
+                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
+                                 bool stream_completed_to_host);
     // Registers blocks[j] under keys[j] (logical block first_logical_block + j)
     // and reports and streams what was newly cached; cacheFullBlocksForGroup
     // passes a table window, an in-forward State checkpoint its own block.
@@ -1077,20 +1135,28 @@ private:
                              std::int32_t first_logical_block, std::uint64_t access_epoch,
                              CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     // One run of table slots a publication registers in a group, the key of
-    // each (keys[j] is slot first_cache_block + j), and the boundary kind it
-    // registers them under.
+    // each (keys[j] is slot first_cache_block + j), the logical block it
+    // registers keys[0] at -- the slot itself for a History group, the
+    // boundary's full-page count for a State group's slot 1, so eviction can
+    // tell a deeper checkpoint from a shallower one -- and the boundary kind.
     struct PublishedRange {
         std::int32_t first_cache_block{0};
+        std::int32_t first_logical_block{0};
         std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page plus the tail's blocks of a prefix-closed group, the blocks holding
     // the window behind the newest boundary of a sliding group, slot 1 of a
-    // State group at a non-chunk point, nothing for a replayable one.
+    // State group at a point that publishes state (with frequent State
+    // checkpoints on, unless it is keyed by an earlier page whose KV left the
+    // Device), nothing for a replayable one.
     // The one source for cacheCompletedBlocksForGroup and for
     // PublishedDataSlotsAfter.
     std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
+    // Whether every prefix-closed group holds the KV of the prefix page under
+    // page_hash on the Device (a sliding window's blocks are not checked).
+    bool deviceHoldsPageKv(const ContentHash& page_hash) const;
     // The key of table slot `block` of a History group at a publication point:
     // its page's chain hash below the full pages, the tail hash from there on.
     CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;
@@ -1122,10 +1188,13 @@ private:
     // tree node. It returns the key that left the index, nullopt when the
     // entry is pinned or gone. A superseded input (MarkSupersededStateInput) an
     // admission, rotation or restore evicts counts as
-    // request_reclaim and is never recorded. With write_back_segment (an
-    // admission's or a restore's cache victim under the write-back policy) any
-    // other entry that left is recorded there -- its metadata read before it
-    // left, its Host entry held when the Host has one; the segment's
+    // request_reclaim and is never recorded; an unproven State checkpoint
+    // (IsUnprovenStateCheckpoint) is never recorded either, whatever evicts
+    // it, and counts under `reason` (UnprovenEntriesNotWrittenBack). With
+    // write_back_segment (an admission's or a restore's cache victim under the
+    // write-back policy) any other entry that left is recorded there -- its
+    // metadata read before it left, its Host entry held when the Host has one;
+    // the segment's
     // newest_access_epoch rises to its epoch -- and holds its tree node, tail
     // hint included, until the segment settles; one no probe could resume from
     // on the Host is dropped instead (DeadEntriesNotWrittenBack). nullptr drops
@@ -1206,6 +1275,8 @@ private:
     // victims leave behind for this plan's write-back drain; and the dead
     // prefix entries either tier is left with are collected.
     bool write_back_evictions_{false};
+    // SetFrequentStateCheckpoints.
+    bool frequent_state_checkpoints_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
     std::int32_t checkpoint_granularity_{1};
@@ -1261,6 +1332,8 @@ private:
     // Accounting only.
     HostEvictionStats host_evictions_;
     std::uint64_t dead_entries_not_written_back_{0};
+    std::uint64_t unproven_entries_not_written_back_{0};
+    std::int64_t unproven_state_checkpoint_trims_{0};
     std::uint64_t store_candidates_dropped_by_flush_{0};
     DeviceEvictionStats device_evictions_;
 };

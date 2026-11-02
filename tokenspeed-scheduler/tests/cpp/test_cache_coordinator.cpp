@@ -1494,6 +1494,725 @@ TEST(CacheCoordinatorAdmissionTest, MergesGroupEpochsWithPinnedEntriesInEitherGr
     }
 }
 
+// With frequent State checkpoints on (CacheCoordinator::
+// SetFrequentStateCheckpoints), a State group's kChunk entry at its page
+// depth that no hit acquired is an unproven checkpoint. It keeps the
+// epoch-first order every entry follows: it leads its own epoch as a
+// probationary boundary, beside a sliding window's, the shallowest first so a
+// chain keeps its deepest one, and leaves after every older epoch's entries,
+// an older established State checkpoint and older KV included. The order is
+// the one without the mode: ranked ahead of the epochs, every unproven
+// checkpoint would go to the next admission that needs room while the Device
+// is full, long before a sibling prompt could hit it.
+TEST(CacheCoordinatorAdmissionTest, UnprovenStateCheckpointsLeadTheirOwnEpochShallowestFirst) {
+    for (const bool frequent : {true, false}) {
+        SCOPED_TRACE(frequent);
+        BlockPool pool(8, {1, 1, 1});
+        const std::vector<CacheGroupSpec> specs = {
+            {.attn_kind = AttnKind::kFull,
+             .sliding_window = 0,
+             .cache_blocks_per_lcm_block = 1,
+             .block_granularity = 4},
+            {.attn_kind = AttnKind::kState,
+             .sliding_window = 0,
+             .cache_blocks_per_lcm_block = 1,
+             .block_granularity = 0},
+            {.attn_kind = AttnKind::kSlidingWindow,
+             .sliding_window = 8,
+             .cache_blocks_per_lcm_block = 1,
+             .block_granularity = 4},
+        };
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                            /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                            /*write_back_evictions=*/false);
+        coordinator.SetFrequentStateCheckpoints(frequent);
+        const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1},
+                                                               {2, 2, 2, 2},
+                                                               {3, 3, 3, 3},
+                                                               {4, 4, 4, 4},
+                                                               {5, 5, 5, 5},
+                                                               {6, 6, 6, 6},
+                                                               {7, 7, 7, 7},
+                                                               {8, 8, 8, 8}});
+        constexpr std::uint64_t kOlderAccessEpoch = 6;
+        constexpr std::uint64_t kNewerAccessEpoch = 7;
+        const CacheBlockLocation older_window = CacheBoundaryForGroup(coordinator, pool, hashes[0], /*group_id=*/2,
+                                                                      kOlderAccessEpoch, /*logical_block_index=*/2);
+        const CacheBlockLocation older_kv = CacheBoundaryForGroup(coordinator, pool, hashes[1], /*group_id=*/0,
+                                                                  kOlderAccessEpoch, /*logical_block_index=*/9);
+        const CacheBlockLocation older_unproven = CacheBoundaryForGroup(coordinator, pool, hashes[2], /*group_id=*/1,
+                                                                        kOlderAccessEpoch, /*logical_block_index=*/8);
+        // An established State checkpoint of the older epoch, which leaves
+        // before the newer unproven ones.
+        const CacheBlockLocation older_endpoint =
+            CacheBoundaryForGroup(coordinator, pool, hashes[7], /*group_id=*/1, kOlderAccessEpoch,
+                                  /*logical_block_index=*/4, CacheBoundaryKind::kEndpoint);
+        const CacheBlockLocation deep = CacheBoundaryForGroup(coordinator, pool, hashes[3], /*group_id=*/1,
+                                                              kNewerAccessEpoch, /*logical_block_index=*/7);
+        const CacheBlockLocation shallow = CacheBoundaryForGroup(coordinator, pool, hashes[4], /*group_id=*/1,
+                                                                 kNewerAccessEpoch, /*logical_block_index=*/3);
+        const CacheBlockLocation endpoint =
+            CacheBoundaryForGroup(coordinator, pool, hashes[5], /*group_id=*/1, kNewerAccessEpoch,
+                                  /*logical_block_index=*/5, CacheBoundaryKind::kEndpoint);
+        const CacheBlockLocation kv = CacheBoundaryForGroup(coordinator, pool, hashes[6], /*group_id=*/0,
+                                                            kNewerAccessEpoch, /*logical_block_index=*/1);
+        ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+
+        // Each admission holds one more KV block, so each evicts one entry.
+        std::vector<std::vector<BlockTable>> held;
+        held.reserve(8);
+        const auto admit_one_block = [&] {
+            std::vector<BlockTable>& tables = held.emplace_back(coordinator.NumGroups());
+            std::vector<GroupDemand> demands = {
+                {.table = &tables[0], .extent = DenseGrowth{4}},
+                {.table = &tables[1], .extent = StateStep{StateStep::Kind::kKeep}},
+                {.table = &tables[2]},
+            };
+            return coordinator
+                .Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
+                       /*evict_blocks_past_segments=*/false)
+                .has_value();
+        };
+        const auto cached = [&](std::uint32_t group_id, CacheBlockLocation location) {
+            return coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group_id)).Contains(pool, location);
+        };
+        const std::vector<std::pair<std::uint32_t, CacheBlockLocation>> expected_order = {
+            {2, older_window}, {1, older_unproven}, {1, older_endpoint}, {0, older_kv},
+            {1, shallow},      {1, deep},           {1, endpoint},       {0, kv}};
+        for (std::size_t evicted = 0; evicted < expected_order.size(); ++evicted) {
+            SCOPED_TRACE(evicted);
+            ASSERT_TRUE(admit_one_block());
+            for (std::size_t i = 0; i < expected_order.size(); ++i) {
+                EXPECT_EQ(cached(expected_order[i].first, expected_order[i].second), i > evicted);
+            }
+        }
+    }
+}
+
+// A frequent checkpoint is published in every State group under one hash.
+// The trim counts unproven ones over the first State group, pinned ones
+// included, and evicts the unpinned ones beyond the cap -- oldest epoch,
+// then shallowest -- with their blocks in every State group. A checkpoint a
+// hit acquired, and an endpoint's, are not unproven.
+TEST(CacheCoordinatorTrimTest, TrimUnprovenStateCheckpointsKeepsTheNewestDeepest) {
+    BlockPool pool(32, {1, 1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false);
+    coordinator.SetFrequentStateCheckpoints(true);
+    const std::vector<std::string> hashes =
+        ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}, {6, 6, 6, 6}});
+    const auto checkpoint = [&](const std::string& hash, std::uint64_t access_epoch, std::int32_t depth,
+                                CacheBoundaryKind kind) {
+        for (const std::uint32_t group_id : {1U, 2U}) {
+            CacheBoundaryForGroup(coordinator, pool, hash, group_id, access_epoch, depth, kind);
+        }
+    };
+    checkpoint(hashes[0], /*access_epoch=*/1, /*depth=*/2, CacheBoundaryKind::kChunk);
+    checkpoint(hashes[1], /*access_epoch=*/1, /*depth=*/6, CacheBoundaryKind::kChunk);
+    checkpoint(hashes[2], /*access_epoch=*/2, /*depth=*/1, CacheBoundaryKind::kChunk);
+    checkpoint(hashes[3], /*access_epoch=*/1, /*depth=*/4, CacheBoundaryKind::kChunk);
+    checkpoint(hashes[4], /*access_epoch=*/1, /*depth=*/3, CacheBoundaryKind::kChunk);
+    checkpoint(hashes[5], /*access_epoch=*/1, /*depth=*/5, CacheBoundaryKind::kEndpoint);
+    // hashes[3] is some request's slot 0; a hit acquired hashes[4].
+    const CacheBlockRef pinned = coordinator.GroupPrefixIndex(1).Find(pool, Key(hashes[3], 1));
+    ASSERT_TRUE(static_cast<bool>(pinned));
+    for (const std::uint32_t group_id : {1U, 2U}) {
+        const std::array<CacheKey, 1> keys{Key(hashes[4], group_id)};
+        coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group_id))
+            .AcquireMatched(pool, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}}, /*access_epoch=*/1);
+    }
+    const auto cached = [&](std::size_t hash) {
+        const bool in_first = coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[hash], 1));
+        EXPECT_EQ(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[hash], 2)), in_first)
+            << "a checkpoint is cached in every State group or in none";
+        return in_first;
+    };
+
+    // Unproven: 0, 1, 2 and the pinned 3. Two over the cap of 2 leave: the
+    // oldest epoch's shallowest, then its next.
+    EXPECT_EQ(coordinator.TrimUnprovenStateCheckpoints(2), 2);
+    EXPECT_EQ(coordinator.UnprovenStateCheckpointTrims(), 2);
+    EXPECT_FALSE(cached(0));
+    EXPECT_FALSE(cached(1));
+    for (const std::size_t kept : {2, 3, 4, 5}) {
+        EXPECT_TRUE(cached(kept)) << kept;
+    }
+    EXPECT_EQ(coordinator.TrimUnprovenStateCheckpoints(2), 0) << "within the cap";
+
+    // At 0 the newest leaves too; the pinned one is counted but stays.
+    EXPECT_EQ(coordinator.TrimUnprovenStateCheckpoints(0), 1);
+    EXPECT_EQ(coordinator.UnprovenStateCheckpointTrims(), 3);
+    EXPECT_FALSE(cached(2));
+    for (const std::size_t kept : {3, 4, 5}) {
+        EXPECT_TRUE(cached(kept)) << kept;
+    }
+}
+
+// A State group's slot 1 is published at the depth of its boundary's full
+// pages, so the trim keeps a chain's deepest checkpoint even when its block
+// sits below a shallower one's.
+TEST(CacheCoordinatorTrimTest, AStateCheckpointIsPublishedAtItsPageDepth) {
+    BlockPool pool(16, {1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false);
+    coordinator.SetFrequentStateCheckpoints(true);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
+    const std::uint64_t access_epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+    // The deeper checkpoint's request is admitted first, so its block is lower.
+    std::vector<BlockTable> deep(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, deep, /*num_tokens=*/12));
+    std::vector<BlockTable> shallow(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, shallow, /*num_tokens=*/4));
+    ASSERT_LT(deep[1].Blocks()[1]->Location().lcm_block_id, shallow[1].Blocks()[1]->Location().lcm_block_id);
+    CacheCompletedBlocksForTest(coordinator, deep, hashes, access_epoch, /*first_new_prefix_page=*/0,
+                                /*num_computed_tokens=*/12, CacheBoundaryKind::kChunk,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/true);
+    CacheCompletedBlocksForTest(coordinator, shallow, std::span{hashes}.first(1), access_epoch,
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kChunk,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/true);
+    coordinator.Free(deep);
+    coordinator.Free(shallow);
+
+    EXPECT_EQ(coordinator.TrimUnprovenStateCheckpoints(1), 1);
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[2], 1))) << "the checkpoint at 12 stays";
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1)));
+}
+
+// A state published at a point that hashes no new page is keyed by a page an
+// earlier point published -- a restored request resuming at the frontier its
+// retraction hashed, on private copies of its pages when there is no Host
+// cache. When that page's KV has left the Device index, nothing could match
+// the state, so with frequent State checkpoints on it is not published; once
+// the KV is there, it is. Off, the publication is the one without the mode,
+// KV or not, so a run without the flags plans as before.
+TEST(CacheCoordinatorTrimTest, AStateKeyedByAnEarlierPageNeedsThatPagesKvOnTheDevice) {
+    for (const bool frequent : {true, false}) {
+        SCOPED_TRACE(frequent);
+        BlockPool pool(16, {1, 1});
+        const std::vector<CacheGroupSpec> specs = {
+            {.attn_kind = AttnKind::kFull,
+             .sliding_window = 0,
+             .cache_blocks_per_lcm_block = 1,
+             .block_granularity = 4},
+            {.attn_kind = AttnKind::kState,
+             .sliding_window = 0,
+             .cache_blocks_per_lcm_block = 1,
+             .block_granularity = 0},
+        };
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false,
+                            /*write_back_evictions=*/false);
+        coordinator.SetFrequentStateCheckpoints(frequent);
+        const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+        const std::uint64_t access_epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+        std::vector<BlockTable> tables(coordinator.NumGroups());
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+        const auto publish_state_only = [&] {
+            coordinator.CacheCompletedBlocks(tables,
+                                             RequestProgress{
+                                                 .completed_pages =
+                                                     CompletedPages{
+                                                         .prefix_hashes = hashes,
+                                                         .first_new_prefix_page = 2,
+                                                         .publish_state = true,
+                                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                                     },
+                                                 .num_computed_tokens = 8,
+                                             },
+                                             access_epoch);
+        };
+        publish_state_only();
+        EXPECT_EQ(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)), !frequent)
+            << (frequent ? "the pages are private" : "published as without the mode");
+        if (!frequent) {
+            coordinator.Free(tables);
+            continue;
+        }
+
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, access_epoch, /*first_new_prefix_page=*/0,
+                                    /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk,
+                                    /*stream_completed_to_host=*/false, /*publish_state=*/false);
+        ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
+        publish_state_only();
+        EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)));
+    }
+}
+
+// A frequent checkpoint is usable only while every State group holds it, so
+// evicting one State group's block takes the others' with it. An endpoint's
+// State blocks keep their own eviction order, as they always have.
+// The KV a state keyed by an earlier page needs is the page itself in a
+// prefix-closed group and only the window behind the boundary in a sliding
+// one: a sliding window of two rows (two-token blocks, P = 4) keeps block 3,
+// [6, 8), behind 8 and never publishes block 2, yet a probe resumes at 8, so
+// the state there is published.
+TEST(CacheCoordinatorTrimTest, AStateKeyedByAnEarlierPageNeedsOnlyTheWindowOfASlidingGroup) {
+    BlockPool pool(16, {1, 1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 2,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false);
+    coordinator.SetFrequentStateCheckpoints(true);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const std::uint64_t access_epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+    CacheCompletedBlocksForTest(coordinator, tables, hashes, access_epoch, /*first_new_prefix_page=*/0,
+                                /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    ASSERT_FALSE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[1], 2, /*page_offset=*/0)));
+    ASSERT_TRUE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[1], 2, /*page_offset=*/1)));
+    coordinator.CacheCompletedBlocks(tables,
+                                     RequestProgress{
+                                         .completed_pages =
+                                             CompletedPages{
+                                                 .prefix_hashes = hashes,
+                                                 .first_new_prefix_page = 2,
+                                                 .publish_state = true,
+                                                 .boundary_kind = CacheBoundaryKind::kEndpoint,
+                                             },
+                                         .num_computed_tokens = 8,
+                                     },
+                                     access_epoch);
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)));
+    coordinator.Free(tables);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 8);
+}
+
+// A retraction image's Host L2 leg takes no unproven checkpoint: it rides
+// the snapshot pool like an unpublished slot. Once a hit proved it, it rides
+// L2 as an endpoint's checkpoint, which ranks alike on the Device, so a
+// restore that republishes it -- the index keeps no acquisition across that --
+// keeps it established.
+TEST(CacheCoordinatorTrimTest, AProvenCheckpointIsImagedAsAnEndpoints) {
+    BlockPool pool(16, {1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false);
+    coordinator.SetFrequentStateCheckpoints(true);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+    CacheCompletedBlocksForTest(coordinator, tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/true);
+    EXPECT_EQ(coordinator.PublishedDataSlots(tables, /*num_tokens=*/8)[1].size(), 0u) << "unproven";
+    {
+        const std::array<CacheKey, 1> keys{Key(hashes[1], 1)};
+        coordinator.GroupPrefixIndex(1).AcquireMatched(pool, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
+                                                       CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+    }
+    const std::vector<std::vector<ImageSlot>> published = coordinator.PublishedDataSlots(tables, /*num_tokens=*/8);
+    ASSERT_EQ(published[1].size(), 1u);
+    EXPECT_EQ(published[1][0].slot_index, 1);
+    EXPECT_EQ(published[1][0].boundary_kind, CacheBoundaryKind::kEndpoint);
+    EXPECT_EQ(published[1][0].logical_block_index, 2) << "the checkpoint's page depth";
+    ASSERT_EQ(published[0].size(), 2u);
+    EXPECT_EQ(published[0][0].boundary_kind, CacheBoundaryKind::kChunk) << "a KV page keeps its kind";
+    coordinator.Free(tables);
+}
+
+// The cover check of the dead checkpoints the in-forward checkpoint skips
+// asks HoldsStateCheckpoint: an unproven Device checkpoint does not count,
+// since the cap may evict it at any publication and it never reaches the
+// Host. Once a hit acquires it, or the Host holds the State, it does.
+TEST(CacheCoordinatorTrimTest, AnUnprovenCheckpointHoldsNoStateForTheCoverCheck) {
+    BlockPool pool(16, {1, 1});
+    BlockPool host_pool(8, {1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    for (const std::string& hash : hashes) {
+        CacheBoundaryForGroup(coordinator, pool, hash, /*group_id=*/0, /*access_epoch=*/1, /*logical_block_index=*/0);
+        CacheBoundaryForGroup(coordinator, pool, hash, /*group_id=*/1, /*access_epoch=*/1, /*logical_block_index=*/1);
+    }
+    EXPECT_TRUE(coordinator.HoldsStateCheckpoint(hashes[0])) << "off, no checkpoint is unproven";
+    coordinator.SetFrequentStateCheckpoints(true);
+    EXPECT_FALSE(coordinator.HoldsStateCheckpoint(hashes[0]));
+    EXPECT_TRUE(coordinator.HoldsUnprovenStateCheckpoint(hashes[0]));
+
+    const std::array<CacheKey, 1> keys{Key(hashes[0], 1)};
+    coordinator.GroupPrefixIndex(1).AcquireMatched(pool, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
+                                                   /*access_epoch=*/2);
+    EXPECT_TRUE(coordinator.HoldsStateCheckpoint(hashes[0])) << "a hit proved it";
+    EXPECT_FALSE(coordinator.HoldsUnprovenStateCheckpoint(hashes[0]));
+
+    CacheBlockRef host_block = coordinator.AcquireHostBlock(/*group_id=*/1, /*bucket=*/0);
+    ASSERT_TRUE(host_block);
+    coordinator.CacheHostBlock(host_block, Key(hashes[1], 1), std::nullopt);
+    EXPECT_TRUE(coordinator.HoldsStateCheckpoint(hashes[1])) << "the Host's copy counts";
+}
+
+// Frequent State checkpoints under the write-back policy, on the coordinator:
+// one KV group (four blocks per parent, P = 4) and one State group, the Host
+// as large as the Device. An unproven checkpoint (CacheCoordinator::
+// IsUnprovenStateCheckpoint) never rides an eviction write-back, a proven one
+// does like any entry, and none makes a Host copy a duplicate of the Device.
+class FrequentCheckpointWriteBackTest : public ::testing::Test {
+protected:
+    static constexpr std::int32_t kP = 4;
+    static constexpr std::uint32_t kFull = 0;
+    static constexpr std::uint32_t kState = 1;
+    static constexpr std::array kSpecs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+
+    FrequentCheckpointWriteBackTest() { coordinator_.SetFrequentStateCheckpoints(true); }
+
+    // Admits a request over `tokens`, a whole number of pages, and publishes
+    // them with the State group's checkpoint at the end as `state_kind`
+    // (kChunk: a frequent chunk end's, unproven until a hit claims it);
+    // returns the pages' hashes.
+    std::vector<std::string> PublishAs(const std::vector<std::int32_t>& tokens, CacheBoundaryKind state_kind) {
+        const auto num_tokens = static_cast<std::int32_t>(tokens.size());
+        std::vector<BlockTable> tables(2);
+        EXPECT_TRUE(AdmitForTest(coordinator_, tables, num_tokens));
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::int32_t page = 0; page < num_tokens / kP; ++page) {
+            pages.emplace_back(tokens.data() + static_cast<std::ptrdiff_t>(page * kP), static_cast<std::size_t>(kP));
+        }
+        std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
+        coordinator_.CacheCompletedBlocks(
+            tables,
+            RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                                              .first_new_prefix_page = 0,
+                                                              .publish_state = true,
+                                                              .boundary_kind = state_kind},
+                            .num_computed_tokens = num_tokens},
+            CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+        coordinator_.Free(tables);
+        return hashes;
+    }
+
+    CacheBlockLocation StateLocationOf(const std::string& hash) const {
+        return *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, kState, Key(hash, kState));
+    }
+
+    // Holds every free slot and empty parent of `pool`, so what comes next
+    // is funded by evictions.
+    void HoldFreeCapacity(BlockPool& pool) {
+        for (CacheBlockRef& block : pool.AcquireBlocks(kFull, pool.NumFreeSlots(kFull))) {
+            held_.push_back(std::move(block));
+        }
+        for (CacheBlockRef& block : pool.AcquireBlocks(kState, pool.NumEmptyLcmBlocks())) {
+            held_.push_back(std::move(block));
+        }
+    }
+
+    // An admission of one KV block on a full Device, released at once.
+    void AdmitOneBlockOnAFullDevice() {
+        HoldFreeCapacity(device_);
+        std::vector<BlockTable> tables(2);
+        ASSERT_TRUE(AdmitForTest(coordinator_, tables, coordinator_.ProbePrefix({}),
+                                 GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
+                                 StateStep{.kind = StateStep::Kind::kKeep}));
+        coordinator_.Free(tables);
+        held_.clear();
+    }
+
+    // The keys the plan's admissions recorded for their write-back drain.
+    static std::vector<CacheKey> RecordedKeys(const std::vector<CacheCoordinator::EvictedSegment>& segments) {
+        std::vector<CacheKey> keys;
+        for (const CacheCoordinator::EvictedSegment& segment : segments) {
+            for (const CacheCoordinator::EvictedBlock& member : segment.members) {
+                keys.push_back(member.key);
+            }
+        }
+        return keys;
+    }
+
+    BlockPool device_{32, {4, 1}};
+    BlockPool host_{32, {4, 1}};
+    CacheCoordinator coordinator_ = MakeCoordinator(kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_,
+                                                    /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                    /*write_back_evictions=*/true);
+    // Declared after the coordinator, so released before the pools.
+    std::vector<CacheBlockRef> held_;
+};
+
+// The unproven checkpoint at 8 sits under the established one at 16 and is
+// the oldest entry, so the admission takes it alone, first. With frequent
+// checkpoints on it is dropped, counted as the admission's victim and among
+// the unproven entries not written back; off, the same kChunk entry is an
+// ordinary probationary boundary, recorded for the Host.
+TEST_F(FrequentCheckpointWriteBackTest, AnUnprovenCheckpointIsDroppedNeverWrittenBack) {
+    for (const bool frequent : {true, false}) {
+        SCOPED_TRACE(frequent);
+        coordinator_.SetFrequentStateCheckpoints(frequent);
+        const std::vector<std::string> shorter = PublishAs(MakeTokens(8), CacheBoundaryKind::kChunk);
+        const std::vector<std::string> longer = PublishAs(MakeTokens(16), CacheBoundaryKind::kEndpoint);
+        const CacheCoordinator::DeviceEvictionStats before = coordinator_.DeviceEvictions();
+        const std::uint64_t dropped_before = coordinator_.UnprovenEntriesNotWrittenBack();
+        AdmitOneBlockOnAFullDevice();
+
+        EXPECT_FALSE(coordinator_.GroupPrefixIndex(kState).Contains(device_, Key(shorter[1], kState)));
+        EXPECT_TRUE(coordinator_.GroupPrefixIndex(kState).Contains(device_, Key(longer[3], kState)));
+        std::vector<CacheCoordinator::EvictedSegment> segments = coordinator_.TakeEvictedSegments();
+        EXPECT_EQ(RecordedKeys(segments),
+                  frequent ? std::vector<CacheKey>{} : std::vector<CacheKey>{Key(shorter[1], kState)});
+        for (CacheCoordinator::EvictedSegment& segment : segments) {
+            coordinator_.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+        }
+        EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks - before.admission.blocks, 1u);
+        EXPECT_EQ(coordinator_.UnprovenEntriesNotWrittenBack() - dropped_before, frequent ? 1u : 0u);
+        ASSERT_TRUE(coordinator_.ClearCache());
+    }
+}
+
+// Whatever evicts an unproven checkpoint -- a victim, or a request's own
+// released slot, which the drain counts as considered -- records nothing; a
+// checkpoint a hit acquired is proven and is written back.
+TEST_F(FrequentCheckpointWriteBackTest, OnlyAProvenCheckpointRidesAnEvictionWriteBack) {
+    const std::vector<std::string> unproven = PublishAs(MakeTokens(8, 1), CacheBoundaryKind::kChunk);
+    const std::vector<std::string> released = PublishAs(MakeTokens(8, 100), CacheBoundaryKind::kChunk);
+    const std::vector<std::string> proven = PublishAs(MakeTokens(8, 200), CacheBoundaryKind::kChunk);
+    {
+        const std::array<CacheKey, 1> keys{Key(proven[1], kState)};
+        coordinator_.GroupPrefixIndex(kState).AcquireMatched(device_, keys, /*begin_blocks=*/0,
+                                                             GroupPrefixProbe{.hits = {1}},
+                                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+    }
+    CacheCoordinator::EvictedSegment segment;
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(coordinator_, kState, StateLocationOf(unproven[1]),
+                                                           &CacheCoordinator::DeviceEvictionStats::admission,
+                                                           &segment));
+    EXPECT_TRUE(segment.members.empty());
+    const std::uint64_t considered_before = coordinator_.DeviceEvictions().request_reclaim_for_write_back;
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(coordinator_, kState, StateLocationOf(released[1]),
+                                                           &CacheCoordinator::DeviceEvictionStats::request_reclaim,
+                                                           &segment));
+    EXPECT_TRUE(segment.members.empty());
+    EXPECT_EQ(coordinator_.DeviceEvictions().request_reclaim_for_write_back - considered_before, 1u)
+        << "counted as considered, so the drain's outcomes add up";
+    EXPECT_EQ(coordinator_.UnprovenEntriesNotWrittenBack(), 2u);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(
+        coordinator_, kState, StateLocationOf(proven[1]), &CacheCoordinator::DeviceEvictionStats::admission, &segment));
+    ASSERT_EQ(segment.members.size(), 1u) << "a proven checkpoint is written back";
+    EXPECT_EQ(segment.members[0].key, Key(proven[1], kState));
+    EXPECT_EQ(coordinator_.UnprovenEntriesNotWrittenBack(), 2u);
+    coordinator_.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+}
+
+// The Host's order never meets an unproven checkpoint (none is ever written
+// back), and an unproven Device checkpoint does not make a Host copy
+// redundant. X's and Y's State are on the Host, X's copied first, both over
+// Device KV; the Device also holds Y's checkpoint, a frequent chunk end's. A
+// Host segment plan needing one victim takes the older X, since Y's Device
+// copy is unproven and may leave the Device at any publication; off, that
+// copy completes Y's Device boundary and Y's Host copy goes as its duplicate.
+TEST_F(FrequentCheckpointWriteBackTest, AnUnprovenDeviceCheckpointCoversNoHostCopy) {
+    for (const bool frequent : {true, false}) {
+        SCOPED_TRACE(frequent);
+        coordinator_.SetFrequentStateCheckpoints(frequent);
+        const std::vector<std::string> x = PublishAs(MakeTokens(16, 100), CacheBoundaryKind::kEndpoint);
+        const std::vector<std::string> y = PublishAs(MakeTokens(16, 1), CacheBoundaryKind::kChunk);
+        for (const std::vector<std::string>* pages : {&x, &y}) {
+            CacheBlockRef block = host_.AcquireBlock(kState);
+            coordinator_.CacheHostBlock(block, Key(pages->back(), kState), std::nullopt);
+        }
+        // X's Device checkpoint leaves; its pages stay under its Host copy.
+        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, kState, StateLocationOf(x.back())));
+        ASSERT_TRUE(coordinator_.GroupPrefixIndex(kFull).Contains(device_, Key(x.back(), kFull)));
+        HoldFreeCapacity(host_);
+        const std::array<std::uint32_t, 1> groups{kState};
+        const std::array<std::int32_t, 1> buckets{0};
+        const std::array<CacheCoordinator::HostSegmentRows, 1> segments{
+            CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+        CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostSegments(groups, buckets, segments);
+        ASSERT_TRUE(static_cast<bool>(batch.blocks[0]));
+        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(x.back(), kState)), !frequent);
+        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(y.back(), kState)), frequent);
+        batch.blocks.clear();
+        held_.clear();
+        ASSERT_TRUE(coordinator_.ClearCache());
+    }
+}
+
+// Admits `tokens` (whole pages of kFrequentPage tokens) into fresh tables
+// and publishes them, the State at the end as `state_kind` when
+// publish_state; returns the pages' chain hashes.
+constexpr std::int32_t kFrequentPage = 4;
+std::vector<std::string> PublishPagesInto(CacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                          const std::vector<std::int32_t>& tokens, bool publish_state,
+                                          CacheBoundaryKind state_kind) {
+    const auto num_tokens = static_cast<std::int32_t>(tokens.size());
+    EXPECT_TRUE(AdmitForTest(coordinator, tables, num_tokens));
+    std::vector<std::span<const std::int32_t>> pages;
+    for (std::int32_t page = 0; page < num_tokens / kFrequentPage; ++page) {
+        pages.emplace_back(tokens.data() + static_cast<std::ptrdiff_t>(page * kFrequentPage),
+                           static_cast<std::size_t>(kFrequentPage));
+    }
+    std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
+    coordinator.CacheCompletedBlocks(tables,
+                                     RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                                                                       .first_new_prefix_page = 0,
+                                                                                       .publish_state = publish_state,
+                                                                                       .boundary_kind = state_kind},
+                                                     .num_computed_tokens = num_tokens},
+                                     CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+    return hashes;
+}
+
+// An unproven checkpoint a plan selects no longer holds the pages above it
+// for the plan's later candidates, so the older chain still leaves whole
+// before a newer one. A (published first) has an unproven checkpoint at 8 and
+// an established one at 16, B an established one at 16; they fill eleven of
+// twelve parents, and the admission needs six. The unproven 8 leaves first,
+// then A's checkpoint at 16 with every page of A, which only it still needs:
+// B stays. Were the 8 still counted, A's pages 0-1 would look shared and the
+// plan would take B instead, keeping all of the older A, the unproven 8
+// included.
+TEST(FrequentCheckpointPlanTest, ASelectedUnprovenCheckpointLetsItsOlderChainLeaveWhole) {
+    BlockPool device(12, {1, 1});
+    BlockPool host(32, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kFrequentPage},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kFrequentPage, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    coordinator.SetFrequentStateCheckpoints(true);
+    const auto publish = [&](const std::vector<std::int32_t>& tokens, CacheBoundaryKind state_kind) {
+        std::vector<BlockTable> tables(2);
+        std::vector<std::string> hashes =
+            PublishPagesInto(coordinator, tables, tokens, /*publish_state=*/true, state_kind);
+        coordinator.Free(tables);
+        return hashes;
+    };
+    const std::vector<std::int32_t> a_tokens = MakeTokens(16, 1);
+    publish(std::vector<std::int32_t>(a_tokens.begin(), a_tokens.begin() + 8), CacheBoundaryKind::kChunk);
+    const std::vector<std::string> a = publish(a_tokens, CacheBoundaryKind::kEndpoint);
+    const std::vector<std::string> b = publish(MakeTokens(16, 100), CacheBoundaryKind::kEndpoint);
+    ASSERT_EQ(device.NumEmptyLcmBlocks(), 1);
+    ASSERT_TRUE(coordinator.HoldsUnprovenStateCheckpoint(a[1]));
+
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}),
+                             GroupDemand{.extent = DenseGrowth{6 * kFrequentPage}}, RequestProgress{},
+                             StateStep{.kind = StateStep::Kind::kKeep}));
+    const auto cached = [&](const std::string& hash, std::uint32_t group) {
+        return coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group))
+            .Contains(device, CacheKey{.group_id = group, .content_hash = hash});
+    };
+    for (const std::string& page : a) {
+        EXPECT_FALSE(cached(page, 0)) << "A leaves whole";
+    }
+    EXPECT_FALSE(cached(a[1], 1));
+    EXPECT_FALSE(cached(a[3], 1));
+    for (const std::string& page : b) {
+        EXPECT_TRUE(cached(page, 0)) << "the newer B stays";
+    }
+    EXPECT_TRUE(cached(b[3], 1));
+    EXPECT_EQ(coordinator.UnprovenEntriesNotWrittenBack(), 1u);
+    std::size_t recorded = 0;
+    for (CacheCoordinator::EvictedSegment& segment : coordinator.TakeEvictedSegments()) {
+        recorded += segment.members.size();
+        coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+    }
+    EXPECT_EQ(recorded, 5u) << "A's four pages and its checkpoint at 16";
+    coordinator.Free(tables);
+}
+
+// The deepest unproven checkpoint of a request still running past it leaves
+// alone under either write policy. A published one at its chunk end 8 and
+// released it, and still holds its pages 0-3; B's established chain is
+// newer and unpinned. An admission needing room takes A's checkpoint, the
+// oldest entry, by itself: under the write-back policy (segment eviction) its
+// segment would take its own page, which A holds, and the whole set would be
+// passed over for B's chain.
+TEST(FrequentCheckpointPlanTest, ARunningRequestsDeepestUnprovenCheckpointLeavesAlone) {
+    for (const bool write_back : {false, true}) {
+        SCOPED_TRACE(write_back ? "write-back" : "write-through");
+        BlockPool device(13, {1, 1});
+        BlockPool host(64, {1, 1});
+        const std::array specs{
+            CacheGroupSpec{
+                .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kFrequentPage},
+            CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        };
+        CacheCoordinator coordinator = MakeCoordinator(specs, kFrequentPage, device, /*enable_l3_storage=*/false, &host,
+                                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                       /*write_back_evictions=*/write_back);
+        coordinator.SetFrequentStateCheckpoints(true);
+        const std::vector<std::int32_t> a_tokens = MakeTokens(16, 1);
+        {
+            std::vector<BlockTable> tables(2);
+            PublishPagesInto(coordinator, tables, std::vector<std::int32_t>(a_tokens.begin(), a_tokens.begin() + 8),
+                             /*publish_state=*/true, CacheBoundaryKind::kChunk);
+            coordinator.Free(tables);
+        }
+        std::vector<BlockTable> running(2);
+        const std::vector<std::string> a =
+            PublishPagesInto(coordinator, running, a_tokens, /*publish_state=*/false, CacheBoundaryKind::kChunk);
+        std::vector<std::string> b;
+        {
+            std::vector<BlockTable> tables(2);
+            b = PublishPagesInto(coordinator, tables, MakeTokens(16, 100), /*publish_state=*/true,
+                                 CacheBoundaryKind::kEndpoint);
+            coordinator.Free(tables);
+        }
+        ASSERT_TRUE(coordinator.HoldsUnprovenStateCheckpoint(a[1]));
+        ASSERT_EQ(device.NumEmptyLcmBlocks(), 1);
+
+        std::vector<BlockTable> tables(2);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}),
+                                 GroupDemand{.extent = DenseGrowth{2 * kFrequentPage}}, RequestProgress{},
+                                 StateStep{.kind = StateStep::Kind::kKeep}));
+        const auto cached = [&](const std::string& hash, std::uint32_t group) {
+            return coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group))
+                .Contains(device, CacheKey{.group_id = group, .content_hash = hash});
+        };
+        EXPECT_FALSE(cached(a[1], 1)) << "A's unproven checkpoint leaves first";
+        EXPECT_TRUE(cached(b[3], 1)) << "B's established checkpoint stays";
+        for (const std::string& page : b) {
+            EXPECT_TRUE(cached(page, 0)) << "B's pages stay";
+        }
+        EXPECT_EQ(coordinator.UnprovenEntriesNotWrittenBack(), write_back ? 1u : 0u);
+        for (CacheCoordinator::EvictedSegment& segment : coordinator.TakeEvictedSegments()) {
+            coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+        }
+        coordinator.Free(tables);
+        coordinator.Free(running);
+    }
+}
+
 TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionFails) {
     BlockPool pool(3, {1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {
@@ -10908,6 +11627,58 @@ TEST_P(HostContinuationPlanTest, AResumedHostTailIsSupersededByItsDeviceContinua
 }
 
 INSTANTIATE_TEST_SUITE_P(DeviceCheckpointOwnership, HostContinuationPlanTest, ::testing::Values(false, true));
+
+// A frequent chunk end continues a resumed Host tail no more than any
+// unproven checkpoint does (CacheCoordinator::IsUnprovenStateCheckpoint): it
+// leaves the Device first and never reaches the Host. Published at 24 under
+// the admission's epoch, it supersedes the tail the request resumed from only
+// with frequent checkpoints off; on, the older session's tail leaves by its
+// age instead.
+class HostContinuationFrequentPlanTest : public HostSegmentPlanTest, public ::testing::WithParamInterface<bool> {};
+
+TEST_P(HostContinuationFrequentPlanTest, AnUnprovenDeviceContinuationSupersedesNoHostTail) {
+    const bool frequent = GetParam();
+    coordinator_.SetFrequentStateCheckpoints(frequent);
+    const TailPublication older = *WriteBack(MakeTokens(18, 100));
+    const std::vector<std::int32_t> tokens = MakeTokens(26);
+    const TailPublication tail = *WriteBack({tokens.begin(), tokens.begin() + 18});
+    const std::vector<std::string> input_hashes = hashes_;
+    {
+        std::vector<BlockTable> tables(4);
+        const auto admitted = AdmitForTest(
+            coordinator_, tables,
+            coordinator_.ProbePromptPrefix({.prefix_hashes = input_hashes, .tokens = tokens, .max_tokens = 18}),
+            GroupDemand{.extent = DenseGrowth{8}});
+        ASSERT_TRUE(admitted.has_value());
+        std::vector<std::vector<std::int32_t>> pages;
+        for (std::int32_t page = 0; page < 6; ++page) {
+            pages.emplace_back(tokens.begin() + page * kP, tokens.begin() + (page + 1) * kP);
+        }
+        hashes_ = ContentHashes(pages);
+        const RequestProgress progress{
+            .completed_pages =
+                CompletedPages{
+                    .prefix_hashes = hashes_, .publish_state = true, .boundary_kind = CacheBoundaryKind::kChunk},
+            .num_computed_tokens = 24,
+        };
+        coordinator_.CacheCompletedBlocks(tables, progress, admitted->access_epoch);
+        coordinator_.Free(tables);
+    }
+    ASSERT_EQ(coordinator_.HoldsUnprovenStateCheckpoint(hashes_.back()), frequent);
+    HoldFreeCapacity(host_pool_, /*spare_parents=*/0);
+    const std::array segments{HostSegmentRows{.first_row = 0, .past_end_row = 3}};
+    const CacheCoordinator::HostAllocationBatch batch =
+        coordinator_.AcquireHostSegments(state_group_ids_, zero_buckets_, segments);
+
+    EXPECT_EQ(batch.stats.allocated, 3u);
+    for (std::uint32_t group = 0; group < 4; ++group) {
+        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(tail.hash, group)), frequent) << "group " << group;
+        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(older.hash, group)), !frequent) << "group " << group;
+    }
+    EXPECT_EQ(coordinator_.HostEvictions().superseded.blocks, frequent ? 0u : 4u);
+}
+
+INSTANTIATE_TEST_SUITE_P(FrequentOffAndOn, HostContinuationFrequentPlanTest, ::testing::Bool());
 
 // The next prompt can share the aligned checkpoint and diverge before the
 // deeper Device frontier. Its KV remains usable while Host State ages by LRU.

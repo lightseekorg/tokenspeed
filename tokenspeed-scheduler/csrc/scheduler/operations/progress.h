@@ -54,15 +54,25 @@ enum class PublicationPoint {
     // at a junction -- and the partial page's KV, which a junction has cached
     // already, stays the owner's, unpublished (OwnerTail::kKept).
     kStateCheckpoint,
+    // A page-aligned prefill chunk end that is a frequent State checkpoint
+    // (SchedulerConfig::frequent_state_checkpoints): the full pages publish
+    // as at kChunk, and so does every State group's slot 1, as an unproven
+    // checkpoint (CacheBoundaryKind::kChunk) that a hit promotes. There is no
+    // tail, so the owner holds no copy-in block for it and moves off no
+    // published block: slot 1 rotates into slot 0.
+    kFrequentStateCheckpoint,
 };
 
 // Hashes the full prefix pages num_computed_tokens has filled since the
 // previous publication, and at a non-chunk point the partial page beyond
-// them, and states the request's progress for the coordinator. A non-chunk
-// point may publish the live state only when allow_state_checkpoint is true.
-// A retained in-forward checkpoint is published whenever its frontier has been
-// reached, independently of the live-state policy. The returned spans view
-// cache_progress, which must outlive their use.
+// them (a kFrequentStateCheckpoint point, page-aligned, has none), and
+// states the request's progress for the coordinator. Every point but kChunk
+// publishes the frontier's live state (at a kFrequentStateCheckpoint point
+// as an unproven checkpoint), even with nothing new to hash, but only when
+// allow_state_checkpoint is true. A retained in-forward checkpoint is
+// published whenever its frontier has been reached, independently of the
+// live-state policy. The returned spans view cache_progress, which must
+// outlive their use.
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host, PublicationPoint point,

@@ -134,7 +134,9 @@ arithmetic kept out of the planner: how a chunk is cut lives in
 entry both prefill paths call), what each group demands for it in
 `scheduler/operations/group_demands.h`.
 
-**Junction cut.** A chunk is never shortened to a page boundary: a prompt
+**Junction cut.** Apart from the opt-in State checkpoint modes of §1.2, which
+round a chunk down to a page and never cut it at a fixed position, a chunk is
+never shortened to a page boundary: a prompt
 end publishes its partial page as a tail (§1.2), so a chunk ending mid-page
 costs nothing. The one cut is the *junction* of a hybrid hit: when the KV
 groups' hit `T` reaches past the longest state checkpoint `T_s`
@@ -145,8 +147,10 @@ prompt sharing that prefix resumes at `T` in every group. The next chunk's
 admission publishes that checkpoint (`PublicationPoint::kStateCheckpoint`):
 the state under the junction's key, but not the KV there, which is cached
 already, so the owner keeps writing its partial block and needs no copy-in
-(`cache-concepts.md`, copy-in). Every other chunk end publishes only its
-completed full pages.
+(`cache-concepts.md`, copy-in). One ending on a frequent State checkpoint
+(§1.2, `PublicationPoint::kFrequentStateCheckpoint`) publishes its completed
+full pages and its state, on a page, so it needs no copy-in either. Every
+other chunk end publishes only its completed full pages.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
@@ -276,7 +280,8 @@ published), and a finish or retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state),
 except the dead prompt ends and finishes that the in-forward checkpoint
 skips (below). An ordinary chunk end or decode step publishes nothing for a State
-group (`CompletedPages::publish_state` is false). The key is the key of the
+group (`CompletedPages::publish_state` is false), except the opt-in frequent
+checkpoints below. The key is the key of the
 exact token count `T`: the chain hash of the last page when `T` is a page
 multiple, otherwise the tail hash `hash@T` the KV groups use — so one key
 names a request's progress across every group kind (`cache-concepts.md`). A
@@ -390,6 +395,80 @@ decode-produced state, which those groups keep private anyway. Their other
 unaligned prompt ends still publish a KV tail, although no hit resumes there
 either.
 
+**Frequent checkpoints (opt-in).** A prompt that diverges from an earlier one
+long before its end -- a sibling sharing a long prefix with an earlier
+prompt -- finds only the natural checkpoints, often far behind its
+divergence. With `frequent_state_checkpoints`
+(`--enable-frequent-state-checkpoints`, off by default, requires prefix
+caching and an explicit `max_unproven_state_checkpoints`), every local
+prefill chunk end `e` on a page inside the prompt
+(`FrequentStateCheckpointAt`: `0 < e < PrefillSize()`, a multiple of the
+page) is a checkpoint too, the start of the prompt's last chunk included: a
+prefill holds the head of line until its last chunk is scheduled, so a
+sibling is admitted beside that chunk or after it, while the first prompt's
+KV is published only through that start until its first decode (on the P
+role its hand-off) publishes the prompt. A chunk that would end past a page
+at least one chunk budget before the prompt end ends on it instead
+(`ChunkEndingOnFrequentStateCheckpoint`: fewer than a page of tokens moves
+to the next chunk; no chunk is cut at a fixed position). Within the prompt's
+last budget no chunk is rounded, so a follow-up computing little past its
+hit is chunked exactly as without the mode, its chunk ends checkpoints where
+they fall on a page. The next chunk's admission publishes the full pages as
+at any chunk end and every State group's slot 1 under the page's chain hash
+(`PublicationPoint::kFrequentStateCheckpoint`): the block the chunk wrote,
+which then rotates into slot 0, so no forward or runtime change is involved,
+the request holds no third block (the published one stays in the cache, one
+block per State group) and no copy-in block (a page-aligned point publishes
+no tail), and any State backend serves it. A junction or
+in-forward boundary the chunk ended on stays a natural checkpoint
+(`kStateCheckpoint`); the two modes are meant to be used together. Such a
+checkpoint is **unproven** -- `CacheBoundaryKind::kChunk`, registered at the
+logical index of its page depth (`CacheCoordinator::IsUnprovenStateCheckpoint`,
+which only the mode makes true) -- until a hit acquires it or an endpoint
+republishes it (raising its kind). The AdmissionPlanner ranks it at its own
+access epoch like any entry (an aged one at its retention rank, like any
+checkpoint: `cache-concepts.md`, checkpoint retention), first within that
+epoch (a probationary boundary), the shallowest first, so a chain keeps its
+deepest one; the
+uncached blocks and a superseded input (epoch 0) leave before it. No class
+sets it ahead of older epochs: the Device is full in steady state, and such
+a class would hand every unproven checkpoint to the next admission that
+needs room, seconds before the sibling it was written for arrives. It leaves alone, every State group's block at once, never as a
+segment of its pages, which a request still running past it may hold; once
+selected it no longer holds the pages above it for the candidates that
+follow (an established checkpoint boundary does until the candidates run
+out: `cache-concepts.md`, `AdmissionPlanner`), so the chain under them still
+leaves whole with its next checkpoint boundary. Their number is bounded by
+the cap: after each admission that publishes one,
+`TrimUnprovenStateCheckpoints` evicts the unpinned unproven checkpoints
+beyond `max_unproven_state_checkpoints`, the oldest request's first, the
+shallowest first within one (`Scheduler::UnprovenStateCheckpointTrims`
+counts them). Pinned ones count: a running prefill's slot 0, and the last
+chunk's start until the first decode, or on the P role until the hand-off is
+acknowledged, so the cap should exceed the prefills the role keeps in
+flight. An unproven checkpoint never reaches the Host -- never streamed at
+publication, never queued at a finish, never an L2 entry of a retraction
+image (it rides the snapshot pool), and under the write-back policy
+whatever evicts it drops it instead of writing it back
+(`HostCacheStats::unproven_entries_not_written_back`); a proven one is
+written back like any entry, and an image carries it as an endpoint's, so a
+restore that republishes it keeps it established. Nor does
+an unproven Device checkpoint shape the Host's order: a Host segment plan
+takes no Host copy for its duplicate and no Host tail for its continuation.
+A publication in place at a dead prompt end (above) never counts one as the
+cached `C` (`HoldsStateCheckpoint`), so a fragile checkpoint never stands in
+for a published one; and no frequent position is a prompt end or a finish,
+so none brings back a dropped one. With the mode on, a state published where
+no new page is hashed (a frequent, junction or in-forward boundary a
+restored prefill resumes at) is published only while every prefix-closed
+group holds that page's KV on the Device; off, the publication is the one
+without the mode.
+Either way a state published at a page boundary registers that page's KV
+event descriptor. Each checkpoint costs one block per State group -- as much
+as one request's whole recurrent state -- taken from the Device cache that
+would otherwise hold reusable entries, so the cap bounds their Device
+footprint: `max_unproven_state_checkpoints` times that state size.
+
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
 `Finishing` and nothing else; after every batch of events,
@@ -435,9 +514,10 @@ groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
 shares the prefix resumes at the KV boundary in every group. For unrestricted
-State groups no alignment is imposed on a chunk, and apart from the opt-in
-in-forward checkpoint above no checkpoint is produced inside a forward: a
-chunk's state output is its own natural checkpoint.
+State groups, apart from the opt-in modes above, which end some chunks on a
+page, no alignment is imposed on a chunk for the state's sake, and apart from
+the in-forward checkpoint no checkpoint is produced inside a forward: a
+chunk's state output is its own checkpoint.
 The backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
 
@@ -490,16 +570,25 @@ every role — the pair, never a page per token — so `ReservePrefillDemands`
 reserves nothing for it and the capacity model (§1.4) charges `2` per request.
 An in-forward checkpoint's block is a third only between its forward and the
 next publication point, and only when the pool holds it then (otherwise the
-chunk is cut at the boundary); the bound charges nothing for it.
+chunk is cut at the boundary); the bound charges nothing for it. A frequent
+checkpoint is no holding at all: it is the slot 1 a chunk wrote, and once
+published it is a cache entry that `max_unproven_state_checkpoints` bounds
+and the planner ranks by its access epoch.
 On the D role the landing writes slot 1 and slot 0 stays null unless this
 node already holds the prompt-end checkpoint (§3.2).
 
 **Retraction and restore.** A victim publishes its frontier like a finish, so
-its slot 1 rides the L2 leg of the image when there is a Host cache and the
-unpublished slot 0 goes to the snapshot pool (§2). The restore rebuilds the
-pair in place (`StateStep::kKeep`), copying the published slot 1 into a fresh
-block rather than claiming it — the resumed request writes it next — so a
-resumed request needs no checkpoint it did not already own (§4).
+its slot 1 rides the L2 leg of the image when there is a Host cache and an
+unpublished or unproven slot 0 goes to the snapshot pool (§2). The restore
+rebuilds the pair in place (`StateStep::kKeep`), copying the published slot 1
+into a fresh block rather than claiming it — the resumed request writes it
+next — so a resumed request needs no checkpoint it did not already own (§4).
+A prefill resumed at a page-aligned frontier that is a junction, an
+in-forward boundary or a frequent checkpoint publishes the state there again
+at its next chunk, without hashing a new page. Without a Host cache its pages
+are private copies by then, and the cache may have evicted the published
+ones meanwhile; with frequent checkpoints on, a state keyed by a page whose
+KV has left the Device is not published, since nothing could match it.
 
 ### 1.3 Bounded replay
 
@@ -765,7 +854,8 @@ State group's slot 1; §1.2), then `TierTransferManager::SplitRetractionImage`
 classifies every data slot of every table and `StartRetractionStores` takes
 the image as the split planned:
 
-- *The L2 leg.* A slot whose Device block is a published prefix entry becomes
+- *The L2 leg.* A slot whose Device block is a published prefix entry,
+  except an unproven State checkpoint (§1.2), becomes
   an ordinary Host L2 entry, acquired — like every Host copy — in the Device
   block's bucket (`cache-concepts.md`, placement). Keys already Host-cached, or
   carried by a store still in flight that publishes them at its ACK (never an
@@ -784,11 +874,12 @@ the image as the split planned:
   canonical block and lets its own unindexed block return to the pool. An image
   therefore never pins a Host block the index does not know, and the restore's
   L2 rows always come from published entries.
-- *The pool leg.* Every other slot — a State group's unpublished slot 0,
-  replayable groups, any block the index did not take, the published slots
-  the Host does not take (below), and with no Host cache the whole image —
-  gets a block of the request-private **snapshot pool** (`snapshot_allocator`;
-  never prefix-indexed, never evicted), again in the Device block's bucket.
+- *The pool leg.* Every other slot — a State group's unpublished or unproven
+  slot 0 (§1.2), replayable groups, any block the index did not take, the
+  published slots the Host does not take (below), and with no Host cache the
+  whole image — gets a block of the request-private **snapshot pool**
+  (`snapshot_allocator`; never prefix-indexed, never evicted), again in the
+  Device block's bucket.
   These rows, plus the **slot-state blob** of the request's runtime row
   (sampling state, speculative readiness — exported by the runtime into
   `snapshot_slot`), ride one `SnapshotStoreOperation`; the op may carry zero
@@ -1181,8 +1272,9 @@ reserve is needed — scheduling order is the capacity priority.
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is
 one: with L2 the published prefix — tail and state checkpoint included —
-travels as pinned L2 entries and only the unpublished slots go to the snapshot
-pool; without L2 the whole image goes to the pool.
+travels as pinned L2 entries and only the unpublished slots (and an unproven
+checkpoint, §1.2) go to the snapshot pool; without L2 the whole image goes to
+the pool.
 Either way the request resumes where it stopped, and never competes for
 admission as a newcomer.
 
@@ -1344,14 +1436,14 @@ registers every boundary it may mutate, the page a state is published under
 included, even when it hashes no new page (a prefill resumed at its
 retraction frontier republishes the state there). A boundary is
 `BlockStored` only while every group holds its child -- the State groups
-included, whose checkpoint exists only at a natural point or the opt-in
-in-forward checkpoint (§1.2) -- so a hybrid model emits `BlockStored` for
-its prompt end and its finish (unless they are dead, §1.2), its junction
-cuts and the in-forward checkpoint's page boundary, never for another
-interior chunk end's chain hash; a tail's descriptor carries the rows below
-`T` and the residency check counts a tail's blocks from it. Retraction
-publishes twice without an admission: `retractVictim` registers the newly
-hashed pages before
+included -- so a hybrid model emits `BlockStored` for its prompt end and its
+finish (unless they are dead, §1.2), its junction cuts and an interior chain
+hash where a State checkpoint is published (the in-forward checkpoint or a
+frequent one, §1.2), and `BlockRemoved` once that checkpoint leaves again (a
+trim, an eviction); never for another interior chunk end's chain hash. A
+tail's descriptor carries the rows below `T` and the residency check counts a
+tail's blocks from it. Retraction publishes twice without an admission:
+`retractVictim` registers the newly hashed pages before
 `CacheCompletedBlocks` (as the finish-time publication does), and the
 `RestoreDone` handler registers the restored request's whole prefix chain
 before `CompleteSnapshotRestore` republishes its L2-tier destinations — the
@@ -1565,6 +1657,16 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   that overtakes a forward still in flight (an overlapped decode) publishes
   the KV rows below the frontier, which are final, but not the State
   groups' live slot that forward is writing (`PublicationPoint::kFinalKvOnly`).
+- An unproven State checkpoint (§1.2) is only ever a page-aligned local prefill
+  chunk end inside its prompt, never a decode step, a junction or an
+  in-forward boundary (those are endpoints). After every admission that
+  publishes one, the Device caches at most `max_unproven_state_checkpoints`
+  of them unless the excess is pinned (pinned ones count, and the cap never
+  evicts them), and the planner ranks the unpinned ones by their access
+  epochs, each leaving alone; none reaches Host -- not streamed by its
+  publication, queued or copied by a finish or carried by a retraction
+  image's L2 leg; a hit or an endpoint republication promotes it to ordinary
+  cache.
 - A `Retracted` request holds no Device pages; its image is held by that state
   alone (Host pins and pool refs) and dropped with it. It becomes a
   readmission candidate only once every store it waits for has landed, at

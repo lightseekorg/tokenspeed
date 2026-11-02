@@ -47,6 +47,32 @@ std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, s
     return 0;
 }
 
+bool FrequentStateCheckpointAt(std::int32_t boundary_tokens, std::int32_t prompt_tokens,
+                               std::int32_t prefix_granularity) {
+    _assert(prefix_granularity > 0, "a frequent checkpoint needs a positive page");
+    return boundary_tokens > 0 && boundary_tokens < prompt_tokens && boundary_tokens % prefix_granularity == 0;
+}
+
+std::int32_t ChunkEndingOnFrequentStateCheckpoint(std::int32_t first_pos, std::int32_t tokens,
+                                                  std::int32_t prompt_tokens, std::int32_t junction_tokens,
+                                                  std::int32_t chunk_budget, std::int32_t prefix_granularity) {
+    _assert(first_pos >= 0 && tokens > 0 && first_pos + tokens <= prompt_tokens,
+            "a chunk lies inside its prompt and computes at least one token");
+    _assert(chunk_budget > 0 && prefix_granularity > 0, "a chunk rounds to a page under a positive budget");
+    const std::int32_t end = first_pos + tokens;
+    if (end == prompt_tokens || (junction_tokens > 0 && end == junction_tokens)) {
+        return tokens;
+    }
+    // Only a page at least one budget before the prompt end draws a chunk end
+    // onto it; the last budget is left as the chunking without the mode cuts it.
+    const std::int32_t page_end = end / prefix_granularity * prefix_granularity;
+    if (page_end > first_pos && FrequentStateCheckpointAt(page_end, prompt_tokens, prefix_granularity) &&
+        page_end + chunk_budget <= prompt_tokens) {
+        return page_end - first_pos;
+    }
+    return tokens;
+}
+
 std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t unscheduled,
                                      std::int32_t replay_window) {
     _assert(0 <= prefill_tokens && prefill_tokens <= unscheduled, "a chunk cannot exceed the unscheduled prompt");

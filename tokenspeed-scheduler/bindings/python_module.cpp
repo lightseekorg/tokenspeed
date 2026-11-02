@@ -173,7 +173,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
-        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance);
+        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
+        // Prefill chunk ends on a page inside the prompt publish unproven
+        // State checkpoints; the cap is required (>= 1) with the mode, 0
+        // without.
+        .def_rw("frequent_state_checkpoints", &tokenspeed::SchedulerConfig::frequent_state_checkpoints)
+        .def_rw("max_unproven_state_checkpoints", &tokenspeed::SchedulerConfig::max_unproven_state_checkpoints);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -293,7 +298,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
         .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
-        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection);
+        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection)
+        .def_ro("unproven_state_checkpoint_trim",
+                &tokenspeed::CacheCoordinator::DeviceEvictionStats::unproven_state_checkpoint_trim);
     nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
         .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
         .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
@@ -325,6 +332,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
         .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
+        .def_ro("unproven_entries_not_written_back", &tokenspeed::HostCacheStats::unproven_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 
@@ -654,6 +662,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Published partial-page boundaries (hash@T) the prefix probe can resume at.")
         .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
              "Tails dropped because more than eight were published under one prior page.")
+        .def("unproven_state_checkpoint_trims", &tokenspeed::Scheduler::UnprovenStateCheckpointTrims,
+             "Unproven frequent State checkpoints evicted to stay within max_unproven_state_checkpoints.")
         .def("can_abort_before_admission", &tokenspeed::Scheduler::CanAbortBeforeAdmission, nb::arg("id"))
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
