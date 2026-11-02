@@ -488,6 +488,7 @@ public:
     // Present source blocks refresh matching entries without pinning or inserting them.
     void TouchExisting(const BlockPool& pool, std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks,
                        std::uint64_t access_epoch) {
+        _assert(blocks.size() <= keys.size(), "source block span exceeds key span");
         CacheEntries* entries = findCacheEntries(pool);
         if (entries == nullptr) {
             return;
