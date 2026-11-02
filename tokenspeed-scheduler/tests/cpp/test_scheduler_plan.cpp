@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -1405,6 +1406,250 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     for (std::int32_t i = 0; i < 3; ++i) {
         const auto row = reuse->BlockTables().at("linear_attention_" + std::to_string(i)).at(0);
         EXPECT_GT(row.at(0), 0) << "the junction checkpoint is the chunk's input";
+    }
+}
+
+// prefill_decode_interval: after a round that schedules a prefill chunk, the
+// next N rounds that can schedule a decode run decodes alone, but no prompt
+// is held back more than N rounds in total.
+class PrefillDecodeIntervalSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.prefill_decode_interval = 2;
+        // Two pages per chunk: a 6-page prompt takes three prefill rounds.
+        cfg.max_scheduled_tokens = 4;
+        return cfg;
+    }
+
+    // Plans one round, lands its forward and returns what the round ran:
+    // "P:<ids>" when it scheduled a prefill chunk, "D:<ids>" for decodes only,
+    // "-" for no forward. `chunking` names prompts whose chunk this round
+    // leaves incomplete (an intermediate chunk produces no token). Retraction
+    // images and restores the plan starts land with it.
+    std::string Round(const std::set<std::string>& chunking = {}) {
+        const ExecutionPlan plan = PlanOnce();
+        AckImageStores(plan);
+        AckRestores(plan);
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->request_ids.empty()) {
+            return "-";
+        }
+        std::string ran = batch->NumExtends() > 0 ? "P:" : "D:";
+        for (const std::string& id : batch->request_ids) {
+            ran += id;
+            SendForwardDone(id, chunking.contains(id) ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{7});
+        }
+        return ran;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalSuite, ANewPromptWaitsForTheIntervalsDecodeRounds) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    EXPECT_EQ(Round(), "D:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");  // the second decode round owed since a's prefill
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, APromptIsHeldBackAtMostTheIntervalAcrossItsChunks) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b's first chunk started a new interval, but b has already been held
+    // back two rounds: the interval is suspended until b is done.
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, SuspendedRoundsDoNotCountForAWaitingPrompt) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    Submit(MakeRequestSpec("c", 1, /*start=*/200));
+    // b's chunks fill each round's budget, so c waits behind them; the
+    // interval is suspended, so these rounds do not count against c.
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "P:c");
+}
+
+class PrefillDecodeIntervalTwoSlotsSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.max_batch_size = 2;
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalTwoSlotsSuite, APromptWaitingForASlotCountsTheRoundsItIsHeldBack) {
+    Submit(MakeRequestSpec("a", 1));
+    EXPECT_EQ(Round(), "P:a");
+    Submit({MakeRequestSpec("b", 6, /*start=*/100), MakeRequestSpec("c", 1, /*start=*/200)});
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    // b takes the second slot; c, held back two rounds, waits for a slot and
+    // suspends the interval meanwhile.
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+    SendFinish("a");
+    // b's last chunk started an interval that still owes a round, but c is
+    // overdue: it runs as soon as it has a slot.
+    EXPECT_EQ(Round(), "P:c");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, APromptRunsAtOnceWhenNoDecodeIsRunning) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    SendFinish("a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    // Two decode rounds are owed, but nothing can decode: the engine would
+    // idle, so the prefill runs.
+    EXPECT_EQ(Round(), "P:b");
+}
+
+TEST_F(PrefillDecodeIntervalTwoSlotsSuite, SuspendedDecodeRoundsDoNotCountForAWaitingPrompt) {
+    Submit(MakeRequestSpec("a", 1));
+    EXPECT_EQ(Round(), "P:a");
+    Submit({MakeRequestSpec("b", 6, /*start=*/100), MakeRequestSpec("c", 1, /*start=*/200)});
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "P:b");
+    Submit(MakeRequestSpec("d", 1, /*start=*/300));
+    // c, overdue and without a slot, suspends the interval: these decode
+    // rounds do not count against d.
+    EXPECT_EQ(Round(), "D:ab");
+    EXPECT_EQ(Round(), "D:ab");
+    SendFinish("a");
+    EXPECT_EQ(Round(), "P:c");
+    EXPECT_EQ(Round(), "D:bc");
+    SendFinish("b");
+    // d has been held back one round, so the interval still holds it.
+    EXPECT_EQ(Round(), "D:c");
+    EXPECT_EQ(Round(), "P:d");
+}
+
+class PrefillDecodeIntervalRetractionSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.debug_force_retraction_interval = -5;  // the oldest Prefilling request, every fifth plan
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalRetractionSuite, ARestoredPromptKeepsTheRoundsItWasHeldBack) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");  // plan 5 retracts b
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_EQ(Round(), "D:a");  // b's restore rides beside the decode
+    ASSERT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b's chunk started a new interval, but b keeps the two rounds it was
+    // held back before its retraction.
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+class PrefillDecodeIntervalCapacitySuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.prefill_decode_interval = 9;
+        cfg.max_scheduled_tokens = 8;
+        cfg.device_allocator.total_pages = 14;
+        cfg.cache_groups.front().total_pages = 14;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeIntervalCapacitySuite, APromptRetractedWhileHeldBackCountsThatRound) {
+    Submit({MakeRequestSpec("a", 2), MakeRequestSpec("d", 1, /*start=*/300), MakeRequestSpec("b", 6, /*start=*/100)});
+    EXPECT_EQ(Round({"b"}), "P:adb");
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_EQ(Round(), "D:ad");
+    }
+    // The ninth round b is held back, a's next page retracts it.
+    EXPECT_EQ(Round(), "D:ad");
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    SendFinish("a");
+    EXPECT_EQ(Round(), "D:d");  // b's restore rides beside the decode
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b's chunk started a new interval, but the round b was retracted in
+    // counts: b has been held back nine rounds and runs on.
+    EXPECT_EQ(Round(), "P:b");
+}
+
+class MixedPrefillDecodeIntervalSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        cfg.max_scheduled_tokens = 64;
+        return cfg;
+    }
+};
+
+TEST_F(MixedPrefillDecodeIntervalSuite, ADeferredPromptJoinsNoDecodeRound) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 2, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:ba");  // the mixed round: prefill rows first
+}
+
+TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole) {
+    const auto config = [](Role role, std::int32_t interval) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.prefill_decode_interval = interval;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, 4).Validate());
+    for (const auto& [role, interval] : {std::pair{Role::kP, 4}, std::pair{Role::kD, 4}, std::pair{Role::kFused, -1}}) {
+        try {
+            config(role, interval).Validate();
+            ADD_FAILURE() << "prefill_decode_interval " << interval << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("prefill_decode_interval"), std::string::npos) << error.what();
+        }
     }
 }
 
