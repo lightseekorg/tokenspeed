@@ -88,8 +88,7 @@ def test_temporary_packed_history_and_current_keep_exact_bytes(
     monkeypatch.setattr(
         dist, "get_process_group_ranks", lambda group: list(range(degree))
     )
-    monkeypatch.setattr(dist, "new_group", lambda **kwargs: object())
-    monkeypatch.setattr(dist, "destroy_process_group", lambda group: None)
+
     local_rows, null_rows = 512, 128
     history_counts = tuple(128 if owner < 2 else 0 for owner in range(degree))
     cache = [payload(local_rows, 576, 100 + owner) for owner in range(degree)]
@@ -142,7 +141,7 @@ def test_temporary_packed_history_and_current_keep_exact_bytes(
         cache[rank].unsqueeze(1),
         index[rank].unsqueeze(1) if has_index else None,
         ranks=tuple(range(degree)),
-        bootstrap_group=object(),
+        history_group=object(),
         max_current_rows=total,
         history_null_rows=null_rows,
     )
@@ -214,7 +213,7 @@ def test_history_ensure_rejects_stale_batch_and_different_stream(
         cache,
         None,
         ranks=(0,),
-        bootstrap_group=object(),
+        history_group=object(),
         max_current_rows=1,
         history_null_rows=128,
     )

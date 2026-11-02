@@ -358,3 +358,10 @@ interfaces. Tensor references and allocator stream tracking cover every queued
 consumer. Weight preparation and Decode graph behavior remain unchanged.
 These byte-preserving gathers do not establish cross-provider bitwise equality
 for attention arithmetic or reductions.
+
+Prefill KV transport borrows an isolated accelerator process group from the
+runtime process-group manager. All world ranks create the cache-owner groups
+in the same order when publishing the cache pool, before any forward or
+decode graph capture. A forward never creates a process group; an idle DP
+rank still participates in startup. Temporary tensor ownership ends after
+the final consumer, while the process-group manager retains the communicator.

@@ -41,7 +41,7 @@ class AscendDSAPrefill:
         index_cache,
         *,
         ranks,
-        bootstrap_group,
+        history_group,
         max_current_rows,
         history_null_rows,
     ):
@@ -65,14 +65,13 @@ class AscendDSAPrefill:
 
         if not hasattr(torch.ops.custom, "dsa_cp_patch"):
             raise RuntimeError("flash_ops is missing the ACLNN DSA CP patch adapter")
-        if not set(ranks).issubset(dist.get_process_group_ranks(bootstrap_group)):
-            raise ValueError("Prefill bootstrap group must cover all cache owners")
+        if self.degree > 1 and (
+            history_group is None
+            or tuple(dist.get_process_group_ranks(history_group)) != tuple(ranks)
+        ):
+            raise ValueError("Prefill collective group must match cache owners")
         self.compute_stream = None
-        self.history_group = None
-        if self.degree > 1:
-            self.history_group = dist.new_group(
-                ranks=list(ranks), backend="hccl", use_local_synchronization=True
-            )
+        self.history_group = history_group
         self.layer_id = None
         self.batch_key = None
         self._sources = None
@@ -364,14 +363,12 @@ class AscendDSAPrefill:
         self._meta.clear()
 
     def close(self):
-        """Drain execution before destroying the owned communicator."""
+        """Drain execution; the runtime manager owns the collective group."""
         if self._closed:
             return
         if self.compute_stream is not None:
             self.compute_stream.synchronize()
-        if self.history_group is not None:
-            dist.destroy_process_group(self.history_group)
-            self.history_group = None
+        self.history_group = None
         self.kv = self.index = self._sources = self.batch_key = self.layer_id = None
         self._current.clear()
         self._meta.clear()

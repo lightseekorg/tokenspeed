@@ -280,7 +280,7 @@ class AscendDSAKernels:
         index_cache,
         *,
         ranks,
-        bootstrap_group,
+        history_group,
         max_current_rows,
         history_null_rows,
     ):
@@ -288,7 +288,7 @@ class AscendDSAKernels:
             kv_cache,
             index_cache,
             ranks=ranks,
-            bootstrap_group=bootstrap_group,
+            history_group=history_group,
             max_current_rows=max_current_rows,
             history_null_rows=history_null_rows,
         )

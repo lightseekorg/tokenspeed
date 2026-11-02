@@ -66,7 +66,7 @@ class PrefillMetadata:
         return self.extend_prefix_lens_cpu.to(self.page_table.device)
 
 
-def bounded_transport(rank, degree, scratch_pool):
+def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
     """Uneven/empty owners, shared pages, both planes and mapped commits."""
     from tokenspeed.runtime.layers.attention.dcp.ascend import (
         AscendPrefillOptions,
@@ -91,8 +91,8 @@ def bounded_transport(rank, degree, scratch_pool):
         runtime = AscendDSAPrefill(
             cache,
             index,
-            ranks=tuple(range(degree)),
-            bootstrap_group=dist.group.WORLD,
+            ranks=ranks,
+            history_group=groups[int(has_index)],
             max_current_rows=capacity.max_current_rows,
             history_null_rows=capacity.kv_page_size,
         )
@@ -134,7 +134,7 @@ def bounded_transport(rank, degree, scratch_pool):
             rows = sum(extends)
             lengths = torch.tensor(extends)
             past = torch.tensor(prefixes)
-            placement = CachePlacement(128, degree * 31 + 1, tuple(range(degree)), rank)
+            placement = CachePlacement(128, degree * 31 + 1, ranks, rank)
             kwargs = {
                 "degree": degree,
                 "rank": rank,
@@ -169,12 +169,13 @@ def bounded_transport(rank, degree, scratch_pool):
                     getattr(plan, name).cpu(), getattr(cpu_plan, name), rtol=0, atol=0
                 )
             histories = [
-                bits(local_rows, 31000 + case * 31 + peer) for peer in range(degree)
+                bits(local_rows, 31000 + ranks[0] * 1000 + case * 31 + peer)
+                for peer in range(degree)
             ]
             cache.copy_(histories[rank])
             if has_index:
                 index.copy_(histories[rank][:, :128])
-            values = bits(rows, 41000 + case)
+            values = bits(rows, 41000 + ranks[0] * 1000 + case)
             begin = sum(plan.row_counts[:rank])
             end = begin + plan.row_counts[rank]
             slots = torch.cat(
@@ -278,9 +279,6 @@ def bounded_transport(rank, degree, scratch_pool):
             )
         for actual, expected in pending:
             exact(actual, expected)
-    # Keep both groups alive through the suite. Torch's local-synchronization
-    # group names depend on the number of live groups; destroy/recreate would
-    # reuse the first group's store keys and stale HCCL root info.
     for runtime in runtimes:
         runtime.close()
     return results
@@ -289,7 +287,11 @@ def bounded_transport(rank, degree, scratch_pool):
 def main():
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    degree = int(os.environ["WORLD_SIZE"])
+    world = int(os.environ["WORLD_SIZE"])
+    degree = int(os.environ.get("TEST_CACHE_GROUP_SIZE", str(world)))
+    assert world % degree == 0
+    owner_rank = rank % degree
+    ranks = tuple(range(rank // degree * degree, (rank // degree + 1) * degree))
     torch.set_num_threads(1)
     torch.npu.set_device(local_rank)
     torch.npu.reset_peak_memory_stats()
@@ -297,13 +299,26 @@ def main():
     output = Path(os.environ["TEST_OUTPUT"])
     output.mkdir(parents=True, exist_ok=True)
     scratch = workspace_pool("npu")
-    results = bounded_transport(rank, degree, scratch)
+    groups = []
+    # Match production: deterministic global creation, including idle DP ranks.
+    for _ in range(2):
+        for begin in range(0, world, degree):
+            members = tuple(range(begin, begin + degree))
+            group = dist.new_group(ranks=list(members), backend="hccl")
+            if members == ranks:
+                groups.append(group)
+    results = bounded_transport(owner_rank, degree, scratch, ranks=ranks, groups=groups)
+    for group in groups:
+        dist.destroy_process_group(group)
     torch.npu.synchronize()
     (output / f"rank{rank}.json").write_text(
         json.dumps(
             {
                 "rank": rank,
                 "degree": degree,
+                "world_size": world,
+                "owner_rank": owner_rank,
+                "owner_ranks": ranks,
                 "cases": results,
                 "byteexact": True,
                 "max_memory_allocated": torch.npu.max_memory_allocated(),
