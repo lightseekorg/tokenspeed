@@ -100,6 +100,24 @@ class Chunks:
 
 
 def chunking(prefix_lens: torch.Tensor, num_chunks, batch_size, chunk_len):
+    """Equal-width chunks: every request reads ``chunk_len`` rows per loop.
+
+    Loops that a request's prefix no longer reaches contribute zero rows for
+    it, so the per-loop row count shrinks as short prefixes finish. Example,
+    ``prefix_lens = [256, 512, 768, 1024]``, ``chunk_len = 256``,
+    ``num_chunks = cdiv(1024, 256) = 4``::
+
+                      req0  req1  req2  req3
+        starts[0]        0     0     0     0     ends[0]   256  256  256  256
+        starts[1]      256   256   256   256     ends[1]   256  512  512  512
+        starts[2]      512   512   512   512     ends[2]   256  512  768  768
+        starts[3]      768   768   768   768     ends[3]   256  512  768 1024
+        len_in_chunk   [[256, 256, 256, 256], [0, 256, 256, 256],
+                        [0, 0, 256, 256], [0, 0, 0, 256]]
+
+    ``plan_prefix_chunks`` uses this layout when the per-request share of
+    the capacity is small; otherwise it shares the capacity instead.
+    """
     starts = (
         torch.arange(num_chunks, device=prefix_lens.device, dtype=torch.int32)
         .unsqueeze(1)
@@ -126,6 +144,32 @@ def plan_prefix_chunks(prefix_lens_cpu: torch.Tensor, capacity: int) -> Chunks:
     Returns:
         CPU chunk boundaries and lengths in request order. Every prefix is read
         exactly once; a finished request contributes no further rows.
+
+    When the equal share ``capacity // batch_size`` is below 1024 rows, the
+    plan falls back to ``chunking`` with that share as the chunk width: FP8
+    attention rounding depends on the partition size, and pooling such short
+    chunks into larger ones can amplify its error. Otherwise each loop hands
+    the whole capacity to the requests that still have prefix rows, smallest
+    remainder first: a request that fits within an equal share of what is
+    left takes exactly its remainder, and the rest of the budget is split
+    evenly (remainder rows go to the first requests) among the others.
+    Example, ``prefix_lens = [900, 300, 9000]``, ``capacity = 6144``
+    (share ``2048 >= 1024``, so the capacity is shared)::
+
+        loop 0: active (by remainder) req1 300, req0 900, req2 9000
+                6144 / 3 = 2048 >= 300  -> req1 takes 300, budget 5844
+                5844 / 2 = 2922 >= 900  -> req0 takes 900, budget 4944
+                4944 / 1 = 4944 <  9000 -> req2 takes 4944
+        loop 1: active req2 (4056 left) -> takes 4056
+
+                      req0  req1  req2
+        starts[0]        0     0     0     ends[0]   900  300  4944
+        starts[1]      900   300  4944     ends[1]   900  300  9000
+        len_in_chunk   [[900, 300, 4944], [0, 0, 4056]]
+        boundaries     [[0, 0, 0], [900, 300, 4944], [900, 300, 9000]]
+
+    Equal-width chunks of ``6144 // 3 = 2048`` rows would need five loops
+    for the same batch, with two requests idle in the last four.
     """
     if prefix_lens_cpu.device.type != "cpu" or prefix_lens_cpu.ndim != 1:
         raise ValueError("prefix lengths must be a one-dimensional CPU tensor")
