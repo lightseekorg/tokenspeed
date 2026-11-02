@@ -61,21 +61,24 @@ _WARP_BASES_N8 = ((0, 1), (0, 2), (0, 4))
 # beat hipBLASLt by at least 3% in the median of three cold-L2 sweeps (M 512
 # to 8192 every 256 rows, 848, and 12288 to 32768) on the ROCm 10.2.0a20261010
 # stack that CI pins. Rows between two sweep points run here only when both
-# did; None leaves a range open past the last point. The winner depends on
-# hipBLASLt's own kernel choice, so re-measure when that pin moves.
+# did; None leaves a range open past the last point. Ranges at most 512 rows
+# apart merge when these kernels lose by under 3% between them, and closed
+# ranges under 512 rows wide are dropped: narrower ones gained nothing at row
+# counts off the sweep grid. The winner depends on hipBLASLt's own kernel
+# choice, so re-measure when that pin moves.
 _LARGEM_ROWS = {
     (128, 1536): ((512, None),),
     (128, 2048): ((512, None),),
     (512, 128): ((512, None),),
     (512, 3072): ((512, 1280), (3840, None)),
     (768, 7168): ((512, 1024), (4096, None)),
-    (1024, 7168): ((512, 848), (4096, None)),
+    (1024, 7168): ((4096, None),),
     (1536, 1536): ((1536, 2560), (4864, None)),
-    (1536, 2304): ((512, 768), (1024, 1792), (2304, 2816), (3328, 3584), (4096, None)),
-    (1536, 4096): ((768, 1024), (4096, None)),
-    (1536, 7168): ((512, 848), (4096, None)),
-    (2048, 4096): ((848, 1024), (4096, None)),
-    (2304, 7168): ((512, 848), (4096, None)),
+    (1536, 2304): ((512, 1792), (2304, 3584), (4096, None)),
+    (1536, 4096): ((4096, None),),
+    (1536, 7168): ((4096, None),),
+    (2048, 4096): ((4096, None),),
+    (2304, 7168): ((4096, None),),
     (3584, 7168): ((4096, None),),
     (4096, 32): ((512, None),),
     (4096, 128): ((512, 8192),),
@@ -84,20 +87,14 @@ _LARGEM_ROWS = {
     (4224, 7168): ((4096, None),),
     (5120, 32): ((848, None),),
     (5120, 512): ((512, 8192),),
-    (7168, 1536): ((1024, 3840), (4352, 4608)),
+    (7168, 1536): ((1024, 3840),),
     (7168, 2112): ((512, 2048), (2560, 3328), (6144, 7168), (7936, None)),
-    (7168, 3584): ((512, 2304), (4096, 4608), (6400, 6656), (7424, 8192)),
+    (7168, 3584): ((512, 2304), (4096, 4608), (7424, 8192)),
     (7168, 4608): ((512, 1536), (5632, 7168), (12288, None)),
-    (7168, 6288): ((512, 2560), (3072, None)),
-    (7168, 8448): (
-        (512, 768),
-        (1536, 1792),
-        (3072, 3584),
-        (4608, 5632),
-        (7168, None),
-    ),
-    (8192, 4096): ((848, 1792), (4096, 4352), (7424, None)),
-    (14336, 2112): ((1024, 2560), (3072, 3584), (6144, 7168), (24576, None)),
+    (7168, 6288): ((512, None),),
+    (7168, 8448): ((3072, 3584), (4608, 5632), (7168, None)),
+    (8192, 4096): ((848, 1792), (7424, None)),
+    (14336, 2112): ((1024, 3584), (6144, 7168), (24576, None)),
 }
 # Columns past the last whole cluster column that push the warp pipeline grid
 # into one more CU round ran 2-25% faster on 128 x 64 large-M tiles after it,

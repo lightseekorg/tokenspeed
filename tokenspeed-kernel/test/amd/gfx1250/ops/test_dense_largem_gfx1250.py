@@ -102,8 +102,8 @@ def test_largem_warp_pipeline_compiles_under_compile_monitor():
         (8192, 4096, 6416, True),  # GLM KDA q/k/v/beta/f_a/g_a, tail peeled
         (848, 4096, 6416, True),
         (768, 4096, 6416, False),
-        (1024, 2048, 4096, True),  # GLM KDA output
-        (1025, 2048, 4096, False),
+        (1792, 8192, 4096, True),  # GLM MTP eh_proj
+        (1793, 8192, 4096, False),
         (2048, 1536, 7168, False),  # K3 o_proj between its ranges
         (8192, 4096, 288, True),  # GLM MoE router
         (12288, 4096, 288, False),

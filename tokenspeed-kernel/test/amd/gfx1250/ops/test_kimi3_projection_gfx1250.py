@@ -474,21 +474,21 @@ def test_kimi3_gfx1250_large_m_qkvfab_matches(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches() -> None:
+def test_kimi3_gfx1250_large_m_linear_latent_in_shape_matches() -> None:
     from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 
     generator = torch.Generator(device="cuda")
     generator.manual_seed(3600)
     hidden_states = torch.randn(
         512,
-        1536,
+        768,
         device="cuda",
         dtype=torch.bfloat16,
         generator=generator,
     )
     weight = torch.randn(
         7168,
-        1536,
+        768,
         device="cuda",
         dtype=torch.bfloat16,
         generator=generator,

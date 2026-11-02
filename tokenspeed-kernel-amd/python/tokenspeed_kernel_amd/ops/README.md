@@ -575,9 +575,11 @@ projections with many rows.
   `(K, N)` and a row range holding M. The table covers the BF16 serving
   weights of GLM-5.3-Flash, DeepSeek-V4.1-Flash and Kimi K3 with its EAGLE3
   draft. Each range is where these kernels beat hipBLASLt by at least 3% in
-  the median of three cold-L2 sweeps on the ROCm nightly CI pins; the
-  winner tracks hipBLASLt's own kernel choice, so the table is re-measured
-  when that pin moves.
+  the median of three cold-L2 sweeps on the ROCm nightly CI pins. Ranges
+  under 512 rows wide are dropped and close ones merged, since narrower
+  ranges gained nothing at row counts off the sweep grid. The winner tracks
+  hipBLASLt's own kernel choice, so the table is re-measured when that pin
+  moves.
 - Outputs of at most 512 columns run on one wave of dense tiles when one
   fits (a `64`- or `128`-row tile of `32` or `64` columns dividing N, at most
   one CTA per CU), and on the large-M kernels otherwise.
