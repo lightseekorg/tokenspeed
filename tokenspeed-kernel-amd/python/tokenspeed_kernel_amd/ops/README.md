@@ -1285,7 +1285,10 @@ head and 128 latent columns. Each also multiplies its BF16 latent slice by
 the matching 128 rows of the head's value weight and publishes an FP32
 partial; the last of a row's four programs, found by an arrival counter, adds
 the partials in a fixed order, rounds to BF16, applies the gate and rezeroes
-the counter. Past 16 rows every row reloads its weight slice, and the latent
+the counter. The partials go through `.cg` stores and loads, which work at
+device scope, so a relaxed counter bump after the stores drain is enough;
+every program loads the gate before the bump so the last arrival does not
+wait for it. Past 16 rows every row reloads its weight slice, and the latent
 merge followed by the batched projection GEMM is faster.
 
 ### gfx950 MLA prefill

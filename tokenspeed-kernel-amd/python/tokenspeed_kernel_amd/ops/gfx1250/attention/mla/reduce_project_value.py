@@ -318,6 +318,12 @@ def _mla_query_block_reduce_project_value_kernel(
     )
     NUM_D: gl.constexpr = LATENT // BLOCK_D
     row = token * HEADS + head
+    if HAS_GATE:
+        # Only the row's last arrival applies the gate, but loading it here
+        # keeps its latency off the end of the merge.
+        gate = gl.load(
+            gate_ptr + token * GATE_STRIDE_B + (head * VALUE + offs_v) * GATE_STRIDE_N
+        )
     VEC: gl.constexpr = BLOCK_D // 32
     TILE_LAYOUT: gl.constexpr = gl.BlockedLayout(
         [1, VEC], [1, 32], [num_warps, 1], [1, 0]
@@ -379,9 +385,11 @@ def _mla_query_block_reduce_project_value_kernel(
     partial_row = partial_ptr + row.to(gl.int64) * (NUM_D * VALUE)
     gl.store(partial_row + d_block * VALUE + offs_v, projected, cache_modifier=".cg")
     # Every wave publishes its stores before one atomic announces the slice.
+    # ".cg" stores and loads work at device scope, so the announcement needs
+    # no release or acquire of its own.
     _wait_stores()
     gl.barrier()
-    old = gl.atomic_add(counter_ptr + row, 1, sem="acq_rel", scope="gpu")
+    old = gl.atomic_add(counter_ptr + row, 1, sem="relaxed", scope="gpu")
     if old == NUM_D - 1:
         gl.store(counter_ptr + row, 0)
         total = gl.load(partial_row + offs_v, cache_modifier=".cg", volatile=True)
@@ -391,12 +399,7 @@ def _mla_query_block_reduce_project_value_kernel(
             )
         total = total.to(gl.bfloat16).to(gl.float32)
         if HAS_GATE:
-            gate = gl.load(
-                gate_ptr
-                + token * GATE_STRIDE_B
-                + (head * VALUE + offs_v) * GATE_STRIDE_N
-            ).to(gl.float32)
-            total *= 1.0 / (1.0 + gl.exp(-gate))
+            total *= 1.0 / (1.0 + gl.exp(-gate.to(gl.float32)))
         gl.store(
             output_ptr + row * VALUE + offs_v,
             total.to(output_ptr.dtype.element_ty),
