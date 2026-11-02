@@ -31,12 +31,16 @@ import types
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
+    BATCHES,
+    EXPERTS,
+    HIDDEN,
+    LATENT,
+)
 
-H, L, E, K = 7168, 3584, 896, 16
-TP = 8
+TOP_K, TP = 16, 8
 I_RANK, SHARED_RANK = 3072 // TP, 6144 // TP
 BETA, LINEAR_BETA, SCALE, EPS = 4.0, 25.0, 2.5, 1e-5
-BATCHES = (*range(1, 9), 16, 32, 64)
 # FP32 logits agree to ~1e-7; tokens whose 16th and 17th choices are closer may differ.
 TIE_MARGIN = 1e-5
 
@@ -111,24 +115,30 @@ class _Weights:
                 lo, hi, shape, dtype=torch.uint8, device=device, generator=g
             )
 
-        self.router = normal(E, H, std=0.02)
-        self.bias = torch.randn(E, device=device, generator=g) * 0.05
-        self.down = normal(L, H, std=0.02)
-        self.up = normal(H, L, std=0.02)
-        self.norm = (1 + torch.randn(L, device=device, generator=g) * 0.1).bfloat16()
-        self.shared_gate_up = [normal(2 * SHARED_RANK, H, std=0.02) for _ in range(TP)]
-        self.shared_down = [normal(H, SHARED_RANK, std=0.02) for _ in range(TP)]
+        self.router = normal(EXPERTS, HIDDEN, std=0.02)
+        self.bias = torch.randn(EXPERTS, device=device, generator=g) * 0.05
+        self.down = normal(LATENT, HIDDEN, std=0.02)
+        self.up = normal(HIDDEN, LATENT, std=0.02)
+        self.norm = (
+            1 + torch.randn(LATENT, device=device, generator=g) * 0.1
+        ).bfloat16()
+        self.shared_gate_up = [
+            normal(2 * SHARED_RANK, HIDDEN, std=0.02) for _ in range(TP)
+        ]
+        self.shared_down = [normal(HIDDEN, SHARED_RANK, std=0.02) for _ in range(TP)]
         if experts is not None:
             self.w13, self.w13_scale = experts.w13, experts.w13_scale
             self.w2, self.w2_scale = experts.w2, experts.w2_scale
             return
         # MXFP4 experts with scales 2^-8 .. 2^-4, intermediate split by rank.
-        self.w13 = [byte(E, 2 * I_RANK, L // 2) for _ in range(TP)]
+        self.w13 = [byte(EXPERTS, 2 * I_RANK, LATENT // 2) for _ in range(TP)]
         self.w13_scale = [
-            byte(E, 2 * I_RANK, L // 32, lo=119, hi=124) for _ in range(TP)
+            byte(EXPERTS, 2 * I_RANK, LATENT // 32, lo=119, hi=124) for _ in range(TP)
         ]
-        self.w2 = [byte(E, L, I_RANK // 2) for _ in range(TP)]
-        self.w2_scale = [byte(E, L, I_RANK // 32, lo=119, hi=124) for _ in range(TP)]
+        self.w2 = [byte(EXPERTS, LATENT, I_RANK // 2) for _ in range(TP)]
+        self.w2_scale = [
+            byte(EXPERTS, LATENT, I_RANK // 32, lo=119, hi=124) for _ in range(TP)
+        ]
 
 
 def _serving_experts(weights, rank):
@@ -159,13 +169,13 @@ def _reference(weights, x):
     scores = torch.sigmoid(x32 @ weights.router.float().T)
     choice = scores + weights.bias
     ranked = choice.sort(dim=-1, descending=True).values
-    clear = (ranked[:, K - 1] - ranked[:, K]) > TIE_MARGIN
-    ids = choice.topk(K, dim=-1).indices
+    clear = (ranked[:, TOP_K - 1] - ranked[:, TOP_K]) > TIE_MARGIN
+    ids = choice.topk(TOP_K, dim=-1).indices
     routed = scores.gather(1, ids)
     routed = routed / (routed.sum(-1, keepdim=True) + 1e-20) * SCALE
 
     latent = _mxfp8((x32 @ weights.down.float().T).bfloat16(), floor=False)
-    combined = torch.zeros(x.shape[0], L, device=x.device)
+    combined = torch.zeros(x.shape[0], LATENT, device=x.device)
     for t in range(x.shape[0]):
         chosen = ids[t]
         for r in range(TP):
@@ -212,8 +222,8 @@ def chain(request):
         beta=BETA,
         linear_beta=LINEAR_BETA,
     )
-    rows = slice(rank * (L // TP), (rank + 1) * (L // TP))
-    up_rows = slice(rank * (H // TP), (rank + 1) * (H // TP))
+    rows = slice(rank * (LATENT // TP), (rank + 1) * (LATENT // TP))
+    up_rows = slice(rank * (HIDDEN // TP), (rank + 1) * (HIDDEN // TP))
     layers = [
         owner.layer(
             ordinal=ordinal,
@@ -241,8 +251,8 @@ def chain(request):
 
 def _inputs(batch, device, seed):
     g = torch.Generator(device=device).manual_seed(seed)
-    x = torch.randn(batch, H, device=device, generator=g).bfloat16()
-    residual = torch.randn(batch, H, device=device, generator=g).bfloat16()
+    x = torch.randn(batch, HIDDEN, device=device, generator=g).bfloat16()
+    residual = torch.randn(batch, HIDDEN, device=device, generator=g).bfloat16()
     return x, residual
 
 
