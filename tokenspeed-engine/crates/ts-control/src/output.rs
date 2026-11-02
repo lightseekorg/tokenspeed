@@ -1385,8 +1385,8 @@ impl OutputProcessor {
     }
 
     /// The outputs due from `rids` this step, each request's at its stream
-    /// interval; a request this finishes leaves the processor, into
-    /// `released`.
+    /// interval; a finished request leaves the processor, into `released`,
+    /// whether or not an output was due.
     fn stream(&mut self, rids: &[&str], released: &mut Vec<String>) -> Vec<StreamedOutput> {
         let interval = self.stream_interval;
         let spec = self.spec_num_tokens;
@@ -1395,10 +1395,9 @@ impl OutputProcessor {
             let Some(state) = self.states.get_mut(rid) else {
                 continue;
             };
-            let Some(output) = Self::stream_state(rid, state, interval, spec) else {
-                continue;
-            };
-            outputs.push(output);
+            if let Some(output) = Self::stream_state(rid, state, interval, spec) {
+                outputs.push(output);
+            }
             if state.finished() {
                 let (_, state) = self.states.remove_entry(rid).expect("present above");
                 self.log_end(rid, &state);
@@ -1953,6 +1952,25 @@ mod tests {
         assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
         assert!(c.outputs.is_empty(), "the client tore down already");
         assert_eq!(c.released, ["r"]);
+    }
+
+    #[test]
+    fn a_finished_request_leaves_even_when_no_output_is_due() {
+        // Release follows the finish, not the output: with its final output
+        // already marked sent, the finishing commit streams nothing and still
+        // releases the request.
+        let mut p = processor(None);
+        register(&mut p, "r", 2, 2, &[]);
+        p.commit(&batch(&[("r", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        p.states.get_mut("r").unwrap().finished_output = true;
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 2)], 0), None, &result(&[4], &[1]))
+            .unwrap();
+        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+        assert!(c.outputs.is_empty());
+        assert_eq!(c.released, ["r"]);
+        assert_eq!(p.num_running(), 0);
     }
 
     #[test]
