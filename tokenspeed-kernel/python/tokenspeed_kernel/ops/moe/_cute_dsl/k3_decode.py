@@ -39,6 +39,12 @@ import cutlass.cute as cute
 import torch
 import torch.distributed as dist
 from cutlass.cute.runtime import make_fake_stream
+from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
+    BATCHES,
+    EXPERTS,
+    HIDDEN,
+    LATENT,
+)
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.host import (
     OprojMailbox,
     fake,
@@ -66,60 +72,6 @@ from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe.tail_runtime import (
     MoeTailBox,
     PreparedTail,
 )
-
-HIDDEN, LATENT, EXPERTS = 7168, 3584, 896
-# Decode batches the chain is compiled for; others take the ordinary MoE.
-BATCHES = (*range(1, 9), 16, 32, 64)
-
-
-def supports(
-    *,
-    tp_size: int,
-    hidden_size: int,
-    latent_size: int,
-    num_experts: int,
-    top_k: int,
-    num_groups: int,
-    topk_groups: int,
-    scoring_func: str,
-    linear_beta: float | None,
-    router_dtype: torch.dtype,
-    expert_dtype: str,
-    pdl: bool,
-    batch_invariant: bool,
-) -> bool:
-    """Whether the chain serves a MoE layer.
-
-    Args:
-        tp_size: The tensor-parallel group the experts and latent are split over.
-        hidden_size, latent_size: Model and routed-latent widths.
-        num_experts, top_k, num_groups, topk_groups, scoring_func: Routing.
-        linear_beta: SiTU's linear cap (the kernels need one).
-        router_dtype: The router weight's dtype.
-        expert_dtype: The routed experts' weight format.
-        pdl: Whether programmatic dependent launch is enabled; the chain always
-            launches with it.
-        batch_invariant: Whether reductions must not depend on the batch; the
-            chain reduces in its own order.
-
-    Returns:
-        True for TP8 MXFP4 experts behind an ungrouped sigmoid top-16 router over
-        896 experts, with this model's widths, outside batch-invariant modes.
-    """
-    return (
-        tp_size == 8
-        and hidden_size == HIDDEN
-        and latent_size == LATENT
-        and num_experts == EXPERTS
-        and top_k == 16
-        and num_groups == topk_groups == 1
-        and scoring_func == "sigmoid"
-        and linear_beta is not None
-        and router_dtype == torch.bfloat16
-        and expert_dtype == "mxfp4"
-        and pdl
-        and not batch_invariant
-    )
 
 
 class RingResidual:

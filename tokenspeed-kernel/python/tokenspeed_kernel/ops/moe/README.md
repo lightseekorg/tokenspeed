@@ -485,7 +485,8 @@ MoE.
 
 Three places decide where the chain runs. The Kimi-K3 MoE execution plan
 allows it for one tensor-parallel group shared by attention and MoE on
-Blackwell TRT-LLM. `supports()` here declares what the kernels serve: TP8
+Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
+`cutlass` import, so any platform can ask) declares what the kernels serve: TP8
 MXFP4 experts behind an ungrouped sigmoid top-16 router over 896 experts, a
 linear SiTU cap, a BF16 router, PDL enabled and no batch-invariant reduction.
 The model then binds it where both hold for every MoE layer, the node decodes

@@ -20,6 +20,9 @@
 
 """The Kimi-K3 decode chain's declared envelope."""
 
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -41,7 +44,7 @@ SERVED = dict(
 
 
 def _supports(**overrides) -> bool:
-    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import supports
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import supports
 
     return supports(**{**SERVED, **overrides})
 
@@ -71,3 +74,18 @@ def test_the_kimi_k3_tp8_mxfp4_layer_is_served():
 )
 def test_anything_else_is_declined(overrides):
     assert not _supports(**overrides)
+
+
+def test_the_envelope_imports_no_cutlass():
+    """Platforms without nvidia-cutlass-dsl import it to decline the chain."""
+    source = (
+        Path(__file__).parents[3]
+        / "python/tokenspeed_kernel/ops/moe/_cute_dsl/k3_decode_support.py"
+    ).read_text()
+    imported = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module.split(".")[0])
+    assert imported <= {"__future__", "torch"}

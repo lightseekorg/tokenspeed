@@ -280,11 +280,12 @@ def _bindable(monkeypatch, layers, *, multicast=True, pdl=True, **arg_overrides)
     _Owner.built.clear()
     monkeypatch.setattr(kimi_k3, "pdl_enabled", lambda: pdl)
     monkeypatch.setattr(kimi_k3, "multicast_backend_available", lambda g: multicast)
-    # The real op module's row counts and envelope; only construction is recorded.
-    monkeypatch.setattr(
-        importlib.import_module("tokenspeed_kernel.ops.moe._cute_dsl.k3_decode"),
-        "KimiK3DecodeMoE",
-        _Owner,
+    # The real row counts and envelope (``k3_decode_support``); the kernel module,
+    # which needs cutlass, is replaced by one that records construction.
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.moe._cute_dsl.k3_decode",
+        SimpleNamespace(KimiK3DecodeMoE=_Owner),
     )
     manager = importlib.import_module(
         "tokenspeed.runtime.distributed.process_group_manager"

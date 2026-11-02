@@ -3994,9 +3994,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
             )
         ):
             return False
-        from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
+        from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
             BATCHES,
-            KimiK3DecodeMoE,
             supports,
         )
 
@@ -4036,6 +4035,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
         group = pg_manager.get_device_process_group(self.mapping.moe.tp_ep_group)
         if not multicast_backend_available(group):
             return False
+        from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
+
         beta, linear_beta = _situ_betas(self.config)
         owner = KimiK3DecodeMoE(
             group=group,
