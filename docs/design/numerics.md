@@ -209,7 +209,8 @@ construction can be selected under `auto` with `--yarn-ramp-mask-device cpu
 inverse-frequency construction under `rl-bitwise`. Under `auto`, both devices
 default independently to `cuda`; setting only the ramp device to `cpu` leaves
 frequency construction on CUDA. For the previous all-CPU construction, set
-both options to `cpu`. Both devices participate in the RoPE cache identity.
+both options to `cpu`. Both devices participate in the RoPE cache identity
+and the L3 KV deployment identity, preventing reuse across construction devices.
 The transfer and frequency construction run when the cos/sin cache is
 initialized; forward reuses that cache.
 
