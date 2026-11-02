@@ -1651,10 +1651,10 @@ strides chosen by the common packer. PLE layers on planes of different widths
 get different strides, so PLE copies each layer's state at its own stride.
 Groups whose fields do not fit the widest decoder field of each plane, or whose
 exact strides require inconsistent packing ratios, retain separate planes. A
-group wider than one K page also retains them when sharing would make one of
-the engine's pipeline stages hold more bytes: a stage allocates every plane its
-layers' fields touch, so a field on a plane that no other layer of its stage
-uses costs that stage the whole plane.
+group wider than one K page also retains separate planes when sharing would
+make one of the engine's pipeline stages hold more bytes: a stage allocates
+every plane its layers' fields touch, so a field on a plane that no other layer
+of its stage uses costs that stage the whole plane.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
