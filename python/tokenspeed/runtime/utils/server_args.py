@@ -387,6 +387,10 @@ class ServerArgs:
     # the recurrent state there, where hybrid models publish a checkpoint;
     # no chunk is cut for it.
     enable_state_checkpoint_in_forward: bool = False
+    # Hybrid models: a State checkpoint with a newer checkpoint after it ranks,
+    # under cache pressure, as if last used this many new requests ago. None
+    # is the scheduler's default, 16 times the per-rank batch size.
+    checkpoint_retention_requests: int | None = None
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
     # special kv cache
@@ -2700,6 +2704,18 @@ class ServerArgs:
             "that boundary resumes there. No extra prefill round; that forward "
             "holds one more state block. Requires prefix caching. See "
             "docs/design/scheduler.md section 1.2.",
+        )
+        parser.add_argument(
+            "--checkpoint-retention-requests",
+            type=int,
+            dest="checkpoint_retention_requests",
+            default=ServerArgs.checkpoint_retention_requests,
+            help="Hybrid (recurrent-state) models: under cache pressure, a State "
+            "checkpoint with a newer checkpoint after it is evicted before cache "
+            "entries used within this many new requests on its attention-DP "
+            "rank, while entries unused for longer are evicted first. 0 evicts "
+            "every entry by its own last use (plain LRU). Default: 16 times the "
+            "per-rank max batch size. See docs/design/cache-concepts.md.",
         )
 
         # KVStore

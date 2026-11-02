@@ -100,7 +100,8 @@ Scheduler::Scheduler(SchedulerConfig config)
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost(),
-                                   config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack)},
+                                   config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack,
+                                   config_.CheckpointRetentionRequests())},
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
@@ -431,6 +432,7 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
 }
 

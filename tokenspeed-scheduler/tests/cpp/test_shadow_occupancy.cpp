@@ -90,7 +90,7 @@ TEST(BlockTableAccounting, ReleasedPrefixesAndSharedParentsCountOnce) {
                                            .block_granularity = 4}};
     auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/false);
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const auto blocks = device.AcquireBlocks(0, 8);
     ASSERT_EQ(blocks.size(), 8u);
     std::vector<BlockTable> first{BlockTable::FromBlocks(/*group_id=*/0, {blocks.begin(), blocks.begin() + 7}, 0)};
@@ -113,9 +113,9 @@ TEST(HostPacking, SnapshotAdmissionCountsTheSnapshotPoolsChildren) {
         BlockPool device{2, {4}};
         BlockPool snapshots{1, {host_packing}};
         const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 4, .block_granularity = 2}};
-        auto coordinator =
-            MakeCoordinator(specs, /*prefix_granularity=*/2, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                            &snapshots, /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        auto coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device, /*enable_l3_storage=*/false,
+                                           /*host_pool=*/nullptr, &snapshots, /*stream_device_cache_to_host=*/false,
+                                           /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         const std::int32_t blocks = host_packing == 2 ? 3 : 5;
         const std::int32_t tokens = blocks * 2;
         std::vector<BlockTable> tables{BlockTable::FromBlocks(/*group_id=*/0, device.AcquireBlocks(0, blocks), 0)};

@@ -62,7 +62,8 @@ TEST(CacheCoordinatorAdmissionBuckets, HostHitDestinationsPreserveSourceOwnershi
                                               .cache_blocks_per_lcm_block = 8,
                                               .block_granularity = 4,
                                               .shard_count = shards}};
-        auto coordinator = MakeCoordinator(specs, 4, device_pool, false, &host_pool, nullptr, false, true);
+        auto coordinator = MakeCoordinator(specs, 4, device_pool, false, &host_pool, nullptr, false, true,
+                                           /*checkpoint_retention_requests=*/0);
         const std::vector<std::string> hashes{"first", "second", "third", "fourth"};
         std::vector<std::int32_t> source_buckets;
         for (std::size_t i = 0; i < hashes.size(); ++i) {
@@ -139,7 +140,8 @@ TEST(CacheCoordinatorPreparedKeysTest, ProbeOwnsKeysAfterRequestIsReleased) {
     BlockPool pool(4, {1});
     const std::array specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false);
+    auto coordinator =
+        MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
     CacheCoordinator::PrefixProbe probe;
     {
         Request request(RequestSpec{.request_id = "prepared", .tokens = {1, 2, 3, 4, 5, 6, 7}}, 2, Role::kFused);
@@ -228,7 +230,8 @@ TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(coord.NumGroups(), 2);
 }
 
@@ -239,7 +242,7 @@ TEST(MakeCoordinatorTest, UsesOneCacheBlockPerLcmBlockByDefault) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(coordinator.Allocator(0).CacheBlocksPerLcmBlock(), 1);
 }
 
@@ -253,7 +256,8 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
                                              /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(coord.PrefixGranularity(), 128);
     EXPECT_EQ(coord.GroupBlockGranularity(0), 128);
     EXPECT_TRUE(coord.GroupIsState(1));
@@ -298,7 +302,7 @@ TEST(MakeCoordinatorTest, ManagersMayUseSmallerPagesThanTheCoordinatorDomain) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/8, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(coordinator.PrefixGranularity(), 8);
     EXPECT_EQ(coordinator.GroupBlockGranularity(0), 8);
     EXPECT_EQ(coordinator.GroupBlockGranularity(1), 2);
@@ -313,7 +317,7 @@ TEST(CacheCoordinatorCapacityTest, EmptyParentsExcludeCacheOnlyParents) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     PrefixCacheIndex& index = coordinator.GroupPrefixIndex(0);
     const CacheKey key = Key("cached", /*group_id=*/0);
 
@@ -343,7 +347,7 @@ TEST(CacheCoordinatorCapacityTest, GroupAvailablePagesTracksLocalSlotsAndEmptyPa
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(coordinator.GroupAvailablePages(0), 12);
     EXPECT_EQ(coordinator.GroupAvailablePages(1), 6);
     CacheBlockRef group_zero = pool.AcquireBlock(/*group_id=*/0);
@@ -366,7 +370,7 @@ TEST(CacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/8, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
     ASSERT_EQ(tables[0].NumBlocks(), 1);
@@ -397,11 +401,13 @@ TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
     };
     EXPECT_THROW(MakeCoordinator(valid, /*prefix_granularity=*/0, pool, /*enable_l3_storage=*/false,
                                  /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false),
+                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                 /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
     EXPECT_THROW(MakeCoordinator(valid, /*prefix_granularity=*/-1, pool, /*enable_l3_storage=*/false,
                                  /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false),
+                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                 /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
 
     const std::vector<CacheGroupSpec> zero_packing = {
@@ -409,7 +415,8 @@ TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
     };
     EXPECT_THROW(MakeCoordinator(zero_packing, /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
                                  /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false),
+                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                 /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
 }
 
@@ -425,7 +432,8 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_p), /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
                                   /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false),
+                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                  /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
 
     std::vector<CacheGroup> wrong_k;
@@ -438,7 +446,8 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_k), /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
                                   /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false),
+                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                  /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
 
     // A spec sharded across two owners while its allocator balances nothing
@@ -455,7 +464,8 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_shards), /*prefix_granularity=*/128, sharded_pool,
                                   /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false),
+                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                  /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
 }
 
@@ -472,7 +482,8 @@ TEST(CacheCoordinatorTest, RejectsManagerGroupIdThatDiffersFromItsIndex) {
 
     EXPECT_THROW(CacheCoordinator(std::move(groups), /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
                                   /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false),
+                                  /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                  /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
 }
 
@@ -543,7 +554,8 @@ TEST(MakeCoordinatorTest, UsesOneLogicalGranularityAcrossGroups) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                                              /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(coord.PrefixGranularity(), 4);
     EXPECT_EQ(coord.GroupBlockGranularity(0), coord.GroupBlockGranularity(1));
 }
@@ -558,7 +570,8 @@ TEST(CoordinatorMatchTest, BothGroupsAllMiss) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 0);
@@ -579,7 +592,8 @@ TEST(CoordinatorMatchTest, CommonIsMinCoverageFullDeeperThanSwa) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
     // swa front 3-run (a TAIL run would null-pad back to index 0 -> coverage 4).
@@ -606,7 +620,8 @@ TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshAccessEpoch) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
@@ -634,7 +649,8 @@ TEST(CoordinatorMatchTest, ProbeDoesNotRefreshAccessEpoch) {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
     const std::int32_t oldest = CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
@@ -657,10 +673,10 @@ TEST(CacheCoordinatorTest, ClearDeviceCacheLeavesHostCacheUntouched) {
     BlockPool host_pool(4, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
 
     CacheForGroup(coordinator, device_pool, hashes[0], /*group_id=*/0);
@@ -682,10 +698,10 @@ TEST(CacheCoordinatorTest, ClearCacheRemovesDeviceAndHostEntries) {
     BlockPool host_pool(4, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
 
     CacheForGroup(coordinator, device_pool, hashes[0], /*group_id=*/0);
@@ -708,7 +724,7 @@ TEST(CacheCoordinatorTest, ClearDeviceCacheRejectsPinnedEntryWithoutPartialMutat
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     CacheForGroup(coordinator, pool, hashes[0], /*group_id=*/0);
     CacheForGroup(coordinator, pool, hashes[1], /*group_id=*/0);
@@ -746,7 +762,7 @@ TEST(CacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     std::vector<GroupDemand> first_demands = {
         GroupDemand{.table = &tables[0], .extent = DenseGrowth{5}},
@@ -787,7 +803,7 @@ TEST(CacheCoordinatorAdmissionTest, AcquireMatchedFullPrefixUsesOneAccessEpoch) 
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
 
     std::vector<BlockTable> cached_tables(coordinator.NumGroups());
@@ -825,7 +841,7 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -879,7 +895,7 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}});
     std::vector<BlockTable> owner_tables(coordinator.NumGroups());
 
@@ -925,7 +941,7 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionPrefersOlderRequestBeforePositio
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> old_hashes = ContentHashes({{1, 1, 1, 1}});
     const std::vector<std::string> new_hashes = ContentHashes({{2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
 
@@ -961,7 +977,7 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionIsSuffixFirstWithinOneAccessEpoc
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
 
     std::vector<BlockTable> cached_tables(coordinator.NumGroups());
@@ -984,10 +1000,10 @@ TEST(CacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshAccessEpoch) 
     BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     const std::int32_t cached_hit = CacheForGroup(coordinator, pool, hashes[0], 0);
     CacheBlockRef pinned = pool.AcquireBlock(/*group_id=*/0);
@@ -1029,7 +1045,7 @@ TEST(CacheCoordinatorAdmissionTest, UsesPoolAllocationOrderForEmptyParents) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
@@ -1052,7 +1068,7 @@ TEST(CacheCoordinatorAdmissionTest, PacksSlotsFromOneNewParentTogether) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
@@ -1067,10 +1083,10 @@ TEST(CacheCoordinatorAdmissionTest, FreeCachedHitCostsNoAdditionalPlacement) {
     BlockPool pool(2, {1});
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
     const std::int32_t hit_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
@@ -1094,7 +1110,7 @@ TEST(CacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilConsum
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::array<std::int32_t, 1> tokens{1};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
@@ -1120,10 +1136,10 @@ TEST(CacheCoordinatorAdmissionTest, HeterogeneousGroupsSharePartialAndEmptyParen
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
     const std::int32_t hit_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
@@ -1146,10 +1162,10 @@ TEST(CacheCoordinatorAdmissionTest, PacksDemandBeforeConsumingAnotherGroupsOnlyP
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
     CacheForGroup(coordinator, pool, hashes[0], 0);
 
@@ -1172,10 +1188,10 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithCompactPackingWhenGreedyFreeSlots
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     const std::int32_t first_partial_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
     CacheBlockRef fills_first_parent = pool.AcquireBlock(/*group_id=*/0);
@@ -1202,10 +1218,10 @@ TEST(CacheCoordinatorAdmissionTest, KeepsCachedChildrenWhenUnpackedPlacementFits
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     CacheForGroup(coordinator, pool, hashes[0], 0);
     CacheBlockRef fills_first_parent = pool.AcquireBlock(/*group_id=*/0);
@@ -1226,10 +1242,10 @@ TEST(CacheCoordinatorAdmissionTest, UsesEmptyParentBeforeEvictingCachedChild) {
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
     CacheForGroup(coordinator, pool, hashes[0], 0);
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
@@ -1247,10 +1263,10 @@ TEST(CacheCoordinatorAdmissionTest, DoesNotShareFreeSlotsFromBoundForeignParent)
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     CacheBlockRef pinned = pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
 
@@ -1270,10 +1286,10 @@ TEST(CacheCoordinatorAdmissionTest, EvictsOldestCachedChildNeededForCapacity) {
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     CacheForGroup(coordinator, pool, hashes[0], 0);
     CacheForGroup(coordinator, pool, hashes[1], 0);
@@ -1291,7 +1307,8 @@ TEST(CacheCoordinatorAdmissionTest, ScatteredAvailableSlotsWaitForAWholeParentTo
         {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false);
+    auto coordinator =
+        MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
     const auto hashes = ContentHashes({{1, 1, 1, 1},
                                        {2, 2, 2, 2},
                                        {3, 3, 3, 3},
@@ -1327,10 +1344,10 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPermanen
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
 
     std::vector<BlockTable> first_tables(coordinator.NumGroups());
@@ -1372,10 +1389,10 @@ TEST(CacheCoordinatorAdmissionTest, OrdinarySwaKeepsLongerUnhitFrontier) {
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     GroupAllocator& manager = coordinator.Allocator(0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     constexpr std::uint64_t kSameAccessEpoch = 7;
@@ -1399,10 +1416,10 @@ TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistor
         {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     constexpr std::uint64_t kSameAccessEpoch = 7;
 
@@ -1436,7 +1453,8 @@ TEST(CacheCoordinatorAdmissionTest, MergesGroupEpochsWithPinnedEntriesInEitherGr
         specs[state_group] = CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1};
         specs[full_group] =
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4};
-        CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false);
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
         const auto hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
         CacheBoundaryForGroup(coordinator, pool, hashes[0], full_group, 1, 0, CacheBoundaryKind::kEndpoint);
         CacheBoundaryForGroup(coordinator, pool, hashes[1], state_group, 2, 0, CacheBoundaryKind::kEndpoint);
@@ -1465,7 +1483,7 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     constexpr std::uint64_t kSameAccessEpoch = 7;
 
@@ -1514,7 +1532,7 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
             std::vector<CacheGroupSpec>{
                 {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
                 {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
-            4, pool, false, nullptr, nullptr, false, false);
+            4, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
         std::vector<BlockTable> tables(2);
         std::vector<GroupDemand> demands{
             {.table = &tables[0], .extent = DenseGrowth{64}},
@@ -1561,7 +1579,8 @@ TEST(CacheCoordinatorAdmissionTest, OnlyNewlyExpiredWindowSlotsCanFundGrowth) {
                                                 .sliding_window = 5,
                                                 .cache_blocks_per_lcm_block = 1,
                                                 .block_granularity = 4}};
-    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false);
+    auto coordinator =
+        MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, 8));
     const auto original = BlockTableLcmBlockIds(tables[0]);
@@ -1594,7 +1613,8 @@ TEST(CacheCoordinatorAdmissionTest, ExpiredWindowPinsAndHolesDoNotFundGrowthUnti
                                                 .sliding_window = 5,
                                                 .cache_blocks_per_lcm_block = 1,
                                                 .block_granularity = 4}};
-    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false);
+    auto coordinator =
+        MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, 16));
     tables[0].EvictToNull(0).reset();
@@ -1632,7 +1652,7 @@ TEST(CacheCoordinatorAdmissionTest, SkipsProtectedOldestEpochAndEvictsLaterEpoch
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
 
     // The first candidate epoch is entirely protected by the incoming prefix.
@@ -1663,10 +1683,10 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveUncachedReclaimDoesNotEvictCached
     const std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::string cached_hash = ContentHashes({{1, 1, 1, 1}}).front();
     CacheBoundaryForGroup(coordinator, pool, cached_hash, /*group_id=*/0, /*access_epoch=*/1,
                           /*logical_block_index=*/0, CacheBoundaryKind::kChunk);
@@ -1695,10 +1715,10 @@ TEST(CacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent) 
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     CacheForGroup(coordinator, pool, hashes[0], 0);
     CacheForGroup(coordinator, pool, hashes[1], 0);
@@ -1723,7 +1743,7 @@ TEST(CacheCoordinatorAdmissionTest, UsesLocalSlotAfterEvictingAnotherWholeParent
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
     const std::int32_t old_full_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
     EXPECT_EQ(CacheForGroup(coordinator, pool, hashes[1], 0), old_full_parent);
@@ -1751,7 +1771,7 @@ TEST(CacheCoordinatorAdmissionTest, RestoresOlderSiblingWhenMiddleCandidateFrees
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
     GroupAllocator& manager = coordinator.Allocator(0);
     std::vector<CacheBlockRef> cached = pool.AcquireBlocks(/*group_id=*/0, /*num=*/3);
@@ -1790,10 +1810,10 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveHitParentCannotBecomeVictim) {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4},
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     const std::int32_t protected_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
     CacheForGroup(coordinator, pool, hashes[1], 0);
@@ -1821,7 +1841,7 @@ TEST(CacheCoordinatorAdmissionTest, ReclaimsTableOwnerBeforeEvictingProspectiveV
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
 
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -1849,7 +1869,7 @@ TEST(CacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
 
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -1884,7 +1904,7 @@ TEST(CacheCoordinatorAdmissionTest, RejectsProspectiveVictimWithAnExtraOwner) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
 
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -1919,7 +1939,8 @@ TEST(CoordinatorMatchTest, SwaMissForcesZeroCommon) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
@@ -1940,7 +1961,8 @@ TEST(CoordinatorAllocTest, ColdStartAllocatesAlignedPages) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
     CacheCoordinator::PrefixProbe prefix = coord.ProbePrefix(ch);
     EXPECT_EQ(prefix.device.num_common_tokens, 0);
@@ -1962,7 +1984,8 @@ TEST(CoordinatorAllocTest, ClaimsCommonPrefixThenAllocatesRemainder) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     // swa window 4 -> pages_needed 1, so a single cached front page is a hit.
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
     CacheForGroup(coord, pool, ch[0], 0);
@@ -1988,7 +2011,8 @@ TEST(CoordinatorAllocTest, CrossGroupShortfallAllocatesNothing) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
     CacheCoordinator::PrefixProbe prefix = coord.ProbePrefix(ch);
     ASSERT_EQ(prefix.device.num_common_tokens, 0);
@@ -2012,7 +2036,8 @@ TEST(CoordinatorStepTest, AcquireKeepsGroupsAligned) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, 4));  // 1 page each
     EXPECT_EQ(tables[0].NumBlocks(), 1);
@@ -2032,7 +2057,8 @@ TEST(CoordinatorStepTest, AcquireShortfallAllocatesNothing) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(2);
     std::int32_t free_before = pool.NumEmptyLcmBlocks();
     // 2 pages per group (8 tokens) = 4 blocks, only 3 free -> fail, nothing taken.
@@ -2052,7 +2078,8 @@ TEST(CoordinatorStepTest, CacheFullBlocksThenMatchHits) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}});
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, 4));  // 1 page each
@@ -2072,7 +2099,8 @@ TEST(CoordinatorStepTest, FreeReturnsAllGroups) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, 8));  // 2 pages each = 4 blocks
     std::int32_t free_mid = pool.NumEmptyLcmBlocks();
@@ -2092,7 +2120,8 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
 
     // Request A: cold, allocate 2 pages each, cache both, free.
@@ -2126,7 +2155,8 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch =
         ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     std::vector<BlockTable> tables(2);
@@ -2156,7 +2186,8 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch =
         ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     std::vector<BlockTable> tables(2);
@@ -2187,7 +2218,8 @@ TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{7, 7, 7, 7}});
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, 8));  // 2 pages each
@@ -2207,7 +2239,8 @@ TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
@@ -2237,7 +2270,8 @@ TEST(CoordinatorMatchTest, FullShorterThanSwaBoundsSwaWithRunIntact) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
@@ -2273,7 +2307,8 @@ TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
     CacheForGroup(coord, pool, ch[1], 1);
@@ -2308,7 +2343,8 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsSharedBoundaryMatches) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
     for (std::uint32_t g : {1u, 2u}) {
@@ -2348,7 +2384,8 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsCascadingShrinkConverges) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch =
         ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
@@ -2388,7 +2425,8 @@ TEST(CoordinatorMatchTest, SwaGroupOrderDoesNotChangeConvergedCommon) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch =
         ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 1);
@@ -2422,7 +2460,8 @@ TEST(CoordinatorMatchTest, MultiWindowThreeGroupsSharedBoundary) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
     CacheForGroup(coord, pool, ch[2], 1);
@@ -2459,7 +2498,8 @@ TEST(CoordinatorMatchTest, MultiWindowCascadeToZero) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
     CacheForGroup(coord, pool, ch[2], 1);
@@ -2493,7 +2533,8 @@ TEST(CoordinatorMatchTest, DeepCascadeRequiresSecondConvergeSweep) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0},
                                                  {1, 1, 1, 1},
                                                  {2, 2, 2, 2},
@@ -2534,7 +2575,8 @@ TEST(CoordinatorMatchTest, MultiWindowSlideCreditSumsPerWindow) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/10));
 
@@ -2559,7 +2601,8 @@ TEST(CoordinatorMatchTest, AllFullGroupsMinTruncationUnchanged) {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
     CacheForGroup(coord, pool, ch[0], 1);
@@ -2580,7 +2623,8 @@ TEST(CoordinatorMatchTest, SingleFullGroupUnchanged) {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
@@ -2601,7 +2645,8 @@ TEST(CoordinatorMatchTest, SwaOnlyConfigKeepsTailRunWithLeadingHoles) {
                                           .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
     CacheForGroup(coord, pool, ch[2], 0);
     CacheForGroup(coord, pool, ch[3], 0);
@@ -2627,7 +2672,8 @@ TEST(CoordinatorAllocTest, RejectedAdmissionLeavesCachedPrefixUnclaimed) {
          .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[0], 1);
@@ -2654,10 +2700,10 @@ TEST(CacheCoordinatorReclaimExpired, OnlySlidingWindowGroupEvicts) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     // 6 tokens -> 3 pages per group.
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
@@ -2697,7 +2743,8 @@ TEST(CoordinatorMatchTest, ThreeGroupsCommonIsMinCoverageAcrossAll) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     // Shortest window group first in index order: group 2's deeper match trims to
     // group 1's bound inside the sweep (the reverse order would be a cascade).
@@ -2734,7 +2781,8 @@ TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
     };
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
     // Groups 0 and 2 fully cache both pages; group 1 caches nothing. The all-miss
     // group zeroes the bound before group 2 matches (the reverse would be a cascade).
@@ -2758,7 +2806,7 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     BlockPool host_pool(4, {1, 1});
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                                    /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
@@ -2800,10 +2848,10 @@ TEST(CacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, 4));
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
@@ -2835,7 +2883,8 @@ TEST(CacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollect
     };
     CacheCoordinator off = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                            /*snapshot_pool=*/nullptr,
-                                           /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                           /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                           /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(off.NumGroups());
     ASSERT_TRUE(AdmitForTest(off, tables, /*num_tokens=*/8));  // pages 0..3; N=8 slides out pages 0,1
     EXPECT_EQ(SlideCredit(off, tables, 8), 2) << "collection-off counts uncached ref-1 blocks";
@@ -2844,7 +2893,7 @@ TEST(CacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollect
     BlockPool host_pool(4, {1});
     CacheCoordinator on = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                           /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                          /*write_back_evictions=*/false);
+                                          /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables2(on.NumGroups());
     ASSERT_TRUE(AdmitForTest(on, tables2, 8));
     EXPECT_EQ(SlideCredit(on, tables2, 8), 0) << "collection-on excludes uncached slide-out blocks";
@@ -2863,10 +2912,10 @@ TEST(CacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent) 
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const CacheKey first = Key("first", 0);
     const CacheKey second = Key("second", 0);
     CacheBlockRef first_ref = host_pool.AcquireBlock(0);
@@ -2892,10 +2941,10 @@ TEST(CacheCoordinatorHostReplacement, RebindsACompleteEvictableParentAcrossGroup
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     CacheBlockRef first = host_pool.AcquireBlock(0);
     CacheBlockRef second = host_pool.AcquireBlock(0);
     coordinator.CacheHostBlock(first, Key("first", 0), std::nullopt);
@@ -2945,10 +2994,10 @@ TEST(CacheCoordinatorHostReplacement, SameGroupUsesLastAccessAfterPrefixHits) {
         BlockPool host_pool(2, {1});
         const std::array specs{
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                            /*snapshot_pool=*/nullptr,
-                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+            /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         HostPut(coordinator, host_pool, "old", 0);
         HostHit(coordinator, host_pool, Key("old", 0), NextTestAccessEpoch());
         HostPut(coordinator, host_pool, "new", 0);
@@ -2977,7 +3026,8 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseRefreshesExistingHostRecency) {
                                                   .block_granularity = state ? 0 : 4}};
             CacheCoordinator coordinator = MakeCoordinator(
                 specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                /*checkpoint_retention_requests=*/0);
             const auto a = ContentHashes({{1, 2, 3, 4}});
             const auto b = ContentHashes({{5, 6, 7, 8}});
             const auto publish = [&](std::span<const std::string> hashes) {
@@ -3044,7 +3094,8 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                 const std::array specs{CacheGroupSpec{.attn_kind = state ? AttnKind::kState : AttnKind::kFull,
                                                       .cache_blocks_per_lcm_block = 1,
                                                       .block_granularity = state ? 0 : 4}};
-                auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false, false);
+                auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false, false,
+                                                   /*checkpoint_retention_requests=*/0);
                 const std::vector<std::int32_t> tokens =
                     tail ? std::vector<std::int32_t>{1, 2, 3} : std::vector<std::int32_t>{1, 2, 3, 4};
                 const auto hashes = tail ? std::vector<std::string>{} : ContentHashes({tokens});
@@ -3127,10 +3178,10 @@ TEST(CacheCoordinatorHostReplacement, CrossGroupUsesMostRecentChildAccess) {
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         };
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                            /*snapshot_pool=*/nullptr,
-                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+            /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         const std::int32_t old_parent = HostPut(coordinator, host_pool, "old-0", 0);
         HostPut(coordinator, host_pool, "old-1", 0);
         HostHit(coordinator, host_pool, Key("old-0", 0), NextTestAccessEpoch());
@@ -3156,10 +3207,10 @@ TEST(CacheCoordinatorHostReplacement, EqualEpochDoesNotProtectPreviouslyAcquired
     BlockPool host_pool(1, {2});
     const std::array specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::uint64_t access_epoch = NextTestAccessEpoch();
     const CacheBlockLocation first = CacheBoundaryForGroup(coordinator, host_pool, "first", 0, access_epoch, -1);
     const CacheBlockLocation second = CacheBoundaryForGroup(coordinator, host_pool, "second", 0, access_epoch, -1);
@@ -3183,10 +3234,10 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruAllowsStateCheckpointCapacityToGr
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     for (int i = 0; i < 6; ++i) {
         CacheBlockRef ref = host_pool.AcquireBlock(0);
         coordinator.CacheHostBlock(ref, Key("old-" + std::to_string(i), 0), std::nullopt);
@@ -3219,10 +3270,10 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruComparesRefreshedParentsWithSameG
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         };
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                            /*snapshot_pool=*/nullptr,
-                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+            /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         const std::int32_t other_parent = HostPut(coordinator, host_pool, "other-0", 0);
         HostPut(coordinator, host_pool, "other-1", 0);
         const std::int32_t own_parent = HostPut(coordinator, host_pool, "own", 1);
@@ -3247,10 +3298,10 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruProtectsAParentWithARecentSibling
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "cold-sibling", 0);
     const std::int32_t own_parent = HostPut(coordinator, host_pool, "own", 1);
     HostPut(coordinator, host_pool, "hot-sibling", 0);
@@ -3278,7 +3329,8 @@ TEST(CacheCoordinatorHostReplacement, EqualEpochParentsRankByTheirMostProtectedC
             CacheCoordinator coordinator =
                 MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
                                 /*snapshot_pool=*/nullptr,
-                                /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+                                /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                /*checkpoint_retention_requests=*/0);
             const std::uint64_t epoch = NextTestAccessEpoch();
             const CacheBlockLocation other =
                 CacheBoundaryForGroup(coordinator, host_pool, "other-0", 0, epoch, parent_has_prefix ? 0 : 2);
@@ -3309,10 +3361,10 @@ TEST(CacheCoordinatorHostReplacement, HostAndDeviceEvictEqualEpochPrefixesFromTh
         BlockPool host_pool(3, {1});
         const std::array specs{
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                            /*snapshot_pool=*/nullptr,
-                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+            /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         const std::uint64_t epoch = NextTestAccessEpoch();
         for (std::int32_t position = 0; position < 3; ++position) {
             const std::string hash = "page-" + std::to_string(position);
@@ -3345,10 +3397,10 @@ TEST(CacheCoordinatorHostReplacement, EqualEpochUnprovenCheckpointsLeaveBeforeEs
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
             CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         };
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                            /*snapshot_pool=*/nullptr,
-                            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+            /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         const std::uint64_t epoch = NextTestAccessEpoch();
         CacheBoundaryForGroup(coordinator, host_pool, "prefix", 0, epoch, 0);
         CacheBoundaryForGroup(coordinator, host_pool, "established", 1, epoch, 0, CacheBoundaryKind::kEndpoint);
@@ -3375,10 +3427,10 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruSkipsPinnedParentsWithoutFallingB
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "pinned", 0);
     HostPut(coordinator, host_pool, "cold-sibling", 0);
     const std::int32_t middle_parent = HostPut(coordinator, host_pool, "middle", 2);
@@ -3403,10 +3455,10 @@ TEST(CacheCoordinatorHostReplacement, JointBatchRestoresVictimsTheAcceptedRowsDo
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::int32_t older_parent = HostPut(coordinator, host_pool, "old-0", 0);
     HostPut(coordinator, host_pool, "old-1", 0);
     const std::int32_t newer_parent = HostPut(coordinator, host_pool, "newer", 1);
@@ -3441,7 +3493,7 @@ TEST(CacheCoordinatorHostReplacement, JointBatchReusesCompatibleHolesAcrossGroup
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
                                                    /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<CacheBlockRef> first_group = host_pool.AcquireBlocks(0, 8);
     std::vector<CacheBlockRef> second_group = host_pool.AcquireBlocks(1, 4);
     ASSERT_EQ(first_group.size(), 8u);
@@ -3500,9 +3552,10 @@ TEST(CacheCoordinatorHostReplacement, RepeatedBatchesReadCurrentOccupancy) {
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         };
-        CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                                       /*write_back_evictions=*/false);
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
+                            /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         const std::int32_t oldest_parent = HostPut(coordinator, host_pool, "oldest", 0);
         HostPut(coordinator, host_pool, "other", 1);
         {
@@ -3534,10 +3587,10 @@ TEST(CacheCoordinatorHostReplacement, GlobalLruComparesOnlyChildrenInTheRequeste
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const auto put = [&](std::uint32_t group, std::int32_t bucket, const std::string& hash) {
         const std::array buckets{bucket};
         std::vector<CacheBlockRef> refs = host_pool.AcquireBlocksInBuckets(group, buckets);
@@ -3567,10 +3620,10 @@ TEST(CacheCoordinatorHostReplacement, SingleGroupBatchEvictsOnlyTheRequiredChild
         .cache_blocks_per_lcm_block = 2,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "old-0", 0);
     HostPut(coordinator, host_pool, "old-1", 0);
     HostPut(coordinator, host_pool, "old-2", 0);
@@ -3599,10 +3652,10 @@ TEST(CacheCoordinatorHostReplacement, BoundedHistoryScanPreservesGlobalLruAndRep
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::int32_t donor_parent = HostPut(coordinator, host_pool, "donor-0", 1);
     HostPut(coordinator, host_pool, "donor-1", 1);
     for (std::int32_t i = 0; i < 256; ++i) {
@@ -3641,10 +3694,10 @@ TEST(CacheCoordinatorHostReplacement, BoundedHistoryScanPreservesBucketsEpochTie
         .block_granularity = 2,
         .shard_count = 2,
     }};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::array<std::uint64_t, 8> epochs{40, 10, 10, 10, 5, 20, 10, 30};
     std::vector<CacheBlockLocation> locations;
     CacheBlockRef pinned;
@@ -3682,10 +3735,10 @@ TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) 
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
     coordinator.CacheHostBlock(pinned, Key("pinned", 0), std::nullopt);
@@ -3712,10 +3765,10 @@ TEST(CacheCoordinatorHostReplacement, BatchGivesScarceFreeCapacityToFirstCandida
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::array<std::uint32_t, 2> groups{1, 0};
     const std::array<std::int32_t, 2> buckets{0, 0};
     CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
@@ -3735,10 +3788,10 @@ TEST(CacheCoordinatorHostReplacement, BatchGivesInterleavedGroupsFreeCapacityInC
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::array<std::uint32_t, 3> groups{0, 1, 0};
     const std::array<std::int32_t, 3> buckets{0, 0, 0};
     CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
@@ -3760,10 +3813,10 @@ TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) 
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "old-0", 0);
     HostPut(coordinator, host_pool, "old-1", 0);
     HostPut(coordinator, host_pool, "old-2", 0);
@@ -3803,10 +3856,10 @@ TEST(CacheCoordinatorHostReplacement, CountsTheVictimsTheDeviceStillHolds) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "host-only", 0);
     HostPut(coordinator, host_pool, "resident", 0);
     HostPut(coordinator, device_pool, "resident", 0);
@@ -3829,10 +3882,10 @@ TEST(CacheCoordinatorHostReplacement, FlushCountsHostEvictionsAndUndrainedStoreC
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "a", 0);
     HostPut(coordinator, host_pool, "b", 0);
     HostPut(coordinator, host_pool, "c", 1);
@@ -3860,10 +3913,10 @@ TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingDoesNotRescanPlace
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "old-0", 0);
     HostPut(coordinator, host_pool, "old-1", 0);
     HostPut(coordinator, host_pool, "old-2", 0);
@@ -3885,10 +3938,10 @@ TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingChoosesLowestCache
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::int32_t older_parent = HostPut(coordinator, host_pool, "older", 0);
     const std::int32_t newer_parent = HostPut(coordinator, host_pool, "newer", 1);
 
@@ -3917,7 +3970,7 @@ TEST(CacheCoordinatorHostReplacement, AHostStateEvictionTakesTheOtherStateGroups
     BlockPool host_pool(4, {4, 1, 1, 1});
     CacheCoordinator coordinator = MakeCoordinator(
         kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     // A page's three checkpoints and then its KV fill the Host, so group 1's
     // checkpoint is the least recently used entry; the Device still holds
     // group 2's checkpoint.
@@ -3951,7 +4004,7 @@ TEST(CacheCoordinatorHostReplacement, StateCascadeDoesNotOverEvict) {
     BlockPool host_pool(6, {4, 1, 1, 1});
     CacheCoordinator coordinator = MakeCoordinator(
         kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     for (const char* hash : {"older", "newer"}) {
         for (std::uint32_t group = 1; group <= 3; ++group) {
             HostPut(coordinator, host_pool, hash, group);
@@ -3981,7 +4034,7 @@ TEST(CacheCoordinatorHostReplacement, AStateCascadeFundsTheSameGroupsNextBlock) 
     BlockPool host_pool(6, {4, 1, 1, 1});
     CacheCoordinator coordinator = MakeCoordinator(
         kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     for (const char* hash : {"older", "newer"}) {
         for (std::uint32_t group = 1; group <= 3; ++group) {
             HostPut(coordinator, host_pool, hash, group);
@@ -4013,10 +4066,10 @@ TEST(CacheCoordinatorHostReplacement, AParentEvictionsStateCascadeFundsALaterGro
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     const std::int32_t h_parent = HostPut(coordinator, host_pool, "h", 2);
     HostPut(coordinator, host_pool, "x0", 0);
     HostPut(coordinator, host_pool, "x1", 0);
@@ -4047,7 +4100,7 @@ TEST(CacheCoordinatorHostReplacement, AKvBlocksCheckpointVictimFundsTheStateBloc
     BlockPool host_pool(4, {4, 1, 1, 1});
     CacheCoordinator coordinator = MakeCoordinator(
         kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::int32_t checkpoint_parent = HostPut(coordinator, host_pool, "h", 1);
     for (std::uint32_t group = 2; group <= 3; ++group) {
         HostPut(coordinator, host_pool, "h", group);
@@ -4080,7 +4133,7 @@ TEST(CacheCoordinatorHostReplacement, AStateCascadeFundsAKvBlockWithoutAVictim) 
     BlockPool host_pool(4, {4, 1, 1, 1});
     CacheCoordinator coordinator = MakeCoordinator(
         kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<CacheBlockRef> pinned;
     for (const char* hash : {"k0", "k1", "k2", "k3"}) {
         HostPut(coordinator, host_pool, hash, 0);
@@ -4110,7 +4163,7 @@ TEST(CacheCoordinatorHostReplacement, AStateCascadeLeavesAPinnedSibling) {
     BlockPool host_pool(4, {4, 1, 1, 1});
     CacheCoordinator coordinator = MakeCoordinator(
         kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "h", 1);
     HostPut(coordinator, host_pool, "h", 2);
     HostPut(coordinator, host_pool, "k", 0);
@@ -4142,10 +4195,10 @@ TEST(CacheCoordinatorHostReplacement, AParentACascadePartlyEvictedStillGoesWhole
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 2, .block_granularity = 0},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "a", 1);
     const std::int32_t shared_parent = HostPut(coordinator, host_pool, "a", 2);
     ASSERT_EQ(HostPut(coordinator, host_pool, "b", 2), shared_parent);
@@ -4184,10 +4237,10 @@ TEST(CacheCoordinatorHostReplacement, BatchDoesNotRebindPinnedParent) {
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                                   /*checkpoint_retention_requests=*/0);
     HostPut(coordinator, host_pool, "old-0", 0);
     HostPut(coordinator, host_pool, "old-1", 0);
     CacheBlockRef pinned = coordinator.GroupPrefixIndex(0).Find(host_pool, Key("old-0", 0));
@@ -4238,9 +4291,10 @@ TEST(CacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
          .block_granularity = 2},
     };
     BlockPool host_pool(3, {1, 1});
-    CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false, &host_pool,
-        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                        /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{0, 0}, {1, 1}, {2, 2}});
     for (const std::string& hash : hashes) {
         (void)HostPut(coordinator, host_pool, hash, /*gid=*/0);
@@ -4270,7 +4324,7 @@ TEST(CacheCoordinatorHostExtension, BothGroupsFullyPresent) {
     BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
     std::vector<std::int32_t> fp, sp;
@@ -4296,7 +4350,7 @@ TEST(CacheCoordinatorHostExtension, SwaTailMissShrinksBoundary) {
     BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
     std::vector<std::int32_t> fp, sp;
@@ -4320,7 +4374,7 @@ TEST(CacheCoordinatorHostExtension, FullGapCapsExtension) {
     BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
     const std::int32_t fp1 = HostPut(coord, host_pool, ch[1], 0);
@@ -4342,7 +4396,7 @@ TEST(CacheCoordinatorHostExtension, EmptyStoreZeroExtension) {
     BlockPool host_pool(5, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
     SeedDeviceFloor(pool, coord, ch, 1);
@@ -4360,7 +4414,7 @@ TEST(CacheCoordinatorHostExtension, DeviceBoundaryRespected) {
     BlockPool host_pool(5, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
     for (int j = 0; j <= 1; ++j) {
@@ -4382,7 +4436,7 @@ TEST(CacheCoordinatorHostExtension, MatchPinsPagesUntilResultDies) {
     BlockPool host_pool(6, {1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
     for (int j = 1; j <= 3; ++j) (void)HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 0);
@@ -4420,7 +4474,7 @@ TEST(CacheCoordinatorHostExtension, DeepCascadeConverges) {
     BlockPool host_pool(32, {1, 1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0},
                                                  {1, 1, 1, 1},
                                                  {2, 2, 2, 2},
@@ -4464,7 +4518,7 @@ TEST(CacheCoordinatorHostExtension, MultiWindowGroupsExtendTogether) {
     BlockPool host_pool(16, {1, 1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
 
     std::vector<std::int32_t> fp, ap;
@@ -4503,7 +4557,7 @@ TEST(CacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension) 
     BlockPool host_pool(16, {1, 1, 1});
     CacheCoordinator coord = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                             /*write_back_evictions=*/false);
+                                             /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
 
     for (int j = 1; j <= 4; ++j) (void)HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 0);
@@ -4583,7 +4637,7 @@ protected:
              .cache_blocks_per_lcm_block = 4,
              .block_granularity = kP}},
         kP, device_, /*enable_l3_storage=*/false, &host_, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true)};
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0)};
     const std::vector<std::int32_t> tokens_{MakeTokens(16)};
     std::vector<std::string> hashes_;
     std::vector<CacheBlockRef> held_;
@@ -4833,7 +4887,7 @@ TEST(JointStateHostPressureTest, StateAcrossTiersIsNotDeadHostState) {
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
         4, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const auto key = [](const std::string& hash, std::uint32_t group) {
         return CacheKey{.group_id = group, .content_hash = hash};
     };
@@ -4921,7 +4975,8 @@ protected:
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
               kP, device_, /*enable_l3_storage=*/GetParam(), &host_, /*snapshot_pool=*/nullptr,
-              /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false)} {
+              /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+              /*checkpoint_retention_requests=*/0)} {
         std::vector<std::span<const std::int32_t>> pages;
         for (std::size_t start = 0; start + kP <= 36; start += kP) {
             pages.emplace_back(tokens_.data() + start, kP);
@@ -5394,7 +5449,7 @@ TEST(HostSuffixHitSlidingWindowTest, ASlidingWindowCapLowersTheSplit) {
              .block_granularity = 4},
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
         /*prefix_granularity=*/4, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes =
         ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}, {17, 18, 19, 20}});
     for (std::size_t page = 0; page < 4; ++page) {
@@ -5452,7 +5507,7 @@ TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     const std::vector<GroupDemand> demands{{.table = &tables[0]}};
@@ -5472,7 +5527,7 @@ TEST(CompletedBoundaryTest, RejectsEmptyCompletedPageRange) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}});
@@ -5498,10 +5553,10 @@ TEST(CompletedBoundaryTest, RejectsCompletedPagesWithoutComputedProgress) {
     BlockPool pool(8, {1});
     std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+        /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}});
@@ -5526,10 +5581,10 @@ TEST(CompletedBoundaryTest, PublicationWithoutCompletedPagesIsRejected) {
     BlockPool pool(8, {1});
     std::vector<CacheGroupSpec> specs = {
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+        /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -5547,7 +5602,8 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
                                           .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/16));
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
@@ -5579,7 +5635,8 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
                                           .block_granularity = 4}};
     CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/14));
     std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
@@ -5631,7 +5688,7 @@ TEST(BoundedReplayCoordinator, MakeCoordinatorRejectsReplayOnFullOrStateGroups) 
                                                                     .cache_blocks_per_lcm_block = 1,
                                                                     .block_granularity = 4}};
     EXPECT_THROW(MakeCoordinator(full_replay, 4, pool, /*enable_l3_storage=*/false, nullptr, /*snapshot_pool=*/nullptr,
-                                 false, /*write_back_evictions=*/false),
+                                 false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
     const std::vector<CacheGroupSpec> state_replay = {CacheGroupSpec{.attn_kind = AttnKind::kState,
                                                                      .sliding_window = 0,
@@ -5639,14 +5696,15 @@ TEST(BoundedReplayCoordinator, MakeCoordinatorRejectsReplayOnFullOrStateGroups) 
                                                                      .cache_blocks_per_lcm_block = 1,
                                                                      .block_granularity = 4}};
     EXPECT_THROW(MakeCoordinator(state_replay, 4, pool, /*enable_l3_storage=*/false, nullptr, /*snapshot_pool=*/nullptr,
-                                 false, /*write_back_evictions=*/false),
+                                 false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0),
                  std::runtime_error);
 }
 
 TEST(BoundedReplayCoordinator, ReplayableGroupNeverConstrainsTheCommonBoundary) {
     BlockPool pool(16, {1, 1});
     CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
-                                             /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
+                                             /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     EXPECT_EQ(coord.ReplayWindowTokens(), 8);
     EXPECT_FALSE(coord.GroupIsReplayable(0));
     EXPECT_TRUE(coord.GroupIsReplayable(1));
@@ -5673,7 +5731,8 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverConstrainsTheCommonBoundary) 
 TEST(BoundedReplayCoordinator, AdmitMaterializesReplayableSuffixFromWindowBegin) {
     BlockPool pool(32, {1, 1});
     CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
-                                             /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
+                                             /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     for (const std::string& hash : hashes) {
         CacheForGroup(coord, pool, hash, 0);
@@ -5720,7 +5779,8 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
     BlockPool host_pool(16, {1, 1});
     CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, &host_pool,
                                              /*snapshot_pool=*/nullptr,
-                                             /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+                                             /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
 
     std::vector<BlockTable> tables(2);
@@ -5756,7 +5816,8 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
 TEST(BoundedReplayCoordinator, RetentionStillReclaimsReplayablePages) {
     BlockPool pool(32, {1, 1});
     CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
-                                             /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
+                                             /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false,
+                                             /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/24));
     ASSERT_EQ(tables[1].NumBlocks(), 6);
@@ -5842,9 +5903,9 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/5));  // 3 blocks: two full pages + a tail
     const std::vector<std::string> hashes{"h0", "h1"};
@@ -5946,10 +6007,10 @@ TEST(RetractionImageTest, SnapshotRefusesWithoutMutationWhenThePoolCannotHoldThe
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, &snapshot_pool,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));  // 2 + 2 blocks > 3 snapshot parents
     CacheBlockRef pinned = snapshot_pool.AcquireBlock(0);
@@ -5970,10 +6031,10 @@ TEST(RetractionImageTest, SnapshotIsRefusedWithoutASnapshotPool) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     EXPECT_FALSE(coordinator.HasSnapshotPool());
@@ -5987,10 +6048,10 @@ TEST(RetractionImageTest, RestoreEvictsCacheOnlyBlocksAndFailsCleanlyWhenPinned)
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, &snapshot_pool,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));  // 3 of 4 Device parents
     auto image = coordinator.TakeImage(tables, /*num_tokens=*/6, NoHostSlots(1));
@@ -6032,9 +6093,9 @@ TEST(RetractionImageTest, RestoreClaimsStillCachedDeviceBlocksInsteadOfCopying) 
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/5));
     const std::vector<std::string> hashes{"h0", "h1"};
@@ -6085,9 +6146,9 @@ TEST(RetractionImageTest, ShardedImageKeepsEveryCopyInItsBucket) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2, .shard_count = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const GroupAllocator& allocator = coordinator.Allocator(0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/10));  // 5 blocks, balanced over both buckets
@@ -6146,10 +6207,10 @@ TEST(RetractionImageTest, BucketConstrainedRestoreFailsCleanlyWhileOtherBucketsH
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, &snapshot_pool,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const GroupAllocator& allocator = coordinator.Allocator(0);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));  // 2 blocks, one per bucket
@@ -6193,7 +6254,7 @@ TEST(RetractionImageTest, HostAllocationFollowsTheSourceBucket) {
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
                                                    /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const GroupAllocator& allocator = coordinator.Allocator(0);
     // Fill Host with evictable entries of bucket 0 and bucket 1 alike.
     for (std::int32_t i = 0; i < 4; ++i) {
@@ -6241,7 +6302,8 @@ TEST(RestoreWriteBackTest, ARestoreEvictsItsOwnPagesAboveAPageItClaims) {
         BlockPool snapshot_pool(8, {1});
         CacheCoordinator coordinator =
             MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/write_back);
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/write_back,
+                            /*checkpoint_retention_requests=*/0);
         std::vector<BlockTable> tables(1);
         ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
         const std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}, {5, 6}, {7, 8}});
@@ -6325,7 +6387,8 @@ TEST(RestoreWriteBackTest, ARestoreEvictsItsOwnCheckpointBesideAPageItClaims) {
         BlockPool snapshot_pool(8, {1, 1});
         CacheCoordinator coordinator =
             MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/write_back);
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/write_back,
+                            /*checkpoint_retention_requests=*/0);
         std::vector<BlockTable> tables(2);
         ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
         const std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
@@ -6408,7 +6471,8 @@ protected:
                       .attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
               },
               kP, pool_, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-              /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false)} {}
+              /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+              /*checkpoint_retention_requests=*/0)} {}
 
     // A group-0 block held outside any request, in `bucket`.
     std::vector<CacheBlockRef> Resident(std::int32_t bucket) {
@@ -6920,7 +6984,7 @@ protected:
                                  .block_granularity = 2},
               },
               kP, pool_, /*enable_l3_storage=*/false, with_host ? &host_pool_ : nullptr, /*snapshot_pool=*/nullptr,
-              /*stream_device_cache_to_host=*/false, write_back_evictions)} {}
+              /*stream_device_cache_to_host=*/false, write_back_evictions, /*checkpoint_retention_requests=*/0)} {}
 
     // Admits a request over `tokens` and publishes everything below
     // num_computed_tokens as a final frontier. Returns the tail published.
@@ -7128,7 +7192,7 @@ TEST(SlidingWindowOracleTest, AHitterHoldsEveryBlockOfTheWindowBehindAnUnaligned
                                .block_granularity = g},
             },
             P, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         // The owner computes L tokens and publishes its frontier T < L as a
         // final point, T unaligned.
         const std::int32_t T = P + 1 + static_cast<std::int32_t>(rng() % (3 * P));
@@ -7516,7 +7580,8 @@ protected:
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
               kP, pool_, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-              /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false)},
+              /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+              /*checkpoint_retention_requests=*/0)},
           hashes_{ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}})} {}
 
     // A request over three pages publishes them with its checkpoint at their
@@ -7673,7 +7738,7 @@ protected:
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
               kP, pool_, /*enable_l3_storage=*/false, &host_pool_,
               /*snapshot_pool=*/num_snapshot_pages > 0 ? &snapshot_pool_ : nullptr,
-              /*stream_device_cache_to_host=*/false, write_back_evictions)} {}
+              /*stream_device_cache_to_host=*/false, write_back_evictions, /*checkpoint_retention_requests=*/0)} {}
 
     const BoundaryTree& Tree() const { return CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator_); }
 
@@ -8173,9 +8238,9 @@ TEST(BoundaryTreeStateOnlyTest, APageAboveALinkedNodeLeavesWithTheLastCheckpoint
         SCOPED_TRACE(write_back_evictions);
         BlockPool pool(/*num_lcm_blocks=*/8, {1, 1, 1});
         BlockPool host_pool(/*num_lcm_blocks=*/4, {1, 1, 1});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                            /*stream_device_cache_to_host=*/false, write_back_evictions);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/false, write_back_evictions, /*checkpoint_retention_requests=*/0);
         const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
         const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
         for (std::uint32_t group = 0; group < 3; ++group) {
@@ -8219,7 +8284,7 @@ TEST(BoundaryTreeStateOnlyTest, APublicationThatRegistersNothingLeavesNoNode) {
         CacheCoordinator coordinator = MakeCoordinator(
             std::vector<CacheGroupSpec>{{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1}}, kP, pool,
             /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
-            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
         std::vector<BlockTable> tables(1);
         ASSERT_TRUE(AdmitForTest(coordinator, tables, 8));
@@ -9088,7 +9153,7 @@ TEST(SegmentEvictionWithoutStateTest, AMiddlePageTakesItsDeviceSuffix) {
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes =
         ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}});
     std::vector<BlockTable> tables(1);
@@ -9132,7 +9197,7 @@ TEST(SegmentEvictionWithoutStateTest, ASetAbsorbsTheSetsBelowIt) {
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes =
         ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}});
     std::vector<BlockTable> tables(1);
@@ -9170,7 +9235,7 @@ TEST(SegmentEvictionWithoutStateTest, SlidingWindowBlocksStillLeaveAlone) {
              .cache_blocks_per_lcm_block = 1,
              .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes =
         ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}});
     std::vector<BlockTable> tables(2);
@@ -9204,7 +9269,7 @@ TEST(SegmentEvictionWithoutAClosedGroupTest, TheClimbStopsBelowAPageTheDeviceDoe
     CacheCoordinator coordinator = MakeCoordinator(
         std::vector<CacheGroupSpec>{{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1}}, kP, pool,
         /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
     std::vector<BlockTable> tables(1);
@@ -9242,14 +9307,14 @@ TEST(SegmentEvictionWithoutAClosedGroupTest, TheClimbStopsBelowAPageTheWindowLef
     constexpr std::int32_t kP = 4;
     BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
     BlockPool host_pool(/*num_lcm_blocks=*/8, {1, 1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(std::vector<CacheGroupSpec>{{.attn_kind = AttnKind::kSlidingWindow,
-                                                     .sliding_window = 2 * kP,
-                                                     .cache_blocks_per_lcm_block = 1,
-                                                     .block_granularity = kP},
-                                                    {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1}},
-                        kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        std::vector<CacheGroupSpec>{{.attn_kind = AttnKind::kSlidingWindow,
+                                     .sliding_window = 2 * kP,
+                                     .cache_blocks_per_lcm_block = 1,
+                                     .block_granularity = kP},
+                                    {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1}},
+        kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
     const std::vector<std::string> hashes =
         ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}});
@@ -9307,9 +9372,11 @@ TEST_P(SegmentEvictionMirrorTest, EvictionSetsMatchOnTwoMirroredCoordinators) {
     BlockPool second_host(/*num_lcm_blocks=*/1, {4, 1, 1, 1});
     std::array<CacheCoordinator, 2> coordinators{
         MakeCoordinator(specs, kP, first_pool, /*enable_l3_storage=*/false, &first_host, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true),
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+                        /*checkpoint_retention_requests=*/0),
         MakeCoordinator(specs, kP, second_pool, /*enable_l3_storage=*/false, &second_host, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true)};
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+                        /*checkpoint_retention_requests=*/0)};
     const std::array<BlockPool*, 2> pools{&first_pool, &second_pool};
     const std::vector<std::int32_t> trunk = MakeTokens(18);
     for (std::int32_t session = 0; session < 12; ++session) {
@@ -9812,7 +9879,7 @@ TEST(HostKvDuplicateOrderTest, MergesGroupsByOwnershipThenDeviceEpochThenBoundar
                     {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
                     {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
                     {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
-                4, device, false, &host, nullptr, false, true);
+                4, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
             const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
             std::vector<BlockTable> tables(3);
             ASSERT_TRUE(AdmitForTest(coordinator, tables, 8));
@@ -9885,7 +9952,7 @@ TEST(HostWindowDuplicateOracleTest, ReclaimOnlyWhenRemovingTheCopyPreservesThePr
                                  .sliding_window = window,
                                  .cache_blocks_per_lcm_block = 4,
                                  .block_granularity = granularity}},
-                            P, device, false, &host, nullptr, false, true);
+                            P, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
                         const std::int32_t T = 4 * P + tail_tokens;
                         const auto tokens = MakeTokens(T + 1);
                         std::vector<std::vector<std::int32_t>> pages;
@@ -11074,7 +11141,7 @@ TEST(ShardedSegmentEvictionTest, ADeviceBucketShortageEvictsOnlyWhatFundsTheBuck
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP, .shard_count = 2}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::int32_t> s = MakeTokens(3 * kP + 1);
     std::vector<std::vector<std::int32_t>> pages;
     for (std::int32_t page = 0; page < 3; ++page) {
@@ -11151,7 +11218,7 @@ TEST(ShardedSegmentEvictionTest, ADeviceBucketThatCannotBeFundedMakesTheAdmissio
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP, .shard_count = 2}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::int32_t> s = MakeTokens(3 * kP + 1);
     std::vector<std::vector<std::int32_t>> pages;
     for (std::int32_t page = 0; page < 3; ++page) {
@@ -11238,7 +11305,7 @@ TEST(HostSegmentPlanWithoutStateTest, LaterSegmentNotStarvedByAnEarlierOne) {
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}},
         /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, &host_pool,
         /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-        /*write_back_evictions=*/true);
+        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     // V first, the oldest; P stays pinned by the reference kept here.
     CacheBlockRef v = host_pool.AcquireBlock(1);
     coordinator.CacheHostBlock(v, Key("v", 1), std::nullopt);
@@ -11279,7 +11346,7 @@ TEST(HostSegmentPlanSmallPoolTest, MixedPackingEvictsNoNewerEntry) {
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
         /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     for (const auto& [hash, group] : {std::pair{"s", 1u}, std::pair{"a", 0u}, std::pair{"b", 0u}}) {
         CacheBlockRef block = host_pool.AcquireBlock(group);
         coordinator.CacheHostBlock(block, Key(hash, group), std::nullopt);
@@ -11310,7 +11377,7 @@ TEST(HostSegmentPlanWithoutStateTest, ACappedTailIsADeadEntry) {
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> older = ContentHashes({{9, 9, 9, 9}});
     {
         std::vector<BlockTable> tables(1);
@@ -11380,7 +11447,7 @@ TEST(HostSegmentPlanWithoutStateTest, AHostSuffixUnderADevicePageStaysWhenTheLea
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, 3 * kP));
@@ -11423,7 +11490,7 @@ TEST(HostSegmentPlanWithoutStateTest, TheRestorePassKeepsGoneAPageWhoseParentLef
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = kP},
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, 2 * kP));
@@ -11471,7 +11538,7 @@ TEST(HostSegmentPlanWithoutStateTest, TheRestorePassReturnsAPageOnceThePageAbove
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> p = ContentHashes({{9, 9, 9, 9}});
     const std::vector<std::string> c = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     for (const std::vector<std::string>* chain : {&p, &c}) {
@@ -11520,7 +11587,7 @@ TEST(HostSegmentPlanWithoutStateTest, HostLeavesGoDeepestPageFirst) {
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     std::vector<std::vector<std::string>> chains;
     for (const auto& [num_pages, start] : {std::pair{4, 1}, std::pair{2, 100}}) {
         const std::vector<std::int32_t> tokens = MakeTokens(num_pages * kP, start);
@@ -11580,7 +11647,7 @@ TEST(HostSegmentPlanWithoutStateTest, ASharedPageWaitsForEveryBranch) {
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> a = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
     const std::vector<std::string> b = ContentHashes({{1, 2, 3, 4}, {50, 60, 70, 80}});
     for (const std::vector<std::string>* chain : {&a, &b}) {
@@ -11632,7 +11699,7 @@ TEST(HostSegmentPlanWithoutStateTest, AWideForkPageBecomesAHostLeafOnceItsLastBr
         std::vector<CacheGroupSpec>{
             {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     std::string c0;
     std::vector<std::string> branches;
     for (std::size_t branch = 0; branch < kBranches; ++branch) {
@@ -11702,9 +11769,11 @@ TEST_P(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
     BlockPool second_host(/*num_lcm_blocks=*/40, {4, 1, 1, 1});
     std::array<CacheCoordinator, 2> coordinators{
         MakeCoordinator(specs, kP, first_pool, /*enable_l3_storage=*/false, &first_host, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true),
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+                        /*checkpoint_retention_requests=*/0),
         MakeCoordinator(specs, kP, second_pool, /*enable_l3_storage=*/false, &second_host, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true)};
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+                        /*checkpoint_retention_requests=*/0)};
     const std::array<BlockPool*, 2> pools{&first_pool, &second_pool};
     const std::array<BlockPool*, 2> hosts{&first_host, &second_host};
     std::vector<CacheKey> keys;
@@ -12294,7 +12363,7 @@ TEST(DeadEntryWithoutAClosedGroupTest, AStateCheckpointResumesPastAPageHoldingNo
     CacheCoordinator coordinator = MakeCoordinator(
         std::vector<CacheGroupSpec>{{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1}}, kP, pool,
         /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-        /*write_back_evictions=*/true);
+        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::int32_t> tokens = MakeTokens(3 * kP);
     const std::vector<std::string> hashes =
         ContentHashes({{tokens.begin(), tokens.begin() + kP}, {tokens.begin() + kP, tokens.begin() + 2 * kP}});
@@ -13155,7 +13224,7 @@ TEST(EvictionWriteBackTest, AKeyEvictedTwiceInOneBuildIsCopiedOnce) {
         CacheCoordinator coordinator =
             MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false, &host_pool,
                             /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                            /*write_back_evictions=*/true);
+                            /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
         TierTransferManager transfers(coordinator);
         CacheBlockRef pinned;
         if (free_host_blocks == 0) {
@@ -13447,7 +13516,8 @@ TEST(RestoreWriteBackTest, ARestoreWritesBackWhatItEvicts) {
             BlockPool snapshot_pool(8, {1});
             CacheCoordinator coordinator =
                 MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+                                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+                                /*checkpoint_retention_requests=*/0);
             TierTransferManager transfers(coordinator);
             // A retracted request's five blocks, imaged into the snapshot pool.
             std::vector<BlockTable> tables(1);
@@ -13530,9 +13600,9 @@ TEST(RestoreWriteBackTest, ARestoreKeepsTheHostSuffixItsVictimsContinue) {
     BlockPool pool(4, {1});
     BlockPool host_pool(8, {1});
     BlockPool snapshot_pool(8, {1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers(coordinator);
     std::vector<BlockTable> tables(1);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
@@ -13587,7 +13657,8 @@ TEST(RestoreWriteBackTest, ARestoreDropsASupersededInputRatherThanWritingItBack)
         BlockPool snapshot_pool(8, {1});
         CacheCoordinator coordinator =
             MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/!write_back, /*write_back_evictions=*/write_back);
+                            /*stream_device_cache_to_host=*/!write_back, /*write_back_evictions=*/write_back,
+                            /*checkpoint_retention_requests=*/0);
         TierTransferManager transfers(coordinator);
         std::vector<BlockTable> tables(1);
         ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
@@ -13646,9 +13717,9 @@ TEST(RestoreWriteBackTest, AnEmptyRestoreRecordDoesNotShiftTheAdmissionsEpochs) 
         BlockPool pool(4, {1});
         BlockPool host_pool(8, {1});
         BlockPool snapshot_pool(8, {1});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
         std::vector<BlockTable> tables(1);
         ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
         auto image = coordinator.TakeImage(tables, /*num_tokens=*/2, NoHostSlots(1));
@@ -13709,9 +13780,9 @@ TEST(RestoreWriteBackTest, ARestoreRecordWaitsForItsAckAcrossPlans) {
     BlockPool pool(6, {1});
     BlockPool host_pool(8, {1});
     BlockPool snapshot_pool(8, {1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers(coordinator);
     const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
     std::vector<BlockTable> tables(1);
@@ -13804,9 +13875,9 @@ TEST_P(ShardedRestoreWriteBackTest, ARestoreWritesBackWhatItEvicts) {
     BlockPool pool(3, {shards});
     BlockPool host_pool(4, {shards});
     BlockPool snapshot_pool(2, {shards});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers(coordinator);
     const GroupAllocator& allocator = coordinator.Allocator(0);
     std::vector<std::vector<std::int32_t>> x_pages;
@@ -13921,9 +13992,9 @@ TEST(RetractionImageSplitTest, ARefusedImageLeavesTheHostAsItWas) {
     BlockPool pool(8, {1});
     BlockPool host_pool(4, {1});
     BlockPool snapshot_pool(1, {1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers(coordinator);
     const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}, {97, 98}});
     for (const std::string& hash : cached) {
@@ -13963,9 +14034,9 @@ TEST(RetractionImageSplitTest, JointPlanningPlacesTheImageBesidePinnedHistory) {
         BlockPool pool(8, {4, 1});
         BlockPool host_pool(2, {4, 1});
         BlockPool snapshot_pool(snapshot_parents, {4, 1});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         // Outlives the transfer manager, whose snapshot store holds a slot.
         SnapshotSlotAllocator blob_slots(1);
         TierTransferManager transfers(coordinator);
@@ -14029,9 +14100,9 @@ TEST(RetractionImageSplitTest, ACheckpointVictimFreesItsStateSiblingInThePlan) {
     BlockPool pool(8, {1, 1, 1});
     BlockPool host_pool(4, {1, 1, 1});
     BlockPool snapshot_pool(2, {1, 1, 1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     SnapshotSlotAllocator blob_slots(1);
     TierTransferManager transfers(coordinator);
     const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}});
@@ -14076,7 +14147,8 @@ TEST(RetractionImageSplitTest, EachStoreTheImageWaitsForLandsWithItsOwnAck) {
     BlockPool snapshot_pool(2, {1});
     CacheCoordinator coordinator =
         MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                        /*checkpoint_retention_requests=*/0);
     SnapshotSlotAllocator blob_slots(1);
     TierTransferManager transfers(coordinator);
     std::vector<BlockTable> tables(1);
@@ -14135,9 +14207,9 @@ TEST(RetractionImageSplitTest, JointPlacementPreservesTheNewerCheckpoint) {
     BlockPool pool(8, {2, 1});
     BlockPool host_pool(3, {2, 1});
     BlockPool snapshot_pool(1, {2, 1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     SnapshotSlotAllocator blob_slots(1);
     TierTransferManager transfers(coordinator);
     const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}, {97, 98}});
@@ -14187,9 +14259,9 @@ TEST(RetractionImageSplitTest, ARowInFreeRoomKeepsItsParentFromGoingWhole) {
     };
     BlockPool pool(8, {2, 2});
     BlockPool host_pool(2, {2, 2});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}});
     CacheBlockRef pinned = host_pool.AcquireBlock(0);
     {
@@ -14225,9 +14297,9 @@ TEST(RetractionImageSplitTest, AnOlderParentOfAnotherGroupBeatsAYoungerEntry) {
     };
     BlockPool pool(8, {1, 1});
     BlockPool host_pool(2, {1, 1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}});
     const std::vector<CacheKey> host_keys{Key(cached[0], 1), Key(cached[1], 0)};
     for (const CacheKey& key : host_keys) {
@@ -14259,9 +14331,9 @@ TEST(RetractionImageSplitTest, ARowTakesTheOldestEntryOfItsBucketNotItsWholePare
     };
     BlockPool pool(4, {2});
     BlockPool host_pool(1, {2});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}});
     for (std::int32_t bucket = 0; bucket < 2; ++bucket) {
         CacheBlockRef block = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{bucket}).front();
@@ -14302,9 +14374,9 @@ TEST(RetractionImageSplitTest, OneFullHostBucketDecidesTheSplitBeforeAnyEviction
         BlockPool pool(4, {2});
         BlockPool host_pool(2, {2});
         BlockPool snapshot_pool(snapshot_parents, {2});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         // Outlives the transfer manager, whose snapshot store holds a slot.
         SnapshotSlotAllocator blob_slots(1);
         TierTransferManager transfers(coordinator);
@@ -14374,9 +14446,9 @@ TEST(RetractionImageSplitTest, TheProbeCountsARowInTheBucketOfTheBlockItsPublica
     BlockPool pool(4, {2});
     BlockPool host_pool(1, {2});
     BlockPool snapshot_pool(1, {2});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers(coordinator);
     const GroupAllocator& allocator = coordinator.Allocator(0);
     // Both compute the page. The publisher's block opens a parent at its
@@ -14443,9 +14515,9 @@ TEST(RetractionImageSplitTest, BoundariesGoShallowestFirstWhateverTheGroupOrder)
         BlockPool pool(8, {1, 1});
         BlockPool host_pool(1, {1, 1});
         BlockPool snapshot_pool(4, {1, 1});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         // Outlives the transfer manager, whose snapshot store holds a slot.
         SnapshotSlotAllocator blob_slots(1);
         TierTransferManager transfers(coordinator);
@@ -14530,7 +14602,8 @@ TEST(RetractionImageSplitTest, ProbeAndCommitAgreeOnEveryImage) {
                 BlockPool snapshot_pool(1 + static_cast<std::int32_t>(rng() % 4), packings);
                 CacheCoordinator coordinator =
                     MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                                    /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/place_by_segments);
+                                    /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/place_by_segments,
+                                    /*checkpoint_retention_requests=*/0);
                 // Outlives the transfer manager, whose snapshot store holds a slot.
                 SnapshotSlotAllocator blob_slots(1);
                 TierTransferManager transfers(coordinator);
@@ -15030,9 +15103,9 @@ TEST_P(ImageHostPrefixTest, TheSegmentStepPlacesTheBoundariesTheHostCanTake) {
     BlockPool pool(8, {1});
     BlockPool host_pool(3, {1});
     BlockPool snapshot_pool(3, {1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     // Outlives the transfer manager, whose snapshot store holds a slot.
     SnapshotSlotAllocator blob_slots(1);
     TierTransferManager transfers(coordinator);
@@ -15098,9 +15171,9 @@ TEST(ImageSegmentsThenBlocksTest, TheFallbackPlansOnTheHostTheSegmentsLeave) {
     BlockPool pool(8, {1});
     BlockPool host_pool(5, {1});
     BlockPool snapshot_pool(1, {1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     // Outlives the transfer manager, whose snapshot store holds a slot.
     SnapshotSlotAllocator blob_slots(1);
     TierTransferManager transfers(coordinator);
@@ -15158,9 +15231,9 @@ TEST(ImageSegmentsThenBlocksTest, BothPoliciesPlaceTheWholeImageWithAPinnedCheck
         BlockPool pool(8, {2, 1, 1});
         BlockPool host_pool(5, {2, 1, 1});
         BlockPool snapshot_pool(2, {2, 1, 1});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, write_back_evictions);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+            /*stream_device_cache_to_host=*/false, write_back_evictions, /*checkpoint_retention_requests=*/0);
         // Outlives the transfer manager, whose snapshot store holds a slot.
         SnapshotSlotAllocator blob_slots(1);
         TierTransferManager transfers(coordinator);
@@ -15224,9 +15297,9 @@ TEST(ImageSegmentsThenBlocksTest, BothPoliciesPlaceABoundaryWithPinnedHistory) {
         BlockPool pool(8, {2, 1, 1});
         BlockPool host_pool(3, {2, 1, 1});
         BlockPool snapshot_pool(2, {2, 1, 1});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, write_back_evictions);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+            /*stream_device_cache_to_host=*/false, write_back_evictions, /*checkpoint_retention_requests=*/0);
         // Outlives the transfer manager, whose snapshot store holds a slot.
         SnapshotSlotAllocator blob_slots(1);
         TierTransferManager transfers(coordinator);
@@ -15287,9 +15360,9 @@ TEST(ImageSegmentsThenBlocksTest, BothPoliciesPlaceMultipleBoundariesWithPinnedH
         BlockPool pool(8, {2, 1, 1});
         BlockPool host_pool(4, {2, 1, 1});
         BlockPool snapshot_pool(2, {2, 1, 1});
-        CacheCoordinator coordinator =
-            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
-                            /*stream_device_cache_to_host=*/false, write_back_evictions);
+        CacheCoordinator coordinator = MakeCoordinator(
+            specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+            /*stream_device_cache_to_host=*/false, write_back_evictions, /*checkpoint_retention_requests=*/0);
         // Outlives the transfer manager, whose snapshot store holds a slot.
         SnapshotSlotAllocator blob_slots(1);
         TierTransferManager transfers(coordinator);
@@ -15721,7 +15794,7 @@ TEST_P(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
         kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
     std::mt19937 rng(20261029);
     std::vector<std::vector<std::int32_t>> sessions;
@@ -15966,9 +16039,9 @@ TEST(StoragePrefixReservationTest, DistributesRestoredPagesAcrossCyclicOwners) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/true, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 2, pool, /*enable_l3_storage=*/true, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const auto tokens = MakeTokens(7);
     const auto hashes = ComputePrefixHashes(
         std::array{token_span(tokens.data(), 2), token_span(tokens.data() + 2, 2), token_span(tokens.data() + 4, 2)},
@@ -16003,7 +16076,7 @@ TEST(StoragePrefixReservationTest, QueryBudgetIncludesPromptEndStateBeforeHistor
     }
     auto coordinator = MakeCoordinator(specs, kGrain, pool, /*enable_l3_storage=*/true, &host_pool,
                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                       /*write_back_evictions=*/false);
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const auto tokens = MakeTokens(4097);
     std::vector<token_span> pages;
     for (std::size_t begin = 0; begin + kGrain <= tokens.size(); begin += kGrain) {
@@ -16045,7 +16118,8 @@ TEST(CacheCoordinatorStoreCandidates, EndedSessionSuppressesQueuedStoresWithoutF
                                                  .sliding_window = 4,
                                                  .cache_blocks_per_lcm_block = 1,
                                                  .block_granularity = 2}};
-        auto coordinator = MakeCoordinator(specs, 2, pool, false, &host_pool, nullptr, true, false);
+        auto coordinator = MakeCoordinator(specs, 2, pool, false, &host_pool, nullptr, true, false,
+                                           /*checkpoint_retention_requests=*/0);
         std::vector<BlockTable> tables(1);
         const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
         auto admitted =
@@ -16071,7 +16145,8 @@ TEST(CacheCoordinatorSessionAccess, TheRegistrationLivesAsLongAsItsHandle) {
     BlockPool pool(8, {1});
     const std::array specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false);
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false,
+                                       /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto first =

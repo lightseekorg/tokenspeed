@@ -80,6 +80,9 @@ struct HostCacheStats {
     // never written back).
     std::uint64_t dead_entries_not_written_back{0};
     CacheCoordinator::DeviceEvictionStats device_evictions;
+    // CacheCoordinator::CheckpointResumeGaps, the gaps an admission resumed
+    // a State checkpoint after, on either tier.
+    std::vector<std::uint64_t> checkpoint_resume_gaps;
 };
 
 class Scheduler {
