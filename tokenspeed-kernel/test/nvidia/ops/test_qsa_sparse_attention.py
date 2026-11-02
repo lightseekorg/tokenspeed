@@ -1498,8 +1498,10 @@ def test_qsa_sparse_attention_blackwell_fp8_prefix_ends_at_last_valid_tile(
     interleaved before the last valid id, match the reference and, bitwise, a
     twin row whose extra candidates in tiles 8-15 force the full loop in every
     KV split. Those candidates score so low that their softmax weight is
-    exactly zero, so the twin computes the full loop's result. All-padding
-    prefixes run one tile and keep their tail-only or zero output.
+    exactly zero, so the twin computes the full loop's result. Twins alternate
+    between the second and first row of their pair, so CTAs holding two rows
+    see both loop-length orders. All-padding prefixes run one tile and keep
+    their tail-only or zero output.
     """
     if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
         pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
@@ -1537,10 +1539,12 @@ def test_qsa_sparse_attention_blackwell_fp8_prefix_ends_at_last_valid_tile(
         [1024, 2047],
     )
     paired = 2 * len(patterns)
-    # Rows 0, 2, ... end early; each odd row repeats the row before it, query
-    # included, plus one far candidate per tile 8-15, which ends every split's
-    # loop in its last tile. The last two rows have all-padding prefixes, and
-    # only the first of them has tail candidates.
+    # Each pattern fills one row of a pair, which ends early. Its twin repeats
+    # it, query included, plus one far candidate per tile 8-15, which ends
+    # every split's loop in its last tile. The twin comes second in even pairs
+    # and first in odd ones, so a two-row CTA runs a short row before a full one
+    # and the reverse. The last two rows have all-padding prefixes, and only
+    # the first of them has tail candidates.
     slots = torch.full(
         (copies, paired + 2, width), -1, dtype=torch.int32, device=device
     )
@@ -1549,12 +1553,13 @@ def test_qsa_sparse_attention_blackwell_fp8_prefix_ends_at_last_valid_tile(
         64, far_slot, (copies, paired + 2, 3), dtype=torch.int32, device=device
     )
     for index, positions in enumerate(patterns):
+        row, twin = 2 * index + index % 2, 2 * index + 1 - index % 2
         columns = torch.tensor(positions, device=device)
-        slots[:, 2 * index, columns] = torch.randint(
+        slots[:, row, columns] = torch.randint(
             64, far_slot, (copies, columns.numel()), dtype=torch.int32, device=device
         )
-    slots[:, 1:paired:2] = slots[:, 0:paired:2]
-    slots[:, 1:paired:2, 8 * 128 + 120 : 2048 : 128] = far_slot
+        slots[:, twin] = slots[:, row]
+        slots[:, twin, 8 * 128 + 120 : 2048 : 128] = far_slot
     slots[:, -1, 2048:] = -1
     q = torch.randn(
         copies, paired + 2, q_heads, 256, device=device, dtype=torch.bfloat16

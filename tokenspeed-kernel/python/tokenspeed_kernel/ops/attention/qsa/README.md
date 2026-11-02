@@ -274,8 +274,9 @@ split merge. The bound is runtime data, not a compile-time parameter. Grid
 sizing still assumes full prefixes: rows with fewer selected slots, such as
 short contexts and padded rows, finish sooner.
 
-This selects static geometry inside the existing decode provider. Cache
-layout, writers, prefix/offload ownership and descales keep their contracts.
+The tile and grid choice selects static geometry inside the existing decode
+provider. Cache layout, writers, prefix/offload ownership and descales keep
+their contracts.
 Startup warmup enumerates every tile and launch configuration before graph
 capture, and rows remain dynamic within each configuration. Tests cover Hq/Hkv
 of 24/2 and 12/1, target and draft query widths, both sides of the SM107
