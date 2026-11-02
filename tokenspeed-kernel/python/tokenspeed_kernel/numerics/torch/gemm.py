@@ -545,7 +545,7 @@ def torch_grouped_bf16_projection(
     """Preserve the original batched projection and its BF16 rounding."""
     if out is None:
         out = x.new_empty((x.shape[0], weight.shape[0], weight.shape[1]))
-    # Token-major rows let callers flatten without a copy; out= refuses autograd, as other solutions record none.
+    # Token-major rows flatten as a view; out= rejects inputs that need grad.
     with torch.no_grad():
         torch.bmm(x.transpose(0, 1), weight.transpose(1, 2), out=out.transpose(0, 1))
     return out
