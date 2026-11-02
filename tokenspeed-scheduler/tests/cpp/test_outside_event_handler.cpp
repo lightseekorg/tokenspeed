@@ -1310,12 +1310,13 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeFor
     }
 }
 
-// drop_dead_state_checkpoints leaves the D role's publication as it was: r0
-// still publishes its finish past the prompt end (the KV tail [42] and the
-// state at 9), so r1, whose prompt is exactly those nine tokens, claims that
-// state and the peer omits the state transfer.
-TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesItsFinishWithDropDeadStateCheckpoints) {
-    config_.drop_dead_state_checkpoints = true;
+// The in-forward checkpoint leaves the D role's publication as it was (a PD
+// launcher may pass it to both roles): r0 still publishes its finish past the
+// prompt end (the KV tail [42] and the state at 9), so r1, whose prompt is
+// exactly those nine tokens, claims that state and the peer omits the state
+// transfer.
+TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesItsFinishWithTheInForwardCheckpoint) {
+    config_.state_checkpoint_in_forward = true;
     scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");
@@ -1347,8 +1348,8 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesItsFinishWithDrop
 // checkpoint 8 starts. It still publishes the tail [9] and the state at 9,
 // so r2, whose prompt is r1's, claims that state and the peer omits the
 // state transfer.
-TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesACoveredPromptEndWithDropDeadStateCheckpoints) {
-    config_.drop_dead_state_checkpoints = true;
+TEST_F(PdSparseDecodeAdmissionTestSuite, TheDRoleStillPublishesACoveredPromptEndWithTheInForwardCheckpoint) {
+    config_.state_checkpoint_in_forward = true;
     scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const RequestSpec r0 = MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1);
     Submit({r0});

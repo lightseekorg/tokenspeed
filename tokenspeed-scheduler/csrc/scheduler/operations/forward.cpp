@@ -830,16 +830,16 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // claimed. This delivers the preceding prefill's checkpoints; decode
     // never creates an in-forward checkpoint. Every later decode writes slot
     // 1 in place and lets slot 0 go. Restricted groups cannot publish that
-    // decode-produced live state at finish or retraction either. With
-    // drop_dead_state_checkpoints, a fused prompt end its pre-tail State
-    // checkpoint covers (promptEndIsCoveredByCheckpoint) is such a later
-    // decode instead: no tail and no prompt-end state are published, the
-    // partial page stays the owner's and the state is written in place.
+    // decode-produced live state at finish or retraction either. With the
+    // in-forward checkpoint, a fused prompt end its pre-tail State checkpoint
+    // covers (promptEndIsCoveredByCheckpoint) is such a later decode instead:
+    // no tail and no prompt-end state are published, the partial page stays
+    // the owner's and the state is written in place.
     const bool first_decode = request->Is<fsm::PrefillDone>();
     fsm::CacheProgress& cache_progress = request->CacheProgressRef();
     const bool prompt_end =
         first_decode && firstDecodePublishesPromptEnd(config_) &&
-        !(config_.drop_dead_state_checkpoints && promptEndIsCoveredByCheckpoint(*request, cache_progress));
+        !(config_.state_checkpoint_in_forward && promptEndIsCoveredByCheckpoint(*request, cache_progress));
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};

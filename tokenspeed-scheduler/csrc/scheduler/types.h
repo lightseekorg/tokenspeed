@@ -116,17 +116,15 @@ struct SchedulerConfig {
     // forward holds one more block per State group, and the request's next
     // publication point publishes it under the boundary's page hash. The
     // runtime writes the state at ForwardBatch::extend_state_checkpoint_lens
-    // into the third entry of every State group's row. Requires prefix
-    // caching, except on the D role, which never computes a prompt.
+    // into the third entry of every State group's row. The State checkpoints,
+    // and their KV tails, that a next turn re-rendering the end of the
+    // previous prompt and its reply cannot resume at are then skipped: a
+    // prompt end that checkpoint covers (P and fused roles) and a fused finish
+    // past the prompt end are published like chunk ends
+    // (docs/design/scheduler.md §1.2). A model without State groups is
+    // unaffected. Requires prefix caching, except on the D role, which never
+    // computes a prompt and publishes as ever.
     bool state_checkpoint_in_forward{false};
-    // Skip the State checkpoints, and their KV tails, that a next turn
-    // re-rendering the end of the previous prompt and its reply cannot resume
-    // at: a prompt end its pre-tail State checkpoint covers (P and fused
-    // roles) and a fused finish past the prompt end are published like chunk
-    // ends (docs/design/scheduler.md §1.2). A model without State groups is
-    // unaffected, and so is the D role. Requires prefix caching, except on
-    // the D role.
-    bool drop_dead_state_checkpoints{false};
     // Under cache pressure, a State checkpoint more than
     // checkpoint_retention_leaf_distance from the newest checkpoint on its
     // branch ranks as if last used this many new requests ago, or at its own

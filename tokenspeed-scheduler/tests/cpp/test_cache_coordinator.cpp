@@ -5751,15 +5751,15 @@ TEST(SwaRegistrationTest, TheWindowBehindAnInForwardStateCheckpointIsPublishedAs
     }
 }
 
-// drop_dead_state_checkpoints drops a prompt end only when a probe can resume
-// at the earlier checkpoint, and a probe takes each State group's checkpoint
-// from whichever tier holds it (the Host-suffix rule): a hash counts as held
-// when every State group holds its state under it on the Device or on Host,
-// one group's on each tier included, never when a group holds none. With the
-// KV of all four pages on the Device, the probe resumes at the third page's
-// boundary, whose two checkpoints sit on different tiers, and not at the
-// fourth's, where one group has none. A model without State groups holds
-// none.
+// The in-forward checkpoint drops a dead prompt end only when a probe can
+// resume at the earlier checkpoint, and a probe takes each State group's
+// checkpoint from whichever tier holds it (the Host-suffix rule): a hash
+// counts as held when every State group holds its state under it on the
+// Device or on Host, one group's on each tier included, never when a group
+// holds none. With the KV of all four pages on the Device, the probe resumes
+// at the third page's boundary, whose two checkpoints sit on different tiers,
+// and not at the fourth's, where one group has none. A model without State
+// groups holds none.
 TEST(CacheCoordinatorStateCheckpointTest, EveryStateGroupMustHoldTheCheckpointOnEitherTier) {
     BlockPool pool(16, {1, 1, 1});
     BlockPool host_pool(8, {1, 1, 1});

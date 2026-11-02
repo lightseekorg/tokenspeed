@@ -344,13 +344,13 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
                 assert _find_forward_op(scheduler.next_execution_plan()) is not None
 
 
-@pytest.mark.parametrize("drop_dead_state_checkpoints", [False, True])
+@pytest.mark.parametrize("state_checkpoint_in_forward", [False, True])
 @pytest.mark.parametrize("finish_after_first_decode", [False, True])
 @pytest.mark.parametrize("decode_width", [1, 3])
 @pytest.mark.parametrize("prompt_tokens", [3, 7, 8])
 @pytest.mark.parametrize("truncate_output", [False, True])
 def test_state_checkpoints_are_published_at_prompt_end_and_finish(
-    drop_dead_state_checkpoints: bool,
+    state_checkpoint_in_forward: bool,
     finish_after_first_decode: bool,
     decode_width: int,
     prompt_tokens: int,
@@ -360,9 +360,9 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     prompt end (whatever its alignment) and the finish frontier. Decode steps in
     between publish nothing, so a prompt sharing the decoded tokens resumes at
     the finish frontier when it reaches it and at the prompt end otherwise.
-    ``drop_dead_state_checkpoints`` publishes no state at a finish past the
-    prompt end, so such a prompt resumes at the prompt end, which no pre-tail
-    checkpoint covers in a prompt this short."""
+    With ``state_checkpoint_in_forward`` a finish past the prompt end publishes
+    no state, so such a prompt resumes at the prompt end, which no pre-tail
+    checkpoint covers in a prompt that fits one chunk."""
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 4
     cfg.num_device_pages = 33
@@ -374,7 +374,7 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     cfg.disable_prefix_cache = False
     cfg.decode_input_tokens = decode_width
     cfg.overlap_schedule_depth = 0
-    cfg.drop_dead_state_checkpoints = drop_dead_state_checkpoints
+    cfg.state_checkpoint_in_forward = state_checkpoint_in_forward
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="state",
@@ -417,7 +417,7 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     scheduler.submit_requests([reuse])
     batch = _find_forward_op(scheduler.next_execution_plan())
     assert batch is not None
-    reaches_finish = finish_frontier <= len(shared) and not drop_dead_state_checkpoints
+    reaches_finish = finish_frontier <= len(shared) and not state_checkpoint_in_forward
     expected = finish_frontier if reaches_finish else prompt_tokens
     assert list(batch.extend_prefix_lens) == [expected]
     [state_row] = dict(batch.block_tables)["state"]

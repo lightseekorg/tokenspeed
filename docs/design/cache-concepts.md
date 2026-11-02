@@ -380,10 +380,11 @@ Publication also registers every non-replayable sliding window at that
 checkpoint's boundary before the request reclaims expired table blocks. The
 forward's final window may start later and cannot replace this earlier window,
 even when the forward ends on a full page.
-Conversely, `--drop-dead-state-checkpoints` skips the natural checkpoints a
-next turn that re-renders the end of the previous prompt cannot resume at,
-with their KV tails: a prompt end inside the page whose start holds the
-pre-tail checkpoint, and a fused finish past the prompt end (same section).
+Conversely, `--enable-state-checkpoint-in-forward` also skips the natural
+checkpoints a next turn that re-renders the end of the previous prompt cannot
+resume at, with their KV tails: a prompt end inside the page whose start
+holds the pre-tail checkpoint, and a fused finish past the prompt end (same
+section).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV

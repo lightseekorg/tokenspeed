@@ -129,15 +129,14 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         }
     }
     // The end state this finish publishes supersedes the checkpoint the turn
-    // resumed from (MarkSupersededStateInput). With
-    // drop_dead_state_checkpoints, a finish publishes no end state, like a
-    // chunk end, whether or not it completes a page, and marks the input all
-    // the same: the prompt end, or the pre-tail checkpoint the next turn
-    // resumes at instead, was published or found cached earlier. Marked at the
-    // finish only: a request that fails earlier (a failed PD transfer)
-    // publishes and marks nothing, and an end state that is the input itself
-    // (a D request that claimed its prompt-end checkpoint and leaves before
-    // any decode) supersedes nothing.
+    // resumed from (MarkSupersededStateInput). A finish that publishes no end
+    // state (finishCheckpointIsDead) publishes like a chunk end, whether or
+    // not it completes a page, and marks the input all the same: the prompt
+    // end, or the pre-tail checkpoint the next turn resumes at instead, was
+    // published or found cached earlier. Marked at the finish only: a request
+    // that fails earlier (a failed PD transfer) publishes and marks nothing,
+    // and an end state that is the input itself (a D request that claimed its
+    // prompt-end checkpoint and leaves before any decode) supersedes nothing.
     if (progress.resumed_tail_hash && !(completed.completed_pages && completed.completed_pages->tail &&
                                         completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
         coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
@@ -169,12 +168,12 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
 // those groups neither publish nor match a state at a covered T, which is
 // never aligned. A request that resumed from a tail beyond C keeps T: it
 // extends an earlier prompt end in place, and the next request likely
-// extends T the same way. In practice C exists only with the
-// in-forward checkpoint (SchedulerConfig::state_checkpoint_in_forward);
-// otherwise only when another publication left a state at C: a junction cut
-// or a retraction there, or another request's prompt end or finish exactly
-// at C. The caller passes the progress before the publication at T, the
-// request's computed frontier.
+// extends T the same way. The callers ask only with the in-forward
+// checkpoint (SchedulerConfig::state_checkpoint_in_forward), where C
+// normally exists: the forward spanning C writes it, and a forward that
+// starts or ends at C finds or leaves the state there cached (a hit at C, a
+// chunk end at C), unless it was evicted since. The caller passes the
+// progress before the publication at T, the request's computed frontier.
 bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const {
     const std::int32_t page = coordinator_.PrefixGranularity();
     const std::int32_t checkpoint = PrefillStateCheckpointTokens(
@@ -191,7 +190,7 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
            coordinator_.HoldsStateCheckpoint(progress.prefix_hashes[checkpoint_pages - 1]);
 }
 
-// With drop_dead_state_checkpoints, a finish at a covered prompt end
+// With the in-forward checkpoint, a finish at a covered prompt end
 // publishes like a chunk end: its full pages and a pending in-forward
 // checkpoint, but no tail and no state. That is the P role's finish (the
 // transfer ACK; the P never computes past its prompt), and a fused
@@ -202,9 +201,9 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
 // The prompt end was the first decode's to publish or skip (scheduleDecode).
 // A model without State groups keeps its tails: there they are resume points
 // of their own. The D role publishes its frontier as ever. (Validate
-// requires prefix caching with the flag on the other roles.)
+// requires prefix caching with the in-forward checkpoint on the other roles.)
 bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const {
-    if (!config_.drop_dead_state_checkpoints || config_.role == Role::kD) {
+    if (!config_.state_checkpoint_in_forward || config_.role == Role::kD) {
         return false;
     }
     const std::int32_t frontier = request.NumComputedTokens();
