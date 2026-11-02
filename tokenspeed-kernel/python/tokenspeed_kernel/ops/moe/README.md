@@ -462,7 +462,9 @@ The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and
 Kimi K3 SiTU. Gated SiLU selects the existing kernel epilogue with both SiTU
 parameters set to `None`. BF16 inputs are quantized and staged with routing
 directly into the symmetric workspace in one kernel, including masking unused
-capacity rows. Prequantized packed E2M1 inputs with linear E4M3 block scales
+capacity rows. BF16 staging rejects routing tensors whose row counts differ
+from the live activation count before launching the staging kernel.
+Prequantized packed E2M1 inputs with linear E4M3 block scales
 remain supported for existing callers. `get_runner` requires an explicit
 `prequantized=True` for packed NVFP4 inputs (including direct workspace writes),
 or `prequantized=False` for fused BF16 quantization and staging.
@@ -509,7 +511,8 @@ reference, uneven/idle ranks, graph replay and alternating capacities.
 `test_trtllm_mega_moe_input_stage.py` separately checks byte-exact packed data
 and scales against FlashInfer quantization, INT32/INT64 route inputs and outputs,
 zero-token owners, changing live counts and alternating captured graphs on the
-same workspace. The stager converts route IDs and scores to their destination buffer dtypes
+same workspace, with a compile guard across changing live counts.
+The stager converts route IDs and scores to their destination buffer dtypes
 and keys compiled specializations by all input and output dtypes; current
 MegaMoE workspaces store INT32 IDs.
 

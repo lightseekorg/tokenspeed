@@ -462,6 +462,7 @@ class MegaMoERunner(TunableRunner):
         max_capacity: int,
         *,
         prequantized: bool,
+        tactic_autotune: bool,
     ):
         self.group = group
         self.world = dist.get_world_size(group)
@@ -474,9 +475,8 @@ class MegaMoERunner(TunableRunner):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.max_capacity = max_capacity
-        self.workspace_capacity = max_capacity
         self.prequantized = prequantized
-        self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
+        self.tactic_autotune = tactic_autotune
         self._extras = (
             "nvfp4_full_collective_workspace_v7_blackwell_small_cap124",
             self.world,
@@ -487,7 +487,6 @@ class MegaMoERunner(TunableRunner):
             situ_beta,
             situ_linear_beta,
             max_capacity,
-            self.workspace_capacity,
             prequantized,
             self.tactic_autotune,
         )
@@ -580,7 +579,7 @@ class MegaMoERunner(TunableRunner):
                 self.hidden,
                 self.intermediate,
                 self.top_k,
-                self.workspace_capacity,
+                self.max_capacity,
                 self.situ_beta,
                 self.situ_linear_beta,
                 prequantized=self.prequantized,
@@ -652,6 +651,7 @@ def get_runner(plan: dict, w: torch.nn.Module, *, prequantized: bool) -> MegaMoE
     situ_beta = w.activation_situ_beta
     situ_linear_beta = w.activation_situ_linear_beta
     max_capacity = _token_capacity(get_autotune_max_num_tokens())
+    tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
     key = (
         id(group),
         torch.cuda.current_device(),
@@ -663,7 +663,7 @@ def get_runner(plan: dict, w: torch.nn.Module, *, prequantized: bool) -> MegaMoE
         situ_linear_beta,
         max_capacity,
         prequantized,
-        os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1",
+        tactic_autotune,
     )
     runner = _runners.get(key)
     if runner is None:
@@ -677,6 +677,7 @@ def get_runner(plan: dict, w: torch.nn.Module, *, prequantized: bool) -> MegaMoE
             situ_linear_beta,
             max_capacity,
             prequantized=prequantized,
+            tactic_autotune=tactic_autotune,
         )
         _runners[key] = runner
     return runner

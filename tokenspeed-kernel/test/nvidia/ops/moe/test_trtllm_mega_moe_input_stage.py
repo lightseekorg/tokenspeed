@@ -35,6 +35,22 @@ from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.input_stage import (  # noqa
 )
 
 
+@pytest.mark.parametrize("id_rows,score_rows", [(2, 3), (3, 2), (4, 3), (3, 4)])
+def test_input_stage_rejects_mismatched_route_rows(id_rows, score_rows):
+    stager = Nvfp4InputStage(128, 2)
+    # Shape validation must reject invalid input before accessing CUDA or compiling.
+    x = torch.empty(3, 128, dtype=torch.bfloat16)
+    scale = torch.ones(1)
+    ids = torch.empty(id_rows, 2, dtype=torch.int32)
+    scores = torch.empty(score_rows, 2)
+    q = torch.empty(16, 64, dtype=torch.uint8)
+    sf = torch.empty(16, 8, dtype=torch.float8_e4m3fn)
+    routes = torch.empty(16, 2, dtype=torch.int32)
+    weights = torch.empty(16, 2)
+    with pytest.raises(ValueError, match="route rows must match activation rows"):
+        stager.run(x, scale, ids, scores, q, sf, routes, weights)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("hidden", [128, 3584, 8192])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
@@ -77,9 +93,10 @@ def test_fused_nvfp4_input_stage(hidden, ids_dtype, routes_dtype, scores_dtype):
 
     # The same compiled stager must handle changing live counts, zero owners,
     # and a shrinking batch without leaving previously live routes behind.
-    for n in (3, 13, 1, 0, 7):
+    for iteration, n in enumerate((3, 13, 1, 0, 7)):
         x, ids, scores = inputs(n)
-        run(x, ids, scores)
+        with assert_no_cute_compile() if iteration else nullcontext():
+            run(x, ids, scores)
         check(x, ids, scores)
 
     captured = []

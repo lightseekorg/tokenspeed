@@ -140,6 +140,8 @@ class Nvfp4InputStage:
 
     def run(self, x, input_scale, ids, scores, q_out, sf_out, ids_out, scores_out):
         """Write live quantized rows and masked tail routes into caller-owned buffers."""
+        if not x.shape[0] == ids.shape[0] == scores.shape[0]:
+            raise ValueError("MegaMoE route rows must match activation rows")
         key = (
             x.dtype,
             input_scale.dtype,

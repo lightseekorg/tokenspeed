@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import tokenspeed.runtime.layers.logits_processor as logits_module
 import tokenspeed.runtime.models.qwen3_5_nextn as nextn_module
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.factory import _check_shared_head_layout
@@ -131,6 +132,79 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, 
     )
     expected = torch.nn.functional.linear(hidden, target.lm_head.weight)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
+    mapping = Mapping(
+        rank=rank, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=2
+    )
+    config = PretrainedConfig(
+        hidden_size=4,
+        vocab_size=128,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    monkeypatch.setattr(nextn_module, "Qwen3_5DraftForCausalLM", _EmbeddingOnlyDraft)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    target = _HeadOnlyTarget(config, mapping)
+    draft = Qwen3_5ForConditionalGenerationNextN(config, mapping)
+    _check_shared_head_layout(target, draft)
+    full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
+    width = target.lm_head.weight.shape[0]
+    start = mapping.lm_head.tp_rank * width
+    with torch.no_grad():
+        target.lm_head.weight.copy_(full_weight[start : start + width])
+    draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
+    rows = [1 + r % 3 for r in range(8)]
+    hidden = [
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r
+        for r, n in enumerate(rows)
+    ]
+
+    # Only the distributed transport is simulated on CPU. The real target and
+    # draft heads, layout validation, and logits GEMM handle distinct DP rows
+    # and vocabulary shards; the peer contributes its independently computed shard.
+    def gather(local, group, counts):
+        return torch.cat(
+            [
+                (local if r == rank else hidden[r])[:count]
+                for r, count in zip(group, counts)
+            ]
+        )
+
+    def transpose(local_logits, group, *, input_split_sizes):
+        offset = sum(input_split_sizes[: group.index(rank)])
+        return torch.cat(
+            [
+                (
+                    local_logits[offset : offset + rows[rank]]
+                    if r == rank
+                    else torch.nn.functional.linear(
+                        hidden[rank], full_weight[i * width : (i + 1) * width]
+                    )
+                )
+                for i, r in enumerate(group)
+            ],
+            dim=1,
+        )
+
+    monkeypatch.setattr(logits_module, "token_all_gather", gather)
+    monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE,
+        query_shard=None,
+        global_num_tokens=rows,
+        all_decode_or_idle=True,
+    )
+    actual = draft.logits_processor._get_logits(
+        hidden[rank], draft.lm_head, metadata, require_full_vocab=False
+    )
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(hidden[rank], full_weight)
+    )
 
 
 class _DraftModel(nn.Module):

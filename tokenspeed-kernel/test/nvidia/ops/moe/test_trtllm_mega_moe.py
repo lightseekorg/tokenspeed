@@ -294,6 +294,17 @@ def run_correctness(
 
     external_inputs = x, ids, weights
     runner = get_runner(plan, w, prequantized=prequantized)
+    if not prequantized:
+        # Reject each short routing tensor before any GPU staging reads it.
+        for ids, weights in (
+            (external_inputs[1][:-1], external_inputs[2]),
+            (external_inputs[1], external_inputs[2][:-1]),
+        ):
+            with pytest.raises(
+                ValueError, match="route rows must match activation rows"
+            ):
+                apply(x)
+        x, ids, weights = external_inputs
     if prequantized:
         values_out, scales_out, ids_out, weights_out = runner.input_buffers(
             tokens, capacity
