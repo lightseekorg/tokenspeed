@@ -139,7 +139,9 @@ def get_or_create_context(*, heap_size: int):
 
     Configured heap capacity takes precedence over the caller's initial size.
     The torch allocator enforces capacity as states allocate their buffers;
-    vmem_chunked grows the heap on demand instead.
+    vmem_chunked grows the heap on demand instead. A world left undecided, as
+    when the heap is used without distributed initialization, is decided here:
+    creating the heap is already a world collective, so this adds no new wait.
     """
     global _context
     if torch.cuda.is_current_stream_capturing():

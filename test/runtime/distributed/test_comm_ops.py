@@ -297,10 +297,21 @@ class TestAutoBackendTopology:
         backend._iris.all_reduce.return_value = "iris"
         backend._nccl.all_reduce.return_value = "nccl"
 
+        backend._iris.can_acquire_outputs.return_value = True
+        backend._iris.acquire_all_reduce_outputs.return_value = "iris"
+
         assert backend.can_prepare_all_reduce_buffers(group, torch.bfloat16) is (
             expected == "iris"
         )
         assert backend.all_reduce(torch.empty(1), group) == expected
+        # Producer-direct outputs create the heap on first use, and stay
+        # node-local even where Iris reduces across nodes.
+        acquires = expected == "iris" and group == (0, 1, 2, 3)
+        like = torch.empty(1)
+        assert backend.can_acquire_all_reduce_outputs(((1,),), like, group) is acquires
+        assert (
+            backend.acquire_all_reduce_outputs(((1,),), like, group) == "iris"
+        ) is acquires
 
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
