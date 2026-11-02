@@ -48,6 +48,28 @@ def load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+@pytest.mark.parametrize(
+    "name",
+    (
+        "amd-kernel-benchmark.yml",
+        "amd-mi350-tests.yml",
+        "amd-mi450-tests.yml",
+        "nvidia-b200-tests.yml",
+        "nvidia-gb200-tests.yml",
+        "nvidia-gb300-tests.yml",
+        "pr-test-ascendnpu-arm.yml",
+        "pr-test-nvidia-arm.yml",
+    ),
+)
+def test_test_workflows_cancel_only_pull_request_runs(name: str):
+    workflow = load_yaml(REPO_ROOT / ".github" / "workflows" / name)
+
+    assert (
+        workflow["concurrency"]["cancel-in-progress"]
+        == "${{ github.event_name == 'pull_request' }}"
+    )
+
+
 @pytest.mark.parametrize("name", PR_TEST_WORKFLOWS)
 def test_pr_workflow_can_classify_pull_request_files(name: str):
     workflow = load_yaml(REPO_ROOT / ".github" / "workflows" / name)
@@ -1126,10 +1148,6 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     assert set(triggers) == {"push", "pull_request"}
     assert submit["name"] == "${{ matrix.name }}"
     assert submit["runs-on"] == "slurm-dispatch-gb300"
-    assert (
-        workflow["concurrency"]["cancel-in-progress"]
-        == "${{ github.event_name == 'pull_request' }}"
-    )
     assert '--runner "$RUNNER"' in submit_script
     assert "--runner-alias" not in submit_script
     assert '--source-pr "$PR_NUMBER"' in submit_script

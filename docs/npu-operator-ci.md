@@ -11,7 +11,7 @@ The NPU allowlist uses its own `TOKENSPEED_NPU_CI_REPOSITORY` variable; it does 
 
 Supported PR events are `opened`, `synchronize`, `reopened`, and `ready_for_review`. Draft PRs do not start the NPU job.
 Accuracy always precedes performance.
-The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
+The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Pull request events cancel older runs for the same PR; pushes and manual runs do not initiate cancellation.
 Test code never runs through `pull_request_target`.
 
 The GitHub-hosted `select` job checks out the event commit, runs the CPU-only API regression tests with `python3 -B -m unittest discover -s test/ci_system/npu -p test_changes.py`, then runs `test/ci_system/npu/changes.py`. Selection uses the same GitHub API change-list checks as the independent NPU workflow:
