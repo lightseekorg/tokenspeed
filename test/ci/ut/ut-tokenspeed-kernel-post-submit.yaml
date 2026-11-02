@@ -1,22 +1,22 @@
 api_version: ci.tokenspeed.io/v1
-name: ut-runtime-1gpu
+name: ut-tokenspeed-kernel-post-submit
 type: ut
 workflow_stage: unit-test
 triggers:
-  - per-commit
+  - post-submit
   - manual
 runner:
   labels:
     - h100-1gpu
     - b200-1gpu
     - gb200-1gpu
+    - b300-1gpu
 env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps.sh
 ut:
   commands:
-    - python3 test/runtime/run_ci_suite.py --device cuda --suite runtime-1gpu --timeout-per-file 1800
-    - python3 -m pytest test/cli -v
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/ops/test_gemm_autotune_capacity_formats.py -v
 report:
   github_step_summary: true
