@@ -169,7 +169,11 @@ def prepare_gdn_decode_step(
     model_profile, profile = _profile(request)
     batch = _positive(request.parameters, "batch")
     state_dtype = _state_dtype(request)
-    traits = {"head_dim": profile.head_dim, "value_head_dim": profile.value_head_dim}
+    traits = {
+        "head_dim": profile.head_dim,
+        "value_head_dim": profile.value_head_dim,
+        "padding_safe": False,
+    }
     if request.solution != "flashinfer":
         traits["state_dtype"] = state_dtype
     spec = _select_registration(request, platform, traits)
@@ -224,12 +228,23 @@ def prepare_gdn_decode_mtp(
             "GDN state_writes must be one of: "
             f"{', '.join(sorted(_IMPLEMENTED_STATE_WRITES))}"
         )
-    traits = {"head_dim": profile.head_dim, "value_head_dim": profile.value_head_dim}
-    if request.solution != "flashinfer":
+    per_token = state_writes == "per_token"
+    traits = {
+        "head_dim": profile.head_dim,
+        "value_head_dim": profile.value_head_dim,
+        "verify_tokens": tokens,
+        "output_only": not per_token,
+        "padding_safe": False,
+        "tree": False,
+        # Probe the general verify registration, not the serving-time chain candidate.
+        "chunked_chain": False,
+        "replay_payload": False,
+    }
+    if request.solution != "flashinfer" and per_token:
+        # State-writing calls select by state dtype, as the facade does.
         traits["state_dtype"] = state_dtype
     spec = _select_registration(request, platform, traits)
     inputs = _decode_inputs(request.seed, batch, tokens, profile)
-    per_token = state_writes == "per_token"
     # Committed rows first, then one scratch row per verified position.
     state = _state_pool(
         batch * (1 + tokens) if per_token else batch, profile, state_dtype

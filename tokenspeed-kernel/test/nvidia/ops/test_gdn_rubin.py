@@ -178,9 +178,8 @@ def test_named_decode_solution_rejects_unsupported_state():
     assert not gdn_decode_supports(
         "gdn_decode_step",
         torch.bfloat16,
-        head_dim=128,
-        value_head_dim=128,
         state_dtype=torch.float32,
+        traits={"head_dim": 128, "value_head_dim": 128},
         trait="strided_qkv",
         solution="flashinfer_rubin",
     )
