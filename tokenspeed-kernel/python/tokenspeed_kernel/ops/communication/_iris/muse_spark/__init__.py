@@ -102,7 +102,10 @@ class MuseIrisState:
     """Compose prepared generic collectives and the model's boundary storage.
 
     All layers reuse these buffers in stream order. Reductions and gathers can
-    return borrowed activations; a consumer must finish before the next write.
+    return borrowed activations; a consumer must finish before the next write,
+    including a column gather another caller runs through the installed
+    gather (a draft's capture sink gathers its context columns at a layer
+    boundary).
     The generic all-reduce retains its independent-output contract.
     Expert TP and EP use the same owned-row token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.
