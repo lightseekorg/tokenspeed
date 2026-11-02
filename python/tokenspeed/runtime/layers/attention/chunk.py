@@ -205,8 +205,8 @@ def plan_prefix_chunks(prefix_lens_cpu: torch.Tensor, capacity: int) -> Chunks:
                 allocated[request] = remaining[request]
                 budget -= remaining[request]
             else:
-                for position, request in enumerate(active[offset:]):
-                    allocated[request] = share + (position < remainder)
+                for position, rest in enumerate(active[offset:]):
+                    allocated[rest] = share + (position < remainder)
                 break
         starts.append(consumed)
         consumed = [start + size for start, size in zip(consumed, allocated)]
@@ -241,7 +241,7 @@ def get_chunks_paged(prefix_lens, prefix_lens_cpu, page_table, page_size):
             chunks.len_in_chunk[idx],
             chunks.cum_seq_lens[idx],
             chunk_kv_indices,
-            page_table.shape[1],
+            page_table.stride(0),
             page_size,
         )
         chunk_kv_indices_list.append(chunk_kv_indices)
