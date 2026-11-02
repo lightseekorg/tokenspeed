@@ -1149,7 +1149,9 @@ def _prepare_fixed_workspaces(
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
         allocated = True
-    if config.qcp_size > 1:
+    # V4.1 allocates its gathered projections and per-request packed history
+    # per forward; it has no DSA history gather workspace to reserve.
+    if config.qcp_size > 1 and config.component(DeepseekV41Config) is None:
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
         if draft_backend is not None:

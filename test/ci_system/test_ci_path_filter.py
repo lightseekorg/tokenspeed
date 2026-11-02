@@ -64,7 +64,7 @@ def test_gb300_slurm_path_filter_covers_shared_and_own_workflow_changes():
 
 def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
     assert not should_run(
-        {".github/workflows/pr-test-nvidia-arm.yml"},
+        {".github/workflows/nvidia-arm-tests.yml"},
         "nvidia-gb300-slurm",
         "pull_request",
         REPO_ROOT,

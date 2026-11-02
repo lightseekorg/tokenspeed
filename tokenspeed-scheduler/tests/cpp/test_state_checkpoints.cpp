@@ -2616,6 +2616,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
 // the Host, or without one starts over.
 TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersInputUnmarked) {
     device_pages_ = 15;
+    host_pages_ = 32;  // Keep Host LRU pressure out of this Device input-lifetime test.
     for (const auto& [policy, host_cache] : {std::pair{SchedulerConfig::HostWritePolicy::kWriteBack, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, false}}) {
@@ -2673,6 +2674,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersI
             AckWriteBacks(plan);
             SendAbortEvent("f1");
             AckWriteBacks(PlanOnce());
+            EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
             const Resume again = Probe("g-again", g);
             const bool from_host = g_finishes && !write_back && host_cache;
             EXPECT_EQ(again.prefix_tokens, g_finishes && !from_host ? 0 : 22);
@@ -3925,7 +3927,7 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
         }
         auto retained = coordinator.RetainInputCheckpoint(hashes, 8);
         EXPECT_EQ(retained.size(), missing == -1 ? keys.size() : 0u);
-        coordinator.RefreshRetainedCheckpoint(retained);
+        coordinator.RefreshRetainedCheckpoint(retained, /*request_access_epoch=*/0);
         for (std::size_t i = 0; i < keys.size(); ++i) {
             if (static_cast<std::int32_t>(i) == missing) {
                 continue;
@@ -3949,6 +3951,47 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             }
         }
     }
+}
+
+TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
+    BlockPool device(16, {1, 1});
+    BlockPool host(16, {1, 1});
+    const std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kState},
+        {.attn_kind = AttnKind::kState},
+    };
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true);
+    std::vector<BlockTable> tables(2);
+    const std::vector<GroupDemand> demands{
+        {.table = &tables[0], .extent = StateStep{StateStep::Kind::kRotate}},
+        {.table = &tables[1], .extent = StateStep{StateStep::Kind::kRotate}},
+    };
+    auto admitted =
+        coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false, "session");
+    ASSERT_TRUE(admitted);
+    const std::vector<std::string> hashes{"checkpoint"};
+    const CacheKey device_key{.group_id = 0, .content_hash = hashes[0]};
+    const CacheKey host_key{.group_id = 1, .content_hash = hashes[0]};
+    {
+        auto block = device.AcquireBlock(0);
+        coordinator.CacheDeviceBlock(block, device_key, 0, CacheBoundaryKind::kEndpoint, admitted->access_epoch);
+        auto metadata = coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata;
+        auto host_block = host.AcquireBlock(1);
+        coordinator.CacheHostBlock(host_block, host_key, metadata);
+    }
+    auto retained = coordinator.RetainInputCheckpoint(hashes, 4);
+    ASSERT_EQ(retained.size(), 2u);
+    coordinator.RefreshRetainedCheckpoint(retained, admitted->access_epoch);
+    coordinator.Free(tables);
+    coordinator.ForgetSessionAccess(admitted->access_epoch);
+    // A retained checkpoint remains pinned until the finishing request drops
+    // its hold, then the same session hint must age both cache tiers.
+    EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);
+    retained.clear();
+    EXPECT_EQ(coordinator.DemoteSession("session", false), 2u);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata.last_access_epoch, 0u);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(1).Inspect(host, host_key)->metadata.last_access_epoch, 0u);
+    EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);
 }
 
 }  // namespace tokenspeed::test
