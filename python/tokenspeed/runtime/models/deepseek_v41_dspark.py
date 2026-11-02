@@ -170,7 +170,7 @@ class _WindowAttention:
         swa_norm_weight,
         swa_norm_eps,
         out_rope_cache=None,
-        key_rows=None,
+        key_rows,
     ):
         if key_rows is not None:
             raise ValueError("DSpark window attention does not accept query sharding")

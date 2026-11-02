@@ -327,6 +327,7 @@ def test_kvp_decode_refresh_has_no_host_history_plan(
                 ForwardMode.DECODE,
                 None,
                 projected_partition=None,
+                query_shard=None,
             )
         assert calls == ([False] * 4 if local_reindex else [False] * 4 + [True] * 2)
         assert len(history_calls) == (4 if local_reindex else 6)

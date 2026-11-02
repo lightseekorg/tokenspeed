@@ -424,6 +424,7 @@ def test_window_attention_matches_dense_reference():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        key_rows=None,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -501,6 +502,7 @@ def test_window_attention_kernel_matches_reference():
         swa_rope_cache=rotary.cos_sin_cache,
         swa_norm_weight=None,
         swa_norm_eps=config.rms_norm_eps,
+        key_rows=None,
     )
     actual = backend.forward_v41(q, swa, **kwargs)
     kv = backend._workspace(

@@ -728,7 +728,7 @@ class DeepseekV41Compressor(nn.Module):
         backend,
         mode,
         *,
-        key_rows: QueryShardGather | None = None,
+        key_rows: QueryShardGather | None,
     ):
         """Project local rows, then pool/write in the original request layout.
 
@@ -917,11 +917,11 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
             view.metadata, view.metadata, None, local.decoder_plan, local.decoder_plan
         )
     if layer_id < ced_decoder_start:
-        return V41RowPlan(full, full, None)
+        return V41RowPlan(full, full, None, None, None)
     view = backend.decoder_view()
     if layer_id == ced_decoder_start:
-        return V41RowPlan(full, view.metadata, view.keep_rows)
-    return V41RowPlan(view.metadata, view.metadata, None)
+        return V41RowPlan(full, view.metadata, view.keep_rows, None, None)
+    return V41RowPlan(view.metadata, view.metadata, None, None, None)
 
 
 class DeepseekV41Attention(nn.Module):
@@ -1048,7 +1048,7 @@ class DeepseekV41Attention(nn.Module):
         backend,
         mode,
         *,
-        key_rows: QueryShardGather | None = None,
+        key_rows: QueryShardGather | None,
     ):
         if self.compressor is None:
             return

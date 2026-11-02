@@ -177,8 +177,8 @@ class V41RowPlan(NamedTuple):
     source: V41Metadata
     query: V41Metadata
     keep_rows: torch.Tensor | None
-    source_shard: QueryShardPlan | None = None
-    query_shard: QueryShardPlan | None = None
+    source_shard: QueryShardPlan | None
+    query_shard: QueryShardPlan | None
 
 
 class V41DecoderView(NamedTuple):
@@ -1380,7 +1380,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         index_process_group,
         *,
         projected_partition: InterleavedQueryPlan | None = None,
-        query_shard: QueryShardPlan | None = None,
+        query_shard: QueryShardPlan | None,
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
@@ -1797,6 +1797,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             forward_mode,
             index_process_group,
             projected_partition=projected_partition,
+            query_shard=None,
         )
         key = (layer_id, forward_mode, id(positions), id(requests))
         self._prepared_selections[key] = (positions, requests, result)
@@ -1808,7 +1809,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         requests,
         forward_mode,
         *,
-        query_shard: QueryShardPlan | None = None,
+        query_shard: QueryShardPlan | None,
     ) -> V41SWAQueryPlan:
         """Validate one prefill query window and retain only address scratch.
 
@@ -1825,7 +1826,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError("V4.1 SWA source rows disagree with the query shard")
             if self._window(positions, requests, forward_mode) is None:
                 raise ValueError("V4.1 sharded SWA requires a canonical source window")
-            source = self._swa_query_plan(positions, requests, forward_mode)
+            source = self._swa_query_plan(
+                positions, requests, forward_mode, query_shard=None
+            )
             plans = []
             first, last = query_shard.local_start, query_shard.local_end
             for request in source.requests:
@@ -2018,7 +2021,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         swa_norm_weight,
         swa_norm_eps,
         out_rope_cache=None,
-        key_rows: QueryShardGather | None = None,
+        key_rows: QueryShardGather | None,
     ) -> torch.Tensor:
         """Joint SWA/global attention; returns BF16 [T,Hlocal,512].
 
@@ -2138,6 +2141,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     swa_norm_weight=swa_norm_weight,
                     swa_norm_eps=swa_norm_eps,
                     out_rope_cache=out_rope_cache,
+                    key_rows=None,
                 )
             return out
         if n == 0 and key_rows is None:

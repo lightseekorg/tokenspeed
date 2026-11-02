@@ -748,7 +748,11 @@ def test_decoder_swa_excludes_history_before_its_retained_window(
     view = methods["_build_decoder_view"](backend, metadata, [True], 128, mode)
     backend._decoder_view = view
     plan = methods["_swa_query_plan"](
-        backend, view.prefill.positions, view.prefill.request_indices, mode
+        backend,
+        view.prefill.positions,
+        view.prefill.request_indices,
+        mode,
+        query_shard=None,
     )
     request = plan.requests[0]
     # Even an unchanged row set must not inherit the encoder's older SWA keys.

@@ -482,7 +482,13 @@ def test_compressor_query_shards_preserve_pairs_and_tails(
         tail.normal_()
         initial_tail = tail.clone()
     expected = compressor(
-        x, owner, meta.positions, meta.request_indices, reference, ForwardMode.EXTEND
+        x,
+        owner,
+        meta.positions,
+        meta.request_indices,
+        reference,
+        ForwardMode.EXTEND,
+        key_rows=None,
     )
     projected = (
         F.linear(x, compressor.wkv.weight)

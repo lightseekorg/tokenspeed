@@ -674,7 +674,7 @@ class RowShardedEngramEmbedding(nn.Module):
             self._copy_rows(param, rows, start - self.row_start)
 
     def forward(
-        self, indices: torch.Tensor, *, query_shard: QueryShardPlan | None = None
+        self, indices: torch.Tensor, *, query_shard: QueryShardPlan | None
     ) -> torch.Tensor:
         """Gather [..., hash columns] IDs into BF16 [..., hash columns, head dim].
 
@@ -880,7 +880,7 @@ class DeepseekV41Engram(nn.Module):
         hash_ids: torch.Tensor,
         token_mask: torch.Tensor,
         *,
-        query_shard: QueryShardPlan | None = None,
+        query_shard: QueryShardPlan | None,
     ) -> torch.Tensor:
         """Inject Engram into [..., 4, hidden_size], returning the same shape/dtype.
 
