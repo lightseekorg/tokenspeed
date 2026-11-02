@@ -3444,10 +3444,6 @@ def test_model_qcp_prefill_config(kvp_size):
 @pytest.mark.parametrize("prefill_kvp", [1, 4])
 def test_pd_prefill_to_sharded_decode_contract(dspark, prefill_kvp):
     from tokenspeed.runtime.pd.cache_protocol import build_arena_cache_transfer_contract
-    from tokenspeed.runtime.pd.transfer_plan import (
-        CacheTransferPlanner,
-        local_transfer_pages,
-    )
 
     recipe = _dspark_recipe if dspark else _recipe
     source_recipe, destination_recipe = recipe("cpu"), recipe("cpu")
@@ -3470,48 +3466,30 @@ def test_pd_prefill_to_sharded_decode_contract(dspark, prefill_kvp):
     )
     source, _ = build_arena_cache_transfer_contract(source_pool.arena)
     destination, _ = build_arena_cache_transfer_contract(destination_pool.arena)
-    planner = CacheTransferPlanner(
-        prefill_tp_size=4,
-        decode_tp_size=4,
-        prefill_layout=source,
-        decode_layout=destination,
-        prefill_field_ids=None,
-    )
-    # Independent allocator IDs: the same logical row can have a different
-    # page number on P and D. Only global KV and Index K are page-sharded.
-    source_ids, destination_ids = tuple(range(1, 9)), tuple(range(8, 0, -1))
-    for group in (SWA, R1, R2, TAIL):
-        seen = []
-        for rank in range(4):
-            route = planner.plan_for_decode_rank(rank)
-            assert len(route.target_prefill_ranks) == prefill_kvp
-            count = destination.shard_count(group)
-            source_count = source.shard_count(group)
-            for source_rank in range(source_count):
-                src, dst = local_transfer_pages(
-                    source_ids,
-                    destination_ids,
-                    group_id=group,
-                    source_layout=source,
-                    destination_layout=destination,
-                    source_owner_rank=source_rank,
-                    destination_owner_rank=rank,
-                )
-                restored_src = ((src - 1) * source_count + source_rank + 1).tolist()
-                restored_dst = (
-                    (dst - 1) * count + (rank if count > 1 else 0) + 1
-                ).tolist()
-                expected = [
-                    (s, d)
-                    for s, d in zip(source_ids, destination_ids)
-                    if (count == 1 or (d - 1) % count == rank)
-                    and (s - 1) % source_count == source_rank
-                ]
-                assert list(zip(restored_src, restored_dst)) == expected
-                seen.extend(restored_src)
-        assert sorted(seen) == sorted(
-            list(source_ids) * (1 if group in (R1, R2) else 4)
-        )
+    # Python publishes the contract; page routing is tested against the Rust
+    # planner in ts-pd/tests/planning.rs.
+    for contract, kvp in ((source, prefill_kvp), (destination, 4)):
+        groups = {group.group_id: group for group in contract.group_specs}
+        assert set(groups) == {SWA, R1, R2, TAIL}
+        for group_id, group in groups.items():
+            assert group.shard_count == (kvp if group_id in (R1, R2) else 1)
+            assert group.transfer_policy is not None
+        fields = {field.field_id: field for field in contract.plan.fields}
+        assert fields
+        assert set(contract.field_addresses) == set(fields)
+        for name, field in fields.items():
+            if name.endswith((".global_kv", ".index_k")):
+                assert field.group_id in (R1, R2)
+            elif ".dspark_kv" in name or name.endswith(".swa"):
+                assert field.group_id == SWA
+            elif name.endswith(".compressor_tail"):
+                assert field.group_id == TAIL
+        assert any(".dspark_kv" in name for name in fields) == dspark
+        # This is the wire representation consumed by the Rust planner.
+        assert contract.to_wire_bytes()
+    assert {field.field_id for field in source.plan.fields} == {
+        field.field_id for field in destination.plan.fields
+    }
 
 
 @pytest.mark.parametrize("size", [2, 4, 8])

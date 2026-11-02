@@ -650,4 +650,11 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
             rtol=0,
             atol=0,
         )
-    torch.testing.assert_close(torch.cat(outputs), expected, rtol=0, atol=0)
+    # Sharding changes GEMM/attention shapes and can change BF16 rounding.
+    # Cache bytes above must still match exactly; floating outputs need not.
+    actual = torch.cat(outputs)
+    torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=1e-4)
+    relative_rms = (actual.float() - expected.float()).norm() / (
+        expected.float().norm().clamp_min(1e-12)
+    )
+    assert relative_rms < 1e-3, relative_rms.item()
