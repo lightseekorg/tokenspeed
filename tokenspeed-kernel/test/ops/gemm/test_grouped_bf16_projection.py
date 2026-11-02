@@ -34,7 +34,10 @@ def test_torch_projection_matches_einsum_bitwise_in_token_major_rows(groups, tok
     # A slice of padded heads, as the attention output reaches the projection.
     heads = torch.randn(tokens, 16 * groups, 256, device="cuda", dtype=torch.bfloat16)
     x = heads[:, : 8 * groups].reshape(tokens, groups, -1)
-    weight = torch.randn(groups, 384, 2048, device="cuda", dtype=torch.bfloat16)
+    # Module weights are parameters, which still require grad outside serving.
+    weight = torch.nn.Parameter(
+        torch.randn(groups, 384, 2048, device="cuda", dtype=torch.bfloat16)
+    )
     expected = torch.einsum("tgd,grd->tgr", x, weight)
 
     result = grouped_bf16_projection(x, weight, None, "torch")
