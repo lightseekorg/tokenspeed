@@ -770,6 +770,10 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         RUNTIME + "execution/forward_step.py",
         "__call__",
         owner="ForwardStepRunner",
+        nullcontext=nullcontext,
+        live_graph_outputs=load_symbol(
+            RUNTIME + "execution/forward_step.py", "live_graph_outputs"
+        ),
         nvtx_range=lambda *args, **kwargs: nullcontext(),
     )
     width, padded_bs = 3, 4
@@ -781,6 +785,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         forward_mode=SimpleNamespace(is_decode=lambda: True, is_idle=lambda: False),
     )
     observed = []
+    accepted_lengths = []
     runner = SimpleNamespace(
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
@@ -794,6 +799,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         _graph_debug=False,
         _expert_load_rows=None,
         device="cuda",
+        config=SimpleNamespace(spec_draft_tree=False),
+        attn_backend=SimpleNamespace(
+            commit_state_after_acceptance=lambda lengths, **kwargs: accepted_lengths.append(
+                lengths.clone()
+            )
+        ),
         max_tokens_per_req=width,
         drafter=None,
         deepep_adapter=SimpleNamespace(replay=lambda: None),
@@ -813,11 +824,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
                 torch.ones(padded_bs),
                 None,
                 None,
+                None,
             )
         },
     )
     empty = torch.empty(0, dtype=torch.int32)
-    tokens, lengths, _, _ = run(
+    tokens, lengths, _, _, _ = run(
         runner,
         live_bs,
         ctx,
@@ -837,3 +849,5 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     assert ctx.output_layout is live_layout
     assert tokens.tolist() == list(range(live_bs * width))
     assert len(lengths) == live_bs
+    assert len(accepted_lengths) == 1
+    torch.testing.assert_close(accepted_lengths[0], lengths)

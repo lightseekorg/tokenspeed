@@ -3946,7 +3946,7 @@ class ServerArgs:
             help="Model-wide query context parallelism (QCP) on the PD prefill "
             "role. Shards extend query rows over attention TP and requires "
             "--query-context-parallel-size equal to --attn-tp-size. V4.1 "
-            "requires KVP=1, replicated attention heads and eager prefill. "
+            "requires KVP=1 or KVP=QCP, replicated attention heads and eager prefill. "
             "GPU DSA requires KVP equal to QCP and a bf16 KV cache; "
             "--attn-head-tp-size can shard its heads. For V4.1 aggregate "
             "serving, use the separate --deepseek-v41-*-query-parallel-size "
