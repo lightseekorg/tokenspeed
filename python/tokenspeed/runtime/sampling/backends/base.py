@@ -217,7 +217,8 @@ class SamplingBackend(ABC):
         if config.synthetic_acceptance_length is not None:
             if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
                 raise ValueError(
-                    "synthetic acceptance requires the greedy sampling backend"
+                    "synthetic acceptance requires the greedy sampling backend, "
+                    "or the flashinfer backend with block rejection"
                 )
             al = config.synthetic_acceptance_length
             if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
@@ -517,6 +518,31 @@ class SamplingBackend(ABC):
         self._synthetic_lengths[
             row_offset : row_offset + force_single_token.numel()
         ].masked_fill_(force_single_token, 1)
+
+    @staticmethod
+    def sample_synthetic_targets(
+        target_probs: torch.Tensor, lengths: torch.Tensor, coins: torch.Tensor
+    ) -> torch.Tensor:
+        """Draw each row's correction/bonus token from the target distribution.
+
+        Args:
+            target_probs: ``[bs, N, V]`` verify target probabilities (after
+                temperature / top-k / top-p).
+            lengths: ``[bs]`` synthetic lengths in ``[1, N]``; the token lands
+                at verify position ``length - 1``.
+            coins: ``[bs]`` uniforms in ``(0, 1)`` prepared outside the graph.
+
+        Returns:
+            ``[bs]`` int64 token ids. Inverse-CDF sampling: greedy rows (a
+            one-hot after top-k = 1) return their argmax, and a zero-probability
+            token is never chosen.
+        """
+        bs, n, vocab = target_probs.shape
+        rows = torch.arange(bs, device=target_probs.device) * n + (lengths.long() - 1)
+        cdf = target_probs.reshape(bs * n, vocab).index_select(0, rows).cumsum_(1)
+        threshold = (coins * cdf[:, -1]).unsqueeze(1)
+        tokens = torch.searchsorted(cdf, threshold, right=True).squeeze(1)
+        return tokens.clamp_(max=vocab - 1)
 
     def write_synthetic_outputs(
         self,

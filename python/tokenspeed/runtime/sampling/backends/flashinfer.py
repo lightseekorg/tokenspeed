@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling.block import block_speculative_sampling
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
 )
@@ -175,9 +176,23 @@ class FlashInferSamplingBackend(SamplingBackend):
     supports_tree_verify = True
     _SUPPORTS_DP_VERIFY = True
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
+    # Only as the block-rejection benchmark mode; checked in __init__.
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
+        # Block verification is a server-wide choice read from the server
+        # args like ``numerics``; it only applies under speculative sampling.
+        self._block_rejection = (
+            global_server_args_dict["enable_block_rejection"]
+            and config.enable_speculative_sampling
+        )
+        if config.synthetic_acceptance_length is not None and not self._block_rejection:
+            raise ValueError(
+                "synthetic acceptance on a flashinfer backend requires block "
+                "rejection with speculative sampling; otherwise use the greedy "
+                "sampling backend"
+            )
         super().__init__(config)
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
@@ -824,21 +839,43 @@ class FlashInferSamplingBackend(SamplingBackend):
                 if use_draft_prob
                 else None
             )
-            chain_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                uniform_samples=coins[:bs, :n],
-                uniform_samples_for_final_sampling=final_coins[:bs],
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=not dp_sampling,
-                use_draft_prob=use_draft_prob,
-                reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
-            )
+            synthetic = self.config.synthetic_acceptance_length is not None
+            if self._block_rejection and draft_probs is None:
+                raise RuntimeError(
+                    "block verification requires recorded draft probabilities"
+                )
+            # Synthetic acceptance mirrors vLLM's rejection_sample_method
+            # "synthetic": the standard draft-probability chain rule below runs
+            # for its cost, then the forced lengths replace its outcome. The
+            # block verifier is a different rejection method and is not run.
+            if self._block_rejection and not synthetic:
+                block_speculative_sampling(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    uniform_samples=coins[:bs, :n],
+                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                )
+            else:
+                chain_speculative_sampling_target_only(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    uniform_samples=coins[:bs, :n],
+                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                    threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                    deterministic=not dp_sampling,
+                    use_draft_prob=use_draft_prob,
+                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                )
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
                 canonical_greedy_verify(
                     logits=logits,
@@ -848,11 +885,28 @@ class FlashInferSamplingBackend(SamplingBackend):
                     accept_index=accept_index,
                     accept_length=accept_length,
                 )
+            if synthetic:
+                lengths = self.synthetic_lengths(
+                    candidates, sampling_info.batch_row_offset
+                )
+                self.write_synthetic_outputs(
+                    candidates,
+                    self.sample_synthetic_targets(
+                        target_probs, lengths, final_coins[:bs]
+                    ),
+                    lengths,
+                    predict,
+                    accept_index,
+                    accept_length,
+                )
 
             accept_length += 1
             # This is the chain implementation's agreement requirement, not
             # a property of the request's random-stream policy. The fused
-            # renorm path skips TP sync only when PDL is disabled.
+            # renorm path skips TP sync only when PDL is disabled. The block
+            # verifier meets the same requirement: fixed grids, per-program
+            # reductions and no atomics, so equal inputs give equal outputs
+            # on every rank.
             needs_tp_sync = pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE
         logprobs_local = None
         if self.config.enable_output_logprobs and dp_sampling:
