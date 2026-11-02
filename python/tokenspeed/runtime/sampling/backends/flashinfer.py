@@ -899,7 +899,10 @@ class FlashInferSamplingBackend(SamplingBackend):
             accept_length += 1
             # This is the chain implementation's agreement requirement, not
             # a property of the request's random-stream policy. The fused
-            # renorm path skips TP sync only when PDL is disabled.
+            # renorm path skips TP sync only when PDL is disabled. The block
+            # verifier meets the same requirement: fixed grids, per-program
+            # reductions and no atomics, so equal inputs give equal outputs
+            # on every rank.
             needs_tp_sync = pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE
         logprobs_local = None
         if self.config.enable_output_logprobs and dp_sampling:

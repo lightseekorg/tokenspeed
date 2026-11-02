@@ -219,7 +219,8 @@ class SamplingBackend(ABC):
         if config.synthetic_acceptance_length is not None:
             if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
                 raise ValueError(
-                    "synthetic acceptance requires the greedy sampling backend"
+                    "synthetic acceptance requires the greedy sampling backend, "
+                    "or the flashinfer backend with block rejection"
                 )
             al = config.synthetic_acceptance_length
             if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
