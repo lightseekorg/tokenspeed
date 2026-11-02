@@ -2717,8 +2717,10 @@ class ServerArgs:
             "checkpoint with a newer checkpoint after it is evicted before cache "
             "entries used within this many new requests on its attention-DP "
             "rank, while entries unused for longer are evicted first. 0 evicts "
-            "every entry by its own last use (plain LRU). Default: 16 times the "
-            "per-rank max batch size. See docs/design/cache-concepts.md.",
+            "every entry by its own last use (plain LRU). Set it to about 16 "
+            "times the expected concurrent requests per attention-DP rank. "
+            "Default: 16 times --max-num-seqs per attention-DP rank. See "
+            "docs/design/cache-concepts.md.",
         )
         parser.add_argument(
             "--checkpoint-retention-leaf-distance",

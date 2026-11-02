@@ -188,7 +188,8 @@ def make_config(
             under cache pressure a hybrid model's State checkpoint with a newer
             checkpoint after it ranks as if last used this many new requests
             ago (0 ranks every cache entry by its own use). None keeps the
-            scheduler's default, 16 times ``max_batch_size``.
+            scheduler's default, 16 times ``max_batch_size``, which is
+            ``--max-num-seqs`` per attention-DP rank.
         checkpoint_retention_leaf_distance:
             ``--checkpoint-retention-leaf-distance``: checkpoints within this
             many of the newest on their branch rank as it does. None keeps the

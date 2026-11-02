@@ -1076,7 +1076,8 @@ Its responsibilities:
   `SchedulerConfig::checkpoint_retention_leaf_distance` (default 0; 1 also
   keeps the checkpoint before the newest) from that leaf is aged. With N =
   `SchedulerConfig::checkpoint_retention_requests` (default 16 ×
-  `max_batch_size`; 0 is plain LRU), an aged checkpoint used within the last N
+  `--max-num-seqs` per attention-DP rank, the scheduler's `max_batch_size`; 0
+  is plain LRU), an aged checkpoint used within the last N
   new-request admissions ranks as if last used at the oldest of them, the
   larger distance first: it leaves before every entry used since, while
   entries unused for longer, such as an abandoned session, leave first. N
