@@ -268,6 +268,10 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         request.return_logprob,
     );
     state.created_time = request.created_time;
+    state.session_id = request
+        .session_params
+        .as_ref()
+        .and_then(|session| session.id.clone());
 
     if invalid.is_none() && request.return_logprob {
         state.set_logprobs(LogprobRequest {

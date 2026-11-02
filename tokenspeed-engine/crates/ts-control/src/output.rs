@@ -553,6 +553,7 @@ impl OutputProcessor {
             .map_or((0.0, 0.0, 0.0, 0, 0.0), |timings| timings.trace_points());
         trace.emit(crate::trace::TraceRecord {
             rid: rid.to_owned(),
+            session: state.session_id.clone(),
             created: state.created_time,
             scheduled,
             prefill_done,
@@ -1928,6 +1929,7 @@ mod tests {
         let mut p =
             OutputProcessor::new(None, 1, Some(4096), Role::Plain, NO_FINISH_LOG, Some(trace));
         register(&mut p, "r", 4, 10, &[2]);
+        p.states.get_mut("r").unwrap().session_id = Some("sess-7".to_owned());
         p.mark_scheduled(&["r".to_owned()]);
         let c = p
             .commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
@@ -1949,6 +1951,7 @@ mod tests {
             ("r", 4, 2)
         );
         assert_eq!(record.finish_reason, "stop");
+        assert_eq!(record.session.as_deref(), Some("sess-7"));
         assert!(record.scheduled > 0.0, "tracing stamps the schedule point");
         assert!(record.first_token >= record.scheduled);
         assert!(record.finish >= record.first_token);

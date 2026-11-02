@@ -54,6 +54,8 @@ const BATCH_WAIT: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceRecord {
     pub rid: String,
+    /// The continual-prompting session, when the request named one.
+    pub session: Option<String>,
     pub created: f64,
     pub scheduled: f64,
     pub prefill_done: f64,
@@ -233,6 +235,20 @@ fn span(record: &TraceRecord) -> Value {
             }));
         }
     }
+    let mut attributes = vec![
+        string_attribute("gen_ai.request_id", &record.rid),
+        int_attribute("gen_ai.prompt_tokens", record.prompt_tokens),
+        int_attribute("tokenspeed.prompt_cached_tokens", record.cached_tokens),
+        int_attribute("gen_ai.completion_tokens", record.output_tokens),
+        string_attribute("gen_ai.response.finish_reason", record.finish_reason),
+        int_attribute("tokenspeed.preempt_count", record.preempt_count),
+        double_attribute("tokenspeed.preempt_seconds", record.preempt_seconds),
+    ];
+    if let Some(session) = &record.session {
+        // The GenAI session convention: same id, one conversation in the
+        // tracing UI, each request its own trace.
+        attributes.push(string_attribute("session.id", session));
+    }
     json!({
         "traceId": trace_id(&record.rid),
         "spanId": span_id(&record.rid),
@@ -240,15 +256,7 @@ fn span(record: &TraceRecord) -> Value {
         "kind": 1,
         "startTimeUnixNano": nanos(record.created),
         "endTimeUnixNano": nanos(record.finish),
-        "attributes": [
-            string_attribute("gen_ai.request_id", &record.rid),
-            int_attribute("gen_ai.prompt_tokens", record.prompt_tokens),
-            int_attribute("tokenspeed.prompt_cached_tokens", record.cached_tokens),
-            int_attribute("gen_ai.completion_tokens", record.output_tokens),
-            string_attribute("gen_ai.response.finish_reason", record.finish_reason),
-            int_attribute("tokenspeed.preempt_count", record.preempt_count),
-            double_attribute("tokenspeed.preempt_seconds", record.preempt_seconds),
-        ],
+        "attributes": attributes,
         "events": events,
         "status": {},
     })
@@ -321,6 +329,7 @@ mod tests {
     fn record() -> TraceRecord {
         TraceRecord {
             rid: "chatcmpl-1".to_owned(),
+            session: Some("sess-7".to_owned()),
             created: 1_700_000_000.0,
             scheduled: 1_700_000_000.5,
             prefill_done: 1_700_000_001.0,
@@ -345,11 +354,23 @@ mod tests {
         assert_eq!(span["endTimeUnixNano"], "1700000002000000000");
         let attrs = span["attributes"].as_array().unwrap();
         assert!(attrs.contains(&string_attribute("gen_ai.response.finish_reason", "stop")));
+        assert!(attrs.contains(&string_attribute("session.id", "sess-7")));
         assert!(attrs.contains(&int_attribute("gen_ai.prompt_tokens", 100)));
         let events = span["events"].as_array().unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0]["name"], "tokenspeed.request.scheduled");
         assert_eq!(events[0]["timeUnixNano"], "1700000000500000000");
+    }
+
+    #[test]
+    fn a_request_without_a_session_carries_no_session_attribute() {
+        let mut record = record();
+        record.session = None;
+        let span = span(&record);
+        let attrs = span["attributes"].as_array().unwrap();
+        assert!(!attrs
+            .iter()
+            .any(|attribute| attribute["key"] == "session.id"));
     }
 
     #[test]

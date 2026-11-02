@@ -34,6 +34,14 @@ body encodes with `serde_json` and ships with `ureq`, so the engine carries
 no opentelemetry dependency stack. Integers are strings and ids hex, as
 protobuf's JSON mapping writes 64-bit and bytes fields.
 
+A request that names a continual-prompting session
+(`session_params.id` on the wire) carries it as the GenAI `session.id`
+attribute — every request stays its own trace, and the tracing UI threads
+one conversation's requests under the session. Requests that name no
+session carry no attribute; conversation branches
+(`session_params.rid`) linking to the request they continue is a later
+refinement.
+
 Attributes follow the GenAI semantic conventions where they apply
 (`gen_ai.system`, `gen_ai.request.model`, prompt and completion tokens,
 finish reason), so Langfuse, Datadog and the Jaeger UIs render the spans

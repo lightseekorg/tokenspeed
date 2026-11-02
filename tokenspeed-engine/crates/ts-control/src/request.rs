@@ -210,6 +210,9 @@ pub struct RequestState {
     pub input_logprobs_sent: bool,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// The continual-prompting session the request belongs to, when it
+    /// names one; traces group a session's requests under it.
+    pub session_id: Option<String>,
     /// Speculative verify rounds this request took part in.
     pub spec_verify_ct: i64,
     /// Once it finished with speculative decoding, its accepted tokens per
@@ -298,6 +301,7 @@ impl RequestState {
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            session_id: None,
             spec_verify_ct: 0,
             accept_draft_tokens: None,
             numerical_error_detected: false,
