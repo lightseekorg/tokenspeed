@@ -115,8 +115,12 @@ class AttentionConfig:
         assert BLOCK_M % 16 == 0
         assert BLOCK_N % 16 == 0
 
-        assert NUM_WARPS in (4, 8, 16)
-        if BLOCK_M == 32:
+        assert NUM_WARPS in (2, 4, 8, 16)
+        if NUM_WARPS == 2:
+            # Keep each wave on sixteen query rows without splitting key columns.
+            assert BLOCK_M == 32
+            warp_bases = [[1, 0]]
+        elif BLOCK_M == 32:
             # Small query tails split four waves across both matrix axes.
             assert NUM_WARPS == 4
             warp_bases = [[1, 0], [0, 1]]
@@ -295,6 +299,24 @@ class AttentionProgram:
         query_axis: gl.constexpr = 1 if head_major else 2
         batch_axis: gl.constexpr = 2 if head_major else 0
         head_program = gl.program_id(head_axis)
+        q_block = gl.program_id(query_axis)
+        if (
+            head_major
+            and cfg.N_HEADS >= 32
+            and cfg.N_HEADS == cfg.N_KV_HEADS
+            and cfg.HEAD_DIM == 128
+            and not cfg.IS_FP8
+            and cfg.WINDOW_LEFT < 0
+            and not cfg.HAS_SINK
+            and not cfg.HAS_LSE
+        ):
+            # Query-first order reuses K/V across neighboring workgroups. One
+            # head must have enough query tiles to fill all 256 CUs first.
+            query_blocks = gl.num_programs(query_axis)
+            if (query_blocks >= 256) & (gl.num_programs(batch_axis) == 1):
+                linear = head_program + gl.num_programs(head_axis) * q_block
+                head_program = linear // query_blocks
+                q_block = linear % query_blocks
         group_size: gl.constexpr = cfg.N_HEADS // cfg.N_KV_HEADS
         if cfg.COMPACT_RAGGED:
             # Flatten the live query tiles. The launch batch dimension gives
@@ -320,7 +342,6 @@ class AttentionProgram:
                 prefix += num_q_blocks
         else:
             batch = gl.program_id(batch_axis)
-            q_block = gl.program_id(query_axis)
             if cfg.REVERSE_Q_BLOCKS:
                 q_block = gl.num_programs(axis=query_axis) - 1 - q_block
             if UNIFORM_SEQLENS:
@@ -521,10 +542,12 @@ class AttentionProgram:
             pred=True,
             clamp_bounds=True,
         )
+        k_waves: gl.constexpr = 0b01 if self.cfg.NUM_WARPS == 2 else 0b0011
+        v_waves: gl.constexpr = 0b10 if self.cfg.NUM_WARPS == 2 else 0b1100
         cdna5.tdm.async_load_fused(
             [
-                (k_desc, self.k_buffer.index(buffer_index), 0b0011),
-                (v_desc, self.v_buffer.index(buffer_index), 0b1100),
+                (k_desc, self.k_buffer.index(buffer_index), k_waves),
+                (v_desc, self.v_buffer.index(buffer_index), v_waves),
             ],
             cache_modifier=".cg",
         )
@@ -1487,7 +1510,7 @@ def process_attention_tile_selected(
     cfg = program.cfg
     if (
         (cfg.HEAD_DIM == 64 or cfg.HEAD_DIM == 128)
-        and cfg.NUM_WARPS == 4
+        and (cfg.NUM_WARPS == 2 or cfg.NUM_WARPS == 4)
         and (cfg.BLOCK_N == 64 or cfg.BLOCK_N == 128)
         and cfg.WINDOW_LEFT < 0
     ):
@@ -2587,6 +2610,14 @@ def _select_medium_prefill_geometry(
         and (length <= 512 or (group == 1 and not uniform) or partial_packed)
     ):
         return PrefillGeometry(64, 64, 4, can_pack, True)
+    # Small MHA grids need more query workgroups to fill the device.
+    if group == 1 and length >= 1024:
+        blocks128 = config.n_heads * sum(triton_cdiv(s, 128) for s in seqlens)
+        if blocks128 < _GFX1250_NUM_CUS:
+            blocks64 = config.n_heads * sum(triton_cdiv(s, 64) for s in seqlens)
+            if uniform and length % 32 == 0 and blocks64 <= _GFX1250_NUM_CUS // 2:
+                return PrefillGeometry(32, 128, 2, can_pack, length <= 2048)
+            return PrefillGeometry(64, 128, 4, can_pack, length <= 2048)
     block_m = 64 if length <= 2048 and rows < 16384 else (128 if rows <= 98304 else 256)
     if length >= 4096 and rows >= 98304:
         block_m = 256
@@ -2953,7 +2984,8 @@ def launch_gluon_mha_prefill_gfx1250(
         qk_valu_group_size = 0
         qk_ds_group_stride = 0
 
-    # Wide separate-head launches schedule heads, then queries, then sequences.
+    # Wide separate-head launches put heads on the first grid axis; create()
+    # remaps long single-sequence MHA grids to visit queries of one head first.
     # Other tiles retain batch/head/query order to spread their causal work.
     # LaunchConfig keeps logical (batch, head, query) dimensions above.
     launch_grid = (

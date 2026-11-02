@@ -576,14 +576,31 @@ def test_mha_prefill_storage_offset_repeated(seqlens, n_q_heads, n_kv_heads, dty
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "head_dim,seqlen",
-    [(64, 8192), (64, 8193), (128, 8192), (128, 8193), (64, 32768), (64, 32769)],
-    ids=["d64-full", "d64-tail", "d128-full", "d128-tail", "d64-wide", "d64-wide-tail"],
+    "head_dim,seqlen,n_q_heads,n_kv_heads",
+    [
+        (64, 8192, 8, 1),
+        (64, 8193, 8, 1),
+        (128, 8192, 8, 1),
+        (128, 8193, 8, 1),
+        (64, 32768, 8, 1),
+        (64, 32769, 8, 1),
+        (128, 1024, 2, 2),
+        (128, 2048, 4, 4),
+        (128, 2048, 8, 8),
+        (128, 4096, 2, 2),
+        (128, 8192, 1, 1),
+        (128, 8192, 2, 2),
+        (128, 2057, 2, 2),
+    ],
 )
-def test_mha_prefill_fixed_shift_retry_graph(dtype, seqlen, head_dim):
+def test_mha_prefill_fixed_shift_retry_graph(
+    dtype, seqlen, head_dim, n_q_heads, n_kv_heads
+):
     """Changing logits must select a safe numerical path on every replay."""
     torch.manual_seed(46)
-    q, k, v, cu, cu_cpu, maximum = _inputs([seqlen], 8, 1, head_dim, "cuda", dtype)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [seqlen], n_q_heads, n_kv_heads, head_dim, "cuda", dtype
+    )
 
     q, k, v = _offset_inputs(q, k, v)
     original = [tensor.clone() for tensor in (q, k, v)]
@@ -863,6 +880,32 @@ def test_mha_prefill_nonzero_sequence_base(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_mha_prefill_query_order_lengths_replay(dtype, batch):
+    """Cross the query-order threshold without losing rows or recompiling."""
+    torch.manual_seed(78)
+    for index, length in enumerate((65279, 65281, 65537)):
+        q, k, v, cu, cu_cpu, maximum = _inputs(
+            [length] * batch, 32, 32, 128, "cuda", dtype
+        )
+        q, k, v = _offset_inputs(q, k, v)
+        if index == 0:
+            prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = prefill.launch_gluon_mha_prefill_gfx1250(
+                q, k, v, cu, cu_cpu, maximum
+            )
+        _check_graph_replays(graph, output, q, k, v, cu_cpu, repeats=10)
+        q.mul_(8)
+        k.mul_(8)
+        _check_graph_replays(graph, output, q, k, v, cu_cpu, repeats=10)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "batch,n_q_heads,n_kv_heads,lengths",
     [
@@ -941,6 +984,54 @@ def test_mha_prefill_medium_ragged_lengths_do_not_recompile(dtype):
                     q, k, v, cu, cu_cpu, maximum
                 )
         _check_sampled_fp64(output, q, k, v, cu_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("length,n_heads", [(1056, 4), (2048, 8)])
+def test_mha_prefill_underfilled_full_reference(dtype, length, n_heads):
+    """Check every output row of the small-grid schedules, including partial K."""
+    torch.manual_seed(77)
+    q, k, v, cu, cu_cpu, maximum = _inputs(
+        [length], n_heads, n_heads, 128, "cuda", dtype
+    )
+    output = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+    expected = _reference(
+        q.double(), k.double(), v.double(), cu_cpu, n_heads, n_heads, 128
+    )
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(
+        output.double(), expected, atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "n_heads,ragged", [(2, False), (4, False), (2, True), (8, True)]
+)
+def test_mha_prefill_underfilled_lengths_replay(dtype, n_heads, ragged):
+    """Small grids preserve tails, retry, and reuse across nearby lengths."""
+    torch.manual_seed(76)
+    lengths = (2049, 2057, 2079) if ragged else (1024, 1056, 1088)
+    for index, length in enumerate(lengths):
+        seqlens = [length, 33, 0] if ragged else [length]
+        q, k, v, cu, cu_cpu, maximum = _inputs(
+            seqlens, n_heads, n_heads, 128, "cuda", dtype
+        )
+        q, k, v = _offset_inputs(q, k, v)
+        if index == 0:
+            prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        else:
+            with assert_no_triton_compile(prefill.gluon_mha_prefill_gfx1250):
+                prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = prefill.launch_gluon_mha_prefill_gfx1250(
+                q, k, v, cu, cu_cpu, maximum
+            )
+        _check_graph_replays(graph, output, q, k, v, cu_cpu, repeats=20)
+        q.mul_(8)
+        k.mul_(8)
+        _check_graph_replays(graph, output, q, k, v, cu_cpu, repeats=20)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
