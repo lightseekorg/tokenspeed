@@ -70,6 +70,7 @@ def test_score_wave_budget_tracks_compiled_resources(batch: int, num_stages: int
         table,
         requests,
         complete,
+        requests,
         logits,
         heads,
         dim,
@@ -88,6 +89,7 @@ def test_score_wave_budget_tracks_compiled_resources(batch: int, num_stages: int
         "BLOCK_D": dim,
         "QUERY_GROUP_SIZE": width,
         "LOOP_QUERY_GROUPS": False,
+        "RAGGED_GROUPS": False,
         "ENABLE_PDL": False,
     }
     kernel = qsa._qwen4_exp_qsa_score_blocks_kernel.warmup(

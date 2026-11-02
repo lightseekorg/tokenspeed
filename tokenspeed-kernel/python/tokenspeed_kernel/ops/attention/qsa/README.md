@@ -181,18 +181,32 @@ runtime inputs. Request count is represented by page-table rows and the
 per-query request indices. The group count opts out of scalar specialization;
 other integer inputs retain Triton's finite alignment classes for optimization.
 
+A query group shares each key tile and never crosses a request. A uniform run
+width uses its largest power-of-two divisor up to the geometry's limit. Four
+index heads of width 128 on NVIDIA allow 32-row groups, a 128-row tensor-core
+dot, once a batch has 1024 rows. Long ragged batches, and long uniform runs
+whose width 32 does not divide, still use 32-row groups: a one-program pass
+cuts each request's run of rows into 32-row slices, the last one partial, and
+writes their first rows to a device table without a host read. Scoring takes a
+group's first row and size from the table and masks rows past it. The table
+has room for `ceil(rows / 32)` plus the page-table row count slices, enough
+because each request's rows are consecutive. Uniform widths that divide 32
+already form whole groups and skip the table.
+
 `BLOCK_N`, `BLOCK_H`, and `BLOCK_D` set static tile dimensions. Query grouping
-also sets `arange` and `reshape` dimensions and remains compile-time; a
-bounded flag selects whether the query-group loop is needed. Model dimensions,
-tensor formats, PDL, and launch tuning stay fixed for a warmed configuration.
+also sets `arange` and `reshape` dimensions and remains compile-time, as does
+the flag that reads groups from the slice table; a bounded flag selects whether
+the query-group loop is needed. Model dimensions, tensor formats, PDL, and
+launch tuning stay fixed for a warmed configuration.
 
 During `kernel_warmup`, scoring compiles and loads every power-of-two group
 allowed by the model geometry and both loop variants, without launching the
 unused variants. Four index heads of width 128 on NVIDIA have six groups,
-1 through 32, and two loop variants. Warmup also covers row-stride and capacity
+1 through 32, and 32-row table slices, each with two loop variants; warmup
+also compiles the slice-table pass. Warmup also covers row-stride and capacity
 classes: one, divisible by 16, and other integers. With 64-block pages, capacity
 and logits strides stay divisible by 16; the three page-table stride classes
-give at most 36 binaries for one fixed tensor-format/PDL configuration.
+give at most 42 scoring binaries for one fixed tensor-format/PDL configuration.
 Later query-count, request-count, and table-width changes reuse these binaries
 while refreshing the launch grid. Grouping and occupancy policies are the same
 during prefill, decode, and CUDA graphs.

@@ -1569,6 +1569,7 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     page_table,
     request_indices,
     complete_blocks,
+    group_rows,
     logits,
     num_heads,
     head_dim,
@@ -1587,6 +1588,7 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     BLOCK_D: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
     LOOP_QUERY_GROUPS: tl.constexpr,
+    RAGGED_GROUPS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
@@ -1601,18 +1603,37 @@ def _qwen4_exp_qsa_score_blocks_kernel(
         group_iterations = 1
     for iteration in range(group_iterations):
         group = group_start + iteration * group_step
-        row = group * QUERY_GROUP_SIZE
+        query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
+        head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
+        if RAGGED_GROUPS:
+            # group_rows lists each group's first row in ascending order, then
+            # the row count for every unused slot, so a group's row count is
+            # the gap to the next entry (at most QUERY_GROUP_SIZE). Unused
+            # slots read the row count and skip.
+            row = tl.load(group_rows + group).to(tl.int64)
+            group_size = tl.load(group_rows + group + 1).to(tl.int64) - row
+            request = tl.load(request_indices + row, mask=group_size > 0, other=0).to(
+                tl.int64
+            )
+        else:
+            # Like ragged rows, uniform rows scale query and logits strides in
+            # int64.
+            row = group.to(tl.int64) * QUERY_GROUP_SIZE
+            group_size = QUERY_GROUP_SIZE
+            request = tl.load(request_indices + row).to(tl.int64)
+        row_mask = query_offsets < group_size
+        head_row_mask = head_offsets // BLOCK_H < group_size
         tile = tl.program_id(1)
         # Every group stays within one request, but each query keeps its own
-        # complete-block frontier and output row.
-        request = tl.load(request_indices + row).to(tl.int64)
-        query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
-        complete = tl.load(complete_blocks + row + query_offsets).to(tl.int64)
+        # complete-block frontier and output row. A row outside the group
+        # gets a zero frontier, so it neither extends the walk nor stores.
+        complete = tl.load(
+            complete_blocks + row + query_offsets, mask=row_mask, other=0
+        ).to(tl.int64)
         max_complete = tl.minimum(tl.max(complete, axis=0), num_blocks)
         # The grid stays bounded during graph replay. Each CTA walks only its
         # valid tiles, reusing Q when a request outgrows the launch width.
         if tile * BLOCK_N < max_complete:
-            head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
             dim_offsets = tl.arange(0, BLOCK_D)
             head_mask = head_offsets % BLOCK_H < num_heads
             dim_mask = dim_offsets < head_dim
@@ -1621,7 +1642,7 @@ def _qwen4_exp_qsa_score_blocks_kernel(
                 + (row + head_offsets[:, None] // BLOCK_H) * stride_q_n
                 + (head_offsets[:, None] % BLOCK_H) * stride_q_h
                 + dim_offsets[None, :] * stride_q_d,
-                mask=head_mask[:, None] & dim_mask[None, :],
+                mask=head_mask[:, None] & head_row_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
             for start in range(
@@ -1756,6 +1777,74 @@ def triton_qsa_block_topk_stream(
     return selected
 
 
+@triton.jit
+def _qsa_max_combine(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit(do_not_specialize=["rows", "bound"])
+def _qsa_ragged_group_rows_kernel(
+    request_indices,
+    table,
+    rows,
+    bound,
+    GROUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program walks the rows in order, carrying the open run's first row
+    # and the number of slices emitted so far across blocks.
+    emitted = tl.zeros((), dtype=tl.int32)
+    run_first = tl.zeros((), dtype=tl.int32)
+    for start in range(0, rows, BLOCK):
+        offsets = start + tl.arange(0, BLOCK)
+        in_range = offsets < rows
+        requests = tl.load(request_indices + offsets, mask=in_range, other=0)
+        previous = tl.load(
+            request_indices + offsets - 1, mask=in_range & (offsets > 0), other=0
+        )
+        run_start = in_range & ((offsets == 0) | (requests != previous))
+        first_row = tl.associative_scan(
+            tl.where(run_start, offsets, run_first), 0, _qsa_max_combine
+        )
+        starts = in_range & ((offsets - first_row) % GROUP == 0)
+        slots = emitted + tl.cumsum(starts.to(tl.int32), axis=0) - 1
+        tl.store(table + slots, offsets, mask=starts)
+        emitted += tl.sum(starts.to(tl.int32), axis=0)
+        run_first = tl.max(tl.where(in_range, first_row, 0), axis=0)
+    for start in range(0, bound + 1, BLOCK):
+        offsets = start + tl.arange(0, BLOCK)
+        tl.store(
+            table + offsets,
+            tl.full((BLOCK,), rows, dtype=tl.int32),
+            mask=(offsets >= emitted) & (offsets <= bound),
+        )
+
+
+# Launch options shared by the slice-table pass and its startup warmup.
+_RAGGED_GROUP_ROWS_LAUNCH = {"BLOCK": 1024, "num_warps": 4}
+
+
+def _qsa_ragged_group_rows(
+    request_indices: torch.Tensor, rows: int, group: int, num_requests: int
+) -> torch.Tensor:
+    """First row of every ``group``-row slice of each request's row run.
+
+    Device-only (no host sync): each contiguous run of equal request ids is cut
+    into slices of ``group`` rows from its first row. Returns int32 starts in
+    ascending order, padded with ``rows`` to a host-known bound plus one entry,
+    so slice ``i`` holds rows ``[t[i], t[i + 1])`` and padding slots are empty.
+    Each request's rows must be consecutive, so there are at most
+    ``num_requests`` runs.
+    """
+    # Each run adds at most one partial slice.
+    bound = triton.cdiv(rows, group) + num_requests
+    table = torch.empty((bound + 1,), dtype=torch.int32, device=request_indices.device)
+    _qsa_ragged_group_rows_kernel[(1,)](
+        request_indices, table, rows, bound, GROUP=group, **_RAGGED_GROUP_ROWS_LAUNCH
+    )
+    return table
+
+
 def _score_grid(
     kernel, query_groups: int, num_tiles: int, sm_count: int
 ) -> tuple[int, int, int]:
@@ -1790,8 +1879,8 @@ def triton_qsa_block_scores(
     block_h = triton.next_power_of_2(query.shape[1])
     # Long uniform runs reuse K across 32 queries. With four index heads this
     # exposes a 128-row dot to Blackwell tensor cores instead of padding a
-    # four-row dot to mma.sync's 16-row instruction. Small/ragged batches keep
-    # their latency-oriented grouping; every group stays within one request.
+    # four-row dot to mma.sync's 16-row instruction. Small batches keep their
+    # latency-oriented grouping; every group stays within one request.
     max_query_group = max(1, min(4, 16 // block_h))
     warm_query_group = (
         32 if _is_nvidia and block_h == 4 and query.shape[2] == 128 else max_query_group
@@ -1799,10 +1888,29 @@ def triton_qsa_block_scores(
     if rows >= 1024:
         max_query_group = warm_query_group
     query_group_size = math.gcd(queries_per_request or 1, max_query_group)
+    # Long ragged batches (prefill chunks of several requests), and long runs
+    # whose width 32 does not divide, still share K in 32-row groups instead of
+    # falling back to one row per program (~6x slower on long contexts). A
+    # device-side table cuts each request's rows into 32-row slices, so groups
+    # never cross a request. Uniform widths that divide 32, including one row
+    # per request, already form whole groups and gain nothing from slicing.
+    ragged = max_query_group == 32 and query_group_size not in (
+        max_query_group,
+        queries_per_request,
+    )
+    if ragged:
+        query_group_size = max_query_group
+        group_rows = _qsa_ragged_group_rows(
+            request_indices, rows, query_group_size, page_table.shape[0]
+        )
+        query_groups = group_rows.shape[0] - 1
+    else:
+        # Unread placeholder for the group table.
+        group_rows = request_indices
+        query_groups = rows // query_group_size
     # The old 512-block tile used 129 KiB shared memory for 4x128 BF16 heads,
     # limiting a B300 SM to one CTA. 128 blocks leave room for concurrent CTAs.
     block_n = 128
-    query_groups = rows // query_group_size
     sm_count = current_platform().sm_count
     args = (
         query,
@@ -1810,6 +1918,7 @@ def triton_qsa_block_scores(
         page_table,
         request_indices,
         complete_blocks,
+        group_rows,
         logits,
         query.shape[1],
         query.shape[2],
@@ -1832,6 +1941,7 @@ def triton_qsa_block_scores(
         # Two buckets bound specialization. The small bucket fits even at
         # one resident CTA/SM and folds away the outer loop during decode.
         "LOOP_QUERY_GROUPS": query_groups > _SCORE_MAX_WAVES * sm_count,
+        "RAGGED_GROUPS": ragged,
         "ENABLE_PDL": use_pdl,
     }
     if is_warming_up():
@@ -1839,21 +1949,41 @@ def triton_qsa_block_scores(
         # Runtime integers also key on 1, divisible-by-16, or other values.
         # Keep those alignment hints and compile every reachable class before
         # live table widths and request-run lengths select another variant.
-        warm_args = list(args)
+        warm_args = dict(zip(_qwen4_exp_qsa_score_blocks_kernel.arg_names, args))
+        # Uniform groups pass request_indices as the unread group table, while
+        # ragged 32-row slices read an int32 table; pointer types key the JIT.
+        group_variants = [
+            (1 << power, False, request_indices)
+            for power in range(warm_query_group.bit_length())
+        ]
+        if warm_query_group == 32:
+            slice_table = torch.empty((1,), dtype=torch.int32, device=query.device)
+            group_variants.append((32, True, slice_table))
+            _qsa_ragged_group_rows_kernel.warmup(
+                request_indices,
+                slice_table,
+                rows,
+                0,
+                GROUP=32,
+                grid=(1,),
+                **_RAGGED_GROUP_ROWS_LAUNCH,
+            )._init_handles()
         # Whole pages already align both block counts and logits row strides.
         column_classes = (1,) if page_size % 16 == 0 else (1, 16, 17)
         for columns in column_classes:
-            warm_args[8] = warm_args[-1] = columns * page_size
+            warm_args["num_blocks"] = warm_args["stride_l_n"] = columns * page_size
             for table_stride in (1, 16, 17):
-                warm_args[-2] = table_stride
-                for power in range(warm_query_group.bit_length()):
+                warm_args["stride_pt_b"] = table_stride
+                for group_size, ragged_groups, group_table in group_variants:
+                    warm_args["group_rows"] = group_table
                     for loop_groups in (False, True):
                         variant = _qwen4_exp_qsa_score_blocks_kernel.warmup(
-                            *warm_args,
+                            **warm_args,
                             **{
                                 **constants,
-                                "QUERY_GROUP_SIZE": 1 << power,
+                                "QUERY_GROUP_SIZE": group_size,
                                 "LOOP_QUERY_GROUPS": loop_groups,
+                                "RAGGED_GROUPS": ragged_groups,
                             },
                             grid=(1,),
                             num_warps=4,

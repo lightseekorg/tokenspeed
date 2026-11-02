@@ -905,11 +905,16 @@ def _expected_logits_ids(scores: torch.Tensor, k: int, n_cols_padded: int) -> li
     return qsa_logits_topk_ids(scores, k)
 
 
+@pytest.mark.parametrize("ragged", [False, True])
 @pytest.mark.parametrize("query_group_size", [1, 4])
 @pytest.mark.parametrize("tile_programs", [1, 2, 5])
 @pytest.mark.parametrize("group_programs", [1, 4])
 def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
-    device: str, query_group_size: int, tile_programs: int, group_programs: int
+    device: str,
+    query_group_size: int,
+    tile_programs: int,
+    group_programs: int,
+    ragged: bool,
 ) -> None:
     rows, heads, dim, page_size, columns = 4, 3, 32, 64, 9
     num_blocks = page_size * columns
@@ -922,19 +927,28 @@ def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
     requests = torch.zeros(rows, device=device, dtype=torch.int64)
     complete = torch.tensor([0, 1, 129, 513], device=device, dtype=torch.int32)
     logits = torch.full((rows, num_blocks), float("nan"), device=device)
+    if ragged:
+        # Uneven slices then empty padding slots, laid out as the ragged
+        # group table: slice i holds rows [starts[i], starts[i + 1]).
+        starts = [0, 1, 3] if query_group_size == 4 else [0, 1, 2, 3]
+        group_rows = torch.tensor(starts + [rows] * 3, device=device, dtype=torch.int32)
+        query_groups = group_rows.numel() - 1
+    else:
+        group_rows, query_groups = requests, rows // query_group_size
     qsa_ops._qwen4_exp_qsa_score_blocks_kernel[
-        (min(rows // query_group_size, group_programs), tile_programs)
+        (min(query_groups, group_programs), tile_programs)
     ](
         query,
         keys,
         table,
         requests,
         complete,
+        group_rows,
         logits,
         heads,
         dim,
         num_blocks,
-        rows // query_group_size,
+        query_groups,
         page_size,
         *query.stride(),
         keys.stride(0),
@@ -945,7 +959,8 @@ def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
         BLOCK_H=4,
         BLOCK_D=32,
         QUERY_GROUP_SIZE=query_group_size,
-        LOOP_QUERY_GROUPS=group_programs < rows // query_group_size,
+        LOOP_QUERY_GROUPS=group_programs < query_groups,
+        RAGGED_GROUPS=ragged,
         ENABLE_PDL=False,
         num_warps=4,
         num_stages=2,
@@ -984,6 +999,7 @@ def test_qwen4_exp_qsa_score_grid_refreshes_without_recompile(device: str) -> No
             table,
             requests,
             complete,
+            requests,
             logits,
             heads,
             dim,
@@ -1000,6 +1016,7 @@ def test_qwen4_exp_qsa_score_grid_refreshes_without_recompile(device: str) -> No
             BLOCK_D=dim,
             QUERY_GROUP_SIZE=width,
             LOOP_QUERY_GROUPS=False,
+            RAGGED_GROUPS=False,
             ENABLE_PDL=False,
             num_warps=4,
             num_stages=2,
@@ -1276,6 +1293,90 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
             assert sorted(indices[row].tolist()) == sorted(expected_ids)
     assert torch.isneginf(scores[0][width : width + 64]).all()
     assert (selected[0][width : width + 64] == -1).all()
+
+
+@pytest.mark.parametrize(
+    "widths,queries_per_request",
+    [
+        ((1000, 37, 3, 64), None),
+        ((5, 1100, 31), None),
+        # Uniform widths that 32 does not divide are cut the same way.
+        ((520, 520), 520),
+        ((1100,), 1100),
+    ],
+)
+def test_qwen4_exp_qsa_ragged_long_query_groups_match_reference(
+    device: str, widths: tuple[int, ...], queries_per_request: int | None
+) -> None:
+    # A long ragged batch (several requests' prefill rows, no uniform width)
+    # shares K in 32-row slices cut per request; partial slices at run ends
+    # and runs crossing the slice table's 1024-row scan blocks must score
+    # like independent rows.
+    torch.manual_seed(151)
+    heads, dim, page_size, columns = 4, 128, 64, 9
+    batch, rows, num_blocks = len(widths), sum(widths), page_size * columns
+    query = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(
+        (batch * columns + 1) * page_size, 1, dim, device=device, dtype=query.dtype
+    )
+    keys[:page_size].fill_(float("nan"))
+    table = torch.arange(
+        1, batch * columns + 1, device=device, dtype=torch.int32
+    ).reshape(batch, columns)
+    # Owning request IDs need not follow the run order.
+    owners = torch.randperm(batch, device=device)
+    requests = owners.repeat_interleave(torch.tensor(widths, device=device))
+    complete = torch.arange(rows, device=device, dtype=torch.int32) % (num_blocks + 1)
+
+    def scores(count: int, width: int | None) -> torch.Tensor:
+        return qsa_ops.triton_qsa_block_scores(
+            query[:count],
+            keys,
+            table,
+            requests[:count],
+            complete[:count],
+            page_size=page_size,
+            queries_per_request=width,
+            enable_pdl=False,
+        )
+
+    logits = scores(rows, queries_per_request)
+    expected = torch.stack(
+        _block_topk_reference_scores(
+            query, keys, table, requests, complete, page_size, num_blocks
+        )
+    )
+    valid = torch.arange(num_blocks, device=device)[None, :] < complete[:, None]
+    torch.testing.assert_close(logits[valid], expected[valid], rtol=1e-5, atol=1e-4)
+    # Row counts and run layouts are runtime values of both kernels.
+    ragged = scores(rows, None)
+    with assert_no_triton_compile(
+        qsa_ops._qwen4_exp_qsa_score_blocks_kernel,
+        qsa_ops._qsa_ragged_group_rows_kernel,
+    ):
+        shorter = scores(rows - 7, None)
+    # Blocks past a row's frontier stay unwritten, so compare written scores.
+    kept = valid[: rows - 7]
+    torch.testing.assert_close(shorter[kept], ragged[: rows - 7][kept], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("widths", [(1000, 37, 3, 64), (1, 32, 33, 2000), (2048,)])
+def test_qwen4_exp_qsa_ragged_group_rows_cut_each_request_run(
+    device: str, widths: tuple[int, ...]
+) -> None:
+    group = 32
+    requests = torch.arange(len(widths), device=device).repeat_interleave(
+        torch.tensor(widths, device=device)
+    )
+    rows = requests.numel()
+    starts, first = [], 0
+    for width in widths:
+        starts += range(first, first + width, group)
+        first += width
+    bound = triton.cdiv(rows, group) + len(widths)
+    expected = starts + [rows] * (bound + 1 - len(starts))
+    table = qsa_ops._qsa_ragged_group_rows(requests, rows, group, len(widths))
+    assert table.tolist() == expected
 
 
 @pytest.mark.parametrize("queries_per_request", [0, -1, 5])
@@ -2231,3 +2332,69 @@ def test_qsa_recent_write_warmup_covers_request_limits(
     with assert_no_triton_compile(kernel):
         for limit in (1, 17, 16, 0, 2, 31, 32, 33, None):
             run(limit)
+
+
+@pytest.mark.parametrize("startup", ["short", "long_ragged"])
+def test_qsa_score_warmup_covers_ragged_long_batches(
+    device: str, monkeypatch: pytest.MonkeyPatch, startup: str
+) -> None:
+    kernels = (
+        qsa_ops._qwen4_exp_qsa_score_blocks_kernel,
+        qsa_ops._qsa_ragged_group_rows_kernel,
+    )
+    # Earlier tests must not supply the specializations this warmup missed.
+    torch.cuda.synchronize()
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    heads, dim, page_size = 4, 128, 64
+    query = torch.randn(2048, heads, dim, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(65 * page_size, 1, dim, device=device, dtype=query.dtype)
+
+    def run(widths: tuple[int, ...], width: int | None, columns: int, stride: int):
+        batch = len(widths)
+        requests = torch.arange(batch, device=device).repeat_interleave(
+            torch.tensor(widths, device=device)
+        )
+        rows = requests.numel()
+        # Serving shortens a persistent table's view and keeps its row stride.
+        pages = torch.arange(batch * stride, device=device, dtype=torch.int32)
+        table = (pages % 64 + 1).reshape(batch, stride)[:, :columns]
+        complete = torch.arange(rows, device=device, dtype=torch.int32) % (
+            columns * page_size + 1
+        )
+        qsa_ops.triton_qsa_block_scores(
+            query[:rows],
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=page_size,
+            queries_per_request=width,
+            enable_pdl=False,
+        )
+
+    # Startup scores either a short uniform batch or one long ragged batch.
+    with kernel_warmup(enabled=True):
+        if startup == "short":
+            run((4, 4), 4, 9, 17)
+        else:
+            run((1000, 37), None, 9, 17)
+    platform = qsa_ops.current_platform()
+    with assert_no_triton_compile(*kernels):
+        # One SM bounds the grid, so these batches also take the group loop.
+        for sm_count in (platform.sm_count, 1):
+            monkeypatch.setattr(
+                qsa_ops,
+                "current_platform",
+                lambda sm_count=sm_count: replace(platform, sm_count=sm_count),
+            )
+            for widths, width in (
+                ((1000, 37, 3, 64), None),
+                ((5, 1100, 31), None),
+                ((520, 520), 520),
+                ((2048,), 2048),
+                ((16,) * 64, 16),
+                ((3, 9, 1), None),
+            ):
+                for columns, stride in ((9, 17), (16, 16), (1, 1)):
+                    run(widths, width, columns, stride)

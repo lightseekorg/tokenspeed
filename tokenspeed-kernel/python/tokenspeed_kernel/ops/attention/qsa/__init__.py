@@ -322,12 +322,13 @@ def qsa_block_scores(
             contiguous last dimension.
         key_cache: Compressed keys shaped ``[slots, 1, head_dim]``.
         page_table: Compressed-cache page ids shaped ``[requests, pages]``.
-        request_indices: Owning request per query row.
+        request_indices: Owning request per query row; each request's rows
+            are consecutive.
         complete_blocks: Fully compressed block count per row.
         page_size: Compressed rows per page.
         queries_per_request: Uniform consecutive rows per request, or None
             for ragged layouts; implementations may share key tiles within
-            these runs.
+            each request's run.
         enable_pdl: Use programmatic dependent launch where supported.
         override: Optional registered kernel name.
         solution: Optional kernel solution.

@@ -535,7 +535,10 @@ page mapping. Mixed batches with device-only decode lengths, and persistent
 decode views, retain the capacity bound; decode graph shapes stay fixed.
 Uniform query runs may share a K tile, but groups must never cross requests.
 A single-request forward is uniform regardless of its forward mode. Long runs
-use larger query groups; ragged layouts retain independent rows. Scoring writes
+use larger query groups. In long batches, ragged layouts and uniform widths that
+are neither a multiple nor a divisor of the larger group cut each request's
+rows into slices of that group on the device; shorter ragged batches retain
+independent rows. Scoring writes
 only each query's complete-block prefix. CUDA, Triton, and gfx950 Gluon top-k
 read that per-row frontier on the device, so the score tail may remain
 uninitialized even when the frontier shrinks during graph replay.
@@ -1181,7 +1184,9 @@ Materialized scoring can group a divisor of that width to share K
 within a request; it must retain each query's complete-block frontier and
 selection. Group size one and larger groups use the same scoring kernel, in
 both eager and captured forwards. Grouping must not be inferred from the total
-row count or page-table batch size for a ragged layout.
+row count or page-table batch size for a ragged layout. Long ragged slices come
+from the device request indices; the page-table batch size only bounds their
+table, because each request's rows are consecutive.
 
 QSA block selection enters through the public QSA API and `select_kernel`.
 The materialized path composes the registered `qsa_block_scores` and
