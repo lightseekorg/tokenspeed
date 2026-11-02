@@ -470,8 +470,8 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // superseded checkpoint boundary's Device copy, newest first, since the
     // Device keeps that one longest -- then the shallower boundary, keeping
     // the longer frontier as Device eviction does, then the candidate
-    // node's first Host entry. A Host-only checkpoint that is not a leaf ranks
-    // as CheckpointAging says: the larger distance first, then the older.
+    // node's first Host entry. An aged Host-only checkpoint ranks as
+    // CheckpointAging says: the larger distance first, then the older.
     enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kHostOnly };
     struct Candidate {
         const BoundaryTree::Node* candidate_node{nullptr};
@@ -573,7 +573,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                 // traversal does not keep an unused checkpoint young.
                 candidate.epoch_sort_key = state_epoch;
                 if (aging.tree != nullptr && state_epoch >= aging.cutoff_epoch && !unaged.contains(&node)) {
-                    candidate.aged_distance = aging.tree->NonLeafDistance(*node.hash, CacheTier::kHost);
+                    candidate.aged_distance = aging.tree->AgedDistance(*node.hash, CacheTier::kHost);
                     if (candidate.aged_distance != 0) {
                         candidate.epoch_sort_key = aging.cutoff_epoch;
                         candidate.aged_epoch = state_epoch;
@@ -616,11 +616,10 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     std::pmr::unordered_set<const BoundaryTree::Node*> walked_by_taken_victims{&scratch};
     bool added_kv_duplicates = false;
     while (!shadow.Fits(need_by_bucket, no_dense_need)) {
-        // A descendant taken in this plan turns an aged checkpoint back into
-        // a leaf, which ranks by its own use.
-        while (
-            !candidates.empty() && candidates.top().aged_distance != 0 &&
-            !aging.tree->KeepsDescendant(*candidates.top().candidate_node->hash, CacheTier::kHost, taken_from_host)) {
+        // Descendants taken in this plan can bring an aged checkpoint within
+        // the leaf distance, where it ranks by its own use.
+        while (!candidates.empty() && candidates.top().aged_distance != 0 &&
+               !aging.tree->StaysAged(*candidates.top().candidate_node->hash, CacheTier::kHost, taken_from_host)) {
             const BoundaryTree::Node* node = candidates.top().candidate_node;
             candidates.pop();
             unaged.insert(node);

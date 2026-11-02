@@ -89,7 +89,7 @@ void Record(CheckpointTree& tree, const Checkpoint& point, CheckpointTree::Resid
 }
 
 TEST(CheckpointTree, DistanceCountsCheckpointsToTheNearestLeaf) {
-    CheckpointTree tree{kPage};
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)}, d{Sequence(16)};
     for (const Checkpoint* point : {&a, &b, &c, &d}) Record(tree, *point, kOnDevice);
     EXPECT_EQ(tree.Distance(a.Hash()), 3);
@@ -106,7 +106,7 @@ TEST(CheckpointTree, DistanceCountsCheckpointsToTheNearestLeaf) {
 }
 
 TEST(CheckpointTree, DistanceStopsAtTheCap) {
-    CheckpointTree tree{kPage};
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     std::vector<Checkpoint> chain;
     for (std::int32_t pages = 1; pages <= 10; ++pages) chain.emplace_back(Sequence(pages * kPage));
     for (const Checkpoint& point : chain) Record(tree, point, kOnDevice);
@@ -121,7 +121,7 @@ TEST(CheckpointTree, DistanceStopsAtTheCap) {
 }
 
 TEST(CheckpointTree, CheckpointsInsideAPageOrderByTokens) {
-    CheckpointTree tree{kPage};
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint a{Sequence(5)}, b{Sequence(9)}, c{Sequence(13)};
     for (const Checkpoint* point : {&a, &b, &c}) Record(tree, *point, kOnDevice);
     EXPECT_EQ(tree.Distance(a.Hash()), 2);
@@ -134,7 +134,7 @@ TEST(CheckpointTree, CheckpointsInsideAPageOrderByTokens) {
 }
 
 TEST(CheckpointTree, ShorterCheckpointPublishedLaterJoinsThePath) {
-    CheckpointTree tree{kPage};
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint longest{Sequence(12)}, inside_page{Sequence(5)}, page_aligned{Sequence(8)};
     Record(tree, longest, kOnDevice);
     Record(tree, inside_page, kOnDevice);
@@ -146,7 +146,7 @@ TEST(CheckpointTree, ShorterCheckpointPublishedLaterJoinsThePath) {
 }
 
 TEST(CheckpointTree, IncompleteCheckpointsDoNotCountAsHops) {
-    CheckpointTree tree{kPage};
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     for (const Checkpoint* point : {&a, &b, &c}) Record(tree, *point, kOnDevice);
     tree.Update(b.Hash(), kIncomplete);
@@ -159,50 +159,67 @@ TEST(CheckpointTree, IncompleteCheckpointsDoNotCountAsHops) {
     EXPECT_EQ(tree.Size(), 1u);
 }
 
-TEST(CheckpointTree, NonLeafDistanceIsPerTierAndCountsBothTiers) {
-    CheckpointTree tree{kPage};
+TEST(CheckpointTree, AgedDistanceIsPerTierAndCountsBothTiers) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
     Record(tree, a, kOnDevice);
     Record(tree, b, kOnHost);
     Record(tree, c, kOnHost);
-    EXPECT_EQ(tree.NonLeafDistance(a.Hash(), CacheTier::kDevice), 2);
-    EXPECT_EQ(tree.NonLeafDistance(a.Hash(), CacheTier::kHost), 0);
-    EXPECT_EQ(tree.NonLeafDistance(b.Hash(), CacheTier::kHost), 1);
-    EXPECT_EQ(tree.NonLeafDistance(c.Hash(), CacheTier::kHost), 0);
+    EXPECT_EQ(tree.AgedDistance(a.Hash(), CacheTier::kDevice), 2);
+    EXPECT_EQ(tree.AgedDistance(a.Hash(), CacheTier::kHost), 0);
+    EXPECT_EQ(tree.AgedDistance(b.Hash(), CacheTier::kHost), 1);
+    EXPECT_EQ(tree.AgedDistance(c.Hash(), CacheTier::kHost), 0);
     std::vector<ContentHash> visited;
-    tree.ForEachNonLeaf(CacheTier::kDevice, 2, [&](const ContentHash& hash) { visited.push_back(hash); });
+    tree.ForEachAged(CacheTier::kDevice, 2, [&](const ContentHash& hash) { visited.push_back(hash); });
     EXPECT_EQ(visited, std::vector<ContentHash>{a.Hash()});
 }
 
 TEST(CheckpointTree, JunctionsKeepTheirRank) {
-    CheckpointTree tree{kPage};
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint a{Sequence(4)}, junction{Sequence(8)}, b{Sequence(12)};
     const Checkpoint c{Concat(Sequence(8), {99, 98, 97, 96})};
     for (const Checkpoint* point : {&a, &junction, &b, &c}) Record(tree, *point, kOnDevice);
     EXPECT_EQ(tree.Distance(junction.Hash()), 1);
-    EXPECT_EQ(tree.NonLeafDistance(junction.Hash(), CacheTier::kDevice), 0);
-    EXPECT_EQ(tree.NonLeafDistance(a.Hash(), CacheTier::kDevice), 2);
-    // One branch gone: an ordinary non-leaf again.
+    EXPECT_EQ(tree.AgedDistance(junction.Hash(), CacheTier::kDevice), 0);
+    EXPECT_EQ(tree.AgedDistance(a.Hash(), CacheTier::kDevice), 2);
+    // One branch gone: aged again.
     tree.Update(c.Hash(), kGone);
-    EXPECT_EQ(tree.NonLeafDistance(junction.Hash(), CacheTier::kDevice), 1);
+    EXPECT_EQ(tree.AgedDistance(junction.Hash(), CacheTier::kDevice), 1);
 }
 
-TEST(CheckpointTree, KeepsDescendantSeesThePlannedRemovals) {
-    CheckpointTree tree{kPage};
+TEST(CheckpointTree, StaysAgedSeesThePlannedRemovals) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint a{Sequence(4)}, b{Sequence(8)};
     Record(tree, a, kOnDevice);
     Record(tree, b, kOnDevice);
     const auto none = [](const ContentHash&) { return false; };
     const auto b_taken = [&](const ContentHash& hash) { return hash == b.Hash(); };
-    EXPECT_TRUE(tree.KeepsDescendant(a.Hash(), CacheTier::kDevice, none));
-    EXPECT_FALSE(tree.KeepsDescendant(a.Hash(), CacheTier::kDevice, b_taken));
+    EXPECT_TRUE(tree.StaysAged(a.Hash(), CacheTier::kDevice, none));
+    EXPECT_FALSE(tree.StaysAged(a.Hash(), CacheTier::kDevice, b_taken));
     // A Host copy stays when the Device's leaves.
     tree.Update(b.Hash(), kOnBoth);
-    EXPECT_TRUE(tree.KeepsDescendant(a.Hash(), CacheTier::kDevice, b_taken));
+    EXPECT_TRUE(tree.StaysAged(a.Hash(), CacheTier::kDevice, b_taken));
+}
+
+TEST(CheckpointTree, LeafDistanceRanksNearbyCheckpointsAsLeaves) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/1};
+    const Checkpoint a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)}, d{Sequence(16)};
+    for (const Checkpoint* point : {&a, &b, &c, &d}) Record(tree, *point, kOnDevice);
+    EXPECT_EQ(tree.Distance(c.Hash()), 1);
+    EXPECT_EQ(tree.AgedDistance(c.Hash(), CacheTier::kDevice), 0);
+    EXPECT_EQ(tree.AgedDistance(b.Hash(), CacheTier::kDevice), 2);
+    EXPECT_EQ(tree.AgedDistance(a.Hash(), CacheTier::kDevice), 3);
+    std::vector<ContentHash> visited;
+    tree.ForEachAged(CacheTier::kDevice, 2, [&](const ContentHash& hash) { visited.push_back(hash); });
+    EXPECT_EQ(visited, std::vector<ContentHash>{b.Hash()});
+    // With D taken, C is the leaf: B comes within the leaf distance, A stays out.
+    const auto d_taken = [&](const ContentHash& hash) { return hash == d.Hash(); };
+    EXPECT_FALSE(tree.StaysAged(b.Hash(), CacheTier::kDevice, d_taken));
+    EXPECT_TRUE(tree.StaysAged(a.Hash(), CacheTier::kDevice, d_taken));
 }
 
 TEST(CheckpointTree, LeavingCheckpointsReleaseSharedPrefixPages) {
-    CheckpointTree tree{kPage};
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
     std::vector<Checkpoint> chain;
     for (std::int32_t pages = 1; pages <= 100; ++pages) chain.emplace_back(Sequence(pages * kPage));
     for (const Checkpoint& point : chain) Record(tree, point, kOnDevice);
@@ -370,6 +387,77 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
     }
 }
 
+TEST(CheckpointRetention, LeafDistanceKeepsTheCheckpointBeforeTheNewest) {
+    for (const std::int32_t leaf_distance : {0, 1}) {
+        SCOPED_TRACE(leaf_distance);
+        BlockPool device(16, {1, 1});
+        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
+                                     /*checkpoint_retention_requests=*/1000, leaf_distance);
+        const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
+        for (const Checkpoint* point : {&other, &a, &b, &c}) Publish(cache, *point);
+        const std::vector<bool> kept = AdmitIntoFullDevice(cache, device, {&other, &a, &b, &c});
+        if (leaf_distance == 0) {
+            EXPECT_EQ(kept, (std::vector<bool>{true, false, false, true}));
+        } else {
+            EXPECT_EQ(kept, (std::vector<bool>{false, false, true, true})) << "B ranks as a leaf: LRU takes other";
+        }
+    }
+}
+
+TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
+    for (const std::int32_t leaf_distance : {0, 1}) {
+        for (const int placement : {0, 1, 2}) {
+            SCOPED_TRACE(testing::Message() << "leaf distance " << leaf_distance << ", placement " << placement);
+            BlockPool device(16, {1, 1});
+            BlockPool host(16, {1, 1});
+            auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false,
+                                         /*checkpoint_retention_requests=*/1000, leaf_distance);
+            const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)};
+            for (const Checkpoint* point : {&other, &a, &b}) {
+                Publish(cache, *point);
+                for (std::uint32_t group : {0u, 1u}) {
+                    CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                    ASSERT_TRUE(block);
+                    cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
+                                         std::nullopt);
+                }
+            }
+            ASSERT_TRUE(cache.ClearDeviceCache());
+            std::vector<CacheBlockRef> pins;
+            while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
+            const std::array<std::uint32_t, 1> groups{0};
+            const std::array<std::int32_t, 1> buckets{0};
+            const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+            const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
+                                : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
+                                                 : cache.AcquireHostSegments(groups, buckets, boundaries);
+            ASSERT_EQ(result.stats.allocated, 1u);
+            // A, at distance 1, is aged only with leaf distance 0.
+            EXPECT_EQ(Holds(cache, host, other), leaf_distance == 0);
+            EXPECT_EQ(Holds(cache, host, a), leaf_distance == 1);
+        }
+    }
+}
+
+TEST(CheckpointRetention, PlannedRemovalCanBringACheckpointWithinTheLeafDistance) {
+    BlockPool device(16, {1, 1});
+    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
+                                 /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
+    const Checkpoint older{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
+    for (const Checkpoint* point : {&older, &a, &b, &c}) Publish(cache, *point);
+    // C ranks first, at epoch 0; once the plan takes it, B is the leaf and A
+    // comes within the leaf distance, ranking by its own use after older.
+    for (std::int32_t group : {0, 1}) {
+        const CacheKey key{.group_id = static_cast<std::uint32_t>(group), .content_hash = c.Hash()};
+        CacheBlockRef block = cache.GroupPrefixIndex(group).Find(device, key);
+        ASSERT_TRUE(block);
+        cache.GroupPrefixIndex(group).Register(device, block, key, /*access_epoch=*/0, /*logical_block_index=*/2,
+                                               CacheBoundaryKind::kEndpoint, /*newly_cached=*/nullptr,
+                                               /*session=*/nullptr);
+    }
+    EXPECT_EQ(AdmitIntoFullDevice(cache, device, {&older, &a, &b, &c}), (std::vector<bool>{false, true, true, false}));
+}
+
 TEST(CheckpointRetention, ResumeGapCountsNewRequestsSinceTheCheckpointsLastUse) {
     BlockPool device(32, {1, 1});
     auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
@@ -397,6 +485,7 @@ TEST(CheckpointRetention, DefaultIsSixteenBatchesOfNewRequests) {
     SchedulerConfig config;
     config.max_batch_size = 8;
     EXPECT_EQ(config.CheckpointRetentionRequests(), 128);
+    EXPECT_EQ(config.checkpoint_retention_leaf_distance, 0);
     config.checkpoint_retention_requests = 0;
     EXPECT_EQ(config.CheckpointRetentionRequests(), 0);
     config.max_batch_size = 1 << 20;

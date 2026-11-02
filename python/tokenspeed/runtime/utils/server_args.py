@@ -391,6 +391,9 @@ class ServerArgs:
     # under cache pressure, as if last used this many new requests ago. None
     # is the scheduler's default, 16 times the per-rank batch size.
     checkpoint_retention_requests: int | None = None
+    # Checkpoints within this many of the newest on their branch rank as it
+    # does. None is the scheduler's default, 0.
+    checkpoint_retention_leaf_distance: int | None = None
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
     # special kv cache
@@ -2716,6 +2719,16 @@ class ServerArgs:
             "rank, while entries unused for longer are evicted first. 0 evicts "
             "every entry by its own last use (plain LRU). Default: 16 times the "
             "per-rank max batch size. See docs/design/cache-concepts.md.",
+        )
+        parser.add_argument(
+            "--checkpoint-retention-leaf-distance",
+            type=int,
+            dest="checkpoint_retention_leaf_distance",
+            default=ServerArgs.checkpoint_retention_leaf_distance,
+            help="Hybrid (recurrent-state) models: State checkpoints within this "
+            "many checkpoints of the newest on their branch rank as the newest "
+            "does under --checkpoint-retention-requests. 0 protects only the "
+            "newest; 1 also the one before it. From 0 to 4. Default: 0.",
         )
 
         # KVStore

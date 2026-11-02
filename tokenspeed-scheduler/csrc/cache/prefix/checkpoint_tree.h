@@ -40,12 +40,14 @@ namespace tokenspeed {
 // State checkpoints ordered by token prefix, including checkpoints inside a
 // page, with each checkpoint's distance to the nearest leaf below it: the
 // newest checkpoint on that branch. Distance counts checkpoints present on
-// either tier. The tree holds metadata only, never a cache block.
+// either tier. A checkpoint more than leaf_distance from a leaf is aged
+// (CheckpointAging); one within it ranks as a leaf does. The tree holds
+// metadata only, never a cache block.
 class CheckpointTree {
 public:
     // Distances from here on rank alike, which bounds every update to this
     // many present ancestors.
-    static constexpr std::int32_t kMaxDistance = 5;
+    static constexpr std::int32_t kMaxDistance = kMaxCheckpointDistance;
 
     struct Residency {
         // Every State group holds the checkpoint, per CacheTier.
@@ -55,7 +57,10 @@ public:
         bool held{false};
     };
 
-    explicit CheckpointTree(std::int32_t prefix_granularity) : prefix_granularity_{prefix_granularity} {}
+    CheckpointTree(std::int32_t prefix_granularity, std::int32_t leaf_distance)
+        : prefix_granularity_{prefix_granularity}, leaf_distance_{leaf_distance} {
+        _assert(leaf_distance_ >= 0 && leaf_distance_ < kMaxDistance, "checkpoint leaf distance out of range");
+    }
     CheckpointTree(const CheckpointTree&) = delete;
     CheckpointTree& operator=(const CheckpointTree&) = delete;
     CheckpointTree(CheckpointTree&&) = default;
@@ -130,44 +135,29 @@ public:
         return distanceOf(it->second);
     }
 
-    // The distance of a checkpoint complete on `tier` with a checkpoint below
-    // it on exactly one branch, else 0. A junction, with checkpoints on two or
-    // more branches, has been resumed from more than once and keeps its rank.
-    std::int32_t NonLeafDistance(const ContentHash& hash, CacheTier tier) const {
+    // The distance of an aged checkpoint complete on `tier`, else 0. A
+    // junction, with checkpoints on two or more branches, has been resumed
+    // from more than once and keeps its rank.
+    std::int32_t AgedDistance(const ContentHash& hash, CacheTier tier) const {
         const auto it = nodes_.find(hash);
-        return it == nodes_.end() ? 0 : it->second.non_leaf_distance[static_cast<std::size_t>(tier)];
+        return it == nodes_.end() ? 0 : it->second.aged_distance[static_cast<std::size_t>(tier)];
     }
 
-    // Visits the hashes NonLeafDistance(hash, tier) == distance, in no order.
+    // Visits the hashes AgedDistance(hash, tier) == distance, in no order.
     template <typename Visit>
-    void ForEachNonLeaf(CacheTier tier, std::int32_t distance, const Visit& visit) const {
-        _assert(distance >= 1 && distance <= kMaxDistance, "non-leaf distance out of range");
-        for (const Node* node : non_leaves_[static_cast<std::size_t>(tier)][static_cast<std::size_t>(distance)]) {
+    void ForEachAged(CacheTier tier, std::int32_t distance, const Visit& visit) const {
+        _assert(distance > leaf_distance_ && distance <= kMaxDistance, "aged distance out of range");
+        for (const Node* node : aged_[static_cast<std::size_t>(tier)][static_cast<std::size_t>(distance)]) {
             visit(*node->hash);
         }
     }
 
-    // Whether a checkpoint below `hash` stays present once the checkpoints
-    // `removed(hash)` reports leave `tier`.
+    // Whether a checkpoint stays more than leaf_distance from a leaf once the
+    // checkpoints `removed(hash)` reports leave `tier`.
     template <typename Removed>
-    bool KeepsDescendant(const ContentHash& hash, CacheTier tier, const Removed& removed) const {
+    bool StaysAged(const ContentHash& hash, CacheTier tier, const Removed& removed) const {
         const auto it = nodes_.find(hash);
-        if (it == nodes_.end()) {
-            return false;
-        }
-        const auto tier_index = static_cast<std::size_t>(tier);
-        std::vector<const Node*> pending(it->second.children.begin(), it->second.children.end());
-        while (!pending.empty()) {
-            const Node* node = pending.back();
-            pending.pop_back();
-            const Residency& residency = node->residency;
-            if (residency.pending_host_store || residency.complete[1 - tier_index] ||
-                (residency.complete[tier_index] && !removed(*node->hash))) {
-                return true;
-            }
-            pending.insert(pending.end(), node->children.begin(), node->children.end());
-        }
-        return false;
+        return it != nodes_.end() && !leafWithin(it->second, leaf_distance_, static_cast<std::size_t>(tier), removed);
     }
 
     void Clear() {
@@ -175,13 +165,14 @@ public:
         roots_.clear();
         tails_by_prior_.clear();
         prefixes_.clear();
-        for (auto& by_distance : non_leaves_) {
+        for (auto& by_distance : aged_) {
             for (auto& hashes : by_distance) {
                 hashes.clear();
             }
         }
     }
 
+    std::int32_t LeafDistance() const { return leaf_distance_; }
     std::size_t Size() const { return nodes_.size(); }
     std::size_t PrefixSegments() const { return prefixes_.size(); }
     bool Contains(const ContentHash& hash) const { return nodes_.contains(hash); }
@@ -213,7 +204,7 @@ private:
         // What the parent sees: a present checkpoint reports its distance + 1,
         // an absent one passes on its children's smallest value, 0 for none.
         std::uint8_t value{0};
-        std::array<std::int32_t, 2> non_leaf_distance{};
+        std::array<std::int32_t, 2> aged_distance{};
     };
 
     static bool present(const Node& node) {
@@ -250,21 +241,47 @@ private:
     }
 
     void reindex(Node& node) {
-        const std::int32_t distance = branchesWithCheckpoints(node) == 1 ? distanceOf(node) : 0;
-        for (std::size_t tier = 0; tier < node.non_leaf_distance.size(); ++tier) {
+        const std::int32_t distance =
+            branchesWithCheckpoints(node) == 1 && distanceOf(node) > leaf_distance_ ? distanceOf(node) : 0;
+        for (std::size_t tier = 0; tier < node.aged_distance.size(); ++tier) {
             const std::int32_t wanted = node.residency.complete[tier] ? distance : 0;
-            std::int32_t& current = node.non_leaf_distance[tier];
+            std::int32_t& current = node.aged_distance[tier];
             if (wanted == current) {
                 continue;
             }
             if (current != 0) {
-                non_leaves_[tier][static_cast<std::size_t>(current)].erase(&node);
+                aged_[tier][static_cast<std::size_t>(current)].erase(&node);
             }
             if (wanted != 0) {
-                non_leaves_[tier][static_cast<std::size_t>(wanted)].insert(&node);
+                aged_[tier][static_cast<std::size_t>(wanted)].insert(&node);
             }
             current = wanted;
         }
+    }
+
+    // Whether a leaf lies within `hops` checkpoints below `node`, `node`
+    // itself at 0, counting the checkpoints present once `removed` ones leave
+    // `tier`.
+    template <typename Removed>
+    static bool leafWithin(const Node& node, std::int32_t hops, std::size_t tier, const Removed& removed) {
+        std::vector<const Node*> nearest;
+        std::vector<const Node*> pending(node.children.begin(), node.children.end());
+        while (!pending.empty()) {
+            const Node* below = pending.back();
+            pending.pop_back();
+            const Residency& residency = below->residency;
+            if (residency.pending_host_store || residency.complete[1 - tier] ||
+                (residency.complete[tier] && !removed(*below->hash))) {
+                nearest.push_back(below);
+            } else {
+                pending.insert(pending.end(), below->children.begin(), below->children.end());
+            }
+        }
+        if (nearest.empty()) {
+            return true;
+        }
+        return hops > 0 && std::ranges::any_of(
+                               nearest, [&](const Node* below) { return leafWithin(*below, hops - 1, tier, removed); });
     }
 
     // Recomputes a node and its ancestors until a reported value holds.
@@ -452,17 +469,18 @@ private:
     }
 
     std::int32_t prefix_granularity_;
+    std::int32_t leaf_distance_;
     std::unordered_map<ContentHash, Node> nodes_;
     std::vector<Node*> roots_;
     std::unordered_map<ContentHash, std::unordered_set<Node*>> tails_by_prior_;
     std::unordered_map<ContentHash, std::unique_ptr<PrefixSegment>> prefixes_;
-    // Per tier and distance, the non-leaf checkpoints complete there.
-    std::array<std::array<std::unordered_set<const Node*>, kMaxDistance + 1>, 2> non_leaves_{};
+    // Per tier and distance, the aged checkpoints complete there.
+    std::array<std::array<std::unordered_set<const Node*>, kMaxDistance + 1>, 2> aged_{};
 };
 
-// How an eviction plan on `tier` ranks State checkpoints that are not leaves:
-// one used at or after cutoff_epoch ranks as if last used then, the larger
-// distance first. Without a tree every entry ranks by its own access epoch.
+// How an eviction plan on `tier` ranks aged State checkpoints: one used at or
+// after cutoff_epoch ranks as if last used then, the larger distance first.
+// Without a tree every entry ranks by its own access epoch.
 struct CheckpointAging {
     const CheckpointTree* tree{nullptr};
     CacheTier tier{CacheTier::kDevice};

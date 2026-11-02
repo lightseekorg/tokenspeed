@@ -1072,16 +1072,19 @@ Its responsibilities:
   every State group holds on either tier by token prefix, including
   checkpoints inside a page, and keeps each one's distance to the nearest
   leaf below it, capped at 5 so that a publication or eviction updates at
-  most five ancestors. With N = `SchedulerConfig::checkpoint_retention_requests`
-  (default 16 × `max_batch_size`; 0 is plain LRU), a non-leaf checkpoint used
-  within the last N new-request admissions ranks as if last used at the
-  oldest of them, the larger distance first: it leaves before every entry
-  used since, while entries unused for longer, such as an abandoned session,
-  leave first. N counts admissions, not epochs, because Host publication
-  advances the access epoch too. A junction, with checkpoints on two or more
-  branches below it, has been resumed from more than once (a shared prompt)
-  and keeps its own rank, as does a checkpoint whose last descendant the plan
-  takes. Ranks change no checkpoint's
+  most five ancestors. A checkpoint more than K =
+  `SchedulerConfig::checkpoint_retention_leaf_distance` (default 0; 1 also
+  keeps the checkpoint before the newest) from that leaf is aged. With N =
+  `SchedulerConfig::checkpoint_retention_requests` (default 16 ×
+  `max_batch_size`; 0 is plain LRU), an aged checkpoint used within the last N
+  new-request admissions ranks as if last used at the oldest of them, the
+  larger distance first: it leaves before every entry used since, while
+  entries unused for longer, such as an abandoned session, leave first. N
+  counts admissions, not epochs, because Host publication advances the access
+  epoch too. A junction, with checkpoints on two or more branches below it,
+  has been resumed from more than once (a shared prompt) and keeps its own
+  rank, as does a checkpoint the plan's own victims bring within K of a leaf.
+  Ranks change no checkpoint's
   validity and reserve no capacity. `CheckpointResumeGaps` counts the
   admissions between a resumed checkpoint's last use and its resume, from
   which N is chosen.
@@ -1098,7 +1101,7 @@ Its responsibilities:
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
   alongside Host-side acquire/contains/pin queries. Host L2 uses free
   capacity first, then the same `CacheEvictionPlan` as Device admission:
-  access epoch first (a non-leaf checkpoint at its retention rank, above),
+  access epoch first (an aged checkpoint at its retention rank, above),
   then boundary tier and logical position, followed by
   group and physical location. Equal-age prefix pages leave from the suffix;
   unproven chunk boundaries leave before established boundaries and prefix
@@ -1450,7 +1453,7 @@ inspecting block owners: a newer epoch, even if every entry is pinned, is not
 scanned to select an older candidate from another group. Complete equal epochs
 still participate in every policy tie-break. Selection compares the next candidate from each group with
 the next request-reclaimable candidate using one policy: LRU access epoch (a
-non-leaf State checkpoint at its retention rank), then tier (uncached request-only block → probationary boundary → established
+aged State checkpoint at its retention rank), then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Each candidate expands into a
 *victim set* that is selected, restored and evicted whole. Finally, walk the
 selected sets in reverse and restore every set that is not strictly required,
@@ -1474,7 +1477,7 @@ L2: the segment plan (`AcquireHostSegments`) and the boundary plan
 capacity, selection until demand fits, and reverse minimization between
 Device admission and both Host block-placement entry points. Its
 `CacheEvictionCandidates` cursor reads only the access epochs needed, with
-the same boundary-tier/position ordering on both tiers; the non-leaf
+the same boundary-tier/position ordering on both tiers; the aged
 checkpoints at the retention cutoff come from `CheckpointTree`, one distance
 at a time. The caller defines
 which blocks leave together: Device segments and request releases, or Host

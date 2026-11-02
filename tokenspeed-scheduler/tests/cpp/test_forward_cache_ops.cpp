@@ -513,7 +513,7 @@ TEST(SchedulerConfigValidateTest, HostPackingIsExplicitAndMayDifferFromDevicePac
     EXPECT_NO_THROW(config.Validate());
 }
 
-TEST(SchedulerConfigValidateTest, CheckpointRetentionRequestsStayInRange) {
+TEST(SchedulerConfigValidateTest, CheckpointRetentionStaysInRange) {
     SchedulerConfig config = MakeValidConfig();
     for (const std::int64_t requests : {std::int64_t{0}, kMaxCheckpointRetentionRequests}) {
         config.checkpoint_retention_requests = requests;
@@ -521,6 +521,15 @@ TEST(SchedulerConfigValidateTest, CheckpointRetentionRequestsStayInRange) {
     }
     for (const std::int64_t requests : {std::int64_t{-1}, kMaxCheckpointRetentionRequests + 1}) {
         config.checkpoint_retention_requests = requests;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+    }
+    config.checkpoint_retention_requests.reset();
+    for (const std::int32_t leaf_distance : {0, kMaxCheckpointDistance - 1}) {
+        config.checkpoint_retention_leaf_distance = leaf_distance;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+    }
+    for (const std::int32_t leaf_distance : {-1, kMaxCheckpointDistance}) {
+        config.checkpoint_retention_leaf_distance = leaf_distance;
         EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
     }
 }

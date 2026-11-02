@@ -67,6 +67,7 @@ public:
           request_reclaim_locations_{request_reclaim_locations},
           aging_{aging},
           removed_checkpoints_{removed_checkpoints},
+          aged_floor_{aging.tree != nullptr ? aging.tree->LeafDistance() : 0},
           next_aged_distance_{aging.tree != nullptr ? CheckpointTree::kMaxDistance : 0} {
         cursors_.reserve(groups.size());
         for (std::size_t i = 0; i < groups.size(); ++i) {
@@ -145,7 +146,7 @@ public:
             }
             // Each distance's aged checkpoints are read once those of every
             // larger distance are gone.
-            if (next_aged_distance_ > 0 && aging_.cutoff_epoch <= max_rank_epoch &&
+            if (next_aged_distance_ > aged_floor_ && aging_.cutoff_epoch <= max_rank_epoch &&
                 (best == nullptr || best->rank_epoch > aging_.cutoff_epoch ||
                  (best->rank_epoch == aging_.cutoff_epoch && best->aged_distance < next_aged_distance_))) {
                 loadAgedDistance();
@@ -165,8 +166,8 @@ public:
                 }
                 case Source::kAged: {
                     const auto [candidate, hash] = aged_[next_aged_++];
-                    // A descendant the plan took makes this a leaf again.
-                    if (aging_.tree->KeepsDescendant(*hash, aging_.tier, [&](const ContentHash& descendant) {
+                    // Descendants the plan took can bring this within the leaf distance.
+                    if (aging_.tree->StaysAged(*hash, aging_.tier, [&](const ContentHash& descendant) {
                             return removed_checkpoints_ != nullptr && removed_checkpoints_->contains(descendant);
                         })) {
                         return candidate;
@@ -213,7 +214,7 @@ private:
             return false;
         }
         const std::optional<CacheKey> key = groups_[group_id].Index().KeyOf(pool_, entry.location);
-        return key && aging_.tree->NonLeafDistance(key->content_hash, aging_.tier) != 0;
+        return key && aging_.tree->AgedDistance(key->content_hash, aging_.tier) != 0;
     }
 
     struct GroupCursor {
@@ -247,13 +248,13 @@ private:
         Sort(group.candidates);
     }
 
-    // The unpinned State entries of the next distance's non-leaf checkpoints,
+    // The unpinned State entries of the next distance's aged checkpoints,
     // as loadEpoch skips them.
     void loadAgedDistance() {
         const std::int32_t distance = next_aged_distance_--;
         aged_.clear();
         next_aged_ = 0;
-        aging_.tree->ForEachNonLeaf(aging_.tier, distance, [&](const ContentHash& hash) {
+        aging_.tree->ForEachAged(aging_.tier, distance, [&](const ContentHash& hash) {
             for (std::uint32_t group_id = 0; group_id < groups_.size(); ++group_id) {
                 if (!isState(group_id)) {
                     continue;
@@ -282,8 +283,9 @@ private:
     const RemovedCheckpoints* removed_checkpoints_;
     std::vector<GroupCursor> cursors_;
     std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
+    std::int32_t aged_floor_;
     // The aged candidates of the distance being read, and the next distance
-    // to read (0 once every distance was read).
+    // to read (the leaf distance once every aged distance was read).
     std::vector<std::pair<Candidate, const ContentHash*>> aged_;
     std::size_t next_aged_{0};
     std::int32_t next_aged_distance_;

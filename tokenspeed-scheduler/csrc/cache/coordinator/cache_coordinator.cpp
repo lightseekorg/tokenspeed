@@ -133,7 +133,8 @@ std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStore
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                                    bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                                    bool stream_device_cache_to_host, bool write_back_evictions,
-                                   std::int64_t checkpoint_retention_requests)
+                                   std::int64_t checkpoint_retention_requests,
+                                   std::int32_t checkpoint_retention_leaf_distance)
     : groups_{std::move(groups)},
       pool_{pool},
       host_pool_{host_pool},
@@ -142,7 +143,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
       write_back_evictions_{write_back_evictions},
       enable_l3_storage_{enable_l3_storage && host_pool != nullptr},
       prefix_granularity_{prefix_granularity},
-      checkpoints_{prefix_granularity},
+      checkpoints_{prefix_granularity, checkpoint_retention_leaf_distance},
       checkpoint_retention_requests_{checkpoint_retention_requests} {
     _assert(prefix_granularity_ > 0, "coordinator needs positive prefix_granularity");
     _assert(checkpoint_retention_requests_ >= 0 && checkpoint_retention_requests_ <= kMaxCheckpointRetentionRequests,
@@ -2980,7 +2981,8 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
                                  BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
-                                 std::int64_t checkpoint_retention_requests) {
+                                 std::int64_t checkpoint_retention_requests,
+                                 std::int32_t checkpoint_retention_leaf_distance) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     _assert(specs.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
@@ -3008,7 +3010,8 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
                             snapshot_pool,
                             stream_device_cache_to_host,
                             write_back_evictions,
-                            checkpoint_retention_requests};
+                            checkpoint_retention_requests,
+                            checkpoint_retention_leaf_distance};
 }
 
 CacheBlockRef CacheCoordinator::AcquireHostCachedBlock(const CacheKey& key) {

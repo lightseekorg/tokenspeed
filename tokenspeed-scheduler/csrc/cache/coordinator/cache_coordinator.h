@@ -86,17 +86,19 @@ public:
     // (the Host write-back policy; it needs a Host pool and excludes
     // streaming). The snapshot pool holds retracted requests' private KV
     // images (Snapshot / Restore); nullptr means the engine never retracts.
-    // checkpoint_retention_requests is SchedulerConfig's: State checkpoints
-    // that are not leaves rank, under pressure, as if last used that many new
-    // requests ago (0 ranks every entry by its own use).
+    // checkpoint_retention_requests and checkpoint_retention_leaf_distance are
+    // SchedulerConfig's: a State checkpoint more than the leaf distance from a
+    // leaf ranks, under pressure, as if last used that many new requests ago
+    // (0 requests ranks every entry by its own use).
     // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host,
     // write_back_evictions and checkpoint_retention_requests have no defaults:
     // a shorter call would convert a pool pointer to bool and silently disable
-    // a tier instead of failing to compile.
+    // a tier instead of failing to compile. A leaf distance of 0 ranks only
+    // the newest checkpoint on a branch as a leaf.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                      bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                      bool stream_device_cache_to_host, bool write_back_evictions,
-                     std::int64_t checkpoint_retention_requests);
+                     std::int64_t checkpoint_retention_requests, std::int32_t checkpoint_retention_leaf_distance = 0);
     std::size_t DemoteSession(const std::string& session_id, bool ended);
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
 
@@ -1227,5 +1229,6 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
                                  BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
-                                 std::int64_t checkpoint_retention_requests);
+                                 std::int64_t checkpoint_retention_requests,
+                                 std::int32_t checkpoint_retention_leaf_distance = 0);
 }  // namespace tokenspeed

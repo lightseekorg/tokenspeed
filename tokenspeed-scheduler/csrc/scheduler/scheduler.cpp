@@ -101,7 +101,7 @@ Scheduler::Scheduler(SchedulerConfig config)
                                    snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost(),
                                    config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack,
-                                   config_.CheckpointRetentionRequests())},
+                                   config_.CheckpointRetentionRequests(), config_.checkpoint_retention_leaf_distance)},
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)

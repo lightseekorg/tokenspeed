@@ -119,13 +119,17 @@ struct SchedulerConfig {
     // into the third entry of every State group's row. Requires prefix
     // caching, except on the D role, which never computes a prompt.
     bool state_checkpoint_in_forward{false};
-    // Under cache pressure, a State checkpoint with a newer checkpoint below it
-    // (not a leaf) ranks as if last used this many new requests ago, or at its
-    // own use when older: so it leaves before the entries used since, while
-    // entries unused for longer leave first. 0 ranks every entry by its own
-    // use. Unset means 16 * max_batch_size; at most
-    // kMaxCheckpointRetentionRequests.
+    // Under cache pressure, a State checkpoint more than
+    // checkpoint_retention_leaf_distance from the newest checkpoint on its
+    // branch ranks as if last used this many new requests ago, or at its own
+    // use when older: so it leaves before the entries used since, while entries
+    // unused for longer leave first. 0 ranks every entry by its own use. Unset
+    // means 16 * max_batch_size; at most kMaxCheckpointRetentionRequests.
     std::optional<std::int64_t> checkpoint_retention_requests;
+    // Checkpoints within this distance of the newest on their branch rank as
+    // it does: 0 only the newest, 1 the one before it too. Below
+    // CheckpointTree::kMaxDistance.
+    std::int32_t checkpoint_retention_leaf_distance{0};
     std::int64_t CheckpointRetentionRequests() const {
         return checkpoint_retention_requests.value_or(
             std::min<std::int64_t>(std::int64_t{16} * max_batch_size, kMaxCheckpointRetentionRequests));

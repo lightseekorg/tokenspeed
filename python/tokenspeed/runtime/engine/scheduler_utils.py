@@ -128,6 +128,7 @@ def make_config(
     state_checkpoint_in_forward: bool = False,
     max_kv_page_num: int = 0,
     checkpoint_retention_requests: int | None = None,
+    checkpoint_retention_leaf_distance: int | None = None,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -188,6 +189,10 @@ def make_config(
             checkpoint after it ranks as if last used this many new requests
             ago (0 ranks every cache entry by its own use). None keeps the
             scheduler's default, 16 times ``max_batch_size``.
+        checkpoint_retention_leaf_distance:
+            ``--checkpoint-retention-leaf-distance``: checkpoints within this
+            many of the newest on their branch rank as it does. None keeps the
+            scheduler's default, 0.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -239,6 +244,8 @@ def make_config(
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.
         cfg.checkpoint_retention_requests = checkpoint_retention_requests
+    if checkpoint_retention_leaf_distance is not None:
+        cfg.checkpoint_retention_leaf_distance = checkpoint_retention_leaf_distance
     cfg.disable_l2_cache = disable_l2_cache
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 

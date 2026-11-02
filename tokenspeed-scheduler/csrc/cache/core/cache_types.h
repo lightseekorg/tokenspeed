@@ -47,9 +47,11 @@ enum class CacheBoundaryKind { kChunk, kEndpoint };
 // The tiers a prefix cache entry lives on: Device L1 and Host L2.
 enum class CacheTier { kDevice, kHost };
 
-// The most new-request admissions a non-leaf State checkpoint may rank behind
+// The most new-request admissions an aged State checkpoint may rank behind
 // (SchedulerConfig::checkpoint_retention_requests).
 inline constexpr std::int64_t kMaxCheckpointRetentionRequests{std::int64_t{1} << 20};
+// Checkpoint distances from here on rank alike (CheckpointTree).
+inline constexpr std::int32_t kMaxCheckpointDistance{5};
 
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
