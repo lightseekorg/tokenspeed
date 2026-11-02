@@ -1546,7 +1546,6 @@ class KimiLinearKDA(nn.Module):
         attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project every KDA hidden-state consumer."""
-        proj_local = self.local_num_heads * self.head_dim
         if attnres_partial_args is not None and (
             self.qkvgb_proj.fp8_channel_quant
             or self.qkvgb_proj.fp8_block_quant
