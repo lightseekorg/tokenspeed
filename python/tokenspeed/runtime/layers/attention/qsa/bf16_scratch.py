@@ -25,10 +25,11 @@ of a QSA sparse-attention layer over an FP8 E4M3 cache copies every cache page
 its requests' contexts span into a BF16 scratch, rewrites its selected slots to
 the scratch (``qsa_bf16_kv_scratch``) and attends there with the direct-slot
 CuTe kernel's BF16 path, one query row at a time, instead of the FP8 prefill
-kernel ``qsa_sparse_attention`` selects (FlashInfer FA2 on NVIDIA; the CuTe
-kernel's FP8 path serves decode only). The conversion is exact and the FP8
-path reads the cache at unit scale, so both kernels read the same K/V values
-and differ only in rounding. The cache itself stays FP8.
+kernel ``qsa_sparse_attention`` selects: FlashInfer FA2 by default on NVIDIA,
+where the CuTe kernel is registered for decode only, or the CuTe kernel's FP8
+path where a kernel override selects it for prefill too. The conversion is
+exact and the FP8 path reads the cache at unit scale, so both read the same
+K/V values and differ only in rounding. The cache itself stays FP8.
 
 A call keeps the FP8 path unless it is a pure extend of the target with
 ``MIN_ROWS`` to ``max_rows`` query rows whose context fits the scratch and

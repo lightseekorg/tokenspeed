@@ -1005,9 +1005,10 @@ class _GpuCall:
             scale=0.0625,
         )
 
-    def fp8_prefill(self):
+    def fp8_prefill(self, override):
         """The call through the FP8 prefill path the scratch replaces, as the
-        QSA leaf makes it: ragged rows, logical metadata, unit scales."""
+        QSA leaf makes it: ragged rows, logical metadata, unit scales; a
+        kernel ``override`` stands in for a deployment's override."""
         from tokenspeed_kernel.ops.attention.qsa import (
             QSASparseMetadata,
             QSAWorkspace,
@@ -1024,7 +1025,7 @@ class _GpuCall:
             metadata_capacity_rows=None,
             k_scale=1.0,
             v_scale=1.0,
-            override=None,
+            override=override,
             solution=None,
             sparse_metadata=QSASparseMetadata(
                 selected_blocks=self.selected_blocks,
@@ -1079,8 +1080,11 @@ _HEADS = [(24, 2), (12, 1), (6, 1)]
 
 
 @requires_cute_qsa
+# The default FP8 prefill kernel (FlashInfer FA2), and the CuTe kernel's FP8
+# path a kernel override selects for prefill too.
+@pytest.mark.parametrize("override", [None, "cute_dsl_blackwell_qsa_sparse_attention"])
 @pytest.mark.parametrize("heads", _HEADS)
-def test_scratch_matches_the_fp8_prefill_path(heads):
+def test_scratch_matches_the_fp8_prefill_path(heads, override):
     scratch = QSABf16PrefillScratch(_gpu_plan(heads), device="cuda")
     call = _GpuCall(
         _SEVERAL_REQUESTS, page_size=64, pool_pages=320, seed=11, heads=heads
@@ -1089,7 +1093,7 @@ def test_scratch_matches_the_fp8_prefill_path(heads):
     assert output is not None
     # The scratch replaces this path for the call; both kernels read the same
     # K/V values and differ only in rounding.
-    torch.testing.assert_close(output, call.fp8_prefill(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output, call.fp8_prefill(override), atol=1e-2, rtol=1e-2)
 
 
 @requires_cute_qsa

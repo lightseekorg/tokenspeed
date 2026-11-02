@@ -290,8 +290,9 @@ large KV offsets and execution without further compilation after warmup.
 caller-owned BF16 scratch and rewrites the call's selected slots to it, so a
 large prefill call over an FP8 cache can run the direct-slot CuTe kernel's
 BF16 path, one query row at a time (`max_seqlen_q=1`), instead of the FP8
-prefill kernel that selection picks (FlashInfer FA2 on NVIDIA; the CuTe
-kernel's FP8 path serves decode only). The runtime uses it behind
+prefill kernel that selection picks: FlashInfer FA2 by default on NVIDIA,
+where the CuTe kernel is registered for decode only, or the CuTe kernel's FP8
+path under a kernel override. The runtime uses it behind
 `--enable-qsa-prefill-bf16-scratch`.
 
 Request `r` owns scratch pages `[first_r, first_r + n_r)`, with
