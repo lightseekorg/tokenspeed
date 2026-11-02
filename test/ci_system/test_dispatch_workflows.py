@@ -458,10 +458,9 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
 
 
 def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
-    # AMD splits the runtime-1gpu suite across part-i and part-ii; other
-    # runners run it whole in ut-runtime-1gpu.
+    # Every runner splits the runtime-1gpu suite across part-i and part-ii.
     partitions = {}
-    for suffix in ("", "-part-i", "-part-ii"):
+    for suffix in ("-part-i", "-part-ii"):
         task = load_yaml(REPO_ROOT / f"test/ci/ut/ut-runtime-1gpu{suffix}.yaml")
         for command in task["ut"]["commands"]:
             tokens = shlex.split(command)
