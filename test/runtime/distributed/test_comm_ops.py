@@ -370,7 +370,6 @@ def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
 def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
     import tokenspeed_kernel.ops.communication.fabric as fabric
     import tokenspeed_kernel.ops.communication.iris as kernel_iris
-    import tokenspeed_kernel.platform as kernel_platform
 
     import tokenspeed.runtime.execution.distributed_initializer as initializer
 
@@ -412,9 +411,6 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
         initializer.pg_manager, "get_process_group", lambda backend, group: "pg"
     )
     monkeypatch.setattr(fabric, "gather_fabric_map", lambda: events.append("fabric"))
-    monkeypatch.setattr(
-        kernel_platform, "current_platform", lambda: SimpleNamespace(is_amd=True)
-    )
     monkeypatch.setattr(
         kernel_iris, "discover_iris_world", lambda: events.append("iris")
     )

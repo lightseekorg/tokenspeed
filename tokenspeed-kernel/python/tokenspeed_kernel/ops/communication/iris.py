@@ -68,15 +68,20 @@ def discover_iris_world() -> bool:
     """Decide whether one Iris heap can map every world rank; every rank calls it.
 
     Run it during distributed initialization: the first call is a world
-    collective, and later calls return the cached answer.
+    collective, and later calls return the cached answer. Off AMD there is no
+    Iris heap, so it returns True without a collective.
     """
+    if not _platform.is_amd:
+        return True
     from tokenspeed_kernel.ops.communication._iris import discover_world
 
     return discover_world()
 
 
 def iris_maps_world() -> bool | None:
-    """``discover_iris_world``'s cached answer, or None before it ran."""
+    """``discover_iris_world``'s cached answer, or None before it ran or off AMD."""
+    if not _platform.is_amd:
+        return None
     from tokenspeed_kernel.ops.communication._iris import maps_world
 
     return maps_world()

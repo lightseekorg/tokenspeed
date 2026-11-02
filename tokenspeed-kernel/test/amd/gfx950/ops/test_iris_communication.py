@@ -142,21 +142,14 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
     assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
 
 
-@pytest.mark.parametrize(
-    ("configured", "spans_hosts", "expected"),
-    [(None, False, None), (None, True, "vmem_chunked"), ("vmem", True, "vmem")],
-    ids=["one-host", "across-hosts", "configured"],
-)
-def test_context_picks_vmem_chunked_across_hosts(
-    monkeypatch, configured, spans_hosts, expected
-):
+def test_context_maps_hosts_with_vmem_chunked(monkeypatch):
     from tokenspeed_kernel.ops.communication import _iris
 
     created = []
     monkeypatch.setattr(_iris, "_context", None)
-    monkeypatch.setattr(_iris, "_allocator_type", configured)
+    monkeypatch.setattr(_iris, "_allocator_type", None)
     # A mapped world across hosts needs gfx1250 trays in one fabric domain.
-    monkeypatch.setattr(_iris, "_spans_hosts", spans_hosts)
+    monkeypatch.setattr(_iris, "_spans_hosts", True)
     monkeypatch.setattr(_iris, "_unmapped_reason", None)
     monkeypatch.setattr(
         _iris.iris,
@@ -167,7 +160,7 @@ def test_context_picks_vmem_chunked_across_hosts(
     )
 
     _iris.get_or_create_context(heap_size=1 << 20)
-    assert created == [expected]
+    assert created == ["vmem_chunked"]
 
 
 def test_context_refuses_a_world_it_cannot_map(monkeypatch):

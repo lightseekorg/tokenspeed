@@ -252,8 +252,6 @@ class AutoBackend(CommBackend):
         Distributed initialization decides this on AMD; None before it does,
         or off AMD.
         """
-        if not current_platform().is_amd:
-            return None
         from tokenspeed_kernel.ops.communication.iris import iris_maps_world
 
         return iris_maps_world()
@@ -486,7 +484,8 @@ class AutoBackend(CommBackend):
         Return None unless AMD uses a node-local tiered route without trtllm.
         """
         # The fused mHC kernel runs only on gfx950, which keeps groups spanning
-        # nodes on NCCL.
+        # nodes on NCCL. Like the producer-direct and gather paths below, it
+        # stays node-local even where the Iris all-reduce spans trays.
         if (
             not current_platform().is_amd
             or self.route(Collective.ALL_REDUCE, tensor, group) is not Route.TIERED
