@@ -1379,6 +1379,66 @@ def test_qwen4_exp_qsa_ragged_group_rows_cut_each_request_run(
     assert table.tolist() == expected
 
 
+def test_qwen4_exp_qsa_ragged_scores_refresh_during_graph_replay(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The slice table is cut on the device, so one captured long ragged batch
+    # follows new request runs, owners and frontiers on every replay.
+    torch.manual_seed(163)
+    # One SM bounds the grid, so each CTA also walks several slices.
+    platform = replace(qsa_ops.current_platform(), sm_count=1)
+    monkeypatch.setattr(qsa_ops, "current_platform", lambda: platform)
+    heads, dim, page_size, columns = 4, 128, 64, 9
+    batch, rows, num_blocks = 4, 1104, page_size * columns
+    query = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(
+        (batch * columns + 1) * page_size, 1, dim, device=device, dtype=query.dtype
+    )
+    table = torch.arange(
+        1, batch * columns + 1, device=device, dtype=torch.int32
+    ).reshape(batch, columns)
+    requests = torch.empty(rows, device=device, dtype=torch.int64)
+    complete = torch.empty(rows, device=device, dtype=torch.int32)
+
+    def refresh(widths: tuple[int, ...], owners: tuple[int, ...]) -> None:
+        query.normal_()
+        requests.copy_(
+            torch.tensor(owners, device=device).repeat_interleave(
+                torch.tensor(widths, device=device)
+            )
+        )
+        complete.random_(0, num_blocks + 1)
+
+    def forward() -> torch.Tensor:
+        return qsa_ops.triton_qsa_block_scores(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=page_size,
+            queries_per_request=None,
+            enable_pdl=False,
+        )
+
+    refresh((1000, 37, 3, 64), (0, 1, 2, 3))
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward()
+    for widths, owners in (
+        ((3, 64, 1000, 37), (2, 0, 3, 1)),
+        ((1, 1, 1, 1101), (3, 2, 1, 0)),
+        ((1000, 37, 3, 64), (1, 3, 0, 2)),
+    ):
+        refresh(widths, owners)
+        expected = forward()
+        graph.replay()
+        # Blocks past a row's frontier stay unwritten, so compare written scores.
+        valid = torch.arange(num_blocks, device=device)[None, :] < complete[:, None]
+        torch.testing.assert_close(actual[valid], expected[valid], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("queries_per_request", [0, -1, 5])
 def test_qwen4_exp_qsa_rejects_invalid_query_width(
     device: str, queries_per_request: int
