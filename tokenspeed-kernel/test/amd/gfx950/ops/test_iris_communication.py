@@ -24,8 +24,8 @@ import os
 import socket
 import time
 import traceback
-from types import SimpleNamespace
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -143,27 +143,21 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("configured", "cdna5", "spans_hosts", "expected"),
-    [
-        (None, True, False, None),
-        (None, True, True, "vmem_chunked"),
-        (None, False, True, None),
-        ("vmem", True, True, "vmem"),
-    ],
-    ids=["one-host", "gfx1250-across-hosts", "gfx950-across-hosts", "configured"],
+    ("configured", "spans_hosts", "expected"),
+    [(None, False, None), (None, True, "vmem_chunked"), ("vmem", True, "vmem")],
+    ids=["one-host", "across-hosts", "configured"],
 )
-def test_context_picks_vmem_chunked_only_for_gfx1250_across_hosts(
-    monkeypatch, configured, cdna5, spans_hosts, expected
+def test_context_picks_vmem_chunked_across_hosts(
+    monkeypatch, configured, spans_hosts, expected
 ):
     from tokenspeed_kernel.ops.communication import _iris
 
     created = []
     monkeypatch.setattr(_iris, "_context", None)
     monkeypatch.setattr(_iris, "_allocator_type", configured)
-    monkeypatch.setattr(
-        _iris, "current_platform", lambda: SimpleNamespace(is_cdna5=cdna5)
-    )
-    monkeypatch.setattr(_iris, "_job_spans_hosts", lambda: spans_hosts)
+    # A mapped world across hosts needs gfx1250 trays in one fabric domain.
+    monkeypatch.setattr(_iris, "_spans_hosts", spans_hosts)
+    monkeypatch.setattr(_iris, "_unmapped_reason", None)
     monkeypatch.setattr(
         _iris.iris,
         "iris",
@@ -176,7 +170,23 @@ def test_context_picks_vmem_chunked_only_for_gfx1250_across_hosts(
     assert created == [expected]
 
 
-def _host_span_worker_fn(rank, world_size, port, distinct_hosts, error_dict):
+def test_context_refuses_a_world_it_cannot_map(monkeypatch):
+    from tokenspeed_kernel.ops.communication import _iris
+
+    monkeypatch.setattr(_iris, "_context", None)
+    monkeypatch.setattr(_iris, "_spans_hosts", True)
+    monkeypatch.setattr(
+        _iris, "_unmapped_reason", "the GPUs are not all in one fabric domain"
+    )
+    monkeypatch.setattr(
+        _iris.iris, "iris", Mock(side_effect=AssertionError("heap created"))
+    )
+
+    with pytest.raises(RuntimeError, match="not all in one fabric domain"):
+        _iris.get_or_create_context(heap_size=1 << 20)
+
+
+def _discover_world_worker_fn(rank, world_size, port, hosts, error_dict):
     try:
         dist.init_process_group(
             backend="gloo",
@@ -185,11 +195,19 @@ def _host_span_worker_fn(rank, world_size, port, distinct_hosts, error_dict):
             world_size=world_size,
         )
         from tokenspeed_kernel.ops.communication import _iris
+        from tokenspeed_kernel.ops.communication.iris import (
+            discover_iris_world,
+            iris_maps_world,
+        )
 
-        # Every rank shares this machine's hostname, so only the host identity
-        # can tell the ranks apart.
-        _iris._host_identity = lambda: rank if distinct_hosts else 7
-        assert _iris._job_spans_hosts() is distinct_hosts
+        # Both ranks run on this machine; each claims the host given to it.
+        identity, hostname = hosts[rank]
+        _iris.host_identity = lambda: identity
+        _iris.socket.gethostname = lambda: hostname
+        assert iris_maps_world() is None
+        maps = discover_iris_world()
+        assert iris_maps_world() is maps
+        error_dict[rank] = (maps, _iris._spans_hosts, _iris._unmapped_reason)
     except Exception:
         error_dict[rank] = traceback.format_exc()
     finally:
@@ -197,11 +215,32 @@ def _host_span_worker_fn(rank, world_size, port, distinct_hosts, error_dict):
             dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("distinct_hosts", [True, False])
-def test_hosts_are_told_apart_by_identity_not_hostname(distinct_hosts):
-    _spawn_and_collect(
-        _host_span_worker_fn, (2, _get_open_port(), distinct_hosts), world_size=2
+@pytest.mark.parametrize(
+    ("hosts", "spans_hosts", "reason"),
+    [
+        (((7, "a"), (7, "a")), False, None),
+        (((1, "a"), (2, "a")), True, "hostnames and boot ids disagree"),
+        (((7, "a"), (7, "b")), False, "hostnames and boot ids disagree"),
+        (((1, "a"), (2, "b")), True, "only gfx1250"),
+    ],
+    ids=["one-host", "shared-hostname", "split-hostname", "two-hosts"],
+)
+def test_discover_world_tells_hosts_apart_as_iris_does(hosts, spans_hosts, reason):
+    if reason == "only gfx1250" and current_platform().is_cdna5:
+        pytest.skip("gfx1250 across hosts runs Iris's fabric topology discovery")
+    results = mp.Manager().dict()
+    mp.spawn(
+        _discover_world_worker_fn,
+        args=(2, _get_open_port(), hosts, results),
+        nprocs=2,
+        join=True,
     )
+    for rank in range(2):
+        assert not isinstance(results[rank], str), results[rank]
+        maps, spans, unmapped = results[rank]
+        assert maps is (reason is None)
+        assert spans is spans_hosts
+        assert (unmapped is None) if reason is None else (reason in unmapped)
 
 
 # ---------------------------------------------------------------------------
