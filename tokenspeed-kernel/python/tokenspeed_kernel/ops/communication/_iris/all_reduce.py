@@ -449,7 +449,11 @@ class ProducerLamport:
 
     WORLD_SIZE = 8
     ALL_REDUCE_WORLD_SIZES = (2, 4, 8)
-    # The mailbox holds NUM_STAGES * world_size copies of the largest payload.
+    # gfx1250 generic cap: Lamport measured fastest up to 128 rows of Kimi K3's
+    # paired MoE payload (7168 + 3584 BF16 per row, 2.6 MiB). It is a size
+    # budget, not a shape requirement; whole-tile payloads of any model qualify.
+    # The mailbox holds NUM_STAGES * world_size copies of the largest payload,
+    # so the full cap costs 63 MiB per rank at TP8.
     ALL_REDUCE_MAX_NUMEL = 128 * 10752
     BLOCK_ELEMENTS = 512
     NUM_STAGES = 3
@@ -477,6 +481,10 @@ class ProducerLamport:
         On CDNA5 (gfx1250), Lamport outruns every flag-synchronized protocol
         at the measured TP2, TP4 and TP8 sizes, staged or producer-direct. A
         tray holds four GPUs, so TP8 spans two trays in one fabric domain.
+
+        The capacity is the larger requested capacity, clamped to
+        ``ALL_REDUCE_MAX_NUMEL`` and rounded down to whole 512-element tiles.
+        Producer-direct payloads above it keep the pull protocol.
         """
         if not (
             current_platform().is_cdna5
