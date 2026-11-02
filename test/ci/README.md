@@ -65,7 +65,7 @@ AMD runners run the whole suite in the single `ut-tokenspeed-kernel` task.
 
 All runners split the `runtime-1gpu` suite across `ut-runtime-1gpu-part-i` and
 `ut-runtime-1gpu-part-ii`, which balance test files by their registered
-`est_time` (`run_ci_suite.py --auto-partition-*`). The suite starts one pytest
+`est_time` (`run_ci_suite.py --auto-partition-*`). The suite starts one `pytest`
 process per file, so per-file startup is a large share of its time, and
 running it in one job takes longer than the kernel unit tests.
 
