@@ -25,6 +25,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine import event_loop as event_loop_module  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
+from tokenspeed.runtime.engine.shared_l2_hooks import SharedL2Hooks  # noqa: E402
 from tokenspeed.runtime.metrics.service import MetricsService  # noqa: E402
 from tokenspeed.runtime.utils.server_args import PortArgs  # noqa: E402
 
@@ -82,6 +83,7 @@ def test_device_shutdown_failure_still_retires_l3_resources() -> None:
     loop.kv_transfer = None
     loop._device = FailedDevice()
     loop._l3 = executor
+    loop._shared_l2_hooks = SharedL2Hooks(loop, None)
     try:
         with pytest.raises(RuntimeError, match="Device copy failed"):
             loop.close()
@@ -126,6 +128,7 @@ class _EventLoopHarness:
         self.scheduler = _SchedulerHarness(self.trace)
         self._device = _DeviceHarness(self.trace)
         self._l3 = None
+        self._shared_l2_hooks = SharedL2Hooks(self, None)
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             None,

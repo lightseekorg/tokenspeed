@@ -315,6 +315,12 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         .tokens = request->TokenSlice(0, request->PrefillSize()),
         .max_tokens = max_cacheable_tokens,
     });
+    // KV a shared L2 pool holds past every checkpoint is a junction too: the
+    // checkpoint cut there is where the next prompt sharing that KV resumes.
+    if (const auto* admission = request->AdmissionResourcesPtr()) {
+        match.probe.device.kv_tokens =
+            std::max(match.probe.device.kv_tokens, std::min(admission->pool_kv_tokens, max_cacheable_tokens));
+    }
     // The chain progress counts full pages only; a tail is a boundary, not a
     // hashed page.
     const std::int32_t hit_prefix_pages =
@@ -360,6 +366,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
     std::span<const GroupDemand> demands, const RequestProgress& progress) {
     if (progress.completed_pages) {
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
+        if (shared_l2_) shared_l2_->Publish(*progress.completed_pages);
     } else {
         registerKvEventPrefixPages(request, cache_progress.prefix_hashes,
                                    static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
@@ -694,7 +701,9 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
     if (!load_pairs.empty()) {
         load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
+        if (shared_l2_) shared_l2_->HoldLoad(load_back_operations.back());
     }
+    if (shared_l2_) shared_l2_->ReleaseLookup(request->Id());
     // Admission and the ordinary H2D ticket now own the Host sources. The
     // Submitted state was consumed above, so retire its saved Ready hold here.
     if (storage_id) storage_transfers_->Detach(storage_id);
@@ -832,6 +841,7 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
         // descriptors first, exactly as publishCompletedPages registers before
         // it caches.
         registerKvEventPublication(victim, cache_progress.prefix_hashes, *progress.completed_pages);
+        if (shared_l2_) shared_l2_->Publish(*progress.completed_pages);
         coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
     }
     // A suspended request holds no Device block: the index keeps the

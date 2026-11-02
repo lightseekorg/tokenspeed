@@ -341,6 +341,14 @@ class PendingExecution:
     _future: Future
     _result: ModelExecutionResult | None = field(default=None, init=False, repr=False)
 
+    def ready(self) -> bool:
+        """Whether ``result()`` would return without waiting for the GPU."""
+        if self._result is not None:
+            return True
+        if not self._future.done():
+            return False
+        return self._future.result().copy_event.query()
+
     def result(self) -> ModelExecutionResult:
         if self._result is None:
             results = self._future.result()

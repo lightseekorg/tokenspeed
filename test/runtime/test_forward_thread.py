@@ -100,6 +100,29 @@ def test_pending_execution_joins_future_then_copy_event():
         ft.shutdown()
 
 
+def test_pending_execution_is_ready_once_forward_and_copy_finished():
+    release = threading.Event()
+    copied = []
+    event = SimpleNamespace(query=lambda: bool(copied), synchronize=lambda: None)
+    results = ModelExecutionResult(
+        output_tokens=torch.tensor([7], dtype=torch.int32),
+        copy_event=event,
+    )
+    ft = ForwardThread(torch.device("cpu"), settle=lambda: None)
+    try:
+        pending = PendingExecution(ft.submit(lambda: (release.wait(), results)[1]))
+        assert not pending.ready()
+        release.set()
+        ft.run(lambda: None)
+        # Launches done, the D2H copy still in flight.
+        assert not pending.ready()
+        copied.append(True)
+        assert pending.ready()
+        assert pending.result() is results
+    finally:
+        ft.shutdown()
+
+
 def test_sync_is_rejected_after_the_pending_execution_synced():
     event = SimpleNamespace(synchronize=lambda: None)
     results = ModelExecutionResult(

@@ -171,6 +171,9 @@ def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
             StorageGetOp=Cache.StorageGetOp,
             StoragePutOp=Cache.StoragePutOp,
             StorageCancelOp=Cache.StorageCancelOp,
+            SharedL2ReleaseOp=Cache.SharedL2ReleaseOp,
+            SharedL2WriteOp=Cache.SharedL2WriteOp,
+            SharedL2TouchOp=Cache.SharedL2TouchOp,
         ),
     )
 

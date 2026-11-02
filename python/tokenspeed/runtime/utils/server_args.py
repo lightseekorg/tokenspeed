@@ -515,6 +515,8 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # A paged L2 pool shared by every prefill rank, serving as their Host L2.
+    shared_l2_config: str | None = None
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -1435,6 +1437,20 @@ class ServerArgs:
             self.retraction_snapshot_ratio = 0.0
             self.retraction_snapshot_max_requests = 0
             return
+        if self.shared_l2_config is not None and self.retracting_role:
+            forced = self.debug_force_retraction_interval != 0
+            if host_gb > 0 or ratio not in (None, 0) or max_requests > 0 or forced:
+                raise ValueError(
+                    "shared L2 ranks do not retract; remove the "
+                    "--retraction-snapshot-host-gb, --retraction-snapshot-ratio, "
+                    "--retraction-snapshot-max-requests and "
+                    "--debug-force-retraction-interval overrides (a ratio of 0 is "
+                    "allowed)."
+                )
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            return
         if not self.retracting_role:
             forced = self.debug_force_retraction_interval != 0
             if host_gb > 0 or ratio is not None or max_requests > 0 or forced:
@@ -2070,6 +2086,21 @@ class ServerArgs:
                 "L3 storage (--kvstore-storage-backend) requires Host L2; "
                 "unset --disable-kvstore"
             )
+        if self.shared_l2_config is not None:
+            if self.kvstore_storage_backend is not None:
+                raise ValueError("--shared-l2-config and L3 storage are exclusive")
+            if self.enable_kvstore:
+                raise ValueError(
+                    "--shared-l2-config replaces the Host L2: pass --disable-kvstore"
+                )
+            if self.disaggregation_mode == "decode":
+                raise ValueError(
+                    "--shared-l2-config serves prefill, not decode instances"
+                )
+            if self.mapping.attn.tp_size != 1:
+                raise ValueError("--shared-l2-config serves attention TP 1 ranks only")
+            if self.kv_offload_config is not None:
+                raise ValueError("--shared-l2-config does not support KV offloading")
 
     def validate_cache_options(self):
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
@@ -2707,6 +2738,16 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        parser.add_argument(
+            "--shared-l2-config",
+            type=str,
+            default=ServerArgs.shared_l2_config,
+            help="JSON object joining a shared L2 pool, which serves as this "
+            "rank's Host L2 (requires --disable-kvstore; not with L3 storage "
+            "or on decode instances). Fields: owner, namespace, device_names, "
+            "request_timeout_ms, connect_timeout_s, load_workers, "
+            "write_workers, and scheduler {max_writes, max_write_keys}.",
         )
         # Retraction snapshot pool
         parser.add_argument(

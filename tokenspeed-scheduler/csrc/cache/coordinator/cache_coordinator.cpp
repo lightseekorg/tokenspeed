@@ -156,6 +156,18 @@ bool CacheCoordinator::ClearDeviceCache() {
     return true;
 }
 
+void CacheCoordinator::ReserveHostIndex() {
+    _assert(host_pool_ != nullptr, "only a Host tier has a Host index to size");
+    const auto lcm_blocks = static_cast<std::size_t>(host_pool_->NumLcmBlocks());
+    std::size_t widest = 1;
+    for (CacheGroup& group : groups_) {
+        const auto packing = static_cast<std::size_t>(group.Spec().cache_blocks_per_lcm_block);
+        group.Index().Reserve(*host_pool_, lcm_blocks * packing);
+        widest = std::max(widest, packing);
+    }
+    checkpoints_.Reserve(lcm_blocks * widest);
+}
+
 bool CacheCoordinator::ClearCache() {
     if (host_pool_ == nullptr) {
         return ClearDeviceCache();
@@ -398,6 +410,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                 groups_[i].Index().TouchMatched(*host_pool_, group_keys[i], floor_pages, probe.per_group[i],
                                                 access_epoch);
             }
+            recordPoolTouches(group_keys[i], floor_pages, probe.per_group[i]);
         }
         if (!probe.tail || probe.tail->group_keys[i].empty()) {
             continue;
@@ -410,6 +423,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                 groups_[i].Index().TouchMatched(*host_pool_, probe.tail->group_keys[i], 0, probe.tail->per_group[i],
                                                 access_epoch);
             }
+            recordPoolTouches(probe.tail->group_keys[i], 0, probe.tail->per_group[i]);
         }
         out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
                                        std::make_move_iterator(tail_match.blocks.begin()),
@@ -730,6 +744,18 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPr
     return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
+CacheCoordinator::PrefixProbe CacheCoordinator::ProbeHostPrefix(const PromptPrefix& prompt) const {
+    _assert(host_pool_ != nullptr, "ProbeHostPrefix requires a host pool");
+    _assert(prompt.tokens.empty() || static_cast<std::int64_t>(prompt.tokens.size()) >= prompt.max_tokens,
+            "the probe bound lies inside the supplied tokens");
+    PrefixProbe out;
+    out.group_keys = buildGroupKeys(prompt.prefix_hashes);
+    out.device.per_group.resize(groups_.size());
+    out.host = probeTier<CacheTier::kHost>(prompt, out.group_keys, match_order_, /*floor_tokens=*/0,
+                                           /*claim_partial=*/true, nullptr);
+    return out;
+}
+
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
     return ProbePromptPrefix(PromptPrefix{
         .prefix_hashes = content_hashes,
@@ -1027,7 +1053,8 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
         (groups_[group_index].Spec().attn_kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
-            return automatically_streams_to_host || cache_mutation_sink_ ? &newly_cached : nullptr;
+            return automatically_streams_to_host || cache_mutation_sink_ || publishes_to_pool_ ? &newly_cached
+                                                                                               : nullptr;
         }
         return nullptr;
     }();
@@ -1045,6 +1072,9 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
     for (auto& [key, block_ref] : newly_cached) {
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
+        }
+        if (publishes_to_pool_) {
+            pool_publications_.emplace_back(key, block_ref);
         }
         if (!automatically_streams_to_host) {
             continue;
@@ -1206,6 +1236,19 @@ bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLo
     return true;
 }
 
+void CacheCoordinator::DropHostEntry(const CacheKey& key) {
+    _assert(host_pool_ != nullptr, "DropHostEntry requires a host pool");
+    CacheBlockLocation location;
+    {
+        // The reference from Find must not outlive this lookup: eviction
+        // requires the index to be the block's only owner.
+        const CacheBlockRef block = groups_.at(key.group_id).Index().Find(*host_pool_, key);
+        FatalCheck(static_cast<bool>(block), "a dropped Host entry is missing");
+        location = block->Location();
+    }
+    FatalCheck(evictHostCachedBlock(key.group_id, location, /*demoted=*/false), "a dropped Host entry is in use");
+}
+
 std::optional<CacheBlockLocation> CacheCoordinator::deviceLocationOf(std::size_t group_index,
                                                                      const CacheKey& key) const {
     // The reference from Find must not outlive this lookup: an eviction that
@@ -1271,18 +1314,30 @@ bool CacheCoordinator::checkpointPresent(const ContentHash& hash) const {
     return false;
 }
 
-void CacheCoordinator::recordPublication(const CompletedPages& completed) {
+void CacheCoordinator::RecordCheckpoint(const CompletedPages& completed) {
     if (completed.publish_state && std::ranges::any_of(groups_, [](const CacheGroup& group) {
             return group.Spec().attn_kind == AttnKind::kState;
         })) {
         checkpoints_.PruneVanished([&](const ContentHash& hash) { return checkpointPresent(hash); });
         checkpoints_.Observe(completed);
     }
+}
+
+void CacheCoordinator::recordPublication(const CompletedPages& completed) {
+    RecordCheckpoint(completed);
     if (!completed.tail) {
         return;
     }
     const ContentHash prior = completed.prefix_hashes.empty() ? ContentHash{} : completed.prefix_hashes.back();
     recordTail(prior, *completed.tail);
+}
+
+void CacheCoordinator::recordPoolTouches(std::span<const CacheKey> keys, std::int32_t begin_blocks,
+                                         const GroupPrefixProbe& probe) {
+    if (!publishes_to_pool_) return;
+    for (std::size_t i = 0; i < probe.hits.size(); ++i) {
+        if (probe.hits[i]) pool_touches_.push_back(keys[static_cast<std::size_t>(begin_blocks) + i]);
+    }
 }
 
 void CacheCoordinator::recordTail(const ContentHash& prior, const TailPublication& tail) {
@@ -1737,6 +1792,28 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
 
 CacheBlockRef CacheCoordinator::AcquireHostCachedBlock(const CacheKey& key) {
     return host_pool_ == nullptr ? CacheBlockRef{} : groups_.at(key.group_id).Index().Find(*host_pool_, key);
+}
+
+CoordinatorMatch CacheCoordinator::AcquireHostPrefix(PrefixProbe&& probe) {
+    _assert(host_pool_ != nullptr, "AcquireHostPrefix requires a host pool");
+    if (probe.host.tail && probe.host.tail->tail_tokens > 0) {
+        tails_.Touch(probe.host.tail->hash);
+    }
+    return acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, probe.device.full_page_tokens, std::move(probe.host),
+                                                 ++next_access_epoch_);
+}
+
+void CacheCoordinator::TouchHostBlocks(std::span<const CacheKey> keys) {
+    _assert(host_pool_ != nullptr, "TouchHostBlocks requires a host pool");
+    const std::uint64_t access_epoch = ++next_access_epoch_;
+    const GroupPrefixProbe hit{.hits = {1}};
+    for (const CacheKey& key : keys) {
+        _assert(key.group_id < groups_.size(), "Host touch key group id out of range");
+        groups_[key.group_id].Index().TouchMatched(*host_pool_, std::span{&key, 1}, 0, hit, access_epoch);
+        if (key.page_offset == 0 && tails_.Contains(key.content_hash)) {
+            tails_.Touch(key.content_hash);
+        }
+    }
 }
 
 template <typename Visit>

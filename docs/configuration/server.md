@@ -1101,6 +1101,7 @@ features directly:
 - `--moe-tp-size`
 - `--kvstore-*`
 - `--retraction-snapshot-*`
+- `--shared-l2-config`
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
@@ -1363,3 +1364,47 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Shared L2 pool
+
+`--shared-l2-config` makes one paged pool, shared by every prefill rank, each
+rank's Host L2: one cache index and one eviction policy (the Host L2's), with
+the bytes spread over the nodes' memory. It requires `--disable-kvstore`,
+attention TP 1 and replicated cache groups, and cannot be combined with
+`--kvstore-storage-backend` or KV offloading, or used on decode instances.
+Shared L2 ranks never retract, so a fused instance runs without a retraction
+snapshot pool and rejects the `--retraction-snapshot-*` overrides.
+
+Two services run beside the engines (`python -m
+tokenspeed.runtime.cache.shared_l2`):
+
+* `owner --address tcp://HOST:PORT --lcm-bytes N --providers K
+  --headroom-lcm-blocks H --client-timeout-s S`: one per deployment. It serves
+  the cache index and holds no bytes. `--lcm-bytes` must equal the engines'
+  LCM block size. When fewer than `H/2` LCM blocks are empty, a write evicts
+  back up to `H` in one pass. Its index tables are sized for a full pool at
+  start (tens of MB for a multi-TB pool), so they never grow while serving.
+  It drops a rank silent for `S` seconds with its pins; ranks ping every 5 s.
+* `provider --owner ADDRESS --hostname HOST --device-name NICS --bytes B`:
+  one per node, hosting `B` bytes of pool memory over RDMA.
+
+The rank's JSON names every field explicitly:
+
+```json
+{"owner": "tcp://HOST:PORT", "namespace": "MODEL-AND-WEIGHTS",
+ "device_names": ["mlx5_0,mlx5_1", "mlx5_0,mlx5_1", "mlx5_0,mlx5_1",
+                  "mlx5_0,mlx5_1"], "request_timeout_ms": 30000,
+ "connect_timeout_s": 600, "load_workers": 16, "write_workers": 4,
+ "scheduler": {"max_writes": 4, "max_write_keys": 512}}
+```
+
+`namespace` names the model and weights the pool caches; the owner serves one
+and rejects a client that reports another, so change it with the weights.
+Waiting prompts ask the pool in one request before each plan, and while a
+forward runs as they arrive; a prompt is admitted only after its answer, so a
+prefix the pool holds is never recomputed. A load reads the pool pages layer by
+layer, `load_workers` providers at a time, and the forward waits per layer as
+for a Host L2 load. A failed load stops the engine, as a failed forward would.
+`device_names` gives each local GPU index its RDMA devices. Name the fastest
+GPU-side NICs: on GB300 nodes the socket-0 NICs move about 68 GB/s to or from
+any GPU's memory, the socket-1 NICs about 36 GB/s.

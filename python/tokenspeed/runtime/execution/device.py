@@ -118,6 +118,7 @@ logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
+    from tokenspeed.runtime.cache.shared_l2.client import SharedL2Client
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
@@ -270,6 +271,8 @@ class DeviceBuild:
             register/abort, event polling — or None outside PD.
         host_cache: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
+        shared_l2: The rank's shared L2 client (lookups and writes), or None
+            without a shared L2 pool.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts EPD
             admission needs (``EncoderModelFacts``). A callable, not a value:
@@ -283,6 +286,7 @@ class DeviceBuild:
     transfer: Any
     handle: "DeviceHandle"
     host_cache: HostCacheResources | None
+    shared_l2: SharedL2Client | None
     encoder_model_facts: Any
 
 
@@ -347,8 +351,9 @@ class DeviceHandle:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
         self._thread = executor.forward_thread
-        # The compact Host cache -- the L2 prefix tier, the retraction
-        # snapshot pool, or both -- or None with neither. Behind the handle
+        # The compact Host cache -- the L2 prefix tier (a shared L2 pool's
+        # loads included), the retraction snapshot pool, or both -- or None
+        # with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
         # transfers and records events. Snapshot stores ride ``execute``
         # with the write-backs and restores with the load-backs; all four
@@ -644,8 +649,8 @@ class DeviceHandle:
         l2 = self._l2
         if l2 is None:
             raise RuntimeError(
-                "cache results polled without --enable-kvstore or a retraction "
-                "snapshot pool"
+                "cache results polled without --enable-kvstore, "
+                "--shared-l2-config or a retraction snapshot pool"
             )
         _settle(
             self._l2_submissions,
@@ -1534,7 +1539,27 @@ def build_device_side(
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
-    if server_args.enable_kvstore or not snapshot_pool.disabled:
+    shared_l2 = None
+    if server_args.shared_l2_config is not None:
+        from tokenspeed.runtime.cache.shared_l2.client import create_shared_l2_client
+        from tokenspeed.runtime.cache.shared_l2.executor import (
+            build_shared_l2_load_executor,
+        )
+        from tokenspeed.runtime.cache.shared_l2.layout import build_shared_l2_layout
+
+        # The pool is this rank's Host L2: the scheduler's Host tier is its
+        # proxy and Host loads read it by RDMA.
+        shared_l2 = create_shared_l2_client(
+            server_args.shared_l2_config,
+            layout=build_shared_l2_layout(views.token_to_kv_pool.arena),
+            gpu_id=gpu_id,
+        )
+        host_cache_executor = build_shared_l2_load_executor(
+            shared_l2,
+            device_pool=views.token_to_kv_pool,
+            draft_pool=views.draft_token_to_kv_pool,
+        )
+    elif server_args.enable_kvstore or not snapshot_pool.disabled:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
         from tokenspeed.runtime.distributed.process_group_manager import (
             process_group_manager as pg_manager,
@@ -1563,7 +1588,11 @@ def build_device_side(
         logger.info(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
-    if host_cache_executor is not None and host_cache_executor.host_storage is not None:
+    if (
+        shared_l2 is None
+        and host_cache_executor is not None
+        and host_cache_executor.host_storage is not None
+    ):
         from tokenspeed.runtime.cache.host_storage import HostCacheResources
 
         assert host_cache_executor.block_owners is not None
@@ -1640,6 +1669,7 @@ def build_device_side(
 
     return DeviceBuild(
         host_cache=host_cache,
+        shared_l2=shared_l2,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,

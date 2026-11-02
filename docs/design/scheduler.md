@@ -54,6 +54,28 @@ local hits. Retraction remains an exact image restore, never an L3 re-prefill.
 The D role probes Device history and receives missing data from its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
+**A shared L2 pool is the rank's Host L2.** With
+`SchedulerConfig::shared_l2_config` (never with L3), the Host tier is a proxy
+of the pool: it holds no bytes, and each proxy Host block stands for a pinned
+pool page. Every waiting prompt is looked up once before admission
+(`SharedL2Lookups`, answered by the owner, then `ApplySharedL2Lookups`): the
+owner runs the Host L2 matcher over the whole prompt and pins what it finds,
+and the hit and its tail become proxy Host entries. From there admission is
+the Host L2's -- the Host tier extends the Device hit, load-back pairs copy
+proxy blocks into Device blocks, the runtime reads the pages from the pool
+layer by layer -- and admission takes no waiting prompt before its lookup, so
+a prefix the pool holds is never recomputed. A proxy entry lives while a
+waiting request's lookup or an in-flight load-back holds it; the pool's pin
+goes with the last entry its lookup made. The lookup also reports how far the
+pool's KV pages reach; past the hit that is a junction, as Device KV past its
+checkpoint is, so the first chunk's checkpoint lands where the next prompt
+sharing that KV resumes. A load is assumed to succeed, like a forward: a
+failure stops the engine. Host write-back is off; newly published Device
+blocks, except those just loaded from the pool, are queued for pool writes with
+a reference taken at publication, and Device hits are reported as pool
+touches. `SharedL2Transfers` owns the proxy entries, writes and references.
+Shared L2 ranks never retract: a retraction image would write into the proxy.
+
 Waiting requests retain their immutable prompt hash chain in `AdmissionResources`.
 Admission retries reuse the hashes but probe the current cache again, so cache
 publications and evictions remain visible. The hashes move with pre-admission

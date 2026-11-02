@@ -424,6 +424,9 @@ def wire_ops(monkeypatch):
             StorageGetOp=scheduler_utils_module.Cache.StorageGetOp,
             StoragePutOp=scheduler_utils_module.Cache.StoragePutOp,
             StorageCancelOp=scheduler_utils_module.Cache.StorageCancelOp,
+            SharedL2ReleaseOp=scheduler_utils_module.Cache.SharedL2ReleaseOp,
+            SharedL2WriteOp=scheduler_utils_module.Cache.SharedL2WriteOp,
+            SharedL2TouchOp=scheduler_utils_module.Cache.SharedL2TouchOp,
         ),
     )
 

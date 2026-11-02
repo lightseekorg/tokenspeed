@@ -120,6 +120,7 @@ class _Engine:
                 num_snapshot_pages=1,
                 max_retracted_requests=0,
                 storage_config=None,
+                shared_l2_config=None,
                 decode_input_tokens=width,
                 overlap_schedule_depth=int(overlap),
                 cache_groups=[

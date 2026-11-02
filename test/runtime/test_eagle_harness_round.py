@@ -455,6 +455,7 @@ def _decode_batch(bs: int, width: int):
             num_snapshot_pages=1,
             max_retracted_requests=0,
             storage_config=None,
+            shared_l2_config=None,
             decode_input_tokens=width,
             cache_groups=[
                 ts.CacheGroupConfig(

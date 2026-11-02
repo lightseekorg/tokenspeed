@@ -280,6 +280,13 @@ public:
         return candidates;
     }
 
+    // Sizes the lookups of pool's entries for `entries` up front.
+    void Reserve(const BlockPool& pool, std::size_t entries) {
+        CacheEntries& cache_index = cacheEntries(pool);
+        cache_index.by_key.reserve(entries);
+        cache_index.by_location.reserve(entries);
+    }
+
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
         CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {

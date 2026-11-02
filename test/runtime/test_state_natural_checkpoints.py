@@ -63,6 +63,7 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=None,
+        shared_l2_config=None,
         enable_kv_cache_events=False,
         decode_input_tokens=1,
         overlap_schedule_depth=0,

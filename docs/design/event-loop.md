@@ -332,7 +332,8 @@ There are exactly two call sites, each with a documented reason:
 * **Head of the round** — completed Host cache-op events
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
   `SnapshotDone`, `RestoreDone`, each replica-intersected), together with
-  the L3 hooks' agreed storage facts and local prefill readiness under
+  the shared L2 hooks' `SharedL2WriteDone` events, the L3 hooks' agreed
+  storage facts and local prefill readiness under
   `independent` P/D admission. This includes destination-ready grants, which
   the native request remembers independently of its prefill state. Local P
   readiness does not depend on D allocation and must be visible to the first
@@ -452,6 +453,7 @@ Current inventory:
 | `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, Host-only `L3Executor`, static replica group; no loop reference) | `poll_ready_events`, `cancel_request`, `record_metrics` |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 | `_gc_hooks` | `GcHooks` — `engine/gc_hooks.py` | self-contained (only its interval; no loop reference) | `note_round` |
+| `_shared_l2_hooks` | `SharedL2Hooks` — `engine/shared_l2_hooks.py` | glue (the rank's `SharedL2Client` does the work; the loop back-reference serves the forward wait's intake; every call is a no-op without a pool) | `poll_ready_events`, `lookup`, `submit`, `wait_for_forward`, `close` |
 
 `_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the work
@@ -528,12 +530,16 @@ For orientation, one iteration of `event_loop`:
 2. Poll Host copy completions and asynchronous L3 facts; **advance the
    scheduler (head call site)** so this round's plan sees them. Hooks also
    agree forward/storage permissions and a monotonic clock for soft deadlines.
-3. Plan with those permissions. Adapt cache ops once, submit the storage
-   subset, count Device cache ops, finish `plan.aborts`, and prepare the
-   forward batch. A frozen round drains in-flight forwards; with L3 enabled,
-   the same planner still dispatches storage cleanup with forward/storage
-   permissions disabled. Metrics, DP synchronization and pending-commit
-   dependencies retain the same boundaries.
+3. Plan with those permissions. With a shared L2 pool, the waiting prompts
+   not yet looked up first ask the pool in one owner request
+   (`_shared_l2_hooks.lookup`), and the scheduler mirrors the answers into its proxy
+   Host tier (`apply_shared_l2_lookups`, an input like a submission, not an
+   event). Adapt cache ops once, submit the storage subset and the shared L2
+   commands, count Device cache ops, finish `plan.aborts`, and prepare the
+   forward batch. A frozen round drains in-flight forwards; with L3 or a shared
+   L2 pool, the same planner still dispatches storage cleanup and pool
+   commands with forward/storage permissions disabled. Metrics, DP
+   synchronization and pending-commit dependencies retain the same boundaries.
 4. **One `DeviceHandle.execute(plan, planned, cache_ops=...)` dispatch**, in an order
    that is itself a correctness contract for same-round page reuse. The
    handle consumes the Device tuple already produced by `cache_ops_from_plan`
@@ -573,7 +579,10 @@ For orientation, one iteration of `event_loop`:
    forwarded (`_eplb_hooks.note_round`), and so does the garbage-collection
    hook, which runs a full collection every `FULL_COLLECTION_INTERVAL`
    forwarded rounds (`_gc_hooks.note_round`). Then commit from the queue head
-   down to the effective depth and poll PD transfer events.
+   down to the effective depth and poll PD transfer events. With a shared L2
+   pool, prompts that arrive while a forward's result is awaited are taken in
+   and looked up then (`_shared_l2_hooks.wait_for_forward`), so their lookup
+   costs the GPU nothing.
 5. **Advance the scheduler (tail call site)** with the round's
    `request_changes`, publish KV events (once), and resolve any pending
    pause/release drain.

@@ -137,6 +137,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
+        if (shared_l2_) shared_l2_->Publish(*completed.completed_pages);
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), completed, progress.access_epoch);
         if (completed.completed_pages->tail) {
             store_hashes.push_back(completed.completed_pages->tail->hash);
@@ -202,6 +203,7 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
     tier_transfers_.CompleteLoadBack(event.op_id);
+    if (shared_l2_) shared_l2_->ReleaseLoad(event.op_id);
 }
 
 void Scheduler::handleEvent(const cache::SnapshotDone& event) {

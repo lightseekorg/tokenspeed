@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 import zmq
 from tokenspeed_kernel.compile_monitor import compile_stats
-from tokenspeed_scheduler import Scheduler, StorageConfig
+from tokenspeed_scheduler import Scheduler, SharedL2Config, StorageConfig
 
 from tokenspeed.runtime.cache.l3.factory import create_l3_executor
 from tokenspeed.runtime.cache.l3.metrics import L3Metrics
@@ -74,6 +74,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     scheduler_pd_lifecycle,
     should_use_overlap_schedule,
 )
+from tokenspeed.runtime.engine.shared_l2_hooks import SharedL2Hooks
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
 from tokenspeed.runtime.execution.device import (
     DeviceRole,
@@ -165,6 +166,7 @@ def scheduler_config_from_args(
     specs,
     *,
     storage_config: StorageConfig | None,
+    shared_l2_config: SharedL2Config | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
     decode_input_tokens: int,
@@ -180,6 +182,7 @@ def scheduler_config_from_args(
             geometry, the cache groups and the Host tiers' page counts.
         storage_config: Shared storage scheduling limits, or None
             when no storage backend is configured.
+        shared_l2_config: Shared L2 pool limits, or None without one.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
         decode_input_tokens: Verify width per decode step.
@@ -195,13 +198,17 @@ def scheduler_config_from_args(
         max_batch_size=max_batch_size,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
-        disable_l2_cache=not server_args.enable_kvstore,
+        # A shared L2 pool is the Host L2; the scheduler keeps its proxy tier.
+        disable_l2_cache=not (
+            server_args.enable_kvstore or shared_l2_config is not None
+        ),
         enable_l3_storage=has_l3,
         role=server_args.disaggregation_mode,
         decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         num_snapshot_pages=specs.num_snapshot_pages,
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
+        shared_l2_config=shared_l2_config,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
@@ -320,6 +327,7 @@ class EventLoop:
             ),
         )
         storage_config = self._l3.config.scheduler if self._l3 is not None else None
+        self._shared_l2_hooks = SharedL2Hooks(self, device.shared_l2)
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
@@ -370,7 +378,7 @@ class EventLoop:
         # stores and restores are cache ops too). The hooks get the handle,
         # not the executor: polling goes through it.
         armed = cache_hooks_armed(
-            enable_kvstore=server_args.enable_kvstore,
+            enable_kvstore=server_args.enable_kvstore or self._shared_l2_hooks.active,
             max_retracted_requests=specs.max_retracted_requests,
         )
         self._cache_hooks = CacheOpHooks(
@@ -432,6 +440,7 @@ class EventLoop:
             server_args,
             specs,
             storage_config=storage_config,
+            shared_l2_config=self._shared_l2_hooks.scheduler_config,
             max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
             decode_input_tokens=decode_input_tokens,
@@ -857,7 +866,8 @@ class EventLoop:
             if state is not None:
                 self.output_processor.reap_finished_orphan(request_id, state)
 
-    def _process_new_requests(self):
+    def _process_new_requests(self) -> bool:
+        """Takes in arrived requests; True when any reached the scheduler."""
         recv_reqs = self.request_handler.recv_reqs()
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
@@ -908,7 +918,7 @@ class EventLoop:
         ready.extend(grammar_manager.get_ready_grammar_requests())
 
         if not ready:
-            return
+            return False
 
         admitted_specs = []
         for spec, state, bootstrap in ready:
@@ -956,10 +966,11 @@ class EventLoop:
             admitted_specs.append(spec)
 
         if self._pause_hooks.withhold_admissions(admitted_specs, pause_blocked_before):
-            return
+            return False
 
         if admitted_specs:
             self._submit_scheduler_requests(admitted_specs)
+        return bool(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")
     def _pp_broadcast_output_tokens(self, forward_op, results) -> None:
@@ -1224,6 +1235,7 @@ class EventLoop:
                     allow_forward=not self._pause.forward_blocked,
                     allow_storage=not self._pause.forward_blocked,
                 )
+                ready_events.extend(self._shared_l2_hooks.poll_ready_events())
                 ready_events.extend(self._cache_hooks.poll_ready_events())
                 ready_events.extend(self._pd_hooks.poll_admission_events())
                 if ready_events:
@@ -1246,17 +1258,20 @@ class EventLoop:
                     # Freeze: dispatched forwards can't be un-launched; commit them
                     # all before idling.
                     request_changes.extend(self._drain_in_flight(in_flight))
-                    if self._l3 is not None:
+                    if self._l3 is not None or self._shared_l2_hooks.active:
                         execution_plan = self.scheduler.next_execution_plan()
                         cache_ops = cache_ops_from_plan(execution_plan)
                         self._cache_hooks.count_ops(cache_ops.device)
-                        self._l3.submit_operations(cache_ops.storage)
+                        if self._l3 is not None:
+                            self._l3.submit_operations(cache_ops.storage)
+                        self._shared_l2_hooks.submit(cache_ops.shared_l2)
                         self._device.execute(
                             execution_plan, None, cache_ops=cache_ops.device
                         )
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
+                    self._shared_l2_hooks.lookup()
                     with torch.profiler.record_function(
                         "scheduler.next_execution_plan"
                     ):
@@ -1280,6 +1295,7 @@ class EventLoop:
                     self.output_processor.finish_scheduler_aborted_requests(
                         execution_plan.aborts
                     )
+                    self._shared_l2_hooks.submit(cache_ops.shared_l2)
                     if cache_ops.storage:
                         self._l3.submit_operations(cache_ops.storage)
 
@@ -1397,6 +1413,7 @@ class EventLoop:
                     effective_depth = depth if forward_op is not None else 0
                     while len(in_flight) > effective_depth:
                         fo, res = in_flight.popleft()
+                        self._shared_l2_hooks.wait_for_forward(res)
                         request_changes.extend(self._commit_forward_results(fo, res))
 
                     request_changes.extend(self._pd_hooks.poll_transfer_events())
@@ -1524,6 +1541,7 @@ class EventLoop:
             finally:
                 if self._l3 is not None:
                     self._l3.close(timeout_s=5.0)
+                self._shared_l2_hooks.close()
 
 
 def run_event_loop(

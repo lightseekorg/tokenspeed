@@ -79,6 +79,9 @@ def wire(monkeypatch):
             StorageGetOp=ts.Cache.StorageGetOp,
             StoragePutOp=ts.Cache.StoragePutOp,
             StorageCancelOp=ts.Cache.StorageCancelOp,
+            SharedL2ReleaseOp=ts.Cache.SharedL2ReleaseOp,
+            SharedL2WriteOp=ts.Cache.SharedL2WriteOp,
+            SharedL2TouchOp=ts.Cache.SharedL2TouchOp,
         ),
     )
 
@@ -225,6 +228,7 @@ def _config(**overrides):
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=None,
+        shared_l2_config=None,
     )
     fields.update(overrides)
     return make_config(**fields)
@@ -268,6 +272,7 @@ def test_make_config_requires_storage_limits_exactly_with_l3():
         disable_l2_cache=False,
         enable_l3_storage=True,
         storage_config=limits,
+        shared_l2_config=None,
     )
     config.cache_groups = [ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)]
     scheduler = ts.Scheduler(config)

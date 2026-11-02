@@ -167,6 +167,7 @@ public:
         prefixes_.clear();
         prune_candidates_.clear();
     }
+    void Reserve(std::size_t prefix_segments) { prefixes_.reserve(prefix_segments); }
     std::size_t Size() const { return nodes_.size(); }
     std::size_t PrefixSegments() const { return prefixes_.size(); }
     bool Contains(const ContentHash& hash) const { return nodes_.contains(hash); }

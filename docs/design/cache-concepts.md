@@ -945,6 +945,20 @@ Its responsibilities:
   See [asynchronous L3](async-l3-cache.md) for ownership and retirement, and
   [server configuration](../configuration/server.md#host-l2-and-mooncake-store-l3)
   for deployment settings.
+* **Shared L2.** A pool shared by many prefill ranks runs this same
+  coordinator in its owner (`SharedL2Pool`, `cache/tier/shared_l2_pool.h`)
+  with the pool as the Host tier and an unused Device pool: placement, the
+  prefix index, tails, checkpoint ancestry and eviction are the Host L2's.
+  `ProbeHostPrefix` matches the Host tier from the prompt's start,
+  `AcquireHostPrefix` pins what it found, `TouchHostBlocks` stands for a
+  client's Device hit and `RecordCheckpoint` adds a checkpoint a client
+  published. A checkpoint's lineage takes effect once its State and tail
+  blocks are stored. On a rank, the Host tier is a proxy of the pool: a
+  lookup's hit becomes Host entries (`CacheHostBlock`, `CacheHostTail`) that
+  `DropHostEntry` removes once nothing holds them, and
+  `EnablePoolPublication` hands every newly published Device block to
+  `SharedL2Transfers` with a reference and collects Device-hit keys (see
+  [Scheduler](scheduler.md)).
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.

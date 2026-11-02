@@ -95,6 +95,10 @@ struct AdmissionResources {
     std::int32_t prefix_granularity;
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    // Whether the shared L2 pool was asked for the prompt, and how far its KV
+    // pages reach: past the hit, a junction the first chunk is cut at.
+    bool pool_lookup_asked{false};
+    std::int32_t pool_kv_tokens{0};
     std::optional<std::vector<std::string>> prefix_hashes;
 };
 

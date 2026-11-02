@@ -58,6 +58,7 @@ from tokenspeed.runtime.engine.pause import (  # noqa: E402
     PauseHooks,
     PauseState,
 )
+from tokenspeed.runtime.engine.shared_l2_hooks import SharedL2Hooks  # noqa: E402
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks  # noqa: E402
 from tokenspeed.runtime.metrics.collector import EngineMetrics  # noqa: E402
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo  # noqa: E402
@@ -269,6 +270,7 @@ def _loopback_scheduler(role, allocation_policy):
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=None,
+        shared_l2_config=None,
         decode_allocation_policy=allocation_policy if role == "prefill" else None,
         cache_groups=[
             native.CacheGroupConfig(
@@ -302,6 +304,7 @@ class _PrefillPlanningLoop(EventLoop):
         self.in_flight_depth = 0
         self._pause = PauseController(send_func=lambda _message: None)
         self._l3 = None
+        self._shared_l2_hooks = SharedL2Hooks(self, None)
         self._epd_hooks = EpdPrefillHooks(self, admission=None)
         self._pd_hooks = PdTransferHooks(self, device=None)
         self._cache_hooks = CacheOpHooks(

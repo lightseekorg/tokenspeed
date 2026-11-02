@@ -238,6 +238,8 @@ public:
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
     // Full pages only: a probe that enumerates no tails.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+    // The Host tier alone, from the prompt's start.
+    PrefixProbe ProbeHostPrefix(const PromptPrefix& prompt) const;
 
     // Decode-side PD reuses local history pages; the KV boundary trims the
     // peer's transfer and the partial block of a tail hit is left a hole for
@@ -365,6 +367,9 @@ public:
     // Clears both Device and Host prefix indexes. Returns false without
     // mutation when either tier still has a pinned cached block.
     bool ClearCache();
+    // Sizes the Host index for a full Host pool, so it never rehashes while
+    // serving.
+    void ReserveHostIndex();
     // Same pin checks as ClearDeviceCache / ClearCache, with no mutation.
     // include_host selects both tiers (Host is a no-op without a host pool).
     bool CacheIsClearable(bool include_host) const;
@@ -407,6 +412,24 @@ public:
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
     void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
     CacheBlockRef AcquireHostCachedBlock(const CacheKey& key);
+    // Pins and refreshes the Host part of a probe as an admission claims it: per
+    // group the probe's Host hits (holes empty), then the tail's blocks.
+    CoordinatorMatch AcquireHostPrefix(PrefixProbe&& probe);
+    // Refreshes these Host entries' recency, as a Device hit on them does.
+    void TouchHostBlocks(std::span<const CacheKey> keys);
+    // Adds a published state checkpoint to the ancestry eviction uses to
+    // demote superseded checkpoints. Device publication records its own.
+    void RecordCheckpoint(const CompletedPages& completed);
+
+    // Shared L2: newly published Device blocks are handed out with a reference (no
+    // eviction precedes their write), and Device-hit keys are collected.
+    void EnablePoolPublication() { publishes_to_pool_ = true; }
+    std::vector<std::pair<CacheKey, CacheBlockRef>> TakePoolPublications() {
+        return std::exchange(pool_publications_, {});
+    }
+    std::vector<CacheKey> TakePoolTouches() { return std::exchange(pool_touches_, {}); }
+    // Removes an unreferenced Host entry, as Host eviction would.
+    void DropHostEntry(const CacheKey& key);
     struct StorageReservation {
         std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> blocks;
@@ -588,6 +611,7 @@ private:
     // per-prior cap dropped.
     void recordPublication(const CompletedPages& completed);
     void recordTail(const ContentHash& prior, const TailPublication& tail);
+    void recordPoolTouches(std::span<const CacheKey> keys, std::int32_t begin_blocks, const GroupPrefixProbe& probe);
     bool checkpointComplete(const BlockPool& pool, const ContentHash& hash) const;
     bool checkpointPresent(const ContentHash& hash) const;
     // Evicts every group's Device entries under a tail hash: a tail's blocks
@@ -632,6 +656,9 @@ private:
     std::uint64_t device_demoted_victims_{0};
     std::uint64_t host_demoted_victims_{0};
     std::vector<StoreCandidate> pending_stores_;
+    bool publishes_to_pool_{false};
+    std::vector<std::pair<CacheKey, CacheBlockRef>> pool_publications_;
+    std::vector<CacheKey> pool_touches_;
     CacheMutationSink cache_mutation_sink_;
 };
 

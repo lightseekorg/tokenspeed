@@ -378,7 +378,8 @@ class PauseHooks:
     def apply_transitions(self, grammar_manager) -> None:
         """Apply one-shot pause/resume edges to in-flight and queued requests.
 
-        Called once per iteration from ``_process_new_requests``, right after
+        Called from every ``_process_new_requests`` (once per iteration, and
+        while a forward runs with a shared L2 pool), right after
         control messages were processed (so a fresh edge is acted on in the
         same iteration) and before the early ``if not ready: return`` (which
         would otherwise strand buffered specs until the next inbound request).

@@ -103,7 +103,10 @@ Scheduler::Scheduler(SchedulerConfig config)
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
-                             : nullptr} {
+                             : nullptr},
+      shared_l2_{config_.shared_l2_config ? std::make_unique<SharedL2Transfers>(coordinator_, *config_.shared_l2_config)
+                                          : nullptr} {
+    if (shared_l2_) coordinator_.EnablePoolPublication();
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -214,7 +217,8 @@ bool Scheduler::CanClearCache() const {
 bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
-    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending()) ||
+                                    (shared_l2_ && shared_l2_->HasInFlight());
     if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
         return false;
     }
@@ -234,13 +238,17 @@ bool Scheduler::clearCache(bool include_host) {
     // is not indexed anywhere, so the suspended set is checked directly.
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
-    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending()) ||
+                                    (shared_l2_ && shared_l2_->HasInFlight());
     const std::size_t suspended = RetractedSize();
     if (has_pd_transfers || has_tier_transfers || suspended > 0) {
         spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
                      include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
         return false;
     }
+    // Queued pool writes only pin their Device sources; in-flight ones were
+    // refused above.
+    if (shared_l2_) shared_l2_->DropWrites();
     const auto retention = coordinator_.CheckpointRetentionStats();
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
     if (!cleared) {
@@ -485,6 +493,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             return false;
         }
         releaseStorage(*request);
+        if (shared_l2_) shared_l2_->ReleaseLookup(request->Id());
         kv_event_hash_progress_.erase(request->Id());
         requests_by_id_.erase(request->Id());
         return true;
@@ -496,6 +505,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
+        // With a shared L2 pool a waiting prompt waits for its lookup, so a prefix
+        // the pool holds is never recomputed.
+        if (shared_l2_ && !config_.disable_prefix_cache && request->Is<fsm::Submitted>() &&
+            !shared_l2_->LookedUp(request->Id())) {
+            continue;
+        }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
                              fsm::Retracted>()) {
             candidates.push_back(request.get());
@@ -523,6 +538,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             storage_transfers_->DropBackups();
         storage_operations = storage_transfers_->TakeCommands();
     }
+    std::vector<SharedL2Operation> pool_operations;
+    if (shared_l2_) {
+        shared_l2_->Collect();
+        shared_l2_->StartWrites();
+        pool_operations = shared_l2_->TakeCommands();
+    }
 
     if (forward_allowed_ && config_.StreamsDeviceCacheToHost()) {
         // Boundary publications of live requests: their owners hold the pages,
@@ -548,8 +569,11 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     if (!built.snapshot_restores.empty()) {
         plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
     }
-    const bool has_storage_work = !storage_operations.empty();
+    const bool has_storage_work = !storage_operations.empty() || !pool_operations.empty();
     for (auto& operation : storage_operations) {
+        plan.With(CacheOperation{std::move(operation)});
+    }
+    for (auto& operation : pool_operations) {
         plan.With(CacheOperation{std::move(operation)});
     }
     trackStalledRounds(num_live_requests,
@@ -563,7 +587,8 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
     // With nothing out, only a new submission or an abort can change the next
     // plan.
     const bool stalled = forward_allowed_ && (!storage_transfers_ || !storage_transfers_->HasPending()) &&
-                         num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
+                         (!shared_l2_ || !shared_l2_->HasPending()) && num_live_requests > 0 && plan_is_empty &&
+                         !tier_transfers_.HasAnyInFlight() &&
                          std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
                              return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
                          });

@@ -35,6 +35,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache/tier/shared_l2_transfers.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
@@ -55,6 +56,12 @@ public:
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
 
     ExecutionPlan NextExecutionPlan();
+    // The waiting prompts the shared L2 pool has not been asked about yet; a
+    // prompt is admitted only once its answer was applied.
+    std::vector<SharedL2Lookup> SharedL2Lookups();
+    // Mirrors the pool's answers into the proxy Host tier; returns the proxy
+    // blocks created, with the pool pages a load-back from them copies.
+    std::vector<SharedL2ProxyPage> ApplySharedL2Lookups(const std::vector<SharedL2LookupResult>& results);
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
@@ -261,6 +268,7 @@ private:
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
+    void handleEvent(const cache::SharedL2WriteDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::DestinationReadyEvent& event);
     void handleEvent(const pd::FailedEvent& event);
@@ -442,6 +450,7 @@ private:
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::unique_ptr<StorageTransferManager> storage_transfers_;
+    std::unique_ptr<SharedL2Transfers> shared_l2_;
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};

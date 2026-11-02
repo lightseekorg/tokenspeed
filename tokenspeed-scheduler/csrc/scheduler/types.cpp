@@ -81,6 +81,18 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
+    if (shared_l2_config) {
+        shared_l2_config->Validate();
+        if (enable_l3_storage) throw std::invalid_argument("Scheduler: shared L2 and L3 storage are exclusive");
+        if (!HasHostCache()) throw std::invalid_argument("Scheduler: shared L2 needs its proxy Host tier");
+        if (role == Role::kD) throw std::invalid_argument("Scheduler: the decode role does not use shared L2");
+        // A retraction image's L2 leg would write into the proxy, which holds
+        // no bytes.
+        if (HasSnapshotPool()) throw std::invalid_argument("Scheduler: shared L2 ranks do not retract");
+        for (const CacheGroupConfig& group : cache_groups) {
+            if (group.shard_count != 1) throw std::invalid_argument("Scheduler: shared L2 needs replicated groups");
+        }
+    }
     // The snapshot pool is stated explicitly on every role: the null page
     // alone (and no slots) says "never retract", anything more needs slots.
     // The messages name the binding field and the server arg that sets it,

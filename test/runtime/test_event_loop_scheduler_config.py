@@ -40,7 +40,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_scheduler")
 
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.event_loop import (  # noqa: E402
@@ -62,7 +62,7 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
     )
 
 
-def _config(args: ServerArgs, specs):
+def _config(args: ServerArgs, specs, *, shared_l2_config=None):
     storage_config = None
     if args.kvstore_storage_backend is not None:
         storage_config = StorageRuntimeConfig.from_extra_config(
@@ -72,6 +72,7 @@ def _config(args: ServerArgs, specs):
         args,
         specs,
         storage_config=storage_config,
+        shared_l2_config=shared_l2_config,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.retraction_snapshot_max_requests or 8,
         decode_input_tokens=1,
@@ -168,3 +169,47 @@ def test_a_decode_server_takes_the_in_forward_state_checkpoint_flag_as_a_no_op()
     assert not args.writes_state_checkpoints_in_forward
     cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
     assert not cfg.state_checkpoint_in_forward
+
+
+def _shared_l2_args(**overrides):
+    return ServerArgs(
+        **{
+            "model": "x",
+            "max_num_seqs": 8,
+            "disable_kvstore": True,
+            "shared_l2_config": "{}",
+            **overrides,
+        }
+    )
+
+
+def test_a_shared_l2_rank_keeps_its_host_tier_as_the_pools_proxy():
+    args = _shared_l2_args()
+    cfg = _config(
+        args,
+        _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0),
+        shared_l2_config=ts.SharedL2Config(max_writes=2, max_write_keys=64),
+    )
+    assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
+    assert cfg.enable_l3_storage is False
+    assert cfg.shared_l2_config is not None
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"disable_kvstore": False}, "--disable-kvstore"),
+        (
+            {
+                "disaggregation_mode": "decode",
+                "disaggregation_transfer_backend": "mooncake",
+            },
+            "not decode",
+        ),
+        ({"retraction_snapshot_host_gb": 1.0}, "do not retract"),
+        ({"debug_force_retraction_interval": 3}, "do not retract"),
+    ],
+)
+def test_shared_l2_refuses_settings_it_cannot_serve(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _shared_l2_args(**overrides)

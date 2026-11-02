@@ -35,6 +35,7 @@ from tokenspeed_scheduler import (
     ForwardEvent,
     RequestSpec,
     SchedulerConfig,
+    SharedL2Config,
     StorageConfig,
 )
 
@@ -350,6 +351,7 @@ def make_config(
     num_snapshot_pages: int,
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
+    shared_l2_config: SharedL2Config | None,
     decode_allocation_policy: str | None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
@@ -386,6 +388,9 @@ def make_config(
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
+        shared_l2_config: Limits of a shared L2 pool serving as the Host L2
+            (``num_host_pages`` then sizes its proxy tier), or None without
+            one.
         decode_allocation_policy: Explicit early/independent prefill admission choice,
             or None for decode and fused serving.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
@@ -435,6 +440,7 @@ def make_config(
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.storage_config = storage_config
     cfg.enable_l3_storage = enable_l3_storage
+    cfg.shared_l2_config = shared_l2_config
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     cfg.role = scheduler_role(role)
@@ -818,6 +824,10 @@ class CacheOperations(NamedTuple):
         | Cache.StorageCancelOp,
         ...,
     ]
+    shared_l2: tuple[
+        Cache.SharedL2ReleaseOp | Cache.SharedL2WriteOp | Cache.SharedL2TouchOp,
+        ...,
+    ]
 
 
 def cache_ops_from_plan(execution_plan) -> CacheOperations:
@@ -825,10 +835,12 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
 
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
-    tuple. Unknown kinds fail the whole conversion without partial submission.
+    tuple, shared L2 commands to their own. Unknown kinds fail the whole
+    conversion without partial submission.
     """
     device: list = []
     storage: list = []
+    shared_l2: list = []
     for op in execution_plan.cache:
         if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
             device.append(op)
@@ -846,9 +858,18 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
             ),
         ):
             storage.append(op)
+        elif isinstance(
+            op,
+            (
+                Cache.SharedL2ReleaseOp,
+                Cache.SharedL2WriteOp,
+                Cache.SharedL2TouchOp,
+            ),
+        ):
+            shared_l2.append(op)
         else:
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
-    return CacheOperations(tuple(device), tuple(storage))
+    return CacheOperations(tuple(device), tuple(storage), tuple(shared_l2))
 
 
 def cache_event_key(payload: dict) -> tuple[str, int]:

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -64,8 +65,8 @@ struct SchedulerConfig {
 
     // The D role streams no ordinary Device cache entry to Host; its Host
     // cache holds only the published pages of retracted requests (the image's
-    // L2 leg) until they are restored.
-    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
+    // L2 leg) until they are restored. A shared L2 rank's Host tier is a proxy.
+    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD && !shared_l2_config; }
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
@@ -77,6 +78,9 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // A shared L2 pool as the rank's Host L2, whose Host allocator then
+    // sizes the proxy tier; never with L3.
+    std::optional<SharedL2Config> shared_l2_config;
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 

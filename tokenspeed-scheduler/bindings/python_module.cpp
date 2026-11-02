@@ -29,8 +29,11 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstring>
 #include <stdexcept>
 
+#include "cache/tier/shared_l2_pool.h"
+#include "scheduler/operations/cache.h"
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
 #include "scheduler/capacity_model.h"
@@ -69,6 +72,28 @@ void BindForwardCommonFields(Cls& cls) {
         .def_prop_ro(
             "input_lengths", [](const Op& op) -> const std::vector<std::int32_t>& { return op.input_lengths; },
             nb::rv_policy::reference_internal);
+}
+
+using KeyTuple = std::tuple<std::uint32_t, std::string, std::int32_t>;
+using SharedL2LookupTuple = std::tuple<std::string, std::uint64_t, std::int32_t, std::int32_t,
+                                       std::optional<std::tuple<std::int32_t, std::string>>,
+                                       std::vector<std::tuple<std::uint32_t, std::string, std::int32_t, std::int32_t>>>;
+
+std::vector<std::int32_t> ToTokens(const nb::bytes& tokens) {
+    if (tokens.size() % sizeof(std::int32_t) != 0) throw std::invalid_argument("tokens must be int32 bytes");
+    std::vector<std::int32_t> out(tokens.size() / sizeof(std::int32_t));
+    std::memcpy(out.data(), tokens.c_str(), tokens.size());
+    return out;
+}
+
+std::vector<tokenspeed::CacheKey> ToCacheKeys(const std::vector<KeyTuple>& keys) {
+    std::vector<tokenspeed::CacheKey> out;
+    out.reserve(keys.size());
+    for (const auto& [group_id, content_hash, page_offset] : keys) {
+        out.push_back(
+            tokenspeed::CacheKey{.group_id = group_id, .content_hash = content_hash, .page_offset = page_offset});
+    }
+    return out;
 }
 
 }  // namespace
@@ -238,6 +263,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::class_<tokenspeed::SharedL2Config>(m, "SharedL2Config")
+        .def(nb::init<std::int32_t, std::int32_t>(), nb::arg("max_writes"), nb::arg("max_write_keys"))
+        .def_ro("max_writes", &tokenspeed::SharedL2Config::max_writes)
+        .def_ro("max_write_keys", &tokenspeed::SharedL2Config::max_write_keys)
+        .def("validate", &tokenspeed::SharedL2Config::Validate);
+    scheduler_config.def_rw("shared_l2_config", &tokenspeed::SchedulerConfig::shared_l2_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)
         .value("Get", tokenspeed::StorageKind::kGet)
@@ -315,6 +346,32 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("success", &tokenspeed::cache::StorageDone::success)
         .def_ro("retired", &tokenspeed::cache::StorageDone::retired)
         .def_ro("object_failures", &tokenspeed::cache::StorageDone::object_failures);
+
+    const auto tail_tuple = [](const std::optional<tokenspeed::TailPublication>& tail) -> nb::object {
+        if (!tail) return nb::none();
+        return nb::make_tuple(tail->tail_tokens, tail->hash);
+    };
+    nb::class_<tokenspeed::SharedL2ReleaseOperation>(cache, "SharedL2ReleaseOp")
+        .def_ro("ticket", &tokenspeed::SharedL2ReleaseOperation::ticket);
+    nb::class_<tokenspeed::SharedL2WriteOperation>(cache, "SharedL2WriteOp")
+        .def_ro("op_id", &tokenspeed::SharedL2WriteOperation::op_id)
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::SharedL2WriteOperation& op) { return storage_keys(op.keys); })
+        .def_ro("blocks", &tokenspeed::SharedL2WriteOperation::blocks)
+        .def_prop_ro("publications", [tail_tuple](const tokenspeed::SharedL2WriteOperation& op) {
+            nb::list publications;
+            for (const auto& publication : op.publications) {
+                publications.append(
+                    nb::make_tuple(publication.tokens, publication.prefix_hashes, tail_tuple(publication.tail)));
+            }
+            return publications;
+        });
+    nb::class_<tokenspeed::SharedL2TouchOperation>(cache, "SharedL2TouchOp")
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::SharedL2TouchOperation& op) { return storage_keys(op.keys); });
+    nb::class_<tokenspeed::cache::SharedL2WriteDone>(cache, "SharedL2WriteDone")
+        .def(nb::init<std::uint64_t>(), nb::arg("op_id"))
+        .def_ro("op_id", &tokenspeed::cache::SharedL2WriteDone::op_id);
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
@@ -561,6 +618,53 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def("shared_l2_lookups",
+             // (request_id, prefix_hashes, tokens as int32 bytes, max_tokens).
+             [](tokenspeed::Scheduler& s) {
+                 std::vector<tokenspeed::SharedL2Lookup> lookups;
+                 {
+                     nb::gil_scoped_release release;
+                     lookups = s.SharedL2Lookups();
+                 }
+                 nb::list result;
+                 for (const auto& lookup : lookups) {
+                     result.append(nb::make_tuple(lookup.request_id, lookup.prefix_hashes,
+                                                  nb::bytes(reinterpret_cast<const char*>(lookup.tokens.data()),
+                                                            lookup.tokens.size() * sizeof(std::int32_t)),
+                                                  lookup.max_tokens));
+                 }
+                 return result;
+             })
+        .def(
+            "apply_shared_l2_lookups",
+            // results: (request_id, ticket, num_tokens, kv_tokens, tail | None, slots of
+            // (group_id, content_hash, page_offset, page)); returns (group_id, block, page).
+            [](tokenspeed::Scheduler& s, const std::vector<SharedL2LookupTuple>& results) {
+                std::vector<tokenspeed::SharedL2LookupResult> converted;
+                converted.reserve(results.size());
+                for (const auto& [request_id, ticket, num_tokens, kv_tokens, tail, slots] : results) {
+                    tokenspeed::SharedL2LookupResult& result = converted.emplace_back(tokenspeed::SharedL2LookupResult{
+                        .request_id = request_id, .ticket = ticket, .num_tokens = num_tokens, .kv_tokens = kv_tokens});
+                    if (tail) result.tail = tokenspeed::TailPublication{std::get<0>(*tail), std::get<1>(*tail)};
+                    result.keys.reserve(slots.size());
+                    result.pages.reserve(slots.size());
+                    for (const auto& [group_id, content_hash, page_offset, page] : slots) {
+                        result.keys.push_back(tokenspeed::CacheKey{
+                            .group_id = group_id, .content_hash = content_hash, .page_offset = page_offset});
+                        result.pages.push_back(page);
+                    }
+                }
+                std::vector<tokenspeed::SharedL2ProxyPage> pages;
+                {
+                    nb::gil_scoped_release release;
+                    pages = s.ApplySharedL2Lookups(converted);
+                }
+                std::vector<std::tuple<std::uint32_t, std::int32_t, std::int32_t>> out;
+                out.reserve(pages.size());
+                for (const auto& page : pages) out.emplace_back(page.group_id, page.block, page.page);
+                return out;
+            },
+            nb::arg("results"))
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {
                  nb::list result;
@@ -631,4 +735,77 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};
             },
             nb::arg("content_hashes"));
+    using SharedL2Pool = tokenspeed::SharedL2Pool;
+    using TailTuple = std::tuple<std::int32_t, std::string>;
+    // Keys are (group_id, content_hash, page_offset); a tail is (tail_tokens,
+    // hash); a publication is (tokens, prefix_hashes, tail).
+    using PublicationTuple = std::tuple<std::vector<std::int32_t>, std::vector<std::string>, std::optional<TailTuple>>;
+    const auto to_tail = [](const std::optional<TailTuple>& tail) -> std::optional<tokenspeed::TailPublication> {
+        if (!tail) return std::nullopt;
+        return tokenspeed::TailPublication{.tail_tokens = std::get<0>(*tail), .hash = std::get<1>(*tail)};
+    };
+    nb::class_<SharedL2Pool>(m, "SharedL2Pool")
+        .def(
+            "__init__",
+            [](SharedL2Pool* self, const tokenspeed::SchedulerConfig& config, std::int32_t num_lcm_blocks,
+               std::int32_t headroom_lcm_blocks) {
+                new (self) SharedL2Pool(tokenspeed::MakeSpecsFromConfig(config), config.prefix_granularity,
+                                        num_lcm_blocks, headroom_lcm_blocks);
+            },
+            nb::arg("config"), nb::arg("num_lcm_blocks"), nb::arg("headroom_lcm_blocks"))
+        .def(
+            "probe",
+            // tokens: the prompt up to max_tokens as int32 bytes, as a
+            // shared L2 lookup carries it.
+            [](SharedL2Pool& pool, std::uint64_t client, const std::vector<std::string>& prefix_hashes,
+               const nb::bytes& tokens, std::int32_t max_tokens) {
+                const std::vector<std::int32_t> prompt = ToTokens(tokens);
+                const SharedL2Pool::Hit hit =
+                    pool.Probe(client, {.prefix_hashes = prefix_hashes, .tokens = prompt, .max_tokens = max_tokens});
+                std::optional<TailTuple> tail;
+                if (hit.tail) tail = TailTuple{hit.tail->tail_tokens, hit.tail->hash};
+                std::vector<std::tuple<std::uint32_t, std::string, std::int32_t, std::int32_t>> slots;
+                slots.reserve(hit.slots.size());
+                for (const SharedL2Pool::Slot& slot : hit.slots) {
+                    slots.emplace_back(slot.key.group_id, slot.key.content_hash, slot.key.page_offset, slot.page);
+                }
+                return std::tuple{hit.ticket, hit.num_tokens, hit.kv_tokens, std::move(tail), std::move(slots)};
+            },
+            nb::arg("client"), nb::arg("prefix_hashes"), nb::arg("tokens"), nb::arg("max_tokens"))
+        .def("release", &SharedL2Pool::Release, nb::arg("client"), nb::arg("ticket"))
+        .def(
+            "reserve",
+            [](SharedL2Pool& pool, std::uint64_t client, const std::vector<KeyTuple>& keys) {
+                SharedL2Pool::Reservation reservation = pool.Reserve(client, ToCacheKeys(keys));
+                return std::tuple{reservation.ticket, std::move(reservation.pages)};
+            },
+            nb::arg("client"), nb::arg("keys"))
+        .def(
+            "commit",
+            [to_tail](SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket,
+                      const std::vector<PublicationTuple>& publications) {
+                std::vector<SharedL2Pool::Publication> converted;
+                converted.reserve(publications.size());
+                for (const auto& [tokens, prefix_hashes, tail] : publications) {
+                    converted.push_back({.tokens = tokens, .prefix_hashes = prefix_hashes, .tail = to_tail(tail)});
+                }
+                pool.Commit(client, ticket, converted);
+            },
+            nb::arg("client"), nb::arg("ticket"), nb::arg("publications"))
+        .def(
+            "touch", [](SharedL2Pool& pool, const std::vector<KeyTuple>& keys) { pool.Touch(ToCacheKeys(keys)); },
+            nb::arg("keys"))
+        .def("disconnect", &SharedL2Pool::Disconnect, nb::arg("client"))
+        .def("clear", &SharedL2Pool::Clear)
+        .def("stats", [](const SharedL2Pool& pool) {
+            const SharedL2Pool::Stats stats = pool.GetStats();
+            return std::map<std::string, std::uint64_t>{
+                {"total_lcm_blocks", static_cast<std::uint64_t>(stats.total_lcm_blocks)},
+                {"free_lcm_blocks", static_cast<std::uint64_t>(stats.free_lcm_blocks)},
+                {"cached_blocks", static_cast<std::uint64_t>(stats.cached_blocks)},
+                {"pinned_blocks", static_cast<std::uint64_t>(stats.pinned_blocks)},
+                {"reserved_blocks", stats.reserved_blocks},
+                {"demoted_victims", stats.demoted_victims},
+            };
+        });
 }
