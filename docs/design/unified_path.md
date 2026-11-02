@@ -1537,6 +1537,11 @@ than failing at its first forward (`BaseCausalLM.set_embed_and_head` refuses
 both sides are shared and the draft's copies are dropped before the KV-cache
 budget is profiled, as before.
 
+A drafter sharing a target head constructs its head and logits processor from
+`mapping.lm_head`, just like the target. Attention TP is a separate layout:
+under attention DP the head is normally replicated even when attention uses
+multiple ranks. The factory checks the two logits layouts before binding.
+
 Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
 produced after L. AttnRes tap L is produced at L+1's entry by that layer's
 mixer, before input-layer normalization or snapshot mutation; the final tap
@@ -2267,3 +2272,18 @@ cache groups. Its eager and captured decode share metadata refresh and DCP
 partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
+
+### Distributed draft tuning
+
+The startup draft decode uses one request per attention TP rank so that
+sequence-parallel router projections have nonempty, equal local row counts.
+A single-request TP warmup can skip a GEMM on an empty peer while another
+peer waits in distributed tactic selection. The draft remains in the same
+autotune context as the target. Serving batches and graph capture sizes are
+unchanged. A speculative decode service must reserve at least one request
+per attention TP peer: `max_num_seqs // data_parallel_size >= attn_tp_size`.
+Server-argument validation rejects smaller capacities before allocating
+buffers or running a forward, including with `--disable-autotune` (which
+disables profiling, not startup warmup). Increase `--max-num-seqs` to at
+least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
+this draft decode warmup and are exempt.

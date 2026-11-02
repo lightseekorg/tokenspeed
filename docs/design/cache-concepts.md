@@ -494,6 +494,10 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
+With kernel IO and snapshots enabled, startup warms each Host tier's unflagged
+H2D restore variant while preserving Device bytes. Layerwise L2 loads do not
+warm this variant.
+
 Mapped Host field copies use word accesses when both byte addresses and the
 payload size are 16-byte aligned. Other fields retain byte accesses, including
 packed children whose offsets lose that alignment. Masked copies preserve
@@ -791,6 +795,11 @@ page ids, and executes retention (`ReclaimExpired` punches the first *N*
 slots to null holes). It is deliberately token-free: every token quantity is
 converted to block counts before it reaches the manager.
 
+Dense `Acquire` appends insert the new references as one range, letting the
+vector amortize host storage growth. Spare capacity does not add logical
+slots or acquire cache blocks. With nonthrowing reference moves, a
+host-allocation failure leaves the table unchanged for the whole batch.
+
 The conversion is `GroupGeometry` in the coordinator layer:
 
 * `PlanAcquire(table, demand)` turns a token demand into a token-free
@@ -1048,33 +1057,32 @@ Its responsibilities:
   written back instead (below).
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
   alongside Host-side acquire/contains/pin queries. Host L2 uses free
-  capacity first, then global LRU across cache groups: a compatible child in
-  the requested group competes with fully evictable LCM parents across
-  groups. When only one group needs
-  replacement, its own parents are omitted: the initial allocation pass
-  exhausted the requested buckets' holes, so each such parent has a compatible
-  child no newer than its newest child and cannot beat single-child eviction.
-  For a history group in this case, an ordered cursor collects only enough
-  children for each unresolved bucket, then stops after that epoch. The cursor
-  is destroyed before eviction mutates the index. Donor groups, State groups,
-  and batches with multiple replacement groups retain full candidate scans.
-  Cross-group reuse must free a whole parent, ranked by its most recently
-  accessed child, so a cold sibling cannot cause newer data to be discarded.
-  Equal epochs prefer
-  evicting one child; group and physical location break remaining ties. A
-  prefix hit refreshes its access epoch, and earlier reuse grants no
-  additional protection. Pinned entries, partially pinned foreign parents,
-  and blocks allocated earlier in the same batch remain protected. Parent
-  candidates are snapshots; selection skips parents that are now empty or
-  bound to another group. Parent aggregation reuses coordinator-owned scratch
-  storage and resets and examines only touched parents, rather than the whole
-  Host arena on every allocation batch. Child reuse preserves the requested
-  placement bucket. Host eviction removes each selected entry independently,
-  except that a State checkpoint takes the other State groups' checkpoints
-  at its hash along; each block retries free capacity before it picks a
-  victim, so it places in the room such a cascade freed.
-  No group has an eviction preference or a fixed share of the pool; capacity follows the access
-  pattern, without guaranteeing that KV and every required state checkpoint
+  capacity first, then the same `CacheEvictionPlan` as Device admission:
+  access epoch first, then boundary tier and logical position, followed by
+  group and physical location. Equal-age prefix pages leave from the suffix;
+  unproven chunk boundaries leave before established boundaries and prefix
+  pages. The plan tries victims against shadow occupancy until the accepted
+  rows fit, then restores every unnecessary victim, newest first. Failed
+  rows therefore evict nothing they alone needed. Ordinary stores can place
+  later rows after a shortfall; retraction boundaries must fit whole and
+  stop at the first shortfall.
+  A different group can reuse a parent only after its last occupant leaves.
+  A cold sibling cannot force a hot one out: the hot entry participates at
+  its own rank, and tentative holes that cannot fund the allocation are
+  restored. This needs no separate whole-parent ranking or pool-sized scratch
+  array. Candidate traversal stops when demand fits, reading complete equal
+  epochs for the shared tie-breaks. Cursors are destroyed before eviction.
+  Pinned entries and destinations allocated in the initial free-capacity pass
+  remain protected. Host State at one boundary leaves as a set across its
+  unpinned State groups; Host KV eviction does not take Device checkpoints
+  along. The plan accounts for the full State cascade before picking another
+  victim. Every placed block retains its requested owner bucket.
+  Device prefix hits and publications refresh existing Host copies of the
+  same entries without allocating, pinning, or transferring blocks. A refresh
+  never lowers the Host access epoch. Touching history alone does not refresh
+  an unused State checkpoint at the same boundary.
+  No group has a fixed share of the pool; capacity follows the access pattern,
+  without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
   admission, or a junction cut) queues its tail and state checkpoint too;
@@ -1418,6 +1426,16 @@ pool's own fit formula, so a planner on any pool the coordinator registered
 its groups in tries victims the same way. Both Host plans fit on it over Host
 L2: the segment plan (`AcquireHostSegments`) and the boundary plan
 (`NumHostBoundariesThatFit`, `AcquireHostBoundaries`).
+
+`CacheEvictionPlan` (`eviction_plan.h`) shares candidate merging, shadow
+capacity, selection until demand fits, and reverse minimization between
+Device admission and both Host block-placement entry points. Its
+`CacheEvictionCandidates` cursor reads only the access epochs needed, with
+the same boundary-tier/position ordering on both tiers. The caller defines
+which blocks leave together: Device segments and request releases, or Host
+State cascades. Host segment write-back retains its copy-aware ordering and
+cross-tier checkpoint dependencies; its fallback boundary placement uses the
+shared planner.
 
 A victim set is the candidate block alone unless the coordinator evicts by
 *segments* (`write_back_evictions`, the Host write-back policy). Then the set

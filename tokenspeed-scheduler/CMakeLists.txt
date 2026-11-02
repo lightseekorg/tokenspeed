@@ -188,4 +188,19 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
             csrc
             tests/cpp
     )
+
+    add_executable(tokenspeed_scheduler_group_allocator_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_group_allocator.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_group_allocator_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+    )
+
+    target_include_directories(tokenspeed_scheduler_group_allocator_benchmark
+        PRIVATE
+            csrc
+            tests/cpp
+    )
 endif()

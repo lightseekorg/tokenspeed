@@ -740,9 +740,9 @@ the image as the split planned:
 The split plans the L2 leg before anything is acquired or evicted for it. The
 slots to copy are grouped by boundary (a content hash, with every group's slot
 at it), the shallowest first, and the Host takes the leading boundaries that
-fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, planned in
-`AcquireHostBlocks`' order and with its victim ranking against a shadow of the
-Host); the retraction (`AcquireHostBoundaries`) evicts exactly the planned
+fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, using the shared
+eviction planner). All rows fit jointly against shadow capacity before any
+placement is committed; the retraction (`AcquireHostBoundaries`) evicts exactly the planned
 victims and places exactly those rows. The first boundary the Host cannot take
 whole goes to the pool with every later one, even where the Host has room for
 some of their rows. Under the write-back policy the plan takes Host room for
@@ -750,10 +750,9 @@ every boundary as an eviction write-back does, by whole segments first
 (`AcquireHostSegments`' plan: whole victims, none above a page an eviction
 write-back is still bringing, boundaries dropped from the deepest), then block
 by block, as above, for the boundaries the segment step dropped, against the
-Host less its victims. Where the two steps place fewer boundaries than block
-by block alone, the block-by-block plan stands, so the Host takes at least as
-many boundaries as the block-by-block plan would on the same Host, and
-sometimes more, since its victims differ. Placing block by block may take the
+Host less its victims. Both policies can use all eligible capacity: the
+segment step changes victim preference, while the shared block planner fits
+the remaining rows jointly. Placing block by block may take the
 Host page above an eviction write-back in flight. The write-back still
 publishes at its ACK — the settlement reads the tail hint and the checkpoint
 boundaries under its node, not the gap above — and the next dead-entry

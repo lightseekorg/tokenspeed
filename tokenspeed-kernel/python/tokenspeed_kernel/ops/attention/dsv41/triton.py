@@ -1686,9 +1686,11 @@ def _rope_inplace_kernel(
     X1,
     P0,
     CS0,
+    H,
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
     B: tl.constexpr,
+    HB: tl.constexpr,
     WEIGHTS,
     W0,
     W1,
@@ -1696,27 +1698,29 @@ def _rope_inplace_kernel(
     SCALE_WEIGHTS: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(1) * HB + tl.arange(0, HB)
+    live = head < H
     if SCALE_WEIGHTS:
         weight_ptr = WEIGHTS + token * W0 + head * W1
-        weight = tl.load(weight_ptr).to(tl.float32)
-        tl.store(weight_ptr, weight * WEIGHT_SCALE)
+        weight = tl.load(weight_ptr, live).to(tl.float32)
+        tl.store(weight_ptr, weight * WEIGHT_SCALE, live)
     # Keep padding/compressor sentinels in the caller's metadata. Only this
     # frequency-table lookup maps negative positions to the identity row.
     position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
     valid = position < MAX_POS
     tl.device_assert(valid, "RoPE position is outside the cosine/sine table")
     pair = tl.arange(0, B)
-    mask = (pair < R // 2) & valid
-    base = X + token * X0 + head * X1
-    even = tl.load(base + 2 * pair, mask, 0.0)
-    odd = tl.load(base + 2 * pair + 1, mask, 0.0)
-    cosine = tl.load(CS + position * CS0 + pair, mask, 0.0)
-    sine = tl.load(CS + position * CS0 + R // 2 + pair, mask, 0.0)
+    pair_mask = (pair < R // 2) & valid
+    mask = live[:, None] & pair_mask[None, :]
+    base = X + token * X0 + head[:, None] * X1 + 2 * pair[None, :]
+    even = tl.load(base, mask, 0.0)
+    odd = tl.load(base + 1, mask, 0.0)
+    cosine = tl.load(CS + position * CS0 + pair, pair_mask, 0.0)[None, :]
+    sine = tl.load(CS + position * CS0 + R // 2 + pair, pair_mask, 0.0)[None, :]
     out_even = _rotate_interleaved(even, odd, cosine, sine, False)
     out_odd = _rotate_interleaved(odd, even, cosine, sine, True)
-    tl.store(base + 2 * pair, out_even.to(even.dtype), mask)
-    tl.store(base + 2 * pair + 1, out_odd.to(odd.dtype), mask)
+    tl.store(base, out_even.to(even.dtype), mask)
+    tl.store(base + 1, out_odd.to(odd.dtype), mask)
 
 
 @_register_rope("dsv41_rope_inplace")
@@ -1739,7 +1743,9 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
     # launch there and scale the owned weights with the existing tensor op.
     scale_separately = weights is not None and values.shape[0] * heads > 4096
     fused_weights = None if scale_separately else weights
-    _rope_inplace_kernel[(values.shape[0], heads)](
+    # A program per token and 8 heads: one head's tail is too little work for a program.
+    heads_per_program = min(triton.next_power_of_2(heads), 8)
+    _rope_inplace_kernel[(values.shape[0], triton.cdiv(heads, heads_per_program))](
         values[..., -rotary_dim:],
         positions,
         cache,
@@ -1747,9 +1753,11 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
         0 if values.ndim == 2 else values.stride(1),
         positions.stride(0),
         cache.stride(0),
+        heads,
         rotary_dim,
         cache.shape[0],
         max(triton.next_power_of_2(rotary_dim // 2), 16),
+        heads_per_program,
         fused_weights,
         0 if fused_weights is None else fused_weights.stride(0),
         0 if fused_weights is None else fused_weights.stride(1),

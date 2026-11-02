@@ -20,6 +20,8 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 
+#include "cache/coordinator/eviction_plan.h"
+
 #include <algorithm>
 #include <array>
 #include <functional>
@@ -262,9 +264,15 @@ std::vector<CacheCoordinator::NodeEntry> CacheCoordinator::NodeEntries(const Blo
                 .pool = &pool, .group_id = groups_[i].Id(), .location = entry->location, .in_use = entry->pinned});
         }
     };
+    const auto tier = &pool == host_pool_ ? BoundaryTree::kHost : BoundaryTree::kDevice;
     // Preserve group and block order within each kind without a temporary
     // partition buffer for every inspected boundary.
     for (const bool state : {true, false}) {
+        // Partial checkpoints and pending Host stores keep the mark set;
+        // only its absence proves that every State lookup would miss.
+        if (state && !node.has_checkpoint[tier]) {
+            continue;
+        }
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             if (GroupIsState(i) == state) {
                 forEachBoundaryKey(boundary, node.tail_tokens, std::array{i}, append);
@@ -425,10 +433,22 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         const std::int32_t floor_pages = GroupIsState(i) ? 0 : floor_tokens / geometry_[i].BlockGranularity();
         out.per_group[i] =
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
+        if constexpr (Tier == CacheTier::kDevice) {
+            if (host_pool_ != nullptr) {
+                groups_[i].Index().TouchExisting(*host_pool_, std::span{group_keys[i]}.subspan(floor_pages),
+                                                 out.per_group[i].blocks, access_epoch);
+            }
+        }
         if (probe.tail && !probe.tail->group_keys[i].empty()) {
             // The tail's blocks follow the full pages in the same table.
             PrefixMatch tail_match = groups_[i].Index().AcquireMatched(
                 pool, probe.tail->group_keys[i], /*begin_blocks=*/0, probe.tail->per_group[i], access_epoch);
+            if constexpr (Tier == CacheTier::kDevice) {
+                if (host_pool_ != nullptr) {
+                    groups_[i].Index().TouchExisting(*host_pool_, probe.tail->group_keys[i], tail_match.blocks,
+                                                     access_epoch);
+                }
+            }
             out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
                                            std::make_move_iterator(tail_match.blocks.begin()),
                                            std::make_move_iterator(tail_match.blocks.end()));
@@ -670,20 +690,23 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
     // Without a KV group there is no KV boundary to record: a junction
     // exists only where cached KV outruns the state.
     bool kv_settled = std::ranges::none_of(match_order, [&](std::size_t i) { return !GroupIsState(i); });
+    PrefixProbe::TailHit tail{.group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
+                              .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
+    std::vector<GroupPrefixProbe> page_hits(groups_.size());
     const auto visit = [&](std::int32_t page_tokens, std::int32_t tail_tokens, const ContentHash& published_hash) {
         const std::int32_t boundary = page_tokens + tail_tokens;
         // Record the longest KV reach first: the junction still needs it
         // when State is missing. Shorter boundaries can reject State before
-        // constructing history hit arrays.
+        // filling history hit arrays.
         if (kv_settled && !stateGroupsAcceptBoundary(match_order, prompt.prefix_hashes, page_tokens, tail_tokens,
                                                      published_hash, /*allow_host=*/false, /*extra_hits=*/nullptr)) {
             return true;
         }
-        PrefixProbe::TailHit tail{.tail_tokens = tail_tokens,
-                                  .hash = published_hash,
-                                  .group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
-                                  .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
-        std::vector<GroupPrefixProbe> page_hits(groups_.size());
+        tail.tail_tokens = tail_tokens;
+        tail.hash = published_hash;
+        for (auto& keys : tail.group_keys) {
+            keys.clear();
+        }
         bool kv_accepts = true;
         bool state_accepts = true;
         for (const std::size_t i : match_order) {
@@ -693,6 +716,10 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
             const bool accepts = groupAcceptsBoundary<CacheTier::kDevice>(
                 i, prompt.prefix_hashes, /*floor_tokens=*/0, page_tokens, tail_tokens, tail.group_keys[i],
                 tail.per_group[i], &page_hits[i], /*extra_hits=*/nullptr);
+            // Once KV reach is known, a rejected boundary contributes nothing.
+            if (!accepts && kv_settled) {
+                return true;
+            }
             (GroupIsState(i) ? state_accepts : kv_accepts) = accepts && (GroupIsState(i) ? state_accepts : kv_accepts);
         }
         if (kv_accepts && !kv_settled) {
@@ -1145,6 +1172,10 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
             PrefixMatch match = groups_[i].Index().AcquireMatched(
                 pool_, probe.state_at_prompt_end->group_keys[i],
                 /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i], access_epoch);
+            if (host_pool_ != nullptr) {
+                groups_[i].Index().TouchExisting(*host_pool_, probe.state_at_prompt_end->group_keys[i], match.blocks,
+                                                 access_epoch);
+            }
             out.state_at_prompt_end[i] = std::move(match.blocks.front());
             if (BoundaryTree::Node* node = boundary_tree_.Find(probe.state_at_prompt_end->hash)) {
                 node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
@@ -1384,6 +1415,9 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
     if constexpr (Tier == CacheTier::kHost) {
         return;
     }
+    if (host_pool_ != nullptr) {
+        groups_[group_index].Index().TouchExisting(*host_pool_, keys, blocks, access_epoch);
+    }
     for (auto& [key, block_ref] : newly_cached) {
         // Every hash an index holds has a tree node: a publication linked its
         // own before registering; any other entry with no node yet starts one
@@ -1426,6 +1460,83 @@ CacheBlockRef CacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) co
     return groups_[key.group_id].Index().Find(pool_, key);
 }
 
+namespace {
+
+class HostEvictionPlanner {
+public:
+    struct Member {
+        std::uint32_t group_id;
+        CacheBlockLocation location;
+    };
+    struct VictimSet {
+        std::vector<Member> members;
+    };
+
+    HostEvictionPlanner(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
+                        const BlockPool& pool)
+        : coordinator_{coordinator}, groups_{groups}, pool_{pool}, plan_{pool, groups}, no_dense_need_(groups.size()) {
+        plan_.StartCandidates(&taken_, nullptr);
+    }
+
+    bool Fits(std::span<const std::vector<std::int64_t>> needed) const { return plan_.Fits(needed, no_dense_need_); }
+
+    void Seed(std::uint32_t group_id, CacheBlockLocation location) {
+        taken_.insert(location);
+        plan_.Remove(group_id, location);
+    }
+
+    bool Fit(std::span<const std::vector<std::int64_t>> needed) {
+        return plan_.SelectUntilFits(needed, no_dense_need_, [&] {
+            while (const auto candidate = plan_.Next({})) {
+                if (taken_.contains(candidate->location)) continue;
+                VictimSet set;
+                const auto take = [&](std::uint32_t group_id, CacheBlockLocation location) {
+                    Seed(group_id, location);
+                    set.members.push_back({group_id, location});
+                };
+                take(candidate->group_id, candidate->location);
+                // Host State eviction takes the other unpinned State groups at this boundary.
+                if (coordinator_.GroupIsState(candidate->group_id)) {
+                    const auto key = groups_[candidate->group_id].Index().KeyOf(pool_, candidate->location);
+                    coordinator_.ForEachBoundaryKey(
+                        *key, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& sibling_key) {
+                            if (!coordinator_.GroupIsState(i)) return;
+                            const auto sibling = groups_[i].Index().Inspect(pool_, sibling_key);
+                            if (sibling && !sibling->pinned && !taken_.contains(sibling->location)) {
+                                take(groups_[i].Id(), sibling->location);
+                            }
+                        });
+                }
+                victims_.push_back(std::move(set));
+                return true;
+            }
+            return false;
+        });
+    }
+
+    void Minimize(std::span<const std::vector<std::int64_t>> needed) {
+        plan_.Minimize(victims_, needed, no_dense_need_);
+    }
+    const std::vector<VictimSet>& Victims() const { return victims_; }
+    std::vector<VictimSet> TakeVictims() { return std::move(victims_); }
+    CacheCoordinator::HostAllocationStats Stats() const {
+        return {.group_scans = plan_.Candidates().GroupScans(),
+                .block_candidates = plan_.Candidates().ScannedCandidates(),
+                .parent_candidates = plan_.TouchedParents()};
+    }
+
+private:
+    const CacheCoordinator& coordinator_;
+    const std::vector<CacheGroup>& groups_;
+    const BlockPool& pool_;
+    CacheEvictionPlan plan_;
+    std::vector<std::int64_t> no_dense_need_;
+    CacheEvictionCandidates::LocationSet taken_;
+    std::vector<VictimSet> victims_;
+};
+
+}  // namespace
+
 CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                                                           std::span<const std::int32_t> buckets) {
     _assert(host_pool_ != nullptr, "AcquireHostBlocks requires a host pool");
@@ -1435,209 +1546,50 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
     batch.stats.requested = group_ids.size();
     _assert(group_ids.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
             "Host allocation batch request exceeds int32 range");
-
-    // A Host block lands in the bucket of the Device block it mirrors, so under
-    // page-cyclic sharding both ends of a copy have the same owner.
     const auto acquire_in_bucket = [&](std::uint32_t group_id, std::int32_t bucket) {
         const std::array<std::int32_t, 1> one{bucket};
         std::vector<CacheBlockRef> refs = host_pool_->AcquireBlocksInBuckets(group_id, one);
         return refs.empty() ? CacheBlockRef{} : std::move(refs.front());
     };
-
-    std::vector<bool> needs_replacement(groups_.size(), false);
-    for (std::size_t i = 0; i < group_ids.size(); ++i) {
-        _assert(group_ids[i] < groups_.size(), "Host block group id out of range");
-        _assert(buckets[i] >= 0 && buckets[i] < groups_[group_ids[i]].Allocator().ShardCount(),
+    std::vector<std::size_t> unresolved;
+    for (std::size_t row = 0; row < group_ids.size(); ++row) {
+        _assert(group_ids[row] < groups_.size(), "Host block group id out of range");
+        _assert(buckets[row] >= 0 && buckets[row] < groups_[group_ids[row]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
-        // Free capacity first, in candidate order.
-        batch.blocks[i] = acquire_in_bucket(group_ids[i], buckets[i]);
-        if (!batch.blocks[i]) {
-            needs_replacement[group_ids[i]] = true;
+        batch.blocks[row] = acquire_in_bucket(group_ids[row], buckets[row]);
+        if (!batch.blocks[row]) unresolved.push_back(row);
+    }
+    if (!unresolved.empty()) {
+        std::vector<HostEvictionPlanner::VictimSet> victims;
+        std::vector<std::size_t> accepted;
+        {
+            HostEvictionPlanner planner{*this, groups_, *host_pool_};
+            std::vector<std::vector<std::int64_t>> needed(groups_.size());
+            for (std::size_t i = 0; i < groups_.size(); ++i) needed[i].resize(groups_[i].Allocator().ShardCount());
+            for (const std::size_t row : unresolved) {
+                auto& need = needed[group_ids[row]][buckets[row]];
+                ++need;
+                if (planner.Fit(needed))
+                    accepted.push_back(row);
+                else
+                    --need;
+            }
+            planner.Minimize(needed);
+            victims = planner.TakeVictims();
+            batch.stats = planner.Stats();
+            batch.stats.requested = group_ids.size();
         }
-    }
-    const auto replacement_group_count = std::ranges::count(needs_replacement, true);
-    if (replacement_group_count == 0) {
-        batch.stats.allocated = batch.stats.requested;
-        return batch;
-    }
-
-    // Keep the most recently accessed Host entries; location only breaks ties.
-    const auto value = [](std::uint32_t candidate_group, CacheBlockLocation location,
-                          const PrefixCacheIndex::CachedBlockMetadata& metadata) {
-        return std::tuple{metadata.last_access_epoch, candidate_group, location.lcm_block_id, location.slot_index};
-    };
-    struct BucketCandidates {
-        std::vector<PrefixCacheIndex::EvictionCandidate> entries;
-        std::size_t next{0};
-    };
-    std::vector<std::vector<BucketCandidates>> children(groups_.size());
-    auto& parents = host_parent_candidates_;
-    for (const std::int32_t parent_id : host_touched_parents_) {
-        parents[parent_id] = {};
-    }
-    host_touched_parents_.clear();
-    // An eligible parent contains only unpinned cache entries. Accumulate
-    // their counts and newest access while collecting each group's entries
-    // once, rather than looking every child up again in a placement scan.
-    for (std::uint32_t group_id = 0; group_id < groups_.size(); ++group_id) {
-        ++batch.stats.group_scans;
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        // The free-capacity pass exhausted every unsatisfied bucket's holes.
-        // Each fully evictable own parent therefore has a compatible child
-        // no newer than its newest child. With one requesting group the
-        // parent cannot beat that child (ties prefer one child), so omit it.
-        const bool needs_parent = replacement_group_count > 1 || !needs_replacement[group_id];
-        if (needs_replacement[group_id]) {
-            children[group_id].resize(static_cast<std::size_t>(allocator.ShardCount()));
-        }
-        if (!needs_parent && !GroupIsState(group_id)) {
-            // No parent from this group can be donated. Its oldest children,
-            // bounded by demand per bucket, suffice for the global comparison.
-            std::vector<std::size_t> needed(allocator.ShardCount(), 0);
-            std::size_t remaining = 0;
-            for (std::size_t i = 0; i < group_ids.size(); ++i) {
-                if (group_ids[i] == group_id && !batch.blocks[i]) {
-                    ++needed[buckets[i]];
-                    ++remaining;
+        for (const auto& set : victims) {
+            for (const auto& [group_id, location] : set.members) {
+                if (groups_[group_id].Index().Contains(*host_pool_, location)) {
+                    FatalCheck(evictHostCachedBlock(group_id, location, &HostEvictionStats::lru),
+                               "a planned Host victim became pinned");
                 }
             }
-            PrefixCacheIndex::EvictionCursor cursor;
-            std::vector<PrefixCacheIndex::EvictionCandidate> epoch;
-            // Any epoch may hold the replacement this allocation needs.
-            while (remaining > 0 && groups_[group_id].Index().NextEvictionEpoch(
-                                        *host_pool_, cursor, std::numeric_limits<std::uint64_t>::max(), epoch)) {
-                batch.stats.block_candidates += epoch.size();
-                for (auto& candidate : epoch) {
-                    const std::int32_t bucket = allocator.BucketOf(candidate.location);
-                    if (needed[bucket] > 0) {
-                        children[group_id][bucket].entries.push_back(std::move(candidate));
-                        --needed[bucket];
-                        --remaining;
-                    }
-                }
-                epoch.clear();
-            }
-            continue;
         }
-        std::vector<PrefixCacheIndex::EvictionCandidate> entries =
-            groups_[group_id].Index().EvictableCandidates(*host_pool_);
-        batch.stats.block_candidates += entries.size();
-        if (needs_parent && !entries.empty() && parents.empty()) {
-            parents.resize(static_cast<std::size_t>(host_pool_->NumLcmBlocks()) + 1);
-        }
-        for (auto& candidate : entries) {
-            if (needs_parent) {
-                const std::int32_t parent_id = candidate.location.lcm_block_id;
-                HostParentCandidate& parent = parents[parent_id];
-                if (parent.evictable_children == 0) {
-                    host_touched_parents_.push_back(parent_id);
-                }
-                ++parent.evictable_children;
-                parent.newest_access_epoch = std::max(parent.newest_access_epoch, candidate.metadata.last_access_epoch);
-            }
-            if (children[group_id].size() > 1) {
-                children[group_id][allocator.BucketOf(candidate.location)].entries.push_back(std::move(candidate));
-            }
-        }
-        if (children[group_id].size() == 1) {
-            children[group_id].front().entries = std::move(entries);
-        }
-        for (BucketCandidates& bucket : children[group_id]) {
-            std::ranges::sort(bucket.entries, {}, [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
-                return value(group_id, candidate.location, candidate.metadata);
-            });
-        }
-    }
-    using HostParentValue = std::tuple<std::uint64_t, std::uint32_t>;
-    std::vector<std::pair<HostParentValue, std::int32_t>> victim_parents;
-    victim_parents.reserve(host_touched_parents_.size());
-    for (const std::int32_t parent_id : host_touched_parents_) {
-        ++batch.stats.parent_candidates;
-        const HostParentCandidate& parent = parents[parent_id];
-        if (parent.evictable_children > 0 && parent.evictable_children == host_pool_->OccupiedCount(parent_id)) {
-            victim_parents.emplace_back(HostParentValue{parent.newest_access_epoch, *host_pool_->BoundGroup(parent_id)},
-                                        parent_id);
-        }
-    }
-    // Only a batch's victims are consumed. Build a min-heap in linear time
-    // instead of sorting every eligible parent before selecting the first.
-    std::ranges::make_heap(victim_parents, std::greater{});
-    const auto discard_parent = [&] {
-        std::ranges::pop_heap(victim_parents, std::greater{});
-        victim_parents.pop_back();
-    };
-    for (std::size_t i = 0; i < group_ids.size(); ++i) {
-        if (batch.blocks[i]) {
-            continue;
-        }
-        const std::uint32_t group_id = group_ids[i];
-        const std::int32_t bucket = buckets[i];
-        // An earlier replacement may have opened more slots for this group,
-        // also through the State cascade of another group's victim
-        // (evictHostCachedBlock): that room is used before any victim goes.
-        batch.blocks[i] = acquire_in_bucket(group_id, bucket);
-        if (!batch.blocks[i]) {
-            BucketCandidates& candidates = children[group_id][bucket];
-            while (candidates.next < candidates.entries.size() &&
-                   !groups_[group_id].Index().MetadataFor(*host_pool_, candidates.entries[candidates.next].location)) {
-                // Another group's replacement may have rebound this parent,
-                // or an earlier victim's State cascade taken the entry.
-                ++candidates.next;
-            }
-            while (!victim_parents.empty()) {
-                const auto& [parent_value, parent_id] = victim_parents.front();
-                // Candidate metadata is a snapshot: check current placement
-                // as well as destinations pinned earlier in this batch. A
-                // State cascade may have emptied a parent (skipped here) or
-                // taken some of its children (the rest still go whole).
-                if (!parents[parent_id].allocated && host_pool_->OccupiedCount(parent_id) > 0 &&
-                    host_pool_->BoundGroup(parent_id) == std::get<1>(parent_value)) {
-                    break;
-                }
-                discard_parent();
-            }
-            const bool has_child = candidates.next < candidates.entries.size();
-            const bool has_parent = !victim_parents.empty();
-            if (!has_child && !has_parent) {
-                continue;
-            }
-            // Compare feasible reclamations across all groups. A foreign
-            // parent costs every occupied child, so its newest child sets
-            // the epoch. Equal epochs prefer evicting just one child.
-            if (has_child && (!has_parent || candidates.entries[candidates.next].metadata.last_access_epoch <=
-                                                 std::get<0>(victim_parents.front().first))) {
-                // The retry above found no compatible hole. Releasing one
-                // Host child creates the only placement for its refill; its
-                // State cascade takes only other groups' entries.
-                const CacheBlockLocation location = candidates.entries[candidates.next++].location;
-                _assert(evictHostCachedBlock(group_id, location, &HostEvictionStats::lru),
-                        "selected Host child is not evictable");
-            } else {
-                const auto [parent_value, victim_parent] = victim_parents.front();
-                discard_parent();
-                const std::uint32_t bound_group = std::get<1>(parent_value);
-                _assert(host_pool_->BoundGroup(victim_parent) == bound_group, "selected Host parent changed groups");
-                const std::int32_t victim_packing = host_pool_->Packing(bound_group);
-                for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
-                    const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};
-                    if (host_pool_->IsOccupied(location)) {
-                        _assert(evictHostCachedBlock(bound_group, location, &HostEvictionStats::lru),
-                                "selected Host parent changed before eviction");
-                    }
-                }
-            }
-            batch.blocks[i] = acquire_in_bucket(group_id, bucket);
-            _assert(static_cast<bool>(batch.blocks[i]), "evicting a Host victim did not free a placement");
-        }
-        // The result now pins this parent; it cannot be rebound later in
-        // this batch even though the new entry has not been registered yet.
-        if (!victim_parents.empty()) {
-            const std::int32_t parent_id = batch.blocks[i]->Location().lcm_block_id;
-            HostParentCandidate& parent = parents[parent_id];
-            if (parent.evictable_children == 0 && !parent.allocated) {
-                host_touched_parents_.push_back(parent_id);
-            }
-            parent.allocated = true;
+        for (const std::size_t row : accepted) {
+            batch.blocks[row] = acquire_in_bucket(group_ids[row], buckets[row]);
+            FatalCheck(static_cast<bool>(batch.blocks[row]), "planned Host placement failed");
         }
     }
     batch.stats.allocated = static_cast<std::size_t>(
@@ -1666,222 +1618,44 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostBoundaries(std::sp
         next_row = boundary.past_end_row;
     }
     _assert(next_row == group_ids.size(), "Host boundaries cover every row");
-    // The rows so far by group and bucket, the demand the shadow fits.
-    std::vector<std::vector<std::int64_t>> need_by_bucket(groups_.size());
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        need_by_bucket[i].assign(static_cast<std::size_t>(groups_[i].Allocator().ShardCount()), 0);
-    }
+    std::vector<std::vector<std::int64_t>> needed(groups_.size());
+    for (std::size_t i = 0; i < groups_.size(); ++i) needed[i].resize(groups_[i].Allocator().ShardCount());
     for (std::size_t row = 0; row < group_ids.size(); ++row) {
         _assert(group_ids[row] < groups_.size(), "Host block group id out of range");
         _assert(buckets[row] >= 0 && buckets[row] < groups_[group_ids[row]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
-        ++need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
+        ++needed[group_ids[row]][buckets[row]];
     }
-    const std::vector<std::int64_t> no_dense_need(groups_.size(), 0);
-    ShadowOccupancy shadow{*host_pool_, groups_};
+    HostEvictionPlanner planner{*this, groups_, *host_pool_};
     HostPlacementPlan plan;
-    // Every row fits the free capacity: no victim.
-    if (shadow.Fits(need_by_bucket, no_dense_need)) {
+    if (planner.Fits(needed)) {
         plan.num_placed = boundaries.size();
         return plan;
     }
-    // By segments, every boundary is planned first as AcquireHostSegments
-    // plans an eviction write-back's segments; the per-block plan then places
-    // the ones the segment step dropped, against the Host less its victims.
-    // Where the two steps place fewer than the per-block plan alone, that
-    // plan stands: the image comes before the cache.
     if (place_by_segments) {
         plan = planHostSegments(group_ids, buckets, boundaries);
-        if (plan.num_placed == boundaries.size()) {
-            return plan;
-        }
+        if (plan.num_placed == boundaries.size()) return plan;
     }
-    // The demand restarts from the rows the segments place.
-    for (std::vector<std::int64_t>& group_need : need_by_bucket) {
-        std::ranges::fill(group_need, 0);
-    }
-    const std::size_t num_segment_rows = plan.num_placed == 0 ? 0 : boundaries[plan.num_placed - 1].past_end_row;
-    for (std::size_t row = 0; row < num_segment_rows; ++row) {
-        ++need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
-    }
+    for (auto& group_need : needed) std::ranges::fill(group_need, 0);
+    const std::size_t segment_rows = plan.num_placed == 0 ? 0 : boundaries[plan.num_placed - 1].past_end_row;
+    for (std::size_t row = 0; row < segment_rows; ++row) ++needed[group_ids[row]][buckets[row]];
+    for (const auto& victim : plan.victims) planner.Seed(victim.group_id, victim.location);
 
-    // AcquireHostBlocks' candidates, in its order: per group and bucket the
-    // unpinned entries, the least recently accessed first (location breaks
-    // ties), and the parents whose every occupant is an unpinned entry, by
-    // their newest one, then group and id.
-    struct BucketCandidates {
-        std::vector<PrefixCacheIndex::EvictionCandidate> entries;
-        std::size_t next{0};
-    };
-    std::vector<std::vector<BucketCandidates>> children(groups_.size());
-    // Per parent holding an unpinned entry: how many it holds, the newest
-    // access among them, its occupants no victim has taken yet, and whether
-    // a row took the room one of its children left (AcquireHostBlocks places
-    // the row there, which keeps the parent from going whole later on) or
-    // the rows placed need its free slots.
-    struct ParentCandidate {
-        std::uint64_t newest_access_epoch{0};
-        std::int32_t evictable_children{0};
-        std::int32_t untaken_occupants{0};
-        bool allocated{false};
-    };
-    std::unordered_map<std::int32_t, ParentCandidate> parents;
-    for (std::uint32_t group_id = 0; group_id < groups_.size(); ++group_id) {
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        children[group_id].resize(static_cast<std::size_t>(allocator.ShardCount()));
-        for (PrefixCacheIndex::EvictionCandidate& candidate :
-             groups_[group_id].Index().EvictableCandidates(*host_pool_)) {
-            ParentCandidate& parent = parents[candidate.location.lcm_block_id];
-            ++parent.evictable_children;
-            parent.newest_access_epoch = std::max(parent.newest_access_epoch, candidate.metadata.last_access_epoch);
-            children[group_id][allocator.BucketOf(candidate.location)].entries.push_back(std::move(candidate));
-        }
-        for (BucketCandidates& bucket : children[group_id]) {
-            std::ranges::sort(bucket.entries, {}, [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
-                return std::tuple{candidate.metadata.last_access_epoch, group_id, candidate.location.lcm_block_id,
-                                  candidate.location.slot_index};
-            });
-        }
-    }
-    std::vector<std::tuple<std::uint64_t, std::uint32_t, std::int32_t>> victim_parents;
-    for (auto& [parent_id, parent] : parents) {
-        parent.untaken_occupants = host_pool_->OccupiedCount(parent_id);
-        if (parent.evictable_children == parent.untaken_occupants) {
-            victim_parents.emplace_back(parent.newest_access_epoch, *host_pool_->BoundGroup(parent_id), parent_id);
-        }
-    }
-    std::ranges::sort(victim_parents);
-    std::size_t next_parent = 0;
-
-    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> taken;
-    // The segments' victims leave first.
-    for (const HostPlacementPlan::Victim& victim : plan.victims) {
-        shadow.Remove(victim.group_id, victim.location);
-        taken.insert(victim.location);
-        if (const auto parent = parents.find(victim.location.lcm_block_id); parent != parents.end()) {
-            --parent->second.untaken_occupants;
-        }
-    }
-    const auto take_entry = [&](std::uint32_t group_id, CacheBlockLocation location) {
-        shadow.Remove(group_id, location);
-        taken.insert(location);
-        if (const auto parent = parents.find(location.lcm_block_id); parent != parents.end()) {
-            --parent->second.untaken_occupants;
-        }
-        plan.victims.push_back(
-            HostPlacementPlan::Victim{.group_id = group_id, .location = location, .reason = &HostEvictionStats::lru});
-    };
-    // As evictHostCachedBlock evicts: a checkpoint takes the other State
-    // groups' at its hash along, those not pinned (Find's reference is the
-    // second when the index alone holds one).
-    const auto take = [&](std::uint32_t group_id, CacheBlockLocation location) {
-        take_entry(group_id, location);
-        if (!GroupIsState(group_id)) {
-            return;
-        }
-        const std::optional<CacheKey> key = groups_[group_id].Index().KeyOf(*host_pool_, location);
-        ForEachBoundaryKey(*key, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& sibling_key) {
-            if (!GroupIsState(i)) {
-                return;
-            }
-            const CacheBlockRef sibling = groups_[i].Index().Find(*host_pool_, sibling_key);
-            if (sibling && sibling.use_count() == 2 && !taken.contains(sibling->Location())) {
-                take_entry(groups_[i].Id(), sibling->Location());
-            }
-        });
-    };
-
-    // A boundary at a time, as AcquireHostBlocks takes a batch: the rows that
-    // fit the capacity left go first, then each other row, in order, takes
-    // victims until it fits. A boundary short of a victim returns those it
-    // took and ends the plan.
     for (const HostSegmentRows& boundary : boundaries.subspan(plan.num_placed)) {
-        const std::size_t num_victims_before = plan.victims.size();
-        std::vector<std::size_t> short_rows;
-        for (std::size_t row = boundary.first_row; row < boundary.past_end_row; ++row) {
-            std::int64_t& need = need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
-            ++need;
-            if (!shadow.Fits(need_by_bucket, no_dense_need)) {
-                --need;
-                short_rows.push_back(row);
-            }
-        }
-        for (const std::size_t row : short_rows) {
-            const std::uint32_t group_id = group_ids[row];
-            const auto bucket = static_cast<std::size_t>(buckets[row]);
-            BucketCandidates& candidates = children[group_id][bucket];
-            ++need_by_bucket[group_id][bucket];
-            while (!shadow.Fits(need_by_bucket, no_dense_need)) {
-                while (candidates.next < candidates.entries.size() &&
-                       taken.contains(candidates.entries[candidates.next].location)) {
-                    ++candidates.next;
-                }
-                while (next_parent < victim_parents.size()) {
-                    const std::uint32_t bound_group = std::get<1>(victim_parents[next_parent]);
-                    const std::int32_t parent_id = std::get<2>(victim_parents[next_parent]);
-                    ParentCandidate& parent = parents.at(parent_id);
-                    if (parent.untaken_occupants > 0 && !parent.allocated) {
-                        // AcquireHostBlocks never takes a parent a row landed
-                        // in whole. The shadow does not track where the rows
-                        // placed before this one land, so a parent stays when
-                        // they need its free slots: with those filled as
-                        // well, they would not fit.
-                        const GroupAllocator& allocator = groups_[bound_group].Allocator();
-                        std::vector<std::int64_t> free_slots(static_cast<std::size_t>(allocator.ShardCount()),
-                                                             host_pool_->Packing(bound_group) / allocator.ShardCount());
-                        for (const CacheBlockLocation& location : host_pool_->OccupiedLocations(parent_id)) {
-                            if (!taken.contains(location)) {
-                                --free_slots[static_cast<std::size_t>(allocator.BucketOf(location))];
-                            }
-                        }
-                        --need_by_bucket[group_id][bucket];
-                        for (std::size_t b = 0; b < free_slots.size(); ++b) {
-                            need_by_bucket[bound_group][b] += free_slots[b];
-                        }
-                        const bool rows_need_its_slots = !shadow.Fits(need_by_bucket, no_dense_need);
-                        for (std::size_t b = 0; b < free_slots.size(); ++b) {
-                            need_by_bucket[bound_group][b] -= free_slots[b];
-                        }
-                        ++need_by_bucket[group_id][bucket];
-                        if (!rows_need_its_slots) {
-                            break;
-                        }
-                        parent.allocated = true;
-                    }
-                    ++next_parent;
-                }
-                const bool has_child = candidates.next < candidates.entries.size();
-                const bool has_parent = next_parent < victim_parents.size();
-                if (!has_child && !has_parent) {
-                    plan.victims.resize(num_victims_before);
-                    if (place_by_segments) {
-                        HostPlacementPlan per_block =
-                            planHostBoundaries(group_ids, buckets, boundaries, /*place_by_segments=*/false);
-                        if (per_block.num_placed > plan.num_placed) {
-                            return per_block;
-                        }
-                    }
-                    return plan;
-                }
-                // Equal epochs prefer one child, as in AcquireHostBlocks.
-                if (has_child && (!has_parent || candidates.entries[candidates.next].metadata.last_access_epoch <=
-                                                     std::get<0>(victim_parents[next_parent]))) {
-                    const CacheBlockLocation location = candidates.entries[candidates.next++].location;
-                    parents.at(location.lcm_block_id).allocated = true;
-                    take(group_id, location);
-                } else {
-                    const std::uint32_t bound_group = std::get<1>(victim_parents[next_parent]);
-                    const std::int32_t parent_id = std::get<2>(victim_parents[next_parent]);
-                    ++next_parent;
-                    for (const CacheBlockLocation& location : host_pool_->OccupiedLocations(parent_id)) {
-                        if (!taken.contains(location)) {
-                            take(bound_group, location);
-                        }
-                    }
-                }
-            }
+        for (std::size_t row = boundary.first_row; row < boundary.past_end_row; ++row)
+            ++needed[group_ids[row]][buckets[row]];
+        if (!planner.Fit(needed)) {
+            for (std::size_t row = boundary.first_row; row < boundary.past_end_row; ++row)
+                --needed[group_ids[row]][buckets[row]];
+            break;
         }
         ++plan.num_placed;
+    }
+    planner.Minimize(needed);
+    for (const auto& set : planner.Victims()) {
+        for (const auto& [group_id, location] : set.members) {
+            plan.victims.push_back({.group_id = group_id, .location = location, .reason = &HostEvictionStats::lru});
+        }
     }
     return plan;
 }
