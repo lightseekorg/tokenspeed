@@ -381,8 +381,8 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
                                                                   const RequestProgress& progress,
                                                                   std::optional<std::uint64_t> request_access_epoch,
                                                                   bool evict_blocks_past_segments) {
-    std::optional<CacheCoordinator::AdmissionResult> result =
-        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch, evict_blocks_past_segments);
+    std::optional<CacheCoordinator::AdmissionResult> result = coordinator_.Admit(
+        std::move(prefix), demands, progress, request_access_epoch, evict_blocks_past_segments, /*session_id=*/{});
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;

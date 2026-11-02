@@ -71,6 +71,11 @@ use ts_wire::{
     ControlRequest, Value,
 };
 
+use crate::request::MAX_CACHE_SESSION_ID_BYTES;
+
+/// The most session IDs a single demotion call may carry.
+const MAX_DEMOTE_SESSION_IDS: usize = 4096;
+
 /// The weight-update group an RL route names when its body names none.
 const DEFAULT_GROUP: &str = "weight_update_group";
 
@@ -145,14 +150,15 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
     Ok(match method {
         "demote_sessions" => {
             let session_ids = body.strs("session_ids")?;
-            if session_ids.len() > 4096
+            if session_ids.len() > MAX_DEMOTE_SESSION_IDS
                 || session_ids
                     .iter()
-                    .any(|id| id.is_empty() || id.len() > 4096)
+                    .any(|id| id.is_empty() || id.len() > MAX_CACHE_SESSION_ID_BYTES)
             {
-                return Err(
-                    "demote_sessions requires at most 4096 nonempty bounded session ids".into(),
-                );
+                return Err(format!(
+                    "demote_sessions requires at most {MAX_DEMOTE_SESSION_IDS} nonempty session ids \
+                     of at most {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
+                ));
             }
             let ended = body
                 .get("ended")
@@ -777,6 +783,39 @@ mod tests {
         let error = rl("pause_generation", vec!["wait".into()]).unwrap_err();
         assert!(error.contains("takes [body]"), "{error}");
     }
+
+    #[test]
+    fn demotion_enforces_session_id_byte_and_count_limits() {
+        for (ids, accepted) in [
+            (vec!["s".repeat(4096)], true),
+            (vec!["s".repeat(4097)], false),
+            (vec!["🦀".repeat(1024)], true),
+            (vec![format!("{}s", "🦀".repeat(1024))], false),
+            (vec!["s".to_owned(); 4096], true),
+            (vec!["s".to_owned(); 4097], false),
+        ] {
+            let result = rl(
+                "demote_sessions",
+                vec![body(vec![
+                    (
+                        "session_ids",
+                        Value::Array(ids.iter().cloned().map(Value::Str).collect()),
+                    ),
+                    ("ended", Value::Bool(false)),
+                ])],
+            );
+            if accepted {
+                let ControlRequest::DemoteSessions(request) = result.unwrap() else {
+                    panic!("expected a demotion request");
+                };
+                assert_eq!(request.session_ids, ids);
+                assert!(!request.ended);
+            } else {
+                assert!(result.unwrap_err().contains("UTF-8 bytes"));
+            }
+        }
+    }
+
     #[test]
     fn demotion_requires_explicit_end_semantics_and_bounded_ids() {
         let ids = Value::Array(vec!["s".into()]);

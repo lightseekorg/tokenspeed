@@ -589,7 +589,8 @@ fn session_demotion_preserves_active_pages_and_reusable_cache() {
         .unwrap();
     scheduler.next_execution_plan();
     assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
-    assert!(scheduler.demote_session("session-a", true) > 0);
+    // Finish publishes the pages at their already-demoted session's age.
+    assert_eq!(scheduler.demote_session("session-a", true), 0);
     let mut resumed = spec("resumed", (1..=40).collect());
     resumed.session_id = "session-b".into();
     scheduler.submit_requests(&[resumed]);
@@ -598,6 +599,28 @@ fn session_demotion_preserves_active_pages_and_reusable_cache() {
         plan.forward_batches()[0].extend_prefix_lens[0] > 0,
         "demotion must not invalidate reusable KV"
     );
+}
+
+#[test]
+fn session_demotion_counts_only_newly_aged_idle_pages() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let mut request = spec("tagged", (1..=40).collect());
+    request.session_id = "session-a".into();
+    scheduler.submit_requests(&[request]);
+    scheduler.next_execution_plan();
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "tagged", vec![42])])
+        .unwrap();
+    scheduler
+        .advance(&[event(ForwardEventKind::Finish, "tagged", vec![])])
+        .unwrap();
+    scheduler.next_execution_plan();
+    assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
+    assert!(scheduler.demote_session("session-a", false) > 0);
+    assert_eq!(scheduler.demote_session("session-a", false), 0);
+    assert_eq!(scheduler.demote_session("session-a", true), 0);
 }
 
 #[test]

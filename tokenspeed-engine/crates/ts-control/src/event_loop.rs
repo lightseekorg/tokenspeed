@@ -1757,13 +1757,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 ));
             }
             Effect::AdmissionSnapshot => {
-                let snapshot = self.scheduler.admission_snapshot(1024);
+                // Version 1 rounds demand up to 1024-token buckets. Bump the
+                // contract version if the curve's bucketing semantics change;
+                // see docs/design/cache-concepts.md.
+                const ADMISSION_CONTRACT_VERSION: i64 = 1;
+                const ADMISSION_TOKEN_STEP: i32 = 1024;
+                let snapshot = self.scheduler.admission_snapshot(ADMISSION_TOKEN_STEP);
                 self.controls.reply(ControlOutput::GetAdmission(
                     ts_wire::control::GetAdmissionReqOutput {
                         rid: None,
                         http_worker_ipc: None,
                         success: true,
-                        contract_version: 1,
+                        contract_version: ADMISSION_CONTRACT_VERSION,
                         dp_rank: -1,
                         free_slots: snapshot.free_slots.into(),
                         total_slots: snapshot.total_slots.into(),

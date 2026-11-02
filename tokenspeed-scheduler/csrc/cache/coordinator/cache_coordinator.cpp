@@ -1447,12 +1447,13 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
                                            std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
                                            bool stream_completed_to_host) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
+    const SessionCacheOwner session = SessionForAccess(access_epoch);
     const bool automatically_streams_to_host =
         stream_device_cache_to_host_ &&
         (groups_[group_index].Spec().attn_kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     groups_[group_index].Index().RegisterFullBlocks(tierPool<Tier>(), blocks, keys, access_epoch, first_logical_block,
                                                     boundary_kind, Tier == CacheTier::kDevice ? &newly_cached : nullptr,
-                                                    SessionForAccess(access_epoch));
+                                                    session);
     if constexpr (Tier == CacheTier::kHost) {
         return;
     }
@@ -1473,8 +1474,7 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
         }
-        if (!automatically_streams_to_host ||
-            (SessionForAccess(access_epoch) && SessionForAccess(access_epoch)->ended)) {
+        if (!automatically_streams_to_host || (session && session->ended)) {
             continue;
         }
         pending_stores_.push_back(StoreCandidate{
@@ -2703,10 +2703,11 @@ std::vector<CacheBlockRef> CacheCoordinator::RetainInputCheckpoint(std::span<con
     return blocks;
 }
 
-void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks) {
+void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks, std::uint64_t request_access_epoch) {
     if (blocks.empty()) {
         return;
     }
+    const SessionCacheOwner session = SessionForAccess(request_access_epoch);
     const std::uint64_t access_epoch = ++next_access_epoch_;
     for (CacheBlockRef& block : blocks) {
         _assert(block.IsOwnedBy(pool_) || host_pool_ != nullptr && block.IsOwnedBy(*host_pool_),
@@ -2722,7 +2723,7 @@ void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks
         const auto metadata = index.MetadataFor(pool, block->Location());
         _assert(metadata.has_value(), "a cached block has eviction metadata");
         index.Register(pool, block, *key, access_epoch, metadata->logical_block_index, metadata->boundary_kind,
-                       /*newly_cached=*/nullptr);
+                       /*newly_cached=*/nullptr, session);
         if (GroupIsState(key->group_id)) {
             BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
             _assert(node != nullptr, "a cached checkpoint has a boundary-tree node");

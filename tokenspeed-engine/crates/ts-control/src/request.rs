@@ -159,6 +159,9 @@ pub struct StopCriteria {
     pub token_limit: i64,
 }
 
+/// Cache ownership IDs have the same UTF-8 byte limit at ingress and demotion.
+pub(crate) const MAX_CACHE_SESSION_ID_BYTES: usize = 4096;
+
 /// The device's per-request stop table width (`MAX_STOP_TOKEN_IDS`).
 pub const MAX_STOP_TOKEN_IDS: usize = 16;
 

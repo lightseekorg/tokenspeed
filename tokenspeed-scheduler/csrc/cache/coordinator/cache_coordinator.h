@@ -157,8 +157,9 @@ public:
     std::vector<CacheBlockRef> RetainInputCheckpoint(std::span<const std::string> prefix_hashes,
                                                      std::int32_t boundary_tokens) const;
     // A finishing producer makes its retained input available to the next
-    // turn now. Refresh its recency without recording a prefix-cache hit.
-    void RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks);
+    // turn now. Refresh its recency without recording a prefix-cache hit or
+    // changing the finishing request's session ownership.
+    void RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks, std::uint64_t request_access_epoch);
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
                                           bool count_uncached) const {
         const CacheGroup& group = groups_[static_cast<std::size_t>(i)];
@@ -329,7 +330,7 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments, const std::string& session_id = {});
+                                         bool evict_blocks_past_segments, const std::string& session_id);
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;

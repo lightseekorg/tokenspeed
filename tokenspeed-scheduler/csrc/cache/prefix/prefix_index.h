@@ -142,7 +142,7 @@ public:
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
                   std::int32_t logical_block_index, CacheBoundaryKind boundary_kind,
-                  std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached, SessionCacheOwner session = nullptr) {
+                  std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached, SessionCacheOwner session) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         _assert(pool.BoundGroup(block_ref->Location().lcm_block_id) == group_id_,
                 "cache block must belong to the prefix index group");
@@ -195,8 +195,7 @@ public:
     void RegisterFullBlocks(const BlockPool& pool, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
                             std::uint64_t access_epoch, std::int32_t first_logical_block,
                             CacheBoundaryKind boundary_kind,
-                            std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached,
-                            SessionCacheOwner session = nullptr) {
+                            std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached, SessionCacheOwner session) {
         _assert(first_logical_block >= 0, "first_logical_block must be >= 0");
         _assert(blocks.size() == keys.size(), "one key per published block");
         for (std::size_t j = 0; j < keys.size(); ++j) {
@@ -440,7 +439,10 @@ public:
         if (!cache_index) return 0;
         std::size_t changed = 0;
         for (auto it = cache_index->entries.begin(); it != cache_index->entries.end(); ++it) {
-            if (!it->session || !sessions.contains(it->session.get()) || !it->block_ref.unique()) continue;
+            if (!it->session || !sessions.contains(it->session.get()) || !it->block_ref.unique() ||
+                it->last_access_epoch == 0) {
+                continue;
+            }
             touchEntry(*cache_index, it, 0);
             ++changed;
         }
@@ -488,8 +490,7 @@ public:
     // Pins the probed hits: marks them acquired at access_epoch and returns
     // owning references aligned with probe.hits.
     PrefixMatch AcquireMatched(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                               const GroupPrefixProbe& probe, std::uint64_t access_epoch,
-                               SessionCacheOwner session = nullptr) {
+                               const GroupPrefixProbe& probe, std::uint64_t access_epoch, SessionCacheOwner session) {
         _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
                 "matched block range is out of bounds");
         PrefixMatch match;

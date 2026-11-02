@@ -141,11 +141,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # the client receives a terminal abort instead of a silent drop.
     validation_error: str | None = None
 
-    # Hard-pin to an attention-DP rank. Keep last: array_like declaration
-    # order is the wire contract.
+    # Hard-pin to an attention-DP rank.
     data_parallel_rank: int | None = None
     # Router-only cache retention identity; no prompt concatenation.
     cache_session_id: str | None = None
+    # array_like declaration order is the wire contract; append new fields here.
 
 
 # Serialized form of BaseFinishReason.to_json() (or None while streaming) —

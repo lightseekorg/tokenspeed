@@ -2538,19 +2538,28 @@ A request may carry `cache_session_id` as cache ownership metadata. It does not
 change tokens or introduce implicit append semantics. The native scheduler tags
 published Device/Host prefixes with a shared session owner. Reuse by a different
 session, or by an untagged request, removes exclusive ownership permanently for
-that entry so a session hint cannot penalize shared prefixes.
+that entry so a session hint cannot penalize shared prefixes. Refreshing retained
+checkpoints at request finish preserves their session ownership; it does not
+count as reuse by an untagged request. Prefix-index mutations require an explicit
+owner, including `nullptr` for untagged reuse, so callers cannot accidentally
+clear ownership by omitting an argument. Both request ingress and the
+`demote_sessions` RL call reject session IDs longer than 4096 UTF-8 bytes.
 
 `DemoteSessions` takes explicit session IDs and an `ended` boolean. It lowers the
 LRU epoch only for exclusively owned, currently unreferenced cached blocks. It
 never invalidates KV or releases blocks held by active requests or transfers.
 Demoted data remains matchable and is promoted on reuse. Ending a session also
 suppresses its exclusive pending/new Host stores; transfers already submitted
-complete normally. Reusing an ended ID creates a new owner generation.
+complete normally. Reusing an ended ID creates a new owner generation. The
+returned demotion count includes only blocks whose LRU epoch actually changed.
+Already-demoted blocks are not counted again unless later access promotes them.
 
 `GetAdmission` reports live request slots, available/total physical LCM blocks,
 Host capacity, waiting/retracted counts, and a contract-versioned capacity curve.
-The curve rounds token lengths up to a bucket and uses the native capacity model
-across full-history, sliding-window and state groups. Consumers must not derive
-physical demand by dividing token counts by a page size. Snapshot collection is
-an explicit control operation; the allocator scan is not added to each forward.
+Contract version 1 rounds token lengths up to 1024-token buckets and uses the
+native capacity model across full-history, sliding-window and state groups.
+Changes to the bucketing contract require a corresponding version bump. Consumers
+must not derive physical demand by dividing token counts by a page size. Snapshot
+collection is an explicit control operation; the allocator scan is not added to
+each forward.
 The transport identifies each reply's DP rank, independent of reply arrival order.

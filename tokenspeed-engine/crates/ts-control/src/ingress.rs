@@ -33,7 +33,7 @@ use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
     grammar::ReasoningGrammar,
-    request::{LogprobRequest, RequestState, MAX_STOP_TOKEN_IDS},
+    request::{LogprobRequest, RequestState, MAX_CACHE_SESSION_ID_BYTES, MAX_STOP_TOKEN_IDS},
     sampling,
 };
 
@@ -241,6 +241,17 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         .validation_error
         .clone()
         .or_else(|| embeddings.as_ref().err().cloned())
+        .or_else(|| {
+            request
+                .cache_session_id
+                .as_ref()
+                .filter(|id| id.len() > MAX_CACHE_SESSION_ID_BYTES)
+                .map(|_| {
+                    format!(
+                        "cache_session_id exceeds the limit of {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
+                    )
+                })
+        })
         .or_else(|| refusal(&view, &params, limits));
 
     let prompt_len = request.input_ids.as_ref().map_or(0, Vec::len) as i64;
@@ -624,6 +635,32 @@ mod tests {
         assert_eq!(admission.state.stop_token_ids, BTreeSet::from([2, 9]));
         assert_eq!(admission.state.stop_criteria().token_limit, 11);
         assert!(admission.sampling_params.is_normalized);
+    }
+
+    #[test]
+    fn cache_session_ids_preserve_bounded_tags_and_refuse_oversized_tags() {
+        for session_id in [
+            None,
+            Some(String::new()),
+            Some("s".repeat(4095)),
+            Some("s".repeat(4096)),
+            Some("🦀".repeat(1024)),
+        ] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_session_id = session_id.clone();
+            let Some(Admitted::Run(admission)) = admit(request, &limits()) else {
+                panic!("expected admission for a bounded session id");
+            };
+            assert_eq!(admission.spec.session_id, session_id.unwrap_or_default());
+            assert_eq!(admission.spec.tokens, [1, 2, 3]);
+        }
+        for session_id in ["s".repeat(4097), format!("{}s", "🦀".repeat(1024))] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_session_id = Some(session_id);
+            let message = refused_message(admit(request, &limits()).unwrap());
+            assert!(message.contains("cache_session_id"), "{message}");
+            assert!(message.contains("4096 UTF-8 bytes"), "{message}");
+        }
     }
 
     #[test]

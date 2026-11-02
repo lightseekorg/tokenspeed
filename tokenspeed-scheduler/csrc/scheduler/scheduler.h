@@ -123,13 +123,13 @@ public:
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
     std::int32_t AvailableLcmBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
-    // Per-step gauges: empty parents are O(1), active parents walk the live
-    // requests' block tables. Parents resident only as cache are
-    // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
     std::int32_t FreeRequestSlots() const { return req_pool_allocator_.AvailableSlots(); }
     std::int32_t TotalRequestSlots() const { return req_pool_allocator_.Size(); }
     std::int32_t TotalLcmBlocks() const { return block_pool_.NumLcmBlocks(); }
     std::vector<std::int64_t> AdmissionCapacityCurve(std::int32_t token_step) const;
+    // Per-step gauges: empty parents are O(1), active parents walk the live
+    // requests' block tables. Parents resident only as cache are
+    // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
     std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
     std::int32_t ActiveLcmBlocks() const;
     // RemotePrefilling only: a subset of PrefillSize(), never an extra total.

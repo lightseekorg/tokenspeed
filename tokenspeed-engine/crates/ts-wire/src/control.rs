@@ -61,19 +61,33 @@ control_struct! {
     GetAdmissionReqInput {}
     /// Native allocator snapshot and a conservative cache-demand curve.
     GetAdmissionReqOutput {
+        /// Whether the snapshot was collected.
         success: bool,
+        /// Attention-DP rank, assigned by the transport before sending.
         dp_rank: i64,
+        /// Version of the capacity curve's interpretation and bucketing.
         contract_version: i64,
+        /// Request-pool slots available for admission.
         free_slots: i64,
+        /// Total request-pool slots.
         total_slots: i64,
+        /// Device LCM blocks available after reclaiming evictable cache.
         available_blocks: i64,
+        /// Total Device LCM blocks.
         total_blocks: i64,
+        /// Free Host LCM blocks.
         host_free_blocks: i64,
+        /// Total Host LCM blocks.
         host_total_blocks: i64,
+        /// Requests suspended for later restoration.
         retracted: i64,
+        /// Requests waiting for admission.
         waiting: i64,
+        /// Maximum logical token extent for one request.
         max_tokens: i64,
+        /// Token width of a capacity-curve bucket.
         capacity_token_step: i64,
+        /// Device LCM block demand at each bucket's upper token bound.
         capacity_blocks: Vec<i64>,
     }
 
@@ -86,7 +100,9 @@ control_struct! {
     }
     /// Cache priority hints never invalidate active or shared blocks.
     DemoteSessionsReqOutput {
+        /// Whether the cache priority hint was applied.
         success: bool,
+        /// Summary of how many cached blocks changed priority.
         message: String,
     }
 
