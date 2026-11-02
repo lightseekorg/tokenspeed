@@ -158,6 +158,24 @@ protected:
         PlanOnce();
         return resume;
     }
+
+    // The KV events since the last drain, as the block hashes stored and the
+    // block hashes removed.
+    struct Drained {
+        std::vector<std::uint64_t> stored;
+        std::vector<std::uint64_t> removed;
+    };
+    Drained Drain() {
+        Drained out;
+        for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+            if (const auto* stored = std::get_if<KvBlockStoredEvent>(&event)) {
+                out.stored.push_back(stored->block_hashes.front());
+            } else {
+                out.removed.push_back(std::get<KvBlockRemovedEvent>(event).block_hashes.front());
+            }
+        }
+        return out;
+    }
 };
 
 class AlignedStateCheckpointSuite : public StateCheckpointSuite {
@@ -2410,6 +2428,105 @@ TEST_F(StateRestoreClaimSuite, ARetractionAtAPageBoundaryRestoresUnderWriteBack)
     EXPECT_EQ(scheduler_->RequestTokenSize("r"), -1);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
     EXPECT_TRUE(scheduler_->CanClearCache());
+}
+
+// A request retracted on a page-aligned frontier and restored with no Host
+// cache resumes on private copies of its pages. Here the pool is so tight
+// that the restore evicts their cache entries, and a drain between the
+// restore's ACK and the next chunk drops their descriptors. The next chunk's
+// admission publishes the state at the frontier again without hashing a new
+// page: the junction the chunk before it was cut at, or the in-forward
+// checkpoint's boundary. That publication must not trip over the dropped
+// descriptor, and with the KV through the frontier gone nothing is reported
+// stored.
+class StateCheckpointRestoreKvEventSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        cfg.debug_force_retraction_interval = -4;
+        cfg.state_checkpoint_in_forward = in_forward_;
+        // One full and one State group over thirteen usable blocks.
+        std::erase_if(cfg.cache_groups, [](const CacheGroupConfig& group) {
+            return group.group_id == "state1" || group.group_id == "state2";
+        });
+        cfg.device_allocator.total_pages = 14;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Plans one round in which `id` runs a prefill chunk alone, lands it and
+    // returns where it started and how many tokens it computed.
+    std::pair<std::int32_t, std::int32_t> RunChunk(const std::string& id, bool completes = false) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_TRUE_OR_RETURN(batch != nullptr && batch->request_ids == std::vector<std::string>{id},
+                              (std::pair<std::int32_t, std::int32_t>{-1, -1}));
+        SendForwardDone(id, completes ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        return {batch->extend_prefix_lens.at(0), batch->input_lengths.at(0)};
+    }
+
+    // The forced retraction of the plan after `id`'s last chunk landed, and
+    // the restore of the plan after it, with a drain after each ACK.
+    void RetractAndRestore() {
+        const ExecutionPlan retraction = PlanOnce();
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+        AckImageStores(retraction);
+        Drain();
+        const ExecutionPlan readmit = PlanOnce();
+        ASSERT_NE(FindRestore(readmit), nullptr);
+        AckRestores(readmit);
+        Drain();
+    }
+
+    bool in_forward_{false};
+};
+
+// The second prompt shares the first one's first 8 tokens and no checkpoint,
+// so its first chunk is cut at the junction at 8; it is retracted there, and
+// the chunk [8, 16) resumes at the junction.
+TEST_F(StateCheckpointRestoreKvEventSuite, AJunctionAfterARestoreFindsItsDescriptor) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    const std::vector<std::int32_t> seed = MakeTokens(12);
+    Submit(RequestSpec{.request_id = "seed", .tokens = seed, .max_new_tokens = 1});
+    RunChunk("seed");
+    RunChunk("seed", /*completes=*/true);
+    SendFinish("seed");
+    // Plans 3-6 run nothing, so the second prompt's first chunk is plan 7 and
+    // the forced retraction of plan 8 takes it.
+    for (std::int32_t plan = 3; plan <= 6; ++plan) {
+        PlanOnce();
+    }
+    Drain();
+    std::vector<std::int32_t> tokens(seed.begin(), seed.begin() + 8);
+    for (std::int32_t i = 0; i < 26; ++i) {
+        tokens.push_back(500 + i);
+    }
+    Submit(RequestSpec{.request_id = "r", .tokens = tokens, .max_new_tokens = 1});
+    EXPECT_EQ(RunChunk("r"), (std::pair<std::int32_t, std::int32_t>{0, 8})) << "cut at the junction";
+    RetractAndRestore();
+    EXPECT_EQ(RunChunk("r"), (std::pair<std::int32_t, std::int32_t>{8, 8}));
+    EXPECT_TRUE(Drain().stored.empty()) << "the KV through 8 is gone";
+}
+
+// A 26-token prompt's in-forward checkpoint sits at 24, where its third chunk
+// ends; it is retracted there, and the chunk [24, 26) resumes at the boundary.
+TEST_F(StateCheckpointRestoreKvEventSuite, AnInForwardBoundaryAfterARestoreFindsItsDescriptor) {
+    in_forward_ = true;
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    Submit(RequestSpec{.request_id = "seed", .tokens = MakeTokens(26), .max_new_tokens = 1});
+    // Plans 1-3 run [0, 8), [8, 16) and [16, 24); plan 4 retracts, plan 5
+    // restores.
+    for (std::int32_t chunk = 0; chunk < 3; ++chunk) {
+        EXPECT_EQ(RunChunk("seed"), (std::pair<std::int32_t, std::int32_t>{8 * chunk, 8}));
+    }
+    Drain();
+    RetractAndRestore();
+    EXPECT_EQ(RunChunk("seed", /*completes=*/true), (std::pair<std::int32_t, std::int32_t>{24, 2}));
+    EXPECT_TRUE(Drain().stored.empty()) << "the KV through 24 is gone";
 }
 
 // Retraction after the forward that wrote the in-forward checkpoint, before

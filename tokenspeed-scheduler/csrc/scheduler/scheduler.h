@@ -282,9 +282,10 @@ private:
         bool evict_blocks_past_segments);
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
-    // The descriptors a publication mutates: its newly hashed full pages and,
-    // at a tail, the partial page under its tail hash (token_ids = the rows
-    // below T, parent = the last full page).
+    // The descriptors a publication mutates: its newly hashed full pages, the
+    // last full page when it publishes state there without a tail (hashed
+    // earlier or not), and at a tail the partial page under its tail hash
+    // (token_ids = the rows below T, parent = the last full page).
     void registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);

@@ -1339,16 +1339,19 @@ harmless.
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
-descriptor of a boundary with no cached child. A boundary is `BlockStored`
-only while every group holds its child -- the State groups included, whose
-checkpoint exists only at a natural point or the opt-in in-forward
-checkpoint (§1.2) -- so a hybrid model emits `BlockStored` for its prompt
-end and its finish (unless they are dead, §1.2), its junction cuts and the
-in-forward checkpoint's page boundary, never for another interior chunk
-end's chain hash; a tail's
-descriptor carries the rows below `T` and the residency check counts a
-tail's blocks from it. Retraction publishes twice
-without an admission: `retractVictim` registers the newly hashed pages before
+descriptor of a boundary with no cached child. A publication therefore
+registers every boundary it may mutate, the page a state is published under
+included, even when it hashes no new page (a prefill resumed at its
+retraction frontier republishes the state there). A boundary is
+`BlockStored` only while every group holds its child -- the State groups
+included, whose checkpoint exists only at a natural point or the opt-in
+in-forward checkpoint (§1.2) -- so a hybrid model emits `BlockStored` for
+its prompt end and its finish (unless they are dead, §1.2), its junction
+cuts and the in-forward checkpoint's page boundary, never for another
+interior chunk end's chain hash; a tail's descriptor carries the rows below
+`T` and the residency check counts a tail's blocks from it. Retraction
+publishes twice without an admission: `retractVictim` registers the newly
+hashed pages before
 `CacheCompletedBlocks` (as the finish-time publication does), and the
 `RestoreDone` handler registers the restored request's whole prefix chain
 before `CompleteSnapshotRestore` republishes its L2-tier destinations — the
