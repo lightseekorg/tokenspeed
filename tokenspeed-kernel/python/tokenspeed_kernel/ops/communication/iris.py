@@ -67,12 +67,9 @@ def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None
 def discover_iris_world() -> bool:
     """Decide whether one Iris heap can map every world rank; every rank calls it.
 
-    Run it during distributed initialization: the first call is a world
-    collective, and later calls return the cached answer. Off AMD there is no
-    Iris heap, so it returns True without a collective.
+    Run it on AMD during distributed initialization: the first call is a world
+    collective, and later calls return the cached answer.
     """
-    if not _platform.is_amd:
-        return True
     from tokenspeed_kernel.ops.communication._iris import discover_world
 
     return discover_world()

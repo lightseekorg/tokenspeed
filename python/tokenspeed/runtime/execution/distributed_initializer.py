@@ -247,10 +247,15 @@ class DistributedInitializer:
 
         gather_fabric_map()
 
-        from tokenspeed_kernel.ops.communication.iris import discover_iris_world
+        from tokenspeed_kernel.platform import current_platform
 
-        # The Iris heap spans the world; routing reads whether it can map it.
-        discover_iris_world()
+        # Only AMD has an Iris heap, and the Iris module needs Gluon, which NPU
+        # builds lack. The heap spans the world; routing reads whether it can
+        # map it.
+        if current_platform().is_amd:
+            from tokenspeed_kernel.ops.communication.iris import discover_iris_world
+
+            discover_iris_world()
 
         # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
         if config.hidden_size > 0:
