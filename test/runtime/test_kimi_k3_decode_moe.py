@@ -158,7 +158,7 @@ def test_only_single_group_tp8_blackwell_binds_the_chain(
 
 
 @pytest.mark.parametrize(
-    "algorithm,width,captured,padding,rows",
+    "algorithm,width,captured,disable_padding,rows",
     [
         (None, None, [1, 2, 4], False, {1, 2, 4}),
         ("DSPARK", 8, [1, 2, 4], False, {8, 16, 32}),
@@ -171,7 +171,7 @@ def test_only_single_group_tp8_blackwell_binds_the_chain(
     ids=["decode", "dspark-verify", "eagle3-verify", "default", "default-unpadded"],
 )
 def test_decode_graph_rows_follow_the_executor_ladder(
-    monkeypatch, algorithm, width, captured, padding, rows
+    monkeypatch, algorithm, width, captured, disable_padding, rows
 ):
     args = kimi_k3.global_server_args_dict
     monkeypatch.setitem(args, "speculative_algorithm", algorithm)
@@ -179,7 +179,7 @@ def test_decode_graph_rows_follow_the_executor_ladder(
     monkeypatch.setitem(args, "cudagraph_capture_sizes", captured)
     monkeypatch.setitem(args, "max_num_seqs", 16)
     monkeypatch.setitem(args, "max_cudagraph_capture_size", 16)
-    monkeypatch.setitem(args, "disable_cuda_graph_padding", padding)
+    monkeypatch.setitem(args, "disable_cuda_graph_padding", disable_padding)
     monkeypatch.setitem(args, "mapping", _mapping())
     assert kimi_k3._decode_graph_rows() == rows
 

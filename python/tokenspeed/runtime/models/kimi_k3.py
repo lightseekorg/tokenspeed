@@ -58,7 +58,6 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -111,6 +110,8 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.forward_step import (
+    DecodeLadderArgs,
+    get_batch_sizes_to_capture,
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -843,8 +844,6 @@ def _apply_attn_res(
 def _decode_graph_rows() -> set[int]:
     """Token rows of each decode graph the executor captures (its resolved batch
     ladder); speculative verify runs the verify width per request."""
-    from tokenspeed.runtime.execution.forward_step import get_batch_sizes_to_capture
-
     args = global_server_args_dict
     per_request = (
         int(args["speculative_num_draft_tokens"])
@@ -852,7 +851,7 @@ def _decode_graph_rows() -> set[int]:
         else 1
     )
     ladder = get_batch_sizes_to_capture(
-        SimpleNamespace(
+        DecodeLadderArgs(
             cudagraph_capture_sizes=args["cudagraph_capture_sizes"],
             max_num_seqs=args["max_num_seqs"],
             data_parallel_size=args["mapping"].attn.dp_size,
