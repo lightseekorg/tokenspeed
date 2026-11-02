@@ -79,7 +79,7 @@ std::int32_t CacheBlockFor(CacheCoordinator& coordinator, BlockPool& pool, const
     coordinator.GroupPrefixIndex(group_index)
         .Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch, /*logical_block_index=*/-1,
                   CacheBoundaryKind::kChunk,
-                  /*newly_cached=*/nullptr);
+                  /*newly_cached=*/nullptr, /*session=*/nullptr);
     block_ref.reset();
     return id;
 }
