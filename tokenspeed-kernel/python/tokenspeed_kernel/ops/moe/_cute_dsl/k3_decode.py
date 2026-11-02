@@ -126,10 +126,14 @@ class KimiK3DecodeMoE:
         *,
         group: dist.ProcessGroup,
         batches: tuple[int, ...],
+        verify_width: int,
         moe_layers: int,
         beta: float,
         linear_beta: float,
     ) -> None:
+        """Args: ``batches`` are the token row counts the chain serves;
+        ``verify_width`` is the rows per request of every decode forward (1
+        without speculative decoding), which picks the shared expert's splits."""
         tp = dist.get_world_size(group)
         if tp != 8:
             raise ValueError(f"the K3 decode MoE chain serves TP8, got TP{tp}")
@@ -141,6 +145,7 @@ class KimiK3DecodeMoE:
         self.tp, self.rank = tp, dist.get_rank(group)
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.batches = tuple(sorted(batches))
+        self.verify_width = verify_width
         self.moe_layers = moe_layers
         self.beta, self.linear_beta = beta, linear_beta
         owner = (group, self.device, tp, self.rank)
@@ -242,6 +247,7 @@ class KimiK3DecodeMoELayer:
             owner.linear_beta,
             plan=state.plan,
             counters=state.shared,
+            q=owner.verify_width,
         )
         experts = PersistentExperts(
             w["w13"].view(torch.uint8),

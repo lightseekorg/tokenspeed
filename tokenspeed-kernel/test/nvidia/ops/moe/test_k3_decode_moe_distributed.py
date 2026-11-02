@@ -181,19 +181,30 @@ def _reference(weights, x):
     return output, clear
 
 
-@pytest.fixture(scope="module")
-def chain():
+# Five MoE layers rotate through all three tail parities and, like the model's
+# 92, wrap with 5 % 3 == 2; each has its own non-expert weights.
+MOE_LAYERS = 5
+
+
+@pytest.fixture(scope="module", params=(1, 8), ids=("decode", "verify-8"))
+def chain(request):
+    """The chain for every row count, built for plain decode or a verify width
+    of 8 (which picks the shared expert's verify splits)."""
     rank, device = _setup()
     _require_multicast()
     from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
 
     first = _Weights(device, 1234)
-    weights = (first, _Weights(device, 5678, experts=first))
+    weights = (first,) + tuple(
+        _Weights(device, 1234 + ordinal, experts=first)
+        for ordinal in range(1, MOE_LAYERS)
+    )
     experts = _serving_experts(first, rank)
     owner = KimiK3DecodeMoE(
         group=dist.group.WORLD,
         batches=BATCHES,
-        moe_layers=2,
+        verify_width=request.param,
+        moe_layers=MOE_LAYERS,
         beta=BETA,
         linear_beta=LINEAR_BETA,
     )
@@ -202,7 +213,7 @@ def chain():
     layers = [
         owner.layer(
             ordinal=ordinal,
-            layer_idx=layer_idx,
+            layer_idx=1 + 3 * ordinal,
             router=w.router,
             correction_bias=w.bias,
             routed_scaling_factor=SCALE,
@@ -218,7 +229,7 @@ def chain():
             norm_eps=EPS,
             up_shard=w.up[up_rows].contiguous(),
         )
-        for ordinal, (w, layer_idx) in enumerate(zip(weights, (1, 4)))
+        for ordinal, w in enumerate(weights)
     ]
     yield weights, layers, device
     dist.barrier()
@@ -240,36 +251,52 @@ def _assert_close(weights, x, residual, out):
     assert worst < 0.02, f"row relative error {worst:.4f} (median {error.median():.4f})"
 
 
+def _step(layers, x, residual):
+    """Every MoE layer in model order, each accumulating onto the previous output."""
+    outputs = []
+    for layer in layers:
+        residual = layer.run(x, residual)
+        outputs.append(residual)
+    return outputs
+
+
+def _check_step(weights, x, residual, outputs):
+    for w, before, out in zip(weights, (residual, *outputs[:-1]), outputs):
+        _assert_close(w, x, before, out)
+
+
 @pytest.mark.parametrize("batch", BATCHES)
 def test_chain_matches_the_reference_eagerly(chain, batch):
     weights, layers, device = chain
-    for step, (w, layer) in enumerate(zip(weights, layers)):
-        x, residual = _inputs(batch, device, 100 * batch + step)
-        out = layer.run(x, residual)
-        torch.cuda.synchronize()
-        _assert_close(w, x, residual, out)
-
-
-@pytest.mark.parametrize("batch", (1, 16))
-def test_chain_replays_in_a_cuda_graph_with_fresh_inputs(chain, batch):
-    """Two layers per graph replay; each replay re-arms the mailboxes it read."""
-    weights, layers, device = chain
-    x, residual = _inputs(batch, device, 7)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        layers[1].run(layers[0].run(x, residual), residual)
-    torch.cuda.current_stream().wait_stream(stream)
+    x, residual = _inputs(batch, device, 100 * batch)
+    outputs = _step(layers, x, residual)
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        first = layers[0].run(x, residual)
-        second = layers[1].run(x, first)
-    for seed in (11, 12, 13):
-        fresh_x, fresh_residual = _inputs(batch, device, seed)
+    _check_step(weights, x, residual, outputs)
+
+
+def test_chain_replays_cuda_graphs_of_changing_row_counts(chain):
+    """Steps of 64, 1 and 16 rows in mixed order, each a graph replay with fresh
+    inputs: every layer re-arms what it read, and the first one also what the
+    last layer may have published at the largest row count."""
+    weights, layers, device = chain
+    graphs = {}
+    for batch in (64, 1, 16):
+        x, residual = _inputs(batch, device, batch)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            _step(layers, x, residual)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = _step(layers, x, residual)
+        graphs[batch] = graph, x, residual, outputs
+    for step, batch in enumerate((64, 1, 64, 16, 1, 16)):
+        graph, x, residual, outputs = graphs[batch]
+        fresh_x, fresh_residual = _inputs(batch, device, 1000 + step)
         x.copy_(fresh_x)
         residual.copy_(fresh_residual)
         graph.replay()
         torch.cuda.synchronize()
-        _assert_close(weights[0], x, residual, first)
-        _assert_close(weights[1], x, first, second)
+        _check_step(weights, x, residual, outputs)

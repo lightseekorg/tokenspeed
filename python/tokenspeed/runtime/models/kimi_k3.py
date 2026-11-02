@@ -841,15 +841,20 @@ def _apply_attn_res(
     )
 
 
+def _decode_verify_width() -> int:
+    """Token rows per request of every decode forward: the verify width under
+    speculative decoding, else 1."""
+    args = global_server_args_dict
+    if args["speculative_algorithm"]:
+        return int(args["speculative_num_draft_tokens"])
+    return 1
+
+
 def _decode_graph_rows() -> set[int]:
     """Token rows of each decode graph the executor captures (its resolved batch
     ladder); speculative verify runs the verify width per request."""
     args = global_server_args_dict
-    per_request = (
-        int(args["speculative_num_draft_tokens"])
-        if args["speculative_algorithm"]
-        else 1
-    )
+    per_request = _decode_verify_width()
     ladder = get_batch_sizes_to_capture(
         DecodeLadderArgs(
             cudagraph_capture_sizes=args["cudagraph_capture_sizes"],
@@ -3969,7 +3974,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     def _prepare_decode_moe(self) -> bool:
         """Bind the TP8 decode MoE chain to every MoE layer it can serve."""
-        mapping = self.mapping
+        mapping, config, args = self.mapping, self.config, global_server_args_dict
         if not (
             current_platform().is_blackwell
             and mapping.attn.dp_size == 1
@@ -3978,6 +3983,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
             and mapping.moe.tp_size == 8
             and mapping.moe.ep_size == 1
             and mapping.attn.tp_group == mapping.moe.tp_ep_group
+            # A prefill-only role never decodes.
+            and args["disaggregation_mode"] != "prefill"
+            # The chain always launches with PDL and reduces in its own order.
+            and pdl_enabled()
+            and not args["force_deterministic_rsag"]
+            and not args["batch_invariant_collectives"]
+            # The kernels are specialized to this routing and activation.
+            and config.num_experts == 896
+            and config.num_experts_per_token == 16
+            and config.num_expert_group == config.topk_group == 1
+            and config.moe_router_activation_func == "sigmoid"
+            and config.activation_situ_linear_beta is not None
         ):
             return False
         layers = [
@@ -3997,6 +4014,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 and moe.routed_expert_up_proj.narrowed
                 and moe.routed_expert_norm is not None
                 and moe.shared_experts.shared_parallel is None
+                and moe.gate.weight.dtype == torch.bfloat16
                 for moe in (layer.block_sparse_moe for layer in layers)
             )
         ):
@@ -4020,6 +4038,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         owner = KimiK3DecodeMoE(
             group=group,
             batches=batches,
+            verify_width=_decode_verify_width(),
             moe_layers=len(layers),
             beta=beta,
             linear_beta=linear_beta,

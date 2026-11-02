@@ -153,7 +153,7 @@ def test_only_single_group_tp8_blackwell_binds_the_chain(
         lambda: SimpleNamespace(is_blackwell=blackwell),
     )
     # Gating precedes any layer access, so a model without layers suffices.
-    model = SimpleNamespace(mapping=_mapping(**overrides), model=None)
+    model = SimpleNamespace(mapping=_mapping(**overrides), model=None, config=_config())
     assert KimiLinearForCausalLM._prepare_decode_moe(model) is False
 
 
@@ -230,7 +230,7 @@ def _decoder(layer_id: int, *, moe: bool):
         down_proj=_weight(f"{tag}.shared_down"),
     )
     block.gate = SimpleNamespace(
-        weight=f"{tag}.router", e_score_correction_bias=f"{tag}.bias"
+        weight=_Weight(f"{tag}.router"), e_score_correction_bias=f"{tag}.bias"
     )
     block.routed_scaling_factor = 2.5
     block.decode_moe = None
@@ -238,11 +238,35 @@ def _decoder(layer_id: int, *, moe: bool):
     return layer
 
 
-def _bindable(monkeypatch, layers, *, multicast=True):
+class _Weight(str):
+    """A named stand-in weight that reports the BF16 dtype the binding checks."""
+
+    dtype = torch.bfloat16
+
+
+def _config(**overrides):
+    config = SimpleNamespace(
+        hidden_act="situ",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+        moe_renormalize=True,
+        num_experts=896,
+        num_experts_per_token=16,
+        num_expert_group=1,
+        topk_group=1,
+        moe_router_activation_func="sigmoid",
+    )
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    return config
+
+
+def _bindable(monkeypatch, layers, *, multicast=True, pdl=True, **arg_overrides):
     _Owner.built.clear()
     monkeypatch.setattr(
         kimi_k3, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
     )
+    monkeypatch.setattr(kimi_k3, "pdl_enabled", lambda: pdl)
     monkeypatch.setattr(kimi_k3, "multicast_backend_available", lambda g: multicast)
     monkeypatch.setitem(
         sys.modules,
@@ -265,15 +289,13 @@ def _bindable(monkeypatch, layers, *, multicast=True):
     monkeypatch.setitem(args, "max_cudagraph_capture_size", 64)
     monkeypatch.setitem(args, "disable_cuda_graph_padding", False)
     monkeypatch.setitem(args, "mapping", _mapping())
+    monkeypatch.setitem(args, "disaggregation_mode", "null")
+    monkeypatch.setitem(args, "force_deterministic_rsag", False)
+    monkeypatch.setitem(args, "batch_invariant_collectives", False)
+    for name, value in arg_overrides.items():
+        monkeypatch.setitem(args, name, value)
     return SimpleNamespace(
-        mapping=_mapping(),
-        model=SimpleNamespace(layers=layers),
-        config=SimpleNamespace(
-            hidden_act="situ",
-            activation_situ_beta=4.0,
-            activation_situ_linear_beta=25.0,
-            moe_renormalize=True,
-        ),
+        mapping=_mapping(), model=SimpleNamespace(layers=layers), config=_config()
     )
 
 
@@ -287,6 +309,7 @@ def test_binding_hands_each_moe_layer_its_own_weights(monkeypatch):
     assert owner.kwargs == dict(
         group=("device", model.mapping.moe.tp_ep_group),
         batches=(1, 8),
+        verify_width=1,
         moe_layers=2,
         beta=4.0,
         linear_beta=25.0,
@@ -328,3 +351,62 @@ def test_a_group_without_multicast_is_not_bound(monkeypatch):
     model = _bindable(monkeypatch, layers, multicast=False)
     assert KimiLinearForCausalLM._prepare_decode_moe(model) is False
     assert not _Owner.built
+
+
+@pytest.mark.parametrize(
+    "bind_overrides,config_overrides",
+    [
+        ({"disaggregation_mode": "prefill"}, {}),
+        ({"pdl": False}, {}),
+        ({"force_deterministic_rsag": True}, {}),
+        ({"batch_invariant_collectives": True}, {}),
+        ({}, {"activation_situ_linear_beta": None}),
+        ({}, {"num_experts": 384}),
+        ({}, {"num_experts_per_token": 8}),
+        ({}, {"num_expert_group": 8}),
+        ({}, {"moe_router_activation_func": "softmax"}),
+    ],
+    ids=[
+        "prefill-role",
+        "pdl-off",
+        "deterministic-rsag",
+        "batch-invariant",
+        "no-linear-beta",
+        "384-experts",
+        "top-8",
+        "grouped-routing",
+        "softmax-router",
+    ],
+)
+def test_modes_and_routing_the_kernels_do_not_serve_are_not_bound(
+    monkeypatch, bind_overrides, config_overrides
+):
+    layers = [_decoder(i, moe=True) for i in range(2)]
+    model = _bindable(monkeypatch, layers, **bind_overrides)
+    for name, value in config_overrides.items():
+        setattr(model.config, name, value)
+    assert KimiLinearForCausalLM._prepare_decode_moe(model) is False
+    assert not _Owner.built
+
+
+def test_a_non_bf16_router_is_not_bound(monkeypatch):
+    layers = [_decoder(i, moe=True) for i in range(2)]
+    layers[1].block_sparse_moe.gate.weight = SimpleNamespace(dtype=torch.float32)
+    model = _bindable(monkeypatch, layers)
+    assert KimiLinearForCausalLM._prepare_decode_moe(model) is False
+    assert not _Owner.built
+
+
+def test_speculative_decoding_hands_the_chain_its_verify_width(monkeypatch):
+    layers = [_decoder(i, moe=True) for i in range(2)]
+    model = _bindable(
+        monkeypatch,
+        layers,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+    assert KimiLinearForCausalLM._prepare_decode_moe(model) is True
+    (owner,) = _Owner.built
+    # Verify graphs of 1 and 8 requests run 8 and 64 rows.
+    assert owner.kwargs["verify_width"] == 8
+    assert owner.kwargs["batches"] == (8, 64)

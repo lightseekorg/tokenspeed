@@ -482,3 +482,11 @@ re-arms what it read, so the chain needs no separate reset and replays in a
 CUDA graph. Every rank must run the same batches, since each mailbox is shared
 by the group. Other row counts and every non-decode forward keep the TRT-LLM
 MoE.
+
+The model binds the chain only where its kernels apply: 896 experts with
+ungrouped sigmoid top-16 routing, a linear SiTU cap, a BF16 router, PDL
+enabled, no deterministic or batch-invariant reduction mode, and not on a
+prefill-only disaggregated node. Under speculative decoding the shared expert
+uses the splits tuned for verify steps. Each MoE layer keeps a contiguous copy
+of its router rows and latent-down shard (about 7.7 MiB per layer at TP8)
+beside the mailboxes and scratch.
