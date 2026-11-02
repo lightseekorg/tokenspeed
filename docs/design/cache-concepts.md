@@ -1850,7 +1850,14 @@ backend base reads a local cache in place and rebuilds one dealt over owners
 by all-gathering each owner's rows as raw cache-dtype bytes, bitwise the
 unsharded read; a leaf declaring `supports_mla_dcp` only hands it each
 prefill's prefix loops and host page table (`_prepare_prefix_history`), so
-planning the gathers never waits on the device. The gathers run on a named
+planning the gathers never waits on the device. Chunk planning shares the fixed
+history-expansion capacity among requests with remaining prefix rows. Finished
+requests release their share to the others; the total expansion never exceeds
+the existing buffer capacity. Both local slot reads and owner-count planning
+consume the same host per-request boundaries, including partial pages. Small
+partitions (an initial share below 1024 rows) retain equal-width chunks to avoid
+amplifying FP8 attention rounding when changing the softmax partitioning.
+The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse

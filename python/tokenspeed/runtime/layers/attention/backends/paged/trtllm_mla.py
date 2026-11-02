@@ -319,12 +319,16 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         )
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
+        # The host chunk boundaries only feed the distributed prefix-history
+        # gather (KVP), which this backend does not support: it reads every
+        # history row from its own pool, so the boundaries are not needed here.
         (
             chunked_loop_num,
             chunk_kv_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            _chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
