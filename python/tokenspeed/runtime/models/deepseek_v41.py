@@ -907,11 +907,7 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
             raise ValueError("V4.1 model query sharding requires pure prefill")
         if layer_id < ced_decoder_start:
             return V41RowPlan(full, full, None, shard, shard)
-        # Attention needs compute ownership only. The output stage separately
-        # supplies valid sampled rows; open-chunk compute rows are not outputs.
-        local = backend.partition_prefill_queries(
-            shard, sampled_rows_cpu=torch.empty(0, dtype=torch.int64)
-        )
+        local = backend.prefill_query_shard()
         view = backend.decoder_view()
         if layer_id == ced_decoder_start:
             return V41RowPlan(
@@ -2486,11 +2482,8 @@ class DeepseekV41Model(nn.Module):
             and ctx.capture_hidden_mode.need_capture()
         )
         if ctx.query_shard is not None:
-            if view.logits_rows_cpu is None:
-                raise RuntimeError("V4.1 QCP output requires host sampled-row metadata")
-            plan = _row_plan(
-                self.ced_decoder_start + 1, self.ced_decoder_start, ctx
-            ).query_shard
+            local = ctx.attn_backend.prefill_query_shard()
+            plan = local.decoder_plan
             if capture:
                 # DSpark writes replicated SWA-window fields before PD transfer.
                 # Gather CED taps, not the full encoder span or just sampled rows.
@@ -2502,8 +2495,6 @@ class DeepseekV41Model(nn.Module):
                     list(plan.row_counts),
                 )
                 captured = list(packed.split(widths, dim=-1))
-            sampled = torch.tensor(view.logits_rows_cpu, dtype=torch.int64)
-            plan = replace(plan, sampled_rows_per_rank=plan.rows_per_rank(sampled))
             if plan.sampled_rows_total != ctx.output_layout.num_output_tokens:
                 raise RuntimeError(
                     "V4.1 QCP output ownership disagrees with output layout"
@@ -2512,7 +2503,7 @@ class DeepseekV41Model(nn.Module):
                 hidden = gather_sampled_rows(
                     hidden,
                     plan,
-                    sampled.to(device=hidden.device),
+                    local.sampled_rows,
                     group=self.mapping.attn.qcp_group,
                 )
             else:

@@ -23,10 +23,13 @@
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_block_to_local
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
-def _pack_decode_history(
+def _history_pack(
     cache,
     table,
     visible_rows,
@@ -69,22 +72,38 @@ def _pack_decode_history(
     )
 
 
-def pack_decode_history(
+@register_kernel(
+    "attention",
+    "dsv41_history_pack",
+    name="triton_dsv41_history_pack",
+    solution="triton",
+    signatures=[format_signature(x=dense_tensor_format(torch.uint8))],
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_history_pack(
     cache: torch.Tensor,
     table: torch.Tensor,
     visible_rows: torch.Tensor,
-    *,
     virtual_block_count: int,
     degree: int,
     rank: int,
 ) -> torch.Tensor:
     """Prepare uint8 history for MAX reduction, including a zero null page.
 
-    cache is a possibly strided [local_pages, 64, row_bytes] field; table
-    contains virtual pages and may be strided. visible_rows is a device
-    scalar. Nonowners, invalid pages and pages beyond visible_rows contribute
-    zero. A partially visible page retains all bytes, including its scales.
-    The returned contiguous tensor has shape [table.numel() + 1, 64, row_bytes].
+    Args:
+        cache: GPU uint8 [local_pages, 64, row_bytes] field, possibly strided.
+        table: Integer [pages] virtual page table, possibly strided.
+        visible_rows: Integer device scalar bounding the visible rows.
+        virtual_block_count: Virtual pages of the placement; larger ids are
+            invalid.
+        degree: Ranks the pages are placed over, page-cyclically.
+        rank: This rank's position among them.
+
+    Returns:
+        Contiguous [pages + 1, 64, row_bytes]. Nonowners, invalid pages and
+        pages beyond visible_rows contribute zero, as does the null page. A
+        partially visible page retains all bytes, including its scales.
     """
     if cache.ndim != 3 or cache.shape[1] != 64 or cache.dtype != torch.uint8:
         raise ValueError("History requires uint8 [pages, 64, row_bytes]")
@@ -109,7 +128,7 @@ def pack_decode_history(
     ):
         raise ValueError("History cache does not cover the placement")
     result = cache.new_empty((table.numel() + 1, 64, cache.shape[2]))
-    _pack_decode_history[(table.numel() + 1, triton.cdiv(64 * cache.shape[2], 1024))](
+    _history_pack[(table.numel() + 1, triton.cdiv(64 * cache.shape[2], 1024))](
         cache,
         table,
         visible_rows,

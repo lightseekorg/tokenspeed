@@ -680,10 +680,9 @@ class RowShardedEngramEmbedding(nn.Module):
 
         Without a query shard, TP peers pass identical indices. A query shard
         gathers IDs and reduce-scatters table contributions to its local rows.
-        Shared host tables gather the
-        full copy and skip the all-reduce. GPU and host-sharded tables expand
-        only local rows and reduce. Dequantization uses the same FP8/E8M0
-        torch casts in both paths.
+        Shared host tables gather the full copy and skip the all-reduce. GPU
+        and host-sharded tables expand only local rows and reduce.
+        Dequantization uses the same FP8/E8M0 torch casts in both paths.
         """
         sharded = query_shard is not None and query_shard.size > 1
         if sharded:

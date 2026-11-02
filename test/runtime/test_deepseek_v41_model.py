@@ -3733,11 +3733,19 @@ def test_model_qcp_ced_communication_and_outputs(
         with torch.device("meta"):
             model = DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu")
         backend = _backend("cpu", 2)
-        meta = _extend(backend, _tables("cpu"), lengths, prefixes, [0, 0], prompts)
-        view = backend.decoder_view()
         plan = QueryShardPlan.from_forward(
             total_tokens=total, input_lengths=lengths, size=4, rank=rank
         )
+        meta = _extend(
+            backend,
+            _tables("cpu"),
+            lengths,
+            prefixes,
+            [0, 0],
+            prompts,
+            query_shard=plan,
+        )
+        view = backend.decoder_view()
         ctx = _ctx(backend, total, ForwardMode.EXTEND)
         ctx.bs = ctx.num_extends = 2
         ctx.output_layout = ForwardOutputLayout.from_prefill(
@@ -3749,7 +3757,7 @@ def test_model_qcp_ced_communication_and_outputs(
         )
         ctx.query_shard = plan
         ctx.collective_num_tokens = view.metadata.positions.numel()
-        local = backend.partition_prefill_queries(plan, sampled_rows_cpu=sample_encoder)
+        local = backend.prefill_query_shard()
         for layer_id in (2, 20, 24):
             layer = model.layers[layer_id]
             ffn_ctx = layer._ffn_context(ctx)
@@ -3983,9 +3991,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             # deterministic taps must be restored byte-for-byte across uneven
             # CED owners, including ranks with no local rows.
             view = backend.decoder_view()
-            local = backend.partition_prefill_queries(
-                plan, sampled_rows_cpu=torch.tensor([length - 1])
-            )
+            local = backend.prefill_query_shard()
             full = (
                 torch.arange(
                     view.metadata.positions.numel() * config.hidden_size,

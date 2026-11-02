@@ -570,8 +570,10 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
     tables = _tables("cuda")
     reference = _backend("cuda", 2)
 
-    def prepare(backend):
-        return _extend(backend, tables, lengths, [0, 0], [0, 0], lengths)
+    def prepare(backend, plan=None):
+        return _extend(
+            backend, tables, lengths, [0, 0], [0, 0], lengths, query_shard=plan
+        )
 
     meta = prepare(reference)
     before = reference.cache_pool.arena.buffer.clone()
@@ -616,10 +618,10 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
         attention.load_state_dict(reference_attention.state_dict())
         backend = _backend("cuda", 2)
         backend.cache_pool.arena.buffer.copy_(before)
-        local_meta = prepare(backend)
         plan = QueryShardPlan.from_forward(
             total_tokens=total, input_lengths=lengths, size=4, rank=rank
         )
+        local_meta = prepare(backend, plan)
         ctx = _ctx(backend, total, ForwardMode.EXTEND)
         ctx.query_shard = plan
         row_plan = v41._row_plan(layer, 20, ctx)

@@ -119,13 +119,18 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             raise ValueError(
                 "V4.1 indexer query parallel size must be 1 or attention TP"
             )
+        if attn.has_head_tp:
+            # The model shards heads over head TP without a head/token
+            # exchange, which is only correct for ranks holding the same rows.
+            raise ValueError(
+                "V4.1 does not support --attn-head-tp-size; its heads shard "
+                "over attention TP, or are replicated under model QCP"
+            )
         if attn.has_qcp:
             if server_args.disaggregation_mode != "prefill":
                 raise ValueError(
                     "V4.1 model QCP currently requires the PD prefill role"
                 )
-            if attn.head_tp_size != 1:
-                raise ValueError("V4.1 model QCP requires head TP=1")
             if (
                 not server_args.disable_prefill_graph
                 or server_args.enable_mixed_batch
@@ -139,7 +144,9 @@ class DeepseekV41Config(SoftmaxAttnConfig):
                 query_size != 1
                 or server_args.deepseek_v41_attention_query_parallel_size != 1
             ):
-                raise ValueError("V4.1 model QCP cannot combine with aggregate QCP")
+                raise ValueError(
+                    "V4.1 model QCP cannot combine with operator-level QCP"
+                )
         query_rank = attn.tp_rank if query_size > 1 else 0
         query_group = (
             attn.tp_group if query_size > 1 else (attn.tp_group[attn.tp_rank],)

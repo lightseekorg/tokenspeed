@@ -44,7 +44,7 @@ holds (``V41Metadata.global_write_floor``).
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import torch
@@ -54,9 +54,7 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_ops import all_gather, token_all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.backends.base import (
-    AttentionBackend,
-)
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -200,16 +198,18 @@ class V41DecoderView(NamedTuple):
 
 
 class V41PrefillQueryShard(NamedTuple):
-    """Local row maps; cache-production metadata stays in the full layout.
+    """This rank's rows of a model-wide QCP prefill, planned once per forward.
 
-    source_rows selects this rank's encoder inputs. keep_rows selects its CED
-    outputs from those inputs. decoder_plan.local_slice selects the same rows
-    from the existing global decoder view, without redistributing ownership.
+    Cache-production metadata stays in the full layout. keep_rows selects
+    this rank's CED decoder rows from its encoder rows. decoder_plan splits
+    the decoder view's rows at the encoder shard boundaries, without
+    redistributing ownership; its sampled rows are the view's logits rows,
+    which sampled_rows holds on the device in the view's layout.
     """
 
-    source_rows: slice
     keep_rows: torch.Tensor
     decoder_plan: QueryShardPlan
+    sampled_rows: torch.Tensor
 
 
 @dataclass
@@ -319,6 +319,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._swa_plans: dict[tuple[ForwardMode, int], V41SWAQueryPlan] = {}
         self._prefill_spans: tuple[V41PrefillSpan, ...] = ()
         self._decoder_view: V41DecoderView | None = None
+        self._prefill_query_shard: V41PrefillQueryShard | None = None
         self._decode_schedule_keepalive: list[object] = []
         # One native decode schedule per distinct (SWA lengths, global lengths)
         # pair within a forward; layers reusing a selection share it.
@@ -369,6 +370,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._swa_plans.clear()
         self._prefill_spans = ()
         self._decoder_view = None
+        self._prefill_query_shard = None
         self._decode_schedule_keepalive.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -508,6 +510,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             copy_page_table(src, dest, actual_bs)
         meta.num_extends = num_extends
         self.forward_metadata = self.forward_decode_metadata = meta
+        self._prefill_query_shard = None
         from tokenspeed_kernel.ops.attention.dsv41 import decode_rows
 
         decode_rows(
@@ -647,7 +650,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 len(self.spec.indexer_query_group) > 1
                 or len(self.spec.attention_query_group) > 1
             ):
-                raise ValueError("V4.1 model QCP cannot combine with aggregate QCP")
+                raise ValueError(
+                    "V4.1 model QCP cannot combine with operator-level QCP"
+                )
         if self.kvp_size > 1:
             if (
                 not forward_mode.is_extend()
@@ -779,6 +784,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decoder_view = self._build_decoder_view(
             meta, completes, window, forward_mode
         )
+        self._prefill_query_shard = (
+            None
+            if query_shard is None
+            else self._partition_prefill_queries(query_shard)
+        )
         self.sparse_topk.clear()
 
     def _build_decoder_view(
@@ -891,21 +901,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise RuntimeError("V4.1 metadata has not been prepared for this forward")
         return self._decoder_view
 
-    def partition_prefill_queries(
-        self, plan: QueryShardPlan, *, sampled_rows_cpu: torch.Tensor
-    ) -> V41PrefillQueryShard:
+    def prefill_query_shard(self) -> V41PrefillQueryShard:
+        """This rank's rows of the current model-wide QCP prefill."""
+        if self._prefill_query_shard is None:
+            raise RuntimeError("V4.1 metadata was not prepared with a query shard")
+        return self._prefill_query_shard
+
+    def _partition_prefill_queries(self, plan: QueryShardPlan) -> V41PrefillQueryShard:
         """Derive encoder/CED row ownership without slicing cache-write plans.
 
-        sampled_rows_cpu contains only valid output rows, in the full encoder
-        layout, not the retained numerical-shape rows of incomplete requests.
-        Planning uses host spans and host sampled rows; it never copies a GPU
-        selection to the host or treats a rank boundary as a cache prefix.
+        Planning uses host spans and the decoder view's host logits rows; it
+        never copies a GPU selection to the host or treats a rank boundary as
+        a cache prefix. Device row maps are uploaded once per forward.
         """
-        meta = self.query_metadata(ForwardMode.EXTEND)
-        if self.forward_decode_metadata.positions.numel():
-            raise ValueError("V4.1 query shards require a pure prefill batch")
-        if plan.total_rows != meta.positions.numel():
-            raise ValueError("V4.1 query shard size disagrees with prefill rows")
         view = self.decoder_view()
         sources = {span.request: span for span in self._prefill_spans}
         kept = []
@@ -921,25 +929,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError("V4.1 CED rows fall outside their source request")
             kept.extend(range(start, start + span.count))
         kept_cpu = torch.tensor(kept, dtype=torch.int64)
-        counts = plan.rows_per_rank(kept_cpu)
-        sampled_counts = plan.rows_per_rank(sampled_rows_cpu)
-        if sampled_rows_cpu.numel():
-            if (sampled_rows_cpu < 0).any():
-                raise ValueError("V4.1 sampled rows must be nonnegative")
-            locations = torch.searchsorted(kept_cpu, sampled_rows_cpu)
-            if (locations >= kept_cpu.numel()).any() or not torch.equal(
-                kept_cpu[locations], sampled_rows_cpu
-            ):
-                raise ValueError("V4.1 sampled rows must survive CED narrowing")
         decoder_plan = QueryShardPlan(
             size=plan.size,
             rank=plan.rank,
-            row_counts=counts,
-            sampled_rows_per_rank=sampled_counts,
+            row_counts=plan.rows_per_rank(kept_cpu),
+            sampled_rows_per_rank=(0,) * plan.size,
+        )
+        # Logits rows index the view, whose rows the decoder plan splits.
+        sampled_cpu = torch.tensor(view.logits_rows_cpu, dtype=torch.int64)
+        decoder_plan = replace(
+            decoder_plan,
+            sampled_rows_per_rank=decoder_plan.rows_per_rank(sampled_cpu),
         )
         local = kept_cpu[decoder_plan.local_slice] - plan.local_start
         return V41PrefillQueryShard(
-            plan.local_slice, local.to(device=self.device), decoder_plan
+            self._upload_int64(local.tolist()),
+            decoder_plan,
+            (
+                view.logits_rows
+                if view.logits_rows is not None
+                else self._upload_int64(sampled_cpu.tolist())
+            ),
         )
 
     def _window(self, positions, requests, forward_mode):
@@ -1328,7 +1338,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     def plan_indexer_queries(
         self, layer_id, positions, requests, forward_mode, index_process_group
     ) -> InterleavedQueryPlan | None:
-        """Plan encoder aggregate indexer QCP rows before projection using shared host metadata."""
+        """Plan encoder indexer QCP rows before projection using shared host metadata."""
         owner = self.spec.kv_owners[layer_id]
         source = self.spec.index_sources[layer_id]
         group = self.spec.indexer_query_group
@@ -1409,7 +1419,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 projected_partition is not None
                 or len(self.spec.indexer_query_group) > 1
             ):
-                raise ValueError("Model QCP cannot combine with aggregate indexer QCP")
+                raise ValueError(
+                    "Model QCP cannot combine with operator-level indexer QCP"
+                )
             source_window = self._window(positions, request_indices, forward_mode)
             if source_window is None or positions.numel() != query_shard.total_rows:
                 raise ValueError(
@@ -1552,7 +1564,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._partitioned_index_layers.add(layer_id)
                 if self.spec.indexer_query_rank == 0:
                     logging.getLogger(__name__).info(
-                        f"V4.1 aggregate indexer QCP: layer={layer_id}, "
+                        f"V4.1 indexer QCP: layer={layer_id}, "
                         f"layout=interleave, size={partition.size}, "
                         f"global_rows={partition.total_rows}, local_rows={n}, "
                         f"local_projection={projected_partition is not None}"
@@ -2039,7 +2051,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError("V4.1 layer_id is outside the backbone")
             if len(self.spec.attention_query_group) > 1:
                 raise ValueError(
-                    "Model QCP cannot combine with aggregate attention QCP"
+                    "Model QCP cannot combine with operator-level attention QCP"
                 )
             if positions.numel() != key_rows.plan.total_rows:
                 raise ValueError("V4.1 SWA source rows disagree with the query shard")
@@ -2394,7 +2406,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ):
                 if layer_id not in self._attention_exchange_layers:
                     logging.getLogger(__name__).info(
-                        f"V4.1 aggregate attention QCP: layer={layer_id}, "
+                        f"V4.1 prefill attention QCP: layer={layer_id}, "
                         f"size={len(group)}, rows={request_q.shape[0]}, "
                         f"local_heads={request_q.shape[1]}"
                     )

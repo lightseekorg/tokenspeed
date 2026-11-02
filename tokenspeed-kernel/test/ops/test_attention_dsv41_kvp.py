@@ -18,14 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from test.utils import assert_no_triton_compile
+"""Owner-local V4.1 history pages for the KVP byte-wise MAX all-reduce."""
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.dsv41._triton.kvp import (
-    _pack_decode_history,
-    pack_decode_history,
-)
+from tokenspeed_kernel.ops.attention import dsv41
+from tokenspeed_kernel.ops.attention.dsv41._triton.kvp import _history_pack
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 
@@ -51,7 +50,7 @@ def test_pack_history_bytes(width, degree, rows):
     ).repeat_interleave(2)[::2]
     visible = torch.tensor(rows, dtype=torch.int32, device="cuda")
     for rank in range(degree):
-        actual = pack_decode_history(
+        actual = dsv41.history_pack(
             cache, table, visible, virtual_block_count=17, degree=degree, rank=rank
         )
         torch.testing.assert_close(
@@ -67,7 +66,7 @@ def test_pack_history_graph_updates():
     visible = torch.tensor(1, dtype=torch.int64, device="cuda")
 
     def run():
-        return pack_decode_history(
+        return dsv41.history_pack(
             cache, table, visible, virtual_block_count=17, degree=8, rank=0
         )
 
@@ -91,13 +90,38 @@ def test_pack_history_capacity_does_not_recompile():
 
     def run(capacity):
         table = torch.ones(capacity, dtype=torch.int32, device="cuda")
-        return pack_decode_history(
+        return dsv41.history_pack(
             cache, table, visible, virtual_block_count=129, degree=8, rank=0
         )
 
     run(16)
-    with assert_no_triton_compile(_pack_decode_history):
+    with assert_no_triton_compile(_history_pack):
         for capacity in (0, 1, 17, 256):
             actual = run(capacity)
             assert actual.shape == (capacity + 1, 64, 132)
             assert torch.count_nonzero(actual) == 0
+
+
+def test_pack_history_reads_pages_past_int32_bytes():
+    # Local page offsets are runtime-scaled; the last pages of a pool past
+    # 2**31 bytes must not wrap. Only those pages are written and compared.
+    width, degree, rank = 132, 2, 1
+    pages = (1 << 31) // (64 * width) + 4
+    cache = torch.empty((pages, 64, width), dtype=torch.uint8, device="cuda")
+    local = torch.tensor([pages - 1, 1, pages - 3], device="cuda")
+    cache[local] = torch.randint(
+        0, 256, (local.numel(), 64, width), dtype=torch.uint8, device="cuda"
+    )
+    assert (pages - 1) * cache.stride(0) > 1 << 31
+    table = ((local - 1) * degree + rank + 1).to(torch.int32)
+    visible = torch.tensor(local.numel() * 64, dtype=torch.int32, device="cuda")
+    actual = dsv41.history_pack(
+        cache,
+        table,
+        visible,
+        virtual_block_count=(pages - 1) * degree + 1,
+        degree=degree,
+        rank=rank,
+    )
+    assert torch.count_nonzero(actual[0]) == 0
+    torch.testing.assert_close(actual[1:], cache[local], rtol=0, atol=0)

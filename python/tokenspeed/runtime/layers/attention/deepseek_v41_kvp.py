@@ -103,11 +103,9 @@ def gather_decode_history(
     ):
         raise ValueError("V4.1 decode history requires a page table and scalar length")
     if cache.is_cuda:
-        from tokenspeed_kernel.ops.attention.dsv41._triton.kvp import (
-            pack_decode_history,
-        )
+        from tokenspeed_kernel.ops.attention.dsv41 import history_pack
 
-        result = pack_decode_history(
+        result = history_pack(
             cache,
             table,
             visible_rows,
