@@ -42,8 +42,15 @@
 // after every plan no retraction image was refused once planned; and under
 // write-back, after every plan, the blocks evicted for the cache (by
 // admission, stranded suffix or restore) equal the sum of the drain's
-// outcomes. Once everything is acknowledged, no Host entry is pinned and
+// outcomes, the dead entries and unproven State checkpoints it dropped
+// included. Once everything is acknowledged, no Host entry is pinned and
 // nothing is in flight.
+//
+// The frequent runs turn on frequent State checkpoints with a small cap and a
+// chunk budget most prompts span several chunks of, each role under each
+// write policy, with and without the in-forward checkpoint (and the dead
+// checkpoints it skips); their prompts repeat and extend earlier ones more
+// often, so the checkpoints get hit.
 //
 // The random runs acknowledge op by op, out of order and now and then twice.
 // The mirrored runs drive two schedulers of one seed, as two ranks of a
@@ -61,6 +68,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -77,10 +85,32 @@ namespace {
 constexpr std::int32_t kP = 8;
 constexpr std::int32_t kRounds = 300;
 
+// What a run changes in its seed's draws. The defaults change nothing: every
+// draw is still made, so a seed keeps its random stream.
+struct LoopKnobs {
+    // Replaces the drawn SchedulerConfig::state_checkpoint_in_forward, which
+    // also skips the dead prompt ends and finishes, when set.
+    std::optional<bool> in_forward;
+    // Replaces the drawn write policy (true: write-back) when set.
+    std::optional<bool> write_back;
+    // A prompt draw below repeat_below repeats a live prompt; then one below
+    // continue_below continues a finished prompt, with new user tokens always
+    // under extend_always, otherwise half the time. Any other draw is a system
+    // prompt with new user tokens.
+    double repeat_below{0.15};
+    double continue_below{0.45};
+    bool extend_always{false};
+    // SchedulerConfig::frequent_state_checkpoints with this cap (0: off), and
+    // a chunk budget in place of 48 tokens (0: none).
+    std::int32_t frequent_cap{0};
+    std::int32_t chunk_budget{0};
+};
+
 struct ClosedLoop {
     std::mt19937 rng;
     Role role;
     bool mirrored;
+    LoopKnobs knobs;
     bool write_back{false};
     std::int32_t overlap_depth{0};
     std::int32_t kv_shards{1};
@@ -131,9 +161,10 @@ struct ClosedLoop {
     int Rand(int lo, int hi_exclusive) { return std::uniform_int_distribution<int>(lo, hi_exclusive - 1)(rng); }
     double Uniform() { return std::uniform_real_distribution<double>(0.0, 1.0)(rng); }
 
-    ClosedLoop(unsigned seed, Role loop_role, bool mirrored_ranks)
-        : rng(seed), role(loop_role), mirrored(mirrored_ranks) {
-        write_back = Rand(0, 2) == 0;
+    ClosedLoop(unsigned seed, Role loop_role, bool mirrored_ranks, LoopKnobs loop_knobs)
+        : rng(seed), role(loop_role), mirrored(mirrored_ranks), knobs(loop_knobs) {
+        // value_or's argument is evaluated either way: the draw is made.
+        write_back = knobs.write_back.value_or(Rand(0, 2) == 0);
         if (role == Role::kFused) {
             overlap_depth = 1;
             mixed = Rand(0, 2) == 0;
@@ -144,7 +175,7 @@ struct ClosedLoop {
             overlap_depth = Rand(0, 2);
         }
         const std::int32_t history_block = Rand(0, 2) == 0 ? kP : kP / 2;
-        const bool in_forward = Rand(0, 2) == 0;
+        const bool in_forward = knobs.in_forward.value_or(Rand(0, 2) == 0);
         const std::int32_t host_pages = std::vector<std::int32_t>{9, 17, 33}[Rand(0, 3)];
         kv_shards = std::vector<std::int32_t>{1, 2, 4, 8}[Rand(0, 4)];
         const std::int32_t device_pages = std::vector<std::int32_t>{24, 40, 64}[Rand(0, 3)];
@@ -158,12 +189,14 @@ struct ClosedLoop {
         cfg.disable_l2_cache = false;
         cfg.host_write_policy =
             write_back ? SchedulerConfig::HostWritePolicy::kWriteBack : SchedulerConfig::HostWritePolicy::kWriteThrough;
-        cfg.max_scheduled_tokens = 48;
+        cfg.max_scheduled_tokens = knobs.chunk_budget > 0 ? knobs.chunk_budget : 48;
         cfg.max_batch_size = 6;
         cfg.decode_input_tokens = 1;
         cfg.overlap_schedule_depth = overlap_depth;
         cfg.enable_mixed_prefill_decode = mixed;
         cfg.state_checkpoint_in_forward = in_forward;
+        cfg.frequent_state_checkpoints = knobs.frequent_cap > 0;
+        cfg.max_unproven_state_checkpoints = knobs.frequent_cap;
         cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "full_attention",
                                                     .block_granularity = history_block,
                                                     .total_pages = (device_pages - 1) * packing + 1,
@@ -232,13 +265,13 @@ struct ClosedLoop {
             }
             const double draw = Uniform();
             std::vector<std::int32_t> tokens;
-            if (draw < 0.15 && !live.empty()) {
+            if (draw < knobs.repeat_below && !live.empty()) {
                 auto it = live.begin();
                 std::advance(it, Rand(0, static_cast<int>(live.size())));
                 tokens = it->second.prompt;
-            } else if (draw < 0.45 && !done.empty()) {
+            } else if (draw < knobs.continue_below && !done.empty()) {
                 tokens = done[static_cast<std::size_t>(Rand(0, static_cast<int>(done.size())))];
-                if (Uniform() < 0.5) {
+                if (knobs.extend_always || Uniform() < 0.5) {
                     tokens.insert(tokens.end(), user.begin(), user.end());
                 }
             } else {
@@ -401,12 +434,13 @@ struct ClosedLoop {
             // The blocks evicted for the cache (by admission, stranded suffix
             // or restore, including reusable released inputs) add up to the drain's outcomes: a Host entry
             // already, carried by a store in flight, without Host room,
-            // copied, or dropped as dead; recopied and cancelled blocks are
-            // among the copied ones. The counts are cumulative, so the first
-            // round they differ ends the run.
+            // copied, or dropped as dead or as unproven frequent State
+            // checkpoints; recopied and cancelled blocks are among the copied
+            // ones. The counts are cumulative, so the first round they differ
+            // ends the run.
             const TierTransferManager::WriteBackStats& eviction = stats.eviction_stores;
-            std::uint64_t outcomes =
-                eviction.host_cached + eviction.in_flight + eviction.no_placement + stats.dead_entries_not_written_back;
+            std::uint64_t outcomes = eviction.host_cached + eviction.in_flight + eviction.no_placement +
+                                     stats.dead_entries_not_written_back + stats.unproven_entries_not_written_back;
             for (const std::uint64_t blocks : eviction.blocks) {
                 outcomes += blocks;
             }
@@ -582,7 +616,7 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     std::uint64_t aborts = 0;
     std::uint64_t handoffs = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
-        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false);
+        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false, LoopKnobs{});
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
                                           << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
         try {
@@ -618,7 +652,7 @@ TEST(ClosedLoopRandomTest, MirroredPrefillSchedulersPlanAlike) {
     // prefix loads the runs made.
     std::map<std::pair<bool, std::int32_t>, std::pair<std::uint64_t, std::uint64_t>> exercised;
     for (unsigned seed = 16; seed < 32; ++seed) {
-        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true);
+        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true, LoopKnobs{});
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
                                           << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
         try {
@@ -655,7 +689,7 @@ TEST(ClosedLoopRandomTest, FusedRoleNeverRaisesAndDrains) {
     std::uint64_t decode_only_write_backs = 0;
     std::uint64_t aborts = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
-        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/false);
+        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/false, LoopKnobs{});
         SCOPED_TRACE(::testing::Message()
                      << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " mixed "
                      << loop.mixed << " capacity retraction " << loop.capacity_retraction << " knob "
@@ -696,7 +730,7 @@ TEST(ClosedLoopRandomTest, MirroredFusedSchedulersPlanAlike) {
     std::uint64_t write_backs = 0;
     std::uint64_t restores = 0;
     for (unsigned seed = 64; seed < 80; ++seed) {
-        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/true);
+        ClosedLoop loop(seed, Role::kFused, /*mirrored_ranks=*/true, LoopKnobs{});
         SCOPED_TRACE(::testing::Message()
                      << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " mixed "
                      << loop.mixed << " capacity retraction " << loop.capacity_retraction << " knob "
@@ -717,6 +751,51 @@ TEST(ClosedLoopRandomTest, MirroredFusedSchedulersPlanAlike) {
     }
     EXPECT_GT(write_backs, 0u);
     EXPECT_GT(restores, 0u);
+}
+
+// Frequent State checkpoints capped at one or four checkpoints, with a
+// 24-token chunk budget so that most prompts span several chunks: 16 seeds per
+// role, write policy and in-forward checkpoint (off, or on and skipping the
+// dead checkpoints), every fourth with mirrored ranks; seven prompts in ten
+// repeat a live prompt or extend a finished one, so the checkpoints get hit.
+// Under write-back the unproven checkpoints an eviction drops count among the
+// drain's outcomes.
+TEST(ClosedLoopRandomTest, FrequentStateCheckpointsNeverRaiseAndDrain) {
+    std::uint64_t trims = 0;
+    std::uint64_t dropped = 0;
+    for (const Role role : {Role::kP, Role::kFused}) {
+        for (const bool write_back : {false, true}) {
+            for (const bool in_forward : {false, true}) {
+                for (unsigned seed = 0; seed < 16; ++seed) {
+                    ClosedLoop loop(seed, role, /*mirrored_ranks=*/seed % 4 == 3,
+                                    LoopKnobs{.in_forward = in_forward,
+                                              .write_back = write_back,
+                                              .repeat_below = 0.15,
+                                              .continue_below = 0.7,
+                                              .extend_always = true,
+                                              .frequent_cap = seed % 2 == 0 ? 1 : 4,
+                                              .chunk_budget = 24});
+                    SCOPED_TRACE(::testing::Message() << "seed " << seed << (role == Role::kP ? " P" : " fused")
+                                                      << (write_back ? " write-back" : " write-through")
+                                                      << " in-forward " << in_forward << " shards " << loop.kv_shards);
+                    try {
+                        loop.Run();
+                    } catch (const std::exception& error) {
+                        ADD_FAILURE() << "raised: " << error.what();
+                        continue;
+                    }
+                    for (const std::unique_ptr<Scheduler>& scheduler : loop.schedulers) {
+                        EXPECT_EQ(scheduler->HostPoolPinnedBlocks(), 0);
+                        EXPECT_TRUE(scheduler->CanClearCache());
+                    }
+                    trims += static_cast<std::uint64_t>(loop.schedulers[0]->UnprovenStateCheckpointTrims());
+                    dropped += loop.schedulers[0]->GetHostCacheStats().unproven_entries_not_written_back;
+                }
+            }
+        }
+    }
+    EXPECT_GT(trims, 0u) << "the cap evicted unproven checkpoints";
+    EXPECT_GT(dropped, 0u) << "and write-back evictions dropped some";
 }
 
 }  // namespace tokenspeed::test
