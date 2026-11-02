@@ -2233,6 +2233,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         speculative_num_draft_tokens=0,
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
+        enable_qsa_prefill_bf16_scratch=False,
     )
 
     setup = prepare_cache_setup(
@@ -2399,6 +2400,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
         mapping=Mapping(rank=0, world_size=1),
+        enable_qsa_prefill_bf16_scratch=False,
     )
     return prepare_cache_setup(
         family="qwen4_exp",
