@@ -2295,9 +2295,16 @@ std::vector<CacheBlockRef> CacheCoordinator::TakeDeferredAdmissionHostPins() {
     return std::exchange(deferred_admission_host_pins_, {});
 }
 
+bool CacheCoordinator::HasDeferredEvictionPages() const {
+    return std::ranges::any_of(evicted_segments_, [](const EvictedSegment& segment) {
+        return std::ranges::any_of(segment.members,
+                                   [](const EvictedBlock& member) { return static_cast<bool>(member.device_ref); });
+    });
+}
+
 std::vector<CacheCoordinator::EvictedSegment> CacheCoordinator::TakeEvictedSegments() {
-    std::deque<EvictedSegment> recorded =
-        std::exchange(evicted_segments_, {});  // Union-find over the recording order: merged_into[s] leads to the
+    std::deque<EvictedSegment> recorded = std::exchange(evicted_segments_, {});
+    // Union-find over the recording order: merged_into[s] leads to the
     // segment s was merged with.
     std::vector<std::size_t> merged_into(recorded.size());
     std::iota(merged_into.begin(), merged_into.end(), std::size_t{0});

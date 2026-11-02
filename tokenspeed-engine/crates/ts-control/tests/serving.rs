@@ -2115,22 +2115,14 @@ async fn retracted_requests_resume_where_they_stopped() {
                     continue;
                 }
                 engine.settle().await;
-                // Under write-back a plan's WriteBack ops are one per image it
-                // stores to the Host and at most one for the cache it evicts:
-                // more of them than SnapshotStore ops write back evicted
-                // cache. Some plan restores and writes back what it evicted,
-                // on every rank.
-                for (rank, member) in engine.ranks.iter().enumerate() {
-                    let plans = member.plans.lock().unwrap();
-                    assert!(
-                        plans.iter().any(|(_, _, ops)| {
-                            let count = |kind| ops.iter().filter(|op| op.kind == kind).count();
-                            count(CacheOpKind::SnapshotRestore) > 0
-                                && count(CacheOpKind::WriteBack) > count(CacheOpKind::SnapshotStore)
-                        }),
-                        "rank {rank}, {case}: no restore wrote back what it evicted"
-                    );
-                }
+                // What an admission evicts is written back ahead of the
+                // admission itself, its pinned store deferring the admission
+                // until the store's agreed acknowledgment -- and a victim an
+                // in-flight store already covers needs no store of its own,
+                // so no bare op count proves the evictions were written back.
+                // The proof is below: every warm prompt sent again hits its
+                // full pages, and at least one of them comes back from the
+                // Host.
                 // What the restores evicted is on the Host: every warm prompt
                 // sent again hits its 2 full pages, on the Device or loaded
                 // back. Each one waits for the acknowledgments of the cache
@@ -2318,8 +2310,9 @@ async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
                 "{rid} on {layout:?}"
             );
         }
-        // The third prompt's admission evicts the first one's last pages; it
-        // decodes long enough to be aborted while it runs.
+        // The third prompt's admission evicts the first one's last pages and
+        // defers behind their pinned write-back: it waits in the waiting
+        // room when the test aborts it, its budget far from spent.
         let doomed = engine
             .client
             .generate(prompt("c", 20_000, 1000))
@@ -2332,25 +2325,26 @@ async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0, "{layout:?}");
-        // The engine streams nothing more for a client's own abort. Every
-        // rank releases the prompt before its budget runs out, with its
-        // write-back still unacknowledged.
+        // The engine streams nothing more for a client's own abort. C's
+        // admission defers behind the pinned write-back of what it evicted,
+        // whose acknowledgment the closed gate holds back: c has not
+        // forwarded yet, so no rank has released it. The abort takes effect
+        // at c's next forward -- once the gate opens below, c's admission
+        // completes and it ends there -- and c's write-back still lands.
         assert!(engine.client.abort("c").await.unwrap());
         drop(doomed);
         for _ in 0..500 {
-            if (0..engine.ranks.len()).all(|rank| engine.released_on(rank).len() == 3) {
+            if (0..engine.ranks.len()).all(|rank| engine.released_on(rank).len() == 2) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         for (rank, member) in engine.ranks.iter().enumerate() {
             let released = engine.released_on(rank);
-            assert_eq!(released.len(), 3, "rank {rank} on {layout:?}");
-            let (rid, generated) = &released[2];
-            assert_eq!(rid, "c", "rank {rank} on {layout:?}");
-            assert!(
-                *generated < 1000,
-                "rank {rank} on {layout:?}: generated {generated} tokens after the abort"
+            assert_eq!(
+                released.iter().map(|(rid, _)| rid.as_str()).collect::<Vec<_>>(),
+                ["a", "b"],
+                "rank {rank} on {layout:?}"
             );
             assert!(member.acknowledged.lock().unwrap().is_empty(), "{layout:?}");
             member.ack_gate.open();
@@ -2375,7 +2369,14 @@ async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
         assert!(engine.cache_ops(CacheOpKind::LoadBack) >= 1, "{layout:?}");
         assert_eq!(chunks.last().unwrap().cached_tokens, 187 * 16, "{layout:?}");
         engine.settle().await;
-        assert_eq!(engine.released_on(0).len(), 4, "{layout:?}");
+        // A, b and a-again ran to their budgets; c ended at its first
+        // forward once the gate let its deferred admission through.
+        let released = engine.released_on(0);
+        assert_eq!(
+            released.iter().map(|(rid, _)| rid.as_str()).collect::<Vec<_>>(),
+            ["a", "a-again", "b", "c"],
+            "{layout:?}"
+        );
         for rank in 1..engine.ranks.len() {
             assert_eq!(
                 engine.released_on(rank),
@@ -3201,22 +3202,14 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
         assert_eq!(cached, [0, 0, 0, 187 * 16], "{case}");
     }
 
-    // The device acknowledges nothing until the test opens its gate. While
-    // the third prompt's write-backs are unacknowledged, none of the pages
-    // they carry is reused from the Host. The first prompt sent again waits
-    // for those copies instead of recomputing a shorter prefix. Opening the
-    // gate lets it load them back, evicting the second prompt's last pages;
-    // the second prompt sent again loads those back too.
-    let (prefill, decode, _wire) = start_pd_pair(
-        1,
-        Layout::Single,
-        Tiers::HostL2WriteBack,
-        Setup {
-            held_cache_acks: true,
-            ..Setup::default()
-        },
-    )
-    .await;
+    // The same pair with the prompts' chain one link longer. An admission
+    // that evicts defers behind the pinned write-back and runs once its
+    // acknowledgment lands, so no page is reused from the Host before its
+    // store is acknowledged. The first prompt sent again loads the evicted
+    // pages back, evicting the second prompt's last pages; the second sent
+    // again loads those back too.
+    let (prefill, decode, _wire) =
+        start_pd_pair(1, Layout::Single, Tiers::HostL2WriteBack, Setup::default()).await;
     let mut cached = Vec::new();
     let prompts = [
         ("a", 0),
@@ -3230,16 +3223,12 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
             input_ids: Some((first + 1..=first + 3000).collect()),
             ..disaggregated(rid, room, 1, 2)
         };
-        let prefilled = prefill.client.generate(request.clone()).await.unwrap();
-        let decoded = decode.client.generate(request).await.unwrap();
-        if rid == "a-again" {
-            assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 0);
-            assert!(prefill.ranks[0].acknowledged.lock().unwrap().is_empty());
-            prefill.ranks[0].ack_gate.open();
-        }
-        let (prefilled, decoded) = tokio::join!(collect(prefilled), collect(decoded));
-        assert_eq!(tokens(&prefilled), [1000], "{rid} held");
-        assert_eq!(tokens(&decoded), [1000, 1001], "{rid} held");
+        let (prefilled, decoded) = tokio::join!(
+            run(&prefill.client, request.clone()),
+            run(&decode.client, request)
+        );
+        assert_eq!(tokens(&prefilled), [1000], "{rid}");
+        assert_eq!(tokens(&decoded), [1000, 1001], "{rid}");
         cached.push(prefilled.last().unwrap().cached_tokens);
     }
     // Both repeated prompts reuse all their full pages after the stores land.
@@ -3271,8 +3260,45 @@ async fn a_prefill_replica_writes_back_what_it_evicts_on_every_rank() {
         .await;
         let case = format!("{layout:?} at depth {depth}");
         let mut cached = Vec::new();
+        let mut covered = Vec::new();
         let prompts = [("a", 0), ("b", 10_000), ("c", 20_000), ("a-again", 0)];
         for (room, (rid, first)) in (70_u64..).zip(prompts) {
+            if rid == "a-again" {
+                // Let the first three prompts' releases settle on every
+                // rank, then land every acknowledgment of their stores and
+                // snapshot the write-backs so far: the rerun below loads the
+                // first prompt's pages back, and only those stores can carry
+                // them. The third prompt's own image store is planned by the
+                // rerun's arrival on the idle engine and publishes after the
+                // load-back, covering none of its pages.
+                prefill.settle().await;
+                let dispatched: usize = prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, _, ops)| ops.len())
+                    .sum();
+                for _ in 0..500 {
+                    if prefill
+                        .ranks
+                        .iter()
+                        .all(|rank| rank.acknowledged.lock().unwrap().len() == dispatched)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                covered = prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(_, _, ops)| ops.iter())
+                    .filter(|op| op.kind == CacheOpKind::WriteBack)
+                    .map(|op| op.op_id)
+                    .collect();
+            }
             let request = TokenizedGenerateReqInput {
                 input_ids: Some((first + 1..=first + 3000).collect()),
                 ..disaggregated(rid, room, 1, 2)
@@ -3313,9 +3339,14 @@ async fn a_prefill_replica_writes_back_what_it_evicts_on_every_rank() {
             .map(|rank| rank.acknowledged.lock().unwrap().clone())
             .collect();
         // The ranks poll in the same rounds, so their poll counts are one
-        // timeline: on every rank, the first prompt's load-back comes no
-        // earlier than the poll at which the slowest rank acknowledged the
-        // write-backs dispatched before it.
+        // timeline. A store publishes once every rank's acknowledgment of it
+        // has landed -- the agreed event alone advances the scheduler. The
+        // load-back reads the first prompt's pages, so it comes no earlier
+        // than the publication of the write-backs that can carry them: the
+        // ones dispatched before the wait above. What a-again's own arrival
+        // flushes afterwards borrows in-flight coverage instead -- its
+        // admission does not wait behind stores that cover none of the
+        // loaded pages.
         for (rank, rank_plans) in plans.iter().enumerate() {
             let load = rank_plans
                 .iter()
@@ -3324,17 +3355,23 @@ async fn a_prefill_replica_writes_back_what_it_evicts_on_every_rank() {
             let written_back: Vec<u32> = rank_plans[..load]
                 .iter()
                 .flat_map(|(_, _, ops)| ops)
-                .filter(|op| op.kind == CacheOpKind::WriteBack)
+                .filter(|op| op.kind == CacheOpKind::WriteBack && covered.contains(&op.op_id))
                 .map(|op| op.op_id)
                 .collect();
             let landed = acknowledged
                 .iter()
-                .flatten()
-                .filter(|&&(_, kind, op_id)| {
-                    kind == CacheEventKind::WriteBackDone && written_back.contains(&op_id)
+                .map(|rank_acks| {
+                    rank_acks
+                        .iter()
+                        .filter(|&&(_, kind, op_id)| {
+                            kind == CacheEventKind::WriteBackDone && written_back.contains(&op_id)
+                        })
+                        .map(|&(poll, _, _)| poll)
+                        .max()
+                        .unwrap_or(0)
                 })
-                .map(|&(poll, _, _)| poll)
-                .max()
+                .reduce(usize::max)
+                .filter(|&landed| landed > 0)
                 .unwrap_or_else(|| panic!("no write-back before the load on rank {rank}, {case}"));
             assert!(
                 rank_plans[load].0 >= landed,
@@ -3423,23 +3460,15 @@ async fn a_transfer_failing_on_one_prefill_rank_fails_on_every_rank() {
     assert_eq!(prefill.released_on(0), [("doomed".to_owned(), 0)]);
     assert_eq!(prefill.released_on(1), prefill.released_on(0));
 
-    // Under Host write-back, with the second rank holding back every cache
-    // acknowledgment, the transfer breaks on that rank once the doomed
-    // prompt's admission has written back what it evicted. Both ranks
-    // release the prompt alike, and once the acknowledgments land nothing is
-    // pinned or in flight: the cache flushes and serving goes on.
+    // Under Host write-back the transfer breaks on the second rank once the
+    // doomed prompt's admission has written back what it evicted: the
+    // admission defers behind its pinned store until the acknowledgment,
+    // then the transfer starts and fails. Both ranks release the prompt
+    // alike, and with the acknowledgments landed nothing is pinned or in
+    // flight: the cache flushes and serving goes on.
     for layout in [Layout::Tp(2), Layout::TpKvp(2, 2)] {
-        let (prefill, decode, wire) = start_pd_pair(
-            1,
-            layout,
-            Tiers::HostL2WriteBack,
-            Setup {
-                held_cache_acks: true,
-                ..Setup::default()
-            },
-        )
-        .await;
-        prefill.ranks[0].ack_gate.open();
+        let (prefill, decode, wire) =
+            start_pd_pair(1, layout, Tiers::HostL2WriteBack, Setup::default()).await;
         // Three 3000-token prompts fill the Device; the third evicts the
         // first one's last pages.
         let prompts = [("a", 0), ("b", 10_000), ("c", 20_000)];
@@ -3497,11 +3526,6 @@ async fn a_transfer_failing_on_one_prefill_rank_fails_on_every_rank() {
             "{layout:?}"
         );
         assert_eq!(prefill.released_on(1), prefill.released_on(0), "{layout:?}");
-        assert!(
-            prefill.ranks[1].acknowledged.lock().unwrap().is_empty(),
-            "{layout:?}"
-        );
-        prefill.ranks[1].ack_gate.open();
         let dispatched: usize = [CacheOpKind::WriteBack, CacheOpKind::LoadBack]
             .into_iter()
             .map(|kind| prefill.cache_ops(kind))
@@ -4117,9 +4141,10 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
     // The devices hold every cache acknowledgment until the test opens their
     // gates; then the odd ranks of a mirrored replica acknowledge three polls
     // late. Under write-through a finished request's prefix is stored to the
-    // Host; under write-back, what the third of three 3000-token prompts
-    // evicts of the first one. Either way the KV cache cannot be cleared, nor
-    // released, until the stores land.
+    // Host; under write-back the finished prompts' images are, and the third
+    // prompt's admission defers behind the pinned store of what it evicts.
+    // Either way the KV cache cannot be cleared, nor released, until the
+    // stores land.
     for layout in [Layout::Single, Layout::Tp(2), Layout::TpKvp(2, 2)] {
         for (tiers, prompts) in [
             (Tiers::HostL2, &[("r1", 0, 65)][..]),
@@ -4142,14 +4167,27 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
             )
             .await;
             for &(rid, first, len) in prompts {
-                let chunks = run(
-                    &engine.client,
-                    TokenizedGenerateReqInput {
-                        input_ids: Some((first + 1..=first + len).collect()),
-                        ..request(rid, 1, budget(2))
-                    },
-                )
-                .await;
+                let served = TokenizedGenerateReqInput {
+                    input_ids: Some((first + 1..=first + len).collect()),
+                    ..request(rid, 1, budget(2))
+                };
+                if write_back && rid == "c" {
+                    // C's admission defers behind the pinned write-back of
+                    // what it evicts, whose acknowledgment the closed gate
+                    // holds back: it never forwards while the gate holds.
+                    // Abort it; its store stays in flight below.
+                    let doomed = engine.client.generate(served).await.unwrap();
+                    for _ in 0..5000 {
+                        if engine.cache_ops(CacheOpKind::WriteBack) > 0 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    assert!(engine.client.abort("c").await.unwrap(), "{case}");
+                    drop(doomed);
+                    continue;
+                }
+                let chunks = run(&engine.client, served).await;
                 assert_eq!(tokens(&chunks), [1000, 1001], "{rid} on {case}");
             }
             for _ in 0..500 {
@@ -4200,9 +4238,9 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
             );
             // The first prompt is served exactly after the wake. Under
             // write-through it hits its full pages on the Host. Under
-            // write-back the Host holds only the first prompt's last pages,
-            // which continued a prefix the cleared Device alone held: nothing
-            // reaches them, and nothing hits.
+            // write-back the Host holds both finished prompts' images -- the
+            // aborted third never stored its own, so nothing evicted them --
+            // and the first prompt loads all its full pages back.
             let (_, first, len) = prompts[0];
             let chunks = run(
                 &engine.client,
@@ -4215,7 +4253,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
             assert_eq!(tokens(&chunks), [1000, 1001], "{case}");
             assert_eq!(
                 chunks.last().unwrap().cached_tokens,
-                if write_back { 0 } else { 64 },
+                if write_back { 187 * 16 } else { 64 },
                 "{case}"
             );
             // Each rank released and resumed the KV cache once; a follower may

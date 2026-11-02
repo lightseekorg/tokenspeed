@@ -36,8 +36,9 @@ plan, including cached sliding-window groups beside the State groups.
 The P role also runs with the history group's pages dealt over two and four
 KV-parallel shards under write-back, and over two under write-through. Every
 Host op is acknowledged zero to three plans late, out of order and now and
-then twice. Under write-back every write-back must be stream-ordered (no
-pinned source); every history copy keeps its two ends in one shard's bucket;
+then twice. Under write-back an in-place plan's eviction stores are
+stream-ordered while a deferred admission's pin their Device sources until
+the ACK; every history copy keeps its two ends in one shard's bucket;
 under either policy, once everything is acknowledged no Host entry is pinned
 and nothing is in flight. These rows declare the cache groups in a random
 order, as K3 declares a State group before its history group.
@@ -331,10 +332,10 @@ class _Loop:
         """The plan's cache copies, each acknowledged zero to three rounds on."""
         for op in plan.cache:
             if isinstance(op, ts.Cache.WriteBackOp):
-                if self.uses_write_back:
-                    assert not any(
-                        op.source_pinned
-                    ), "a write-back pins no Device source"
+                # Under write-back a deferred admission's eviction stores pin
+                # their Device sources until the ACK; an in-place plan's are
+                # stream-ordered. Either way the loop's end asserts nothing
+                # stays pinned or in flight once everything is acknowledged.
                 # A page's shard is (page id - 1) % kv_shards.
                 for groups, sources, destinations in zip(
                     op.group_ids, op.src_pages, op.dst_pages

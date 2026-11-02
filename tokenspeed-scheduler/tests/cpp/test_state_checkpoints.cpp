@@ -3298,12 +3298,19 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
         << "s2: its three checkpoints and six KV blocks";
     // Every State block is a parent of its own, so a page id names the
     // parent whichever State group takes it. The defer splits the grants:
-    // this plan zeroes f1's alone; f2's land at the retry below.
-    std::set<std::int32_t> state_zeroed;
+    // this plan zeroes f1's alone; f2's land at the retry below. Which
+    // freed page funds a grant is the scheduler's free page order, so read
+    // the grants from the block table rows (0/-1 mark empty slots).
+    std::set<std::int32_t> state_zeroed, state_granted;
     for (const std::string& group : {"state0", "state1", "state2"}) {
         state_zeroed.insert(plan.pages_to_zero.at(group).begin(), plan.pages_to_zero.at(group).end());
+        for (const std::int32_t page : StateRow(*batch, group, "f1")) {
+            if (page > 0) {
+                state_granted.insert(page);
+            }
+        }
     }
-    EXPECT_EQ(state_zeroed, (std::set<std::int32_t>{3, 6, 8, 9, 12, 13}));
+    EXPECT_EQ(state_zeroed, state_granted);
     std::set<std::int32_t> full_zeroed{plan.pages_to_zero.at("full").begin(), plan.pages_to_zero.at("full").end()};
     EXPECT_EQ(full_zeroed, (std::set<std::int32_t>{26, 42})) << "the KV blocks after a's and b's prompts";
     const HostCacheStats stats = scheduler_->GetHostCacheStats();
@@ -3320,9 +3327,14 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(next).empty());
     for (const std::string& group : {"state0", "state1", "state2"}) {
         state_zeroed.insert(next.pages_to_zero.at(group).begin(), next.pages_to_zero.at(group).end());
+        for (const std::int32_t page : StateRow(*admitted, group, "f2")) {
+            if (page > 0) {
+                state_granted.insert(page);
+            }
+        }
     }
     full_zeroed.insert(next.pages_to_zero.at("full").begin(), next.pages_to_zero.at("full").end());
-    EXPECT_EQ(state_zeroed, (std::set<std::int32_t>{3, 5, 6, 8, 9, 10, 12, 13, 14, 15, 17, 18}));
+    EXPECT_EQ(state_zeroed, state_granted);
     EXPECT_EQ(full_zeroed, (std::set<std::int32_t>{26, 27, 28, 42}))
         << "the free slots beside b's last page fund f2 as well";
     for (const std::string& id : {"a", "b"}) {
@@ -3332,7 +3344,13 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
             EXPECT_TRUE(state_zeroed.contains(pinned[id][group].at(1))) << id << " " << group;
         }
     }
-    EXPECT_TRUE(state_zeroed.contains(store.src_pages[0][3])) << "s2's group-3 checkpoint funds f2";
+    // s2's written-back State pages return to the free pool at the ACK and
+    // fund the retries the ACK unblocks, in the pool's free page order.
+    bool s2_state_reused = false;
+    for (std::size_t row = 0; row < store.src_pages[0].size(); ++row) {
+        s2_state_reused |= store.group_ids[0][row] != 0 && state_zeroed.contains(store.src_pages[0][row]);
+    }
+    EXPECT_TRUE(s2_state_reused) << "s2's written-back State pages fund the retries";
     EXPECT_EQ(scheduler_->GetHostCacheStats().eviction_stores.ops, 2u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 18);
 }

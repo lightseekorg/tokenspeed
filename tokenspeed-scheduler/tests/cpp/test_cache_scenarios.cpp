@@ -2089,6 +2089,88 @@ TEST_F(FusedRetractionL2TestSuite, TheImageWaitsForAnEarlierStoreThatCarriesOneO
     EXPECT_EQ(FindRestore(readmit)->request_ids, std::vector<std::string>{"r1"});
 }
 
+// Same pool arithmetic under the Host write-back policy: nothing streams to
+// the Host at publication, so a finished request's published pages stay
+// dirty until their eviction store lands.
+class WriteBackDeferralRetractionSuite : public FusedRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FusedRetractionL2TestSuite::MakeConfig();
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        return cfg;
+    }
+};
+
+TEST_F(WriteBackDeferralRetractionSuite, ADeferredAdmissionGatesRetractionLikeAPinnedStore) {
+    // f fills most of the pool and finishes: under write-back its pages stay
+    // published, dirty and cache-only. r1 and r2 decode beside them; when
+    // both grow into their third page the pool is empty, so their grants
+    // fund themselves by evicting f's blocks and defer behind the pinned
+    // eviction store. Between those admissions and the drain right after
+    // them, the victims sit in the deferred set: they gate retraction
+    // exactly like the in-flight pinned store they are about to become, so
+    // nobody is imaged for capacity the ACK is about to return.
+    Submit(MakeRequestSpec("f", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan f_prefill = PlanOnce();
+    SendForwardDone("f", {105});
+    SendFinish("f");
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/1));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/1, /*start=*/11));
+    ExecutionPlan prefill = PlanOnce();
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    ExecutionPlan first_decode = PlanOnce();
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    ExecutionPlan second_decode = PlanOnce();
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+
+    // The third-page grants defer behind f's eviction store: the round stays
+    // quiet, and in particular no snapshot store images anyone.
+    const ExecutionPlan blocked = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(FindSnapshotStore(blocked), nullptr)
+        << "the deferred eviction pages gate retraction; nobody is imaged for capacity the ACK returns";
+    const auto eviction_stores = ExtractCacheOpsOfKind<WriteBackBatch>(blocked);
+    ASSERT_FALSE(eviction_stores.empty()) << "the same plan drains the deferred eviction stores";
+    for (const CacheOperation& op : eviction_stores) {
+        const auto& store = std::get<WriteBackBatch>(op);
+        EXPECT_EQ(store.source_pinned, std::vector<bool>(store.source_pinned.size(), true));
+    }
+    const ForwardBatch* blocked_forward = FindForwardBatch(blocked);
+    ASSERT_TRUE(blocked_forward == nullptr || blocked_forward->request_ids.empty())
+        << "both third-page grants wait for the eviction store's ACK";
+    for (const CacheOperation& op : eviction_stores) {
+        for (const std::uint32_t id : std::get<WriteBackBatch>(op).op_ids) {
+            SendWriteBackDone(id);
+        }
+    }
+
+    // The ACK releases the victims' pins: both grants resume, neither having
+    // been retracted.
+    bool r1_resumed = false;
+    bool r2_resumed = false;
+    for (int round = 0; round < 4 && !(r1_resumed && r2_resumed); ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr) {
+            continue;
+        }
+        if (std::ranges::find(batch->request_ids, "r1") != batch->request_ids.end()) {
+            SendForwardDone("r1", {45});
+            r1_resumed = true;
+        }
+        if (std::ranges::find(batch->request_ids, "r2") != batch->request_ids.end()) {
+            SendForwardDone("r2", {145});
+            r2_resumed = true;
+        }
+    }
+    EXPECT_TRUE(r1_resumed && r2_resumed) << "the acknowledged eviction stores fund both retries";
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+}
+
 TEST_F(FusedRetractionL2TestSuite, FinishWhileRetractedReleasesTheImage) {
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));

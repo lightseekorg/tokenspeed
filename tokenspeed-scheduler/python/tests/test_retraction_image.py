@@ -282,11 +282,14 @@ def test_finish_while_retracted_releases_the_pins_at_the_acks() -> None:
 
 
 def test_under_write_back_the_image_copies_every_published_slot() -> None:
-    """Under the write-back policy nothing streams at publication, so a's
-    image copies every published slot to the Host itself -- none is a Host
-    entry already. Its restore needs pages the finished requests left as
-    Device cache: the plan that restores a writes them back, the store
-    listed ahead of the restore."""
+    """Under the write-back policy nothing streams at publication, so the
+    victim's image copies every published slot to the Host itself -- none is
+    a Host entry already. Whose image that is depends on the round the
+    retraction lands on: a deferred admission's pinned eviction store holds
+    the retraction off until its ACK, and the victim is whoever the capacity
+    block serves then. The restore needs pages the finished requests left as
+    Device cache: the plan that restores writes them back, the store listed
+    ahead of the restore."""
     cfg = _make_config()
     cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack
     scheduler = ts.Scheduler(cfg)
@@ -304,16 +307,18 @@ def test_under_write_back_the_image_copies_every_published_slot() -> None:
     for index, request_id in enumerate(request_ids):
         _advance(scheduler, request_id, [1000 + index])
 
-    a_row: list[int] = []
+    last_rows: dict[str, list[int]] = {}
     next_token = 2000
     for _ in range(16):
         plan = scheduler.next_execution_plan()
         op = _find_forward_op(plan)
         scheduled = () if op is None else tuple(op.request_ids)
+        if op is not None:
+            tables = dict(op.block_tables)["full"]
+            for index, request_id in enumerate(scheduled):
+                last_rows[request_id] = list(tables[index])
         if _ops(plan, ts.Cache.SnapshotOp):
             break
-        if "a" in scheduled:
-            a_row = list(dict(op.block_tables)["full"][scheduled.index("a")])
         _ack_write_backs(scheduler, plan, host_rows)
         for request_id in scheduled:
             _advance(scheduler, request_id, [next_token])
@@ -322,13 +327,15 @@ def test_under_write_back_the_image_copies_every_published_slot() -> None:
         pytest.fail("decode growth never retracted a request")
 
     [snapshot] = _ops(plan, ts.Cache.SnapshotOp)
+    [victim] = list(snapshot.request_ids)
     [write_back] = _ops(plan, ts.Cache.WriteBackOp)
     assert list(write_back.source_pinned) == [False]
     [stored_pages] = write_back.src_pages
-    assert sorted(stored_pages) == sorted(a_row)
+    victim_pages = [page for page in last_rows[victim] if page >= 0]
+    assert sorted(stored_pages) == sorted(victim_pages)
     stats = scheduler.host_cache_stats()
     assert stats.retraction_stores.ops == 1
-    assert list(stats.retraction_stores.blocks) == [5]
+    assert list(stats.retraction_stores.blocks) == [len(victim_pages)]
     assert stats.retraction_stores.host_cached == 0
     assert stats.retraction_stores.in_flight == 0
 
@@ -339,8 +346,9 @@ def test_under_write_back_the_image_copies_every_published_slot() -> None:
     done = ts.Cache.SnapshotDoneEvent()
     done.op_id = int(snapshot.op_ids[0])
     _ack(scheduler, done)
-    for request_id in ("b", "c", "d"):
-        _finish(scheduler, request_id)
+    for request_id in request_ids:
+        if request_id != victim:
+            _finish(scheduler, request_id)
 
     for _ in range(4):
         before = scheduler.host_cache_stats()
@@ -349,9 +357,9 @@ def test_under_write_back_the_image_copies_every_published_slot() -> None:
             break
         _ack_write_backs(scheduler, plan, host_rows)
     else:
-        pytest.fail("a was never restored")
+        pytest.fail(f"{victim} was never restored")
     after = scheduler.host_cache_stats()
-    assert list(_ops(plan, ts.Cache.RestoreOp)[0].request_ids) == ["a"]
+    assert list(_ops(plan, ts.Cache.RestoreOp)[0].request_ids) == [victim]
     assert (
         after.device_evictions.restore.blocks > before.device_evictions.restore.blocks
     )

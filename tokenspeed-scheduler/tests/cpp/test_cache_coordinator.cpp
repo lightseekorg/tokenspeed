@@ -74,8 +74,9 @@ TEST(CacheCoordinatorAdmissionBuckets, HostHitDestinationsPreserveSourceOwnershi
         }
         std::vector<BlockTable> tables(1);
         const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
-        auto admitted = coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt,
-                                          false, kNoInFlightStores);
+        auto admitted =
+            coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt, false,
+                              CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
         ASSERT_TRUE(admitted);
         EXPECT_EQ(admitted->host_prefix_tokens, 16);
         ASSERT_EQ(admitted->load_pairs.size(), hashes.size());
@@ -158,7 +159,8 @@ TEST(CacheCoordinatorPreparedKeysTest, ProbeOwnsKeysAfterRequestIsReleased) {
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{1}}};
     const auto admitted =
-        coordinator.Admit(std::move(probe), demands, RequestProgress{}, std::nullopt, false, kNoInFlightStores);
+        coordinator.Admit(std::move(probe), demands, RequestProgress{}, std::nullopt, false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
     ASSERT_TRUE(admitted);
     EXPECT_EQ(admitted->device_prefix_tokens, 6);
     EXPECT_EQ(tables[0].NumBlocks(), 4);
@@ -755,7 +757,8 @@ TEST(CacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
     };
     const std::optional<CacheCoordinator::AdmissionResult> first =
         coordinator.Admit(coordinator.ProbePrefix({}), first_demands, RequestProgress{}, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
 
     ASSERT_TRUE(first);
     ASSERT_EQ(first->new_page_ids.size(), 2u);
@@ -772,7 +775,8 @@ TEST(CacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
     };
     const std::optional<CacheCoordinator::AdmissionResult> tail =
         coordinator.Admit(coordinator.ProbePrefix({}), tail_demands, RequestProgress{}, first->access_epoch,
-                          /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
 
     ASSERT_TRUE(tail);
     ASSERT_EQ(tail->new_page_ids.size(), 2u);
@@ -804,7 +808,9 @@ TEST(CacheCoordinatorAdmissionTest, AcquireMatchedFullPrefixUsesOneAccessEpoch) 
     const std::array<std::int32_t, 1> no_new_tokens{0};
     std::vector<GroupDemand> hit_demands = FreshDemands(hit_tables, no_new_tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(hashes), hit_demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     std::vector<std::uint64_t> access_epochs;
     for (CacheBlockLocation location : locations) {
@@ -845,7 +851,8 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
     };
     const std::optional<CacheCoordinator::AdmissionResult> second =
         coordinator.Admit(coordinator.ProbePrefix({}), second_demands, second_progress, first->access_epoch,
-                          /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
     ASSERT_TRUE(second);
     EXPECT_EQ(second->access_epoch, first->access_epoch);
 
@@ -861,7 +868,8 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
     };
     const std::optional<CacheCoordinator::AdmissionResult> final =
         coordinator.Admit(coordinator.ProbePrefix({}), final_publication, final_progress, first->access_epoch,
-                          /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
     ASSERT_TRUE(final);
 
     for (const CacheBlockRef& block_ref : tables[0].Blocks()) {
@@ -901,7 +909,9 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
         GroupDemand{.table = &rejected_tables[0], .extent = DenseGrowth{4}},
     };
     EXPECT_FALSE(coordinator.Admit(std::move(probe), rejected_demands, RequestProgress{}, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                   /*evict_blocks_past_segments=*/false,
+                                   CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                   kNoInFlightStores));
     metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
     EXPECT_EQ(metadata->last_access_epoch, owner->access_epoch);
@@ -913,7 +923,8 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
     };
     const std::optional<CacheCoordinator::AdmissionResult> hit =
         coordinator.Admit(coordinator.ProbePrefix(hashes), hit_demands, RequestProgress{}, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
     ASSERT_TRUE(hit);
     EXPECT_EQ(hit->access_epoch, owner->access_epoch + 1);
 }
@@ -1005,7 +1016,9 @@ TEST(CacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshAccessEpoch) 
     for (int retry = 0; retry < 2; ++retry) {
         CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(std::span<const std::string>{hashes}.first(1));
         EXPECT_FALSE(coordinator.Admit(std::move(prefix), demands, RequestProgress{}, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                       /*evict_blocks_past_segments=*/false,
+                                       CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                       kNoInFlightStores));
         EXPECT_TRUE(tables[0].Blocks().empty());
         EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, cached_location));
         const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
@@ -1080,7 +1093,9 @@ TEST(CacheCoordinatorAdmissionTest, FreeCachedHitCostsNoAdditionalPlacement) {
     const std::array<std::int32_t, 1> tokens{4};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, hit_parent);
@@ -1103,7 +1118,8 @@ TEST(CacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilConsum
 
     const std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
     ASSERT_TRUE(result);
 
     EXPECT_TRUE(result->load_pairs.empty());
@@ -1133,7 +1149,9 @@ TEST(CacheCoordinatorAdmissionTest, HeterogeneousGroupsSharePartialAndEmptyParen
     const std::array<std::int32_t, 2> tokens{4, 4};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     ASSERT_EQ(tables[0].NumBlocks(), 1);
     EXPECT_EQ(tables[0].Blocks()[0]->Location(), (CacheBlockLocation{.lcm_block_id = hit_parent, .slot_index = 1}));
@@ -1158,7 +1176,9 @@ TEST(CacheCoordinatorAdmissionTest, PacksDemandBeforeConsumingAnotherGroupsOnlyP
     const std::array<std::int32_t, 2> tokens{8, 4};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     const std::int32_t packed_parent = tables[0].Blocks()[0]->Location().lcm_block_id;
@@ -1189,7 +1209,9 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithCompactPackingWhenGreedyFreeSlots
     const std::array<std::int32_t, 2> tokens{8, 8};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, tables[0].Blocks()[1]->Location().lcm_block_id);
@@ -1217,7 +1239,9 @@ TEST(CacheCoordinatorAdmissionTest, KeepsCachedChildrenWhenUnpackedPlacementFits
     const std::array<std::int32_t, 2> tokens{8, 0};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 2);
 }
@@ -1259,7 +1283,9 @@ TEST(CacheCoordinatorAdmissionTest, DoesNotShareFreeSlotsFromBoundForeignParent)
     const std::array<std::int32_t, 2> tokens{0, 4};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                   /*evict_blocks_past_segments=*/false,
+                                   CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                   kNoInFlightStores));
 
     EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{0});
     EXPECT_TRUE(tables[0].Blocks().empty());
@@ -1311,12 +1337,14 @@ TEST(CacheCoordinatorAdmissionTest, ScatteredAvailableSlotsWaitForAWholeParentTo
     const auto demands = FreshDemands(tables, std::array<std::int32_t, 2>{0, 4});
     for (int attempt = 0; attempt < 2; ++attempt) {
         EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false,
+                                       CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
                                        kNoInFlightStores));
         EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 8);
         EXPECT_TRUE(tables[1].Blocks().empty());
     }
     first.reset();
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
                                   kNoInFlightStores));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 4);
     EXPECT_EQ(tables[1].NumBlocks(), 1);
@@ -1346,7 +1374,9 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPermanen
     const std::array<std::int32_t, 1> no_new_tokens{0};
     std::vector<GroupDemand> hit_demands = FreshDemands(hit_tables, no_new_tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(std::span{hashes}.first(1)), hit_demands, RequestProgress{},
-                                  std::nullopt, /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  std::nullopt, /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
     coordinator.Free(hit_tables);
 
     std::vector<BlockTable> second_tables(coordinator.NumGroups());
@@ -1421,7 +1451,9 @@ TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistor
         {.table = &tables[2]},
     };
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)));
@@ -1449,6 +1481,7 @@ TEST(CacheCoordinatorAdmissionTest, MergesGroupEpochsWithPinnedEntriesInEitherGr
         demands[state_group] = GroupDemand{.table = &tables[state_group], .extent = StateStep{StateStep::Kind::kKeep}};
         demands[full_group] = GroupDemand{.table = &tables[full_group], .extent = DenseGrowth{4}};
         ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false,
+                                      CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
                                       kNoInFlightStores));
         EXPECT_TRUE(coordinator.GroupPrefixIndex(full_group).Contains(pool, Key(hashes[0], full_group)));
         EXPECT_FALSE(coordinator.GroupPrefixIndex(state_group).Contains(pool, Key(hashes[1], state_group)));
@@ -1490,7 +1523,9 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
     }
     for (int attempt = 0; attempt < 3; ++attempt) {
         EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                       /*evict_blocks_past_segments=*/false,
+                                       CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                       kNoInFlightStores));
         for (const BlockTable& table : tables) {
             EXPECT_EQ(table.NumBlocks(), 0);
         }
@@ -1500,7 +1535,9 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
     pins[0].reset();
     pins[1].reset();
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0, 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1, 0)));
@@ -1522,6 +1559,7 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
             {.table = &tables[1], .extent = StateStep{.kind = StateStep::Kind::kRotate}},
         };
         ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false,
+                                      CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
                                       kNoInFlightStores));
         ASSERT_EQ(pool.NumEmptyLcmBlocks(), capacity - 18);
         const auto history = BlockTableLcmBlockIds(tables[0]);
@@ -1533,6 +1571,7 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
             // A spare parent funds the rotation even while an outside reader
             // retains the input. The live history is never released.
             ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false,
+                                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
                                           kNoInFlightStores));
             EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), history);
             EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
@@ -1541,14 +1580,16 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
         const CacheBlockLocation output = tables[1].Blocks()[1]->Location();
         for (int attempt = 0; attempt < 2; ++attempt) {
             EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false,
+                                           CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
                                            kNoInFlightStores));
             EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), history);
             EXPECT_EQ(tables[1].Blocks()[0], retained_input);
             EXPECT_EQ(tables[1].Blocks()[1]->Location(), output);
         }
         retained_input.reset();
-        ASSERT_TRUE(
-            coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false, kNoInFlightStores));
+        ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false,
+                                      CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                      kNoInFlightStores));
         EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), history);
         EXPECT_EQ(tables[1].NumBlocks(), 2);
         EXPECT_TRUE(tables[1].Blocks()[0]);
@@ -1569,7 +1610,8 @@ TEST(CacheCoordinatorAdmissionTest, OnlyNewlyExpiredWindowSlotsCanFundGrowth) {
     std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{4}}};
     const auto advance = [&](std::int32_t computed) {
         return coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{.num_computed_tokens = computed},
-                                 std::nullopt, false, kNoInFlightStores);
+                                 std::nullopt, false,
+                                 CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
     };
     EXPECT_FALSE(advance(7));
     EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), original);
@@ -1606,16 +1648,18 @@ TEST(CacheCoordinatorAdmissionTest, ExpiredWindowPinsAndHolesDoNotFundGrowthUnti
     const auto before = BlockTableLcmBlockIds(tables[0]);
     const std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{8}}};
     const RequestProgress progress{.num_computed_tokens = 16};
-    EXPECT_FALSE(
-        coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false, kNoInFlightStores));
+    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false,
+                                   CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                   kNoInFlightStores));
     EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), before);
     EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 0);
 
     // The cached block and the uncached expired block now fund two new
     // slots. Neither the hole nor the still-live window supplies capacity.
     retained.reset();
-    ASSERT_TRUE(
-        coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false, kNoInFlightStores));
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt, false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
     EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 3);
     ASSERT_EQ(tables[0].NumBlocks(), 6);
     for (std::int32_t slot = 0; slot < 6; ++slot) {
@@ -1651,7 +1695,9 @@ TEST(CacheCoordinatorAdmissionTest, SkipsProtectedOldestEpochAndEvictsLaterEpoch
         {.table = &tables[0], .extent = DenseGrowth{8}},
     };
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(std::span{hashes}.first(1)), demands, RequestProgress{},
-                                  std::nullopt, /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  std::nullopt, /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], /*group_id=*/0, /*page_offset=*/0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], /*group_id=*/0, /*page_offset=*/0)));
@@ -1679,13 +1725,17 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveUncachedReclaimDoesNotEvictCached
     std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = StateStep{StateStep::Kind::kRotate}}};
     const RequestProgress progress{.num_computed_tokens = 4};
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
 
     // The third step's rotation releases the request's own unpublished input
     // block, which funds its fresh live slot: the cached checkpoint stays.
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{.num_computed_tokens = 8},
-                                  std::nullopt, /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  std::nullopt, /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(cached_hash, 0)));
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
 }
@@ -1709,7 +1759,9 @@ TEST(CacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent) 
     const std::array<std::int32_t, 2> tokens{0, 4};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{1});
     EXPECT_EQ(tables[1].NumBlocks(), 1);
@@ -1776,7 +1828,9 @@ TEST(CacheCoordinatorAdmissionTest, RestoresOlderSiblingWhenMiddleCandidateFrees
     const std::array<std::int32_t, 2> tokens{0, 4};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
@@ -1806,7 +1860,9 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveHitParentCannotBecomeVictim) {
     CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(std::span<const std::string>{hashes}.first(1));
 
     EXPECT_FALSE(coordinator.Admit(std::move(prefix), demands, RequestProgress{}, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                   /*evict_blocks_past_segments=*/false,
+                                   CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                   kNoInFlightStores));
     EXPECT_EQ(pool.BoundGroup(protected_parent), std::optional<std::uint32_t>{0});
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 2);
     EXPECT_TRUE(tables[0].Blocks().empty());
@@ -1833,7 +1889,9 @@ TEST(CacheCoordinatorAdmissionTest, ReclaimsTableOwnerBeforeEvictingProspectiveV
     std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{4}}};
     const RequestProgress progress{.num_computed_tokens = 8};
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     ASSERT_EQ(tables[0].NumBlocks(), 3);
     EXPECT_FALSE(tables[0].Blocks()[0]);
@@ -1868,7 +1926,9 @@ TEST(CacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit) {
         .num_computed_tokens = 8,
     };
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
 
     EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
@@ -1904,7 +1964,9 @@ TEST(CacheCoordinatorAdmissionTest, RejectsProspectiveVictimWithAnExtraOwner) {
     std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{4}}};
     const RequestProgress progress{.num_computed_tokens = 8};
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                   /*evict_blocks_past_segments=*/false,
+                                   CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                   kNoInFlightStores));
     EXPECT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_TRUE(tables[0].Blocks()[0]);
 }
@@ -4016,7 +4078,8 @@ TEST(CacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     const std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
 
     ASSERT_TRUE(result);
     EXPECT_EQ(result->host_prefix_tokens, 6);
@@ -5225,7 +5288,9 @@ TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
     // Retention progress alone names no completed page: nothing is published,
     // however many pages the table has filled.
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{.num_computed_tokens = 4},
-                                  std::nullopt, /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                                  std::nullopt, /*evict_blocks_past_segments=*/false,
+                                  CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores,
+                                  kNoInFlightStores));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
     coordinator.Free(tables);
 }
@@ -5252,9 +5317,11 @@ TEST(CompletedBoundaryTest, RejectsEmptyCompletedPageRange) {
         .num_computed_tokens = 4,
     };
 
-    EXPECT_THROW(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, kNoInFlightStores),
-                 std::runtime_error);
+    EXPECT_THROW(
+        coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores),
+        std::runtime_error);
     EXPECT_THROW(coordinator.CacheCompletedBlocks(tables, progress, /*access_epoch=*/1), std::runtime_error);
     coordinator.Free(tables);
 }
@@ -5280,9 +5347,11 @@ TEST(CompletedBoundaryTest, RejectsCompletedPagesWithoutComputedProgress) {
             },
     };
 
-    EXPECT_THROW(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, kNoInFlightStores),
-                 std::runtime_error);
+    EXPECT_THROW(
+        coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt,
+                          /*evict_blocks_past_segments=*/false,
+                          CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores),
+        std::runtime_error);
     EXPECT_THROW(coordinator.CacheCompletedBlocks(tables, progress, /*access_epoch=*/1), std::runtime_error);
     coordinator.Free(tables);
 }
@@ -5328,7 +5397,8 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
         .num_computed_tokens = 16,
     };
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, progress, std::nullopt,
-                            /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                            /*evict_blocks_past_segments=*/false,
+                            CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores));
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[0], 0)));
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[1], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[2], 0)));
@@ -5360,7 +5430,8 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
     };
 
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, progress, std::nullopt,
-                            /*evict_blocks_past_segments=*/false, kNoInFlightStores));
+                            /*evict_blocks_past_segments=*/false,
+                            CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores));
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[2], 0)));
@@ -5455,7 +5526,8 @@ TEST(BoundedReplayCoordinator, AdmitMaterializesReplayableSuffixFromWindowBegin)
     };
     const std::optional<CacheCoordinator::AdmissionResult> admitted =
         coord.Admit(coord.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt,
-                    /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                    /*evict_blocks_past_segments=*/false,
+                    CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
     ASSERT_TRUE(admitted.has_value());
     EXPECT_EQ(admitted->device_prefix_tokens, 16);
     EXPECT_EQ(admitted->junction_tokens, 0);
@@ -5582,7 +5654,8 @@ std::optional<CacheCoordinator::AdmissionResult> AdmitDemands(CacheCoordinator& 
         demands[i].table = &tables[i];
     }
     return coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                             /*evict_blocks_past_segments=*/false, kNoInFlightStores);
+                             /*evict_blocks_past_segments=*/false,
+                             CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores, kNoInFlightStores);
 }
 
 std::optional<CacheCoordinator::AdmissionResult> RestoreDemands(CacheCoordinator& coordinator,
@@ -12630,6 +12703,72 @@ TEST_F(WriteBackTransactionTest, AMixedDrainEmitsOneOpPerGuard) {
     }
     EXPECT_FALSE(transfers_.HasAnyInFlight());
     coordinator_.Free(b_next);
+}
+
+// A speculative admission (kNeverDefer, the in-forward probe's contract): a
+// plan that could only defer behind eviction stores fails WITHOUT evicting
+// the victims a committed admission would have -- no deferred pages, nothing
+// to drain, the victims still published. The committed admission over the
+// same demand then defers for real: its pages gate until the drain hands
+// them to the pinned op's ticket.
+TEST_F(WriteBackTransactionTest, ASpeculativeProbeFailsWithoutTouchingItsVictims) {
+    std::vector<BlockTable> a_tables(4);
+    PublishFinal(a_tables, MakeTokens(2 * kP));
+    const std::vector<std::string> a_hashes = hashes_;
+    coordinator_.Free(a_tables);
+    HoldFreeCapacity(pool_, /*spare_parents=*/0);
+
+    std::vector<BlockTable> probe_tables(4);
+    EXPECT_FALSE(AdmitForTest(coordinator_, probe_tables, coordinator_.ProbePrefix({}),
+                              GroupDemand{.extent = DenseGrowth{kP}}, StateStep{StateStep::Kind::kKeep},
+                              CacheCoordinator::AdmissionDeferPolicy::kNeverDefer));
+    coordinator_.Free(probe_tables);
+    EXPECT_FALSE(coordinator_.HasDeferredEvictionPages());
+    EXPECT_FALSE(StartSingleEvictionStore(transfers_).has_value()) << "the probe evicted nobody to copy";
+    for (const std::string& hash : a_hashes) {
+        EXPECT_NE(Tree().Find(hash), nullptr) << "the probe's would-be victims stay published";
+    }
+
+    EvictOldest();
+    EXPECT_TRUE(coordinator_.HasDeferredEvictionPages());
+    const std::optional<WriteBackOperation> op = StartSingleEvictionStore(transfers_);
+    ASSERT_TRUE(op.has_value());
+    EXPECT_TRUE(op->source_pinned);
+    EXPECT_FALSE(coordinator_.HasDeferredEvictionPages()) << "the drained pages now gate as the op's ticket";
+    EXPECT_TRUE(transfers_.HasAnyInFlight());
+    transfers_.CompleteWriteBack(op->op_id);
+    EXPECT_FALSE(transfers_.HasAnyInFlight());
+}
+
+// A capacity grant's admission (kEvictInPlace, the retraction retry's
+// contract): the same plan that defers behind its eviction stores under the
+// committed policy takes the victims' pages NOW -- the admission succeeds,
+// nothing gates as deferred pages, and the drain emits the victims' store on
+// the stream-ordered lane, fencing the round's reuse behind the copy rather
+// than the admission behind an ACK.
+TEST_F(WriteBackTransactionTest, AnEvictInPlaceAdmissionTakesTheVictimPagesNow) {
+    std::vector<BlockTable> a_tables(4);
+    PublishFinal(a_tables, MakeTokens(2 * kP));
+    const std::vector<std::string> a_hashes = hashes_;
+    coordinator_.Free(a_tables);
+    HoldFreeCapacity(pool_, /*spare_parents=*/0);
+
+    std::vector<BlockTable> b_tables(4);
+    ASSERT_TRUE(AdmitForTest(coordinator_, b_tables, coordinator_.ProbePrefix({}),
+                             GroupDemand{.extent = DenseGrowth{kP}}, StateStep{StateStep::Kind::kKeep},
+                             CacheCoordinator::AdmissionDeferPolicy::kEvictInPlace));
+    EXPECT_FALSE(coordinator_.HasDeferredEvictionPages()) << "nothing waits for an ACK";
+
+    const std::optional<WriteBackOperation> op = StartSingleEvictionStore(transfers_);
+    ASSERT_TRUE(op.has_value()) << "the evicted victims still need their write-back";
+    EXPECT_FALSE(op->source_pinned) << "the victims' store is stream-ordered";
+    for (const std::string& hash : a_hashes) {
+        EXPECT_TRUE(std::ranges::find(op->transfers, hash, &CacheTransfer::content_hash) != op->transfers.end())
+            << "the victims ride the stream-ordered store";
+    }
+    transfers_.CompleteWriteBack(op->op_id);
+    EXPECT_FALSE(transfers_.HasAnyInFlight());
+    coordinator_.Free(b_tables);
 }
 
 // Y continues X's four pages with a page and a tail of its own, and the Host

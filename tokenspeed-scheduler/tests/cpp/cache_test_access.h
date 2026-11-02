@@ -146,8 +146,8 @@ inline const CacheCoordinator::StreamOrderedStoreQuery kNoInFlightStores = [](co
 // first admission).
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
     CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
-    GroupDemand prototype, const RequestProgress& progress,
-    StateStep state_step = StateStep{StateStep::Kind::kRotate}) {
+    GroupDemand prototype, const RequestProgress& progress, StateStep state_step,
+    CacheCoordinator::AdmissionDeferPolicy defer_policy) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (std::size_t i = 0; i < tables.size(); ++i) {
@@ -160,7 +160,26 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
         demands.push_back(demand);
     }
     return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt, /*evict_blocks_past_segments=*/false,
-                             kNoInFlightStores);
+                             defer_policy, kNoInFlightStores);
+}
+
+// Behaves like a committed admission: a plan funded only by evicting cache
+// blocks defers behind its own eviction stores.
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
+    CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
+    GroupDemand prototype, const RequestProgress& progress,
+    StateStep state_step = StateStep{StateStep::Kind::kRotate}) {
+    return AdmitForTest(coordinator, tables, std::move(prefix), prototype, progress, state_step,
+                        CacheCoordinator::AdmissionDeferPolicy::kDeferBehindEvictionStores);
+}
+
+// The same admission with an explicit defer policy: kNeverDefer is the
+// speculative in-forward probe's contract -- a plan that could only defer
+// behind its eviction stores fails leaving the victims untouched.
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
+    CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
+    GroupDemand prototype, StateStep state_step, CacheCoordinator::AdmissionDeferPolicy defer_policy) {
+    return AdmitForTest(coordinator, tables, std::move(prefix), prototype, RequestProgress{}, state_step, defer_policy);
 }
 
 // The overloads without progress admit a request that has computed nothing

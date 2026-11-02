@@ -1165,7 +1165,7 @@ bool CacheCoordinator::deferBehindOwnEvictionStores(std::size_t first_own_segmen
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
     std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments,
-    const StreamOrderedStoreQuery& stream_ordered_stores) {
+    AdmissionDeferPolicy defer_policy, const StreamOrderedStoreQuery& stream_ordered_stores) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].table != nullptr, "group demand requires a block table");
@@ -1255,7 +1255,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const bool defers_behind_eviction_stores =
         write_back_evictions_ && !plan.victims.empty() &&
         std::ranges::none_of(plan.victims, [](const VictimSet& set) { return set.is_request_reclaim; });
-    if (defers_behind_eviction_stores) {
+    if (defers_behind_eviction_stores && defer_policy == AdmissionDeferPolicy::kNeverDefer) {
+        // A speculative attempt fails leaving the victims untouched: its
+        // caller falls back to a demand without the optional block, and
+        // evicting now would strand this shape's write-back.
+        return std::nullopt;
+    }
+    if (defers_behind_eviction_stores && defer_policy == AdmissionDeferPolicy::kDeferBehindEvictionStores) {
         // The defer's matched Host prefix stays pinned through the plan's
         // drain, so the stores' Host placement cannot evict the entries the
         // retry loads -- the same cover an admitted plan's loads give. Copies:

@@ -311,6 +311,19 @@ public:
     // victim the Host or such a store already covers needs no store of its
     // own, and a plan needing no stores has no ACK to wait behind.
     using StreamOrderedStoreQuery = std::function<std::optional<CacheBlockRef>(const CacheKey&)>;
+    // What a plan funded only by evicting cache blocks does
+    // (defers_behind_eviction_stores in Admit). kDeferBehindEvictionStores:
+    // evict the victims now, pin their pages until the store's ACK, and
+    // answer nullopt so the caller retries against the freed pins.
+    // kNeverDefer: answer nullopt leaving the victims untouched -- for a
+    // speculative attempt (the in-forward checkpoint probe), whose caller
+    // falls back to a demand without the optional block and would abandon
+    // the shape the victims were evicted for. kEvictInPlace: never defer --
+    // take the victims' pages for this admission now and stream-order their
+    // stores, fencing this round's zeroing and loads behind the copies. Its
+    // one caller is the capacity retraction's grant retry (docs/design/
+    // scheduler.md §2 gives why a defer there livelocks).
+    enum class AdmissionDeferPolicy { kDeferBehindEvictionStores, kNeverDefer, kEvictInPlace };
     // demands say what each group needs for the round ahead; progress says
     // what the request completed since its previous admission. Completed
     // pages are published and expired slots reclaimed inside this
@@ -328,7 +341,7 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments,
+                                         bool evict_blocks_past_segments, AdmissionDeferPolicy defer_policy,
                                          const StreamOrderedStoreQuery& stream_ordered_stores);
 
     // The data slots of a retracted request are the non-null slots covering
@@ -523,6 +536,13 @@ public:
     // again in one build) are merged too: the drain copies the key once. The
     // write-back drain is its one consumer, once per plan.
     std::vector<EvictedSegment> TakeEvictedSegments();
+    // True while a recorded eviction segment still pins its Device pages
+    // (EvictedBlock::device_ref): pages the drain right after this build
+    // moves into a pinned store whose ACK releases them -- capacity a
+    // blocked admission waits behind before anyone is sacrificed
+    // (docs/design/scheduler.md §4). Between plans this is empty; the wait
+    // on the ACK itself is the transfer manager's HasPinnedStoresInFlight.
+    bool HasDeferredEvictionPages() const;
     // The Host prefix pins of the admissions this plan deferred behind their
     // eviction stores (deferred_admission_host_pins_): the write-back drain
     // takes them at its start so its Host placement cannot evict what those

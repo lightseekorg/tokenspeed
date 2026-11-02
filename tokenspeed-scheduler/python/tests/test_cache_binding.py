@@ -210,12 +210,13 @@ def test_host_write_policy_round_trips():
     assert ts.Scheduler(cfg).host_pool_total_blocks() == 8
 
 
-def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
+def test_an_eviction_store_is_pinned_and_published_at_its_ack():
     """Under Host write-back (the prefill role) nothing reaches the Host until
     an admission evicts: a handed-off prompt's pages leave the Device for the
-    next prompt, in the plan that re-grants them, so their store is
-    stream-ordered. Its Host blocks are taken while the copy is in flight,
-    and the Host publishes its entries at the ACK."""
+    next prompt. The admission defers behind their store, whose sources stay
+    pinned until the ACK; the plan after the ACK grants them and prefills.
+    The store's Host blocks are taken while the copy is in flight, and the
+    Host publishes its entries at the ACK."""
     page = 16
     cfg = ts.SchedulerConfig()
     cfg.role = ts.SchedulerConfig.Role.P
@@ -260,19 +261,23 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
     assert scheduler.host_pool_free_blocks() == 8
 
     # The second prompt takes the free page and two of the first prompt's,
-    # its tail and the page under it: one store, stream-ordered, in the plan
-    # that re-grants them. It takes two Host blocks and publishes nothing
-    # while it is in flight, the hand-off's plan included.
-    prefill_ops, hand_off_ops = prefill_and_hand_off("b", list(range(500, 540)))
-    (store,) = prefill_ops
-    assert hand_off_ops == []
+    # its tail and the page under it. The admission defers behind their
+    # store: one op, its two sources pinned until the ACK, no forward. It
+    # takes two Host blocks and publishes nothing while it is in flight.
+    scheduler.submit_requests([_spec("b", list(range(500, 540)))])
+    scheduler.advance(ExecutionEvent().add_event(ts.PD.BootstrappedEvent("b")))
+    deferred = scheduler.next_execution_plan()
+    assert _find_forward_op(deferred) is None
+    (store,) = deferred.cache
     assert isinstance(store, Cache.WriteBackOp)
-    assert list(store.source_pinned) == [False]
+    assert list(store.source_pinned) == [True]
     assert [len(rows) for rows in store.src_pages] == [2]
     assert scheduler.host_pool_cached_blocks() == 0
     assert scheduler.host_pool_free_blocks() == 6
 
-    # The ACK publishes both entries.
+    # The ACK publishes both entries and releases the sources; the next plan
+    # grants them to the retried admission, which prefills, then hands off --
+    # neither plan carrying cache ops.
     acks = ExecutionEvent()
     for op_id in store.op_ids:
         done = Cache.WriteBackDoneEvent()
@@ -281,6 +286,14 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
     scheduler.advance(acks)
     assert scheduler.host_pool_cached_blocks() == 2
     assert scheduler.host_pool_free_blocks() == 6
+    prefill = scheduler.next_execution_plan()
+    assert list(_find_forward_op(prefill).request_ids) == ["b"]
+    assert list(prefill.cache) == []
+    _advance(scheduler, "b", [1000])
+    hand_off = scheduler.next_execution_plan()
+    assert list(hand_off.remote_decode.request_ids) == ["b"]
+    assert list(hand_off.cache) == []
+    scheduler.advance(ExecutionEvent().add_event(ts.PD.SucceededEvent("b")))
 
 
 def test_device_evictions_count_a_requests_own_reclaim_apart():
@@ -470,16 +483,21 @@ def test_host_cache_stats_count_eviction_write_backs():
         events = ExecutionEvent()
         events.add_event(ts.PD.BootstrappedEvent(rid))
         scheduler.advance(events)
-        # The prefill, then the hand-off to the decode peer, which succeeds.
-        plan = scheduler.next_execution_plan()
-        acks = ExecutionEvent()
-        for op in plan.cache:
-            stores.append([list(rows) for rows in op.src_pages])
-            for op_id in op.op_ids:
-                done = Cache.WriteBackDoneEvent()
-                done.op_id = op_id
-                acks.add_event(done)
-        scheduler.advance(acks)
+        # An admission that evicts defers behind its pinned eviction stores:
+        # ACK them until a plan carries the prefill forward, then hand off to
+        # the decode peer, which succeeds.
+        while True:
+            plan = scheduler.next_execution_plan()
+            acks = ExecutionEvent()
+            for op in plan.cache:
+                stores.append([list(rows) for rows in op.src_pages])
+                for op_id in op.op_ids:
+                    done = Cache.WriteBackDoneEvent()
+                    done.op_id = op_id
+                    acks.add_event(done)
+            scheduler.advance(acks)
+            if _find_forward_op(plan) is not None:
+                break
         _advance(scheduler, rid, [1000])
         assert list(scheduler.next_execution_plan().remote_decode.request_ids) == [rid]
         events = ExecutionEvent()

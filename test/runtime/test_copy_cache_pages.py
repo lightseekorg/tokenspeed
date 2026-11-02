@@ -348,28 +348,28 @@ class TestFinishTailHitCopyCudaTest:
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
 class TestWriteBackOfPagesThePlanReusesCudaTest:
-    """Under Host write-back an admission's or a restore's evictions reach the
-    Host in the plan that re-grants their pages, end to end through
-    ``DeviceHandle.execute``.
+    """Under Host write-back an admission that evicts defers behind its own
+    pinned store, end to end through ``DeviceHandle.execute``: the store's
+    plan carries no forward, and its ACK admits the retry that re-grants the
+    pages.
 
     On a full Device two finished prompts, A and E, each hold two full pages
-    and a tail. B resends A and hits inside A's tail; C diverges in E's tail. B's
-    admission evicts E's tail and takes its page for the private copy of A's
-    tail; C's evicts A's tail, the page B's copy reads, and gets it zeroed.
-    One stream-ordered store writes both tails back. The handle submits the
-    round -- the store, then the copy, then the zeroing -- while the store's
-    copy is held back on the write stream, and the copy and the zeroing still
-    wait for it. The Host then gives both tails back as the prompts left them
-    through the scheduler's own load-backs: D resends A once B and C are
-    done, and its plan evicts B's and C's tails and loads A's into B's page;
-    F resends E once D is done, and its plan loads E's into C's former page.
+    and a tail. B resends A and hits inside A's tail; C diverges in E's tail.
+    Their admissions evict both tails and defer behind one pinned store of
+    both. The handle submits the store while its copy is held back on the
+    write stream; only its ACK admits the retry, which loads A's tail back
+    into E's old page for B and zeroes A's old page for C. The Host gives
+    both tails back as the prompts left them through the scheduler's own
+    load-backs: D resends A once B and C are done -- its admission defers
+    behind the store of B's and C's tails, then its retry loads A's tail into
+    B's page; F resends E once D is done, loading E's into C's former page.
 
     At overlap depth 1 the loop hands a round over while the forward of the
     round before may still be running on the execution stream. Two variants
     stand that forward in, held back, as the last writer of both tails: the
     store, not held back, still reads what it writes; held back longer than
-    that forward, the store still goes ahead of the round's copy and zeroing,
-    which that forward alone would have released.
+    that forward, the store still reads the same bytes before its ACK lets
+    the round's copy and zeroing run.
     """
 
     PAGE = 16
@@ -555,35 +555,59 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 assert scheduler.tail_entries() == 2
 
                 # C shares E's full pages, but cannot reuse its pending tail.
-                # Its new tail still exercises zeroing a write-back source.
+                # B's and C's admissions evict both tails and defer behind
+                # their one pinned store: no forward until its ACK.
                 plan = submit(
                     {
                         "b": prompts["a"] + [7, 8, 9],
                         "c": prompts["e"][: 2 * self.PAGE] + list(range(400, 412)),
                     }
                 )
-                hit_b, hit_c = forwards(plan)[0].extend_prefix_lens
-                assert (hit_b, hit_c) == (41, 32)
+                assert not forwards(plan)
                 assert plan.remote_decode is None
                 (store,) = cache_ops_from_plan(plan).device
-                assert list(store.source_pinned) == [False]
+                assert list(store.source_pinned) == [True]
                 assert [list(rows) for rows in store.src_pages] == [[tail_a, tail_e]]
-                # B copies A's tail into E's; C's new page, A's tail, is zeroed.
-                assert plan.pages_to_copy_arrays()[group].tolist() == [[tail_a, tail_e]]
-                assert list(plan.pages_to_zero[group]) == [tail_a]
                 return plan, store, tail_a, tail_e
 
-            # Warm the complete handle path with a real plan and its ACKs.
-            # Keep first-use staging and stream/event setup outside the
-            # overlap trial.
-            warm_plan, warm_store, _, _ = prepare_reuse_plan()
-            execute(warm_plan)
+            def reuse_retry_plan(host_a, tail_a, tail_e):
+                # The store's ACK admits the retried batch: B's tail page is
+                # loaded back with A's tail from the Host and C's new page is
+                # zeroed -- the zeroing of a write-back source still
+                # exercised. Which of the two evicted tail pages a request is
+                # granted is the scheduler's free page order, so read the
+                # grants from the plan's block tables.
+                plan = scheduler.next_execution_plan()
+                forward = forwards(plan)[0]
+                hit_b, hit_c = forward.extend_prefix_lens
+                assert (hit_b, hit_c) == (41, 32)
+                assert plan.remote_decode is None
+                tables = forward.block_tables_arrays()[group]
+                tail_b, tail_c = int(tables[0][2]), int(tables[1][2])
+                assert {tail_b, tail_c} == {tail_a, tail_e}
+                (load,) = cache_ops_from_plan(plan).device
+                assert [list(rows) for rows in load.src_pages] == [[host_a]]
+                assert [list(rows) for rows in load.dst_pages] == [[tail_b]]
+                assert plan.pages_to_copy_arrays()[group].tolist() == []
+                assert list(plan.pages_to_zero[group]) == [tail_c]
+                return plan, load, tail_b, tail_c
+
+            # Warm the complete handle path with real plans and their ACKs:
+            # the deferred store, then the retried admission's round. Keep
+            # first-use staging and stream/event setup outside the overlap
+            # trial.
+            warm_deferred, warm_store, warm_a, warm_e = prepare_reuse_plan()
+            execute(warm_deferred)
             assert land() == list(warm_store.op_ids)
+            warm_host_a, _ = (int(page) for page in warm_store.dst_pages[0])
+            warm_plan, warm_load, _, _ = reuse_retry_plan(warm_host_a, warm_a, warm_e)
+            execute(warm_plan)
+            assert land() == list(warm_load.op_ids)
 
             # Begin the correctness trial with fresh scheduler ownership;
             # the executor has completed and acknowledged all warmup work.
             scheduler = ts.Scheduler(scheduler_config)
-            plan, store, tail_a, tail_e = prepare_reuse_plan()
+            deferred, store, tail_a, tail_e = prepare_reuse_plan()
             host_a, host_e = (int(page) for page in store.dst_pages[0])
 
             # Random bytes stand in for the KV the forwards wrote.
@@ -620,31 +644,38 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                             arena.buffer[offset : offset + size].copy_(
                                 written[offset : offset + size]
                             )
-            # The round, with the store's copy held back unless only the
-            # forward is: the handle has submitted the copy and the zeroing
-            # behind the store while it waits.
+            # The deferred store, its copy held back unless only the forward
+            # is: the handle submits it behind the held-back writes, and it
+            # still reads the tails as they leave them.
             if held != "forward":
                 with torch.cuda.stream(executor.write_stream):
                     torch.cuda._sleep(
                         400_000_000 if held == "forward_and_store" else 200_000_000
                     )
-            execute(plan)
+            execute(deferred)
             assert not executor.write_stream.query()
             if held != "store":
                 assert not model_executor.execution_stream.query()
             assert land() == list(store.op_ids)
             assert scheduler.host_pool_cached_blocks() == 2
+            # The ACK admits the retried batch; B's tail page is loaded back
+            # with A's tail as the prompts left it, and C's page is zeroed.
+            plan, load, tail_b, tail_c = reuse_retry_plan(host_a, tail_a, tail_e)
+            execute(plan)
+            assert land() == list(load.op_ids)
             expected = before.clone()
             for (src_off, size), (dst_off, _) in zip(
-                segments(tail_a), segments(tail_e), strict=True
+                segments(tail_a), segments(tail_b), strict=True
             ):
                 expected[dst_off : dst_off + size] = before[src_off : src_off + size]
-                expected[src_off : src_off + size] = 0
+            for zero_off, size in segments(tail_c):
+                expected[zero_off : zero_off + size] = 0
             torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
 
             # B's and C's forwards write their pages; once they are done, D
-            # resends A. Its plan evicts B's and C's tails and loads A's from
-            # the Host into B's page.
+            # resends A. Its admission evicts B's and C's tails and defers
+            # behind their store; the ACK's retry loads A's tail from the
+            # Host into D's granted page, one of the two just evicted.
             arena.buffer.copy_(
                 torch.randint(
                     0,
@@ -656,31 +687,46 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             )
             expected = arena.buffer.clone()
             finish(("b", "c"), 2000)
-            plan = submit({"d": prompts["a"] + [11, 12, 13]})
-            assert list(forwards(plan)[0].extend_prefix_lens) == [41]
-            store, load = execute(plan)
-            assert [list(rows) for rows in store.src_pages] == [[tail_a, tail_e]]
+            deferred = submit({"d": prompts["a"] + [11, 12, 13]})
+            assert not forwards(deferred)
+            (store,) = execute(deferred)
+            assert {int(page) for page in store.src_pages[0]} == {tail_b, tail_c}
+            assert land() == list(store.op_ids)
+            plan = scheduler.next_execution_plan()
+            forward = forwards(plan)[0]
+            assert list(forward.extend_prefix_lens) == [41]
+            tail_d = int(forward.block_tables_arrays()[group][0][2])
+            assert tail_d in (tail_a, tail_e)
+            (load,) = execute(plan)
             assert [list(rows) for rows in load.src_pages] == [[host_a]]
-            assert [list(rows) for rows in load.dst_pages] == [[tail_e]]
-            assert sorted(land()) == sorted([*load.op_ids, *store.op_ids])
+            assert [list(rows) for rows in load.dst_pages] == [[tail_d]]
+            assert land() == list(load.op_ids)
             for (src_off, size), (dst_off, _) in zip(
-                segments(tail_a), segments(tail_e), strict=True
+                segments(tail_a), segments(tail_d), strict=True
             ):
                 expected[dst_off : dst_off + size] = before[src_off : src_off + size]
             torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
 
-            # Once D is done, F resends E: its plan evicts D's tail and loads
-            # E's from the Host into C's former page.
+            # Once D is done, F resends E: its admission defers behind the
+            # store of D's tail, then its retry loads E's from the Host into
+            # F's granted page.
             finish(("d",), 3000)
-            plan = submit({"f": prompts["e"] + [14, 15, 16]})
-            assert list(forwards(plan)[0].extend_prefix_lens) == [41]
-            store, load = execute(plan)
-            assert [list(rows) for rows in store.src_pages] == [[tail_e]]
+            deferred = submit({"f": prompts["e"] + [14, 15, 16]})
+            assert not forwards(deferred)
+            (store,) = execute(deferred)
+            assert [list(rows) for rows in store.src_pages] == [[tail_d]]
+            assert land() == list(store.op_ids)
+            plan = scheduler.next_execution_plan()
+            forward = forwards(plan)[0]
+            assert list(forward.extend_prefix_lens) == [41]
+            tail_f = int(forward.block_tables_arrays()[group][0][2])
+            assert tail_f in (tail_a, tail_e)
+            (load,) = execute(plan)
             assert [list(rows) for rows in load.src_pages] == [[host_e]]
-            assert [list(rows) for rows in load.dst_pages] == [[tail_a]]
-            assert sorted(land()) == sorted([*load.op_ids, *store.op_ids])
+            assert [list(rows) for rows in load.dst_pages] == [[tail_f]]
+            assert land() == list(load.op_ids)
             for (src_off, size), (dst_off, _) in zip(
-                segments(tail_e), segments(tail_a), strict=True
+                segments(tail_e), segments(tail_f), strict=True
             ):
                 expected[dst_off : dst_off + size] = before[src_off : src_off + size]
             torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)

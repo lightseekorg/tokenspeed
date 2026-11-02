@@ -435,7 +435,11 @@ every role — the pair, never a page per token — so `ReservePrefillDemands`
 reserves nothing for it and the capacity model (§1.4) charges `2` per request.
 An in-forward checkpoint's block is a third only between its forward and the
 next publication point, and only when the pool holds it then (otherwise the
-chunk is cut at the boundary); the bound charges nothing for it.
+chunk is cut at the boundary); the bound charges nothing for it. The probe
+that asks whether the pool holds it is speculative: it never evicts for a
+shape the fallback abandons, so under write-back a probe that could fund
+itself only by evicting cache blocks — a plan that would defer (§3.1) —
+reads as failure and leaves the victims untouched.
 On the D role the landing writes slot 1 and slot 0 stays null unless this
 node already holds the prompt-end checkpoint (§3.2).
 
@@ -673,7 +677,16 @@ wait for whoever asks first next round. A D-role round full by batch count
 retracts nothing either, although its remote admission takes no batch slot:
 the batch already runs as many requests as it can hold, so retracting a
 resident for the admission would add no throughput and cost an image and a
-restore. Two edges of the loop:
+restore. Under write-back the grant retry — the retry itself and the
+empty-round decode batch — **never defers** (§3.1): it takes its eviction
+victims' pages in place and stream-orders their stores
+(`AdmissionDeferPolicy::kEvictInPlace`). A deferred retry would fail the
+round's contract twice over: the blocker still waits, and next round the
+restore phase (§3.3) hands the freed pages back to the victim's own
+readmission before the blocker tries — the retract/restore livelock the grant
+exists to break. The fence the in-place store adds costs nothing here: the
+retry only runs in a round no prefill progressed in, so the pipeline it
+fences is already idle. Two edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the restore
@@ -856,9 +869,12 @@ when that result lands. Two global gates remain. An in-flight load-back: it is
 writing pages its admission owns, and the victim policy cannot see that write.
 And an in-flight *pinned* store: it holds Device capacity the ack returns by
 itself, so retracting anyone for that capacity would be the thrash of §4 — the
-blocked admission retries against the released pins next round instead.
-Stream-ordered stores — both legs of an image, and an in-place plan's
-eviction write-backs —
+blocked admission retries against the released pins next round instead. The
+pages a deferred admission's eviction stores are about to copy gate the same
+way: pinned in the deferred set from the admission until the drain right
+after the build moves them into the pinned op's ticket (§3.1), they are that
+in-flight store one drain earlier. Stream-ordered stores — both legs of an
+image, and an in-place plan's eviction write-backs —
 hold nothing and gate nothing, and an in-flight restore gates nothing: its
 request is `Restoring`, invisible to `chooseVictim`.
 
@@ -1007,8 +1023,10 @@ written back in the same plan, by the drain right after the build (§2);
 how a segment is recorded, placed, published or dropped is in [Cache
 concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator).
 A plan that grants the evicted pages away in place — a request's own reclaim,
-a restore — rides the stream-ordered lane, like the image's legs: the runtime
-orders the copy ahead of the plan's page reuse. A plan funding itself only by
+a restore, or the capacity retraction's grant retry and its empty-round
+decode batch (§3.2, `AdmissionDeferPolicy::kEvictInPlace`) — rides the
+stream-ordered lane, like the image's legs: the runtime orders the copy ahead
+of the plan's page reuse. A plan funding itself only by
 evicting cache blocks defers instead: the eviction runs, the stores pin the
 pages until their ACK, and the admission retries against the freed pins in a
 later round, exactly as one whose plan found no fit. The defer falls through

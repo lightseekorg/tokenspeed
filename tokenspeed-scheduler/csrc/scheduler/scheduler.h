@@ -240,13 +240,16 @@ private:
     };
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
                                                 std::int32_t remaining, std::int32_t decode_input_tokens,
-                                                std::int64_t kv_token_limit);
+                                                std::int64_t kv_token_limit,
+                                                CacheCoordinator::AdmissionDeferPolicy defer_policy);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
-                                                             std::int64_t kv_token_limit);
+                                                             std::int64_t kv_token_limit,
+                                                             CacheCoordinator::AdmissionDeferPolicy defer_policy);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                           Request* request);
+                                                           Request* request,
+                                                           CacheCoordinator::AdmissionDeferPolicy defer_policy);
 
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                  std::vector<LoadBackOperation>& load_back_operations);
@@ -265,10 +268,12 @@ private:
                                                            std::span<const GroupDemand> demands,
                                                            const RequestProgress& progress,
                                                            std::optional<std::uint64_t> request_access_epoch,
-                                                           bool evict_blocks_past_segments);
+                                                           bool evict_blocks_past_segments,
+                                                           CacheCoordinator::AdmissionDeferPolicy defer_policy);
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
-        std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
+        std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments,
+        CacheCoordinator::AdmissionDeferPolicy defer_policy);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,
@@ -391,7 +396,8 @@ private:
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
                                                              std::vector<LoadBackOperation>& load_backs,
-                                                             std::int32_t kv_page_budget);
+                                                             std::int32_t kv_page_budget,
+                                                             CacheCoordinator::AdmissionDeferPolicy defer_policy);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
@@ -474,7 +480,8 @@ private:
                         std::vector<WriteBackOperation>& write_back_operations);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
-    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                             CacheCoordinator::AdmissionDeferPolicy defer_policy);
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
