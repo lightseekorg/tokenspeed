@@ -6345,6 +6345,26 @@ protected:
     std::vector<std::string> hashes_;
 };
 
+TEST_F(TailPublicationTest, BoundaryKeyEnumerationPreservesBorrowedKeysAndNamespaces) {
+    CacheKey boundary{.namespace_id = 7, .group_id = 99, .content_hash = std::string(64, 'h'), .page_offset = 99};
+    const CacheKey original = boundary;
+    std::vector<CacheKey> borrowed;
+    coordinator_.ForEachBoundaryKey(boundary, /*tail_tokens=*/3, [&](std::size_t group, const CacheKey& key) {
+        EXPECT_EQ(key.group_id, group);
+        EXPECT_EQ(key.namespace_id, original.namespace_id);
+        EXPECT_EQ(key.content_hash, original.content_hash);
+        borrowed.push_back(key);
+    });
+    EXPECT_EQ(boundary, original);
+    ASSERT_FALSE(borrowed.empty());
+
+    std::vector<CacheKey> temporary;
+    coordinator_.ForEachBoundaryKey(
+        CacheKey{.namespace_id = original.namespace_id, .content_hash = original.content_hash}, /*tail_tokens=*/3,
+        [&](std::size_t, const CacheKey& key) { temporary.push_back(key); });
+    EXPECT_EQ(temporary, borrowed);
+}
+
 TEST_F(TailPublicationTest, PublishesThePartialPageUnderHashAtT) {
     std::vector<BlockTable> tables(3);
     // 11 computed tokens: two full pages, then rows [8, 11) of page 2.

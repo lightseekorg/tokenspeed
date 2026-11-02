@@ -251,7 +251,13 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
 std::vector<CacheCoordinator::NodeEntry> CacheCoordinator::NodeEntries(const BlockPool& pool,
                                                                        const BoundaryTree::Node& node) const {
     std::vector<NodeEntry> entries;
+    const auto tier = &pool == host_pool_ ? BoundaryTree::kHost : BoundaryTree::kDevice;
     ForEachBoundaryKey(CacheKey{.content_hash = *node.hash}, node.tail_tokens, [&](std::size_t i, const CacheKey& key) {
+        // The mark includes partial checkpoints and pending Host stores;
+        // only its absence proves that every State lookup would miss.
+        if (GroupIsState(i) && !node.has_checkpoint[tier]) {
+            return;
+        }
         // Find's reference is the second when only the index holds the block.
         if (const CacheBlockRef block = groups_[i].Index().Find(pool, key)) {
             entries.push_back(NodeEntry{.pool = &pool,
@@ -631,13 +637,16 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
     // Without a KV group there is no KV boundary to record: a junction
     // exists only where cached KV outruns the state.
     bool kv_settled = std::ranges::none_of(match_order, [&](std::size_t i) { return !GroupIsState(i); });
+    PrefixProbe::TailHit tail{.group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
+                              .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
+    std::vector<GroupPrefixProbe> page_hits(groups_.size());
     const auto visit = [&](std::int32_t page_tokens, std::int32_t tail_tokens, const ContentHash& published_hash) {
         const std::int32_t boundary = page_tokens + tail_tokens;
-        PrefixProbe::TailHit tail{.tail_tokens = tail_tokens,
-                                  .hash = published_hash,
-                                  .group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
-                                  .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
-        std::vector<GroupPrefixProbe> page_hits(groups_.size());
+        tail.tail_tokens = tail_tokens;
+        tail.hash = published_hash;
+        for (auto& keys : tail.group_keys) {
+            keys.clear();
+        }
         bool kv_accepts = true;
         bool state_accepts = true;
         for (const std::size_t i : match_order) {
@@ -647,6 +656,10 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
             const bool accepts = groupAcceptsBoundary<CacheTier::kDevice>(
                 i, prompt.prefix_hashes, /*floor_tokens=*/0, page_tokens, tail_tokens, tail.group_keys[i],
                 tail.per_group[i], &page_hits[i], /*extra_hits=*/nullptr);
+            // Once KV reach is known, a rejected boundary contributes nothing.
+            if (!accepts && kv_settled) {
+                return true;
+            }
             (GroupIsState(i) ? state_accepts : kv_accepts) = accepts && (GroupIsState(i) ? state_accepts : kv_accepts);
         }
         if (kv_accepts && !kv_settled) {
