@@ -324,7 +324,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         *,
         lora_norm_eps: float,
         independent_selection: bool,
-        native_prefill: bool,
+        prefill_enabled: bool,
         separate_mla_projections: bool,
     ) -> None:
         if not independent_selection:
@@ -405,7 +405,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         self._scales_prepared = False
         self._fused_decode_runtime = None
         self._prefill_weights = None
-        self.native_prefill = native_prefill
+        self.prefill_enabled = prefill_enabled
 
     def configure_fused_decode(self, runtime) -> None:
         """Attach prepared weights and communication state outside forward."""
@@ -424,7 +424,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
                 self.kv_b_proj.weight, self
             )
 
-        if self.native_prefill and self._prefill_weights is None:
+        if self.prefill_enabled and self._prefill_weights is None:
             group = self.mapping.attn.head_tp_group
             pg = (
                 process_group_manager.get_device_process_group(group)
@@ -538,9 +538,8 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         else:
             iq = hidden.new_empty((0, indexer.index_n_heads, indexer.index_head_dim))
             ik = hidden.new_empty((0, 1, indexer.index_head_dim))
-        backend.start_prefill_index(self.layer_id, ik.contiguous())
         if hidden.shape[0]:
-            # Index-K communication runs while the MLA query/latent are formed.
+            # Keep Index-K ready to pack with KV once the latent is formed.
             weights = (
                 indexer.weights_proj(hidden.float())[0] * indexer.weights_softmax_scale
             )
@@ -599,6 +598,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             record_kv_cache=False,
             index_query=iq,
             prefill_latent=latent.contiguous(),
+            index_key=ik.contiguous(),
             index_weights=weights,
             index_init_tokens=self.index_init_tokens,
             index_local_tokens=self.index_local_tokens,
@@ -610,13 +610,10 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         return F.linear(projected.flatten(1), wo)
 
     def forward(self, positions, hidden_states, ctx, comm_manager):
-        if (
-            ctx.forward_mode.is_extend_or_mixed()
-            and ascend_dsa_prefill_backend(ctx.attn_backend).native_prefill_enabled
-        ):
-            if not self.native_prefill:
+        if ctx.forward_mode.is_extend_or_mixed():
+            if not self.prefill_enabled:
                 raise RuntimeError(
-                    "Native DSA cache requires model opt-in before loading weights"
+                    "DSA Prefill weights were disabled for this decode-only model"
                 )
             return self._forward_prefill(positions, hidden_states, ctx)
         if hidden_states.shape[0] == 0:

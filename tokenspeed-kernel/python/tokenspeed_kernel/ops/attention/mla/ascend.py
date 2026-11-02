@@ -42,12 +42,10 @@ def prepare_ascend_mla_prefill(
     ranks,
     bootstrap_group,
     max_current_rows,
-    max_history_rows=0,
-    history_null_rows=0,
-    workspace=None,
+    history_null_rows,
 ):
     """Reuse the DSA HCCL gather/owner-commit transport with no Index-K plane."""
-    from tokenspeed_kernel_npu.ops.dsa import AscendDSAPrefill
+    from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
 
     return AscendDSAPrefill(
         cache,
@@ -55,9 +53,7 @@ def prepare_ascend_mla_prefill(
         ranks=ranks,
         bootstrap_group=bootstrap_group,
         max_current_rows=max_current_rows,
-        max_history_rows=max_history_rows,
         history_null_rows=history_null_rows,
-        workspace=workspace,
     )
 
 
