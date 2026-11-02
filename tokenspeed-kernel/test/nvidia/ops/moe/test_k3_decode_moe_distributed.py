@@ -102,12 +102,15 @@ class _Weights:
 
     def __init__(self, device, seed, experts=None):
         g = torch.Generator(device=device).manual_seed(seed)
-        normal = lambda *s, std: (
-            torch.randn(s, device=device, generator=g) * std
-        ).bfloat16()
-        byte = lambda *s, lo=0, hi=256: torch.randint(
-            lo, hi, s, dtype=torch.uint8, device=device, generator=g
-        )
+
+        def normal(*shape, std):
+            return (torch.randn(shape, device=device, generator=g) * std).bfloat16()
+
+        def byte(*shape, lo=0, hi=256):
+            return torch.randint(
+                lo, hi, shape, dtype=torch.uint8, device=device, generator=g
+            )
+
         self.router = normal(E, H, std=0.02)
         self.bias = torch.randn(E, device=device, generator=g) * 0.05
         self.down = normal(L, H, std=0.02)
