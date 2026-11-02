@@ -1984,8 +1984,13 @@ The contract a model (in tree or a plugin) implements:
   holds too and no solution is wrong at runtime; the padding rows are never
   selected. The history gathers move any row dtype (uint8 index-K rows
   packed in the plane's format -- FP8 bytes then fp32 scales, or bf16 key
-  bytes -- fp32 scales, fp8 latent) as bf16 pairs of their bytes, since the
-  token all-gather's low-latency solution is bf16-only; the workspace
+  bytes -- fp32 scales, fp8 latent) as their bytes, in the layout of the
+  prefix-chunk windows (`HistoryGatherPlan`): every owner sends the largest
+  owner's row count (its own rows, then a null-page tail), one equal-share
+  all-gather lands them rank-major, and one row gather
+  (`gathered_index`) writes them into the workspace in position order, so
+  no pad, strip or scatter copy runs between the collective and the
+  workspace; the workspace
   (`HistoryGatherWorkspace`, `index_k_format` recorded, rows of
   `index_k_row_bytes(head_dim, format)`) is sized by the recipe and
   allocated by the leaf from the same formula; the recipe refuses a draft

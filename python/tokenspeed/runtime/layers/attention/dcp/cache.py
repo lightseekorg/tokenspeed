@@ -36,15 +36,13 @@ from tokenspeed.runtime.distributed.comm_backend import (
     get_global_backend,
 )
 from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather_single,
     all_gather_single_async,
-    token_all_gather_rows,
 )
 from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
-    cyclic_slot_owner,
     owned_prefix_chunk_rows,
-    resolve_cache_slots,
 )
 
 if TYPE_CHECKING:
@@ -106,25 +104,28 @@ class HistoryGatherPlan:
     Built once per forward and group from the virtual slots of every history
     row (prefix plus this chunk, request-major, position order) and the
     host-side owned-row counts; reused by every layer's KV and index-K
-    gathers. Rank ``k``'s rows are the ``owned_rows_per_rank[k]`` rows whose
-    owner is ``k``, in position order, so the all-gathered buffer is
-    rank-major and ``order`` maps it back to position order.
+    gathers. Every rank sends ``send_rows`` rows -- the largest owner's
+    count: its own rows in position order, then a tail nobody reads -- so the
+    all-gather output is ``[degree * send_rows]`` rows, rank-major, and
+    ``gathered_index`` reads it back in position order (the layout of
+    :class:`PrefixHistoryWindow`).
 
     Attributes:
         virtual_slots: ``[rows]`` int64 virtual cache slots in position order.
-        local_slots: ``[rows]`` int64 this rank's physical slots (0 where
-            another rank owns the row).
-        order: ``[rows]`` int64 permutation: position of the i-th row of the
-            rank-major gathered buffer.
-        owned_rows_per_rank: Host counts of rows each owner contributes.
+        send_slots: ``[send_rows]`` physical slots this rank sends, in the
+            virtual slots' integer dtype: its own rows in position order,
+            then slot 0 (the null page) for the tail nobody reads.
+        gathered_index: ``[rows]`` int32 row of the all-gather output that
+            holds each history row, position order.
+        owned_rows_per_rank: Host counts of rows each owner holds.
         group: The owner group the gather runs over (a singleton without
             page sharding).
         rank: This rank's position in ``group``.
     """
 
     virtual_slots: torch.Tensor
-    local_slots: torch.Tensor
-    order: torch.Tensor
+    send_slots: torch.Tensor
+    gathered_index: torch.Tensor
     owned_rows_per_rank: tuple[int, ...]
     group: tuple[int, ...]
     rank: int
@@ -134,11 +135,9 @@ class HistoryGatherPlan:
         return sum(self.owned_rows_per_rank)
 
     @property
-    def local_fetch_slots(self) -> torch.Tensor:
-        """Physical slots of the rows this rank contributes, position order."""
-        first = sum(self.owned_rows_per_rank[: self.rank])
-        mine = self.order[first : first + self.owned_rows_per_rank[self.rank]]
-        return self.local_slots.index_select(0, mine)
+    def send_rows(self) -> int:
+        """Rows every rank contributes to the all-gather."""
+        return max(self.owned_rows_per_rank)
 
 
 def plan_history_gather(
@@ -151,12 +150,14 @@ def plan_history_gather(
 
     Args:
         virtual_slots: ``[rows]`` int64 virtual slots of every history row,
-            position order, identical on every rank.
+            position order, identical on every rank. Each row must have a valid
+            owner; callers validate the host page table with
+            ``owned_history_rows`` before constructing the slots.
         placement: The group's page ownership, or ``None`` when this rank
             holds every row (the gather is then a local slot gather).
         owned_rows_per_rank: Host counts of rows each owner contributes
             (``owned_history_rows`` summed over the group's requests); one
-            entry without a placement.
+            entry without a placement. Counts must match the slots on every rank.
 
     Returns:
         The plan; no device synchronization.
@@ -173,90 +174,97 @@ def plan_history_gather(
                 f"owned_rows_per_rank names {len(counts)} owners for a group of "
                 f"{len(group)}"
             )
-    if sum(counts) != virtual_slots.numel():
+    rows = virtual_slots.numel()
+    if sum(counts) != rows:
         raise ValueError(
-            f"owned rows sum to {sum(counts)} but the history has "
-            f"{virtual_slots.numel()} rows"
+            f"owned rows sum to {sum(counts)} but the history has {rows} rows"
         )
-    local_slots, _owned = resolve_cache_slots(virtual_slots, placement)
-    owner = cyclic_slot_owner(virtual_slots, placement)
-    order = torch.argsort(owner, stable=True)
+    if placement is None:
+        # This rank holds every row: it sends them all, in position order.
+        send_slots = virtual_slots
+        gathered_index = torch.arange(
+            rows, dtype=torch.int32, device=virtual_slots.device
+        )
+    else:
+        # Split the rows by owner; the tail past this rank's own
+        # rows stays slot 0, a row of the null page nobody reads.
+        send_slots = virtual_slots.new_zeros(max(counts))
+        gathered_index = torch.empty(
+            rows, dtype=torch.int32, device=virtual_slots.device
+        )
+        split_slots_by_owner(
+            virtual_slots.contiguous(),
+            block_granularity=placement.block_granularity,
+            degree=len(group),
+            rank=rank,
+            send_rows=max(counts),
+            gathered_index=gathered_index,
+            fetch=send_slots,
+        )
     return HistoryGatherPlan(
         virtual_slots=virtual_slots,
-        local_slots=local_slots,
-        order=order,
+        send_slots=send_slots,
+        gathered_index=gathered_index,
         owned_rows_per_rank=counts,
         group=group,
         rank=rank,
     )
 
 
-# Row dtypes the index-copy kernels implement; others scatter as bytes.
-_SCATTER_DTYPES = frozenset(
-    {torch.bfloat16, torch.float16, torch.float32, torch.uint8, torch.int32}
-)
-
-
 def gather_history_rows(
     plan: HistoryGatherPlan,
-    local_rows: torch.Tensor,
+    send_rows: torch.Tensor,
     *,
     out: torch.Tensor,
 ) -> torch.Tensor:
     """Assemble a request group's history rows in position order.
 
-    Every rank contributes the rows it owns (``plan.local_fetch_slots`` of its
-    own cache plane, as 2-D rows); one all-gather with per-rank counts puts
-    them rank-major, and the plan's order scatters them into position order.
-    Pure data movement: a row's bytes are the owner's bytes wherever the
-    gather lands them, whatever their dtype (:func:`token_all_gather_rows`
-    moves them as bf16 pairs of their bytes). Without page sharding the rows
-    are already local and only the scatter runs.
+    Every rank sends ``plan.send_rows`` rows (``plan.send_slots`` of its own
+    cache plane, as 2-D rows: its own rows, then a tail nobody reads); one
+    all-gather of equal shares puts them rank-major, and one row gather
+    (``plan.gathered_index``) writes them into ``out`` in position order.
+    Pure data movement: the rows travel as their bytes, so a row lands as
+    the owner's bytes whatever its dtype. Without page sharding the rows are
+    already local and only the row gather runs.
 
     Args:
         plan: The group's gather plan.
-        local_rows: ``[owned_rows_per_rank[rank], width]`` rows this rank
-            contributes, position order; any dtype with an even row byte
-            width.
-        out: ``[>= rows, width]`` destination of ``local_rows``' dtype; the
+        send_rows: ``[plan.send_rows, width]`` rows this rank sends; any
+            dtype.
+        out: ``[>= rows, width]`` destination of ``send_rows``' dtype; the
             leading ``rows`` are written.
 
     Returns:
         ``out[:rows]``.
     """
     rows = plan.rows
-    if (
-        local_rows.dim() != 2
-        or local_rows.shape[0] != plan.owned_rows_per_rank[plan.rank]
-    ):
+    if send_rows.dim() != 2 or send_rows.shape[0] != plan.send_rows:
         raise ValueError(
-            f"rank {plan.rank} contributes {plan.owned_rows_per_rank[plan.rank]} "
-            f"rows, got {tuple(local_rows.shape)}"
+            f"rank {plan.rank} sends {plan.send_rows} rows, got "
+            f"{tuple(send_rows.shape)}"
         )
     if (
         out.dim() != 2
         or out.shape[0] < rows
-        or out.shape[1] != local_rows.shape[1]
-        or out.dtype != local_rows.dtype
+        or out.shape[1] != send_rows.shape[1]
+        or out.dtype != send_rows.dtype
     ):
         raise ValueError(
             f"history destination {tuple(out.shape)} {out.dtype} does not hold "
-            f"{rows} rows of {local_rows.shape[1]} {local_rows.dtype}"
+            f"{rows} rows of {send_rows.shape[1]} {send_rows.dtype}"
         )
+    # Bytes: the collective and the row gather then serve every dtype (fp8
+    # included) and keep every bit.
+    payload = send_rows.contiguous().view(torch.uint8)
     if len(plan.group) == 1:
-        gathered = local_rows
+        gathered = payload
     else:
-        gathered = token_all_gather_rows(
-            local_rows, plan.group, list(plan.owned_rows_per_rank)
+        gathered = payload.new_empty(
+            (len(plan.group) * plan.send_rows, payload.shape[1])
         )
+        all_gather_single(gathered, payload, plan.group)
     target = out[:rows]
-    if local_rows.dtype in _SCATTER_DTYPES:
-        target.index_copy_(0, plan.order, gathered)
-    else:
-        # fp8 rows: the index-copy kernels lack the dtype; scatter the bytes.
-        target.view(torch.uint8).index_copy_(
-            0, plan.order, gathered.contiguous().view(torch.uint8)
-        )
+    torch.index_select(gathered, 0, plan.gathered_index, out=target.view(torch.uint8))
     return target
 
 

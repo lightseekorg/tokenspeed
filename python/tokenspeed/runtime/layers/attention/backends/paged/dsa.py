@@ -824,7 +824,7 @@ class DSABackend(PagedAttentionBackend):
             raise RuntimeError("DSA history gather workspace is not allocated")
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_flat = kv_cache.reshape(-1, kv_cache.shape[-1])
-        local = kv_flat.index_select(0, group.gather.local_fetch_slots)
+        local = kv_flat.index_select(0, group.gather.send_slots)
         gather_history_rows(group.gather, local, out=self._history_workspace.kv)
         page = self.kernel_page_size
         return self._history_workspace.kv[: -(-group.rows // page) * page]
@@ -845,7 +845,7 @@ class DSABackend(PagedAttentionBackend):
             raise RuntimeError("DSA history gather workspace is not allocated")
         packed = token_to_kv_pool.gather_index_k_rows(
             layer_id,
-            group.gather.local_fetch_slots,
+            group.gather.send_slots,
             index_k_format=self.index_k_format,
         )
         gathered = gather_history_rows(
