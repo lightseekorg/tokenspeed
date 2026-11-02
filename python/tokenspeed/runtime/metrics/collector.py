@@ -122,14 +122,17 @@ class EngineMetrics:
         self.jit_serving_compiles = factory.counter(
             name="tokenspeed:jit_serving_compiles",
             documentation=(
-                "Triton kernel compilations after startup; each one stalls the "
-                "forward thread."
+                "Triton and CuTe DSL kernel compilations after startup; each "
+                "one stalls the forward thread."
             ),
             labelnames=labelnames,
         )
         self.jit_serving_compile_seconds = factory.counter(
             name="tokenspeed:jit_serving_compile_seconds",
-            documentation="Wall time spent in Triton kernel compilations after startup.",
+            documentation=(
+                "Wall time spent in Triton and CuTe DSL kernel compilations "
+                "after startup."
+            ),
             labelnames=labelnames,
         )
         self.num_nan_aborted_requests = factory.counter(
@@ -144,8 +147,10 @@ class EngineMetrics:
             name="tokenspeed:num_capacity_aborted_requests",
             documentation=(
                 "Requests the scheduler aborted because a capacity retraction "
-                "could not image its victim (retraction snapshot pool or image "
-                "rows exhausted); clients may resubmit them."
+                "could not image its victim (retraction snapshot pool, image "
+                "rows or Host L2 exhausted); clients may resubmit them. Forced "
+                "retractions from --debug-force-retraction-interval aborted "
+                "the same way count too."
             ),
             labelnames=labelnames,
         )

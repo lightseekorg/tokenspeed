@@ -154,7 +154,21 @@ class CPUOwnerCommit:
     current: torch.Tensor
     cache: torch.Tensor
 
-    def patch(self, layer_id, slots, direct, *, width, block_rows, virtual_blocks):
+    def patch(
+        self,
+        layer_id,
+        slots,
+        direct,
+        *,
+        slots_workspace,
+        mapped_slots,
+        width,
+        block_rows,
+        virtual_blocks,
+    ):
+        committed = slots_workspace[: slots.numel()]
+        committed.copy_(slots)
+        slots = committed
         live = (slots >= block_rows) & (slots < virtual_blocks * block_rows)
         self.cache.index_copy_(0, slots[live].long(), self.current[live])
 
@@ -184,6 +198,12 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     cache = torch.full((7 * page, 576), -1, dtype=torch.int32)
     backend = object.__new__(AscendMLABackend)
     backend._prefill_runtime = CPUOwnerCommit(current, cache)
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    backend._prefill_workspace, buffers = AscendPrefillOptions(
+        total, -(-total // page)
+    ).allocate_workspace(local_rows=7 * page, degree=1, index_width=0, device="cpu")
+    backend._prefill_slots = buffers[3]
     backend._placement = CachePlacement(page, 7, (0,), 0)
     backend._prefill_plan = AscendPrefillPlan.build(
         RequestMetadata(torch.tensor(extends), torch.tensor(prefixes), table),
@@ -485,16 +505,16 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         max_padding_fraction=float("inf"),
     )
     arena = CacheArena(layout.bind(3), "npu", cache_group_specs=(group,))
-    kwargs = dict(
-        arena=arena,
-        dtype=torch.bfloat16,
-        model_dtype=torch.bfloat16,
-        quant_method="none",
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        layer_num=1,
-        rank=0,
-    )
+    kwargs = {
+        "arena": arena,
+        "dtype": torch.bfloat16,
+        "model_dtype": torch.bfloat16,
+        "quant_method": "none",
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "layer_num": 1,
+        "rank": 0,
+    }
     if options is None:
         pool = MLATokenToKVPool(**kwargs)
     else:
@@ -521,7 +541,6 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=512,
         max_bs=4,
         components=(spec,),
@@ -541,6 +560,8 @@ def test_ordinary_mla_cache_keeps_prefix_history_without_native_library(
     pool, backend = _prefill_cache_and_backend(monkeypatch, options=None)
     backend.set_cache_pool(pool)
     assert backend.prepare_prefill_workspace() == 0
+    assert backend._prefill_workspace is None
+    assert backend._prefill_slots is None
     rows = pool.get_key_buffer(0).view(-1, 576)
     rows[128:255].fill_(7)
     backend._init_prefill_metadata(
@@ -567,34 +588,213 @@ def test_ordinary_mla_cache_keeps_prefix_history_without_native_library(
         torch.testing.assert_close(rotary.cpu(), torch.full_like(rotary.cpu(), 7))
 
 
-def test_native_prefill_requires_its_reserved_budget_before_loading_library(
-    monkeypatch,
-):
+def test_native_cache_binding_needs_no_transport_library_or_workspace(monkeypatch):
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
     monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
     pool, backend = _prefill_cache_and_backend(
-        monkeypatch, options=AscendPrefillOptions(129, 1)
+        monkeypatch, options=AscendPrefillOptions(129, 4)
     )
-    with pytest.raises(ValueError, match="cache recipe reserved"):
+    backend.set_cache_pool(pool)
+    assert backend.native_prefill_enabled
+    assert backend._prefill_runtime is None
+    assert backend._prefill_workspace is None
+    assert backend._prefill_slots is None
+
+
+def test_native_mla_backend_owns_commit_slots_until_transport_closes(
+    monkeypatch, tmp_path
+):
+    import os
+
+    import torch.distributed as dist
+
+    import tokenspeed.runtime.distributed.process_group_manager as groups
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    options = AscendPrefillOptions(129, 4, 128)
+    pool, backend = _prefill_cache_and_backend(monkeypatch, options=options)
+    if not os.environ.get("TOKENSPEED_DSA_CP_LIBRARY"):
+        pytest.skip("requires the native Prefill transport library")
+    manager = groups.ProcessGroupManager()
+    monkeypatch.setattr(groups, "process_group_manager", manager)
+    manager.init_emulated_rank_zero(
+        f"file://{tmp_path}/bootstrap", "gloo", timeout=60, device_id=None
+    )
+    manager.init_process_group((0,), "gloo")
+    try:
         backend.set_cache_pool(pool)
+        assert backend._prefill_runtime is None
+        assert backend._prefill_workspace is None
+        backend.configure_runtime(
+            block_granularity=128,
+            virtual_block_count=pool.arena.runtime_contract.virtual_block_counts[
+                "full_attention"
+            ],
+            shard_count=1,
+        )
+        backend.init_forward_metadata(
+            bs=1,
+            num_extends=1,
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([1], device="npu", dtype=torch.int32),
+            extend_prefix_lens=torch.tensor([0], device="npu", dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.tensor([0], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([1], device="npu", dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+            page_table=torch.tensor([[1, 0, 0, 0]], device="npu", dtype=torch.int32),
+            page_table_cpu=torch.tensor([[1, 0, 0, 0]], dtype=torch.int32),
+            extend_with_prefix=False,
+            query_shard=None,
+        )
+        assert backend._prefill_runtime is None
+        assert backend._prefill_workspace is None
+        expected = options.required_workspace(
+            local_rows=pool.get_key_buffer(0).numel() // 576, degree=1, index_width=0
+        )
+        backend.prefetch_prefill_layer(0)
+        owner = backend._prefill_workspace
+        slots = backend._prefill_slots
+        assert owner.frozen and owner.capacity_bytes == expected
+        assert slots.numel() >= options.max_current_rows
+        for value in (1, 2):
+            if value > 1:
+                backend.prefetch_prefill_layer(0)
+            current = torch.full((1, 576), value, dtype=torch.bfloat16, device="npu")
+            backend.start_prefill_kv(0, current)
+            backend.consume_prefill_kv(
+                0, torch.tensor([128], dtype=torch.int32, device="npu")
+            )
+            backend.finish_prefill_layer(0)
+            torch.testing.assert_close(
+                pool.get_key_buffer(0).view(-1, 576)[128].cpu(),
+                current[0].cpu(),
+                rtol=0,
+                atol=0,
+            )
+            assert backend._prefill_workspace is owner
+            assert backend._prefill_slots is slots
+    finally:
+        backend.close_prefill()
+        dist.destroy_process_group()
+    assert backend._prefill_workspace is None
+    assert backend._prefill_slots is None
 
 
 @pytest.mark.parametrize("degree", [1, 8, 16])
 @pytest.mark.parametrize("index_width", [0, 128])
-def test_native_workspace_reservation_includes_history_current_and_send(
-    degree, index_width
+def test_native_workspace_size_includes_history_current_and_send(degree, index_width):
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    # The backend's pool includes aligned int64 commit slots beside transport.
+    size = (4 * 128 + (degree + 1) * 128) * (576 + index_width) * 2 + 256
+    exact = AscendPrefillOptions(1, 1)
+    assert (
+        exact.required_workspace(local_rows=128, degree=degree, index_width=index_width)
+        == size
+    )
+
+
+@pytest.mark.parametrize("pages,rows", [(0, 1), (-1, 1), (1, 129)])
+def test_native_workspace_rejects_unbounded_or_oversized_current_rows(pages, rows):
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    with pytest.raises(ValueError, match="page limit"):
+        AscendPrefillOptions(rows, pages, 128)
+
+
+@pytest.mark.parametrize("degree", [1, 8])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_bounded_prefill_counts_all_requests_and_compacts_owner_pages(
+    degree, page_size
 ):
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
-    # One history page per owner, one current page per owner and one send page.
-    size = (degree * 128 * 2 + 128) * (576 + index_width) * 2
-    exact = AscendPrefillOptions(1, size)
-    assert (
-        exact.check_workspace(local_rows=128, degree=degree, index_width=index_width)
-        == size
-    )
-    with pytest.raises(ValueError, match="cache recipe reserved"):
-        AscendPrefillOptions(1, size - 1).check_workspace(
-            local_rows=128, degree=degree, index_width=index_width
+    table = torch.tensor([[2, 3, 4, 5], [2, 3, 6, 7]], dtype=torch.int32)
+    metadata = RequestMetadata(torch.tensor([3, 17]), torch.tensor([127, 63]), table)
+    # Each request rounds to a 128-token scheduler page separately: 2 + 1.
+    options = AscendPrefillOptions(20, max_kv_page_num=3, kv_page_size=128)
+    placement = CachePlacement(128, 33, tuple(range(degree)), 0)
+    plans = [
+        AscendPrefillPlan.build(
+            metadata,
+            placement,
+            degree=degree,
+            rank=rank,
+            page_size=page_size,
+            topk=1,
+            local_cache_pages=64,
+            query_partition=(0, 20),
+            options=options,
         )
+        for rank in range(degree)
+    ]
+    for plan in plans:
+        assert plan.gather is not None
+        assert sum(plan.gather.row_counts) <= 3 * 128
+        assert plan.gather.table[0, 0] == plan.gather.table[1, 0]
+        expected = []
+        for req, (prefix, count) in enumerate([(127, 3), (63, 17)]):
+            expected.extend(
+                int(plan.gather.table[req, pos // page_size]) * page_size
+                + pos % page_size
+                for pos in range(prefix, prefix + count)
+            )
+        assert plan.patch_slots.tolist() == expected
+    with pytest.raises(ValueError, match="needs 3 KV pages, limit is 2"):
+        AscendPrefillPlan.build(
+            metadata,
+            placement,
+            degree=degree,
+            rank=0,
+            page_size=page_size,
+            topk=1,
+            local_cache_pages=64,
+            options=AscendPrefillOptions(20, 2, 128),
+        )
+
+
+def test_bounded_workspace_size_does_not_follow_cache_capacity():
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    options = AscendPrefillOptions(16384, 1024, 128)
+    small = options.required_workspace(local_rows=128, degree=8, index_width=128)
+    large = options.required_workspace(local_rows=1 << 20, degree=8, index_width=128)
+    assert small == large == 2 * 704 * (2 * 1025 * 128 + 9 * 2048) + 16384 * 8
+
+
+@pytest.mark.parametrize("degree", [1, 2, 8])
+@pytest.mark.parametrize("index_width", [0, 128])
+@pytest.mark.parametrize("max_pages", [2, 32])
+def test_prefill_workspace_owns_buffers_apart_from_main_stream_scratch(
+    degree, index_width, max_pages
+):
+    from tokenspeed.runtime.execution.workspace import WorkspacePool
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    options = AscendPrefillOptions(129, max_kv_page_num=max_pages, kv_page_size=128)
+    pool, buffers = options.allocate_workspace(
+        local_rows=2048, degree=degree, index_width=index_width, device="cpu"
+    )
+    required = options.required_workspace(
+        local_rows=2048, degree=degree, index_width=index_width
+    )
+    assert pool.frozen
+    assert (
+        pool.capacity_bytes
+        == sum(x.numel() * x.element_size() for x in buffers)
+        == required
+    )
+    addresses = [x.data_ptr() for x in buffers if x.numel()]
+    assert len(set(addresses)) == len(addresses)
+    for index, value in enumerate(buffers):
+        value.fill_(index + 1)
+    scratch = WorkspacePool("cpu", initial_nbytes=0)
+    scratch.allocate(((129,), torch.int64))[0].fill_(-1)
+    for index, value in enumerate(buffers):
+        assert torch.all(value == index + 1)
+    # The owner outlives the local views even if the allocator reuses scratch.
+    del buffers
+    with pytest.raises(RuntimeError, match="frozen"):
+        pool.allocate(((required + 256,), torch.uint8))

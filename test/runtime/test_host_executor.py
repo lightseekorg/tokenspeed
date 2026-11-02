@@ -17,6 +17,11 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+from tokenspeed.runtime.cache.host_storage import (  # noqa: E402
+    compute_host_group_packing,
+    validate_host_group_packing,
+)
+
 # Pure Python, no runtime dependencies: the knobs of an L2-only executor.
 from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
 
@@ -94,7 +99,11 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
     lanes.host_memory_share = Mock(return_value=10**12)
-    lanes.largest_pinned_fit = Mock(side_effect=lambda room_bytes: max(room_bytes, 0))
+    lanes.largest_pinned_fit = Mock(
+        side_effect=lambda room_bytes, *, block_bytes: (
+            max(room_bytes, 0) // block_bytes * block_bytes
+        )
+    )
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
@@ -128,6 +137,8 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     storage = ModuleType("tokenspeed.runtime.cache.host_storage")
     storage.HostCacheStorage = Mock
     storage.compute_host_lcm_block_bytes = Mock(return_value=1)
+    storage.compute_host_group_packing = compute_host_group_packing
+    storage.validate_host_group_packing = validate_host_group_packing
     layout = ModuleType("tokenspeed.runtime.cache.transfer.layout")
     layout.combine_cache_transfer_layouts = lambda target, draft, group_ids=None: (
         target if draft is None else draft
@@ -414,6 +425,7 @@ class TestGroupAwareWireTest:
         lanes_module = _lanes_module()
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
+        executor._ready_load_acks = []
         executor.attn_tp_rank = 0
         device = SimpleNamespace(type="cuda")
         executor.layout = SimpleNamespace(buffers=(SimpleNamespace(device=device),))
@@ -660,6 +672,62 @@ class TestGroupAwareWireTest:
         fence_stream.wait_event.assert_not_called()
         executor._ordered_write_lane.workspace.load_block_transfers.assert_not_called()
 
+    def test_an_ordered_write_back_with_no_row_of_this_rank_still_fences_and_acks(
+        self,
+    ):
+        # Every row of an eviction belongs to KVP rank 0. Rank 1 copies
+        # nothing, yet its plan's reuse of the evicted pages still waits on the
+        # op's completion and the op is acknowledged: the replica publishes the
+        # segment only once every rank holds its ACK.
+        from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        executor, _ = self._make_write_executor(executor_module)
+        executor.block_owners = BlockOwnerTranslation(
+            shard_counts=[2],
+            device_virtual_counts=[9],
+            host_virtual_counts=[9],
+            rank=1,
+        )
+        fence_stream = Mock(name="fence_stream")
+        finish = Mock(name="finish")
+        finish.query.return_value = True
+
+        class WriteBackOp:
+            def __init__(self):
+                # Residue 0 on both ends of both rows: rank 0's.
+                self.op_ids = [12]
+                self.group_ids = [[0, 0]]
+                self.src_pages = [[1, 3]]
+                self.dst_pages = [[5, 7]]
+                self.source_pinned = [False]
+
+        with (
+            patch.object(
+                executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
+            ),
+            patch.object(
+                lanes_module.device_module, "stream", return_value=nullcontext()
+            ),
+            patch.object(lanes_module.device_module, "Event", return_value=finish),
+            patch.object(lanes_module, "transfer_cache_blocks") as transfer,
+        ):
+            executor.submit_write_backs(
+                [WriteBackOp()],
+                prerequisite_stream=object(),
+                fence_stream=fence_stream,
+            )
+
+        transfer.assert_not_called()
+        executor._ordered_write_lane.workspace.load_block_transfers.assert_not_called()
+        fence_stream.wait_event.assert_called_once_with(finish)
+        pending = executor._completions._pending
+        assert [(event, ack.kind, ack.op_ids) for event, ack in pending] == [
+            (finish, executor_module._AckKind.WRITE_BACK, [12])
+        ]
+        assert [int(event.op_id) for event in executor.poll_results()] == [12]
+
     def test_submit_write_backs_rejects_ragged_guard_vector(self):
         executor_module = self._executor_module()
         executor, _ = self._make_write_executor(executor_module)
@@ -855,8 +923,9 @@ class TestGroupAwareWireTest:
         draft_pool.cache_transfer_layout.return_value = draft_layout
         storage = SimpleNamespace(
             host_cache_block_bytes=(20, 24),
+            group_packing=(1, 1),
             host_field_offsets=((0,), (0, 12)),
-            host_lcm_block_bytes=192,
+            host_lcm_block_bytes=24,
             num_host_lcm_blocks=3,
             host_buffer="host",
         )
@@ -924,13 +993,14 @@ class TestGroupAwareWireTest:
 
         build_geometry.assert_called_once_with(
             rows=(
-                (1, 0, 8, 16, 24, 0, 8, 12),
-                (0, 1, 32, 64, 20, 0, 4, 20),
-                (1, 0, 48, 16, 24, 12, 8, 12),
+                (1, 0, 8, 16, 24, 0, 1, 12),
+                (0, 1, 32, 64, 20, 0, 1, 20),
+                (1, 0, 48, 16, 24, 12, 1, 12),
             ),
             layer_slices=((0, 1), (1, 0), (1, 1), (2, 1)),
             group_packing=(4, 8),
-            host_lcm_block_bytes=192,
+            host_group_packing=(1, 1),
+            host_lcm_block_bytes=24,
             num_host_lcm_blocks=3,
             num_device_lcm_blocks=11,
             num_device_buffers=2,
@@ -951,6 +1021,7 @@ class TestGroupAwareWireTest:
         )
         storage = SimpleNamespace(
             host_cache_block_bytes=(16,),
+            group_packing=(1,),
             host_field_offsets=((0,),),
             host_lcm_block_bytes=64,
             num_host_lcm_blocks=2,
@@ -1278,9 +1349,13 @@ class TestHostMemoryShareTest:
         nprocs_per_node,
         device_lcm_blocks,
         host_size_gb=0,
+        host_lcm_block_bytes=BLOCK_BYTES,
+        l2_tier=True,
+        snapshot_pool=NO_POOL,
         world_cpu_group=None,
     ):
-        """An L2-only executor at --kvstore-ratio 2 and its mocked logger."""
+        """An executor at --kvstore-ratio 2, L2-only by default, and its mocked
+        logger."""
         executor_module = self.executor_module
         lanes_module = _lanes_module()
         field = SimpleNamespace(
@@ -1306,9 +1381,10 @@ class TestHostMemoryShareTest:
             virtual_block_counts={"group": 1 + device_lcm_blocks},
         )
         storage = SimpleNamespace(
-            host_cache_block_bytes=(self.BLOCK_BYTES,),
+            host_cache_block_bytes=(host_lcm_block_bytes,),
+            group_packing=(1,),
             host_field_offsets=((0,),),
-            host_lcm_block_bytes=self.BLOCK_BYTES,
+            host_lcm_block_bytes=host_lcm_block_bytes,
             num_host_lcm_blocks=0,
             host_buffer="host",
         )
@@ -1320,7 +1396,7 @@ class TestHostMemoryShareTest:
             patch.object(
                 executor_module,
                 "compute_host_lcm_block_bytes",
-                return_value=self.BLOCK_BYTES,
+                return_value=host_lcm_block_bytes,
             ),
             patch.object(executor_module, "HostCacheStorage", return_value=storage),
             patch.object(lanes_module.psutil, "virtual_memory", return_value=available),
@@ -1344,11 +1420,11 @@ class TestHostMemoryShareTest:
         ):
             executor = executor_module.HostCacheExecutor(
                 pool,
-                l2_tier=True,
+                l2_tier=l2_tier,
                 host_ratio=2.0,
                 host_size_gb=host_size_gb,
-                snapshot_pool=NO_POOL,
-                slot_state_exporters=None,
+                snapshot_pool=snapshot_pool,
+                slot_state_exporters=None if snapshot_pool.disabled else (),
                 io_backend="direct",
                 attn_tp_rank=0,
                 kvp_rank=0,
@@ -1423,7 +1499,10 @@ class TestHostMemoryShareTest:
 
     def test_every_rank_takes_the_l2_size_the_smallest_share_holds(self):
         # A peer node has 500 GB available: every rank takes what it holds,
-        # and the agreement runs before any rank pins, explicit size or not.
+        # then the ranks compare equal counts and start. The peer adds
+        # peer_blocks to the agreement and, capped to the same size, this
+        # rank's own counts to the comparison; none of them exceeds
+        # peer_blocks, so the minimum with it stands for the peer each time.
         torch = import_module("torch")
         group = object()
         peer_blocks = self._fitting_blocks(500, 4)
@@ -1442,22 +1521,133 @@ class TestHostMemoryShareTest:
                 device_lcm_blocks=self.LARGE_POOL_BLOCKS,
                 world_cpu_group=group,
             )
-            assert (executor.num_host_pages - 1) == (peer_blocks)
-            explicit, _ = self._build(
+        assert (executor.num_host_pages - 1) == (peer_blocks)
+        assert all(c.kwargs["group"] is group for c in reduce.call_args_list)
+
+    def test_pp_stages_with_unequal_block_bytes_refuse_one_explicit_size(
+        self, subtests
+    ):
+        # Pipeline stages store different layers, so their Host LCM blocks
+        # differ in bytes and one --kvstore-size is a different page count on
+        # each: 64 GB is 64,000 blocks of 1 MB and 32,000 of 2 MB. The
+        # mirrored schedulers would diverge, so both stages refuse, after the
+        # same collectives: neither waits in one the other skips. Each stage
+        # counts in its own block, so the other stage's count is this rank's
+        # scaled by the ratio of their block bytes. A pipeline runs only on
+        # the prefill role, which has no snapshot pool, but a pool sized in
+        # gigabytes is compared the same way: 4 GB is 4,000 blocks of 1 MB and
+        # 2,000 of 2 MB. That case runs without L2: the fake scales every
+        # count, so an L2 count would be refused first.
+        torch = import_module("torch")
+        group = object()
+        pool_in_gigabytes = RetractionPoolRequest(
+            host_gb=4.0,
+            ratio=None,
+            max_retracted_requests=8,
+            tail_lcm_blocks_per_request=1,
+        )
+        collectives = {}
+        for l2_tier, host_size_gb, snapshot_pool, mismatch, ratio_flag in (
+            (
+                True,
+                64,
+                NO_POOL,
+                "32000 to 64000 Host L2 LCM blocks",
+                "--kvstore-ratio",
+            ),
+            (
+                False,
+                0,
+                pool_in_gigabytes,
+                "2000 to 4000 snapshot pool LCM blocks",
+                "--retraction-snapshot-ratio",
+            ),
+        ):
+            for block_bytes, peer_block_bytes in (
+                (self.BLOCK_BYTES, 2 * self.BLOCK_BYTES),
+                (2 * self.BLOCK_BYTES, self.BLOCK_BYTES),
+            ):
+
+                def all_reduce(tensor, *, op, group):
+                    assert (op) is (torch.distributed.ReduceOp.MIN)
+                    count = int(tensor.item())
+                    tensor.fill_(min(count, count * block_bytes // peer_block_bytes))
+
+                with (
+                    subtests.test(mismatch=mismatch, block_bytes=block_bytes),
+                    patch.object(
+                        torch.distributed, "all_reduce", side_effect=all_reduce
+                    ) as reduce,
+                ):
+                    with pytest.raises(
+                        (ValueError),
+                        match=(
+                            rf"{mismatch} \(this rank's Host LCM block is "
+                            rf"{block_bytes} bytes\).*{ratio_flag}"
+                        ),
+                    ):
+                        self._build(
+                            available_gb=956,
+                            nprocs_per_node=4,
+                            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                            host_size_gb=host_size_gb,
+                            host_lcm_block_bytes=block_bytes,
+                            l2_tier=l2_tier,
+                            snapshot_pool=snapshot_pool,
+                            world_cpu_group=group,
+                        )
+                    collectives.setdefault(mismatch, []).append(reduce.call_count)
+        for first_stage, second_stage in collectives.values():
+            assert (first_stage) == (second_stage)
+        # Stages whose blocks are the same size add the same counts, so the
+        # group's minimum of each is this rank's own: they start.
+        with patch.object(torch.distributed, "all_reduce"):
+            executor, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                host_size_gb=64,
+                world_cpu_group=group,
+            )
+        assert (executor.num_host_pages - 1) == (64_000)
+
+    def test_a_rank_refused_after_the_comparison_leaves_no_rank_waiting(self):
+        # Every rank asks for 128 GB, which a rank on a 500 GB node cannot pin
+        # in its 114.26 GB share: it refuses, but only after joining every
+        # collective the ranks that start make, so none of them waits on it.
+        # The ranks differ only in the share's fit, which an explicit size
+        # never reads, and compare equal counts, so the group's minimum of
+        # each is this rank's own.
+        torch = import_module("torch")
+        group = object()
+        with patch.object(torch.distributed, "all_reduce") as reduce:
+            executor, _ = self._build(
                 available_gb=956,
                 nprocs_per_node=4,
                 device_lcm_blocks=self.LARGE_POOL_BLOCKS,
                 host_size_gb=128,
                 world_cpu_group=group,
             )
-            assert (explicit.num_host_pages - 1) == (128_000)
-        assert (reduce.call_count) == (2)
+            assert (executor.num_host_pages - 1) == (128_000)
+            collectives = reduce.call_count
+            with pytest.raises((ValueError), match=("Not enough Host memory")):
+                self._build(
+                    available_gb=500,
+                    nprocs_per_node=4,
+                    device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                    host_size_gb=128,
+                    world_cpu_group=group,
+                )
+        assert (reduce.call_count) == (2 * collectives)
         assert all(c.kwargs["group"] is group for c in reduce.call_args_list)
 
     def test_a_pinned_buffer_takes_the_power_of_two_it_rounds_up_to(self):
         lanes_module = _lanes_module()
         pinned = lanes_module.pinned_host_bytes
-        fit = lanes_module.largest_pinned_fit
+
+        def fit(room_bytes):
+            return lanes_module.largest_pinned_fit(room_bytes, block_bytes=1)
+
         assert (pinned(0)) == (0)
         assert (pinned(1)) == (1)
         assert (pinned(2**37)) == (2**37)
@@ -1524,8 +1714,12 @@ class TestCompactLayoutRoundTripTest:
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
-    def _make_executor(self, layout, *, draft_layout=None, io_backend):
-        pool = _SyntheticPool(layout)
+    def _make_executor(
+        self, layout, *, draft_layout=None, io_backend, kvp_rank, arena=None
+    ):
+        """One rank's executor over ``layout``: its arena replicated unless
+        ``arena`` is given, this rank ``kvp_rank`` of its group's owners."""
+        pool = _SyntheticPool(layout, arena)
         draft_pool = (
             _SyntheticPool(draft_layout, pool.arena)
             if draft_layout is not None
@@ -1542,7 +1736,7 @@ class TestCompactLayoutRoundTripTest:
                 slot_state_exporters=None,
                 io_backend=io_backend,
                 attn_tp_rank=0,
-                kvp_rank=0,
+                kvp_rank=kvp_rank,
                 nprocs_per_node=1,
                 world_cpu_group=None,
             )
@@ -1582,7 +1776,7 @@ class TestCompactLayoutRoundTripTest:
             consumers=(("layer.0.k", "layer.0.v"), ("layer.1.state",)),
         )
 
-        executor, pool, _ = self._make_executor(layout, io_backend="kernel")
+        executor, pool, _ = self._make_executor(layout, io_backend="kernel", kvp_rank=0)
 
         # Hand-derived Device ranges for blocks (full: 1, 4; state: 3).
         full_k_one = torch.tensor([0x11, 0x12, 0x13, 0x14], dtype=torch.uint8)
@@ -1646,7 +1840,7 @@ class TestCompactLayoutRoundTripTest:
         layout = self._single_group_layout(
             device, self.CacheField("layer.0.k", 0, 8, 8, 4)
         )
-        executor, pool, _ = self._make_executor(layout, io_backend="kernel")
+        executor, pool, _ = self._make_executor(layout, io_backend="kernel", kvp_rank=0)
         for generation in range(3):
             # Three back-to-back submissions, each with its own Device source
             # and Host block, with no caller synchronization between them: if
@@ -1685,6 +1879,248 @@ class TestCompactLayoutRoundTripTest:
                 [1, 2, 3, 9]
             )
 
+    @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+    @pytest.mark.parametrize(
+        "source_pinned", [False, True], ids=["stream_ordered", "pinned_control"]
+    )
+    def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(
+        self, io_backend, source_pinned
+    ):
+        """An eviction's store reads what the evicted block held, though the
+        same plan overwrites the block right after submitting the store.
+
+        The copy is held back on the write stream, so the overwrite, enqueued
+        on the fence stream right after the submission, would land first
+        unless the fence orders it behind the copy. The control submits the
+        same row as a pinned store, which fences nothing: its copy reads the
+        overwritten bytes, so the test tells the two apart.
+        """
+        torch = self.torch
+        device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
+        layout = self._single_group_layout(
+            device, self.CacheField("layer.0.k", 0, 8, 8, 4)
+        )
+        executor, pool, _ = self._make_executor(
+            layout, io_backend=io_backend, kvp_rank=0
+        )
+        fence_stream = torch.cuda.current_stream()
+
+        class WriteBackOp:
+            # Cache.WriteBackOp has no Python constructor.
+            def __init__(self, op_id: int) -> None:
+                self.op_ids = [op_id]
+                self.group_ids = [[0]]
+                self.src_pages = [[1]]
+                self.dst_pages = [[2]]
+                self.source_pinned = [source_pinned]
+
+        def submit(op_id: int) -> None:
+            with patch.object(self.executor_module.Cache, "WriteBackOp", WriteBackOp):
+                executor.submit_write_backs(
+                    [WriteBackOp(op_id)],
+                    prerequisite_stream=fence_stream,
+                    fence_stream=fence_stream,
+                )
+
+        # The same store first, on the lane the round below takes, so that
+        # round loads no kernel and allocates no staging memory: the process's
+        # first copy kernel launch, or a lane's first pinned allocation, waits
+        # for the device, the held-back copy included, which would close the
+        # window.
+        submit(6)
+        torch.cuda.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [6]
+        generator = torch.Generator(device="cpu").manual_seed(13)
+        evicted = torch.randint(0, 0xEE, (4,), dtype=torch.uint8, generator=generator)
+        device[16:20].copy_(evicted)  # block 1, the evicted one
+        torch.cuda.synchronize()
+
+        with torch.cuda.stream(executor.write_stream):
+            torch.cuda._sleep(200_000_000)
+        submit(7)
+        # The copy has not run yet: the window in which the plan reuses the
+        # block is open.
+        assert not executor.write_stream.query()
+        # The plan re-grants the block at once, on the fence stream.
+        device[16:20].fill_(0xEE)
+        torch.cuda.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [7]
+
+        load_index = executor._start_loading(  # pylint: disable=protected-access
+            [9], [(0, 3, 2)], prerequisite_stream=fence_stream
+        )
+        pool.load_tracker.set_consumers(load_index)
+        pool.load_tracker.wait_for_layer(0)
+        torch.cuda.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [9]
+        expected = (
+            torch.full((4,), 0xEE, dtype=torch.uint8) if source_pinned else evicted
+        )
+        assert torch.equal(device[32:36].cpu(), expected)  # block 3
+        assert torch.equal(
+            device[16:20].cpu(), torch.full((4,), 0xEE, dtype=torch.uint8)
+        )
+
+    @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+    @pytest.mark.parametrize("held", ["write_stream", "execution_stream"])
+    def test_kvp_ranks_copy_an_eviction_before_the_plan_reuses_its_pages(
+        self, io_backend, held
+    ):
+        """Two KVP ranks run one plan. It writes back an eviction whose rows
+        are all rank 0's, then reuses both evicted pages: one is zeroed and
+        written by the forward, the other is a Host load's destination. Rank
+        0's Host gets the bytes the pages held before the plan; rank 1 copies
+        nothing, yet its default stream still waits on the op, which it
+        acknowledges like rank 0.
+
+        One stream is held back while the plan is enqueued: the write stream,
+        so the reuse would land before the copy without the store fence, or
+        the execution stream, whose forward writes the evicted bytes, so the
+        copy would read older ones without its wait on that stream. The held
+        stream sets a marker after its sleep, and each rank's default stream
+        reads it right after the store: the read sees it only behind the
+        fence.
+        """
+        torch = self.torch
+        # One group dealt to two owners: virtual block v is rank (v - 1) % 2's
+        # local block (v - 1) // 2 + 1, on the Device and on the Host. Rank
+        # 0's local blocks 1 to 4 (bytes 16, 24, 32, 40) are virtual 1, 3, 5, 7.
+        contract = SimpleNamespace(
+            group_specs=(SimpleNamespace(group_id="full", shard_count=2),),
+            virtual_block_counts={"full": 1 + 4 * 2},
+            num_lcm_blocks=4,
+            token_capacity=4,
+        )
+        arena = SimpleNamespace(
+            cache_group_specs=contract.group_specs, runtime_contract=contract
+        )
+
+        class WriteBackOp:
+            # Cache.WriteBackOp has no Python constructor; stream-ordered.
+            def __init__(self, op_id, src_pages, dst_pages):
+                self.op_ids = [op_id]
+                self.group_ids = [[0] * len(src_pages)]
+                self.src_pages = [src_pages]
+                self.dst_pages = [dst_pages]
+                self.source_pinned = [False]
+
+        class LoadBackOp:
+            def __init__(self, op_id, src_pages, dst_pages):
+                self.op_ids = [op_id]
+                self.group_ids = [[0] * len(src_pages)]
+                self.src_pages = [src_pages]
+                self.dst_pages = [dst_pages]
+
+        default_stream = torch.cuda.current_stream()
+        execution_stream = torch.cuda.Stream()
+        generator = torch.Generator(device="cpu").manual_seed(29)
+        for rank in (0, 1):
+            device = torch.randint(
+                0, 0xEE, (128,), dtype=torch.uint8, generator=generator
+            ).cuda()
+            loaded = torch.randint(
+                0, 0xEE, (4,), dtype=torch.uint8, generator=generator
+            )
+            evicted = torch.randint(
+                0, 0xEE, (8,), dtype=torch.uint8, generator=generator
+            )
+            written = torch.randint(
+                0, 0xEE, (4,), dtype=torch.uint8, generator=generator
+            )
+            evicted_on_device, written_on_device = evicted.cuda(), written.cuda()
+            marker = torch.zeros((1,), dtype=torch.uint8, device="cuda")
+            seen = torch.zeros((1,), dtype=torch.uint8, device="cuda")
+            layout = self._single_group_layout(
+                device, self.CacheField("layer.0.k", 0, 8, 8, 4)
+            )
+            executor, pool, _ = self._make_executor(
+                layout, io_backend=io_backend, arena=arena, kvp_rank=rank
+            )
+            if rank == 0:
+                device[32:36].copy_(loaded)
+            original = device.cpu()
+            torch.cuda.synchronize()
+            with (
+                patch.object(self.executor_module.Cache, "WriteBackOp", WriteBackOp),
+                patch.object(self.executor_module.Cache, "LoadBackOp", LoadBackOp),
+            ):
+                # The lanes the plan takes and the forward's layer-ready waiter
+                # run once first, so the plan loads no kernel and allocates no
+                # staging memory: either waits for the device, the held stream
+                # included, and would close the window. Virtual 5 goes to the
+                # Host's 5 and back to 7.
+                executor.submit_write_backs(
+                    [WriteBackOp(6, [5], [5])],
+                    prerequisite_stream=execution_stream,
+                    fence_stream=default_stream,
+                )
+                executor.submit_load_backs(
+                    [LoadBackOp(7, [5], [7])], prerequisite_stream=default_stream
+                )
+                with torch.cuda.stream(execution_stream):
+                    pool.load_tracker.wait_for_layer(0)
+                torch.cuda.synchronize()
+                assert sorted(
+                    int(event.op_id) for event in executor.poll_results()
+                ) == [6, 7]
+
+                held_stream = (
+                    executor.write_stream
+                    if held == "write_stream"
+                    else execution_stream
+                )
+                with torch.cuda.stream(held_stream):
+                    torch.cuda._sleep(200_000_000)
+                    marker.fill_(1)
+                # The previous forward wrote the pages this plan evicts.
+                with torch.cuda.stream(execution_stream):
+                    if rank == 0:
+                        device[16:20].copy_(evicted_on_device[:4])
+                        device[24:28].copy_(evicted_on_device[4:])
+                # Virtuals 1 and 3 go to the Host's 1 and 3.
+                executor.submit_write_backs(
+                    [WriteBackOp(21, [1, 3], [1, 3])],
+                    prerequisite_stream=execution_stream,
+                    fence_stream=default_stream,
+                )
+                # The plan's next work on the default stream: behind the fence.
+                seen.copy_(marker)
+                # Virtual 1 is zeroed for its new owner, virtual 3 loads the
+                # Host's 5, and the forward writes virtual 1 -- each where
+                # this rank owns it.
+                if rank == 0:
+                    device[16:20].zero_()
+                executor.submit_load_backs(
+                    [LoadBackOp(22, [5], [3])], prerequisite_stream=default_stream
+                )
+                execution_stream.wait_stream(default_stream)
+                with torch.cuda.stream(execution_stream):
+                    pool.load_tracker.wait_for_layer(0)
+                    if rank == 0:
+                        device[16:20].copy_(written_on_device)
+                # The held stream is still asleep: the window is open.
+                assert not held_stream.query()
+                torch.cuda.synchronize()
+                assert int(seen.item()) == 1, f"rank {rank} read past the fence"
+                assert sorted(
+                    (type(event).__name__, int(event.op_id))
+                    for event in executor.poll_results()
+                ) == [("LoadBackDoneEvent", 22), ("WriteBackDoneEvent", 21)]
+
+                # The Host's 1 and 3 come back to virtuals 5 and 7.
+                executor.submit_load_backs(
+                    [LoadBackOp(23, [1, 3], [5, 7])], prerequisite_stream=default_stream
+                )
+                torch.cuda.synchronize()
+                assert [int(event.op_id) for event in executor.poll_results()] == [23]
+            if rank == 0:
+                assert torch.equal(device[32:36].cpu(), evicted[:4])
+                assert torch.equal(device[40:44].cpu(), evicted[4:])
+                assert torch.equal(device[16:20].cpu(), written)
+                assert torch.equal(device[24:28].cpu(), loaded)
+            else:
+                assert torch.equal(device.cpu(), original)
+
     def test_real_transfer_restores_merged_owner_draft_subset_once(self):
         torch = self.torch
         device = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
@@ -1698,6 +2134,7 @@ class TestCompactLayoutRoundTripTest:
             target_layout,
             draft_layout=draft_layout,
             io_backend="kernel",
+            kvp_rank=0,
         )
 
         device[16:20].fill_(0x11)

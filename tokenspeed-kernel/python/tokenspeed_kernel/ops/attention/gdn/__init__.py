@@ -470,10 +470,15 @@ def gdn_decode_step(
     signature = _attention_format_signature(q=q, k=k, v=v)
     traits = {
         "head_dim": head_dim,
+        "value_head_dim": v.shape[-1],
         "padding_safe": _requires_padding_safe_decode(
             initial_state.dtype, output_only=False, solution=solution
         ),
     }
+    if solution != "flashinfer":
+        # Only the legacy FlashInfer solution retains its old padding contract.
+        # Other named solutions must still accept the actual state dtype.
+        traits["state_dtype"] = initial_state.dtype
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
     kernel = select_kernel(
@@ -775,6 +780,12 @@ def gdn_decode_mtp(
         and _chain_rows_dense(q, k, v, a, b),
         "replay_payload": replay_payload is not None,
     }
+    if solution != "flashinfer" and not output_only:
+        # Only the legacy FlashInfer solution retains its old padding contract;
+        # other named solutions must still accept the actual state dtype. A
+        # read-only verify keeps every dtype-compatible candidate: the legacy
+        # BF16 path only reads the reserved null page for padding.
+        traits["state_dtype"] = initial_state.dtype
     if output_state is not None:
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
@@ -972,10 +983,11 @@ def gdn_decode_supports(
     Args:
         op: ``"gdn_decode_step"`` or ``"gdn_decode_mtp"``.
         dtype: q/k/v dtype.
-        state_dtype: Recurrent-state pool dtype, also used by MTP selection.
+        state_dtype: Recurrent-state pool dtype, used by MTP selection and for
+            safe padding selection.
         traits: The same geometry and execution traits as the actual decode
-            call. MTP includes ``head_dim``, ``value_head_dim``,
-            ``verify_tokens``, ``output_only`` and ``tree``.
+            call, including ``head_dim`` and ``value_head_dim``. MTP also
+            includes ``verify_tokens``, ``output_only`` and ``tree``.
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
             ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
             ``q | k | v`` row, with contiguous heads; such kernels read a/b by
@@ -989,14 +1001,19 @@ def gdn_decode_supports(
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
     traits = dict(traits)
+    output_only = op == "gdn_decode_mtp" and traits["output_only"]
     traits.setdefault(
         "padding_safe",
         _requires_padding_safe_decode(
             state_dtype,
-            output_only=op == "gdn_decode_mtp" and traits["output_only"],
+            output_only=output_only,
             solution=solution,
         ),
     )
+    if solution != "flashinfer" and not output_only:
+        # Mirror the op's own state-dtype trait; read-only verifies keep every
+        # dtype-compatible candidate (see gdn_decode_mtp).
+        traits.setdefault("state_dtype", state_dtype)
     if op == "gdn_decode_mtp":
         traits.setdefault(
             "chunked_chain",

@@ -94,13 +94,18 @@ class TestGlm53FlashConfigTests:
         assert (config.vision_config.out_hidden_size) == (config.hidden_size)
         assert (config.vision_config.swiglu_limit) == (10.0)
 
-    def test_legacy_checkpoint_metadata_loads_canonical_config(self):
+    @pytest.mark.parametrize(
+        "share_indices", [None, False, True], ids=["absent", "off", "on"]
+    )
+    def test_legacy_checkpoint_metadata_loads_canonical_config(self, share_indices):
         raw_config = {
             "model_type": "glm5_next",
             "architectures": ["Glm5NextForConditionalGeneration"],
             "text_config": {"model_type": "glm5_next_text"},
             "vision_config": {"model_type": "glm5_next_vision"},
         }
+        if share_indices is not None:
+            raw_config["text_config"]["index_share_for_mtp_iteration"] = share_indices
         with tempfile.TemporaryDirectory() as model_dir:
             Path(model_dir, "config.json").write_text(
                 json.dumps(raw_config), encoding="utf-8"
@@ -122,6 +127,10 @@ class TestGlm53FlashConfigTests:
         assert (config.architectures) == (["Glm53FlashForConditionalGeneration"])
         assert (draft_config.architectures) == (
             ["Glm53FlashForConditionalGenerationNextN"]
+        )
+        assert config.text_config.index_share_for_mtp_iteration is bool(share_indices)
+        assert draft_config.text_config.index_share_for_mtp_iteration is bool(
+            share_indices
         )
 
     def test_vision_swiglu_limit_precedence(self):

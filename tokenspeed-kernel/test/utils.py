@@ -111,6 +111,53 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
         )
 
 
+@contextmanager
+def assert_no_cute_compile() -> Iterator[None]:
+    """Fail if any CuTe DSL kernel is traced or compiled in the block.
+
+    ``cute.compile`` traces and compiles on every call, and calling a
+    ``@cute.jit`` function directly traces it on every call, so launches must
+    reuse the compiled functions their caller cached. Warm the caller's cache
+    before entering, then launch with shapes that vary the way serving does; a
+    trace means the cache keys on a per-batch value or the launch bypasses it.
+    """
+    from cutlass.base_dsl.dsl import BaseDSL
+
+    with patch.object(
+        BaseDSL, "generate_mlir", autospec=True, side_effect=BaseDSL.generate_mlir
+    ) as traces:
+        yield
+    # generate_mlir(dsl, funcBody, ...): the traced @cute.jit function.
+    kernels = sorted({call.args[1].__qualname__ for call in traces.call_args_list})
+    assert not kernels, (
+        f"traced CuTe DSL kernel(s) {', '.join(kernels)} {traces.call_count} "
+        "time(s); a per-batch value likely keys the compile cache"
+    )
+
+
+def move_pages_past_int32(
+    caches: tuple[torch.Tensor, ...], page_table: torch.Tensor
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Copy paged caches to the far end of pools larger than 2**31 elements.
+
+    Every cache is ``[pages, ...]`` with the same page count. Each returned
+    pool places those pages after more than ``2**31`` elements of unwritten
+    pages, sized by the smallest page so it holds for every cache, and the
+    returned page table points at them, so every page base a kernel computes
+    exceeds the int32 range while only the used pages are written.
+    """
+    pages = caches[0].shape[0]
+    first = 2**31 // min(cache[0].numel() for cache in caches) + 1
+    pools = []
+    for cache in caches:
+        pool = torch.empty(
+            (first + pages, *cache.shape[1:]), dtype=cache.dtype, device=cache.device
+        )
+        pool[first:].copy_(cache)
+        pools.append(pool)
+    return tuple(pools), page_table + first
+
+
 def compiled_kernels(kernel: Any) -> list[Any]:
     """Every binary this process has compiled for a Triton ``kernel``, from its JIT cache."""
     return [

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Private, source-versioned SM90 block-FP8 MoE modules for FlashInfer 0.7.2."""
+"""Private, source-versioned SM90 block-FP8 MoE modules for FlashInfer 0.7.2.post1."""
 
 from __future__ import annotations
 
@@ -153,9 +153,11 @@ def _source_tree(
         "#endif",
     )
     directory = cache / tag
-    # FlashInfer's inline include-directory storage may be shared across DSOs.
-    # Bind the private JIT compiler to this immutable source tree, so loading
-    # another MoE module cannot redirect cold compilation to its headers.
+    # FlashInfer's inline include-directory storage is one process-wide object
+    # shared across DSOs. Bind the private JIT compiler to this immutable source
+    # tree, so loading another MoE module cannot redirect cold compilation to
+    # its headers, and rename the private storage, so loading this module
+    # cannot redirect the installed module to these patched headers either.
     include_dir = json.dumps(str(directory / "csrc/nv_internal/tensorrt_llm"))
     patched[compiler] = _replace_once(
         patched[compiler],
@@ -163,6 +165,9 @@ def _source_tree(
         "for (auto const& dir : std::vector<std::filesystem::path>{"
         + include_dir
         + "}) {",
+    )
+    patched[compiler] = re.sub(
+        r"\b(get|set)JitIncludeDirs\b", rf"\1JitIncludeDirs_{tag}", patched[compiler]
     )
     directory.mkdir(parents=True, exist_ok=True)
     with FileLock(str(directory / "source.lock")):
@@ -217,6 +222,7 @@ def _private_spec(
     flags.append(f"-DFLASHINFER_SM90_MOE_MAX_STAGES_FC2={max_num_stages_fc2}")
     if optimized:
         flags.append("-DFLASHINFER_SM90_GROUPED_MOE_OPTIMIZATIONS=1")
+        flags.append("-DFLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT=1")
     mode = "optimized" if optimized else "expected_m"
     return replace(
         spec,
@@ -237,9 +243,9 @@ def _private_entrypoint(
     from flashinfer.jit import env as jit_env
     from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
-    if flashinfer.__version__ != "0.7.2":
+    if flashinfer.__version__ != "0.7.2.post1":
         raise RuntimeError(
-            f"SM90 MoE patch requires FlashInfer 0.7.2, got {flashinfer.__version__}; "
+            f"SM90 MoE patch requires FlashInfer 0.7.2.post1, got {flashinfer.__version__}; "
             "use mode='default' for the installed implementation"
         )
     if os.environ.get("FLASHINFER_DISABLE_JIT"):

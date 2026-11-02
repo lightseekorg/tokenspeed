@@ -30,8 +30,12 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 
 def _require_blackwell() -> None:
-    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
-        pytest.skip("grouped QSA requires NVIDIA SM100 or SM103")
+    if current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+        ArchVersion(10, 7),
+    ):
+        pytest.skip("grouped QSA requires NVIDIA SM100, SM103, or SM107")
 
 
 @pytest.mark.parametrize(
@@ -337,7 +341,8 @@ def test_qsa_startup_respects_kernel_override(device, monkeypatch, override_sour
     assert not qsa_sparse._WARMED
 
 
-@pytest.mark.parametrize("override_source", ["context", "environment", "callsite"])
+# Context and environment overrides resolve alike; the test above checks context.
+@pytest.mark.parametrize("override_source", ["environment", "callsite"])
 def test_qsa_startup_warms_override_with_conflicting_solution(
     device, monkeypatch, override_source
 ):

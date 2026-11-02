@@ -82,12 +82,10 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -845,7 +843,7 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
     """MiniMax-M3 text model with checkpoint-compatible weight loading."""
 
     model_cls = MiniMaxM3Model
-    fall_back_to_pt_during_load = False
+    supports_aux_capture = True
 
     # Ordered checkpoint->parameter-dict renames applied by load_weights.
     checkpoint_name_replacements = (
@@ -1528,15 +1526,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
         self.multimodal_embedder = MultimodalEmbedder(encoder_mapping=mapping.vision)
         self.image_encoder = self.get_image_feature
         self.video_encoder = self.get_video_feature
-
-    def pad_input_ids(
-        self,
-        input_ids: list[int],
-        mm_inputs: MultimodalInputs,
-    ) -> list[int]:
-        """Replace media placeholders with content-derived prefix-cache IDs."""
-
-        return pad_input_tokens(input_ids, mm_inputs)
 
     def _get_vision_feature(
         self,

@@ -38,7 +38,7 @@ from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slot
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
-from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
+from tokenspeed.runtime.models.deepseek_v3 import absorb_mla_kv_b_proj
 from tokenspeed.runtime.models.dflash import (
     DFlashDecoderLayer,
     DFlashDraftModel,
@@ -564,10 +564,7 @@ class DFlash2DraftModel(DFlashDraftModel):
                 f"DFlash2 MLA checkpoint is missing {len(missing)} weights: {missing[:8]}"
             )
         for layer in self.layers:
-            self_attn = layer.self_attn
-            self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                self_attn.kv_b_proj.weight, self_attn
-            )
+            absorb_mla_kv_b_proj(layer.self_attn)
 
     @torch.no_grad()
     def forward(self, *args, input_embeds: torch.Tensor | None = None, **kwargs):

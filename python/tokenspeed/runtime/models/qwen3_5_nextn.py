@@ -139,8 +139,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
 
-        self.is_multimodal = hasattr(config, "text_config")
-        if self.is_multimodal:
+        if hasattr(config, "text_config"):
             config = config.text_config
 
         quant_config = _resolve_mtp_quant_config(quant_config)
@@ -276,9 +275,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         """
         return "mtp" in name
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
-    ):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -398,16 +395,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
 
 class Qwen3_5MoeForConditionalGenerationNextN(Qwen3_5ForConditionalGenerationNextN):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        quant_config=None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            config=config, mapping=mapping, quant_config=quant_config, prefix=prefix
-        )
+    pass
 
 
 class Qwen3_5MoeForCausalLMNextN(Qwen3_5MoeForConditionalGenerationNextN):

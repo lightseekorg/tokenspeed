@@ -20,11 +20,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import tokenspeed_kernel.benchmark.generators.gdn as gdn_generator
 import tokenspeed_kernel.ops.attention.gdn as gdn_ops
 import torch
-from tokenspeed_kernel.benchmark.harness import BenchmarkRequest
+from tokenspeed_kernel.benchmark.harness import (
+    BenchmarkCaseError,
+    BenchmarkRequest,
+    BenchmarkStatus,
+)
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelSpec
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -37,6 +44,7 @@ def _request(mode: str, **parameters: object) -> BenchmarkRequest:
         parameters={
             "model_profile": "qwen38_flash_tp2",
             "dtype": "bfloat16",
+            "state_dtype": "float32",
             **parameters,
         },
         solution=None,
@@ -143,3 +151,48 @@ def test_gdn_staged_verify_writes_each_position_to_its_own_row(
     assert torch.unique(rows).numel() == 12
     assert int(rows.min()) >= 3
     assert int(rows.max()) < call["initial_state"].shape[0]
+
+
+@pytest.mark.parametrize("state_dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("state_writes", [None, "none", "per_token"])
+def test_gdn_decode_benchmark_runs_with_explicit_state_dtype(state_dtype, state_writes):
+    if state_writes is None:
+        prepare = gdn_generator.prepare_gdn_decode_step
+        request = _request("gdn_decode_step", batch=2, state_dtype=state_dtype)
+        tokens = 1
+    else:
+        prepare = gdn_generator.prepare_gdn_decode_mtp
+        tokens = 4
+        request = _request(
+            "gdn_decode_mtp",
+            batch=2,
+            tokens=tokens,
+            state_writes=state_writes,
+            state_dtype=state_dtype,
+        )
+    prepared = prepare(replace(request, solution="triton"), current_platform())
+    output = prepared.invocation.invoke()
+    assert output.shape == (2, tokens, 24, 128)
+    assert torch.isfinite(output).all()
+    assert prepared.parameters["state_dtype"] == state_dtype
+
+
+@pytest.mark.parametrize("state_dtype", [None, "float16"])
+@pytest.mark.parametrize("mode", ["gdn_decode_step", "gdn_decode_mtp"])
+def test_gdn_decode_benchmark_rejects_missing_or_unsupported_state_dtype(
+    mode, state_dtype
+):
+    request = _request(mode, batch=2, tokens=4, state_writes="none")
+    parameters = dict(request.parameters)
+    if state_dtype is None:
+        del parameters["state_dtype"]
+    else:
+        parameters["state_dtype"] = state_dtype
+    prepare = (
+        gdn_generator.prepare_gdn_decode_step
+        if mode == "gdn_decode_step"
+        else gdn_generator.prepare_gdn_decode_mtp
+    )
+    with pytest.raises(BenchmarkCaseError, match="state_dtype") as error:
+        prepare(replace(request, parameters=parameters), current_platform())
+    assert error.value.status == BenchmarkStatus.INVALID_CASE

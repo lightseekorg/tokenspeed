@@ -431,10 +431,9 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     backend.set_kv_pool(pool)
 
     def supports(op, trait):
-        traits = {"head_dim": HEAD_K_DIM}
+        traits = {"head_dim": HEAD_K_DIM, "value_head_dim": HEAD_V_DIM}
         if op == "gdn_decode_mtp":
             traits.update(
-                value_head_dim=HEAD_V_DIM,
                 verify_tokens=DRAFT_TOKENS,
                 output_only=False,
                 tree=False,

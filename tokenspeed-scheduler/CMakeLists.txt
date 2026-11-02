@@ -56,6 +56,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/core/cache_config.cpp
     csrc/cache/coordinator/cache_admission.cpp
     csrc/cache/coordinator/cache_coordinator.cpp
+    csrc/cache/coordinator/host_segments.cpp
     csrc/cache/core/cache_block_ref.cpp
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
@@ -113,6 +114,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_prefix_index.cpp
         tests/cpp/test_tail_table.cpp
+        tests/cpp/test_boundary_tree.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_group.cpp
@@ -132,8 +134,11 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_token_level_hits.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_cache_operations.cpp
+        tests/cpp/test_pending_prefix_store.cpp
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_capacity_model.cpp
+        tests/cpp/test_shadow_occupancy.cpp
+        tests/cpp/test_closed_loop_random.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests

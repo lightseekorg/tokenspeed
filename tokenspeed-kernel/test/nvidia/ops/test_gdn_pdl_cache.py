@@ -36,7 +36,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
-from tokenspeed_kernel.ops.attention.gdn._flashinfer import pdl
+from tokenspeed_kernel.ops.attention.gdn._flashinfer import adapter
+from tokenspeed_kernel.thirdparty.flashinfer import gdn_pdl as pdl
 
 _compile_cache = {}
 _compile_calls = []
@@ -80,9 +81,13 @@ def test_pdl_persistent_cache_isolation(pdl_first, tmp_path, monkeypatch):
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
     # Mutate temporary source copies to test invalidation without changing
     # installed code or any shared cache directory.
-    adapter_sources = [tmp_path / name for name in ("pdl.py", "adapter.py")]
-    for target in adapter_sources:
-        target.write_text(Path(pdl.__file__).with_name(target.name).read_text())
+    adapter_sources = [
+        tmp_path / "thirdparty/flashinfer/gdn_pdl.py",
+        tmp_path / "ops/attention/gdn/_flashinfer/adapter.py",
+    ]
+    for target, source in zip(adapter_sources, (pdl.__file__, adapter.__file__)):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(Path(source).read_text())
     monkeypatch.setattr(pdl, "__file__", str(adapter_sources[0]))
     upstream_source = tmp_path / "upstream.py"
     upstream_source.write_text("upstream version 1")

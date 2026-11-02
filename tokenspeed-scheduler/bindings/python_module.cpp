@@ -95,6 +95,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
+    nb::enum_<tokenspeed::SchedulerConfig::HostWritePolicy>(scheduler_config, "HostWritePolicy")
+        .value("Unspecified", tokenspeed::SchedulerConfig::HostWritePolicy::kUnspecified)
+        .value("WriteThrough", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteThrough)
+        .value("WriteBack", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteBack);
+
     nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
         .value("Full", tokenspeed::AttnKind::kFull)
         .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
@@ -112,17 +117,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
                std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
                std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
-               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable) {
+               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable,
+               std::int32_t checkpoint_granularity) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    attn_kind,           sliding_window_tokens, replayable,  transfer_policy,
-                    shard_count,
+                    std::move(group_id), block_granularity,      total_pages, cache_blocks_per_lcm_block,
+                    attn_kind,           sliding_window_tokens,  replayable,  transfer_policy,
+                    shard_count,         checkpoint_granularity,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
-            nb::arg("replayable") = false)
+            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -131,12 +137,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
+        .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
@@ -155,7 +163,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
+        .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
+        .def_rw("host_write_policy", &tokenspeed::SchedulerConfig::host_write_policy)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
@@ -255,6 +265,65 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("unavailable_dropped_backup_keys", &tokenspeed::StorageStats::unavailable_dropped_backup_keys)
         .def_ro("disabled_dropped_backup_keys", &tokenspeed::StorageStats::disabled_dropped_backup_keys)
         .def_ro("cleanup_dropped_backup_keys", &tokenspeed::StorageStats::cleanup_dropped_backup_keys);
+
+    // Host L2 counters (Scheduler.host_cache_stats), read-only. Every by-group
+    // list is indexed like SchedulerConfig.cache_groups.
+    nb::class_<tokenspeed::CacheCoordinator::HostEvictionCounts>(m, "HostEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheCoordinator::HostEvictionCounts::blocks)
+        .def_ro("device_resident", &tokenspeed::CacheCoordinator::HostEvictionCounts::device_resident);
+    nb::class_<tokenspeed::CacheCoordinator::HostEvictionStats>(m, "HostEvictionStats")
+        .def_ro("lru", &tokenspeed::CacheCoordinator::HostEvictionStats::lru)
+        .def_ro("duplicate", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate)
+        .def_ro("superseded", &tokenspeed::CacheCoordinator::HostEvictionStats::superseded)
+        .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
+        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
+        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush)
+        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv);
+    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
+        .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);
+    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionStats>(m, "DeviceEvictionStats")
+        .def_ro("admission", &tokenspeed::CacheCoordinator::DeviceEvictionStats::admission)
+        .def_ro("request_reclaim", &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim)
+        .def_ro("request_reclaim_for_write_back",
+                &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim_for_write_back)
+        .def_ro("stranded_suffix", &tokenspeed::CacheCoordinator::DeviceEvictionStats::stranded_suffix)
+        .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
+        .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
+        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
+        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection);
+    nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
+        .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
+        .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
+        .def_ro("host_cached", &tokenspeed::TierTransferManager::WriteBackStats::host_cached)
+        .def_ro("in_flight", &tokenspeed::TierTransferManager::WriteBackStats::in_flight)
+        .def_ro("evicted_before_drain", &tokenspeed::TierTransferManager::WriteBackStats::evicted_before_drain)
+        .def_ro("no_placement", &tokenspeed::TierTransferManager::WriteBackStats::no_placement)
+        .def_ro("snapshot_fallback", &tokenspeed::TierTransferManager::WriteBackStats::snapshot_fallback)
+        .def_ro("image_refused", &tokenspeed::TierTransferManager::WriteBackStats::image_refused)
+        .def_ro("recopied", &tokenspeed::TierTransferManager::WriteBackStats::recopied)
+        .def_ro("cancelled", &tokenspeed::TierTransferManager::WriteBackStats::cancelled);
+    nb::class_<tokenspeed::TierTransferManager::LoadBackStats>(m, "LoadBackStats")
+        .def_ro("ops", &tokenspeed::TierTransferManager::LoadBackStats::ops)
+        .def_ro("blocks", &tokenspeed::TierTransferManager::LoadBackStats::blocks);
+    nb::class_<tokenspeed::PrefixHitStats>(m, "PrefixHitStats")
+        .def_ro("prompt_tokens", &tokenspeed::PrefixHitStats::prompt_tokens)
+        .def_ro("device_hit_tokens", &tokenspeed::PrefixHitStats::device_hit_tokens)
+        .def_ro("host_hit_tokens", &tokenspeed::PrefixHitStats::host_hit_tokens)
+        .def_ro("host_gain_tokens", &tokenspeed::PrefixHitStats::host_gain_tokens)
+        .def_ro("unresumable_kv_tokens", &tokenspeed::PrefixHitStats::unresumable_kv_tokens);
+    nb::class_<tokenspeed::HostCacheStats>(m, "HostCacheStats")
+        .def_ro("prefix_hits", &tokenspeed::HostCacheStats::prefix_hits)
+        .def_ro("publication_stores", &tokenspeed::HostCacheStats::publication_stores)
+        .def_ro("finish_stores", &tokenspeed::HostCacheStats::finish_stores)
+        .def_ro("retraction_stores", &tokenspeed::HostCacheStats::retraction_stores)
+        .def_ro("eviction_stores", &tokenspeed::HostCacheStats::eviction_stores)
+        .def_ro("prefix_loads", &tokenspeed::HostCacheStats::prefix_loads)
+        .def_ro("restore_loads", &tokenspeed::HostCacheStats::restore_loads)
+        .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
+        .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
+        .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
+        .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
@@ -593,6 +662,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
         .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
+        .def("host_pool_free_blocks", &tokenspeed::Scheduler::HostPoolFreeBlocks,
+             "Empty Host L2 pool parents; a parent with any occupied slot counts as used.")
+        .def("host_pool_total_blocks", &tokenspeed::Scheduler::HostPoolTotalBlocks,
+             "Host L2 pool parents (0 without a Host pool).")
+        .def("host_cache_stats", &tokenspeed::Scheduler::GetHostCacheStats,
+             "Host L2 counters and the Device evictions they are read against, cumulative since start. "
+             "Accounting only, for tests and inspection: no scheduling decision reads them, the runtime "
+             "exports none, and reading them changes nothing.")
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
         .def("storage_held_blocks", &tokenspeed::Scheduler::StorageHeldBlocks)

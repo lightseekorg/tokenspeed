@@ -117,10 +117,9 @@ def _whole_call_kernels() -> tuple[object, ...]:
         warp_decode._stage2_fp8_warp_gemv,
         moe_align_fused._fused_align_kernel,
         moe_align_device._prepare_small_kernel,
-        moe_align_device._init_kernel,
-        moe_align_device._count_kernel,
-        moe_align_device._offsets_kernel,
         moe_align_device._scatter_kernel,
+        moe_align_device._chunk_count_kernel,
+        moe_align_device._chunk_scatter_kernel,
         _fp8_token_group_quantize_kernel,
         packed_small.gluon_fp8_packed_small_stage1_gfx950,
         packed_small.gluon_fp8_packed_small_stage2_gfx950,
@@ -404,8 +403,9 @@ def test_packed_large_row_views_reuse_warmed_capacity_buckets() -> None:
         )
 
     # Changed tensor-view sizes cross explicit capacity buckets: M64 has 512
-    # routes, while M65 rounds to 1024.
-    # Warm those two buckets and both cache policies, not every checked size.
+    # routes, while M65 rounds to 1024. They also cross the schedule switch:
+    # through M64 runs 16-row blocks and M65 the 64-row blocks.
+    # Warm those two buckets and both schedules, not every checked size.
     run(62)
     run(64)
     run(66)

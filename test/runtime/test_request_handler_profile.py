@@ -454,6 +454,25 @@ class TestRequestHandlerProtonProfile:
         assert ("ROCR_VISIBLE_DEVICES") in (result.message)
         assert not (self.handler.profile_in_progress)
 
+    @pytest.mark.parametrize("activities", [["PROTON"], ["CPU", "GPU"]])
+    def test_init_rejects_gpu_profiling_without_rocm_tool_registration(
+        self, activities
+    ):
+        req = _start_req(self.output_dir)
+        req.activities = activities
+        with (
+            mock.patch.object(profiler_mod, "proton_available", return_value=True),
+            mock.patch.object(profiler_mod.torch.version, "hip", "7.2"),
+            mock.patch.dict(
+                profiler_mod.os.environ, {"HSA_TOOLS_DISABLE_REGISTER": "1"}
+            ),
+        ):
+            result = self.handler.profile(req)
+
+        assert not (result.success)
+        assert ("HSA_TOOLS_DISABLE_REGISTER=0") in (result.message)
+        assert not (self.handler.profile_in_progress)
+
     def test_start_returns_failure_when_proton_cannot_initialize(self):
         with mock.patch.object(
             profiler_mod, "proton_available", return_value=True

@@ -296,7 +296,7 @@ def test_shared_field_store_matches_standalone_scatter(layer_id: int, heads_l: i
     assert torch.equal(k_view.view(torch.uint8), ref.view(torch.uint8))
 
 
-def _make_config(prefix_granularity: int):
+def _make_config(kernel_page_size: int | None):
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
@@ -312,8 +312,7 @@ def _make_config(prefix_granularity: int):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_mxfp8=True,
-        prefix_granularity=prefix_granularity,
-        kernel_page_size=prefix_granularity,
+        kernel_page_size=kernel_page_size,
         context_len=4096,
         max_bs=8,
         kv_cache_quant_method="none",
@@ -332,7 +331,7 @@ def _create_config_pool(config):
 
     setup = prepare_cache_setup(
         family="mha",
-        server_args=SimpleNamespace(max_total_tokens=512),
+        server_args=SimpleNamespace(max_total_tokens=512, kv_offload_config=None),
         model_config=SimpleNamespace(num_attention_layers=LAYERS),
         attn_config=config,
         draft_model_config=None,
@@ -403,18 +402,20 @@ def test_config_selects_mxfp8_pool_and_sizes():
         MHATokenToKVPoolMXFP8,
     )
 
-    config = _make_config(prefix_granularity=128)
+    config = _make_config(kernel_page_size=None)
     # fp8 data + 1 scale byte per 32: 33/32 of the fp8 cell.
     assert (
         config.cache_cell_size() == HEADS * HEAD_DIM * 2 + (HEADS * HEAD_DIM * 2) // 32
     )
     pool = _create_config_pool(config)
     assert isinstance(pool, MHATokenToKVPoolMXFP8)
+    # The recipe widens its 64-token default grain to the scale tile.
+    assert pool.arena.prefix_granularity == 128
 
 
-def test_config_rejects_non_128_page():
-    config = _make_config(prefix_granularity=64)
-    with pytest.raises(AssertionError, match="prefix-granularity 128"):
+def test_config_rejects_a_page_wider_than_the_scale_tile():
+    config = _make_config(kernel_page_size=256)
+    with pytest.raises(AssertionError, match="128-row pages"):
         _create_config_pool(config)
 
 

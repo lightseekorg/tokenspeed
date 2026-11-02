@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -30,6 +31,7 @@ import os
 import tempfile
 from collections.abc import Generator
 from contextvars import ContextVar
+from dataclasses import replace
 from pathlib import Path
 
 import torch.distributed as dist
@@ -62,6 +64,18 @@ _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 _autotune_process_group: dist.ProcessGroup | None = None
 _warmup_enabled: ContextVar[bool] = ContextVar("kernel_warmup_enabled", default=False)
 
+# These token-row GEMMs use native input-derived buckets. Small-M BF16 has
+# its own bounded discovery, while MoE already receives the token ceiling.
+_TOKEN_GEMMS = frozenset(
+    {
+        "mxfp8_gemm",
+        "fp8_gemm",
+        "fp4_gemm",
+        "bf16_fp4_cute_dsl_sm100_gemm",
+        "nvfp4_gemm_swiglu_nvfp4_quant",
+    }
+)
+
 
 @contextlib.contextmanager
 def kernel_warmup(*, enabled: bool) -> Generator[None]:
@@ -87,6 +101,47 @@ def kernel_warmup(*, enabled: bool) -> Generator[None]:
 def is_warming_up() -> bool:
     """Return whether kernel warmup is enabled in the current context."""
     return _warmup_enabled.get()
+
+
+@functools.cache
+def _gemm_tuning_config(config, num_tokens: int):
+    """Cover num_tokens with generated buckets; preserve explicit buckets."""
+    (spec,) = config.dynamic_tensor_specs
+    if not callable(spec.gen_tuning_buckets):
+        # Explicit native buckets (including an enclosing TS scope) own
+        # their range. FlashInfer context overrides are applied later.
+        return config
+    # Include the enclosing bucket for non-bucket capacities. Keep the
+    # serving mapper and every scale/output/workspace constraint unchanged.
+    buckets = tuple(spec.gen_tuning_buckets(spec.map_to_tuning_buckets(num_tokens)))
+    return replace(
+        config,
+        dynamic_tensor_specs=(replace(spec, gen_tuning_buckets=buckets),),
+    )
+
+
+@contextlib.contextmanager
+def _gemm_token_buckets():
+    """Expose the startup token capacity when a supported GEMM is dispatched."""
+    AutoTuner = _autotuner.AutoTuner
+    original_choose = AutoTuner.choose_one
+    capacity = get_autotune_max_num_tokens()
+
+    def choose(tuner, custom_op, runners, tuning_config, inputs, **kwargs):
+        if custom_op in _TOKEN_GEMMS and tuner.is_tuning_mode:
+            (spec,) = tuning_config.dynamic_tensor_specs
+            rows = inputs[spec.input_idx[0]].shape[spec.dim_idx[0]]
+            # Never shrink the native coverage of an encountered larger input.
+            tuning_config = _gemm_tuning_config(tuning_config, max(capacity, int(rows)))
+        return original_choose(
+            tuner, custom_op, runners, tuning_config, inputs, **kwargs
+        )
+
+    AutoTuner.choose_one = choose
+    try:
+        yield
+    finally:
+        AutoTuner.choose_one = original_choose
 
 
 @contextlib.contextmanager
@@ -232,7 +287,7 @@ def autotune_cache_path(cache_key: dict[str, object]) -> str | None:
 
 
 def set_autotune_max_num_tokens(num_tokens: int) -> None:
-    """Set the token count MoE tuning buckets are generated up to.
+    """Set the token ceiling for MoE and token-row GEMM tuning buckets.
 
     Call once at startup, before :func:`autotune` is first entered. The value must stay
     constant for the process lifetime: flashinfer builds the bucket *mapper*
@@ -250,7 +305,7 @@ def set_autotune_max_num_tokens(num_tokens: int) -> None:
 
 
 def get_autotune_max_num_tokens() -> int:
-    """Token count MoE tuning buckets are generated up to.
+    """Token ceiling for MoE and token-row GEMM tuning buckets.
 
     Returns:
         The value set by :func:`set_autotune_max_num_tokens`, or the default floor.
@@ -269,7 +324,9 @@ def autotune(
 
     Kernels invoked inside the block profile their candidate tactics and cache
     the winner per shape bucket; outside it they are a cache lookup with a
-    heuristic fallback. A no-op when the tuning backend is unavailable.
+    heuristic fallback. Token-row GEMMs expose the configured capacity even
+    when their first input is small. Explicit buckets still take precedence.
+    A no-op when the tuning backend is unavailable.
 
     Args:
         tune_mode: Profile missing configs when true; lookup only when false.
@@ -292,7 +349,8 @@ def autotune(
         )
     candidates = _ep_moe_candidates() if tune_mode else contextlib.nullcontext()
     cache = _reuse_autotune_cache() if tune_mode else contextlib.nullcontext()
-    with cache, candidates, _autotuner.autotune(
+    gemms = _gemm_token_buckets() if tune_mode else contextlib.nullcontext()
+    with cache, candidates, gemms, _autotuner.autotune(
         tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
     ):
         yield

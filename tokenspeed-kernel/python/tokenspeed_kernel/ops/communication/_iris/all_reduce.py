@@ -22,10 +22,17 @@
 
 import dataclasses
 import math
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes, iris
+from tokenspeed_kernel.ops.communication._iris.synchronization import (
+    wait_loads,
+    wait_loads_stores,
+    wait_stores,
+    wait_vmem,
+)
 from tokenspeed_kernel.ops.communication.iris import (
     _PACKED_WORD_BYTES,
     _PRODUCER_DIRECT_GL_DTYPES,
@@ -44,8 +51,8 @@ _TWO_SHOT_NUM_SUBGROUPS = 8
 
 
 @dataclasses.dataclass(frozen=True)
-class IrisCachePolicy:
-    """Cache modifiers for Iris accesses whose policy differs by architecture.
+class IrisArchPolicy:
+    """Cache modifiers and memory waits for Iris that differ by architecture.
 
     Flag polls (".cv"), stores publishing into the local heap (".wt"), and
     system-scope atomics are the same on every architecture and stay literal.
@@ -57,38 +64,57 @@ class IrisCachePolicy:
         peer_signal_store: Store into a peer's memory that the peer polls,
             such as a barrier epoch or a Lamport mailbox; empty selects the
             default.
+        wait_vmem: Subgroup completion of vector loads and stores; does not
+            cover async or tensor copies to LDS.
+        wait_loads: Subgroup completion of vector loads.
+        wait_stores: Subgroup completion of vector stores.
+
+    States select this policy once at construction and pass its wait functions
+    as Gluon constexpr arguments, alongside the cache modifiers. Keep full waits
+    at read-completion and acquire boundaries, including entry epoch updates.
+    Use store-only waits for payload publication and mailbox reset completion.
+    Workgroup barriers and system-scope ordering remain the caller's responsibility.
     """
 
     peer_payload_load: str
     peer_signal_store: str
+    wait_vmem: Callable
+    wait_loads: Callable
+    wait_stores: Callable
 
 
-_IRIS_CACHE_POLICIES = {
-    ArchVersion(9, 5): IrisCachePolicy(
+_IRIS_ARCH_POLICIES = {
+    ArchVersion(9, 5): IrisArchPolicy(
         peer_payload_load=".cg",
         peer_signal_store=".wt",
+        wait_vmem=wait_vmem,
+        wait_loads=wait_vmem,
+        wait_stores=wait_vmem,
     ),
     # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
     # partially read sector over the fabric, and ".wt" peer stores are an order
     # of magnitude slower than plain ones.
-    ArchVersion(12, 5): IrisCachePolicy(
+    ArchVersion(12, 5): IrisArchPolicy(
         peer_payload_load="",
         peer_signal_store="",
+        wait_vmem=wait_loads_stores,
+        wait_loads=wait_loads,
+        wait_stores=wait_stores,
     ),
 }
 
 
-def iris_cache_policy(arch: ArchVersion | None = None) -> IrisCachePolicy:
-    """Return the Iris cache policy for ``arch``, or for the current device.
+def iris_arch_policy(arch: ArchVersion | None = None) -> IrisArchPolicy:
+    """Return the Iris policy for ``arch``, or for the current device.
 
     Raises:
-        ValueError: ``arch`` has no Iris cache policy.
+        ValueError: ``arch`` has no Iris policy.
     """
     if arch is None:
         arch = current_platform().arch_version
-    policy = _IRIS_CACHE_POLICIES.get(arch)
+    policy = _IRIS_ARCH_POLICIES.get(arch)
     if policy is None:
-        raise ValueError(f"Iris has no cache policy for {arch}")
+        raise ValueError(f"Iris has no policy for {arch}")
     return policy
 
 
@@ -175,6 +201,7 @@ class StagedPullOneShot:
         block_size: int,
         num_subgroups: int,
     ):
+        self._arch = iris_arch_policy()
         self.peers = peers
         self.block_size = block_size
         self.num_subgroups = num_subgroups
@@ -197,7 +224,7 @@ class StagedPullOneShot:
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
-            PEER_PAYLOAD_LOAD_CACHE=iris_cache_policy().peer_payload_load,
+            PEER_PAYLOAD_LOAD_CACHE=self._arch.peer_payload_load,
             num_warps=self.num_subgroups,
         )
 
@@ -209,10 +236,10 @@ def _launch_pull_twoshot(
     ready_flags: torch.Tensor,
     out: torch.Tensor,
     *,
+    arch: IrisArchPolicy,
     exit_barrier: bool,
     hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
-    policy = iris_cache_policy()
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
     numel = out.numel() if hc_post is None else out.numel() // 4
     partition_words = numel // peers.world_size // elements_per_word
@@ -242,8 +269,8 @@ def _launch_pull_twoshot(
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
-        PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
-        PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
+        PEER_PAYLOAD_LOAD_CACHE=arch.peer_payload_load,
+        PEER_SIGNAL_STORE_CACHE=arch.peer_signal_store,
         **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
@@ -285,6 +312,7 @@ class StagedPullTwoShot:
         )
 
     def __init__(self, peers: IrisGroup, max_numel: int, dtype: torch.dtype):
+        self._arch = iris_arch_policy()
         self.peers = peers
         self.input = peers.ctx.zeros((max_numel,), dtype=dtype)
         self.scratch = peers.ctx.zeros(
@@ -313,6 +341,7 @@ class StagedPullTwoShot:
             self.scratch,
             self.ready_flags,
             aligned_output,
+            arch=self._arch,
             exit_barrier=True,
         )
         if aligned_output is not out:
@@ -332,6 +361,7 @@ class ProducerPull:
         ) + allocation_bytes((_PULL_MAX_PROGRAMS, world_size), torch.int32)
 
     def __init__(self, producer: ProducerBuffer):
+        self._arch = iris_arch_policy()
         self.producer = producer
         peers = producer.peers
         scratch_numel = _pull_scratch_numel(producer.data.numel(), peers.world_size)
@@ -374,11 +404,12 @@ class ProducerPull:
                 self.scratch,
                 self.ready_flags,
                 out,
+                arch=self._arch,
                 exit_barrier=False,
                 hc_post=hc_post,
             )
             return
-        policy = iris_cache_policy()
+        arch = self._arch
         num_tiles = triton.cdiv(numel, self.BLOCK_SIZE)
         num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
         iris_pull_oneshot[(num_programs,)](
@@ -397,8 +428,8 @@ class ProducerPull:
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
             ELEMENTS_PER_WORD=_PACKED_WORD_BYTES // inputs.element_size(),
-            PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
-            PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
+            PEER_PAYLOAD_LOAD_CACHE=arch.peer_payload_load,
+            PEER_SIGNAL_STORE_CACHE=arch.peer_signal_store,
             **_hc_post_args(hc_post, _PACKED_WORD_BYTES // inputs.element_size()),
             num_warps=self.NUM_SUBGROUPS,
         )
@@ -434,6 +465,7 @@ class ProducerLamport:
         *,
         max_numel: int,
     ):
+        self._arch = iris_arch_policy()
         self.producer = producer
         peers = producer.peers
         assert self.supported(peers.world_size, producer.data.dtype)
@@ -468,7 +500,7 @@ class ProducerLamport:
             TOTAL_ELEMENTS=out.numel(),
             MAX_ELEMENTS=self.max_numel,
             NUM_STAGES=self.NUM_STAGES,
-            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=self.NUM_SUBGROUPS,
         )
 
@@ -509,19 +541,6 @@ def all_reduce_heap_bytes(
         if StagedPullTwoShot.supported(world_size, dtype):
             size += StagedPullTwoShot.heap_bytes(staged_max_numel, world_size, dtype)
     return size
-
-
-@gluon.jit
-def _iris_drain_subgroup_vmem():
-    """Finish this subgroup's outstanding vector memory operations."""
-    gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)",
-        "=r,~{memory}",
-        [],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
 
 
 @gluon.jit
@@ -944,6 +963,7 @@ def _iris_sync_rank_token(
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """Publish a counter to peers and wait for their matching counters."""
     layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
@@ -991,9 +1011,9 @@ def _iris_sync_rank_token(
         sem="acquire",
         scope="sys",
     )
-    _iris_drain_subgroup_vmem()
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     # The acquire is subgroup-local. Keep every subgroup at the protocol
-    # boundary until all of them have observed the peer publications; the
+    # boundary until all of them have observed the peer ready flags; the
     # caller consumes the peer inbox immediately after this helper returns.
     gl.barrier()
 
@@ -1841,6 +1861,7 @@ class ProducerAllReduce:
         )
 
     def __init__(self, pull: ProducerPull, *, enable_lamport: bool):
+        self._arch = iris_arch_policy()
         producer = pull.producer
         peers = producer.peers
         assert current_platform().is_cdna4 and peers.world_size in (4, 8)
@@ -1948,7 +1969,7 @@ class ProducerAllReduce:
                 total_elements=numel,
                 MAX_SHARD_ELEMENTS=self.lamport_two_shot_max_numel // self.world_size,
                 NUM_STAGES=3,
-                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+                PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 num_warps=1,
             )
             return output
@@ -1964,7 +1985,7 @@ class ProducerAllReduce:
                 total_elements=numel,
                 MAX_ELEMENTS=self.lamport_max_numel,
                 NUM_STAGES=3,
-                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+                PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 num_warps=1,
             )
             return output
@@ -1982,6 +2003,8 @@ class ProducerAllReduce:
                 BLOCK=1024,
                 NUM_SUBGROUPS=4,
                 num_warps=4,
+                WAIT_VMEM=self._arch.wait_vmem,
+                WAIT_STORES=self._arch.wait_stores,
             )
             return self.push_output
         if input.data_ptr() != self.pull.producer.data.data_ptr():
@@ -1998,6 +2021,7 @@ class ProducerAllReduce:
             BLOCK=2048,
             NUM_SUBGROUPS=4,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
 
@@ -2304,6 +2328,8 @@ def iris_push_twoshot_allreduce(
     RANK: gl.constexpr,
     BLOCK: gl.constexpr,
     NUM_SUBGROUPS: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """Push BF16 partials to partition owners, then distribute their sums.
 
@@ -2333,7 +2359,7 @@ def iris_push_twoshot_allreduce(
                 mask,
                 cache=".wt",
             )
-    _iris_drain_subgroup_vmem()
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, False)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
@@ -2358,7 +2384,8 @@ def iris_push_twoshot_allreduce(
                 mask,
                 cache=".wt",
             )
-    _iris_drain_subgroup_vmem()
+    # Finish inbox reads and output stores before peers can reuse the inbox.
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
     gl.store(epochs + block, epoch)
@@ -2376,6 +2403,7 @@ def iris_pull_twoshot_allreduce(
     RANK: gl.constexpr,
     BLOCK: gl.constexpr,
     NUM_SUBGROUPS: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """Reduce BF16 input partitions, then gather the full result locally.
 
@@ -2408,7 +2436,7 @@ def iris_pull_twoshot_allreduce(
             result += (values[4] + values[5]) + (values[6] + values[7])
         result = result.to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(result, scratch_ptr, index, mask, cache=".wt")
-    _iris_drain_subgroup_vmem()
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):

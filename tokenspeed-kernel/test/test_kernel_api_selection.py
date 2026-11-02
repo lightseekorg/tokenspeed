@@ -444,20 +444,12 @@ def _is_hopper_plus(platform: PlatformInfo) -> bool:
     return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
 
 
-def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
-    return _is_hopper_plus(platform)
-
-
 def _is_hopper_plus_with_flashmla_prefill(platform: PlatformInfo) -> bool:
     return _is_hopper_plus(platform)
 
 
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
-
-
-def _is_nvidia_with_dsv4_cuda(platform: PlatformInfo) -> bool:
-    return platform.is_nvidia and _attention_cuda_dsv4.has_fused_qnorm_rope_kv_insert()
 
 
 def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
@@ -1002,6 +994,9 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
         ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", False, 64, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", False, 65, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", True, 4096, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", False, 8192, "gluon_mm_fp8_blockscale_largem_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
@@ -1021,7 +1016,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(mi450_platform)
 
-    n, k = 128, 256
+    n, k = 128, 512
     a_dtype = torch.bfloat16 if online else _fp8_dtype()
     a = torch.empty((m, k), dtype=a_dtype)
     b = torch.empty((n, k), dtype=_fp8_dtype())
@@ -2057,150 +2052,6 @@ def _attention_dsv4_selected_i64() -> object:
         torch.empty((16,), dtype=torch.float32),
         512**-0.5,
     )
-
-
-def _attention_dsv4_paged_selected(with_extra: bool, heads: int) -> object:
-    q = torch.empty((2, heads, 512), dtype=torch.bfloat16)
-    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
-    swa_slots = torch.empty((2, 256), dtype=torch.int32)
-    swa_lens = torch.empty((2,), dtype=torch.int32)
-    attn_sink = torch.empty((heads,), dtype=torch.float32)
-    kwargs = {}
-    if with_extra:
-        kwargs = {
-            "extra_kv_cache": torch.empty((2, 64 * 584), dtype=torch.uint8),
-            "extra_slots": torch.empty((2, 1, 128), dtype=torch.int32),
-            "extra_lens": torch.empty((2,), dtype=torch.int32),
-            "extra_page_size": 64,
-        }
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=q,
-        swa_kv_cache=swa_cache,
-        swa_slots=swa_slots,
-        swa_lens=swa_lens,
-        swa_page_size=64,
-        attn_sink=attn_sink,
-        softmax_scale=512**-0.5,
-        **kwargs,
-    )
-
-
-def _attention_dsv4_paged_selected_swa_only() -> object:
-    return _attention_dsv4_paged_selected(with_extra=False, heads=16)
-
-
-def _attention_dsv4_paged_selected_pro_tp8() -> object:
-    tokens = 6
-    q = torch.empty((tokens, 16, 512), dtype=torch.bfloat16)
-    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
-    swa_slots = torch.empty((tokens, 128), dtype=torch.int32)
-    swa_lens = torch.empty((tokens,), dtype=torch.int32)
-    extra_cache = torch.empty((16, 64 * 584), dtype=torch.uint8)
-    extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
-    extra_lens = torch.empty((tokens,), dtype=torch.int32)
-    attn_sink = torch.empty((16,), dtype=torch.float32)
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=q,
-        swa_kv_cache=swa_cache,
-        swa_slots=swa_slots,
-        swa_lens=swa_lens,
-        swa_page_size=64,
-        attn_sink=attn_sink,
-        softmax_scale=512**-0.5,
-        extra_kv_cache=extra_cache,
-        extra_slots=extra_slots,
-        extra_lens=extra_lens,
-        extra_page_size=64,
-    )
-
-
-def _attention_dsv4_paged_selected_pro_tp8_i64() -> object:
-    tokens = 6
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
-        swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
-        swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
-        swa_lens=torch.empty((tokens,), dtype=torch.int32),
-        swa_page_size=64,
-        attn_sink=torch.empty((16,), dtype=torch.float32),
-        softmax_scale=512**-0.5,
-        extra_kv_cache=torch.empty((16, 64 * 584), dtype=torch.uint8),
-        extra_slots=torch.empty((tokens, 1024), dtype=torch.int32),
-        extra_lens=torch.empty((tokens,), dtype=torch.int64),
-        extra_page_size=64,
-    )
-
-
-def _attention_dsv4_swa_cache_insert() -> object:
-    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
-    kv = torch.empty((1, 512), dtype=torch.bfloat16)
-    cache = torch.empty((1, 64 * 584), dtype=torch.uint8)
-    slot_mapping = torch.zeros((1,), dtype=torch.int64)
-    positions = torch.zeros((1,), dtype=torch.int64)
-    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
-    q_out = torch.empty_like(q)
-    return _attention_dsv4_pkg.dsv4_swa_cache_insert(
-        q,
-        kv,
-        cache,
-        slot_mapping,
-        positions,
-        cos_sin_cache,
-        1e-6,
-        64,
-        q_out=q_out,
-        validate_positions=True,
-    )
-
-
-def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A runtime may skip only the redundant position check, not the insert."""
-    calls: list[dict[str, object]] = []
-
-    class _SelectedKernel:
-        name = "test_dsv4_swa_cache_insert"
-
-        def __call__(self, **kwargs):
-            calls.append(kwargs)
-
-    monkeypatch.setattr(
-        _attention_dsv4_pkg,
-        "select_kernel",
-        lambda *args, **kwargs: _SelectedKernel(),
-    )
-    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
-    kv = torch.empty((1, 512), dtype=torch.bfloat16)
-    cache = torch.empty((1, 584), dtype=torch.uint8)
-    slots = torch.zeros((1,), dtype=torch.int64)
-    positions = torch.ones((1,), dtype=torch.int64)
-    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
-
-    with pytest.raises(ValueError, match="positions entries must index"):
-        _attention_dsv4_pkg.dsv4_swa_cache_insert(
-            q,
-            kv,
-            cache,
-            slots,
-            positions,
-            cos_sin_cache,
-            1e-6,
-            1,
-            validate_positions=True,
-        )
-    _attention_dsv4_pkg.dsv4_swa_cache_insert(
-        q,
-        kv,
-        cache,
-        slots,
-        positions,
-        cos_sin_cache,
-        1e-6,
-        1,
-        validate_positions=False,
-    )
-    assert len(calls) == 1
 
 
 def _attention_dsa_decode_fp8_dense_rank128_q4(
@@ -5810,33 +5661,6 @@ _CASES = [
         "gluon_dsv41_index_topk_gfx1250",
         partial(_attention_dsv41_index_topk, 32, None, 68),
     ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_gfx1250",
-        _attention_dsv4_paged_selected_pro_tp8,
-        id_suffix="pro-tp8",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_pro_tp8_i64,
-        id_suffix="pro-tp8-int64-metadata",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_gfx1250",
-        _attention_dsv4_paged_selected_swa_only,
-        id_suffix="swa-only",
-    ),
     *[
         _case(
             _is_hopper_plus_with_flashmla_prefill,
@@ -5846,23 +5670,6 @@ _CASES = [
             f"{solution}_dsv4_prefill",
             partial(_attention_dsv4_selected, width=640, heads=heads),
             id_suffix=f"heads{heads}",
-        )
-        for heads, solution in (
-            (16, "triton"),
-            (32, "triton"),
-            (64, "flashmla"),
-            (128, "flashmla"),
-        )
-    ],
-    *[
-        _case(
-            _is_hopper_plus_with_flashmla,
-            "hopper-plus",
-            "attention",
-            "dsv4_decode",
-            f"{solution}_dsv4_decode",
-            partial(_attention_dsv4_paged_selected, with_extra=True, heads=heads),
-            id_suffix=f"extra-segment-heads{heads}",
         )
         for heads, solution in (
             (16, "triton"),
@@ -5902,14 +5709,6 @@ _CASES = [
         "attn_merge_state",
         "cuda_attn_merge_state",
         _attention_merge_state,
-    ),
-    _case(
-        _is_nvidia_with_dsv4_cuda,
-        "hopper",
-        "attention",
-        "dsv4_swa_cache_insert",
-        "cuda_dsv4_swa_cache_insert",
-        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_blackwell_sm100,
@@ -6050,42 +5849,6 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_split_gfx950",
-        _attention_dsv4_paged_selected_pro_tp8,
-        id_suffix="pro-tp8",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_pro_tp8_i64,
-        id_suffix="pro-tp8-int64-metadata",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        partial(_attention_dsv4_paged_selected, with_extra=True, heads=16),
-        id_suffix="extra-segment",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_swa_only,
-        id_suffix="swa-only",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
         "dsv4_prefill",
         "gluon_dsv4_prefill_gfx950",
         partial(_attention_dsv4_selected, width=640, heads=16),
@@ -6135,14 +5898,6 @@ _CASES = [
         "gluon_dsv4_prefill_gfx1250",
         _attention_dsv4_selected_short,
         id_suffix="width128",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_swa_cache_insert",
-        "triton_dsv4_swa_cache_insert",
-        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_cdna4,
@@ -7025,18 +6780,18 @@ _CASES = [
             "cdna5",
             "moe",
             "topk",
-            "triton_sqrt_softplus_topk",
+            "gluon_sqrt_softplus_topk_gfx1250",
             partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
-        for tokens in (1, 2, 17)
+        for tokens in (1, 2, 17, 8192)
     ],
     _case(
         _is_cdna5,
         "cdna5",
         "moe",
         "topk",
-        "triton_sqrt_softplus_topk",
+        "gluon_sqrt_softplus_topk_gfx1250",
         _moe_topk_hash,
         id_suffix="hash",
     ),

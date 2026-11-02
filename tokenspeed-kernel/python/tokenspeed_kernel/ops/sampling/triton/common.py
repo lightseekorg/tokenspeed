@@ -27,7 +27,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["index_ptr"])
 def _gather_and_expand_scalars_kernel(
     index_ptr,
     temperature_ptr,

@@ -23,14 +23,17 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, wraps
 from weakref import WeakValueDictionary
 
 import torch
+from cuda.bindings import driver
 from flashinfer.attention.prims_ts.decode import (
     suggest_q_token_kv_block_sparse_group_size,
 )
+from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
@@ -38,6 +41,40 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
 from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens, is_autotuning
 from tokenspeed_kernel.workspace import retain_for_capture
+
+
+def _cache_cluster_occupancy(query: Callable[[int], int]) -> Callable[[int], int]:
+    """Cache the hardware query independently of each QSA launch geometry."""
+
+    @cache
+    def cached(device_index: int, context: int, cluster_size: int) -> int:
+        # Device and context belong to the key; FlashInfer reads the current context.
+        return query(cluster_size)
+
+    @wraps(query)
+    def current_context(cluster_size: int) -> int:
+        if not torch.cuda.is_available():
+            return query(cluster_size)
+        try:
+            # Match FlashInfer's context initialization before using its query.
+            torch.cuda.init()
+            torch.empty(0, device="cuda")
+            status, context = driver.cuCtxGetCurrent()
+        except RuntimeError:
+            return query(cluster_size)
+        if status != driver.CUresult.CUDA_SUCCESS or int(context) == 0:
+            return query(cluster_size)
+        return cached(torch.cuda.current_device(), int(context), cluster_size)
+
+    return current_context
+
+
+# FlashInfer 0.7.2 creates HardwareInfo for each new launch specification; that
+# recompiles CuTe's occupancy-query kernel. Capacity depends on the CUDA
+# context and cluster size, so all eager plans can share this query cache.
+fmha_decode_config.get_max_active_clusters_for_cluster_size = _cache_cluster_occupancy(
+    fmha_decode_config.get_max_active_clusters_for_cluster_size
+)
 
 
 def _tensor_layout(tensor: torch.Tensor) -> tuple:
@@ -166,6 +203,7 @@ class _PrimTSQSARunner:
         positions = torch.zeros(
             rows, dtype=metadata.query_positions.dtype, device=self._device
         )
+        seq_lens = torch.ones(rows, dtype=torch.int32, device=self._device)
         # Keep scratch plans and their workspace out of serving/graph state.
         scratch_runner = _PrimTSQSARunner(self._device)
         scratch_workspace = QSAWorkspace()
@@ -180,6 +218,7 @@ class _PrimTSQSARunner:
                     metadata.page_size,
                     metadata.block_size,
                     scratch_workspace,
+                    seq_lens=seq_lens[:routes],
                 )
                 scratch_runner._run(
                     scratch_q[:routes],

@@ -199,12 +199,47 @@ def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
 
 def test_request_length_limits_reserve_the_first_decode_window():
     assert request_length_limits(
-        context_len=4096, max_single_request_tokens=1000, decode_input_tokens=4
+        context_len=4096,
+        max_single_request_tokens=1000,
+        decode_input_tokens=4,
+        max_kv_page_num=0,
+        prefix_granularity=128,
     ) == (1000, 996)
     with pytest.raises(RuntimeError, match="cannot admit one request"):
         request_length_limits(
-            context_len=4096, max_single_request_tokens=4, decode_input_tokens=4
+            context_len=4096,
+            max_single_request_tokens=4,
+            decode_input_tokens=4,
+            max_kv_page_num=0,
+            prefix_granularity=128,
         )
+
+
+@pytest.mark.parametrize(
+    "pages,max_input,valid",
+    [
+        (0, 4095, True),
+        (16, 2047, True),
+        (16, 2048, False),
+        (16, 2049, False),
+        (17, 2048, True),
+    ],
+)
+def test_prefill_kv_capacity_must_exceed_the_unchanged_prompt_limit(
+    pages, max_input, valid
+):
+    args = dict(
+        context_len=max_input + 1,
+        max_single_request_tokens=max_input + 32,
+        decode_input_tokens=1,
+        max_kv_page_num=pages,
+        prefix_granularity=128,
+    )
+    if valid:
+        assert request_length_limits(**args) == (max_input + 1, max_input)
+    else:
+        with pytest.raises(ValueError, match="greater than max_req_input_len"):
+            request_length_limits(**args)
 
 
 # ----------------------------------------------------------------------
@@ -227,8 +262,11 @@ class _CpuExecutor:
     """Stands in for the model executor: samples ``100 + row`` per row and
     records what each forward was given."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, output_token_cumulative_probs: torch.Tensor | None) -> None:
         self.device = "cpu"
+        self.output_token_cumulative_probs: torch.Tensor | None = (
+            output_token_cumulative_probs
+        )
         self.forwards: list[tuple[list[str], list, tuple]] = []
         self.dp_metadata: list = []
         self.idle_forwards: list = []
@@ -276,6 +314,7 @@ class _CpuExecutor:
             output_tokens=torch.arange(100, 100 + rows, dtype=torch.int32),
             output_lengths=torch.ones(rows, dtype=torch.int32),
             output_logprobs=torch.full((rows,), -0.5),
+            output_token_cumulative_probs=self.output_token_cumulative_probs,
             copy_event=_LandedCopy(),
             input_token_logprobs=(
                 torch.tensor([-p / 10 for p in positions]) if plan is not None else None
@@ -350,7 +389,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
 
 @pytest.fixture
 def executor():
-    return _CpuExecutor()
+    return _CpuExecutor(output_token_cumulative_probs=None)
 
 
 def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
@@ -374,7 +413,17 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
     )
 
     assert pending is not None
-    assert plane.complete(pending) == ([100], [1], [-0.5], None, None, None, None, None)
+    assert plane.complete(pending) == (
+        [100],
+        [1],
+        [-0.5],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
     ((rids, sampling_params, stop_criteria),) = executor.forwards
     assert rids == ["r1"]
     assert sampling_params == [params]
@@ -384,7 +433,13 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
     ]
 
 
-def test_the_data_plane_hands_the_logprob_plan_to_the_forward(executor):
+@pytest.mark.parametrize("cumulative_probs", [None, [0.875]])
+def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
+    executor = _CpuExecutor(
+        output_token_cumulative_probs=(
+            torch.tensor(cumulative_probs) if cumulative_probs is not None else None
+        )
+    )
     plane = _data_plane(DeviceHandle(executor))
     plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
@@ -392,7 +447,11 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(executor):
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
     )
 
-    *_, logprobs = plane.complete(pending)
+    *_, logprobs, returned_cumulative_probs = plane.complete(pending)
+    if cumulative_probs is None:
+        assert returned_cumulative_probs is None
+    else:
+        assert returned_cumulative_probs == pytest.approx(cumulative_probs)
     ((plan, sampled_top_k),) = executor.logprob_plans
     assert plan == InputLogprobPlan(
         row_starts=(0,), counts=(2,), position_starts=(0,), top_k=2

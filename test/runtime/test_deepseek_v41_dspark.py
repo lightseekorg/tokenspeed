@@ -940,7 +940,6 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         _speculative_widths_explicit=False,
         attention_backend=None,
         drafter_attention_backend=None,
-        prefix_granularity=64,
         load_format="auto",
         disaggregation_mode="null",
         validate_tp_batch_invariant_weights=Mock(),

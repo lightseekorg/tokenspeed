@@ -22,9 +22,9 @@
 #include <cooperative_groups/reduce.h>
 
 #include <cub/cub.cuh>
-#include <cuda/functional>
 
 #include "math.h"
+#include "reduce_ops.cuh"
 #include "vec_dtypes.cuh"
 
 namespace flashinfer {
@@ -45,7 +45,7 @@ __device__ void Softmax(float* scores_vec) {
     max_score = scores_vec[i] > max_score ? scores_vec[i] : max_score;
   }
   __syncthreads();
-  max_score = BlockReduce(reduce_stroge).Reduce(max_score, ::cuda::maximum<float>{});
+  max_score = BlockReduce(reduce_stroge).Reduce(max_score, MaxReduceOp{});
   if (threadIdx.x == 0) {
     shared_val = max_score;
   }

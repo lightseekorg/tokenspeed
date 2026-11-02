@@ -30,7 +30,6 @@ import socket
 from collections.abc import Sequence
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
@@ -44,6 +43,7 @@ from tokenspeed.runtime.configs.numerics import (
     ROUTER_TOPKS,
     SAMPLING_STREAMS,
     YARN_RAMP_MASK_DEVICES,
+    resolve_numerics_envelope,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
@@ -378,9 +378,9 @@ class ServerArgs:
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
+    # Optional bound on summed per-request KV pages in a local prefill batch.
+    chunk_prefill_kv_size: int | None = None
     enable_mixed_batch: bool = False
-    # Scheduler cache-reuse identity granularity in tokens.
-    prefix_granularity: int = 64
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -476,6 +476,8 @@ class ServerArgs:
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # GEMM2 atomic expert combine for unquantized FlashInfer CUTLASS MoE.
+    moe_cutlass_fused_finalize: bool = True
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
@@ -488,6 +490,8 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
+    kvstore_write_policy: str = "write_through"
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -520,6 +524,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = None
+    min_kv_split: int | None = None
     kda_backend: str = "auto"
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
@@ -556,7 +561,6 @@ class ServerArgs:
     deepseek_v41_indexer_query_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
-    deepseek_v4_prefill_chunk_size: int = 4
     # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
@@ -611,6 +615,8 @@ class ServerArgs:
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
+    # Optional diagnostics over the same distribution as output logprobs.
+    enable_output_cumulative_probs: bool = False
     # Sizing knob for prompt (input) logprobs: prompt rows pushed through the
     # LM head per chunk, bounding the transient [rows, vocab] logits
     # (chunk x vocab x (2 + 2 + 4) bytes: bf16 shard, bf16 gathered, fp32
@@ -683,6 +689,7 @@ class ServerArgs:
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 8
     enable_memory_saver: bool = False
+    weight_memory_policy: Literal["cpu_backup", "discard"] | None = None
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
 
@@ -725,9 +732,19 @@ class ServerArgs:
 
     enable_expert_parallel: bool = False
 
-    @property
-    def mamba_cache_chunk_size(self) -> int:
-        return max(FLA_CHUNK_SIZE, self.prefix_granularity)
+    # Resolved in __post_init__; not options.
+    _grammar_backend_unset: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
+    _beam_checkpoint: bool | None = dataclasses.field(
+        default=False, init=False, repr=False
+    )
+    _beam_grammar_none_warned: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
+    _speculative_widths_explicit: bool = dataclasses.field(
+        default=False, init=False, repr=False
+    )
 
     @property
     def spec_context_pad(self) -> int:
@@ -743,6 +760,7 @@ class ServerArgs:
         return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
     def __post_init__(self):
+        self.validate_weight_memory_policy()
         self.resolve_basic_defaults()
         self.resolve_model_defaults()
         self.resolve_launcher_topology()
@@ -754,7 +772,39 @@ class ServerArgs:
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
+        self.validate_output_cumulative_probs()
         self.validate()
+
+    def validate_output_cumulative_probs(self):
+        from tokenspeed.runtime.utils.env import envs
+
+        if not self.enable_output_cumulative_probs:
+            return
+        if not self.enable_output_logprobs:
+            raise ValueError(
+                "--enable-output-cumulative-probs requires --enable-output-logprobs"
+            )
+        # Synthetic acceptance needs no check here: resolve_speculative_decoding
+        # already refuses it with --enable-output-logprobs.
+        if envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get():
+            raise ValueError(
+                "--enable-output-cumulative-probs does not support "
+                "TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN"
+            )
+        if self.speculative_draft_tree:
+            raise ValueError(
+                "--enable-output-cumulative-probs currently supports chain "
+                "verification only, without draft trees or EAGLE-Harness"
+            )
+        if self.dp_sampling or self.mapping.has_attn_dp:
+            raise ValueError(
+                "--enable-output-cumulative-probs currently requires DP1 without DP sampling"
+            )
+        if self.pipeline_parallel_size != 1 or self.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-output-cumulative-probs currently requires one pipeline stage "
+                "and aggregated serving"
+            )
 
     def resolve_basic_defaults(self):
         resolve_metrics_options(self)
@@ -811,7 +861,7 @@ class ServerArgs:
             self._beam_checkpoint
             and not self._grammar_backend_unset
             and self.grammar_backend == "none"
-            and not getattr(self, "_beam_grammar_none_warned", False)
+            and not self._beam_grammar_none_warned
         ):
             self._beam_grammar_none_warned = True
             logger.warning(
@@ -1526,6 +1576,17 @@ class ServerArgs:
                 "or accuracy evaluation."
             )
 
+        if self.min_kv_split is not None:
+            if type(self.min_kv_split) is not int or not 1 <= self.min_kv_split <= 256:
+                raise ValueError("min_kv_split must be an integer in [1, 256]")
+            if self.attention_backend != "tokenspeed_mla" or (
+                self.speculative_algorithm is not None
+                and self.drafter_attention_backend not in (None, "tokenspeed_mla")
+            ):
+                raise ValueError(
+                    "--min-kv-split requires tokenspeed_mla for target and draft attention"
+                )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -1725,9 +1786,7 @@ class ServerArgs:
             and (current_platform().is_hopper_plus or platform.is_amd)
             and (
                 self.mapping.nnodes == 1
-                or (
-                    getattr(self, "_beam_checkpoint", False) and platform.is_hopper_plus
-                )
+                or (self._beam_checkpoint and platform.is_hopper_plus)
             )
             and self.mapping.has_attn_tp
             and not self.mapping.has_attn_dp
@@ -1773,9 +1832,11 @@ class ServerArgs:
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
+        from tokenspeed.runtime.plugins import ensure_loaded
+
+        ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
-        if self.numerics != "auto":
-            self._resolve_rl_bitwise()
+        resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
             self.enable_allreduce_fusion = False
@@ -1807,7 +1868,7 @@ class ServerArgs:
                 )
 
     def _resolve_rl_bitwise(self):
-        """The rl-bitwise block: every envelope beyond auto runs it."""
+        """Resolve the built-in RL policy; plugins provide their own resolver."""
         # Collectives: one association order per reduction. NCCL's ring
         # chunks by message size, so a plain NCCL sum is run-stable but not
         # batch-size-invariant; batch_invariant_collectives routes every
@@ -1823,6 +1884,7 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
+        self.moe_cutlass_fused_finalize = False
         # MoE keeps auto or the user's provider restriction. The expert
         # plan checks the batch_invariant feature against actual layer geometry.
         # Sampling: greedy rows must break exact logit ties canonically, and
@@ -2021,6 +2083,65 @@ class ServerArgs:
                 raise ValueError(
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
+                )
+        _require_choice(
+            "--kvstore-write-policy",
+            self.kvstore_write_policy,
+            ("write_through", "write_back"),
+        )
+        if self.kvstore_write_policy == "write_back":
+            # Decode's Host holds retraction images only, and L3 staging would
+            # split what is written back; pipeline stages and query context
+            # parallelism have not run write-back. Attention TP and
+            # --kv-parallel-size need no refusal: a written-back segment
+            # publishes once every rank of the replica has acknowledged it
+            # (docs/design/scheduler.md section 3.1). More than 64 cache
+            # groups are refused by SchedulerConfig.Validate, once the model's
+            # cache groups exist.
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                    (
+                        "--disaggregation-mode decode",
+                        self.disaggregation_mode == "decode",
+                    ),
+                    (
+                        "--kvstore-storage-backend",
+                        self.kvstore_storage_backend is not None,
+                    ),
+                    (
+                        "--query-context-parallel-size > 1",
+                        self.query_context_parallel_size > 1,
+                    ),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    "--kvstore-write-policy write_back does not support "
+                    f"{', '.join(unsupported)}"
+                )
+
+    def validate_weight_memory_policy(self):
+        """Memory saving chooses its weight semantics explicitly."""
+        if self.weight_memory_policy not in (None, "cpu_backup", "discard"):
+            raise ValueError("--weight-memory-policy must be cpu_backup or discard")
+        if self.enable_memory_saver and self.weight_memory_policy is None:
+            raise ValueError("--enable-memory-saver requires --weight-memory-policy")
+        if self.weight_memory_policy == "discard":
+            if not self.enable_memory_saver or self.model_update_config is None:
+                raise ValueError(
+                    "Weight discard requires memory saver and Model Updater configuration"
+                )
+            if self.model_update_draft_weights not in ("retain", "refresh"):
+                raise ValueError(
+                    "Weight discard requires an explicit draft update policy"
+                )
+            if self.quantization is not None or self.enable_eplb:
+                raise ValueError(
+                    "Weight discard currently requires unquantized weights without EPLB"
                 )
 
     def validate_model_update_options(self):
@@ -2269,10 +2390,13 @@ class ServerArgs:
             )
 
     def validate(self):
+        self.validate_weight_memory_policy()
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
             raise ValueError("--input-logprob-chunk-tokens must be positive")
+        if self.chunk_prefill_kv_size is not None and self.chunk_prefill_kv_size <= 0:
+            raise ValueError("--chunk-prefill-kv-size must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -2298,14 +2422,8 @@ class ServerArgs:
                     f"chunked_prefill_size must be <= max_prefill_tokens: {self.chunked_prefill_size=} > {self.max_prefill_tokens=}"
                 )
 
-        if self.deepseek_v4_prefill_chunk_size <= 0:
-            raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
-
         self.validate_expert_placement_options()
 
-        from tokenspeed.runtime.utils.env import envs
-
-        envs.TOKENSPEED_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         if not self.disable_pdl:
             os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
             # Enable PDL for fused attention kernels.
@@ -2314,6 +2432,9 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        from tokenspeed.runtime.plugins import ensure_loaded
+
+        ensure_loaded()
         parser.allow_abbrev = False
 
         # Model and port args
@@ -2350,7 +2471,7 @@ class ServerArgs:
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
-            choices=["auto", "slow", "deepseek_v4"],
+            choices=["auto", "slow"],
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer and model-specific tokenizer hooks if available, "
             "'slow' will always use the slow tokenizer.",
@@ -2445,7 +2566,7 @@ class ServerArgs:
             '"fp8_e4m3" (unit scale, or the checkpoint\'s per-tensor KV-cache '
             'scales where the model loads them). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
-            "requires --block-size 128 with an MHA attention backend.",
+            "requires an MHA attention backend.",
         )
         parser.add_argument(
             "--kv-cache-quant-method",
@@ -2542,16 +2663,6 @@ class ServerArgs:
             "same iteration. Not supported with aggregated DCP.",
         )
         parser.add_argument(
-            "--prefix-granularity",
-            "--block-size",  # deprecated alias
-            dest="prefix_granularity",
-            metavar="PREFIX_GRANULARITY",
-            type=int,
-            default=ServerArgs.prefix_granularity,
-            help="Scheduler prefix granularity in tokens: the identity "
-            "boundary of cache reuse. (--block-size is a deprecated alias.)",
-        )
-        parser.add_argument(
             "--enable-state-checkpoint-in-forward",
             action="store_true",
             dest="enable_state_checkpoint_in_forward",
@@ -2583,7 +2694,8 @@ class ServerArgs:
             "--kvstore-ratio",
             type=float,
             default=ServerArgs.kvstore_ratio,
-            help="The ratio of the size of the KVStore host memory pool to the size of the device pool. "
+            help="The ratio of Host L2 LCM block count to Device LCM block count. "
+            "Host blocks use compact payload packing, so this is not a ratio of allocated bytes. "
             "Capped, with a warning, to what fits in this rank's share of the Host memory its node has available.",
         )
         parser.add_argument(
@@ -2591,7 +2703,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kvstore_size,
             help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set. "
-            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available.",
+            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available, "
+            "or if the ranks resolve it to different page counts, as pipeline stages may (use --kvstore-ratio there).",
         )
         parser.add_argument(
             "--kvstore-io-backend",
@@ -2599,6 +2712,23 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
+        )
+        parser.add_argument(
+            "--kvstore-write-policy",
+            type=str,
+            choices=["write_through", "write_back"],
+            default=ServerArgs.kvstore_write_policy,
+            help="What feeds Host L2 (the KVStore) from the GPU prefix cache. "
+            "'write_through' (the default) copies every page the fused or "
+            "prefill role caches. "
+            "'write_back' copies only the pages the GPU evicts, in the "
+            "scheduling step that evicts them (that step's forward waits for "
+            "the copy), so the two tiers hold mostly different pages. "
+            "write_back is refused with --disaggregation-mode decode, "
+            "--disable-kvstore, --kvstore-storage-backend, "
+            "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
+            "and at startup for a model with more than 64 cache groups; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",
@@ -2679,7 +2809,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.mamba_ssm_dtype,
             choices=["float32", "bfloat16"],
-            help="It is used to tune mamba ssm dtype",
+            help="Dtype of the stored linear-attention recurrent state (GDN "
+            "and KDA SSM state). Scans accumulate in float32 either way; "
+            "bfloat16 halves the state memory.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -2690,6 +2822,18 @@ class ServerArgs:
                 "Maximum prefill-token budget used when chunked prefill is "
                 "disabled. Per-iteration scheduling is controlled by "
                 "--chunked-prefill-size."
+            ),
+        )
+        parser.add_argument(
+            "--chunk-prefill-kv-size",
+            type=int,
+            default=ServerArgs.chunk_prefill_kv_size,
+            help=(
+                "Prefill batch KV capacity in tokens, including cached prefixes. "
+                "Converted to a page budget; each request is rounded up separately "
+                "before summing. Its page-aligned capacity must exceed the maximum "
+                "prompt length; an undersized budget fails startup. Omit to keep "
+                "the existing unbounded batch policy."
             ),
         )
         # Other runtime options
@@ -2941,6 +3085,15 @@ class ServerArgs:
             "rl-bitwise the selected kernel must declare batch invariance.",
         )
         parser.add_argument(
+            "--moe-cutlass-fused-finalize",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.moe_cutlass_fused_finalize,
+            help="Enable GEMM2 atomic expert combine for unquantized FP16/BF16 "
+            "MoE on flashinfer_cutlass, for target and draft models. On by "
+            "default; the fused reduction is not run-to-run reproducible. Forced "
+            "off by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
             "--moe-mxfp4-fp8-activation",
             action="store_true",
             help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
@@ -3024,6 +3177,14 @@ class ServerArgs:
             f"{attention_backend_names}, or a name a plugin registers. 'mha' "
             "selects compatible registered MHA kernels; 'gluon' forces "
             "registered Gluon MLA kernels.",
+        )
+        parser.add_argument(
+            "--min-kv-split",
+            type=int,
+            default=None,
+            help="Minimum decode KV splits for tokenspeed_mla target and draft attention "
+            "(1–256). Omit to retain automatic selection. Larger values can improve "
+            "long-context decoding at the cost of workspace and short-context latency.",
         )
         parser.add_argument(
             "--kda-backend",
@@ -3149,7 +3310,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
             help=(
-                "DeepSeek V4 MegaMoE staging-buffer cap on tokens per forward "
+                "DeepSeek V4.1 MegaMoE staging-buffer cap on tokens per forward "
                 "(0 = derive from chunked-prefill / cuda-graph budgets)."
             ),
         )
@@ -3158,16 +3319,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
             help=(
-                "DeepSeek V4 sparse indexer prefill workspace cap (MiB) for the "
+                "Sparse indexer prefill workspace cap (MiB) for the "
                 "softplus_sqrt logits buffer."
-            ),
-        )
-        parser.add_argument(
-            "--deepseek-v4-prefill-chunk-size",
-            type=int,
-            default=ServerArgs.deepseek_v4_prefill_chunk_size,
-            help=(
-                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
             ),
         )
         parser.add_argument(
@@ -3405,6 +3558,17 @@ class ServerArgs:
             help="Enable per-token sampled-token logprobs. OFF by default; enabling extends the captured CUDA-graph footprint. Requests asking for logprobs on a server without this flag receive empty logprobs.",
         )
         parser.add_argument(
+            "--enable-output-cumulative-probs",
+            action="store_true",
+            default=ServerArgs.enable_output_cumulative_probs,
+            help="Return probability mass preceding each sampled token, ordered by "
+            "descending probability and then ascending token ID, for sampling "
+            "calibration. Requires output logprobs. Every sampling step keeps a "
+            "copy of the score logits plus bounded temporaries; prefill and mixed "
+            "steps sample outside any CUDA graph, so this memory comes from "
+            "runtime headroom (leave room with --gpu-memory-utilization).",
+        )
+        parser.add_argument(
             "--input-logprob-chunk-tokens",
             type=int,
             default=ServerArgs.input_logprob_chunk_tokens,
@@ -3592,6 +3756,15 @@ class ServerArgs:
             "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+        )
+        parser.add_argument(
+            "--weight-memory-policy",
+            choices=["cpu_backup", "discard"],
+            default=None,
+            help=(
+                "Required with memory saver: back up weights to CPU, or discard "
+                "them until a complete SDK update. Frozen draft weights retain CPU backup."
+            ),
         )
         parser.add_argument(
             "--disable-cudagraph-memory-reserve",
@@ -3816,7 +3989,7 @@ class ServerArgs:
             "trainer-operation-order switches (docs/design/numerics.md, "
             "alignment.trainer) so a teacher-forced pass reproduces the RL "
             "trainer's logprobs; a model serves it only once its profile "
-            "declares it verified.",
+            "declares it verified. Plugins may register additional envelopes.",
         )
         parser.add_argument(
             "--yarn-ramp-mask-device",

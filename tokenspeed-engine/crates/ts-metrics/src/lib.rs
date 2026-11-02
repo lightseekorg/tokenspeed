@@ -470,13 +470,13 @@ impl EngineMetrics {
             jit_serving_compiles: Metric::counter(
                 exporter,
                 "tokenspeed:jit_serving_compiles",
-                "Triton kernel compilations after startup; each one stalls the forward thread.",
+                "Triton and CuTe DSL kernel compilations after startup; each one stalls the forward thread.",
                 names,
             ),
             jit_serving_compile_seconds: Metric::counter(
                 exporter,
                 "tokenspeed:jit_serving_compile_seconds",
-                "Wall time spent in Triton kernel compilations after startup.",
+                "Wall time spent in Triton and CuTe DSL kernel compilations after startup.",
                 names,
             ),
             num_nan_aborted_requests: Metric::counter(
@@ -490,8 +490,9 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_capacity_aborted_requests",
                 "Requests the scheduler aborted because a capacity retraction could not image its \
-                 victim (retraction snapshot pool or image rows exhausted); clients may resubmit \
-                 them.",
+                 victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may \
+                 resubmit them. Forced retractions from --debug-force-retraction-interval aborted \
+                 the same way count too.",
                 names,
             ),
             num_preemptions: Metric::counter(

@@ -32,6 +32,7 @@ def config(*, host=32, grain=2, groups=None):
     c.num_snapshot_pages = 1
     c.num_device_pages = 64
     c.num_host_pages = host
+    c.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     c.max_scheduled_tokens = 64
     c.max_batch_size = 8
     c.enable_l3_storage = True
@@ -48,6 +49,9 @@ def config(*, host=32, grain=2, groups=None):
         ts.StoragePressure(4, 524288, 500),
     )
     c.cache_groups = groups or [group("full", grain, ts.AttnKind.Full)]
+    c.host_group_packing = [
+        entry.cache_blocks_per_lcm_block for entry in c.cache_groups
+    ]
     return c
 
 

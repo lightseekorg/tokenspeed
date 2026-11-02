@@ -106,8 +106,6 @@ class MHATokenToKVPool(CachePool):
     }
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
         # Different layer views may share an address through the memory plan.
         # Count each physical region once, independent of Python identity.
         k_caches = {t.data_ptr(): t for t in self.k_buffer if t is not None}

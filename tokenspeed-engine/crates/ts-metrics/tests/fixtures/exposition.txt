@@ -1,11 +1,11 @@
 # HELP tokenspeed:iteration_tokens_total Tokens scheduled in one scheduler forward step.
-# HELP tokenspeed:jit_serving_compile_seconds_total Wall time spent in Triton kernel compilations after startup.
-# HELP tokenspeed:jit_serving_compiles_total Triton kernel compilations after startup; each one stalls the forward thread.
+# HELP tokenspeed:jit_serving_compile_seconds_total Wall time spent in Triton and CuTe DSL kernel compilations after startup.
+# HELP tokenspeed:jit_serving_compiles_total Triton and CuTe DSL kernel compilations after startup; each one stalls the forward thread.
 # HELP tokenspeed:kv_cache_usage_perc Fraction of device KV pages in use (0-1).
 # HELP tokenspeed:kv_transfer_failures_total KV transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss on the decode node. Timeouts are counted separately.
 # HELP tokenspeed:kv_transfer_latency_seconds Wall time of one KV cache transfer send to a peer.
 # HELP tokenspeed:kv_transfer_timeouts_total KV transfers that timed out, by transfer stage.
-# HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool or image rows exhausted); clients may resubmit them.
+# HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may resubmit them. Forced retractions from --debug-force-retraction-interval aborted the same way count too.
 # HELP tokenspeed:num_nan_aborted_requests_total Requests terminated by the NaN guard (NaN in logits or an out-of-vocab sampled token id).
 # HELP tokenspeed:num_preemptions_total Requests preempted by a capacity retraction: the scheduler suspended a resident request (its pages imaged to the Host snapshot pool; it later resumes by restore, nothing is recomputed) to free Device pages for a blocked admission. One increment per retraction victim per round, counted from the plan's snapshot-store ops; forced retractions from --debug-force-retraction-interval count too. A retraction whose victim cannot be imaged aborts it instead — see tokenspeed:num_capacity_aborted_requests.
 # HELP tokenspeed:num_requests_running Requests with scheduler-side generation state (decode path).

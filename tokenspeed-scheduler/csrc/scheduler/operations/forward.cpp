@@ -159,7 +159,8 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
 
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
-                                       bool stream_completed_to_host, PublicationPoint point) {
+                                       bool stream_completed_to_host, PublicationPoint point,
+                                       bool allow_state_checkpoint) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
@@ -175,7 +176,10 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     // A final point publishes the frontier's state even when its pages were
     // all published by an earlier step (a D request leaving at a page-aligned
     // frontier): the checkpoint is keyed by the last page's chain hash.
-    const bool publish_state = point != PublicationPoint::kChunk;
+    // A retained in-forward checkpoint below is always eligible. Publishing
+    // the live slot additionally requires a prefill-produced frontier (or an
+    // unrestricted State group); an aligned decode state is not a checkpoint.
+    const bool publish_state = allow_state_checkpoint && point != PublicationPoint::kChunk;
     const bool state_only = publish_state && !tail && !cache_progress.prefix_hashes.empty() &&
                             num_computed_tokens == filled_prefix_pages * prefix_granularity;
     // The in-forward State checkpoint a scheduled forward wrote is published
@@ -230,14 +234,14 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
     fillBlockTables(operation, request, coordinator, group_ids);
     // The in-forward State checkpoint this forward writes: its position in
     // the chunk, and each State group's block as the row's third entry.
-    const fsm::CacheProgress& cache_progress = request.CacheProgress();
+    const fsm::CacheProgress& cache_progress = request.CacheProgressRef();
     const std::int32_t checkpoint = cache_progress.state_checkpoint_tokens;
     if (checkpoint > info.already_scheduled_len && checkpoint < info.already_scheduled_len + info.extend_len) {
         operation.extend_state_checkpoint_len = checkpoint - info.already_scheduled_len;
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             if (const CacheBlockRef& block = cache_progress.state_checkpoint_blocks[i]) {
                 operation.block_tables[group_ids[i]].push_back(
-                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(block->Location()));
+                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block));
             }
         }
     }
@@ -288,9 +292,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t candidate_prefix_pages = config_.role == Role::kD
                                                     ? request->PrefillSize() / prefix_granularity
                                                     : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
-    std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
-    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");
+    const auto hashes = request->PromptPrefixHashes().first(static_cast<std::size_t>(candidate_prefix_pages));
 
     AdmissionMatch match;
     match.candidate_prefix_hashes = hashes;
@@ -298,23 +300,66 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         match.probe = probe(CacheCoordinator::PromptPrefix{});
         return match;
     }
+    auto& prepared_keys = request->GetIf<fsm::Submitted>()->admission.prefix_keys;
+    if (!prepared_keys) {
+        prepared_keys = coordinator_.PreparePrefixKeys(hashes);
+    }
     // The KV walk stops at the probe bound; the D role also reads the prompt's
     // last page and its final tokens for the prompt-end state check.
-    match.probe = probe(CacheCoordinator::PromptPrefix{
+    const CacheCoordinator::PromptPrefix prompt{
         .prefix_hashes = hashes,
         .tokens = request->TokenSlice(0, request->PrefillSize()),
         .max_tokens = max_cacheable_tokens,
-    });
+        .prepared_keys = prepared_keys,
+    };
+    match.probe = probe(prompt);
+    if (config_.role != Role::kD && coordinator_.EvictionStoresExtendPrefix(prompt, match.probe)) {
+        match.waits_for_eviction_store = true;
+        return match;
+    }
+    // Opt-in diagnostics deliberately walk more than matching needs. Emit
+    // only a successful first admission, using the pre-admission snapshot.
+    static const bool inspect_prefix = std::getenv("TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS") != nullptr;
+    if (inspect_prefix) {
+        const auto boundaries = coordinator_.InspectPrefixAvailability(prompt);
+        std::string rows;
+        for (const auto& boundary : boundaries) {
+            if (!rows.empty()) {
+                rows += ',';
+            }
+            rows += fmt::format("[{},{},{},{}]", boundary.tokens, boundary.device_missing, boundary.host_missing,
+                                boundary.union_missing);
+        }
+        std::string group_names;
+        for (const std::string& id : cache_group_ids_) {
+            if (!group_names.empty()) {
+                group_names += ',';
+            }
+            group_names += id;
+        }
+        std::string prompt_hashes;
+        for (const std::string& hash : hashes) {
+            if (!prompt_hashes.empty()) {
+                prompt_hashes += ',';
+            }
+            prompt_hashes += hash;
+        }
+        match.prefix_diagnostic = fmt::format(
+            "request={} prompt={} bound={} resumed={} kv={} groups={} hashes={} boundaries=[{}]", request->Id(),
+            request->PrefillSize(), prompt.max_tokens,
+            std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens),
+            std::max(match.probe.device.kv_tokens, match.probe.host.kv_tokens), group_names, prompt_hashes, rows);
+    }
     // The chain progress counts full pages only; a tail is a boundary, not a
     // hashed page.
     const std::int32_t hit_prefix_pages =
         std::max(match.probe.device.full_page_tokens, match.probe.host.full_page_tokens) / prefix_granularity;
-    match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
+    match.prefix_hashes = hashes.first(static_cast<std::size_t>(hit_prefix_pages));
 
     const std::int32_t extension_pages =
         std::max(match.probe.host.full_page_tokens - match.probe.device.full_page_tokens, 0) / prefix_granularity;
-    const auto extension_begin = hashes.begin() + match.probe.device.full_page_tokens / prefix_granularity;
-    match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
+    const auto extension_begin = static_cast<std::size_t>(match.probe.device.full_page_tokens / prefix_granularity);
+    match.extension_hashes = hashes.subspan(extension_begin, static_cast<std::size_t>(extension_pages));
     return match;
 }
 
@@ -334,9 +379,10 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
                                                                   CacheCoordinator::PrefixProbe&& prefix,
                                                                   std::span<const GroupDemand> demands,
                                                                   const RequestProgress& progress,
-                                                                  std::optional<std::uint64_t> request_access_epoch) {
+                                                                  std::optional<std::uint64_t> request_access_epoch,
+                                                                  bool evict_blocks_past_segments) {
     std::optional<CacheCoordinator::AdmissionResult> result =
-        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch);
+        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch, evict_blocks_past_segments);
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -346,27 +392,53 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
 }
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTracking(
-    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
-    std::span<const GroupDemand> demands, const RequestProgress& progress) {
+    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
+    std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments) {
     if (progress.completed_pages) {
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
     } else {
         registerKvEventPrefixPages(request, cache_progress.prefix_hashes,
                                    static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
     }
-    return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
-                 cache_progress.access_epoch);
+    // Alone, the request has no release to wait for: when whole segments
+    // cannot fund it, blocks leave one by one (docs/design/scheduler.md §1.4),
+    // never for an attempt the caller drops instead (evict_blocks_past_segments
+    // false).
+    const bool others_hold_pages = std::ranges::any_of(requests_, [&request](const std::unique_ptr<Request>& other) {
+        return other.get() != &request && other->HoldsPages();
+    });
+    const auto attempt = [&]() {
+        return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
+                     cache_progress.access_epoch,
+                     /*evict_blocks_past_segments=*/evict_blocks_past_segments && !others_hold_pages);
+    };
+    auto admission = attempt();
+    if (!admission && !cache_progress.retained_input_checkpoint.empty()) {
+        // Keeping an input for a later turn is optional. It must not stop
+        // this request from obtaining the blocks its next forward needs.
+        cache_progress.retained_input_checkpoint.clear();
+        request.CacheProgressRef().retained_input_checkpoint.clear();
+        feedback.admission_failed = false;
+        admission = attempt();
+    }
+    return admission;
 }
 
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request, std::int32_t remaining,
-                                                                  std::int32_t decode_input_tokens) {
+                                                                  std::int32_t decode_input_tokens,
+                                                                  std::int64_t kv_token_limit) {
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return FirstChunkOutcome{};
     }
     AdmissionMatch match = matchPrefixAtAdmission(request);
+    if (match.waits_for_eviction_store) {
+        // The ACK makes the segment visible. Re-probe then, without taking
+        // pages or reporting a capacity failure while the copy is pending.
+        return FirstChunkOutcome{};
+    }
 
     // The D role's prompts are the peer's work; every other first chunk is local.
     const fsm::PrefillSource source =
@@ -384,6 +456,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "a junction lies inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
+    remaining = static_cast<std::int32_t>(
+        std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - hit_tokens)));
     // A remote landing completes the prompt in one transfer; no junction cut
     // can shorten it.
     std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
@@ -403,25 +477,26 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // locally and never retracts, so there is no decode room to prepay.
     const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
+    // Whether another request holds pages. Alone, the request asks for what
+    // max_single_request_tokens counts and waits for no release (below).
+    const bool others_hold_pages = std::ranges::any_of(requests_, [request](const std::unique_ptr<Request>& other) {
+        return other.get() != request && other->HoldsPages();
+    });
     // The first chunk's demands for a chunk of `tokens`, with or without an
     // in-forward State checkpoint.
     const auto chunk_demands = [&](std::int32_t tokens, bool checkpoint) {
         // Sliding-window prepay (docs/design/scheduler.md §1). A remote
         // landing has no later local chunk: the peer fills the whole prompt.
         const std::int32_t later_chunk_tokens = source == fsm::PrefillSource::kLocal ? unscheduled - tokens : 0;
-        // Only beside another page holder, so a request alone asks for what
-        // max_single_request_tokens counts. Any holder, not only one sharing
+        // Only beside another page holder. Any holder, not only one sharing
         // the hit: hit pages may become shared after this admission.
-        const bool others_hold_pages = (hit_tokens > 0 || later_chunk_tokens > 0) &&
-                                       std::ranges::any_of(requests_, [request](const std::unique_ptr<Request>& other) {
-                                           return other.get() != request && other->HoldsPages();
-                                       });
+        const bool prepays = (hit_tokens > 0 || later_chunk_tokens > 0) && others_hold_pages;
         const PrefillReserve reserve{
             .decode_input_tokens = decode_input_tokens,
             .completes_prefill = tokens == unscheduled,
             .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens + headroom : 0,
-            .swa_hit_tokens = others_hold_pages ? hit_tokens : 0,
-            .swa_later_chunk_tokens = others_hold_pages ? later_chunk_tokens : 0,
+            .swa_hit_tokens = prepays ? hit_tokens : 0,
+            .swa_later_chunk_tokens = prepays ? later_chunk_tokens : 0,
             .swa_prompt_after_hit_tokens = unscheduled,
         };
         // Every State table starts as [checkpoint or zero state, fresh] for a
@@ -463,16 +538,23 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                        config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
     bool writes_checkpoint =
         writesInForwardCheckpoint(state_checkpoint, hit_tokens, tokens_this_round, coordinator_.PrefixGranularity());
+    // Accounting only, read before Admit takes the probe: what a Host suffix
+    // adds when it carries the hit past the Device's own boundary (even when
+    // it adds only a State checkpoint over Device KV).
+    const bool host_won = match.probe.host.num_common_tokens > match.probe.device_only_hit_tokens;
+    const std::int32_t host_gain_tokens = host_won ? hit_tokens - match.probe.device_only_hit_tokens : 0;
     // First admission has computed nothing to publish or reclaim. A failed
     // admission changes nothing; one that cannot also hold the in-forward
     // checkpoint's block ends the chunk at the boundary instead, so the next
     // chunk's admission publishes its live slot there, at the cost of a
-    // round (a cache this full keeps no spare block).
+    // round (a cache this full keeps no spare block). That optional block
+    // never makes blocks leave one by one (docs/design/scheduler.md §1.4).
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
-        admission =
-            coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe}, chunk_demands(tokens_this_round, true),
-                               RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+        admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
+                                       chunk_demands(tokens_this_round, true), RequestProgress{},
+                                       /*request_access_epoch=*/std::nullopt,
+                                       /*evict_blocks_past_segments=*/false);
         if (!admission) {
             writes_checkpoint = false;
             tokens_this_round = state_checkpoint - hit_tokens;
@@ -480,7 +562,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     }
     if (!admission) {
         admission = coordinator_.Admit(std::move(match.probe), chunk_demands(tokens_this_round, false),
-                                       RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+                                       RequestProgress{}, /*request_access_epoch=*/std::nullopt,
+                                       /*evict_blocks_past_segments=*/!others_hold_pages);
     }
     if (!admission) {
         feedback.admission_failed = true;
@@ -493,7 +576,19 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
+    if (!match.prefix_diagnostic.empty()) {
+        spdlog::info("[PrefixCacheDiagnostic] {}", match.prefix_diagnostic);
+    }
     recordAdmittedPages(plan, *admission);
+    // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
+    // the Device's prefix (0 when only checkpoints come from Host), and
+    // nothing when the Device won.
+    const std::int32_t host_hit_tokens = std::max(admission->host_prefix_tokens - admission->device_prefix_tokens, 0);
+    prefix_hit_stats_.prompt_tokens += request->PrefillSize();
+    prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;
+    prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
+    prefix_hit_stats_.host_gain_tokens += host_gain_tokens;
+    prefix_hit_stats_.unresumable_kv_tokens += junction_tokens > 0 ? junction_tokens - hit_tokens : 0;
 
     if (!match.extension_hashes.empty()) {
         // The Host-warm H2D destinations of full pages are filled on Host
@@ -508,13 +603,18 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         }
     }
     fsm::CacheProgress cache_progress{
-        .prefix_hashes = std::move(match.prefix_hashes),
+        .prefix_hashes = std::vector<std::string>(match.prefix_hashes.begin(), match.prefix_hashes.end()),
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
+        .resumed_tail_hash = std::move(admission->resumed_tail_hash),
     };
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
         cache_progress.state_checkpoint_blocks = std::move(admission->state_checkpoint_blocks);
+    }
+    if (state_checkpoint > 0 && hit_tokens >= state_checkpoint) {
+        cache_progress.retained_input_checkpoint =
+            coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }
     return FirstChunkOutcome{.state_prefix_cached = admission->state_prefix_cached,
                              .event = fsm::SchedulePrefillFirstChunkEvent{
@@ -535,9 +635,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
-    std::int32_t reserve_num_tokens_in_next_schedule_event) {
+    std::int32_t reserve_num_tokens_in_next_schedule_event, std::int64_t kv_token_limit) {
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
+    remaining = static_cast<std::int32_t>(
+        std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
     fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
                                                      remaining, cache_progress.junction_tokens);
@@ -562,7 +664,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const RequestProgress progress = AdvanceRequestProgress(
         *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
         config_.StreamsDeviceCacheToHost(),
-        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
+        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
+        /*allow_state_checkpoint=*/true);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
@@ -586,7 +689,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     if (writes_checkpoint) {
         AdmissionFeedback checkpoint_feedback;
         admission = admitWithKvEventTracking(plan, checkpoint_feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, true), progress);
+                                             chunk_demands(prefill_tokens, true), progress,
+                                             /*evict_blocks_past_segments=*/false);
         if (!admission) {
             writes_checkpoint = false;
             prefill_tokens = state_checkpoint - first_pos;
@@ -594,7 +698,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     }
     if (!admission) {
         admission = admitWithKvEventTracking(plan, feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, false), progress);
+                                             chunk_demands(prefill_tokens, false), progress,
+                                             /*evict_blocks_past_segments=*/true);
     }
     if (!admission) {
         return std::nullopt;
@@ -605,6 +710,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         cache_progress.state_checkpoint_tokens = state_checkpoint;
         cache_progress.state_checkpoint_blocks = std::move(admission->state_checkpoint_blocks);
     }
+    if (state_checkpoint > 0 && (ends_at_state_checkpoint ||
+                                 (progress.completed_pages && progress.completed_pages->state_checkpoint_pages > 0))) {
+        cache_progress.retained_input_checkpoint =
+            coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
+    }
 
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
@@ -613,7 +723,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request) {
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    fsm::CacheProgress cache_progress = request->CacheProgress();
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
     std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     if (config_.decode_input_tokens > 1) {
@@ -649,31 +758,53 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // blocks (the state by rotation: the first decode reads slot 0 and writes
     // the fresh slot 1). The P and D roles publish at finish only -- the P
     // never writes again, the D's prompt-end state arrived by transfer or was
-    // claimed. Every later decode writes slot 1 in place and lets slot 0 go.
+    // claimed. This delivers the preceding prefill's checkpoints; decode
+    // never creates an in-forward checkpoint. Every later decode writes slot
+    // 1 in place and lets slot 0 go. Restricted groups cannot publish that
+    // decode-produced live state at finish or retraction either.
     const bool first_decode = request->Is<fsm::PrefillDone>();
     const bool prompt_end = first_decode && config_.role == Role::kFused && !config_.disable_prefix_cache;
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};
-    const RequestProgress progress =
-        AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost() && first_decode,
-                               prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
-
-    if (!progress.completed_pages && state_step.kind != StateStep::Kind::kRotate &&
+    fsm::CacheProgress& current_progress = request->CacheProgressRef();
+    const bool completed_page = num_computed_tokens / coordinator_.PrefixGranularity() >
+                                static_cast<std::int32_t>(current_progress.prefix_hashes.size());
+    const bool completed_checkpoint =
+        current_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= current_progress.state_checkpoint_tokens;
+    // Between publication points, consuming an existing reserve cannot fail
+    // and does not change the hash chain. Keep the rollback copy for admission.
+    if (!completed_page && !completed_checkpoint && state_step.kind != StateStep::Kind::kRotate &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
         if (state_step.kind == StateStep::Kind::kRelease) {
             coordinator_.ReleaseStateInputs(tables);
         }
-    } else {
-        std::vector<GroupDemand> demands = MakeGroupDemands(
-            tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
-        if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress)) {
-            return std::nullopt;
-        }
+        current_progress.published_state_checkpoint_blocks.clear();
+        return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
     }
 
+    fsm::CacheProgress cache_progress = current_progress;
+    const RequestProgress progress =
+        AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                               config_.StreamsDeviceCacheToHost() && first_decode,
+                               prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 || prompt_end);
+
+    std::vector<GroupDemand> demands =
+        MakeGroupDemands(tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
+    if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress,
+                                  /*evict_blocks_past_segments=*/true)) {
+        return std::nullopt;
+    }
+
+    if (first_decode && cache_progress.retained_input_checkpoint.empty()) {
+        const std::int32_t checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
+        if (checkpoint > 0) {
+            cache_progress.retained_input_checkpoint =
+                coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, checkpoint);
+        }
+    }
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
@@ -726,14 +857,19 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
 std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                     Request* request, std::int32_t token_budget,
                                                                     std::int32_t decode_reserve,
-                                                                    std::vector<LoadBackOperation>& load_backs) {
+                                                                    std::vector<LoadBackOperation>& load_backs,
+                                                                    std::int32_t kv_page_budget) {
+    const std::int64_t kv_token_limit = config_.max_kv_page_num == 0 || config_.role == Role::kD
+                                            ? std::numeric_limits<std::int64_t>::max()
+                                            : static_cast<std::int64_t>(kv_page_budget) * config_.prefix_granularity;
     if (request->Is<fsm::Prefilling>()) {
-        if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve)) {
+        if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve, kv_token_limit)) {
             return applyEventAndBuildOperation(request, std::move(*event));
         }
         return std::nullopt;
     }
-    FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve);
+    FirstChunkOutcome outcome =
+        schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve, kv_token_limit);
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
@@ -754,10 +890,10 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // fewest clients, and among equal frees the client that has streamed least
 // is interrupted. (On the D role everything resident is decoding.)
 //
-// Only candidates whose image fits the host budgets (imageFits) are ranked.
-// When none does, the host side is out of room and the last resort is to
-// abort a resident instead of imaging one: the newest retractable resident
-// (the least work lost) is returned with image_fits = false. Without a
+// Only candidates whose image fits the host budgets (imageShortfall) are
+// ranked. When none does, the host side is out of room and the last resort
+// is to abort a resident instead of imaging one: the newest retractable
+// resident (the least work lost) is returned with its shortfall. Without a
 // snapshot pool nothing ever fits, so a capacity block there always ends in
 // that abort rather than in a wait that could deadlock once every resident
 // needs a page.
@@ -769,7 +905,9 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // completes on its own reserve and frees its pages then. Excluded by state:
 // Retracted, Restoring, RemotePrefilling. Transient obstacles (a forward still
 // out, a PD transfer pin) do NOT redirect the choice; the caller waits for the
-// chosen victim to quiesce rather than sacrificing a worse-ranked request.
+// chosen victim to quiesce rather than sacrificing a worse-ranked request. The
+// caller decides which residents to offer (maybeRetractForCapacity offers
+// none its own round has dispatched work for).
 Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
     const auto retractable = [ignore_exemption](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
@@ -779,30 +917,46 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
     // hashes the candidate's completed pages) runs for as few candidates as
     // possible -- normally one.
     std::vector<Request*> ranked;
-    std::vector<Request*> decodes;
+    struct DecodeCandidate {
+        Request* request;
+        std::int32_t releasable_blocks;
+    };
+    std::vector<DecodeCandidate> decodes;
     Request* newest = nullptr;
     for (Request* request : candidates) {
         if (!retractable(*request)) {
             continue;
         }
         newest = request;  // candidates arrive in submission order
-        (request->Is<fsm::Prefilling>() ? ranked : decodes).push_back(request);
+        if (request->Is<fsm::Prefilling>()) {
+            ranked.push_back(request);
+        } else {
+            decodes.push_back(
+                DecodeCandidate{request, coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef())});
+        }
     }
     std::ranges::stable_sort(ranked,
                              [](const Request* a, const Request* b) { return a->TokenSize() > b->TokenSize(); });
-    const auto decode_rank = [this](const Request* request) {
-        return std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
-                          request->GeneratedTokens(), request->Id()};
+    const auto decode_rank = [](const DecodeCandidate& candidate) {
+        return std::tuple{-candidate.releasable_blocks, candidate.request->GeneratedTokens(), candidate.request->Id()};
     };
-    std::ranges::stable_sort(
-        decodes, [&decode_rank](const Request* a, const Request* b) { return decode_rank(a) < decode_rank(b); });
-    ranked.insert(ranked.end(), decodes.begin(), decodes.end());
+    std::ranges::stable_sort(decodes, [&decode_rank](const DecodeCandidate& a, const DecodeCandidate& b) {
+        return decode_rank(a) < decode_rank(b);
+    });
+    for (const DecodeCandidate& candidate : decodes) {
+        ranked.push_back(candidate.request);
+    }
+    VictimChoice newest_choice{.victim = newest};
     for (Request* request : ranked) {
-        if (imageFits(*request)) {
-            return VictimChoice{.victim = request, .image_fits = true};
+        const std::optional<ImageShortfall> shortfall = imageShortfall(*request);
+        if (!shortfall) {
+            return VictimChoice{.victim = request};
+        }
+        if (request == newest) {
+            newest_choice.shortfall = shortfall;
         }
     }
-    return VictimChoice{.victim = newest, .image_fits = false};
+    return newest_choice;
 }
 
 // The first half of a retraction: hashes the prefix pages the victim
@@ -817,7 +971,9 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     RequestProgress progress =
         AdvanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
+                                   (config_.role != Role::kD && num_computed_tokens <= victim.PrefillSize()));
     if (progress.completed_pages) {
         // A publication is a KV-event mutation: the newly hashed pages (decode
         // pages no admission has registered yet) and the tail need their token
@@ -829,61 +985,87 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
     // A suspended request holds no Device block: the index keeps the
     // in-forward State checkpoint this publication may have just published.
     cache_progress.published_state_checkpoint_blocks.clear();
+    cache_progress.retained_input_checkpoint.clear();
     victim.CacheProgressRef() = std::move(cache_progress);
 }
 
-bool Scheduler::imageFits(const Request& request) const {
+std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) const {
+    if (!config_.HasSnapshotPool()) {
+        return ImageShortfall::kNoPool;
+    }
     if (snapshot_slots_.AvailableSlots() == 0) {
-        return false;
+        return ImageShortfall::kBlobSlot;
     }
     // The retraction publishes the candidate's completed pages before it
     // images it, and those pages ride the L2 leg. The probe projects that
     // publication on a copy of the progress (hashing the same pages
-    // publishCompletedPrefix will) and reads the L2/pool split off
+    // publishCompletedPrefix will) and splits the image off
     // PublishedDataSlotsAfter -- the publication's own slot rule -- so it
-    // counts against the pool exactly what StartRetractionStores will put
-    // there. Nothing is mutated: a candidate that does not fit is left as it
-    // was. Without a Host pool everything is the pool's.
+    // plans the L2 leg and counts against the pool what StartRetractionStores
+    // will, unless the publication itself changes what that plan reads: a
+    // tail it drops under the per-prior cap takes its Host entries along;
+    // under the write-back policy the segment step ranks Host victims by
+    // what the Device holds, which the publication adds to
+    // (NumHostBoundariesThatFit); and under KV parallelism a slot it
+    // re-points to the Device entry already holding its key rides the pool
+    // in that entry's bucket, not the one counted here. The split
+    // retractVictim makes after the publication can then refuse the image.
+    // Nothing is mutated: a candidate that does not fit is left as it was,
+    // and so is the Host.
     fsm::CacheProgress cache_progress = request.CacheProgress();
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     const RequestProgress progress =
         AdvanceRequestProgress(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
-    const std::vector<std::vector<ImageSlot>> published =
-        coordinator_.PublishedDataSlotsAfter(request.BlockTablesRef(), num_computed_tokens, progress);
-    return coordinator_.SnapshotPoolHolds(
-        request.BlockTablesRef(), num_computed_tokens,
-        coordinator_.HasHostPool() ? published : std::vector<std::vector<ImageSlot>>(published.size()));
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
+                                   (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()));
+    return tier_transfers_
+        .SplitRetractionImage(
+            request.BlockTablesRef(), num_computed_tokens,
+            coordinator_.PublishedDataSlotsAfter(request.BlockTablesRef(), num_computed_tokens, progress))
+        .shortfall;
 }
 
 // Suspends a quiescent victim with its image. First the completed prefix
 // pages are published into the Device index (publishCompletedPrefix: a
 // finish-like publication other requests may hit; it costs only the hashes
 // of pages not yet hashed, and the image's L2 leg is built from exactly
-// those entries). Then the transfer manager takes the image -- published
-// slots as pinned Host L2 entries, everything else in the snapshot pool, each
-// in its Device block's bucket -- and issues both store legs; the victim's
-// Device pages are released by the retract event and may be granted away in
-// this very round, because the runtime orders both copies on the forward
-// thread's stream ahead of the plan's page reuse. A victim whose image cannot
-// be held, or with no blob slot free, is not retracted: the shortfall is
-// returned, and the publication it did stands as its progress.
-std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
-    Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations) {
+// those entries). Then the transfer manager splits the image again on what
+// the publication left -- the published slots the Host serves or places by
+// plan, everything else in the snapshot pool, each in its Device block's
+// bucket -- takes it and issues both store legs; the victim's Device pages
+// are released by the retract event and may be granted away in this very
+// round, because the runtime orders both copies on the forward thread's
+// stream ahead of the plan's page reuse. A victim whose image cannot be held,
+// or with no blob slot free, is not retracted: the shortfall is returned
+// before anything is acquired or evicted for the image, and the publication
+// it did stands as its progress. Both callers then abort it rather than let
+// it run on: the publication registered blocks the victim would write again (a
+// partial page as a tail, and a State group's end state, which a decode step
+// writes in place).
+std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuild& build,
+                                                       std::vector<WriteBackOperation>& write_back_operations) {
     if (snapshot_slots_.AvailableSlots() == 0) {
         return ImageShortfall::kBlobSlot;
     }
     publishCompletedPrefix(victim);
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
+    TierTransferManager::RetractionImageSplit split = tier_transfers_.SplitRetractionImage(
+        victim.BlockTablesRef(), num_computed_tokens,
+        coordinator_.PublishedDataSlots(victim.BlockTablesRef(), num_computed_tokens));
+    if (split.shortfall) {
+        return split.shortfall;  // the publication stands; the caller aborts the victim
+    }
 
     // The blob slot is shared with the store that exports into it (and later
     // the restore that imports from it): an abort before either ACK leaves
     // the slot with the op until the copy is done.
     auto blob_slot = std::make_shared<SnapshotSlotIndex>(snapshot_slots_.Allocate());
-    std::optional<TierTransferManager::RetractionStores> stores = tier_transfers_.StartRetractionStores(
-        victim.Id(), victim.RequestPoolIndex(), blob_slot, victim.BlockTablesRef(), num_computed_tokens);
+    std::optional<TierTransferManager::RetractionStores> stores =
+        tier_transfers_.StartRetractionStores(victim.Id(), victim.RequestPoolIndex(), blob_slot,
+                                              victim.BlockTablesRef(), num_computed_tokens, std::move(split));
     if (!stores) {
-        return ImageShortfall::kSnapshotPool;  // the publication stands; the victim keeps running
+        return ImageShortfall::kSnapshotPool;  // unreachable: the split held the image
     }
     victim.NoteRetracted();
     if (stores->host_store) {
@@ -916,10 +1098,20 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
                      std::to_string(config_.snapshot_allocator.total_pages) +
                      "; raise --retraction-snapshot-ratio / --retraction-snapshot-host-gb)";
             break;
+        case ImageShortfall::kHostL2:
+            detail =
+                "the Host L2 cache cannot take the image's published pages the snapshot pool cannot hold "
+                "(num_host_pages=" +
+                std::to_string(config_.host_allocator.total_pages) + ", " +
+                std::to_string(coordinator_.NumPinnedHostCachedBlocks()) +
+                " Host entries pinned by images and copies, " +
+                (tier_transfers_.HasAnyInFlight() ? "copies in flight" : "no copy in flight") +
+                "; raise --kvstore-size (or --kvstore-ratio when no size is given))";
+            break;
     }
     spdlog::warn(
         "[Scheduler] capacity abort: request {} ({} tokens) cannot be imaged -- {}; aborting it to free its "
-        "pages for the blocked admission",
+        "pages",
         victim.Id(), victim.TokenSize(), detail);
     build.plan.aborts.push_back(SchedulerAbort{
         .request_id = victim.Id(),
@@ -956,16 +1148,21 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
 // for capacity they hold would be the same thrash.
 //
 // The host side is finite too. When no candidate's image fits (no blob slot,
-// or a snapshot pool too small for the tail -- always, without a pool) the
-// last resort is to ABORT the newest retractable resident instead of imaging
-// anyone (onImageDoesNotFit): its pages free in this round exactly as a
-// retraction's would and the grant proceeds. The alternative, waiting, can
+// a snapshot pool too small for the tail, or a Host L2 that cannot take the
+// published pages the pool cannot -- always, without a pool) the last resort
+// is to ABORT the newest retractable resident offered (below) instead of
+// imaging anyone (onImageDoesNotFit): its pages free in this round exactly as
+// a retraction's would and the grant proceeds. The alternative, waiting, can
 // deadlock once every resident needs a page.
 //
 // A grant that cannot join its round (a fused prefill beside an already-built
-// decode batch outside mixed mode) still retracts one victim: the next
-// round's phase order tries the blocker before any other claim on the freed
-// pages.
+// decode batch outside mixed mode) still retracts one victim, and the blocker
+// waits for the next round, whose restore phase runs first: the victim's own
+// readmission, once its image has landed, can take the freed pages back
+// before the blocker tries. So while decodes keep running, the victim can be
+// retracted and restored as often as every other round (the redirect below
+// does not prevent it), until the decodes finish and the grant joins its
+// round.
 void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build,
                                         std::span<Request* const> candidates,
                                         std::vector<WriteBackOperation>& write_back_operations) {
@@ -977,15 +1174,56 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     // policy cannot see that write, so no retraction until it lands. A
     // pinned store mid-flight holds pages the ACK is about to release; the
     // blocked admission retries against them next round before anyone is
-    // sacrificed. (Stream-ordered stores -- both legs of an image -- hold
-    // nothing and gate nothing; an in-flight restore gates nothing because
-    // its request is Restoring, invisible to chooseVictim.)
+    // sacrificed. (Stream-ordered stores -- both legs of an image, and
+    // eviction write-backs -- hold nothing and gate nothing; an in-flight
+    // restore gates nothing because its request is Restoring, invisible to
+    // chooseVictim.)
     if (tier_transfers_.HasLoadBacksInFlight() || tier_transfers_.HasPinnedStoresInFlight()) {
         return;
     }
 
+    // Only a resident this round has dispatched no work for is offered as a
+    // victim, in both tiers. One with this round's forward out cannot quiesce
+    // before the retraction runs, and the next round schedules it again
+    // before retraction runs, so waiting for it would last as long as its
+    // reserve -- while every request blocked beside it keeps its pages idle
+    // -- and its pages cannot free in this round, which an abort exists to
+    // do. A forced victim sitting the round out (maybeForceRetraction) is
+    // marked scheduled with nothing dispatched: it stays offered, and is
+    // waited for while its earlier forward lands.
+    Request* const forced_victim = forced_victim_id_.empty() ? nullptr : findRequest(forced_victim_id_);
+    std::vector<Request*> offered;
+    offered.reserve(candidates.size());
+
     while (true) {
-        VictimChoice choice = chooseVictim(candidates, /*ignore_exemption=*/false);
+        // No room left for the grant -- the batch full or the token budget
+        // spent: a victim retracted now would serve nobody, and its pages
+        // would wait for whoever asks first next round. (An empty round is
+        // never full.) A D-role remote admission takes no batch slot, so it
+        // could still join a round full by batch count, but it is not served
+        // either: that batch already runs as many requests as it can hold,
+        // so retracting a resident for the admission would add no throughput
+        // and cost an image and a restore.
+        if (build.Full(config_.max_batch_size)) {
+            return;
+        }
+        // Rebuilt each pass, so it never offers a request a pass scheduled.
+        offered.clear();
+        std::ranges::copy_if(candidates, std::back_inserter(offered), [&build, forced_victim](Request* request) {
+            return !build.Scheduled(*request) || request == forced_victim;
+        });
+        // No ranked choice can run while every offered resident is still
+        // being written -- a result of an earlier round still landing. Avoid
+        // hashing and planning images that would all wait. With any quiescent
+        // one, retain the full ranking and fit probe: a better-ranked busy
+        // victim must not be bypassed.
+        if (std::ranges::none_of(offered, [this](const Request* request) {
+                return request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
+                       request->ResultsInFlight() == 0 && !pdTransferInFlight(*request);
+            })) {
+            return;
+        }
+        VictimChoice choice = chooseVictim(offered, /*ignore_exemption=*/false);
         // A finished request whose last forward is still out frees its pages
         // when that forward lands (settleFinishedRequests), so a round that
         // waits for it is not empty either.
@@ -997,7 +1235,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (empty_round) {
             // Nothing is retractable under the exemption and the round runs
             // nothing: the empty-round retraction (docs/design/scheduler.md §2).
-            choice = chooseVictim(candidates, /*ignore_exemption=*/true);
+            choice = chooseVictim(offered, /*ignore_exemption=*/true);
         }
         Request* victim = choice.victim;
         if (victim == nullptr) {
@@ -1013,13 +1251,14 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // The victim blocked on its own next page; it comes back through
             // the readmission phase. Its freed capacity goes to the next
             // request whose admission failed this round, else to the first
-            // waiting prompt -- granting it back to the victim's own
-            // readmission is the loop the grant exists to break. With nobody
-            // to serve, retracting it would only cost the image's copies and
-            // its restore: it waits for a completion instead. An empty round
-            // has no completion to wait for, and its decodes take the freed
-            // pages first (below): there the victim is retracted whenever a
-            // decode is left to serve.
+            // waiting prompt, else to a resident prefill the head-of-line
+            // rule kept from trying this round -- granting it back to the
+            // victim's own readmission is the loop the grant exists to break.
+            // With nobody to serve, retracting it would only cost the image's
+            // copies and its restore: it waits for a completion instead. An
+            // empty round has no completion to wait for, and its decodes take
+            // the freed pages first (below): there the victim is retracted
+            // whenever a decode is left to serve.
             const auto blocked = std::ranges::find_if(feedback.capacity_blocked, [victim](Request* request) {
                 // An earlier iteration may have retracted one of them.
                 return request != victim &&
@@ -1027,6 +1266,14 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             });
             const auto waiting = std::ranges::find_if(
                 candidates, [victim](Request* request) { return request != victim && request->Is<fsm::Submitted>(); });
+            // When the victim is a prefill, its chunk failed admission and the
+            // head-of-line rule kept every resident prefill behind it from
+            // trying this round (a forced victim sitting the round out is
+            // marked scheduled and stays out).
+            const auto held_back = std::ranges::find_if(candidates, [&build, victim](Request* request) {
+                return victim->Is<fsm::Prefilling>() && request != victim && request->Is<fsm::Prefilling>() &&
+                       !build.Scheduled(*request);
+            });
             const bool decode_left = std::ranges::any_of(candidates, [victim](Request* request) {
                 return request != victim && request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
             });
@@ -1034,21 +1281,17 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                 blocker = *blocked;
             } else if (waiting != candidates.end()) {
                 blocker = *waiting;
+            } else if (held_back != candidates.end()) {
+                blocker = *held_back;
             } else if (!empty_round || !decode_left) {
                 return;
             }
         }
-        // A victim nobody can image (or whose image turns out not to fit
-        // once the L2 leg is tried) is aborted: the last resort frees its
-        // pages for the grant all the same.
-        std::optional<ImageShortfall> shortfall;
-        if (choice.image_fits) {
+        // A victim nobody can image, or one retractVictim refuses after
+        // publishing, is aborted: the last resort frees its pages all the same.
+        std::optional<ImageShortfall> shortfall = choice.shortfall;
+        if (!shortfall) {
             shortfall = retractVictim(*victim, build, write_back_operations);
-        } else if (!config_.HasSnapshotPool()) {
-            shortfall = ImageShortfall::kNoPool;
-        } else {
-            shortfall =
-                snapshot_slots_.AvailableSlots() == 0 ? ImageShortfall::kBlobSlot : ImageShortfall::kSnapshotPool;
         }
         if (shortfall) {
             onImageDoesNotFit(*victim, *shortfall, build);
@@ -1090,8 +1333,9 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // plan.remote_prefill beside whatever batch this round built.
             // Everything else is local prefill work joining the model batch.
             const std::int32_t budget = remote_grant ? blocker->PrefillSize() : build.token_budget;
-            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, blocker, budget,
-                                                         config_.decode_input_tokens, build.load_backs)) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, blocker, budget, config_.decode_input_tokens,
+                                             build.load_backs, build.kv_page_budget)) {
                 if (remote_grant) {
                     // The blocker is now RemotePrefilling: the peer's prefill
                     // is out against its pages (pdTransferInFlight).
@@ -1147,10 +1391,15 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
         return;
     }
     forced_victim_id_.clear();
-    // The knob is not capacity pressure: a victim it cannot image is left
-    // running, never aborted (onImageDoesNotFit is the retraction loop's).
-    if (retractVictim(*armed, build, write_back_operations)) {
+    // The knob is not capacity pressure: a victim the probe refuses runs on
+    // with nothing published; one retractVictim refuses after its
+    // publication is aborted (see retractVictim).
+    if (imageShortfall(*armed)) {
         spdlog::info("[Scheduler] forced retraction of request {} refused: its image does not fit", armed->Id());
+        return;
+    }
+    if (const std::optional<ImageShortfall> shortfall = retractVictim(*armed, build, write_back_operations)) {
+        onImageDoesNotFit(*armed, *shortfall, build);
     }
 }
 
@@ -1244,9 +1493,9 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     // The restore op owns the request-pool row it imports the blob into until
     // its ACK hands it to the resumed state (an abort meanwhile must not
     // re-grant a row still being written), and shares the blob slot.
-    SnapshotRestoreOperation op =
-        tier_transfers_.StartSnapshotRestore(request->Id(), req_pool_allocator_.Allocate(), retracted->blob_slot,
-                                             std::move(result->load_pairs), std::move(result->snapshot_pairs));
+    SnapshotRestoreOperation op = tier_transfers_.StartSnapshotRestore(
+        request->Id(), req_pool_allocator_.Allocate(), retracted->blob_slot, std::move(result->load_pairs),
+        std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
     const std::uint32_t restore_op = op.op_id;
     build.snapshot_restores.push_back(std::move(op));
     request->Apply(fsm::ScheduleRestoreEvent{&coordinator_, std::move(tables), restore_op});
@@ -1285,7 +1534,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             }
             feedback.admission_failed = false;
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
-                                                         decode_reserve, build.load_backs)) {
+                                                         decode_reserve, build.load_backs, build.kv_page_budget)) {
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
@@ -1393,8 +1642,9 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
-                                                         config_.decode_input_tokens, build.load_backs)) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
+                                             config_.decode_input_tokens, build.load_backs, build.kv_page_budget)) {
                 build.scheduled.insert(request);
                 build.remote_prefill.emplace_back(std::move(*admitted));
                 break;
@@ -1445,6 +1695,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     AdmissionFeedback feedback;
     PlanBuild build{plan};
     build.token_budget = config_.max_scheduled_tokens;
+    build.kv_page_budget = config_.max_kv_page_num;
     switch (config_.role) {
         case Role::kP:
             buildPrefillWorkerPlan(feedback, build, candidates);

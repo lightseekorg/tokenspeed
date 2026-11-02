@@ -62,7 +62,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)
         linear_attn = config.component(LinearAttnConfig)
-        scan_geometry = {
+        self._scan_geometry: dict[str, int | bool] = {
             "head_dim": linear_attn.head_k_dim,
             "value_head_dim": linear_attn.head_v_dim,
             "num_q_heads": linear_attn.num_k_heads // linear_attn.tp_size,
@@ -70,37 +70,42 @@ class GdnAttnBackend(CapacityPrefillBackend):
             "qk_l2norm": True,
         }
         self._prefill_capturable = gdn_chunk_prefill_capturable(
-            config.dtype, **scan_geometry
-        )
-        # In-forward checkpoints sit at prefix-page multiples of a chunk start,
-        # so the scan must store at that granularity.
-        self._stores_in_forward_state_checkpoints = (
-            gdn_chunk_prefill_stores_state_checkpoints(
-                config.dtype,
-                **scan_geometry,
-                interval_granularity=config.prefix_granularity,
-            )
+            config.dtype, **self._scan_geometry
         )
 
         self._head_k_dim = linear_attn.head_k_dim
         self._head_v_dim = linear_attn.head_v_dim
-        # Resolved when a pool binds (its state dtype picks the verify kernel).
+        # Resolved when a pool binds: the pool's prefix granularity spaces the
+        # in-forward checkpoints, and its state dtype picks the verify kernel.
+        self._stores_in_forward_state_checkpoints = False
         self._verify_reads_committed_recurrent_state = False
         self._verify_packed_qkv_views = False
         self._decode_packed_qkv_views = False
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
+        # In-forward checkpoints sit at prefix-page multiples of a chunk start,
+        # so the scan must store at that granularity.
+        contract = cache_pool.arena.runtime_contract
+        self._stores_in_forward_state_checkpoints = (
+            gdn_chunk_prefill_stores_state_checkpoints(
+                self.dtype,
+                **self._scan_geometry,
+                interval_granularity=contract.prefix_granularity,
+            )
+        )
         # Where the verify kernel takes a separate destination pool, verify
         # reads the committed state in place instead of seeding the scratch
         # with a copy of it. Where a decode or verify kernel takes strided
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
         ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
-        decode_traits = {"head_dim": self._head_k_dim}
+        decode_traits = {
+            "head_dim": self._head_k_dim,
+            "value_head_dim": self._head_v_dim,
+        }
         verify_traits = {
             **decode_traits,
-            "value_head_dim": self._head_v_dim,
             "verify_tokens": self.speculative_num_draft_tokens,
             "tree": self.draft_tree,
             "output_only": self.replay_ssm

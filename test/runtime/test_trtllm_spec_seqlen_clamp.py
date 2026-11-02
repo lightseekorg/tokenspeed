@@ -51,7 +51,6 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
         device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        prefix_granularity=PAGE,
         kernel_page_size=PAGE,
         context_len=4096,
         max_bs=8,

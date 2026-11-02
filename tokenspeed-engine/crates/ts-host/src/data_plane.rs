@@ -98,10 +98,20 @@ enum Op {
         dp: DpRound,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    /// A weight load's local prerequisites to check, as its msgpack
+    /// control struct; changes nothing.
+    CheckWeightUpdate {
+        payload: Bytes,
+        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
     /// A weight operation or profile request, as its msgpack control struct.
     UpdateWeights {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
+    CommitWeightUpdate {
+        success: bool,
+        reply: mpsc::SyncSender<Result<(), String>>,
     },
     Profile {
         payload: Bytes,
@@ -431,9 +441,21 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::IdleForward { dp, reply })
     }
 
+    fn check_weight_update(
+        &mut self,
+        op: &ControlRequest,
+    ) -> Result<(bool, String), DataPlaneError> {
+        let payload = control_payload(op)?;
+        self.ask(|reply| Op::CheckWeightUpdate { payload, reply })
+    }
+
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         let payload = control_payload(op)?;
         self.ask(|reply| Op::UpdateWeights { payload, reply })
+    }
+
+    fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError> {
+        self.ask(|reply| Op::CommitWeightUpdate { success, reply })
     }
 
     fn profile(&mut self, request: &ProfileReq) -> Result<(bool, String), DataPlaneError> {
@@ -569,12 +591,15 @@ fn forward_loop(
             match op {
                 Op::Barrier { reply }
                 | Op::IdleForward { reply, .. }
+                | Op::CommitWeightUpdate { reply, .. }
                 | Op::ReleaseMemory { reply, .. }
                 | Op::ResumeMemory { reply, .. }
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
-                Op::UpdateWeights { reply, .. } | Op::Profile { reply, .. } => {
+                Op::CheckWeightUpdate { reply, .. }
+                | Op::UpdateWeights { reply, .. }
+                | Op::Profile { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::SnapshotExpertLoad { reply } => {
@@ -723,10 +748,24 @@ fn run(
                 .map_err(python);
             answer(reply, ran)?;
         }
+        Op::CheckWeightUpdate { payload, reply } => {
+            let done = plane
+                .call_method1("check_weight_update", (PyBytes::new(py, &payload),))
+                .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
         Op::UpdateWeights { payload, reply } => {
             let done = plane
                 .call_method1("update_weights", (PyBytes::new(py, &payload),))
                 .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::CommitWeightUpdate { success, reply } => {
+            let done = plane
+                .call_method1("commit_weight_update", (success,))
+                .map(drop)
                 .map_err(python);
             answer(reply, done)?;
         }
@@ -833,6 +872,7 @@ type Completed = (
     Option<(u64, f64)>,
     Option<Vec<i32>>,
     Option<(Option<Vec<f64>>, Option<TopLogprobs>, Option<TopLogprobs>)>,
+    Option<Vec<f64>>,
 );
 
 /// A launched forward's results, once they landed.
@@ -846,6 +886,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         serving_compiles,
         grammar_terminated_at,
         logprobs,
+        output_token_cumulative_probs,
     ): Completed = plane.call_method1("complete", (launched,))?.extract()?;
     let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
         logprobs.unwrap_or_default();
@@ -853,6 +894,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         output_tokens,
         output_lengths,
         output_logprobs,
+        output_token_cumulative_probs,
         nan_flags,
         next_input_ids,
         serving_compiles,
@@ -929,6 +971,7 @@ class Plane:
         self.held = None
         self.unblock = threading.Event()
         self.failing = False
+        self.cumulative_probs = None
 
     def note(self, name):
         self.calls.append((name, threading.get_ident()))
@@ -954,7 +997,7 @@ class Plane:
 
     def complete(self, launched):
         self.note("complete")
-        return ([launched], [1], None, None, None, None, None, None)
+        return ([launched], [1], None, None, None, None, None, None, self.cumulative_probs)
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -1035,6 +1078,25 @@ result = (Plane(), ts.Scheduler(cfg))
                 .extract()
                 .unwrap()
         })
+    }
+
+    #[test]
+    fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
+        let (plane, mut scheduler) = plane();
+        Python::attach(|py| plane.setattr(py, "cumulative_probs", vec![0.875]).unwrap());
+        let batch = batch();
+        let dispatch = Dispatch {
+            forward: Some(&batch),
+            ..Dispatch::default()
+        };
+        let mut data_plane = start(&plane);
+        let forward = data_plane
+            .execute(scheduler.next_execution_plan(), &dispatch)
+            .unwrap()
+            .unwrap();
+        let result = data_plane.complete(forward).unwrap();
+        assert_eq!(result.output_tokens, [100]);
+        assert_eq!(result.output_token_cumulative_probs, Some(vec![0.875]));
     }
 
     #[test]

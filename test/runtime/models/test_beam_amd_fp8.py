@@ -77,6 +77,7 @@ def test_beam_scheduler_preserves_nonmixed_capacity_and_explicit_opt_in(mixed):
         cache_groups=[],
         num_host_pages=17,
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
     )
     config = scheduler_config_from_args(

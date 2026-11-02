@@ -29,7 +29,7 @@ Only grouped wo_a is dequantized to BF16, after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
 The unquantized LM head follows the model loading dtype, including its logits.
 Packed routed experts use the V4 MoE loader, with zero-padded intermediate lanes
-for MegaMoE's TMA alignment (2304 -> 2560); shared experts are not padded.
+only when required by MegaMoE; shared experts are not padded.
 The generic model loader owns dense and MoELayer postprocessing, including
 MegaMoE weight preparation.
 
@@ -169,12 +169,10 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalForwardContext,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -820,7 +818,7 @@ class DeepseekV41Indexer(nn.Module):
                 rotary.cos_sin_cache,
                 self.scale,
             )
-        if q.is_cuda and current_platform().is_cdna4:
+        if q.is_cuda and (current_platform().is_cdna4 or current_platform().is_cdna5):
             rotary._prepare_cache(q.device)
             return rope_weights_inplace(
                 q, positions, rotary.cos_sin_cache, weights, self.scale, None
@@ -1290,15 +1288,21 @@ class DeepseekV41MoE(DeepseekV4MoE):
 
     def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
         expert_config = config
-        padded = (
-            get_moe_backend().is_mega_moe() and config.moe_intermediate_size % 512 != 0
+        mega_moe = get_moe_backend().is_mega_moe()
+        # Allocation precedes kernel planning; match Blackwell MXFP4 MegaMoE's
+        # 128-wide intermediate alignment.
+        alignment = (
+            128
+            if mega_moe
+            and current_platform().is_blackwell
+            and config.expert_dtype == "fp4"
+            else 512
         )
+        padded = mega_moe and config.moe_intermediate_size % alignment != 0
         if padded:
-            # MegaMoE TMA loads require a 16-byte-aligned 1x32 scale row.
-            # V4.1's 2304-wide routed FFN therefore needs 2560-wide storage.
             expert_config = copy(config)
             expert_config.moe_intermediate_size = (
-                (config.moe_intermediate_size + 511) // 512 * 512
+                (config.moe_intermediate_size + alignment - 1) // alignment * alignment
             )
             expert_config.n_shared_experts = None
         super().__init__(
@@ -1860,8 +1864,6 @@ class V41RowState:
 
 
 class DeepseekV41Model(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config,
@@ -2376,6 +2378,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             encoder_only=getattr(config, "encoder_only", False),
         )
         self.is_multimodal_active = is_multimodal_active
+        self._checkpoint_dir: str | None = None
         self.vision = None
         self.vision_embedder = None
         self.image_encoder = None
@@ -2841,7 +2844,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         ]
         if not pending:
             return
-        checkpoint_dir = getattr(self, "_checkpoint_dir", None)
+        checkpoint_dir = self._checkpoint_dir
         if checkpoint_dir is None:
             return
         from safetensors import safe_open
@@ -2910,11 +2913,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 make_warmup_items=self.vision.make_image_warmup_items,
             )
         }
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs

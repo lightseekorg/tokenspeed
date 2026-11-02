@@ -60,6 +60,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     apply_pd_transfer_policies,
 )
 
+# A multiple of every FlatKV group's span (128 and 64 tokens): one prefix page
+# holds whole pages of all four groups.
+_V41_PREFIX_GRANULARITY = 256
+
 
 class DeepseekV41Recipe(CacheRecipe):
     """Target Flash FlatKV for decode/verify, plus checkpoint-local DSpark windows.
@@ -79,6 +83,11 @@ class DeepseekV41Recipe(CacheRecipe):
 
     @property
     @override
+    def prefix_granularity(self) -> int:
+        return _V41_PREFIX_GRANULARITY
+
+    @property
+    @override
     def layer_types(self) -> tuple[str, ...]:
         return ("sliding_attention",) * self.num_target_layers
 
@@ -90,7 +99,7 @@ class DeepseekV41Recipe(CacheRecipe):
     def dspark_stages(self) -> int:
         """Number of same-checkpoint DSpark draft stages, 0 without DSpark."""
         if (
-            getattr(self.server_args, "speculative_algorithm", None) != "DSPARK"
+            self.server_args.speculative_algorithm != "DSPARK"
             or self.draft_model_config is None
             or self.draft_attn_config is not None
         ):

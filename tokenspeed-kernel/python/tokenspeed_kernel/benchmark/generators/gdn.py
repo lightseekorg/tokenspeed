@@ -138,12 +138,21 @@ def _decode_inputs(
     }
 
 
-def _state_pool(rows: int, profile: _GdnModelProfile) -> torch.Tensor:
-    # FP32 K-last recurrent states, as the runtime's SSM pool stores them.
+def _state_dtype(request: BenchmarkRequest) -> torch.dtype:
+    name = request.parameters.get("state_dtype")
+    if name not in ("float32", "bfloat16"):
+        raise _invalid("GDN decode state_dtype must be explicit: float32 or bfloat16")
+    return torch.float32 if name == "float32" else torch.bfloat16
+
+
+def _state_pool(
+    rows: int, profile: _GdnModelProfile, dtype: torch.dtype
+) -> torch.Tensor:
+    # K-last recurrent states, as the runtime's SSM pool stores them.
     return torch.zeros(
         (rows, profile.num_v_heads, profile.value_head_dim, profile.head_dim),
         device="cuda",
-        dtype=torch.float32,
+        dtype=dtype,
     )
 
 
@@ -153,16 +162,23 @@ def prepare_gdn_decode_step(
 ) -> PreparedBenchmark:
     """Prepare one single-token GDN decode step over ``batch`` requests.
 
-    Each request reads and writes back its own row of an FP32 state pool.
+    Each request reads and writes back its own row. ``state_dtype`` explicitly
+    selects float32 or bfloat16 for both dispatch and the state pool.
     """
 
     model_profile, profile = _profile(request)
     batch = _positive(request.parameters, "batch")
-    spec = _select_registration(
-        request, platform, {"head_dim": profile.head_dim, "padding_safe": False}
-    )
+    state_dtype = _state_dtype(request)
+    traits = {
+        "head_dim": profile.head_dim,
+        "value_head_dim": profile.value_head_dim,
+        "padding_safe": False,
+    }
+    if request.solution != "flashinfer":
+        traits["state_dtype"] = state_dtype
+    spec = _select_registration(request, platform, traits)
     inputs = _decode_inputs(request.seed, batch, 1, profile)
-    state = _state_pool(batch, profile)
+    state = _state_pool(batch, profile, state_dtype)
     indices = torch.arange(batch, device="cuda", dtype=torch.int32)
 
     from tokenspeed_kernel.ops.attention.gdn import gdn_decode_step
@@ -184,7 +200,7 @@ def prepare_gdn_decode_step(
             "model_profile": model_profile,
             "batch": batch,
             "dtype": "bfloat16",
-            "state_dtype": "float32",
+            "state_dtype": request.parameters["state_dtype"],
         },
         validation=None,
     )
@@ -199,11 +215,13 @@ def prepare_gdn_decode_mtp(
     ``state_writes="per_token"`` writes every position's post-update state to
     its own pool row, as the staged verify does; ``"none"`` leaves the pool
     untouched, as the ReplaySSM verify does.
+    ``state_dtype`` explicitly selects float32 or bfloat16 for the pool.
     """
 
     model_profile, profile = _profile(request)
     batch = _positive(request.parameters, "batch")
     tokens = _positive(request.parameters, "tokens")
+    state_dtype = _state_dtype(request)
     state_writes = request.parameters["state_writes"]
     if state_writes not in _IMPLEMENTED_STATE_WRITES:
         raise _invalid(
@@ -211,23 +229,26 @@ def prepare_gdn_decode_mtp(
             f"{', '.join(sorted(_IMPLEMENTED_STATE_WRITES))}"
         )
     per_token = state_writes == "per_token"
-    spec = _select_registration(
-        request,
-        platform,
-        {
-            "head_dim": profile.head_dim,
-            "value_head_dim": profile.value_head_dim,
-            "verify_tokens": tokens,
-            "output_only": not per_token,
-            "padding_safe": False,
-            "tree": False,
-            "chunked_chain": False,  # These benchmark cases use FP32 states.
-            "replay_payload": False,
-        },
-    )
+    traits = {
+        "head_dim": profile.head_dim,
+        "value_head_dim": profile.value_head_dim,
+        "verify_tokens": tokens,
+        "output_only": not per_token,
+        "padding_safe": False,
+        "tree": False,
+        # Probe the general verify registration, not the serving-time chain candidate.
+        "chunked_chain": False,
+        "replay_payload": False,
+    }
+    if request.solution != "flashinfer" and per_token:
+        # State-writing calls select by state dtype, as the facade does.
+        traits["state_dtype"] = state_dtype
+    spec = _select_registration(request, platform, traits)
     inputs = _decode_inputs(request.seed, batch, tokens, profile)
     # Committed rows first, then one scratch row per verified position.
-    state = _state_pool(batch * (1 + tokens) if per_token else batch, profile)
+    state = _state_pool(
+        batch * (1 + tokens) if per_token else batch, profile, state_dtype
+    )
     initial_indices = torch.arange(batch, device="cuda", dtype=torch.int32)
     output_indices = (
         (batch + torch.arange(batch * tokens, device="cuda", dtype=torch.int32)).view(
@@ -261,7 +282,7 @@ def prepare_gdn_decode_mtp(
             "tokens": tokens,
             "state_writes": state_writes,
             "dtype": "bfloat16",
-            "state_dtype": "float32",
+            "state_dtype": request.parameters["state_dtype"],
         },
         validation=None,
     )
@@ -307,7 +328,7 @@ def prepare_gdn_chunk_prefill(
         generator=generator,
     )
     beta = randn(1, total, profile.num_v_heads).sigmoid()
-    state = _state_pool(sequences, profile)
+    state = _state_pool(sequences, profile, torch.float32)
     cu_seqlens = torch.arange(
         0, total + 1, tokens_per_sequence, device="cuda", dtype=torch.int32
     )
