@@ -276,7 +276,8 @@ fn nanos(seconds: f64) -> String {
 /// so the same request id traces to the same id across ranks and logs.
 fn trace_id(rid: &str) -> String {
     let mut out = String::with_capacity(32);
-    for half in [mix(rid_hash(rid, 1)), mix(rid_hash(rid, 2))] {
+    for salt in [0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db] {
+        let half = mix(rid_hash(rid, salt));
         out.push_str(&format!("{:016x}", half as u64));
     }
     out
@@ -285,15 +286,16 @@ fn trace_id(rid: &str) -> String {
 /// The request's span id, 16 hex characters: the same mix over the rid and
 /// the process counter, so every span differs.
 fn span_id(rid: &str) -> String {
-    format!(
-        "{:016x}",
-        (mix(rid_hash(rid, 3) ^ u128::from(SPANS.fetch_add(1, Ordering::Relaxed))) as u64)
-    )
+    let salt = 0x8ebc_6af0_9c88_c6e3_u128;
+    let counter = u128::from(SPANS.fetch_add(1, Ordering::Relaxed));
+    format!("{:016x}", (mix(rid_hash(rid, salt) ^ counter) as u64))
 }
 
-/// `rid` folded to 128 bits; `domain` separates the id derivations.
-fn rid_hash(rid: &str, domain: u8) -> u128 {
-    let mut hash: u128 = 0x243f_6a88_85a3_08d3_1319_8a2e_0370_7344 ^ (u128::from(domain) << 120);
+/// `rid` folded to 128 bits; `salt` separates the derivations. It seeds the
+/// low bits — a wrapping multiply never mixes high bits down into the halves
+/// a u64 read takes.
+fn rid_hash(rid: &str, salt: u128) -> u128 {
+    let mut hash: u128 = 0x243f_6a88_85a3_08d3_1319_8a2e_0370_7344 ^ salt;
     for byte in rid.as_bytes() {
         hash ^= u128::from(*byte);
         hash = hash.wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834);
@@ -365,6 +367,10 @@ mod tests {
         assert_eq!(trace_id("chatcmpl-1"), trace_id("chatcmpl-1"));
         assert_ne!(trace_id("chatcmpl-1"), trace_id("chatcmpl-2"));
         assert_ne!(trace_id("chatcmpl-1"), span_id("chatcmpl-1"));
+        // The two halves derive independently — a repeated half would halve
+        // the id's entropy.
+        let id = trace_id("chatcmpl-1");
+        assert_ne!(&id[..16], &id[16..], "the trace id's halves differ");
     }
 
     #[test]
@@ -391,6 +397,76 @@ mod tests {
         let half = TracePublisher::with_sender(None, 0.5, sender);
         let kept: usize = (0..1000).filter(|_| half.sampled()).count();
         assert!((350..=650).contains(&kept), "kept {kept} of 1000");
+    }
+
+    /// The full export path against a real socket: the export thread, its
+    /// batching, ureq's POST and the OTLP/JSON body, as a receiver sees
+    /// them.
+    #[test]
+    fn a_live_export_posts_one_otlp_json_batch() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let received = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 8192];
+            let mut head = Vec::new();
+            let mut read = 0usize;
+            // Read until the header's end.
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                read += stream.read(&mut buffer).expect("read the head");
+                head.extend_from_slice(&buffer[..read]);
+                read = 0;
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .expect("content length")
+                .trim()
+                .parse()
+                .expect("a number");
+            let header_end = head.find("\r\n\r\n").expect("the end") + 4;
+            let mut body = head[header_end..].as_bytes().to_vec();
+            while body.len() < length {
+                let n = stream.read(&mut buffer).expect("read the body");
+                body.extend_from_slice(&buffer[..n]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("reply");
+            (head, body)
+        });
+
+        let publisher =
+            TracePublisher::new(format!("http://{address}/v1/traces"), 1.0, "m".to_owned());
+        publisher.emit(record());
+        let (head, body) = received.join().expect("the receiver thread");
+
+        let request_line = head.lines().next().expect("the request line");
+        assert!(
+            request_line.starts_with("POST /v1/traces "),
+            "{request_line}"
+        );
+        assert!(
+            head.contains("content-type: application/json")
+                || head.contains("Content-Type: application/json")
+        );
+        let batch: Value = serde_json::from_slice(&body).expect("the OTLP body");
+        let spans = &batch["resourceSpans"][0]["scopeSpans"][0]["spans"];
+        let span = &spans[0];
+        assert_eq!(span["name"], "tokenspeed.request");
+        assert_eq!(span["traceId"].as_str().unwrap().len(), 32);
+        let attributes = span["attributes"].as_array().unwrap();
+        assert!(attributes.contains(&string_attribute("gen_ai.request_id", "chatcmpl-1")));
+        assert!(attributes.contains(&int_attribute("gen_ai.prompt_tokens", 100)));
+        let resource = &batch["resourceSpans"][0]["resource"]["attributes"];
+        assert!(resource
+            .as_array()
+            .unwrap()
+            .contains(&string_attribute("gen_ai.request.model", "m")));
     }
 
     #[test]
