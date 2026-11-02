@@ -1187,18 +1187,16 @@ private:
     // eviction order and cascades never depend on it) and syncs the entry's
     // tree node. It returns the key that left the index, nullopt when the
     // entry is pinned or gone. A superseded input (MarkSupersededStateInput) an
-    // admission, rotation or restore evicts counts as
-    // request_reclaim and is never recorded; an unproven State checkpoint
-    // (IsUnprovenStateCheckpoint) is never recorded either, whatever evicts
-    // it, and counts under `reason` (UnprovenEntriesNotWrittenBack). With
-    // write_back_segment (an admission's or a restore's cache victim under the
-    // write-back policy) any other entry that left is recorded there -- its
-    // metadata read before it left, its Host entry held when the Host has one;
-    // the segment's
-    // newest_access_epoch rises to its epoch -- and holds its tree node, tail
-    // hint included, until the segment settles; one no probe could resume from
-    // on the Host is dropped instead (DeadEntriesNotWrittenBack). nullptr drops
-    // it.
+    // admission, rotation or restore evicts counts as request_reclaim and is
+    // never recorded; an unproven State checkpoint (IsUnprovenStateCheckpoint)
+    // is never recorded either, whatever evicts it, and counts under `reason`
+    // (UnprovenEntriesNotWrittenBack). With write_back_segment (an admission's
+    // or a restore's cache victim under the write-back policy) any other entry
+    // that left is recorded there -- its metadata read before it left, its
+    // Host entry held when the Host has one; the segment's newest_access_epoch
+    // rises to its epoch -- and holds its tree node, tail hint included, until
+    // the segment settles; one no probe could resume from on the Host is
+    // dropped instead (DeadEntriesNotWrittenBack). nullptr drops it.
     std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
                                                   DeviceEvictionCounts DeviceEvictionStats::*reason,
                                                   EvictedSegment* write_back_segment);

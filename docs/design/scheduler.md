@@ -419,22 +419,22 @@ at any chunk end and every State group's slot 1 under the page's chain hash
 which then rotates into slot 0, so no forward or runtime change is involved,
 the request holds no third block (the published one stays in the cache, one
 block per State group) and no copy-in block (a page-aligned point publishes
-no tail), and any State backend serves it. A junction or
-in-forward boundary the chunk ended on stays a natural checkpoint
-(`kStateCheckpoint`); the two modes are meant to be used together. Such a
-checkpoint is **unproven** -- `CacheBoundaryKind::kChunk`, registered at the
-logical index of its page depth (`CacheCoordinator::IsUnprovenStateCheckpoint`,
-which only the mode makes true) -- until a hit acquires it or an endpoint
-republishes it (raising its kind). The AdmissionPlanner ranks it at its own
-access epoch like any entry (an aged one at its retention rank, like any
-checkpoint: `cache-concepts.md`, checkpoint retention), first within that
-epoch (a probationary boundary), the shallowest first, so a chain keeps its
-deepest one; the
-uncached blocks and a superseded input (epoch 0) leave before it. No class
-sets it ahead of older epochs: the Device is full in steady state, and such
-a class would hand every unproven checkpoint to the next admission that
-needs room, seconds before the sibling it was written for arrives. It leaves alone, every State group's block at once, never as a
-segment of its pages, which a request still running past it may hold; once
+no tail), and any State backend serves it. A junction or in-forward boundary
+the chunk ended on stays a natural checkpoint (`kStateCheckpoint`); the two
+modes are meant to be used together. Such a checkpoint is **unproven** --
+`CacheBoundaryKind::kChunk`, registered at the logical index of its page
+depth (`CacheCoordinator::IsUnprovenStateCheckpoint`, which only the mode
+makes true) -- until a hit acquires it or an endpoint republishes it
+(raising its kind). The AdmissionPlanner ranks it at its own access epoch
+like any entry (an aged one at its retention rank, like any checkpoint:
+`cache-concepts.md`, checkpoint retention), first within that epoch (a
+probationary boundary), the shallowest first, so a chain keeps its deepest
+one; the uncached blocks and a superseded input (epoch 0) leave before it.
+No class sets it ahead of older epochs: the Device is full in steady state,
+and such a class would hand every unproven checkpoint to the next admission
+that needs room, seconds before the sibling it was written for arrives. It
+leaves alone, every State group's block at once, never as a segment of its
+pages, which a request still running past it may hold; once
 selected it no longer holds the pages above it for the candidates that
 follow (an established checkpoint boundary does until the candidates run
 out: `cache-concepts.md`, `AdmissionPlanner`), so the chain under them still
