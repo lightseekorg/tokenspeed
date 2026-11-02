@@ -2531,3 +2531,26 @@ let an offline analysis confirm shared full pages against completed earlier
 turns, independently of trace estimates. The extra walk and logging are for
 attribution, not performance measurement; leaving
 the environment variable unset omits both and changes no cache policy.
+
+## Session cache hints and native capacity reports
+
+A request may carry `cache_session_id` as cache ownership metadata. It does not
+change tokens or introduce implicit append semantics. The native scheduler tags
+published Device/Host prefixes with a shared session owner. Reuse by a different
+session, or by an untagged request, removes exclusive ownership permanently for
+that entry so a session hint cannot penalize shared prefixes.
+
+`DemoteSessions` takes explicit session IDs and an `ended` boolean. It lowers the
+LRU epoch only for exclusively owned, currently unreferenced cached blocks. It
+never invalidates KV or releases blocks held by active requests or transfers.
+Demoted data remains matchable and is promoted on reuse. Ending a session also
+suppresses its exclusive pending/new Host stores; transfers already submitted
+complete normally. Reusing an ended ID creates a new owner generation.
+
+`GetAdmission` reports live request slots, available/total physical LCM blocks,
+Host capacity, waiting/retracted counts, and a contract-versioned capacity curve.
+The curve rounds token lengths up to a bucket and uses the native capacity model
+across full-history, sliding-window and state groups. Consumers must not derive
+physical demand by dividing token counts by a page size. Snapshot collection is
+an explicit control operation; the allocator scan is not added to each forward.
+The transport identifies each reply's DP rank, independent of reply arrival order.

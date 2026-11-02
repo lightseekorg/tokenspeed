@@ -57,6 +57,39 @@ macro_rules! control_struct {
 }
 
 control_struct! {
+    /// Poll physical admission capacity; separate from the hot output stream.
+    GetAdmissionReqInput {}
+    /// Native allocator snapshot and a conservative cache-demand curve.
+    GetAdmissionReqOutput {
+        success: bool,
+        dp_rank: i64,
+        contract_version: i64,
+        free_slots: i64,
+        total_slots: i64,
+        available_blocks: i64,
+        total_blocks: i64,
+        host_free_blocks: i64,
+        host_total_blocks: i64,
+        retracted: i64,
+        waiting: i64,
+        max_tokens: i64,
+        capacity_token_step: i64,
+        capacity_blocks: Vec<i64>,
+    }
+
+    /// Age exclusive cached prefixes for router-paused or ended sessions.
+    DemoteSessionsReqInput {
+        /// Session identifiers, bounded by the caller to one control batch.
+        session_ids: Vec<String>,
+        /// Ended sessions no longer benefit from speculative cache writes.
+        ended: bool,
+    }
+    /// Cache priority hints never invalidate active or shared blocks.
+    DemoteSessionsReqOutput {
+        success: bool,
+        message: String,
+    }
+
     /// Drop the prefix caches.
     FlushCacheReqInput {}
     /// [`FlushCacheReqInput`]'s reply.
@@ -417,6 +450,10 @@ tagged_union! {
     /// A control operation, the payload of a CONTROL message.
     #[derive(Debug, Clone, PartialEq)]
     pub enum ControlRequest {
+        /// See [`GetAdmissionReqInput`].
+        GetAdmission(GetAdmissionReqInput),
+        /// See [`DemoteSessionsReqInput`].
+        DemoteSessions(DemoteSessionsReqInput),
         /// See [`FlushCacheReqInput`].
         FlushCache(FlushCacheReqInput),
         /// See [`PauseSchedulerReqInput`].
@@ -458,6 +495,10 @@ tagged_union! {
     /// A control operation's reply.
     #[derive(Debug, Clone, PartialEq)]
     pub enum ControlOutput {
+        /// See [`GetAdmissionReqOutput`].
+        GetAdmission(GetAdmissionReqOutput),
+        /// See [`DemoteSessionsReqOutput`].
+        DemoteSessions(DemoteSessionsReqOutput),
         /// See [`FlushCacheReqOutput`].
         FlushCache(FlushCacheReqOutput),
         /// See [`PauseSchedulerReqOutput`].
@@ -499,6 +540,8 @@ impl ControlRequest {
     /// The tag of the reply this operation gets.
     pub fn reply_tag(&self) -> &'static str {
         match self {
+            Self::DemoteSessions(_) => "DemoteSessionsReqOutput",
+            Self::GetAdmission(_) => "GetAdmissionReqOutput",
             Self::FlushCache(_) => "FlushCacheReqOutput",
             Self::PauseScheduler(_) => "PauseSchedulerReqOutput",
             Self::ResumeScheduler(_) => "ResumeSchedulerReqOutput",
@@ -540,6 +583,8 @@ impl ControlOutput {
             Self::RebalanceExperts(output) => said(output.success, &output.message),
             Self::ReleaseMemoryOccupation(output) => said(output.success, &output.message),
             Self::ResumeMemoryOccupation(output) => said(output.success, &output.message),
+            Self::DemoteSessions(output) => said(output.success, &output.message),
+            Self::GetAdmission(output) => (output.success, None),
             Self::Profile(output) => said(output.success, &output.message),
             Self::IsSchedulerPaused(_) | Self::IsSleeping(_) | Self::GetInternalState(_) => {
                 (true, None)

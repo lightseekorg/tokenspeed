@@ -313,6 +313,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
 
     let spec = RequestSpec {
         request_id: rid.clone(),
+        session_id: request.cache_session_id.unwrap_or_default(),
         tokens: request.input_ids.unwrap_or_default(),
         max_new_tokens: max_new_tokens.clamp(0, i64::from(i32::MAX)) as i32,
         // Prompt logprobs need logits from their start on, so the admission
