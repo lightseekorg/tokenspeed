@@ -291,14 +291,16 @@ impl DataPlane for InstantDevice {
     }
 }
 
-/// A frontend that sends each round's outputs as the transport does, and
-/// submits a new request for every one that finished.
+/// A frontend that hands each round's outputs to another thread to encode,
+/// as the transport does, and submits a new request for every one that
+/// finished.
 struct ChurningFrontend {
     prompt: usize,
     max_new_tokens: i64,
     /// Requests to submit next round.
     due: usize,
     submitted: usize,
+    encoder: mpsc::Sender<(Vec<StreamedOutput>, Load)>,
 }
 
 impl Frontend for ChurningFrontend {
@@ -332,11 +334,7 @@ impl Frontend for ChurningFrontend {
             .iter()
             .filter(|output| output.finish_reason.is_some())
             .count();
-        let frames = EngineOutput::Batch(Box::new(ts_control::transport::output_batch(
-            outputs, 0, load,
-        )))
-        .to_frames();
-        std::hint::black_box(frames);
+        let _ = self.encoder.send((outputs, load));
     }
 
     fn reply(&mut self, _: ControlOutput) {}
@@ -362,6 +360,13 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     };
     let (plans, freed) = mpsc::channel::<ExecutionPlan>();
     let freeing = std::thread::spawn(move || freed.into_iter().for_each(drop));
+    let (encoder, batches) = mpsc::channel::<(Vec<StreamedOutput>, Load)>();
+    let encoding = std::thread::spawn(move || {
+        for (outputs, load) in batches {
+            let batch = ts_control::transport::output_batch(outputs, 0, load);
+            std::hint::black_box(EngineOutput::Batch(Box::new(batch)).to_frames());
+        }
+    });
     let config = LoopConfig {
         in_flight_depth: 1,
         limits: IngressLimits {
@@ -413,6 +418,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             max_new_tokens: generated as i64,
             due: shape.rows,
             submitted: 0,
+            encoder,
         },
         OutputProcessor::new(None, 1, Some(1 << 24), Role::Plain, NO_FINISH_LOG),
         config,
@@ -433,6 +439,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     );
     drop(event_loop);
     freeing.join().unwrap();
+    encoding.join().unwrap();
 }
 
 /// A whole `EventLoop::round` in steady decode: 256 rows of 2K-token

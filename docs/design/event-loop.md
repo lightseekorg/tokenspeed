@@ -18,8 +18,9 @@ One engine rank is one `ts-host` process. Its threads:
 | forward (`ts-forward`) | the Python `HostDataPlane`'s operations, one at a time in queue order: everything that touches CUDA | the `DeviceHandle`, behind it the executor, models, KV pools, CUDA graphs; takes the GIL per operation |
 
 Peripheral threads stay off the round: the wire's Tokio runtime
-(`ts_control::transport`), the PD transfer peer's workers (`ts-pd`), the
-grammar compilers, the KV event publisher, the expert-rebalance solver.
+(`ts_control::transport`, which also encodes each round's outputs), the PD
+transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
+publisher, the expert-rebalance solver.
 
 With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
