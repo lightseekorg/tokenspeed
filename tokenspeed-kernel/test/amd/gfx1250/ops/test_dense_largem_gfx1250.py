@@ -56,7 +56,7 @@ def _project(a, b):
 # size the MI450 simulator lane can run.
 @pytest.mark.parametrize(
     "m,n,k",
-    [(4097, 2112, 7168), (4352, 7168, 4224), (4096, 3072, 512), (4097, 3072, 512)],
+    [(7937, 2112, 7168), (4352, 7168, 4224), (4096, 3072, 512), (4097, 3072, 512)],
 )
 def test_largem_warp_pipeline_matches_torch(m, n, k):
     torch.manual_seed(m + n + k)
@@ -94,25 +94,24 @@ def test_largem_warp_pipeline_compiles_under_compile_monitor():
     torch.testing.assert_close(actual, a @ b.T, atol=1e-2, rtol=1e-2)
 
 
-# GLM-5.3-Flash attention TP4 prefill projections (M, K, N) at an 8192-token
-# chunk, a 5376-token tail and an 848-token tail, and shapes left to hipBLASLt.
+# Serving projections (M, K, N): a row range's inclusive ends, rows between
+# ranges, rows past a closed range, and weights with no range.
 @pytest.mark.parametrize(
     "m,k,n,selected",
     [
-        (8192, 4096, 6416, True),  # KDA q/k/v/beta/f_a/g_a, tail peeled
-        (8192, 2048, 4096, True),  # KDA output
-        (8192, 128, 2048, True),  # KDA f_b and g_b
-        (8192, 4096, 288, True),  # MoE router
-        (848, 4096, 128, True),  # indexer wk, KPool gate
-        (8192, 4096, 160, False),  # fused wk + weights: no one-wave tile
-        (5376, 2048, 4096, False),  # 2x2 clusters leave a third of rounds idle
-        (8192, 21504, 7168, False),  # K past the measured range
-        (848, 2048, 4096, False),  # short wide problems stay on hipBLASLt
-        (511, 4096, 288, False),
-        (8192, 4096, 6400 + 8, False),  # N must be a multiple of 16
+        (8192, 4096, 6416, True),  # GLM KDA q/k/v/beta/f_a/g_a, tail peeled
+        (848, 4096, 6416, True),
+        (768, 4096, 6416, False),
+        (1024, 2048, 4096, True),  # GLM KDA output
+        (1025, 2048, 4096, False),
+        (2048, 1536, 7168, False),  # K3 o_proj between its ranges
+        (8192, 4096, 288, True),  # GLM MoE router
+        (12288, 4096, 288, False),
+        (8192, 21504, 896, False),  # K3 EAGLE3 fc
+        (8192, 4096, 160, False),  # not a serving weight
     ],
 )
-def test_largem_selection_outside_k3_shapes(m, k, n, selected):
+def test_largem_selection_follows_measured_rows(m, k, n, selected):
     assert use_gluon_largem_gfx1250(m, k, n) is selected
 
 
@@ -146,7 +145,7 @@ def test_largem_narrow_outputs_match_torch(m, n, k, kernel):
 def test_largem_warp_pipeline_peels_column_tail():
     # The columns past the last 512-wide cluster column would add a CU round
     # to the warp pipeline grid, so 128 x 64 large-M tiles cover them.
-    m, n, k = 8192, 2304, 512
+    m, n, k = 8192, 2304, 1536
     torch.manual_seed(n + k)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5

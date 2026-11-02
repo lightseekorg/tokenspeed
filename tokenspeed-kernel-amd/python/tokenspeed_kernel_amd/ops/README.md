@@ -569,17 +569,18 @@ projections with many rows.
 #### Contract
 
 - The operation computes `A @ B.T` from BF16 `[M, K]` with a unit column
-  stride and contiguous BF16 `[N, K]`, with `M >= 512` and K a multiple of
-  128, producing a contiguous BF16 `[M, N]`.
-- `use_gluon_largem_gfx1250` selects the K3 weight shapes, and other shapes
-  with N a multiple of 16 and K at most 8192 where a cold-cache sweep (M
-  512-16384, N 32-12544, K 128-8192) measured them faster than hipBLASLt:
-  - Outputs of at most 512 columns that one wave of dense tiles covers (a
-    `64`- or `128`-row tile of `32` or `64` columns dividing N, at most one
-    CTA per CU), or, from 256 columns, one wave of `128 x 128` tiles.
-  - From 4096 rows and 1536 columns, warp pipeline grids whose real
-    `256 x 256` tiles fill at least 80% of their CU rounds, after the column
-    tail peel described below.
+  stride and contiguous BF16 `[N, K]`, with K a multiple of 128, producing a
+  contiguous BF16 `[M, N]`.
+- `use_gluon_largem_gfx1250` selects a shape when `_LARGEM_ROWS` lists its
+  `(K, N)` and a row range holding M. The table covers the BF16 serving
+  weights of GLM-5.3-Flash, DeepSeek-V4.1-Flash and Kimi K3 with its EAGLE3
+  draft. Each range is where these kernels beat hipBLASLt by at least 3% in
+  the median of three cold-L2 sweeps on the ROCm nightly CI pins; the
+  winner tracks hipBLASLt's own kernel choice, so the table is re-measured
+  when that pin moves.
+- Outputs of at most 512 columns run on one wave of dense tiles when one
+  fits (a `64`- or `128`-row tile of `32` or `64` columns dividing N, at most
+  one CTA per CU), and on the large-M kernels otherwise.
 - Ragged M and N are handled in-kernel. The row count is a runtime argument,
   so any number of rows reuses one compiled kernel.
 

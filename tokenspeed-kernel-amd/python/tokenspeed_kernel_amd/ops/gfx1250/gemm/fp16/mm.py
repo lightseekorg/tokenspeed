@@ -25,7 +25,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
-_LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
 _LARGEM_WIDE_N = 3072
 # From this many rows the 256 x 256 warp pipeline tile fills the device.
@@ -57,33 +56,55 @@ _WARP_BASES_M8 = ((1, 0), (2, 0), (4, 0))
 _WARP_BASES_4 = ((0, 1), (1, 0))
 _WARP_BASES_8 = ((0, 1), (1, 0), (2, 0))
 _WARP_BASES_N8 = ((0, 1), (0, 2), (0, 4))
-_LARGEM_SHAPES = {
-    (512, 3072),
-    (768, 7168),
-    (1536, 7168),
-    (1536, 2304),
-    (3584, 7168),
-    (4224, 7168),
-    (7168, 1536),
-    (7168, 2112),
-    (7168, 3584),
-    (7168, 6288),
-    (7168, 8448),
+# Inclusive row ranges, per (K, N) BF16 serving weight of GLM-5.3-Flash,
+# DeepSeek-V4.1-Flash and Kimi K3 with its EAGLE3 draft, where these kernels
+# beat hipBLASLt by at least 3% in the median of three cold-L2 sweeps (M 512
+# to 8192 every 256 rows, 848, and 12288 to 32768) on the ROCm 10.2.0a20261010
+# stack that CI pins. Rows between two sweep points run here only when both
+# did; None leaves a range open past the last point. The winner depends on
+# hipBLASLt's own kernel choice, so re-measure when that pin moves.
+_LARGEM_ROWS = {
+    (128, 1536): ((512, None),),
+    (128, 2048): ((512, None),),
+    (512, 128): ((512, None),),
+    (512, 3072): ((512, 1280), (3840, None)),
+    (768, 7168): ((512, 1024), (4096, None)),
+    (1024, 7168): ((512, 848), (4096, None)),
+    (1536, 1536): ((1536, 2560), (4864, None)),
+    (1536, 2304): ((512, 768), (1024, 1792), (2304, 2816), (3328, 3584), (4096, None)),
+    (1536, 4096): ((768, 1024), (4096, None)),
+    (1536, 7168): ((512, 848), (4096, None)),
+    (2048, 4096): ((848, 1024), (4096, None)),
+    (2304, 7168): ((512, 848), (4096, None)),
+    (3584, 7168): ((4096, None),),
+    (4096, 32): ((512, None),),
+    (4096, 128): ((512, 8192),),
+    (4096, 288): ((512, 8192),),
+    (4096, 6416): ((848, None),),
+    (4224, 7168): ((4096, None),),
+    (5120, 32): ((848, None),),
+    (5120, 512): ((512, 8192),),
+    (7168, 1536): ((1024, 3840), (4352, 4608)),
+    (7168, 2112): ((512, 2048), (2560, 3328), (6144, 7168), (7936, None)),
+    (7168, 3584): ((512, 2304), (4096, 4608), (6400, 6656), (7424, 8192)),
+    (7168, 4608): ((512, 1536), (5632, 7168), (12288, None)),
+    (7168, 6288): ((512, 2560), (3072, None)),
+    (7168, 8448): (
+        (512, 768),
+        (1536, 1792),
+        (3072, 3584),
+        (4608, 5632),
+        (7168, None),
+    ),
+    (8192, 4096): ((848, 1792), (4096, 4352), (7424, None)),
+    (14336, 2112): ((1024, 2560), (3072, 3584), (6144, 7168), (24576, None)),
 }
-# Outside the K3 shapes, the warp pipeline kernel beat hipBLASLt across a
-# cold-cache sweep (M 4096-16384, N 1536-12544, K 128-8192) wherever its real
-# 256 x 256 tiles, after peeling the column tail, kept this share of the CU
-# rounds busy; a lower share lost up to 6% at long K, as did K 21504 at 88%.
-_LARGEM_MIN_CU_UTILIZATION = 0.8
-_LARGEM_MAX_K = 8192
 # Columns past the last whole cluster column that push the warp pipeline grid
 # into one more CU round ran 2-25% faster on 128 x 64 large-M tiles after it,
 # unless the grid already kept this share of its rounds busy.
 _LARGEM_PEEL_MAX_CU_UTILIZATION = 0.9
-# Up to this width one dense WMMA wave (or, from _NARROW_LARGEM_MIN_N columns,
-# one wave of 128 x 128 large-M tiles) beat hipBLASLt from 512 rows.
+# Up to this width one wave of dense WMMA tiles beats the large-M tiles.
 _NARROW_MAX_N = 512
-_NARROW_LARGEM_MIN_N = 256
 # Ascending tile area: of the tiles that divide N, the one with the most CTAs
 # within one wave of the CUs wins, the smaller tile on a tie.
 _NARROW_TILES = (
@@ -136,34 +157,14 @@ def _warp_pipeline_columns(m: int, n: int) -> int:
     return split
 
 
-def _largem_wins(m: int, n: int) -> bool:
-    """Whether the large-M kernels beat hipBLASLt outside the K3 shapes."""
-    if n <= _NARROW_MAX_N:
-        return _narrow_dense_tile(m, n) is not None or (
-            n >= _NARROW_LARGEM_MIN_N
-            and triton.cdiv(m, 128) * triton.cdiv(n, 128) <= _NUM_CUS
-        )
-    if m < _LARGEM_WIDE_M or n < _LARGEM_WARP_PIPELINE_MIN_N:
-        return False
-    utilization, _ = _warp_pipeline_rounds(m, _warp_pipeline_columns(m, n))
-    return utilization >= _LARGEM_MIN_CU_UTILIZATION
-
-
 def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
-    """Return whether the CDNA5 large-M projection is selected for this shape.
+    """Return whether the CDNA5 large-M projection is selected for this shape:
+    a serving weight in ``_LARGEM_ROWS`` with M in one of its row ranges."""
 
-    The K3 shapes run from ``_LARGEM_MIN_M`` rows. Other shapes with K a
-    multiple of 128 up to ``_LARGEM_MAX_K`` and N a multiple of 16 run where
-    they measured faster than hipBLASLt: narrow outputs whose tiles fit one
-    wave of the CUs, and wide ones whose warp pipeline tiles keep the CU
-    rounds busy.
-    """
-
-    if m < _LARGEM_MIN_M:
-        return False
-    if (k, n) in _LARGEM_SHAPES:
-        return True
-    return k % 128 == 0 and k <= _LARGEM_MAX_K and n % 16 == 0 and _largem_wins(m, n)
+    return any(
+        low <= m and (high is None or m <= high)
+        for low, high in _LARGEM_ROWS.get((k, n), ())
+    )
 
 
 def _wmma_tdm_dense_launch_metadata(grid, kernel, args):
@@ -1813,8 +1814,8 @@ def gluon_mm_a16w16_largem_gfx1250(
     n = int(B.shape[0])
     if not use_gluon_largem_gfx1250(m, k, n):
         raise ValueError(
-            f"gfx1250 large-M projection requires M >= {_LARGEM_MIN_M} "
-            f"and a selected shape, got M={m} N={n} K={k}"
+            "gfx1250 large-M projection requires a selected shape and row "
+            f"count, got M={m} N={n} K={k}"
         )
     if (
         A.dtype != torch.bfloat16
