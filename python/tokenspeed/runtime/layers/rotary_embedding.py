@@ -550,16 +550,15 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         mscale_all_dim: float = 0,
         device: str | None = "cuda",
         ramp_device: str,
+        frequency_device: str,
     ) -> None:
         """
         Args:
             device: Device the cos/sin cache is built on and the inverse
                 frequencies are moved to.
-            ramp_device: Device the whole inverse-frequency table (the
-                position frequencies, both divisions and the YaRN linear ramp
-                mask) is computed on before moving to ``device`` once
-                (``--yarn-ramp-mask-device``); the trainer computes it on the
-                host.
+            ramp_device: Device that computes the YaRN linear ramp mask.
+            frequency_device: Device that computes the powers, divisions and
+                interpolation. The ramp is transferred here before combining.
         """
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -574,18 +573,17 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         self.device = device
         self.ramp_device = ramp_device
+        self.frequency_device = frequency_device
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
-        # Every division of the table runs on ramp_device and the result moves
-        # to the model device once: CPU and CUDA round each of them
-        # differently at ulp level, and the trainer builds the whole table on
-        # the host.
+        # Power/division and ramp construction can have different rounding
+        # contracts. Move the ramp without recomputing its values.
         pos_freqs = self.base ** (
             torch.arange(
-                0, self.rotary_dim, 2, dtype=torch.float, device=self.ramp_device
+                0, self.rotary_dim, 2, dtype=torch.float, device=self.frequency_device
             )
             / self.rotary_dim
         )
@@ -608,7 +606,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
                 self.rotary_dim // 2,
                 dtype=torch.float,
                 device=self.ramp_device,
-            )
+            ).to(self.frequency_device)
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
@@ -1214,10 +1212,10 @@ def get_rope(
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
 
-    # deepseek_yarn builds its inverse frequencies on the launch's chosen
-    # device; the cache must not hand a cuda-built table to a cpu launch or
-    # vice versa.
+    # Both construction devices affect deepseek_yarn rounding, so a cached
+    # table must match the launch's ramp and frequency choices.
     yarn_ramp_mask_device = global_server_args_dict["yarn_ramp_mask_device"]
+    yarn_frequency_device = global_server_args_dict["yarn_frequency_device"]
     key = (
         head_size,
         rotary_dim,
@@ -1227,6 +1225,7 @@ def get_rope(
         rope_scaling_args,
         dtype,
         yarn_ramp_mask_device,
+        yarn_frequency_device,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -1359,6 +1358,7 @@ def get_rope(
                 dtype,
                 device="npu" if current_platform().is_npu else "cuda",
                 ramp_device=yarn_ramp_mask_device,
+                frequency_device=yarn_frequency_device,
                 **extra_kwargs,
             )
         elif scaling_type == "longrope":

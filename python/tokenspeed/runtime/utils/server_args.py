@@ -42,6 +42,7 @@ from tokenspeed.runtime.configs.numerics import (
     RL_BITWISE_SAMPLING_BACKENDS,
     ROUTER_TOPKS,
     SAMPLING_STREAMS,
+    YARN_FREQUENCY_DEVICES,
     YARN_RAMP_MASK_DEVICES,
     resolve_numerics_envelope,
 )
@@ -647,9 +648,10 @@ class ServerArgs:
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
-    # Device that computes the deepseek_yarn RoPE inverse frequencies (the
-    # position frequencies, both divisions and the YaRN linear ramp mask).
+    # Device that computes the deepseek_yarn linear ramp mask.
     yarn_ramp_mask_device: str = "cuda"
+    # Device that computes deepseek_yarn powers, divisions and interpolation.
+    yarn_frequency_device: str = "cuda"
     # Where LongCat-style MLA applies its sqrt(hidden / lora_rank) norm scales:
     # folded into the q_a/kv_a layernorm weights at load, or multiplied at
     # runtime after q_b_proj / kv_a_layernorm as the trainer does.
@@ -1021,6 +1023,11 @@ class ServerArgs:
                 "--yarn-ramp-mask-device",
                 self.yarn_ramp_mask_device,
                 YARN_RAMP_MASK_DEVICES,
+            ),
+            (
+                "--yarn-frequency-device",
+                self.yarn_frequency_device,
+                YARN_FREQUENCY_DEVICES,
             ),
             ("--mla-lora-scale", self.mla_lora_scale, MLA_LORA_SCALES),
             ("--layer-boundary-norm", self.layer_boundary_norm, LAYER_BOUNDARY_NORMS),
@@ -1904,9 +1911,10 @@ class ServerArgs:
         # Trainer alignment: the training framework's operation order wherever
         # the two engines are known to differ. Each switch is documented in
         # ``docs/design/numerics.md`` under "alignment.trainer".
-        # The trainer builds its RoPE inverse frequencies on the host; CPU and
-        # CUDA division round each of them differently at ulp level.
+        # The trainer constructs the ramp on CPU, then computes powers,
+        # divisions and interpolation on CUDA. Both choices affect rounding.
         self.yarn_ramp_mask_device = "cpu"
+        self.yarn_frequency_device = "cuda"
         # The trainer multiplies the LoRA norm scales as separate bf16 ops.
         self.mla_lora_scale = "runtime"
         # The trainer materializes each layer's bf16 output before the next
@@ -3996,12 +4004,20 @@ class ServerArgs:
             type=str,
             choices=list(YARN_RAMP_MASK_DEVICES),
             default=ServerArgs.yarn_ramp_mask_device,
-            help="Device that computes the deepseek_yarn RoPE inverse "
-            "frequencies (the position frequencies, both divisions and the "
-            "YaRN linear ramp mask) before the table is moved to the model "
-            "device once. The trainer builds it on the host, and CPU and CUDA "
-            "division round differently at ulp level. Folded to cpu by "
-            "--numerics rl-bitwise.",
+            help="Device that computes the deepseek_yarn linear ramp mask. "
+            "Defaults to cuda, independently of --yarn-frequency-device. "
+            "Folded to cpu by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--yarn-frequency-device",
+            type=str,
+            choices=list(YARN_FREQUENCY_DEVICES),
+            default=ServerArgs.yarn_frequency_device,
+            help="Device that computes deepseek_yarn powers, divisions and "
+            "interpolation. Defaults to cuda, independently of --yarn-ramp-mask-device. "
+            "Folded to cuda by --numerics rl-bitwise, overriding explicit cpu. "
+            "Use cuda with --yarn-ramp-mask-device cpu for CUDA frequencies "
+            "with a CPU-built ramp. CPU and CUDA arithmetic can round differently.",
         )
         parser.add_argument(
             "--mla-lora-scale",

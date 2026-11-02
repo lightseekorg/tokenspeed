@@ -201,12 +201,23 @@ and only the reported log-probabilities change.
 | Switch | Trainer form | Changes |
 | --- | --- | --- |
 | `--sampling-stream per-request` | Non-greedy rows draw from a Philox stream keyed by `(request seed, position)` only (`sampling.deterministic` above); the trainer plays back the sampled ids, so this is an invariance switch rather than an alignment one — T>0 rollouts need it | tokens at T>0 (not logprobs) |
-| `--yarn-ramp-mask-device cpu` | The whole `inv_freq` table of `deepseek_yarn` RoPE — position frequencies, both divisions and the YaRN linear ramp mask — is computed on the host and copied to the device once, as the trainer builds its `inv_freq` on the host; CPU and CUDA division round differently at ulp level, and every rotated q/k inherits the difference | forward values |
+| `--yarn-ramp-mask-device cpu` | Compute the `deepseek_yarn` linear ramp on CPU; `rl-bitwise` pins this choice. The computed ramp is transferred to the frequency device before interpolation | forward values |
+| `--yarn-frequency-device cuda` | Compute YaRN powers, divisions and interpolation on CUDA after transferring the CPU-built ramp; `rl-bitwise` pins this choice, overriding an explicit `cpu`. CPU and CUDA arithmetic can round differently | forward values |
 | `--mla-lora-scale runtime` | The `sqrt(hidden / lora_rank)` norm scales of LongCat-style MLA stay out of the `q_a_layernorm` / `kv_a_layernorm` weights and multiply `q` after `q_b_proj` and the latent after `kv_a_layernorm` in bf16, as the trainer does; the DSA indexer reads the unscaled `q_lora` | forward values |
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
 | `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
 | `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 (refused by `resolve_numerics` otherwise) and a kernel declaring `combine_order` with `slot`; under `--all2all-backend deepep` that kernel must also own the exchange (`supports_all_to_all_ep`) and returns the complete output of the rows this rank owns. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
+
+`rl-bitwise` folds YaRN to a CPU ramp and CUDA frequencies. The same
+construction can be selected under `auto` with `--yarn-ramp-mask-device cpu
+--yarn-frequency-device cuda`. This replaces the previous all-CPU
+inverse-frequency construction under `rl-bitwise`. Under `auto`, both devices
+default independently to `cuda`; setting only the ramp device to `cpu` leaves
+frequency construction on CUDA. For the previous all-CPU construction, set
+both options to `cpu`. Both devices participate in the RoPE cache identity.
+The transfer and frequency construction run when the cos/sin cache is
+initialized; forward reuses that cache.
 
 These are the switches the host can mirror with no new vendor dependency.
 The rest of the trainer's form lives in kernel leaves and model code the host

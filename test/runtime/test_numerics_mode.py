@@ -167,6 +167,82 @@ class TestNumericsMode:
         with pytest.raises((ValueError), match=("--yarn-ramp-mask-device")):
             ServerArgs(model="x", yarn_ramp_mask_device="npu")
 
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    @pytest.mark.parametrize("ramp_device", [None, "cpu", "cuda"])
+    @pytest.mark.parametrize("frequency_device", [None, "cpu", "cuda"])
+    def test_yarn_devices_default_independently_and_fold_with_the_envelope(
+        self, numerics, ramp_device, frequency_device
+    ):
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        argv = [
+            "--model",
+            "x",
+            "--numerics",
+            numerics,
+        ]
+        devices = {}
+        if ramp_device is not None:
+            argv.extend(["--yarn-ramp-mask-device", ramp_device])
+            devices["yarn_ramp_mask_device"] = ramp_device
+        if frequency_device is not None:
+            argv.extend(["--yarn-frequency-device", frequency_device])
+            devices["yarn_frequency_device"] = frequency_device
+        cli_args = prepare_server_args(argv)
+        direct_args = ServerArgs(
+            model="x",
+            numerics=numerics,
+            **devices,
+        )
+        expected_ramp = "cpu" if numerics == "rl-bitwise" else ramp_device or "cuda"
+        expected_frequency = (
+            "cuda" if numerics == "rl-bitwise" else frequency_device or "cuda"
+        )
+        for args in (cli_args, direct_args):
+            assert args.yarn_ramp_mask_device == expected_ramp
+            assert args.yarn_frequency_device == expected_frequency
+
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    @pytest.mark.parametrize("device", [None, "npu"])
+    @pytest.mark.parametrize(
+        "field", ["yarn_ramp_mask_device", "yarn_frequency_device"]
+    )
+    def test_yarn_devices_reject_invalid_values(self, numerics, field, device):
+        with pytest.raises(ValueError, match="--" + field.replace("_", "-")):
+            ServerArgs(model="x", numerics=numerics, **{field: device})
+
+    def test_yarn_devices_reach_rope_launch_state(self):
+        from tokenspeed_kernel.platform import pdl_enabled
+
+        from tokenspeed.runtime.utils.env import (
+            global_server_args_dict,
+            global_server_args_dict_update,
+        )
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--numerics",
+                "rl-bitwise",
+                "--yarn-ramp-mask-device",
+                "cpu",
+                "--yarn-frequency-device",
+                "cpu",
+            ]
+        )
+        original = global_server_args_dict.copy()
+        original_pdl = pdl_enabled()
+        try:
+            global_server_args_dict_update(args)
+            assert global_server_args_dict["yarn_ramp_mask_device"] == "cpu"
+            assert global_server_args_dict["yarn_frequency_device"] == "cuda"
+        finally:
+            pdl_enabled(original_pdl)
+            global_server_args_dict.clear()
+            global_server_args_dict.update(original)
+
     def test_rl_bitwise_applies_the_mla_lora_scale_at_runtime(self):
         assert (ServerArgs(model="x").mla_lora_scale) == ("folded")
         assert (ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale) == (
