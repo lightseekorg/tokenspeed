@@ -20,14 +20,16 @@
 
 """An EPD encode rank's data plane: admitting requests (their cache lookups
 and shared-memory pixels, opened on every rank before any consumes them),
-embedding batches and copying each item's rows into its send slot, and
-reporting the finished copies. The host's loop and sender are tested in
+embedding batches and copying each item's rows into its send slot,
+reporting the finished copies, and collecting garbage every few batches.
+The host's loop and sender are tested in
 Rust (``ts-control``'s ``encode``, ``ts-pd``'s ``epd::sender``); the vision
 tower here is a stand-in that returns the items' pixels.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 import time
@@ -48,6 +50,10 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 from tokenspeed.runtime.cache.embedding_cache import (  # noqa: E402
     EmbeddingCache,
     TieredEmbeddingCache,
+)
+from tokenspeed.runtime.engine.gc_hooks import (  # noqa: E402
+    FULL_COLLECTION_INTERVAL,
+    freeze_startup_heap,
 )
 from tokenspeed.runtime.engine.io_struct import MsgpackEncoder  # noqa: E402
 from tokenspeed.runtime.epd.encode_host import (  # noqa: E402
@@ -223,6 +229,33 @@ def test_a_request_with_two_items_is_taken_but_not_kept():
     plane.release([1])
     with pytest.raises(KeyError):
         plane.encode([(1, 0)])
+
+
+def test_a_full_collection_runs_every_interval_of_batches():
+    # Serving's collector: CPython starts no full collection by itself, so
+    # every one recorded here is the data plane's.
+    thresholds = gc.get_threshold()
+    freeze_startup_heap()
+    full_collections: list[int] = []
+    batch = 0
+
+    def record(phase: str, info: dict) -> None:
+        if phase == "stop" and info["generation"] == 2:
+            full_collections.append(batch)
+
+    gc.callbacks.append(record)
+    try:
+        plane, _ = _plane(_Tower())
+        for batch in range(1, 2 * FULL_COLLECTION_INTERVAL + 1):
+            plane.admit([(batch, _frames(_item(7, 1), room=batch))])
+            plane.encode([(batch, 0)])
+            plane.encoded()
+    finally:
+        gc.callbacks.remove(record)
+        gc.unfreeze()
+        gc.set_threshold(*thresholds)
+        gc.collect()
+    assert full_collections == [FULL_COLLECTION_INTERVAL, 2 * FULL_COLLECTION_INTERVAL]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

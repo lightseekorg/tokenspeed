@@ -190,11 +190,9 @@ from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -693,7 +691,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
     ) -> bool:
         if self.qkv_parallel is not None:
             return False
-        projection = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        projection = self.fused_qkv_a_proj_with_mqa
         if projection is None:
             return False
         blocks, weight_a, weight_b, eps, scratch_a, scratch_b = args
@@ -4471,11 +4469,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.vision is None:
             return {}
         return {"image_encoder": self.make_encoder_cudagraph_wrapper(mapping)}
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def multimodal_input_embeds(

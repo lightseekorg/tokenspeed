@@ -151,7 +151,7 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
         weight instead of running the full GEMM.
         """
         kv_width = self.kv_lora_rank + self.qk_rope_head_dim
-        fused = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        fused = self.fused_qkv_a_proj_with_mqa
         if fused is not None:
             weight = getattr(fused, "weight", None)
             if weight is not None and weight.dtype == hidden_states.dtype:

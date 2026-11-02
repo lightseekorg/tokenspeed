@@ -5,6 +5,14 @@ full-cache slots, and attends to those slots. The block selector takes an
 explicit `auto`, `stream`, or `logits` path. Backend selection and overrides
 preserve the requested path.
 
+## PrimTS plan preparation
+
+The FlashInfer PrimTS adapter caches cluster occupancy by CUDA device, context,
+and cluster size. New eager layouts retain their own workspace plans and route
+offsets while sharing the hardware capacity query. This keeps CuTe's
+occupancy-query kernel compilation in startup and preserves the serving JIT
+checks when batch geometry changes.
+
 ## TMA gather sparse attention
 
 `thirdparty/cute_dsl/qsa_tma_gather.py` provides `TmaGatherSparseAttention`, an explicit,
@@ -151,6 +159,12 @@ but contribute zero complete blocks to scoring and top-k selection.
 
 Compressed-key RoPE is read only at compression write boundaries. Non-boundary
 draft rows may have valid raw-key tags before their group-start header is staged.
+
+Each recent-cache page owns a separate raw-key ring. A later token suppresses
+an earlier writer only when both address the same physical page and ring slot.
+Prefill must leave the last raw keys and group-start positions in every page
+it computes, including pages before the final window, so an interior state
+checkpoint has valid recent-cache data when the scheduler publishes it.
 
 Startup metadata preparation covers integer alignment classes for compressed
 page-table row strides. Recent-cache writes cover these classes for row count

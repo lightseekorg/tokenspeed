@@ -42,6 +42,10 @@ keeps communication storage outside the weight region. They remain resident,
 including across discard; their memory must be included in the training headroom. NCCL release is independent and
 optional. No NCCL suspend feature is required when its tag is omitted.
 
+Expert placement state (load counters and, for all-to-all EP under a static
+dispatch algorithm, the per-rank dispatch map) is allocated with the placement
+before the model is built, so it also stays resident across discard.
+
 ## Allocator runtime requirements
 
 The allocator must recognize managed pointers when they are freed outside their

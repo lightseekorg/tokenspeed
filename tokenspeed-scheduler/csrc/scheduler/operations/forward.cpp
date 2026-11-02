@@ -300,14 +300,23 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         match.probe = probe(CacheCoordinator::PromptPrefix{});
         return match;
     }
+    auto& prepared_keys = request->GetIf<fsm::Submitted>()->admission.prefix_keys;
+    if (!prepared_keys) {
+        prepared_keys = coordinator_.PreparePrefixKeys(hashes);
+    }
     // The KV walk stops at the probe bound; the D role also reads the prompt's
     // last page and its final tokens for the prompt-end state check.
     const CacheCoordinator::PromptPrefix prompt{
         .prefix_hashes = hashes,
         .tokens = request->TokenSlice(0, request->PrefillSize()),
         .max_tokens = max_cacheable_tokens,
+        .prepared_keys = prepared_keys,
     };
     match.probe = probe(prompt);
+    if (config_.role != Role::kD && coordinator_.EvictionStoresExtendPrefix(prompt, match.probe)) {
+        match.waits_for_eviction_store = true;
+        return match;
+    }
     // Opt-in diagnostics deliberately walk more than matching needs. Emit
     // only a successful first admission, using the pre-admission snapshot.
     static const bool inspect_prefix = std::getenv("TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS") != nullptr;
@@ -383,7 +392,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
 }
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTracking(
-    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
+    ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
     std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments) {
     if (progress.completed_pages) {
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
@@ -398,9 +407,21 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
     const bool others_hold_pages = std::ranges::any_of(requests_, [&request](const std::unique_ptr<Request>& other) {
         return other.get() != &request && other->HoldsPages();
     });
-    return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
-                 cache_progress.access_epoch,
-                 /*evict_blocks_past_segments=*/evict_blocks_past_segments && !others_hold_pages);
+    const auto attempt = [&]() {
+        return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
+                     cache_progress.access_epoch,
+                     /*evict_blocks_past_segments=*/evict_blocks_past_segments && !others_hold_pages);
+    };
+    auto admission = attempt();
+    if (!admission && !cache_progress.retained_input_checkpoint.empty()) {
+        // Keeping an input for a later turn is optional. It must not stop
+        // this request from obtaining the blocks its next forward needs.
+        cache_progress.retained_input_checkpoint.clear();
+        request.CacheProgressRef().retained_input_checkpoint.clear();
+        feedback.admission_failed = false;
+        admission = attempt();
+    }
+    return admission;
 }
 
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
@@ -413,6 +434,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         return FirstChunkOutcome{};
     }
     AdmissionMatch match = matchPrefixAtAdmission(request);
+    if (match.waits_for_eviction_store) {
+        // The ACK makes the segment visible. Re-probe then, without taking
+        // pages or reporting a capacity failure while the copy is pending.
+        return FirstChunkOutcome{};
+    }
 
     // The D role's prompts are the peer's work; every other first chunk is local.
     const fsm::PrefillSource source =
@@ -586,6 +612,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         cache_progress.state_checkpoint_tokens = state_checkpoint;
         cache_progress.state_checkpoint_blocks = std::move(admission->state_checkpoint_blocks);
     }
+    if (state_checkpoint > 0 && hit_tokens >= state_checkpoint) {
+        cache_progress.retained_input_checkpoint =
+            coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
+    }
     return FirstChunkOutcome{.state_prefix_cached = admission->state_prefix_cached,
                              .event = fsm::SchedulePrefillFirstChunkEvent{
                                  tokens_this_round,
@@ -680,6 +710,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         cache_progress.state_checkpoint_tokens = state_checkpoint;
         cache_progress.state_checkpoint_blocks = std::move(admission->state_checkpoint_blocks);
     }
+    if (state_checkpoint > 0 && (ends_at_state_checkpoint ||
+                                 (progress.completed_pages && progress.completed_pages->state_checkpoint_pages > 0))) {
+        cache_progress.retained_input_checkpoint =
+            coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
+    }
 
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
@@ -763,6 +798,13 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         return std::nullopt;
     }
 
+    if (first_decode && cache_progress.retained_input_checkpoint.empty()) {
+        const std::int32_t checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
+        if (checkpoint > 0) {
+            cache_progress.retained_input_checkpoint =
+                coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, checkpoint);
+        }
+    }
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
@@ -863,7 +905,9 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // completes on its own reserve and frees its pages then. Excluded by state:
 // Retracted, Restoring, RemotePrefilling. Transient obstacles (a forward still
 // out, a PD transfer pin) do NOT redirect the choice; the caller waits for the
-// chosen victim to quiesce rather than sacrificing a worse-ranked request.
+// chosen victim to quiesce rather than sacrificing a worse-ranked request. The
+// caller decides which residents to offer (maybeRetractForCapacity offers
+// none its own round has dispatched work for).
 Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
     const auto retractable = [ignore_exemption](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
@@ -941,6 +985,7 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
     // A suspended request holds no Device block: the index keeps the
     // in-forward State checkpoint this publication may have just published.
     cache_progress.published_state_checkpoint_blocks.clear();
+    cache_progress.retained_input_checkpoint.clear();
     victim.CacheProgressRef() = std::move(cache_progress);
 }
 
@@ -1105,9 +1150,9 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
 // The host side is finite too. When no candidate's image fits (no blob slot,
 // a snapshot pool too small for the tail, or a Host L2 that cannot take the
 // published pages the pool cannot -- always, without a pool) the last resort
-// is to ABORT the newest retractable resident instead of imaging anyone
-// (onImageDoesNotFit): its pages free in this round exactly as a
-// retraction's would and the grant proceeds. The alternative, waiting, can
+// is to ABORT the newest retractable resident offered (below) instead of
+// imaging anyone (onImageDoesNotFit): its pages free in this round exactly as
+// a retraction's would and the grant proceeds. The alternative, waiting, can
 // deadlock once every resident needs a page.
 //
 // A grant that cannot join its round (a fused prefill beside an already-built
@@ -1137,18 +1182,48 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         return;
     }
 
+    // Only a resident this round has dispatched no work for is offered as a
+    // victim, in both tiers. One with this round's forward out cannot quiesce
+    // before the retraction runs, and the next round schedules it again
+    // before retraction runs, so waiting for it would last as long as its
+    // reserve -- while every request blocked beside it keeps its pages idle
+    // -- and its pages cannot free in this round, which an abort exists to
+    // do. A forced victim sitting the round out (maybeForceRetraction) is
+    // marked scheduled with nothing dispatched: it stays offered, and is
+    // waited for while its earlier forward lands.
+    Request* const forced_victim = forced_victim_id_.empty() ? nullptr : findRequest(forced_victim_id_);
+    std::vector<Request*> offered;
+    offered.reserve(candidates.size());
+
     while (true) {
-        // No ranked choice can run while every resident is still being
-        // written. Avoid hashing and planning images that would all wait.
-        // With any quiescent resident, retain the full ranking and fit probe:
-        // a better-ranked busy victim must not be bypassed.
-        if (std::ranges::none_of(candidates, [this](const Request* request) {
+        // No room left for the grant -- the batch full or the token budget
+        // spent: a victim retracted now would serve nobody, and its pages
+        // would wait for whoever asks first next round. (An empty round is
+        // never full.) A D-role remote admission takes no batch slot, so it
+        // could still join a round full by batch count, but it is not served
+        // either: that batch already runs as many requests as it can hold,
+        // so retracting a resident for the admission would add no throughput
+        // and cost an image and a restore.
+        if (build.Full(config_.max_batch_size)) {
+            return;
+        }
+        // Rebuilt each pass, so it never offers a request a pass scheduled.
+        offered.clear();
+        std::ranges::copy_if(candidates, std::back_inserter(offered), [&build, forced_victim](Request* request) {
+            return !build.Scheduled(*request) || request == forced_victim;
+        });
+        // No ranked choice can run while every offered resident is still
+        // being written -- a result of an earlier round still landing. Avoid
+        // hashing and planning images that would all wait. With any quiescent
+        // one, retain the full ranking and fit probe: a better-ranked busy
+        // victim must not be bypassed.
+        if (std::ranges::none_of(offered, [this](const Request* request) {
                 return request->IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
                        request->ResultsInFlight() == 0 && !pdTransferInFlight(*request);
             })) {
             return;
         }
-        VictimChoice choice = chooseVictim(candidates, /*ignore_exemption=*/false);
+        VictimChoice choice = chooseVictim(offered, /*ignore_exemption=*/false);
         // A finished request whose last forward is still out frees its pages
         // when that forward lands (settleFinishedRequests), so a round that
         // waits for it is not empty either.
@@ -1160,7 +1235,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (empty_round) {
             // Nothing is retractable under the exemption and the round runs
             // nothing: the empty-round retraction (docs/design/scheduler.md §2).
-            choice = chooseVictim(candidates, /*ignore_exemption=*/true);
+            choice = chooseVictim(offered, /*ignore_exemption=*/true);
         }
         Request* victim = choice.victim;
         if (victim == nullptr) {

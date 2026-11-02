@@ -1063,6 +1063,14 @@ These are sampler tests with constructed logits, not full-model acceptance tests
 
 ### Outputs are persistent-buffer slices on both paths
 
+Optional sampled-token cumulative probabilities (`--enable-output-cumulative-probs`)
+follow the sampled logprobs' rows and lifetime: the forward returns them beside
+`output_logprobs`, a decode graph captures them with the same forward, and
+replay slices both to the live rows. They are computed once, at the common
+sampling boundary (`sampling/diagnostics.py`), from a copy of the target
+scores; no backend computes them. `docs/guides/sampling-calibration.md` is
+the contract: ordering, masking, supported configurations and cost.
+
 `sample()` and `verify()` land their outputs in each sampling backend's
 persistent output buffers, on eager and replay alike. The FlashInfer backend
 packs tokens and accept lengths into one region (`_output_pack_buf`), so its

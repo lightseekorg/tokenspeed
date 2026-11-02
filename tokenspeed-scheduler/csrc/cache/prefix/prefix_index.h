@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <iterator>
 #include <list>
-#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -85,6 +84,15 @@ public:
         EvictionOrderMap::const_iterator next_{};
     };
 
+    // Traverses only keys present in both configured pools, in the source
+    // pool's newest-first order. Like EvictionCursor, it borrows the index
+    // and pools for one read-only planning pass.
+    class CommonCursor {
+        friend class PrefixCacheIndex;
+        const CacheEntries* cache_index_{nullptr};
+        EvictionOrderMap::const_reverse_iterator next_{};
+    };
+
     // One unpinned entry, paired with the metadata an eviction policy reads.
     struct EvictionCandidate {
         CacheBlockLocation location;
@@ -99,12 +107,33 @@ public:
         bool pinned;
     };
 
+    struct CommonEntry {
+        const CacheKey* key;
+        CachedBlockSnapshot source;
+        CachedBlockSnapshot peer;
+    };
+
     explicit PrefixCacheIndex(std::uint32_t group_id) : group_id_{group_id} {}
 
     PrefixCacheIndex(const PrefixCacheIndex&) = delete;
     PrefixCacheIndex& operator=(const PrefixCacheIndex&) = delete;
     PrefixCacheIndex(PrefixCacheIndex&&) = default;
     PrefixCacheIndex& operator=(PrefixCacheIndex&&) = default;
+
+    // Maintain the intersection of one source/peer pair. The secondary index
+    // owns no blocks and follows source recency; ownership is read by cursors.
+    void TrackCommonEntries(const BlockPool& source_pool, const BlockPool& peer_pool) {
+        _assert(&source_pool != &peer_pool, "common entries need distinct pools");
+        CacheEntries& source = cacheEntries(source_pool);
+        CacheEntries& peer = cacheEntries(peer_pool);
+        _assert(source.common_peer == nullptr && peer.common_peer == nullptr, "common pools are configured once");
+        source.common_peer = &peer;
+        source.common_source = true;
+        peer.common_peer = &source;
+        for (auto it = source.entries.begin(); it != source.entries.end(); ++it) {
+            linkCommonEntry(source, it);
+        }
+    }
 
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
@@ -146,8 +175,8 @@ public:
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
-        cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
         cache_index.available_order.emplace(evictionOrder(*entry_it), entry_it);
+        linkCommonEntry(cache_index, entry_it);
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
         }
@@ -256,17 +285,18 @@ public:
         return metadataOf(*entry_it);
     }
 
-    // The next epoch, including one whose entries are all pinned. Reading its
-    // order key does not inspect block owners or advance the cursor.
+    // The next potentially evictable epoch. Entries known to be pinned have
+    // already left available_order and rejoin it when their last owner leaves.
+    // Reading the order key does not inspect owners or advance the cursor.
     std::optional<std::uint64_t> PeekEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor) const {
         if (cursor.cache_index_ == nullptr) {
             cursor.cache_index_ = findCacheEntries(pool);
             if (cursor.cache_index_ == nullptr) {
                 return std::nullopt;
             }
-            cursor.next_ = cursor.cache_index_->by_eviction_order.begin();
+            cursor.next_ = cursor.cache_index_->available_order.begin();
         }
-        if (cursor.next_ == cursor.cache_index_->by_eviction_order.end()) {
+        if (cursor.next_ == cursor.cache_index_->available_order.end()) {
             return std::nullopt;
         }
         return cursor.next_->first.last_access_epoch;
@@ -282,12 +312,11 @@ public:
             return false;
         }
         auto& available = cursor.cache_index_->available_order;
-        auto next = available.lower_bound(cursor.next_->first);
-        while (next != available.end() && next->first.last_access_epoch <= max_access_epoch) {
-            const std::uint64_t epoch = next->first.last_access_epoch;
+        while (cursor.next_ != available.end() && cursor.next_->first.last_access_epoch <= max_access_epoch) {
+            const std::uint64_t epoch = cursor.next_->first.last_access_epoch;
             const std::size_t initial_size = out.size();
-            while (next != available.end() && next->first.last_access_epoch == epoch) {
-                const auto current = next++;
+            while (cursor.next_ != available.end() && cursor.next_->first.last_access_epoch == epoch) {
+                const auto current = cursor.next_++;
                 CacheEntry& cache_entry = *current->second;
                 if (cache_entry.block_ref.unique()) {
                     out.push_back(EvictionCandidate{
@@ -303,12 +332,52 @@ public:
                 }
             }
             if (out.size() != initial_size) {
-                cursor.next_ = cursor.cache_index_->by_eviction_order.upper_bound(lastInEpoch(epoch));
                 return true;
             }
         }
-        cursor.next_ = cursor.cache_index_->by_eviction_order.upper_bound(lastInEpoch(max_access_epoch));
         return false;
+    }
+
+    // Borrowed keys and snapshots neither pin blocks nor update recency.
+    // Start a fresh cursor after any index or ownership change.
+    std::optional<CommonEntry> NextCommonRecentEntry(const BlockPool& source_pool, CommonCursor& cursor) const {
+        if (cursor.cache_index_ == nullptr) {
+            cursor.cache_index_ = findCacheEntries(source_pool);
+            if (cursor.cache_index_ == nullptr) {
+                return std::nullopt;
+            }
+            cursor.next_ = cursor.cache_index_->common_order.rbegin();
+        }
+        if (cursor.next_ == cursor.cache_index_->common_order.rend()) {
+            return std::nullopt;
+        }
+        const CacheEntry& source = *(cursor.next_++)->second;
+        const CacheEntry& peer = *source.common_peer;
+        return CommonEntry{
+            .key = &source.key,
+            .source = CachedBlockSnapshot{.location = source.block_ref->Location(),
+                                          .metadata = metadataOf(source),
+                                          .pinned = !source.block_ref.unique()},
+            .peer = CachedBlockSnapshot{.location = peer.block_ref->Location(),
+                                        .metadata = metadataOf(peer),
+                                        .pinned = !peer.block_ref.unique()},
+        };
+    }
+
+    // Visit all entries without ordering or filtering ownership. Borrowed
+    // keys and snapshots neither pin blocks nor touch recency. The visitor
+    // must not mutate this index or block ownership during traversal.
+    template <typename Visit>
+    void ForEachEntry(const BlockPool& pool, const Visit& visit) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return;
+        }
+        for (const CacheEntry& entry : cache_index->entries) {
+            visit(entry.key, CachedBlockSnapshot{.location = entry.block_ref->Location(),
+                                                 .metadata = metadataOf(entry),
+                                                 .pinned = !entry.block_ref.unique()});
+        }
     }
 
     std::int32_t NumEntries(const BlockPool& pool) const {
@@ -322,6 +391,14 @@ public:
         }
         return static_cast<std::int32_t>(std::ranges::count_if(
             cache_index->entries, [](const CacheEntry& cache_entry) { return cache_entry.block_ref.use_count() > 1; }));
+    }
+
+    // An upper bound: traversal removes pinned entries lazily, and ownership
+    // notifications restore an entry as soon as it becomes unpinned again.
+    // This can overestimate eviction capacity, never underestimate it.
+    std::size_t PotentiallyEvictableEntries(const BlockPool& pool) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        return cache_index == nullptr ? 0 : cache_index->available_order.size();
     }
 
     // Every unpinned entry of one tier, in no particular order. Callers that
@@ -444,25 +521,41 @@ private:
         EvictionOrderMap* available_order{nullptr};
         EvictionOrderMap::node_type pinned_order;
         CacheBlockUniqueObserver unique_observer;
+        CacheEntry* common_peer{nullptr};
     };
 
     struct CacheEntries {
         // Owns each CacheEntry once. The maps are non-owning secondary indices
-        // into stable list nodes. by_eviction_order additionally keeps the
-        // entries sorted by age, so a caller reaches the oldest ones without
-        // visiting the rest; AdmissionPlanner still owns the policy that ranks
-        // entries within one access epoch.
+        // into stable list nodes. available_order keeps eviction candidates
+        // sorted by age; common_order keeps shared keys in source age order.
+        // AdmissionPlanner owns the policy that ranks one access epoch.
         CacheEntryList entries;
         std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
         std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
-        EvictionOrderMap by_eviction_order;
         // Entries known to be pinned are removed lazily during traversal.
         // Ownership notifications restore them without changing their age.
         mutable EvictionOrderMap available_order;
+        // Only the source keeps the order. Entries in both pools point at
+        // each other while their keys coexist; erasing either unlinks them.
+        CacheEntries* common_peer{nullptr};
+        bool common_source{false};
+        EvictionOrderMap common_order;
     };
 
-    static EvictionOrder lastInEpoch(std::uint64_t epoch) noexcept {
-        return EvictionOrder{epoch, std::numeric_limits<std::int32_t>::max(), std::numeric_limits<std::int32_t>::max()};
+    void linkCommonEntry(CacheEntries& cache_index, CacheEntryIterator entry) {
+        if (cache_index.common_peer == nullptr) {
+            return;
+        }
+        CacheEntries& peer = *cache_index.common_peer;
+        const auto other = findEntry(peer, entry->key);
+        if (other == peer.entries.end()) {
+            return;
+        }
+        entry->common_peer = &*other;
+        other->common_peer = &*entry;
+        CacheEntries& source = cache_index.common_source ? cache_index : peer;
+        const auto source_entry = cache_index.common_source ? entry : other;
+        source.common_order.emplace(evictionOrder(*source_entry), source_entry);
     }
 
     static void restoreAvailable(void* context) noexcept {
@@ -497,11 +590,15 @@ private:
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }
-        auto order_node = cache_index.by_eviction_order.extract(evictionOrder(*entry_it));
         auto available_node = cache_index.available_order.extract(evictionOrder(*entry_it));
+        auto common_node = cache_index.common_source && entry_it->common_peer != nullptr
+                               ? cache_index.common_order.extract(evictionOrder(*entry_it))
+                               : EvictionOrderMap::node_type{};
         entry_it->last_access_epoch = access_epoch;
-        order_node.key() = evictionOrder(*entry_it);
-        cache_index.by_eviction_order.insert(std::move(order_node));
+        if (common_node) {
+            common_node.key() = evictionOrder(*entry_it);
+            cache_index.common_order.insert(std::move(common_node));
+        }
         if (available_node) {
             available_node.key() = evictionOrder(*entry_it);
             cache_index.available_order.insert(std::move(available_node));
@@ -544,9 +641,13 @@ private:
         return index_it == cache_index.by_location.end() ? cache_index.entries.end() : index_it->second;
     }
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
+        if (CacheEntry* peer = entry_it->common_peer) {
+            CacheEntries& source = cache_index.common_source ? cache_index : *cache_index.common_peer;
+            source.common_order.erase(evictionOrder(cache_index.common_source ? *entry_it : *peer));
+            peer->common_peer = nullptr;
+        }
         entry_it->unique_observer.Reset();
         cache_index.available_order.erase(evictionOrder(*entry_it));
-        cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());
         cache_index.entries.erase(entry_it);

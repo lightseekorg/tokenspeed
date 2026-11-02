@@ -285,6 +285,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionStats>(m, "DeviceEvictionStats")
         .def_ro("admission", &tokenspeed::CacheCoordinator::DeviceEvictionStats::admission)
         .def_ro("request_reclaim", &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim)
+        .def_ro("request_reclaim_for_write_back",
+                &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim_for_write_back)
         .def_ro("stranded_suffix", &tokenspeed::CacheCoordinator::DeviceEvictionStats::stranded_suffix)
         .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
         .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)

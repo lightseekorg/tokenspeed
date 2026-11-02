@@ -1092,7 +1092,7 @@ def start_expert_load_window(executor) -> None:
 
 
 def arm_data_plane_sync_debug(device: str) -> None:
-    """Arm torch's sync-debug mode for the serving phase when asked to.
+    """Arm torch's sync-debug mode for the serving phase; it cannot be off.
 
     Startup synchronizes on purpose -- weight loading, tuning, graph capture,
     the PD transfer and L2 executor builders, the EPD receive's NCCL
@@ -1103,18 +1103,19 @@ def arm_data_plane_sync_debug(device: str) -> None:
     synchronization that serializes the data plane against the step in
     flight -- ``.cpu()``, ``.item()``, ``.tolist()``, ``bool(tensor)``,
     ``nonzero``, pageable host<->device copies, ``stream.synchronize()``.
+    ``TOKENSPEED_DATA_PLANE_SYNC_DEBUG`` picks whether a report warns or
+    raises.
     """
     mode = envs.TOKENSPEED_DATA_PLANE_SYNC_DEBUG.get()
-    if mode == "default":
-        return
     if mode not in ("warn", "error"):
         raise ValueError(
-            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be default, warn or error, got {mode!r}"
+            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be warn or error, got {mode!r}; "
+            "the data-plane sync check cannot be disabled"
         )
     if torch.device(device).type != "cuda":
-        logger.warning(
-            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG={mode!s} ignored on {device!s}: "
-            "sync-debug mode is a CUDA facility"
+        logger.info(
+            f"Data-plane sync check unavailable on {device!s}: sync-debug mode "
+            "is a CUDA facility"
         )
         return
     torch.cuda.set_sync_debug_mode(mode)

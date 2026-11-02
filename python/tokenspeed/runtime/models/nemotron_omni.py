@@ -60,14 +60,12 @@ from tokenspeed.runtime.models.radio import (
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.encoder_cudagraph import EncoderForwardStepRunner
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
     MultimodalForwardContext,
-    MultimodalInputs,
 )
 
 _RADIO_PREFIX = "vision_model.radio_model.model."
@@ -197,11 +195,6 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
             )
         self.multimodal_embedder = MultimodalEmbedder(encoder_mapping=mapping.vision)
         self.image_encoder = self.get_image_feature
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     def _project_vision(
         self, features: torch.Tensor, grids: list[tuple[int, int]]

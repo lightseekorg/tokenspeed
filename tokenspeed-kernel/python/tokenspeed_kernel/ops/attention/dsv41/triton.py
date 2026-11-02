@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 # (decoded dimensions, quantization group, value bytes, total row bytes,
 #  quantized dimensions). QUANTIZED == D means the whole row is quantized. The
@@ -1324,7 +1325,7 @@ def index_topk(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "PAGES"])
 def _compressor_pool(
     CONTENT,
     SCORES,
@@ -1352,15 +1353,17 @@ def _compressor_pool(
     T3: tl.constexpr,
     O0: tl.constexpr,
     O1: tl.constexpr,
-    PAGES: tl.constexpr,
+    PAGES,
 ):
     row = tl.program_id(0)
     channels = tl.arange(0, 512)
     live = tl.load(ACTIVE + row * A0)
     previous = tl.load(PREVIOUS + row * P0)
-    slot = tl.load(SLOTS + row * S0)
+    slot = tl.load(SLOTS + row * S0).to(tl.int64)
     in_current = live & (previous >= 0) & (previous < N)
-    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES * 2)
+    # Pool capacity changes when startup replaces the probe arena. Widen
+    # before multiplying so a runtime int32 page count cannot wrap the bound.
+    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES.to(tl.int64) * 2)
     old_content = tl.load(CONTENT + previous * C0 + channels * C1, in_current, 0.0)
     old_scores = tl.load(SCORES + previous * G0 + channels * G1, in_current, 0.0)
     tail_offset = slot // 2 * T0 + slot % 2 * T1 + channels * T3
@@ -1477,7 +1480,7 @@ def _rotate_interleaved(value, partner, cosine, sine, odd):
     return tl.where(odd, first + second, first - second)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NP"], do_not_specialize_on_alignment=["POS", "SLOTS"])
 def _swa_rope_insert(
     X,
     W,
@@ -1488,16 +1491,16 @@ def _swa_rope_insert(
     CACHE,
     SLOTS,
     OUT,
-    X0: tl.constexpr,
+    X0,
     X1: tl.constexpr,
     POS0: tl.constexpr,
     CS0: tl.constexpr,
     C0: tl.constexpr,
     S0: tl.constexpr,
-    O0: tl.constexpr,
+    O0,
     O1: tl.constexpr,
     P: tl.constexpr,
-    NP: tl.constexpr,
+    NP,
     MAX_POS: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -1512,7 +1515,9 @@ def _swa_rope_insert(
         position_valid, "SWA RoPE position is outside the cosine/sine table"
     )
     slot = tl.load(SLOTS + token * S0).to(tl.int64)
-    live = (slot >= P) & (slot < NP * P)
+    # Capacity is a runtime bound, not kernel geometry. Promote before the
+    # product to retain the constexpr path's range for large pools.
+    live = (slot >= P) & (slot < NP.to(tl.int64) * P)
     x = tl.load(X + token * X0 + d * X1).to(tl.float32)
     normalized = x
     if HAS_NORM:
@@ -2983,7 +2988,7 @@ def finish_selection(
     Selection width is runtime data; only its power-of-two tile specializes.
     """
     output = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
-    _finish_selection[(indices.shape[0],)](
+    kernel_launcher(_finish_selection, (indices.shape[0],))(
         indices,
         scores,
         lengths,
@@ -3005,6 +3010,7 @@ def finish_selection(
 
 @triton.jit(
     do_not_specialize=["selected_stride", "candidate_stride", "K", "C"],
+    do_not_specialize_on_alignment=["Lengths", "BlockLengths"],
 )
 def _write_selection(
     Selected,
@@ -3047,7 +3053,7 @@ def write_selection(selected, candidates, out):
     rows, lengths, blocks, block_lengths = out
     if selected.shape[0] == 0:
         return
-    _write_selection[(selected.shape[0],)](
+    kernel_launcher(_write_selection, (selected.shape[0],))(
         selected,
         candidates if candidates is not None else selected,
         rows,
@@ -3129,7 +3135,10 @@ def decode_rows(
         )
 
 
-@triton.jit(do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS"])
+@triton.jit(
+    do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS", "SWA_PAGES"],
+    do_not_specialize_on_alignment=["Positions", "Requests", "Write"],
+)
 def _decode_window_kernel(
     Positions,
     Requests,
@@ -3143,7 +3152,7 @@ def _decode_window_kernel(
     TABLE_ROWS,
     PS: tl.constexpr,
     RS: tl.constexpr,
-    SWA_PAGES: tl.constexpr,
+    SWA_PAGES,
 ):
     row = tl.program_id(0)
     pos = tl.load(Positions + row * PS).to(tl.int64)
@@ -3205,7 +3214,10 @@ def decode_window(
         )
 
 
-@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TR", "TC", "TS0", "TS1", "PAGES"],
+    do_not_specialize_on_alignment=["Table", "P", "Req"],
+)
 def _global_slots_kernel(
     Rows,
     P,
@@ -3223,7 +3235,7 @@ def _global_slots_kernel(
     TS0,
     TS1,
     RATIO: tl.constexpr,
-    PAGES: tl.constexpr,
+    PAGES,
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -3273,7 +3285,10 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     return out
 
 
-@triton.jit(do_not_specialize=["N", "TC", "TR", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TC", "TR", "TS0", "TS1"],
+    do_not_specialize_on_alignment=["Table", "P", "Req"],
+)
 def _selection_table_kernel(
     P,
     Req,
@@ -3316,7 +3331,9 @@ def selection_table(positions, requests, table, ratio):
     out = torch.empty((n, table.shape[1]), dtype=torch.int32, device=table.device)
     lengths = torch.empty(n, dtype=torch.int32, device=table.device)
     if n:
-        _selection_table_kernel[(n, max(1, triton.cdiv(table.shape[1], 256)))](
+        kernel_launcher(
+            _selection_table_kernel, (n, max(1, triton.cdiv(table.shape[1], 256)))
+        )(
             positions,
             requests,
             table,
@@ -3334,7 +3351,10 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TR", "TC", "TS0", "TS1", "PAGES"],
+    do_not_specialize_on_alignment=["Table"],
+)
 def _compressor_metadata(
     Positions,
     Requests,
@@ -3354,7 +3374,7 @@ def _compressor_metadata(
     TC,
     TS0,
     TS1,
-    PAGES: tl.constexpr,
+    PAGES,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -3794,18 +3814,19 @@ def _index_select_all(
     ROW_BLOCK: tl.constexpr,
     CANDIDATE_BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     visible = tl.load(Visible + row * LS)
     ids = tl.arange(0, ROW_BLOCK)
     page = tl.load(
         Table + row * TS0 + (ids // 64) * TS1, (ids < K) & (ids // 64 < TC), other=-1
     )
     valid = (ids < K) & (ids < visible) & (page > 0) & (page < PAGES)
-    selected = tl.sort(tl.where(valid, ids, 2147483647))
-    tl.store(
-        Rows + row * K + ids, tl.where(selected == 2147483647, -1, selected), ids < K
-    )
-    tl.store(Lengths + row, tl.sum(valid.to(tl.int32)))
+    # Logical IDs are already ordered; compact holes without sorting them.
+    prefix = tl.cumsum(valid.to(tl.int32))
+    length = tl.sum(valid.to(tl.int32))
+    tl.store(Rows + row * K + prefix - 1, ids, valid)
+    tl.store(Rows + row * K + ids, -1, (ids < K) & (ids >= length))
+    tl.store(Lengths + row, length)
     count = tl.full((), 0, tl.int32)
     if C:
         candidate_ids = tl.arange(0, CANDIDATE_BLOCK)
@@ -3829,6 +3850,10 @@ def _index_select_all(
             tl.where(candidate_selected == 2147483647, -1, candidate_selected),
             candidate_ids < C,
         )
+        # Visible rows fit K; the larger candidate destination only needs padding.
+        for start in range(CANDIDATE_BLOCK, C, 1024):
+            padding = start + tl.arange(0, 1024)
+            tl.store(Blocks + row * C + padding, -1, padding < C)
         count = tl.sum(candidate_valid.to(tl.int32))
     tl.store(BlockLengths + row, count)
 
@@ -3874,7 +3899,7 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
             out[2].shape[1],
             candidate_block_size,
             triton.next_power_of_2(out[0].shape[1]),
-            triton.next_power_of_2(max(1, out[2].shape[1])),
+            triton.next_power_of_2(triton.cdiv(out[0].shape[1], candidate_block_size)),
             num_warps=4,
         )
     return out
@@ -4342,3 +4367,18 @@ def compact_slots(slots, lengths):
             BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
         )
     return out, counts
+
+
+# Candidate budgets vary with history and are bounded by 2048 in _index_topk_outputs.
+_SELECTION_BLOCKS = tuple(1 << bit for bit in range(12))
+register_triton_warmup(
+    _finish_selection,
+    variants=lambda args: () if args["POSITION_SORT"] else ({"B": _SELECTION_BLOCKS},),
+)
+register_triton_warmup(
+    _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
+)
+register_triton_warmup(
+    _selection_table_kernel,
+    variants=lambda args: ({"RATIO": tuple(sorted({1, args["RATIO"]}))},),
+)

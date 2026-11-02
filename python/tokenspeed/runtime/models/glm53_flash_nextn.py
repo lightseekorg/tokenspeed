@@ -146,7 +146,6 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
     ) -> None:
         super().__init__()
         del prefix
-        self.vl_config = config
         self.config = config.text_config
         self.mapping = mapping
         self.quant_config = quant_config

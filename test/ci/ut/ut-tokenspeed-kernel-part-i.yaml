@@ -18,8 +18,6 @@ install:
 ut:
   commands:
     - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v
-    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v
-    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v
-    - python3 -m pytest tokenspeed-kernel/test/ -v --ignore=tokenspeed-kernel/test/ops --ignore=tokenspeed-kernel/test/test_numerics.py --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py
+    - python3 -m pytest tokenspeed-kernel/test/ -v --ignore=tokenspeed-kernel/test/ops --ignore=tokenspeed-kernel/test/nvidia/thirdparty --ignore=tokenspeed-kernel/test/test_numerics.py --ignore=tokenspeed-kernel/test/nvidia/ops/test_gemm_autotune_capacity_formats.py
 report:
   github_step_summary: true

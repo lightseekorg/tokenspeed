@@ -20,11 +20,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "cache/allocator/group_allocator.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/prefix_hasher.h"
@@ -326,6 +328,53 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
     CacheBlockRef again = table.EvictToNull(0);
     EXPECT_FALSE(again);  // empty on already-null
     EXPECT_FALSE(table.Blocks()[0]);
+}
+
+TEST(GroupAllocatorTest, ExpiredSlotBoundIncludesEveryReclaimableBlock) {
+    BlockPool pool(6, {1});
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    PrefixCacheIndex index(/*group_id=*/0);
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(0, 6);
+    ASSERT_EQ(blocks.size(), 6u);
+    for (const std::int32_t slot : {2, 4}) {
+        index.Register(pool, blocks[slot], CacheKey{.content_hash = std::to_string(slot)}, /*access_epoch=*/1, slot,
+                       CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+    }
+    BlockTable table = BlockTable::FromBlocks(std::move(blocks), /*available_tokens=*/0);
+    allocator.ReclaimExpired(pool, table, 1);
+    table.EvictToNull(1).reset();
+    CacheBlockRef cached_pin = table.Blocks()[2];
+    CacheBlockRef uncached_pin = table.Blocks()[3];
+
+    for (const bool pinned : {true, false}) {
+        SCOPED_TRACE(pinned);
+        if (!pinned) {
+            cached_pin.reset();
+            uncached_pin.reset();
+        }
+        for (const std::int32_t expired : {0, 1, 2, 3, 4, 5, 6, 10}) {
+            SCOPED_TRACE(expired);
+            std::vector<CacheBlockLocation> expected;
+            std::int32_t cached = 0;
+            for (std::int32_t slot = pinned ? 4 : 2; slot < std::min(expired, 6); ++slot) {
+                expected.push_back(table.Blocks()[slot]->Location());
+                cached += slot == 2 || slot == 4;
+            }
+            EXPECT_EQ(allocator.ReclaimableBlockLocationsAt(index, table, expired), expected);
+            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired, /*count_uncached=*/true), expected.size());
+            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired, /*count_uncached=*/false), cached);
+            const auto slots = allocator.ExpiredBlockSlotsAt(table, expired);
+            EXPECT_EQ(slots.size(), std::max(std::min(expired, 6) - 1, 0));
+            EXPECT_GE(slots.size(), expected.size());
+        }
+    }
+    allocator.ReclaimExpired(pool, table, 5);
+    EXPECT_TRUE(allocator.ExpiredBlockSlotsAt(table, 3).empty());
+    EXPECT_TRUE(allocator.ReclaimableBlockLocationsAt(index, table, 3).empty());
+    EXPECT_EQ(allocator.ReclaimableBlockLocationsAt(index, table, 10), std::vector{table.Blocks()[5]->Location()});
+    allocator.ReclaimExpired(pool, table, 10);
+    EXPECT_TRUE(allocator.ExpiredBlockSlotsAt(table, 10).empty());
+    EXPECT_TRUE(allocator.ReclaimableBlockLocationsAt(index, table, 10).empty());
 }
 
 TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {

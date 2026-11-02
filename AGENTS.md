@@ -205,14 +205,19 @@ Inside the root `tokenspeed-kernel/` directory:
   widths, split counts computed from the batch size), must be runtime
   arguments, or be bucketed first (such as `next_power_of_2`) when the kernel
   needs a compile-time bound. The same holds for template arguments of other
-  JITs such as DeepGEMM. Reviews should check every new or changed kernel
-  signature and launch site for this. Kernels should have tests to guard
-  against excessive scalar parameter specialization with
-  `assert_no_triton_compile` from `test/utils.py`. Tensor parameters need no
-  such test. At runtime, `tokenspeed_kernel.compile_monitor` logs every
-  Triton compilation after startup and names a parameter that keeps taking
-  new values. CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
-  parameter fails the model tests.
+  JITs such as DeepGEMM, for static CuTe DSL tensor dimensions, and for the
+  key under which a caller caches a `cute.compile` result, which must hold
+  only what the kernel specializes on. Call CuTe DSL kernels through their
+  compiled functions; a direct `@cute.jit` call traces on every call. Reviews
+  should check every new or changed kernel signature and launch site for this.
+  Kernels should have tests to guard against excessive scalar parameter
+  specialization with `assert_no_triton_compile` or `assert_no_cute_compile`
+  from `test/utils.py`. Triton tensor parameters need no such test. At runtime,
+  `tokenspeed_kernel.compile_monitor` logs every Triton and CuTe DSL
+  compilation after startup and names a parameter that keeps taking new
+  values, a call site that keeps recompiling known specializations, and a
+  direct `@cute.jit` call. CI serves with
+  `TOKENSPEED_JIT_COMPILE_CHECK=error`, so any of these fails the model tests.
 * Integer offsets into global memory must not overflow int32. Compute in
   int64 every offset whose bound grows with a runtime count: a token,
   request, page, slot, or expert index times a stride, or a product of sizes

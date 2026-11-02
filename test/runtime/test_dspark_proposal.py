@@ -27,6 +27,7 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     """A DSpark drafter shell carrying only the proposal state."""
     drafter = DSpark.__new__(DSpark)
     drafter.spec_num_tokens = spec_num_tokens
+    drafter.lm_head = None
     torch.manual_seed(0)
     head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
     drafter.markov_head = head

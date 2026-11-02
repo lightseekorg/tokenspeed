@@ -483,6 +483,7 @@ def _super_cache_recipe(
             speculative_draft_tree=with_draft and topk > 1,
             enable_replay_ssm=with_draft,
             kv_offload_config=None,
+            mamba_ssm_dtype="float32",
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=SimpleNamespace()),

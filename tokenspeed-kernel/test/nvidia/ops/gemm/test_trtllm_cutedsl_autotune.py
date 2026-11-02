@@ -280,6 +280,59 @@ def test_loaded_tactics_compile_lazily_and_match_hybrid_buckets(tmp_path, monkey
 
 
 @torch.inference_mode()
+def test_startup_warmup_compiles_every_servable_tactic(tmp_path, monkeypatch):
+    """After startup warmup, no token count compiles while serving."""
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
+    from utils import assert_no_cute_compile
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    monkeypatch.setattr(launcher, "_compiled", {})
+    monkeypatch.setattr(launcher, "_max_active_clusters", {})
+    monkeypatch.setattr(runner_module, "_warmed_shapes", set())
+    device = torch.cuda.current_device()
+    extras = (*runner_module._CACHE_EXTRAS, device)
+    # A loaded cache whose tactics startup's own token counts never launch.
+    tuned = {768: (True, (128, 128), (2, 1)), 8192: (True, (128, 128), (2, 2))}
+    configs = {}
+    for bucket, tactic in tuned.items():
+        shapes = ((bucket, 256), (384, 256), (bucket, 2), (3, 2), (bucket, 384))
+        key = str(
+            ("trtllm_cutedsl_fp8_blockscale", "BlockwiseGemmRunner", shapes, extras)
+        )
+        configs[key] = ["BlockwiseGemmRunner", tactic]
+    path = tmp_path / "startup-configs.json"
+    path.write_text(json.dumps(configs))
+    assert load_autotune_cache(str(path), None, 0)
+
+    with kernel_warmup(enabled=True):
+        warmup = _inputs(16, 384, 256)
+        torch.testing.assert_close(
+            _mm(warmup), _reference(warmup), atol=1e-4, rtol=1e-2
+        )
+    assert {tactic for _, tactic in launcher._compiled} == {
+        *launcher.DEFAULT_TACTICS,
+        *tuned.values(),
+    }
+    # One occupancy query per cluster size, not per compiled tactic.
+    assert launcher._max_active_clusters.keys() == {
+        (device, 1),
+        (device, 2),
+        (device, 4),
+    }
+    with assert_no_cute_compile():
+        for m in (1, 100, 300, 700, 800, 5000, 8193):
+            inputs = _inputs(m, 384, 256)
+            torch.testing.assert_close(
+                _mm(inputs), _reference(inputs), atol=1e-4, rtol=1e-2
+            )
+    tuner.clear_cache()
+
+
+@torch.inference_mode()
 def test_nearest_tactic_from_in_memory_cache(monkeypatch):
     """Nearest-M reuse also works before the tuning cache is saved."""
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module

@@ -158,6 +158,7 @@ class GreedySamplingBackend(SamplingBackend):
     flashinfer is unavailable."""
 
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
+    _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:

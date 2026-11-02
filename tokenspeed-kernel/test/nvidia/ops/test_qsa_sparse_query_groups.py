@@ -341,7 +341,8 @@ def test_qsa_startup_respects_kernel_override(device, monkeypatch, override_sour
     assert not qsa_sparse._WARMED
 
 
-@pytest.mark.parametrize("override_source", ["context", "environment", "callsite"])
+# Context and environment overrides resolve alike; the test above checks context.
+@pytest.mark.parametrize("override_source", ["environment", "callsite"])
 def test_qsa_startup_warms_override_with_conflicting_solution(
     device, monkeypatch, override_source
 ):

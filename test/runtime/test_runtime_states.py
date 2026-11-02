@@ -147,6 +147,23 @@ def test_reset_states_does_not_synchronize_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_remote_candidate_landing_does_not_synchronize_cuda():
+    # A PD decode destination lands each remote prefill's candidates on the
+    # forward thread, while a step may be in flight.
+    states = RuntimeStates(4, 32, 3, "cuda")
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        states.write_remote_spec_candidate_ids(2, [5, 6, 7])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    torch.cuda.synchronize()
+    assert states.future_input_map[2].tolist() == [5, 6, 7]
+    assert states.spec_candidates_ready.tolist() == [i == 2 for i in range(5)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_reset_states_graph_replay_uses_current_inputs():
     states = RuntimeStates(4, 32, 2, "cuda")
     indices = torch.tensor([1, 3], dtype=torch.int64, device="cuda")

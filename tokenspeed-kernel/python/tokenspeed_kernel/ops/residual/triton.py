@@ -39,6 +39,7 @@ from tokenspeed_kernel.signature import (
     format_signature,
     format_signatures,
 )
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _MIX_SIGNATURES = format_signatures(
@@ -1360,7 +1361,9 @@ def mhc_prefill_project_hc4(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"], do_not_specialize_on_alignment=["n_splits"]
+)
 def _mhc_pre_mix_hc4_kernel(
     gemm_out_mul,
     gemm_out_sqrsum,
@@ -1373,8 +1376,8 @@ def _mhc_pre_mix_hc4_kernel(
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
-    # The split count follows the batch's token count; a runtime loop bound
-    # keeps one binary per kernel (the partials are summed in the same order).
+    # Keep the single-split fast path; other batch-derived split counts share
+    # one runtime loop, with partials summed in the same order.
     n_splits,
     num_tokens,
 ):
@@ -1470,7 +1473,7 @@ def mhc_pre_mix_hc4(
     Returns:
         None. The three output buffers are written in place.
     """
-    _mhc_pre_mix_hc4_kernel[(num_tokens,)](
+    kernel_launcher(_mhc_pre_mix_hc4_kernel, (num_tokens,))(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
@@ -2016,3 +2019,7 @@ def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps
             enable_fp_fusion=False,
         )
     return out
+
+
+# Preserve the fast single-split specialization; all other counts share a key.
+register_triton_warmup(_mhc_pre_mix_hc4_kernel, variants=({"n_splits": (1, 2)},))

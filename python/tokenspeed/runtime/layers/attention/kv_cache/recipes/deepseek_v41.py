@@ -99,7 +99,7 @@ class DeepseekV41Recipe(CacheRecipe):
     def dspark_stages(self) -> int:
         """Number of same-checkpoint DSpark draft stages, 0 without DSpark."""
         if (
-            getattr(self.server_args, "speculative_algorithm", None) != "DSPARK"
+            self.server_args.speculative_algorithm != "DSPARK"
             or self.draft_model_config is None
             or self.draft_attn_config is not None
         ):

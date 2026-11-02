@@ -314,6 +314,7 @@ def test_device_evictions_count_a_requests_own_reclaim_apart():
     evictions = stats.device_evictions
     # Each State group's released checkpoint at 4.
     assert evictions.request_reclaim.blocks == 3
+    assert evictions.request_reclaim_for_write_back == 0  # No Host write-back policy.
     assert evictions.admission.blocks == 0
     assert evictions.stranded_suffix.blocks == 0
 

@@ -82,8 +82,25 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        for (const CacheBlockRef& block_ref : table.Blocks()) {
-            ids.push_back(block_ref ? ResolveCacheBlockId(*block_ref) : 0);
+        ids.resize(static_cast<std::size_t>(table.ReclaimedPrefixBlocks()), 0);
+        const BlockPool* previous_pool = nullptr;
+        std::int32_t previous_parent = 0;
+        std::int32_t parent_base = 0;
+        for (const CacheBlockRef& block_ref : table.Blocks().subspan(table.ReclaimedPrefixBlocks())) {
+            if (!block_ref) {
+                ids.push_back(0);
+                continue;
+            }
+            const CacheBlock& block = *block_ref;
+            const CacheBlockLocation location = block.Location();
+            // Adjacent slots often share a parent. Its group and packing
+            // cannot change while these references keep it occupied.
+            if (&block.OwnerPool() != previous_pool || location.lcm_block_id != previous_parent) {
+                parent_base = ResolveCacheBlockId(block) - location.slot_index;
+                previous_pool = &block.OwnerPool();
+                previous_parent = location.lcm_block_id;
+            }
+            ids.push_back(parent_base + location.slot_index);
         }
         return ids;
     }
@@ -324,13 +341,20 @@ public:
         table.reclaimed_prefix_blocks_ = std::max(table.reclaimed_prefix_blocks_, expired);
     }
 
+    // Unreclaimed slots below the retention frontier, including null holes
+    // and shared blocks. The size is an optimistic reclaim bound; the actual
+    // candidates must come from this same range and pass the ownership check.
+    std::span<const CacheBlockRef> ExpiredBlockSlotsAt(const BlockTable& table, std::int32_t num_expired_blocks) const {
+        const std::int32_t first = table.ReclaimedPrefixBlocks();
+        const std::int32_t count = std::max(std::min(num_expired_blocks, table.NumBlocks()) - first, 0);
+        return table.Blocks().subspan(first, count);
+    }
+
     // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
     std::int32_t BlocksReclaimableAt(const PrefixCacheIndex& index, const BlockTable& table,
                                      std::int32_t num_expired_blocks, bool count_uncached) const {
-        const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::int32_t freed = 0;
-        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
-            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+        for (const CacheBlockRef& block : ExpiredBlockSlotsAt(table, num_expired_blocks)) {
             if (!block) {
                 continue;
             }
@@ -345,10 +369,8 @@ public:
 
     std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const PrefixCacheIndex& index, const BlockTable& table,
                                                                 std::int32_t num_expired_blocks) const {
-        const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::vector<CacheBlockLocation> locations;
-        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
-            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+        for (const CacheBlockRef& block : ExpiredBlockSlotsAt(table, num_expired_blocks)) {
             if (!block) {
                 continue;
             }

@@ -1349,6 +1349,7 @@ class TestKimiK3RegistrationTests:
         torch.nn.Module.__init__(attention)
 
         attention.qkv_parallel = None
+        attention.fused_qkv_a_proj_with_mqa = None
         assert not (attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 
     def test_resolve_architecture_returns_registered_name(self):

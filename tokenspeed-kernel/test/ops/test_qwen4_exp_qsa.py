@@ -675,6 +675,56 @@ def test_qwen4_exp_qsa_recent_write_matches_torch(device: str) -> None:
         torch.testing.assert_close(position_cache, expected_positions)
 
 
+@pytest.mark.parametrize("rows", [64, 67, 128, 131])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_qwen4_exp_qsa_recent_write_preserves_each_page(
+    device: str, rows: int, masked: bool, enable_pdl: bool
+) -> None:
+    ratio, head_dim, page_size = 4, 8, 64
+    logical = torch.arange(rows, device=device, dtype=torch.int64)
+    requests = torch.zeros_like(logical)
+    page_ids = torch.tensor([3, 1, 4], device=device, dtype=torch.int64)
+    recent_locs = (page_ids[logical // page_size] * page_size + logical % page_size).to(
+        torch.int32
+    )
+    token_k = (
+        torch.arange(rows * head_dim, device=device, dtype=torch.float32)
+        .reshape(rows, 1, head_dim)
+        .to(torch.bfloat16)
+    )
+    positions = torch.stack((logical, logical + 1000, logical + 2000), dim=1)
+    valid_rows = rows - 2 if masked else rows
+    write_mask = logical < valid_rows if masked else None
+    raw = torch.full((5, ratio, 1, head_dim), -1, device=device, dtype=torch.bfloat16)
+    position_cache = torch.full((5, 3), -1, device=device, dtype=torch.int64)
+    expected_raw, expected_positions = raw.clone(), position_cache.clone()
+    # A later page has a separate ring. Each completed page must retain its
+    # own last rows so a checkpoint at that page boundary can resume.
+    for page_number, page in enumerate((3, 1, 4)):
+        start = page_number * page_size
+        stop = min(start + page_size, valid_rows)
+        for row in range(max(start, stop - ratio), stop):
+            expected_raw[page, row % ratio] = token_k[row]
+            if row % ratio == 0:
+                expected_positions[page] = positions[row]
+    qwen4_exp_qsa_recent_write(
+        token_k,
+        logical,
+        requests,
+        recent_locs,
+        positions,
+        raw,
+        position_cache,
+        page_size,
+        ratio,
+        write_mask=write_mask,
+        enable_pdl=enable_pdl,
+    )
+    torch.testing.assert_close(raw, expected_raw, atol=0, rtol=0)
+    torch.testing.assert_close(position_cache, expected_positions, atol=0, rtol=0)
+
+
 def test_qwen4_exp_qsa_recent_write_honors_explicit_mask(device: str) -> None:
     ratio, head_dim, recent_page_size = 4, 8, 64
     logical = torch.tensor([0, 1], device=device)

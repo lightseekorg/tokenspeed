@@ -303,14 +303,18 @@ synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
 the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
-copies and an event the commit waits on. Torch's sync-debug mode enforces this
-rule, and `HostBootstrap.enter_serving` arms it once the rank finished
+copies and an event the commit waits on; host-built metadata goes the other
+way through `host_to_device` (`utils/host_sync.py`), a non-blocking copy from
+contiguous pinned memory. Torch's sync-debug mode enforces this
+rule, and `HostBootstrap.enter_serving` always arms it once the rank finished
 startup and the frontend handshake (weight loading, tuning, capture, the
-transfer and L2 builders all synchronize on purpose):
-`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
-Python location, `error` raises there. CI runs the serving paths with
-`error`; the commit's event wait and the non-blocking copies pass
-unflagged, so a report is always a real stall.
+transfer and L2 builders all synchronize on purpose); there is no switch to
+leave it off. `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` (the default) reports
+each offending site with its Python location, `error` raises there. CI
+serves every `server_smoke`, `eval`, and `perf` task with `error`, which a
+task cannot relax; the commit's event wait and the non-blocking copies pass
+unflagged, so a report is always a real stall. A deliberate wait off the
+per-round path is wrapped in `allow_host_sync` (`utils/host_sync.py`).
 
 One named exception: a drafter may leave its round pending after the forward
 (`BaseDrafter.finish_round`) and finish it in the next forward's `settle`,
@@ -330,18 +334,21 @@ compile-cache key. Startup compiles on purpose (graph capture, tuning), so
 the bootstrap installs `tokenspeed_kernel.compile_monitor` before building
 anything and `enter_serving` marks the end of startup right after arming the
 sync-debug mode; an encode rank marks it once it reported ready. From then
-on the monitor logs every Triton compilation with its duration and cause and
-reports by name any compile-time kernel parameter that keeps taking new
-values from one call site -- a per-batch value passed as `tl.constexpr`;
-each commit reports the compilation counts and durations, which the control
-plane exports as `tokenspeed:jit_serving_compiles` /
-`tokenspeed:jit_serving_compile_seconds`. `TOKENSPEED_JIT_COMPILE_CHECK=error`
-raises there instead, and CI serving jobs run with it.
+on the monitor logs every Triton and CuTe DSL compilation with its duration
+and cause and reports by name any compile-time kernel parameter that keeps
+taking new values from one call site (a per-batch value passed as
+`tl.constexpr` or as a static CuTe DSL dimension), a call site that keeps
+recompiling specializations the kernel already has, and a direct `@cute.jit`
+call, which traces the kernel in Python on every call; each commit reports
+the compilation counts and durations, which the control plane exports as
+`tokenspeed:jit_serving_compiles` / `tokenspeed:jit_serving_compile_seconds`.
+`TOKENSPEED_JIT_COMPILE_CHECK=error` raises there instead, and CI serving
+jobs run with it.
 The same mark closes the kernel package's compile switch
 (`compile_monitor.is_serving()`), installed monitor or not. A kernel whose
-library compiles once per batch shape outside Triton -- FlashInfer's joint BF16
-GEMM and the ll_bf16 router's dot-product kernel compile once per exact row
-count -- runs only before it:
+library compiles once per batch shape with no key to bucket -- FlashInfer's
+joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
+exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
 compiles instead of compiling on the forward thread.
 
@@ -356,10 +363,11 @@ JIT mark: it collects once, freezes the survivors (`gc.freeze`: no later
 collection walks them) and raises the generation-2 threshold far enough that
 CPython does not start full collections by itself. The data plane's
 `GcHooks` runs one on the forward thread every `FULL_COLLECTION_INTERVAL`
-forwarded rounds, a count that is the
-same on every rank, so the ranks collect in the same round and each
-collection walks only what serving keeps alive. The young generations still
-collect automatically.
+forwarded rounds, a count that is the same on every rank, so the ranks
+collect in the same round and each collection walks only what serving keeps
+alive. An EPD encode rank does the same and counts its vision-tower batches,
+which every rank of its attention-TP group forms alike. The young
+generations still collect automatically.
 
 ### Profiling the issuing thread
 

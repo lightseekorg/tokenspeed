@@ -42,7 +42,6 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.utils import get_layer_id
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3_audio import Qwen3AudioEncoder
 from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
@@ -50,7 +49,6 @@ from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
     EncoderForwardStepRunner,
@@ -59,7 +57,6 @@ from tokenspeed.runtime.multimodal.encoder_cudagraph import (
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils.env import envs
 
@@ -241,11 +238,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             )
         split = self.config.hidden_size
         return embedding[:, :split], embedding[:, split:]
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     def pre_encode(
         self, items: list[MultimodalDataItem]
@@ -471,13 +463,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                     loaded.add(f"audio_tower.{loaded_name}")
                 continue
 
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and not self.model.start_layer <= layer_id < self.model.end_layer
-            ):
-                continue
             if "rotary_emb" in name:
                 continue
             if self.config.tie_word_embeddings and name == "lm_head.weight":

@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -64,7 +65,10 @@ struct CacheKey {
 };
 
 struct CacheKeyHash {
-    std::size_t operator()(const CacheKey& key) const noexcept {
+    // Hashing the content digest is not a cheap integer operation. Without
+    // noexcept, libstdc++ retains each node's hash instead of recomputing it
+    // while traversing a bucket or erasing an entry.
+    std::size_t operator()(const CacheKey& key) const {
         std::size_t hash = std::hash<CacheNamespaceId>{}(key.namespace_id);
         const std::size_t group_hash = std::hash<std::uint32_t>{}(key.group_id);
         hash ^= group_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
@@ -74,6 +78,12 @@ struct CacheKeyHash {
         return hash ^ (offset_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
     }
 };
+
+// Immutable keys expanded for one prompt and one coordinator's group geometry.
+// These carry no residency or ownership information; every retry still probes
+// the current cache indexes. Sharing keeps a pending probe valid when its
+// request drops the prepared keys after successful admission.
+using PreparedPrefixKeys = std::shared_ptr<const std::vector<std::vector<CacheKey>>>;
 
 struct CacheGroupSpec {
     AttnKind attn_kind{AttnKind::kFull};

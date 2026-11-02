@@ -53,6 +53,9 @@ pub struct ForwardResult {
     /// The tokens' logprobs in the same layout; `None` when the forward
     /// computed none.
     pub output_logprobs: Option<Vec<f64>>,
+    /// Selected tokens' cumulative probability mass in the same layout;
+    /// `None` when the diagnostic is disabled.
+    pub output_token_cumulative_probs: Option<Vec<f64>>,
     /// Per-row NaN-guard flags; `None` with the guard off.
     pub nan_flags: Option<Vec<i32>>,
     /// P role: each row's sampled token and the drafter's candidates, the
@@ -109,7 +112,8 @@ pub struct LogprobPlan {
 impl ForwardResult {
     /// The result as a pipeline's last stage shares it. The top-k
     /// alternatives are not shared: the ingress refuses them under pipeline
-    /// parallelism.
+    /// parallelism. Nor are the cumulative probabilities: the engine refuses
+    /// that diagnostic under pipeline parallelism.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Writer::new();
         out.i32s(&self.output_tokens);
@@ -145,6 +149,8 @@ impl ForwardResult {
             output_tokens,
             output_lengths,
             output_logprobs,
+            // Not shared: the engine refuses the diagnostic under a pipeline.
+            output_token_cumulative_probs: None,
             nan_flags,
             next_input_ids,
             serving_compiles: None,
@@ -259,6 +265,9 @@ pub struct StreamedOutput {
     pub cached_tokens: i64,
     /// Logprobs of `output_ids`; empty when not requested.
     pub output_logprobs: Vec<f64>,
+    /// Cumulative probability mass of `output_ids`; empty without diagnostics
+    /// or when the request did not ask for logprobs.
+    pub output_token_cumulative_probs: Vec<f64>,
     /// The finish reason in full once the request ended.
     pub finish_details: Option<FinishDetails>,
     /// With speculative decoding: verify rounds so far, and once finished
@@ -324,6 +333,16 @@ pub enum CommitError {
     Shape {
         /// Rows in the batch.
         rows: usize,
+        /// The mismatched column.
+        column: &'static str,
+        /// Its length.
+        found: usize,
+    },
+    /// A per-token diagnostic column does not match the sampled tokens.
+    #[error("forward result has {tokens} tokens but {found} {column}")]
+    TokenColumn {
+        /// Tokens in the result.
+        tokens: usize,
         /// The mismatched column.
         column: &'static str,
         /// Its length.
@@ -954,6 +973,15 @@ impl OutputProcessor {
         if let Some(flags) = &result.nan_flags {
             check("nan_flags", flags.len())?;
         }
+        if let Some(probs) = &result.output_token_cumulative_probs {
+            if probs.len() != result.output_tokens.len() {
+                return Err(CommitError::TokenColumn {
+                    tokens: result.output_tokens.len(),
+                    column: "output_token_cumulative_probs",
+                    found: probs.len(),
+                });
+            }
+        }
 
         // The request stats' clock: a decode step lasts from the previous
         // commit, and a round with prefill rows interrupts the decodes in it.
@@ -994,6 +1022,10 @@ impl OutputProcessor {
                 .output_logprobs
                 .as_ref()
                 .map(|lps| window(lps, pt, output_length));
+            let mut model_cumulative_probs = result
+                .output_token_cumulative_probs
+                .as_ref()
+                .map(|probs| window(probs, pt, output_length));
             let is_decode = i >= batch.num_extends;
             // The prefill rows' sampled-token alternatives, in prefill output
             // order.
@@ -1079,6 +1111,9 @@ impl OutputProcessor {
                 if let Some(lps) = model_logprobs.as_mut() {
                     lps.truncate(1);
                 }
+                if let Some(probs) = model_cumulative_probs.as_mut() {
+                    probs.truncate(1);
+                }
                 tracing::warn!(rid, "request terminated: NaN detected in logits");
             }
             if is_decode && self.spec_num_tokens.is_some() {
@@ -1119,6 +1154,20 @@ impl OutputProcessor {
                 if state.return_logprob {
                     if let Some(lp) = model_logprobs.as_ref().and_then(|lps| lps.get(j)) {
                         state.output_logprobs.push(*lp);
+                    }
+                    if let Some(prob) = model_cumulative_probs
+                        .as_ref()
+                        .and_then(|probs| probs.get(j))
+                    {
+                        // The column stays indexed like `output_ids`: an
+                        // earlier token that came without a value (a remote
+                        // prefill's bootstrap token) keeps its place as NaN.
+                        let before = state.output_ids.len() - 1;
+                        state.output_token_cumulative_probs.resize(
+                            before.max(state.output_token_cumulative_probs.len()),
+                            f64::NAN,
+                        );
+                        state.output_token_cumulative_probs.push(*prob);
                     }
                 }
                 let finished_before = state.finished();
@@ -1272,6 +1321,21 @@ impl OutputProcessor {
             } else {
                 Vec::new()
             };
+            // Indexed like `output_ids` (see the commit), so the new tokens'
+            // values start where theirs do. Once the request has any value,
+            // every output carries one per token, NaN where none arrived, so
+            // the column never misaligns with the tokens.
+            let output_token_cumulative_probs =
+                if state.return_logprob && !state.output_token_cumulative_probs.is_empty() {
+                    let mut values = state
+                        .output_token_cumulative_probs
+                        .get(sent..)
+                        .map_or_else(Vec::new, <[f64]>::to_vec);
+                    values.resize(n_new, f64::NAN);
+                    values
+                } else {
+                    Vec::new()
+                };
             // Prompt logprobs ship once, in the first output after the
             // prompt's final chunk committed.
             let input_logprobs = if state.input_logprobs_sent {
@@ -1294,6 +1358,7 @@ impl OutputProcessor {
                 completion_tokens: state.output_ids.len() as i64,
                 cached_tokens: state.cached_tokens,
                 output_logprobs,
+                output_token_cumulative_probs,
                 finish_details: state.finished_reason.as_ref().map(FinishReason::details),
                 spec: self
                     .spec_num_tokens
@@ -1330,6 +1395,7 @@ mod tests {
             output_tokens: tokens.to_vec(),
             output_lengths: lengths.to_vec(),
             output_logprobs: None,
+            output_token_cumulative_probs: None,
             nan_flags: None,
             next_input_ids: None,
             serving_compiles: None,
@@ -1658,6 +1724,45 @@ mod tests {
     }
 
     #[test]
+    fn a_bootstrap_token_without_a_cumulative_probability_keeps_the_column_aligned() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG);
+        register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
+        // The prefill node sends the first token's logprob, but no cumulative
+        // probability.
+        p.remote_prefill_done("r", 9, 0, Some(-0.25));
+        let decode = ForwardResult {
+            output_logprobs: Some(vec![-0.5]),
+            output_token_cumulative_probs: Some(vec![0.375]),
+            ..result(&[10], &[1])
+        };
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 3)], 0), None, &decode)
+            .unwrap();
+        let output = &c.outputs[0];
+        assert_eq!(output.output_ids, [9, 10]);
+        assert_eq!(output.output_logprobs, [-0.25, -0.5]);
+        // One value per token: the bootstrap token's place holds NaN.
+        let probs = &output.output_token_cumulative_probs;
+        assert_eq!(probs.len(), 2);
+        assert!(probs[0].is_nan());
+        assert_eq!(probs[1], 0.375);
+        // The next output starts at the next token.
+        let c = p
+            .commit(
+                &batch(&[("r", 1, 0, 3)], 0),
+                None,
+                &ForwardResult {
+                    output_logprobs: Some(vec![-0.75]),
+                    output_token_cumulative_probs: Some(vec![0.625]),
+                    ..result(&[11], &[1])
+                },
+            )
+            .unwrap();
+        assert_eq!(c.outputs[0].output_ids, [11]);
+        assert_eq!(c.outputs[0].output_token_cumulative_probs, [0.625]);
+    }
+
+    #[test]
     fn the_prefill_role_ships_its_prompt_logprobs_with_its_final_output() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, true);
@@ -1970,5 +2075,102 @@ mod tests {
             .commit(&batch(&[("r", 1, 0, 1)], 1), None, &first)
             .unwrap();
         assert_eq!(c.outputs[0].output_logprobs, [-0.25]);
+    }
+
+    #[test]
+    fn cumulative_probabilities_follow_streamed_tokens_and_logprob_requests() {
+        let mut p = processor(None);
+        for (rid, logprobs) in [("scored", true), ("plain", false)] {
+            p.register(
+                rid.to_owned(),
+                RequestState::new(vec![0], 4, BTreeSet::new(), true, Some(2), logprobs),
+            );
+        }
+        for (step, token) in [5, 6, 7, 8].into_iter().enumerate() {
+            let mut forward = result(&[token, token + 10], &[1, 1]);
+            forward.output_logprobs = Some(vec![-(token as f64), -10.0]);
+            forward.output_token_cumulative_probs = Some(vec![token as f64 / 10.0, 0.9]);
+            let c = p
+                .commit(
+                    &batch(
+                        &[("scored", 1, 0, 1), ("plain", 1, 0, 1)],
+                        if step == 0 { 2 } else { 0 },
+                    ),
+                    None,
+                    &forward,
+                )
+                .unwrap();
+            if step == 1 {
+                assert!(c.outputs.is_empty());
+                continue;
+            }
+            let scored = c
+                .outputs
+                .iter()
+                .find(|output| output.rid == "scored")
+                .unwrap();
+            let expected = match step {
+                0 => vec![5],
+                2 => vec![6, 7],
+                _ => vec![8],
+            };
+            assert_eq!(scored.output_ids, expected);
+            assert_eq!(
+                scored.output_logprobs,
+                expected.iter().map(|&id| -(id as f64)).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                scored.output_token_cumulative_probs,
+                expected
+                    .iter()
+                    .map(|&id| id as f64 / 10.0)
+                    .collect::<Vec<_>>()
+            );
+            let plain = c
+                .outputs
+                .iter()
+                .find(|output| output.rid == "plain")
+                .unwrap();
+            assert!(plain.output_logprobs.is_empty());
+            assert!(plain.output_token_cumulative_probs.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_stop_token_cuts_cumulative_probabilities_with_its_verify_window() {
+        let mut p = processor(Some(3));
+        p.register(
+            "r".to_owned(),
+            RequestState::new(vec![0], 10, BTreeSet::from([7]), true, None, true),
+        );
+        let mut first = result(&[5], &[1]);
+        first.output_logprobs = Some(vec![-0.5]);
+        first.output_token_cumulative_probs = Some(vec![0.1]);
+        p.commit(&batch(&[("r", 1, 0, 1)], 1), None, &first)
+            .unwrap();
+        let mut verify = result(&[6, 7, 8], &[3]);
+        verify.output_logprobs = Some(vec![-0.6, -0.7, -0.8]);
+        verify.output_token_cumulative_probs = Some(vec![0.2, 0.3, 0.4]);
+        let c = p
+            .commit(&batch(&[("r", 3, 0, 1)], 0), None, &verify)
+            .unwrap();
+        assert_eq!(c.outputs[0].output_ids, [6, 7]);
+        assert_eq!(c.outputs[0].output_logprobs, [-0.6, -0.7]);
+        assert_eq!(c.outputs[0].output_token_cumulative_probs, [0.2, 0.3]);
+    }
+
+    #[test]
+    fn cumulative_probabilities_must_cover_the_result_tokens() {
+        let mut p = processor(None);
+        register(&mut p, "r", 1, 2, &[]);
+        let mut forward = result(&[5], &[1]);
+        forward.output_token_cumulative_probs = Some(vec![]);
+        assert!(matches!(
+            p.commit(&batch(&[("r", 1, 0, 1)], 1), None, &forward),
+            Err(CommitError::TokenColumn {
+                column: "output_token_cumulative_probs",
+                ..
+            })
+        ));
     }
 }

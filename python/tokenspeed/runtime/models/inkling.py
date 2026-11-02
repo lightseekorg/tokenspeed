@@ -128,12 +128,10 @@ from tokenspeed.runtime.models.deepseek_v3 import MoEGate as _DSV3MoEGate
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.common import set_weight_attrs
@@ -1615,10 +1613,6 @@ class InklingForConditionalGeneration(nn.Module):
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Weights the MTP draft model shares (see inkling_nextn.py)."""
         return self.model.embed_tokens.weight, self.lm_head.weight
-
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
-        """Rewrite each placeholder run to the item's content-derived pad id."""
-        return pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
         """Encode image patch features to LM embeddings.
