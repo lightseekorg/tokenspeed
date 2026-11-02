@@ -484,9 +484,11 @@ stored. Through 8192 columns that tile gives each of the 256 CUs one
 rocBLAS. QKVFAB's 6288 columns leave a masked 16-column tail in the last tile.
 QKVFAB, QKV+gate, and add3 run the 64-row tile without split-K.
 
-Up to 16 rows, general dense projections use a two-warp `16 x 32` tile when
-`N` is divisible by 32 and has at least 192 such tiles; other accepted `N`
-uses one warp and a `16 x 16` tile. KDA QKVFAB and MLA QKV+gate use the
+Up to 16 rows, general dense projections with more than 128 128-column tiles
+(vocabulary shards such as LM heads) use an eight-warp `16 x 128` tile with
+128-wide K tiles. Others use a two-warp `16 x 32` tile when `N` is divisible
+by 32 and has at least 192 such tiles; other accepted `N` uses one warp and a
+`16 x 16` tile. KDA QKVFAB and MLA QKV+gate use the
 one-warp tile, and add3 uses the two-warp tile. All use 256-wide K tiles when
 K is divisible by 256, falling back to 128-wide tiles otherwise. The add3
 epilogue loads `X` and `Y` for the stored tile.
@@ -513,7 +515,8 @@ projection covers other batch sizes with the same model dimensions.
 ### gfx1250 BF16 GEMM
 
 `gluon_mm_a16w16_gfx1250` is a general BF16 GEMM with FP32 or BF16 output. It
-backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`).
+backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`),
+including the DSpark drafter's base logits over the LM head's vocabulary shard.
 `gluon_grouped_mm_a16w16_gfx1250` runs the one- or two-group `wo_a`
 projections up to 2048 rows (`gluon_grouped_bf16_projection_gfx1250`) and can
 quantize the result for `wo_b` (`gluon_grouped_bf16_projection_fp8_gfx1250`).
@@ -534,7 +537,12 @@ quantize the result for `wo_b` (`gluon_grouped_bf16_projection_fp8_gfx1250`).
 #### Algorithm
 
 Batches that the dense WMMA kernel can tile within one wave of the 256 CUs run
-there. Up to 32 rows use one 16- or 32-row tile without split-K. From 33 to 128
+there. Up to 128 rows, an output with more than 128 128-column tiles (and at
+most 256 of them for a 128-row tile) uses unsplit 128-column tiles, so each
+program reads its activation rows once per 128 weight rows; fewer tiles leave
+CUs idle, and past one wave two resident 128-row programs keep only two TDM
+buffers each. The grouped form keeps the choice below. Otherwise,
+up to 32 rows use one 16- or 32-row tile without split-K. From 33 to 128
 rows, a 64- or 128-row tile splits K by the first of 5, 4, or 2 that divides the
 K tiles, leaves at least two per split, and keeps the grid within the CUs. It
 keeps 16-column tiles when they fit a split of 5 and otherwise repeats the
