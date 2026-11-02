@@ -151,8 +151,8 @@ Inside the root `tokenspeed-scheduler/` directory:
   by an id) to an owning handle whose destructor releases it, and keep that
   handle in the object whose lifetime it shares, usually an FSM state or the
   request itself. Avoid paired acquire/release calls, hand-kept counters and
-  erase-on-teardown code spread across call sites. `CacheBlockRef` and
-  `ReqPoolIndex` are the models to follow.
+  erase-on-teardown code spread across call sites. `CacheBlockRef`,
+  `ReqPoolIndex` and `StorageLease` are the models to follow.
 
 ## tokenspeed-scheduler releases
 

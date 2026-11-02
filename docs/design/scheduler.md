@@ -722,8 +722,8 @@ the image as the split planned:
   already canonical on Host (an L3 prefetch of the same page by another prompt
   landed first), `PrefixCacheIndex::Register` redirects the ticket to that
   entry, and `CompleteWriteBack` hands the entries as published to every
-  `Retracted` request waiting for the op (`StoreLandedEvent`,
-  `RetractionImage::FollowPublished`), which re-points its slot to the
+  `Retracted` request that waited for the op
+  (`RetractionImage::FollowPublished`), which re-points its slot to the
   canonical block and lets its own unindexed block return to the pool. An image
   therefore never pins a Host block the index does not know, and the restore's
   L2 rows always come from published entries.
@@ -1164,12 +1164,14 @@ the bytes — an L2 entry with its `CacheKey`, or a snapshot-pool block with
 none) — the blob slot, the `ResumeShape` that names the state it resumes
 (`ResumePrefilling{window, reserve}`, `ResumePrefillDone{window, reserve}` or
 `ResumeDecoding{reserve}`), its `retraction_epoch` and `resumes_generation`
-stamp, and `pending_store_ops`: every op the image waits for — both legs' own
-ops and any earlier in-flight store carrying one of its keys. The image is
-**landed** (`ImageLanded()`) when all of them have been acknowledged
-(`cache::WriteBackDone`, `cache::SnapshotDone`); until then the request is
-not a readmission candidate, because a restore started earlier would copy
-bytes that have not arrived.
+stamp, and `image_stores`: a `StoreWait` on every op the image waits for —
+both legs' own ops and any earlier in-flight store carrying one of its keys.
+Each wait is a weak reference to the op's in-flight record, which the
+transfer manager drops at the op's ACK (`cache::WriteBackDone`,
+`cache::SnapshotDone`). The image is **landed** (`ImageLanded()`) when every
+wait has expired; nothing records the ACKs on the request. Until then the
+request is not a readmission candidate, because a restore started earlier
+would copy bytes that have not arrived.
 
 **Readmission order** (`rankedReadmissions`) is derived, not stored: among
 this round's candidates whose image landed, victims with generated output

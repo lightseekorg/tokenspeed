@@ -91,7 +91,30 @@ public:
                      bool stream_device_cache_to_host, bool write_back_evictions);
     std::size_t DemoteSession(const std::string& session_id, bool ended);
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
-    void ForgetSessionAccess(std::uint64_t epoch) { session_access_.erase(epoch); }
+
+    // A request's session, registered under its access epoch for every
+    // admission, publication and restore that epoch dates
+    // (SessionForAccess). The first admission of a request with a session id
+    // registers it and returns this handle; dropping the handle unregisters
+    // it. Move-only; the coordinator must outlive it.
+    class SessionAccess {
+    public:
+        SessionAccess() noexcept = default;
+        SessionAccess(const SessionAccess&) = delete;
+        SessionAccess& operator=(const SessionAccess&) = delete;
+        SessionAccess(SessionAccess&& other) noexcept;
+        SessionAccess& operator=(SessionAccess&& other) noexcept;
+        ~SessionAccess();
+
+    private:
+        friend class CacheCoordinator;
+
+        SessionAccess(CacheCoordinator& coordinator, std::uint64_t access_epoch, SessionCacheOwner session);
+        void release() noexcept;
+
+        CacheCoordinator* coordinator_{nullptr};
+        std::uint64_t access_epoch_{0};
+    };
     SessionCacheOwner SessionForAccess(std::uint64_t epoch) const {
         const auto it = session_access_.find(epoch);
         return it == session_access_.end() ? nullptr : it->second;
@@ -278,6 +301,10 @@ public:
         // turn ended. The end state the request publishes supersedes it
         // (MarkSupersededStateInput).
         std::optional<ContentHash> resumed_tail_hash;
+        // The first admission of a request with a session id: that session's
+        // registration under access_epoch, for the caller to hold as long as
+        // the request lives. Empty otherwise.
+        SessionAccess session_access;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -1119,6 +1146,7 @@ private:
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
     SessionCacheOwner sessionTag(const std::string& id);
+    // One entry per live SessionAccess handle, which adds and erases it.
     std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
     std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
     std::size_t session_tags_since_sweep_{0};

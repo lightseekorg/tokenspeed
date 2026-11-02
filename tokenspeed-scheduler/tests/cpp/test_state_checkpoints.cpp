@@ -3983,7 +3983,7 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
     ASSERT_EQ(retained.size(), 2u);
     coordinator.RefreshRetainedCheckpoint(retained, admitted->access_epoch);
     coordinator.Free(tables);
-    coordinator.ForgetSessionAccess(admitted->access_epoch);
+    admitted->session_access = {};
     // A retained checkpoint remains pinned until the finishing request drops
     // its hold, then the same session hint must age both cache tiers.
     EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);

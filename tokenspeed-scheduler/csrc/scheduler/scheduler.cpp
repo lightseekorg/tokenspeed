@@ -252,7 +252,7 @@ bool Scheduler::clearCache(bool include_host) {
     return true;
 }
 
-void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                            std::int32_t first_page) {
     if (!config_.enable_kv_cache_events) {
         return;
@@ -261,27 +261,21 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
             "KV event page range is invalid");
     const std::vector<std::span<const std::int32_t>> token_pages = request.FullPrefixPages(false);
     _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
-
-    KvEventHashProgress& progress = kv_event_hash_progress_[request.Id()];
-    for (std::size_t i = progress.block_hashes.size(); i < prefix_hashes.size(); ++i) {
-        const std::optional<std::uint64_t> parent_hash =
-            i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
-        progress.block_hashes.push_back(HashKvBlock(token_pages[i], parent_hash));
-    }
+    const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
 
     for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
         CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
-            i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
+            i == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[i - 1]};
         KvBlockStoredEvent event{
-            .block_hashes = {progress.block_hashes[i]},
+            .block_hashes = {block_hashes[i]},
             .parent_block_hash = parent_hash,
             .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
             .block_size = config_.prefix_granularity,
         };
         const auto [it, inserted] = kv_event_boundaries_.try_emplace(
             key, KvEventBoundary{.stored = std::move(event), .depth = static_cast<std::int32_t>(i)});
-        FatalCheck(inserted || (it->second.stored.block_hashes.front() == progress.block_hashes[i] &&
+        FatalCheck(inserted || (it->second.stored.block_hashes.front() == block_hashes[i] &&
                                 it->second.depth == static_cast<std::int32_t>(i)),
                    "one cache content hash mapped to different KV event blocks");
         // The next drain drops the descriptor if the publication never lands.
@@ -289,18 +283,16 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
     }
 }
 
-void Scheduler::registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+void Scheduler::registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                            const CompletedPages& completed) {
     registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
     if (!config_.enable_kv_cache_events || !completed.tail) {
         return;
     }
     const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
-    const KvEventHashProgress& progress = kv_event_hash_progress_.at(request.Id());
-    // Admission can hash beyond an early junction or retraction frontier.
-    _assert(progress.block_hashes.size() >= prefix_hashes.size(), "the tail's parent page has its KV event hash");
+    const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
     const std::optional<std::uint64_t> parent_hash =
-        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[full_pages - 1]};
+        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[full_pages - 1]};
     const std::span<const std::int32_t> tail_tokens =
         request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
     const CacheKey key{.content_hash = completed.tail->hash};
@@ -486,13 +478,12 @@ std::vector<std::int64_t> Scheduler::AdmissionCapacityCurve(std::int32_t token_s
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
+    // Dropping a finished request drops what it still holds elsewhere -- its
+    // session's registration under its access epoch -- with it.
     std::erase_if(requests_, [this](const auto& request) {
         if (!request->template Is<fsm::Finished>()) {
             return false;
         }
-        releaseStorage(*request);
-        coordinator_.ForgetSessionAccess(request->SessionEpoch());
-        kv_event_hash_progress_.erase(request->Id());
         requests_by_id_.erase(request->Id());
         return true;
     });
