@@ -368,6 +368,7 @@ def kernel(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
     enable_pdl: bool,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run direct-slot QSA with exact prefix reuse within uniform requests.
 
@@ -377,7 +378,8 @@ def kernel(
     last 128-entry tile holding a positive id (at least one tile); the skipped
     tiles hold only masked entries, so the output matches the full loop. K/V
     offsets are 64-bit. The enable_pdl flag is retained by CUDA graph capture.
-    Returns BF16 output with the query's shape.
+    Returns BF16 output with the query's shape, written into ``out`` when
+    given (contiguous, the query's shape and dtype).
     """
     if query.ndim != 3 or query.shape[-1] != _HEAD_DIM:
         raise ValueError("QSA requires query shape [tokens, query_heads, 256]")
@@ -402,11 +404,22 @@ def kernel(
         raise TypeError("QSA requires int32 selected slots")
     if max_seqlen_q < 1 or query.shape[0] % max_seqlen_q:
         raise ValueError("max_seqlen_q must be positive and divide the query rows")
+    if out is not None and (
+        out.shape != query.shape
+        or out.dtype is not query.dtype
+        or out.device != query.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("QSA output must be a contiguous tensor like the query")
     if query.shape[0] == 0:
-        return torch.empty_like(query)
+        return torch.empty_like(query) if out is None else out
     if not query.is_contiguous():
         query = query.contiguous()
-    output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+    output = (
+        torch.empty(query.shape, dtype=query.dtype, device=query.device)
+        if out is None
+        else out
+    )
     scale_qs = float(scale) * _scalar(k_scale, 1.0)
     scale_o = _scalar(v_scale, 1.0)
     bf16_kv = key_cache.dtype is torch.bfloat16

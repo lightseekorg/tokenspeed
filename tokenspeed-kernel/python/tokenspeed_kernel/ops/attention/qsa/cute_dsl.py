@@ -487,6 +487,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run Blackwell QSA with exact query-prefix and KV operand reuse.
 
@@ -505,9 +506,11 @@ def cute_dsl_blackwell_qsa_sparse_attention(
             by this implementation's call-owned prefix flags.
         k_scale: Scalar key-cache descale, folded into scale.
         v_scale: Scalar value-cache descale, applied to the output.
+        out: Optional contiguous output shaped and typed like q; None
+            allocates one.
 
     Returns:
-        BF16 attention output with q's shape.
+        BF16 attention output with q's shape (``out`` when given).
 
     Twelve query heads share one sixteen-head tile for BF16 and FP8 caches;
     SM107 FP8 grids with fewer tiles than SMs keep two eight-head tiles.
@@ -523,7 +526,8 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     data is gathered directly from the cache with 64-bit offsets; preparation
     neither copies KV nor caches decisions across calls or graph replays.
     FP8 retains its synchronous gather/conversion; on SM100/SM103 its rows per
-    CTA and KV splits follow the wave count of the launch grid.
+    CTA and KV splits follow the wave count of the launch grid. BF16 gathers
+    zero-fill padded entries instead of reading slot 1.
     """
 
     del metadata_capacity_rows  # This backend does not use fallback plan storage.
@@ -537,6 +541,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         enable_pdl=pdl_enabled(),
+        out=out,
     )
 
 
