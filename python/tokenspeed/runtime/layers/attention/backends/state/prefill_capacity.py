@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaForwardMetadata,
 )
 from tokenspeed.runtime.utils.tensor import upload_packed
+from tokenspeed.runtime.utils.triton import tl, triton
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
@@ -131,13 +132,59 @@ class CapacityPrefillMetadata(MambaForwardMetadata):
         boundary, which the refresh pads with the live total), never from a
         Python int the capture would freeze.
         """
-        live_total = self.query_start_loc[-1]
+        live_total = self.query_start_loc[-1:]
         for tensor in tensors:
-            if tensor is None:
-                continue
-            rows = torch.arange(tensor.shape[0], device=tensor.device)
-            padding = (rows >= live_total).view(-1, *([1] * (tensor.ndim - 1)))
-            tensor.masked_fill_(padding, 0)
+            if tensor is not None:
+                _zero_rows_from(tensor, live_total)
+
+
+_ZERO_ROWS_BLOCK = 1024
+
+
+# The grid is the row count and the live total is read on device, so neither
+# compiles a variant. The bound is the last of a shape's boundaries: its
+# address alignment follows the request count, so it stays out of the compile
+# key. row_stride and num_cols are model widths, fixed per scrubbed input.
+@triton.jit(do_not_specialize_on_alignment=["live_ptr"])
+def _zero_rows_from_kernel(ptr, live_ptr, row_stride, num_cols, BLOCK: tl.constexpr):
+    # One program per row: live rows only read the bound, so an unpadded
+    # forward writes nothing. The row offset grows with the token count, so it
+    # is int64; offsets inside a row stay int32.
+    row = tl.program_id(0)
+    if row >= tl.load(live_ptr):
+        base = ptr + row.to(tl.int64) * row_stride
+        for start in range(0, num_cols, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            tl.store(
+                base + cols,
+                tl.zeros([BLOCK], dtype=ptr.dtype.element_ty),
+                mask=cols < num_cols,
+            )
+
+
+def _zero_rows_from(tensor: torch.Tensor, live_total: torch.Tensor) -> None:
+    """Zero ``tensor``'s rows from the device bound ``live_total[0]`` onward.
+
+    A masked fill over the whole tensor would rewrite every live row too, for
+    each scrubbed input of every layer; this touches the padding rows only.
+    Host tensors and rows whose trailing dims are not contiguous keep the
+    masked fill.
+    """
+    rows = tensor.shape[0]
+    if rows == 0:
+        return
+    if not tensor.is_cuda or (tensor.dim() > 1 and not tensor[0].is_contiguous()):
+        index = torch.arange(rows, device=tensor.device)
+        padding = (index >= live_total).view(-1, *([1] * (tensor.dim() - 1)))
+        tensor.masked_fill_(padding, 0)
+        return
+    _zero_rows_from_kernel[(rows,)](
+        tensor,
+        live_total,
+        tensor.stride(0),
+        tensor.numel() // rows,
+        BLOCK=_ZERO_ROWS_BLOCK,
+    )
 
 
 def _capacity_metadata(source, bucket, checkpoints):
