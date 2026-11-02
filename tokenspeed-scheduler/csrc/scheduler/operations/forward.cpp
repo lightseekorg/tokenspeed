@@ -75,6 +75,17 @@ bool holdsHeadOfLine(const Request& request) {
     return request.Is<fsm::Prefilling>();
 }
 
+// A chunk cut at a junction, not by the round's budget: it leaves budget the
+// prompts behind it can use.
+bool endsAtJunction(const Request& request) {
+    const auto* state = request.GetIf<fsm::Prefilling>();
+    if (state == nullptr) {
+        return false;
+    }
+    const std::int32_t junction = state->resources.cache_progress.junction_tokens;
+    return junction > 0 && state->window.begin + state->window.size == junction;
+}
+
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
@@ -1258,7 +1269,8 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
 // visible.
 //
 // Head-of-line: an incomplete prefill that scheduled stops further prefill
-// work (nothing may consume the capacity it still needs), and a resident
+// work (nothing may consume the capacity it still needs), unless it was cut
+// at a junction on the P role (junction_cuts_hold_line is false), and a resident
 // chunk that FAILED admission stops it too -- admitting behind it would
 // strand it. A readmission whose restore failed for capacity waits without
 // becoming the capacity blocker (retracting a victim for it is pure thrash
@@ -1267,7 +1279,7 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
 // for would starve it.
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
-                                         std::int32_t decode_reserve) {
+                                         bool junction_cuts_hold_line, std::int32_t decode_reserve) {
     for (const bool resident : {true, false}) {
         if (!resident && new_prompts_sealed) {
             return;
@@ -1285,7 +1297,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                                          decode_reserve, build.load_backs)) {
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
-                if (holdsHeadOfLine(*request)) {
+                if (holdsHeadOfLine(*request) && (junction_cuts_hold_line || !endsAtJunction(*request))) {
                     return;
                 }
             } else if (feedback.admission_failed) {
@@ -1351,7 +1363,11 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
+    // The P role never retracts: a prompt cut at a junction that later finds
+    // no room waits, resident chunks going first, so the round's budget is
+    // not left idle behind it.
+    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false,
+                             /*junction_cuts_hold_line=*/false, config_.decode_input_tokens);
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -1426,7 +1442,8 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, /*junction_cuts_hold_line=*/true,
+                             config_.decode_input_tokens);
 
     if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
         scheduleDecodeBatch(feedback, build, candidates);

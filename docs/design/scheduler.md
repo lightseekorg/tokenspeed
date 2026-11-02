@@ -182,6 +182,13 @@ prompt, then stops. The same rule makes the finishing round of a chunked
 prefill cheap: its final chunk releases the line *within* the round, so the
 prompts queued behind it start in that round, not the next.
 
+**On the P role a junction cut does not hold the line.** A first chunk cut
+at a junction (§1) stops there by choice, not because the round's budget ran
+out, so sealing the round would leave most of it idle while prompts wait. The
+P role never retracts: a cut prompt that later finds no room waits, and
+resident chunks are scheduled before new prompts, so it continues first in the
+next round. Decoding roles keep the rule for every incomplete prefill.
+
 **Decodes are not part of the line.** In mixed mode the decode batch is built
 before the prefill phases and takes its token budget first (§3.3), so a round
 is *all decodes + the completing prefills + at most one truncated prefill*.

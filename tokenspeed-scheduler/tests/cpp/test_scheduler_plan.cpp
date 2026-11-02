@@ -771,6 +771,82 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     }
 }
 
+// A prompt cut at a junction leaves the rest of the round to the prompts behind
+// it on the P role, which never retracts; a decoding role keeps the round
+// sealed behind any incomplete prefill.
+class PrefillRoleJunctionCutTestSuite : public HybridJunctionCutTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = HybridJunctionCutTestSuite::MakeConfig();
+        cfg.role = Role::kP;
+        cfg.decode_allocation_policy = DecodeAllocationPolicy::kIndependent;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.transfer_policy = group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot
+                                                                        : CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendDestinationReady(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::DestinationReadyEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendPdSucceeded(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::SucceededEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(PrefillRoleJunctionCutTestSuite, PromptsBehindAJunctionCutJoinItsRound) {
+    Submit(MakeHybridRequest("seed", 100));
+    SendBootstrapped("seed");
+    const ExecutionPlan seed_plan = PlanOnce();
+    ASSERT_NE(FindForwardBatch(seed_plan), nullptr);
+    SendForwardDone("seed", {900});
+    PlanOnce();
+    SendDestinationReady("seed");
+    PlanOnce();
+    SendPdSucceeded("seed");
+    PlanOnce();
+
+    Submit(MakeHybridRequest("junction", 200));
+    Submit(RequestSpec{.request_id = "other", .tokens = {500, 501, 502, 503, 504, 505}});
+    SendBootstrapped("junction");
+    SendBootstrapped("other");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"junction", "other"}));
+    EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{8, 6}));
+}
+
+TEST_F(HybridJunctionCutTestSuite, PromptsBehindAJunctionCutWaitOnADecodingRole) {
+    Submit(MakeHybridRequest("seed", 100));
+    PlanOnce();
+    SendForwardDone("seed", {900});
+    PlanOnce();
+    SendFinish("seed");
+    PlanOnce();
+
+    Submit(MakeHybridRequest("junction", 200));
+    Submit(RequestSpec{.request_id = "other", .tokens = {500, 501, 502, 503, 504, 505}});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, std::vector<std::string>{"junction"});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{8});
+}
+
 TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 2;
