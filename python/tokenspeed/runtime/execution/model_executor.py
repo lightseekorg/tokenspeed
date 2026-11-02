@@ -421,6 +421,7 @@ class ModelExecutorConfig:
 
     # ====== DP =========
     data_parallel_size: int = 1
+    attention_tp_size: int = 1
     world_size: int = 1
     world_group: list[int] | None = None
 
@@ -531,6 +532,7 @@ class ModelExecutorConfig:
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
+            attention_tp_size=server_args.mapping.attn.tp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
             pp_size=server_args.mapping.pp_size,
@@ -1150,10 +1152,11 @@ class ModelExecutor:
                         # Prefill-only roles do not allocate decode/verify scratch.
                         # The draft model is reached through the shared speculative
                         # forward, not model_runner.forward above. One request
-                        # exposes its operators; FI still owns their bucket
-                        # enumeration.
+                        # per attention TP rank keeps sequence-parallel router
+                        # GEMMs nonempty on every peer during distributed tuning.
                         self.forward_step.warmup_decode_path(
-                            batch_sizes=(1,), graph_phase=False
+                            batch_sizes=(self.config.attention_tp_size,),
+                            graph_phase=False,
                         )
         finally:
             set_autotune_process_group(None)

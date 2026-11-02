@@ -455,3 +455,84 @@ over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
+
+## NVFP4 MegaMoE for Qwen3.5
+
+The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and
+Kimi K3 SiTU. Gated SiLU selects the existing kernel epilogue with both SiTU
+parameters set to `None`. BF16 inputs are quantized and staged with routing
+directly into the symmetric workspace in one kernel, including masking unused
+capacity rows. BF16 staging rejects routing tensors whose row counts differ
+from the live activation count before launching the staging kernel.
+Prequantized packed E2M1 inputs with linear E4M3 block scales
+remain supported for existing callers. `get_runner` requires an explicit
+`prequantized=True` for packed NVFP4 inputs (including direct workspace writes),
+or `prequantized=False` for fused BF16 quantization and staging.
+Input format is part of the runner's
+tuning key, and calibrated input scales stay runtime tensors across graph replay;
+weights are converted once to interleaved gate/up rows and blocked scales.
+Gate/up global weight scales must match. The adapter currently targets
+SM100/SM103 and requires MoE TP=1.
+
+Qwen3.5 uses precomputed Qwen top-k and a separate, fully replicated shared
+expert with its original sigmoid gate. Select
+`--moe-backend mega_moe --all2all-backend none` with NVFP4 routed weights,
+MoE TP=1 and EP>1. Attention rows must already be scattered before the MoE,
+for example DP4/TP2/EP8 or DP8/TP1/EP8. Layouts with attention TP equal to
+MoE TP*EP (including TP8/EP8) are rejected before weights are constructed.
+The common communication manager handles input and final normalization and
+row gathering; the model needs no additional all-reduce bypass or row slicing.
+
+`Qwen3_5MoeSparseMoeBlock` checks MegaMoE options during construction: EPLB, redundant experts, nontrivial placement
+and external all-to-all backends are unsupported. The NVFP4 weight adapter
+checks MoE TP=1. Weight dtype, activation and
+hardware compatibility are checked by the common MoE kernel planner.
+
+All ranks, including empty token owners, must enter the expert call with the
+same capacity. Existing runner warmup and autotuning reserve the workspace
+before graph capture; returned outputs alias that workspace. Shared experts
+run independently on the existing auxiliary stream during CUDA graph capture
+and replay, overlapping routed experts; the streams join before applying the
+shared sigmoid gate and gathering rows. Warmup retains serialized execution
+so kernel tuning and compilation finish before capture.
+
+Run the kernel regression on Blackwell, for example:
+
+```bash
+PYTHONPATH="tokenspeed-kernel/test:$PYTHONPATH" torchrun --standalone --nproc-per-node=2 \
+  tokenspeed-kernel/test/nvidia/ops/moe/test_trtllm_mega_moe.py \
+  --activation silu --input-format bf16 --intermediate-size 192 --capacity 8 --tokens 5
+```
+
+Repeat with `--input-format nvfp4` to cover prequantized inputs, and with
+`--autotune` for tactic coverage. The test compares a dequantized
+reference, uneven/idle ranks, graph replay and alternating capacities.
+
+`test_trtllm_mega_moe_input_stage.py` separately checks byte-exact packed data
+and scales against FlashInfer quantization, INT32/INT64 route inputs and outputs,
+zero-token owners, changing live counts and alternating captured graphs on the
+same workspace, with a compile guard across changing live counts.
+The stager converts route IDs and scores to their destination buffer dtypes
+and keys compiled specializations by all input and output dtypes; current
+MegaMoE workspaces store INT32 IDs.
+
+Qwen3.5 follows K3's empty-owner path: gate, top-k, quantization and shared
+expert work are skipped when there are no local tokens, but the rank still
+participates in the collective MegaMoE call. Nonempty ranks use normal tuning;
+the model does not disable GEMM tuning for uneven batches.
+
+MegaMoE reserves scratch for all candidate tactics before CUDA graph capture,
+whether tactic autotuning is enabled or disabled. With tuning disabled,
+`forward()` selects the original capacity-based default; enabling
+`MEGAMOE_TACTIC_AUTOTUNE=1` searches the candidates. The candidate set excludes
+FC2 write-back tactics. Token capacity and persistent addresses do not change,
+and launches with an unreserved tactic or capacity are rejected.
+
+The temporary full-capacity workspace experiment reserves the configured maximum
+per-rank token capacity before capture, including the prefill ceiling (8192 in
+the capacity test) and the MTP verification batch (64 requests times 4 tokens).
+This follows the serving-capacity allocation policy of vLLM's MegaMoE buffer;
+the CuTe kernel retains its own layouts and alignment. Each forward executes
+one collective with no 128-token chunk loop. All layers and captured capacities
+continue to share stable workspace addresses. Kimi K3 writes packed activations
+and routes directly into views of this full-capacity symmetric allocation.
