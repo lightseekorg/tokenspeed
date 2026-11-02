@@ -755,11 +755,10 @@ public:
     // group by group in offset order, each key under the boundary's namespace
     // and content hash.
     template <typename Visit>
-    void ForEachBoundaryKey(const CacheKey& boundary, std::int32_t tail_tokens, Visit&& visit) const {
+    void ForEachBoundaryKey(CacheKey key, std::int32_t tail_tokens, Visit&& visit) const {
         _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
-        // One key, its group and offset set in place: the content hash is
-        // copied once per boundary, not once per key.
-        CacheKey key{.namespace_id = boundary.namespace_id, .content_hash = boundary.content_hash};
+        // Reuse temporary keys without another hash copy. Borrowed keys are
+        // copied at entry so changing the group and offset leaves callers intact.
         for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
             const auto i = static_cast<std::int32_t>(group_index);
             // A replayable group never holds an entry.
