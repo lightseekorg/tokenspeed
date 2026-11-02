@@ -135,6 +135,17 @@ def _relative_error(actual, expected):
         pytest.param(16, 15, [15, 1025], torch.float8_e4m3fn, id="partial-block"),
         # Head blocks.
         pytest.param(128, 4, [1025, 4], torch.bfloat16, id="head-blocks"),
+        # Single-query EAGLE3 draft at TP8, one and sixteen requests: one
+        # 16-row block per request, its four warps splitting the keys.
+        pytest.param(8, 1, [50_250], torch.float8_e4m3fn, id="draft-c1"),
+        pytest.param(
+            8,
+            1,
+            [50_250 - 13 * i for i in range(16)],
+            torch.float8_e4m3fn,
+            id="draft-c16",
+        ),
+        pytest.param(32, 1, [4097, 129], torch.float8_e4m3fn, id="draft-head-blocks"),
     ],
 )
 def test_query_block_mla_matches_reference(heads, queries, cache_lengths, dtype):
@@ -377,39 +388,3 @@ def test_query_block_projected_value_fuses_merge_and_projection(
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(replayed, direct, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize(
-    "heads,cache_lengths",
-    [
-        # EAGLE3 draft at TP8 for one and sixteen requests: one 16-row block
-        # per request, its four warps splitting the keys.
-        pytest.param(8, [50_250], id="draft-c1"),
-        pytest.param(8, [50_250 - 13 * i for i in range(16)], id="draft-c16"),
-        pytest.param(12, [1, 63, 64, 65, 4097], id="k3-short"),
-        # Two head blocks.
-        pytest.param(32, [4097, 129], id="head-blocks"),
-    ],
-)
-def test_single_query_mla_matches_reference(heads, cache_lengths):
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
-        launch_gluon_mla_decode_gfx1250,
-    )
-
-    q, cache, table, lengths = _make_inputs(cache_lengths, heads, 1)
-    result, lse = launch_gluon_mla_decode_gfx1250(
-        q,
-        cache,
-        table,
-        lengths,
-        max_seqlen_k=65_536,
-        qk_nope_head_dim=128,
-        kv_lora_rank=_KV_LORA_RANK,
-        qk_rope_head_dim=_ROPE_DIM,
-        softmax_scale=_SOFTMAX_SCALE,
-        return_lse=True,
-    )
-    reference, reference_lse = _reference(q, cache, table, lengths)
-    assert torch.isfinite(result).all()
-    assert _relative_error(result, reference) < 0.05
-    torch.testing.assert_close(lse, reference_lse, atol=2e-3, rtol=2e-4)

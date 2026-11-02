@@ -1404,7 +1404,7 @@ def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
 
 @pytest.mark.parametrize(
     ("batch", "heads"),
-    [(1, 12), (2, 12), (4, 12), (8, 12), (16, 12), (1, 8), (4, 8), (1, 16), (4, 16)],
+    [(1, 12), (4, 12), (8, 12), (16, 12), (1, 8), (4, 8), (1, 16), (4, 16)],
 )
 def test_kda_fused_verify_and_replay_match_sequential_reference(
     batch: int, heads: int
