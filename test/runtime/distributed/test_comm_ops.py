@@ -367,7 +367,10 @@ def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
         fabric.group_has_fabric((0, 1))
 
 
-def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
+@pytest.mark.parametrize("amd", [True, False], ids=["amd", "not-amd"])
+def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch, amd):
+    import sys
+
     import tokenspeed_kernel.ops.communication.fabric as fabric
     import tokenspeed_kernel.ops.communication.iris as kernel_iris
     import tokenspeed_kernel.platform as kernel_platform
@@ -413,18 +416,25 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
     )
     monkeypatch.setattr(fabric, "gather_fabric_map", lambda: events.append("fabric"))
     monkeypatch.setattr(
-        kernel_platform, "current_platform", lambda: SimpleNamespace(is_amd=True)
+        kernel_platform, "current_platform", lambda: SimpleNamespace(is_amd=amd)
     )
     monkeypatch.setattr(
         kernel_iris, "discover_iris_world", lambda: events.append("iris")
     )
+    if not amd:
+        # NPU builds cannot import the Iris module, so it must stay unloaded.
+        monkeypatch.delitem(sys.modules, kernel_iris.__name__)
 
     initializer.DistributedInitializer.initialize(config)
 
     assert events[0] == "distributed"
-    # Iris decides whether its heap maps the world once every group exists.
-    assert events[-2:] == ["fabric", "iris"]
-    assert events.count("fabric") == events.count("iris") == 1
+    if amd:
+        # Iris decides whether its heap maps the world once every group exists.
+        assert events[-2:] == ["fabric", "iris"]
+        assert events.count("fabric") == events.count("iris") == 1
+    else:
+        assert events[-1] == "fabric" and "iris" not in events
+        assert kernel_iris.__name__ not in sys.modules
 
 
 def get_open_port() -> int:
