@@ -269,10 +269,20 @@ Within one export, adjacent live slots sharing a parent reuse its resolved ID
 base; the owning pool remains part of that check because Host and Device
 packing can differ.
 
-With KVP virtual-block placement, `CacheBatchMetadata` validates exported IDs
-against each group's **virtual** block count. The physical page count bounds
-local arena storage only; applying it to the scheduler table would reject valid
-remote-owner IDs before the runtime can translate them.
+Operations borrow their scheduled request's tables only until their batch is
+built. A request selected for that build cannot be retracted or scheduled
+again in it. Batch construction resolves rows directly into one owned
+contiguous buffer per group, writing null prefixes and `-1` row padding there.
+No borrowed table escapes into an execution plan. The legacy nested table
+accessor materializes the same padded rows from that buffer on demand; NumPy
+views keep their owning batch alive. Pinned staging remains runtime-owned.
+
+`CacheBatchMetadata` checks the exported groups, dtype and shape on every
+forward. `TOKENSPEED_VALIDATE_PAGE_IDS=1` additionally scans the IDs against
+each group's **virtual** block count; this diagnostic scan is off by default.
+The physical page count bounds local arena storage only; applying it to the
+scheduler table would reject valid remote-owner IDs before the runtime can
+translate them.
 
 #### Recurrent state: two slots, natural checkpoints
 

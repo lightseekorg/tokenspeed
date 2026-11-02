@@ -48,6 +48,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     cache_group_config,
     scheduler_role,
 )
+from tokenspeed.runtime.utils.env import envs
 
 # The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
 # load-back ticket, a retraction image's snapshot store, a restore. The data
@@ -562,6 +563,10 @@ def packed_block_tables_from_forward_op(
     stage is returned too, so a backend planning from the tables reads them
     without a D2H sync.
 
+    Structural contract checks run whenever bounds or expected groups are
+    supplied. Set ``TOKENSPEED_VALIDATE_PAGE_IDS=1`` to also scan every page
+    ID against the supplied bounds; this diagnostic scan is off by default.
+
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
         device: Destination device for the packed tensor.
@@ -627,6 +632,7 @@ def packed_block_tables_from_forward_op(
     else:
         ordered_items = array_items
     if strict_validation:
+        validate_page_ids = envs.TOKENSPEED_VALIDATE_PAGE_IDS.get()
         for group_id, arr in ordered_items:
             if not isinstance(arr, np.ndarray):
                 raise ValueError(f"cache group {group_id!r} must be a NumPy array")
@@ -644,7 +650,7 @@ def packed_block_tables_from_forward_op(
             )
             if max_page_ids is not None and group_max_page_id is None:
                 raise ValueError(f"max_page_ids is missing cache group {group_id!r}")
-            if group_max_page_id is not None:
+            if group_max_page_id is not None and validate_page_ids:
                 invalid = (arr < -1) | (arr > group_max_page_id)
                 if bool(invalid.any()):
                     raise ValueError(

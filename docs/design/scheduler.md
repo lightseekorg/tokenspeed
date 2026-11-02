@@ -35,6 +35,12 @@ and reclaims inside the same `Admit` (`AdvanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
+Between publication points, decode admission borrows the request's existing
+hash chain even when it allocates or reclaims blocks. Only a publication
+stages a copy of cache progress, committed after admission succeeds. The
+published checkpoint holder is retired on successful admission; the optional
+retained input checkpoint may still be released to retry a capacity failure.
+
 Decode-role remote admission covers the complete unmatched prompt in one
 landing window. Local prefill chunk limits and junction cuts do not shorten
 it: the peer transfers the full prompt's KV past the hit and its prompt-end
@@ -122,10 +128,11 @@ reuse a previous reachability result.
 
 Decode consumes an existing reserve in place when no page or pending State
 checkpoint became complete and no sliding-window block needs reclaiming. This
-does not copy the accumulated hash chain. Publication and capacity admission
-still use a progress copy so a failed admission leaves the request unchanged.
-Previously published checkpoint holders are released after the in-place step,
-as they are after a successful admission.
+does not copy the accumulated hash chain. An admission that only allocates or
+reclaims capacity borrows the same chain. Publication still stages progress on
+a copy and commits it only on successful admission. Previously published
+checkpoint holders are released after a successful step. An optional retained
+input checkpoint may be dropped to retry a capacity failure.
 
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in

@@ -78,18 +78,18 @@ TEST_F(KvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
     const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
     ASSERT_NE(prefill, nullptr);
-    ASSERT_EQ(prefill->block_tables.count("full"), 1u);
-    ASSERT_EQ(prefill->block_tables.count("swa"), 1u);
-    EXPECT_EQ(prefill->block_tables.at("full").size(), 1u);
-    EXPECT_EQ(prefill->block_tables.at("swa").size(), 1u);
-    const auto& full_prefill_row = prefill->block_tables.at("full").at(0);
+    ASSERT_EQ(prefill->BlockTables().count("full"), 1u);
+    ASSERT_EQ(prefill->BlockTables().count("swa"), 1u);
+    EXPECT_EQ(prefill->BlockTables().at("full").size(), 1u);
+    EXPECT_EQ(prefill->BlockTables().at("swa").size(), 1u);
+    const auto full_prefill_row = prefill->BlockTables().at("full").at(0);
     ASSERT_GE(full_prefill_row.size(), 2u);
     EXPECT_NE(full_prefill_row[0], full_prefill_row[1])
         << "two child slots in one LCM block need distinct kernel page ids";
     ASSERT_EQ(prefill_plan.pages_to_zero.count("full"), 1u);
     ASSERT_EQ(prefill_plan.pages_to_zero.count("swa"), 1u);
     EXPECT_EQ(prefill_plan.pages_to_zero.at("full"), full_prefill_row);
-    EXPECT_EQ(prefill_plan.pages_to_zero.at("swa"), prefill->block_tables.at("swa").at(0));
+    EXPECT_EQ(prefill_plan.pages_to_zero.at("swa"), prefill->BlockTables().at("swa").at(0));
 
     SendForwardDone("r1", {42});
     EXPECT_EQ(scheduler_->PrefillSize(), 1u);
@@ -107,11 +107,11 @@ TEST_F(KvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     const ForwardBatch* last_decode = FindForwardBatch(*last_plan);
     ASSERT_NE(last_decode, nullptr);
 
-    const auto& full_row = last_decode->block_tables.at("full").at(0);
+    const auto full_row = last_decode->BlockTables().at("full").at(0);
     for (std::int32_t id : full_row) {
         EXPECT_GT(id, 0) << "full row should keep history with no null/padding hole";
     }
-    const auto& swa_row = last_decode->block_tables.at("swa").at(0);
+    const auto swa_row = last_decode->BlockTables().at("swa").at(0);
     EXPECT_NE(std::find(swa_row.begin(), swa_row.end(), 0), swa_row.end())
         << "swa row should contain a null hole after the sliding window slides";
 
@@ -171,10 +171,10 @@ TEST_F(KvCacheLifecycleTestSuite, TwoRequestsBatchBlockTables) {
     ASSERT_NE(prefill, nullptr);
     ASSERT_EQ(prefill->request_ids.size(), 2u);
 
-    ASSERT_EQ(prefill->block_tables.count("full"), 1u);
-    ASSERT_EQ(prefill->block_tables.count("swa"), 1u);
-    const auto& full = prefill->block_tables.at("full");
-    const auto& swa = prefill->block_tables.at("swa");
+    ASSERT_EQ(prefill->BlockTables().count("full"), 1u);
+    ASSERT_EQ(prefill->BlockTables().count("swa"), 1u);
+    const auto full = prefill->BlockTables().at("full");
+    const auto swa = prefill->BlockTables().at("swa");
     ASSERT_EQ(full.size(), 2u);
     ASSERT_EQ(swa.size(), 2u);
 
@@ -209,15 +209,16 @@ TEST_F(KimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
     ExecutionPlan plan = PlanOnce();
     const ForwardBatch* op = FindForwardBatch(plan);
     ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->block_tables.size(), GroupIds().size());
+    ASSERT_EQ(op->BlockTables().size(), GroupIds().size());
 
     std::set<std::int32_t> all_real;
     std::size_t fresh_positive_entries = 0;
     for (const auto& group_id : GroupIds()) {
-        ASSERT_EQ(op->block_tables.count(group_id), 1u) << group_id;
-        ASSERT_EQ(op->block_tables.at(group_id).size(), 1u) << group_id;
+        ASSERT_EQ(op->BlockTables().count(group_id), 1u) << group_id;
+        ASSERT_EQ(op->BlockTables().at(group_id).size(), 1u) << group_id;
         std::set<std::int32_t> group_real;
-        const std::size_t group_entries = CollectDisjointRealPages(op->block_tables.at(group_id), group_real, group_id);
+        const std::size_t group_entries =
+            CollectDisjointRealPages(op->BlockTables().at(group_id), group_real, group_id);
         EXPECT_GT(group_entries, 0u) << group_id;
         fresh_positive_entries += group_entries;
         for (std::int32_t page_id : group_real) {

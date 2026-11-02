@@ -78,7 +78,14 @@ bool holdsHeadOfLine(const Request& request) {
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
-    operation.block_tables = BuildBlockTables(coordinator, request.BlockTablesRef(), group_ids);
+    const auto& tables = request.BlockTablesRef();
+    _assert(tables.size() == group_ids.size(), "forward tables/group_ids size mismatch");
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
+            "forward tables/coordinator size mismatch");
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        operation.block_tables.emplace(
+            group_ids[i], ForwardBlockTable{coordinator.Allocator(static_cast<std::int32_t>(i)), tables[i]});
+    }
 }
 
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
@@ -240,8 +247,8 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
         operation.extend_state_checkpoint_len = checkpoint - info.already_scheduled_len;
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             if (const CacheBlockRef& block = cache_progress.state_checkpoint_blocks[i]) {
-                operation.block_tables[group_ids[i]].push_back(
-                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block));
+                operation.block_tables.at(group_ids[i]).checkpoint_page_id =
+                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block);
             }
         }
     }
@@ -773,8 +780,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                                 static_cast<std::int32_t>(current_progress.prefix_hashes.size());
     const bool completed_checkpoint =
         current_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= current_progress.state_checkpoint_tokens;
-    // Between publication points, consuming an existing reserve cannot fail
-    // and does not change the hash chain. Keep the rollback copy for admission.
+    // With no publication, allocation or reclaim, consume the existing reserve
+    // without an admission probe.
     if (!completed_page && !completed_checkpoint && state_step.kind != StateStep::Kind::kRotate &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
@@ -785,12 +792,20 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
     }
 
-    fsm::CacheProgress cache_progress = current_progress;
+    // Allocation/reclaim alone does not change the hash chain. Snapshot only
+    // for publication; failed admission must not commit its progress changes.
+    std::optional<fsm::CacheProgress> pending_progress;
+    if (completed_page || completed_checkpoint || prompt_end) {
+        pending_progress.emplace(current_progress);
+    }
+    fsm::CacheProgress& cache_progress = pending_progress ? *pending_progress : current_progress;
     const RequestProgress progress =
-        AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost() && first_decode,
-                               prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
-                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 || prompt_end);
+        pending_progress
+            ? AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                                     config_.StreamsDeviceCacheToHost() && first_decode,
+                                     prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
+                                     /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 || prompt_end)
+            : RequestProgress{.num_computed_tokens = num_computed_tokens};
 
     std::vector<GroupDemand> demands =
         MakeGroupDemands(tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
@@ -806,7 +821,11 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, checkpoint);
         }
     }
-    request->CacheProgressRef() = std::move(cache_progress);
+    if (pending_progress) {
+        current_progress = std::move(*pending_progress);
+    } else {
+        current_progress.published_state_checkpoint_blocks.clear();
+    }
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
 

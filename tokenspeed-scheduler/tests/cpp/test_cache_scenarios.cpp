@@ -114,14 +114,15 @@ std::vector<std::int32_t> RealPages(const std::vector<std::vector<std::int32_t>>
 void ExpectDecodeWorkingState(const Scheduler& scheduler, const ForwardBatch& batch, std::int32_t computed_tokens,
                               std::int32_t prefix_granularity, std::int32_t usable_blocks) {
     ASSERT_EQ(batch.request_ids, std::vector<std::string>{"parent"});
-    const auto& state = batch.block_tables.at("state").at(0);
+    const auto state = batch.BlockTables().at("state").at(0);
     const std::int32_t input_slot = (computed_tokens - 1) / prefix_granularity;
     ASSERT_GT(state.size(), static_cast<std::size_t>(input_slot));
     for (std::int32_t slot = 0; slot < input_slot; ++slot) {
         EXPECT_EQ(state[slot], 0) << "expired state at the exact accepted frontier: " << slot;
     }
     EXPECT_GT(state[input_slot], 0) << "the next forward still needs its input state";
-    for (const std::int32_t page : batch.block_tables.at("full").at(0)) {
+    const auto full_row = batch.BlockTables().at("full").at(0);
+    for (const std::int32_t page : full_row) {
         EXPECT_GT(page, 0) << "full-history pages never expire";
     }
     // These prompts are shorter than P, so there is no retained prefill
@@ -167,8 +168,8 @@ TEST_F(ChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
     ExecutionPlan chunk1 = PlanOnce();
     const ForwardBatch* op1 = FindForwardBatch(chunk1);
     ASSERT_NE(op1, nullptr);
-    ASSERT_EQ(op1->block_tables.count("full"), 1u);
-    const std::size_t full_after_c1 = op1->block_tables.at("full").at(0).size();
+    ASSERT_EQ(op1->BlockTables().count("full"), 1u);
+    const std::size_t full_after_c1 = op1->BlockTables().at("full").at(0).size();
     EXPECT_GT(full_after_c1, 0u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
     SendForwardDone("r1");
@@ -176,7 +177,7 @@ TEST_F(ChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
     ExecutionPlan chunk2 = PlanOnce();
     const ForwardBatch* op2 = FindForwardBatch(chunk2);
     ASSERT_NE(op2, nullptr);
-    const auto& full_c2 = op2->block_tables.at("full").at(0);
+    const auto full_c2 = op2->BlockTables().at("full").at(0);
     EXPECT_GT(full_c2.size(), full_after_c1) << "second chunk should extend the full-history block table";
     for (std::int32_t id : full_c2) {
         EXPECT_GT(id, 0) << "full-history row must have no null hole";
@@ -211,8 +212,8 @@ TEST_F(ChunkedPrefillSuite, FirstChunkPrepaysPromptHeadroomOnlyInFullHistoryGrou
     const ForwardBatch* op1 = FindForwardBatch(chunk1);
     ASSERT_NE(op1, nullptr);
     ASSERT_EQ(op1->input_lengths, (std::vector<std::int32_t>{4}));
-    EXPECT_EQ(op1->block_tables.at("full").at(0).size(), 11u);
-    EXPECT_EQ(op1->block_tables.at("swa").at(0).size(), 2u);
+    EXPECT_EQ(op1->BlockTables().at("full").at(0).size(), 11u);
+    EXPECT_EQ(op1->BlockTables().at("swa").at(0).size(), 2u);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,16 +254,16 @@ TEST_F(ThreeGroupSuite, ThreeGroupsEachEmitARowAndReclaim) {
     const ForwardBatch* op = FindForwardBatch(prefill);
     ASSERT_NE(op, nullptr);
 
-    ASSERT_EQ(op->block_tables.count("full"), 1u);
-    ASSERT_EQ(op->block_tables.count("swa_small"), 1u);
-    ASSERT_EQ(op->block_tables.count("swa_big"), 1u);
-    EXPECT_EQ(op->block_tables.at("full").size(), 1u);
-    EXPECT_EQ(op->block_tables.at("swa_small").size(), 1u);
-    EXPECT_EQ(op->block_tables.at("swa_big").size(), 1u);
+    ASSERT_EQ(op->BlockTables().count("full"), 1u);
+    ASSERT_EQ(op->BlockTables().count("swa_small"), 1u);
+    ASSERT_EQ(op->BlockTables().count("swa_big"), 1u);
+    EXPECT_EQ(op->BlockTables().at("full").size(), 1u);
+    EXPECT_EQ(op->BlockTables().at("swa_small").size(), 1u);
+    EXPECT_EQ(op->BlockTables().at("swa_big").size(), 1u);
 
-    auto full_pages = RealPages(op->block_tables.at("full"));
-    auto small_pages = RealPages(op->block_tables.at("swa_small"));
-    auto big_pages = RealPages(op->block_tables.at("swa_big"));
+    auto full_pages = RealPages(op->BlockTables().at("full"));
+    auto small_pages = RealPages(op->BlockTables().at("swa_small"));
+    auto big_pages = RealPages(op->BlockTables().at("swa_big"));
     std::set<std::int32_t> all(full_pages.begin(), full_pages.end());
     all.insert(small_pages.begin(), small_pages.end());
     all.insert(big_pages.begin(), big_pages.end());
@@ -318,8 +319,8 @@ TEST_F(SubPageWindowSuite, SubPageWindowsPlateauAtTwoRealPages) {
         const ForwardBatch* op = FindForwardBatch(decode);
         ASSERT_NE(op, nullptr) << "decode step " << step;
         // fullySlidOutBlocks frees only FULLY slid-out pages: 1 <= real pages <= 2.
-        const std::size_t w3_real = RealPages(op->block_tables.at("swa_w3")).size();
-        const std::size_t w5_real = RealPages(op->block_tables.at("swa_w5")).size();
+        const std::size_t w3_real = RealPages(op->BlockTables().at("swa_w3")).size();
+        const std::size_t w5_real = RealPages(op->BlockTables().at("swa_w5")).size();
         EXPECT_GE(w3_real, 1u) << "w=3 lost its live tail page at step " << step;
         EXPECT_LE(w3_real, 2u) << "w=3 working set exceeded 2 pages at step " << step;
         EXPECT_GE(w5_real, 1u) << "w=5 lost its live tail page at step " << step;
@@ -342,8 +343,8 @@ TEST_F(SubPageWindowSuite, StraddlingWindowHoldsPreviousPage) {
         ExecutionPlan decode = PlanOnce();
         const ForwardBatch* op = FindForwardBatch(decode);
         ASSERT_NE(op, nullptr);
-        const std::size_t w3_real = RealPages(op->block_tables.at("swa_w3")).size();
-        const std::size_t w5_real = RealPages(op->block_tables.at("swa_w5")).size();
+        const std::size_t w3_real = RealPages(op->BlockTables().at("swa_w3")).size();
+        const std::size_t w5_real = RealPages(op->BlockTables().at("swa_w5")).size();
         EXPECT_LE(w3_real, w5_real) << "a smaller window can never hold more pages, step " << step;
         if (w3_real < w5_real) {
             diverged = true;  // the straddling window (w=5) holds one more real page
@@ -399,7 +400,7 @@ TEST_F(AllFullTwoGroupSuite, BothFullGroupsKeepHistoryNoHoles) {
     const ForwardBatch* op = FindForwardBatch(*last);
     ASSERT_NE(op, nullptr);
     for (const char* key : {"full_a", "full_b"}) {
-        const auto& row = op->block_tables.at(key).at(0);
+        const auto row = op->BlockTables().at(key).at(0);
         for (std::int32_t id : row) {
             EXPECT_GT(id, 0) << key << " (full-history) must not develop a null hole";
         }
@@ -488,7 +489,7 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     const ForwardBatch* c2op = FindForwardBatch(chunk2);
     ASSERT_NE(c2op, nullptr);
     {
-        const auto& swa_c2 = c2op->block_tables.at("swa").at(0);
+        const auto swa_c2 = c2op->BlockTables().at("swa").at(0);
         ASSERT_EQ(swa_c2.size(), 4u);
         EXPECT_EQ(std::count(swa_c2.begin(), swa_c2.end(), 0), 0)
             << "N=4, W=4: no page fully below token 1, so chunk 2 punches nothing";
@@ -502,11 +503,12 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     const ForwardBatch* c3op = FindForwardBatch(chunk3);
     ASSERT_NE(c3op, nullptr);
     {
-        const auto& swa_c3 = c3op->block_tables.at("swa").at(0);
+        const auto swa_c3 = c3op->BlockTables().at("swa").at(0);
         ASSERT_EQ(swa_c3.size(), 7u);
         for (int s = 0; s <= 1; ++s) EXPECT_EQ(swa_c3[s], 0) << "slot " << s << " punched during prefill";
         for (int s = 2; s <= 6; ++s) EXPECT_GT(swa_c3[s], 0) << "slot " << s;
-        for (std::int32_t id : c3op->block_tables.at("full").at(0)) {
+        const auto full_row = c3op->BlockTables().at("full").at(0);
+        for (std::int32_t id : full_row) {
             EXPECT_GT(id, 0) << "full group keeps every chunk-built page";
         }
     }
@@ -524,10 +526,11 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
         ExecutionPlan plan = PlanOnce();
         const ForwardBatch* op = FindForwardBatch(plan);
         ASSERT_NE(op, nullptr);
-        for (std::int32_t id : op->block_tables.at("full").at(0)) {
+        const auto full_row = op->BlockTables().at("full").at(0);
+        for (std::int32_t id : full_row) {
             EXPECT_GT(id, 0) << "full group must keep chunk-built history without holes (round " << i << ")";
         }
-        swa_rows.push_back(op->block_tables.at("swa").at(0));
+        swa_rows.push_back(op->BlockTables().at("swa").at(0));
         SendForwardDone("r1", {tok++});
     }
 
@@ -574,13 +577,13 @@ TEST_F(ThreeGroupSuite, TwoRequestsBatchedAcrossThreeGroupsNoCollision) {
     ASSERT_EQ(op->request_ids.size(), 2u);
 
     for (const char* key : {"full", "swa_small", "swa_big"}) {
-        ASSERT_EQ(op->block_tables.count(key), 1u) << key;
-        EXPECT_EQ(op->block_tables.at(key).size(), 2u) << key;
+        ASSERT_EQ(op->BlockTables().count(key), 1u) << key;
+        EXPECT_EQ(op->BlockTables().at(key).size(), 2u) << key;
     }
 
     std::vector<std::int32_t> every;
     for (const char* key : {"full", "swa_small", "swa_big"}) {
-        auto pages = RealPages(op->block_tables.at(key));
+        auto pages = RealPages(op->BlockTables().at(key));
         every.insert(every.end(), pages.begin(), pages.end());
     }
     std::vector<std::int32_t> sorted = every;
@@ -645,9 +648,9 @@ TEST_F(MixedBatchSuite, PrefillAndDecodeShareOnePlan) {
     EXPECT_EQ(op->request_ids.at(1), "r1") << "decode after prefill";
 
     for (const char* key : {"full", "swa"}) {
-        ASSERT_EQ(op->block_tables.count(key), 1u) << key;
-        ASSERT_EQ(op->block_tables.at(key).size(), 2u) << key;
-        auto pages = RealPages(op->block_tables.at(key));
+        ASSERT_EQ(op->BlockTables().count(key), 1u) << key;
+        ASSERT_EQ(op->BlockTables().at(key).size(), 2u) << key;
+        auto pages = RealPages(op->BlockTables().at(key));
         std::vector<std::int32_t> sorted = pages;
         std::sort(sorted.begin(), sorted.end());
         EXPECT_EQ(std::adjacent_find(sorted.begin(), sorted.end()), sorted.end())
@@ -696,8 +699,8 @@ TEST_F(MixedBatchSuite, PerRequestSwaHoleAtDifferentDecodeDepths) {
     };
 
     // r2 may or may not remain in the batch; assert only on rows present.
-    const auto& swa = op->block_tables.at("swa");
-    const auto& full = op->block_tables.at("full");
+    const auto swa = op->BlockTables().at("swa");
+    const auto full = op->BlockTables().at("full");
     if (std::find(ids.begin(), ids.end(), "r1") != ids.end()) {
         std::size_t r1 = row_of("r1");
         EXPECT_NE(std::find(swa.at(r1).begin(), swa.at(r1).end(), 0), swa.at(r1).end())
@@ -746,7 +749,7 @@ TEST_F(PrefixGranularityOneSuite, TokenGranularPagesSlideAndReclaim) {
     ExecutionPlan prefill = PlanOnce();
     const ForwardBatch* pop = FindForwardBatch(prefill);
     ASSERT_NE(pop, nullptr);
-    EXPECT_EQ(pop->block_tables.at("full").at(0).size(), 4u) << "three prompt pages plus one preallocated decode page";
+    EXPECT_EQ(pop->BlockTables().at("full").at(0).size(), 4u) << "three prompt pages plus one preallocated decode page";
 
     SendForwardDone("r1", {42});
 
@@ -759,10 +762,11 @@ TEST_F(PrefixGranularityOneSuite, TokenGranularPagesSlideAndReclaim) {
     }
     const ForwardBatch* op = FindForwardBatch(*last);
     ASSERT_NE(op, nullptr);
-    for (std::int32_t id : op->block_tables.at("full").at(0)) {
+    const auto full_row = op->BlockTables().at("full").at(0);
+    for (std::int32_t id : full_row) {
         EXPECT_GT(id, 0) << "full group hole-free at prefix_granularity=1";
     }
-    const auto& swa = op->block_tables.at("swa").at(0);
+    const auto swa = op->BlockTables().at("swa").at(0);
     EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end())
         << "swa group must develop a null hole at prefix_granularity=1 too";
 
@@ -1024,8 +1028,8 @@ TEST_F(PrefillPlateauSuite, SwaWorkingSetPlateausWhileFullGrowsToPromptLength) {
         const ForwardBatch* op = FindForwardBatch(plan);
         ASSERT_NE(op, nullptr) << "chunk " << chunk;
         ASSERT_EQ(op->request_ids.size(), 1u) << "chunk " << chunk << " must be admitted";
-        const std::size_t swa_real = RealPages(op->block_tables.at("swa")).size();
-        const std::size_t full_real = RealPages(op->block_tables.at("full")).size();
+        const std::size_t swa_real = RealPages(op->BlockTables().at("swa")).size();
+        const std::size_t full_real = RealPages(op->BlockTables().at("full")).size();
         EXPECT_LE(swa_real, 5u) << "swa exceeded its four-page window plus decode reserve at chunk " << chunk;
         EXPECT_GE(full_real, full_last) << "full group must grow monotonically, chunk " << chunk;
         swa_peak = std::max(swa_peak, swa_real);
@@ -1126,6 +1130,65 @@ TEST_F(CapacityBlockPrefixCacheSuite, FailedAdmissionLeavesCacheProgressUncommit
     ASSERT_EQ(op->request_ids, std::vector<std::string>{"r3"});
     EXPECT_EQ(op->extend_prefix_lens.at(0), 6)
         << "page 2 was never published: the failed admission's progress leaked into the request";
+}
+
+class AllocationRetrySuite : public CapacityBlockSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = CapacityBlockSuite::MakeConfig();
+        // A group allocates every two tokens, while prefix progress advances
+        // every four. This leaves an allocation-only decode admission between
+        // prefix publication boundaries.
+        cfg.prefix_granularity = 4;
+        cfg.overlap_schedule_depth = 0;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(AllocationRetrySuite, DecodeAllocationFailureRetriesWithoutPublishingACompletedPage) {
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
+    ASSERT_EQ(free_at_start, 12);
+    Submit(MakeRequestSpec("r1", /*num_pages=*/1));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/1, /*start=*/101));
+    const ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* prefills = FindForwardBatch(prefill);
+    ASSERT_NE(prefills, nullptr);
+    ASSERT_EQ(prefills->request_ids, (std::vector<std::string>{"r1", "r2"}));
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+
+    // Both requests consume their prepaid decode slot. r1 lands at token 6,
+    // where two-token cache groups need another block but the four-token
+    // prefix hash chain has no newly completed page.
+    const ExecutionPlan first_decode = PlanOnce();
+    ASSERT_NE(FindForwardBatch(first_decode), nullptr);
+    EXPECT_EQ(FindForwardBatch(first_decode)->request_ids, (std::vector<std::string>{"r1", "r2"}));
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    const ExecutionPlan second_decode = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(second_decode)->request_ids, (std::vector<std::string>{"r1", "r2"}));
+    SendForwardDone("r1", {44});
+    const ExecutionPlan blocked = PlanOnce();
+    const ForwardBatch* blocked_batch = FindForwardBatch(blocked);
+    EXPECT_TRUE(blocked_batch == nullptr ||
+                std::ranges::find(blocked_batch->request_ids, "r1") == blocked_batch->request_ids.end());
+
+    // Once r2 leaves, r1 retries the same non-publication allocation and gets
+    // the new page; its row has grown from the prompt plus reserve to include
+    // the page needed for the next decode.
+    SendForwardDone("r2", {144});
+    SendFinish("r2");
+    const ExecutionPlan retried = PlanOnce();
+    const ForwardBatch* retry_batch = FindForwardBatch(retried);
+    ASSERT_NE(retry_batch, nullptr);
+    ASSERT_EQ(retry_batch->request_ids, (std::vector<std::string>{"r1"}));
+    EXPECT_GT(retry_batch->BlockTables().at("full_a").at(0).size(), 3u);
+    EXPECT_GT(retry_batch->BlockTables().at("full_b").at(0).size(), 3u);
+    SendForwardDone("r1", {44});
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(CapacityBlockSuite, AllBusyResidentsWaitUntilTheirResultsLand) {
@@ -4343,7 +4406,7 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
     const ForwardBatch* prefill_op = FindForwardBatch(prefill);
     ASSERT_NE(prefill_op, nullptr);
     ASSERT_EQ(prefill_op->request_ids.size(), 1u) << "the prompt must admit into the state-group config";
-    ASSERT_EQ(prefill_op->block_tables.count("state"), 1u);
+    ASSERT_EQ(prefill_op->BlockTables().count("state"), 1u);
     SendForwardDone("a", {1000});
 
     // A prompt that does not fit beside a waits for it. a keeps decoding
@@ -4481,7 +4544,7 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
     EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
     EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the junction";
-    const std::vector<std::int32_t> state_row = batch->block_tables.at("state").at(0);
+    const std::vector<std::int32_t> state_row = batch->BlockTables().at("state").at(0);
     ASSERT_EQ(state_row.size(), 2u);
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("state"), state_row[0]), 1)
         << "no checkpoint: the chunk starts from a zeroed block";
@@ -4499,7 +4562,7 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     ASSERT_NE(batch, nullptr);
     ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"first", "second"}));
     EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
-    const std::vector<std::int32_t> rotated = batch->block_tables.at("state").at(0);
+    const std::vector<std::int32_t> rotated = batch->BlockTables().at("state").at(0);
     EXPECT_EQ(rotated[0], state_row[1]) << "the previous chunk's output is this chunk's input";
     EXPECT_NE(rotated[1], 0);
     EXPECT_NE(rotated[1], rotated[0]);
@@ -4523,7 +4586,7 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
         }
         const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
         EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "the junction checkpoint is a hit";
-        EXPECT_EQ(batch->block_tables.at("state").at(row)[0], rotated[0]) << "resumes from the published checkpoint";
+        EXPECT_EQ(batch->BlockTables().at("state").at(row)[0], rotated[0]) << "resumes from the published checkpoint";
         const PrefixHitStats at_third = scheduler_->GetHostCacheStats().prefix_hits;
         EXPECT_EQ(at_third.device_hit_tokens, 6u);
         EXPECT_EQ(at_third.unresumable_kv_tokens, 6u) << "third's KV ends at its hit";
@@ -4588,7 +4651,7 @@ TEST_F(JunctionCutHostSuite, HostOnlyKvCutsTheFirstChunkAtTheJunction) {
     ASSERT_NE(batch, nullptr);
     ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
     EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
-    const std::int32_t checkpoint = batch->block_tables.at("state").at(0)[0];
+    const std::int32_t checkpoint = batch->BlockTables().at("state").at(0)[0];
     SendForwardDone("first", {7});
 
     // `third` shares the same six tokens and resumes at the junction.
@@ -4609,7 +4672,7 @@ TEST_F(JunctionCutHostSuite, HostOnlyKvCutsTheFirstChunkAtTheJunction) {
         }
         const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
         EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "the junction checkpoint is a hit";
-        EXPECT_EQ(batch->block_tables.at("state").at(row)[0], checkpoint) << "resumes from the published checkpoint";
+        EXPECT_EQ(batch->BlockTables().at("state").at(row)[0], checkpoint) << "resumes from the published checkpoint";
         const PrefixHitStats at_third = scheduler_->GetHostCacheStats().prefix_hits;
         EXPECT_EQ(at_third.device_hit_tokens, 6u);
         EXPECT_EQ(at_third.host_hit_tokens, 0u) << "the Device holds the junction's KV and checkpoint";
@@ -5086,7 +5149,7 @@ protected:
         EXPECT_NE(op, nullptr);
         std::map<std::string, std::vector<std::int32_t>> rows;
         if (op != nullptr) {
-            for (const auto& [gid, table] : op->block_tables) {
+            for (const auto& [gid, table] : op->BlockTables()) {
                 rows[gid] = table.at(0);
             }
         }
@@ -5135,13 +5198,13 @@ TEST_F(PrefixHitSuite, TwoRequestsSharePrefixReusePages) {
     EXPECT_EQ(op->input_ids, tail);
     // Complete group rows contain 4 claimed + ceil(4/2) fresh + 1
     // preallocated decode page = 7.
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 7u);
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 7u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 7u);
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 7u);
 
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
     const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 4);
-    ExpectRowPrefixEq(op->block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op->block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op->BlockTables().at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->BlockTables().at("swa").at(0), swa_prefix, "swa row");
 
     // Pool: 4 hit blocks/group remain active, 2 fresh blocks/group are
     // acquired, and 1 decode-reserve block/group is physically held.
@@ -5248,8 +5311,8 @@ TEST_F(PrefixHitSuite, FullHitCapsAtLastToken) {
     // input = tokens [6, 8) of the 1..8 sequence.
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/7));
     // 3 claimed + 1 fresh + 1 preallocated decode page per group.
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 5u);
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 5u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 5u);
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 5u);
     // Pool: 3 hit + 1 fresh + 1 reserved block per group.
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
@@ -5295,7 +5358,7 @@ TEST_F(PrefixReplaySuite, FullHitReplaysPrivateTailPages) {
     EXPECT_EQ(op->input_lengths.at(0), 4);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/4, /*start=*/5));
     for (const char* group_id : {"full", "swa"}) {
-        const auto& row = op->block_tables.at(group_id).at(0);
+        const auto row = op->BlockTables().at(group_id).at(0);
         ASSERT_EQ(row.size(), 5u);  // 2 hit + 2 private replay + 1 decode reserve
         EXPECT_EQ(row[0], first_rows.at(group_id)[0]);
         EXPECT_EQ(row[1], first_rows.at(group_id)[1]);
@@ -5420,14 +5483,14 @@ TEST_F(PrefixReplayHeterogeneousSuite, ReplayTailIsPrivateAcrossPackedGroups) {
     EXPECT_EQ(op->input_lengths.at(0), 8);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/8, /*start=*/25));
 
-    const auto& history = op->block_tables.at("history").at(0);
+    const auto history = op->BlockTables().at("history").at(0);
     ASSERT_EQ(history.size(), 5u);  // 3 hit + 1 replay + 1 decode reserve
     EXPECT_EQ(history[0], first_rows.at("history")[0]);
     EXPECT_EQ(history[1], first_rows.at("history")[1]);
     EXPECT_EQ(history[2], first_rows.at("history")[2]);
     EXPECT_NE(history[3], first_rows.at("history")[3]);
 
-    const auto& state = op->block_tables.at("state").at(0);
+    const auto state = op->BlockTables().at("state").at(0);
     ASSERT_EQ(state.size(), 17u);  // 12 hit + 4 replay + 1 decode reserve
     for (std::size_t i = 0; i < 12; ++i) {
         EXPECT_EQ(state[i], first_rows.at("state")[i]);
@@ -5457,7 +5520,7 @@ TEST_F(PrefixHitSuite, MaxCachedPrefixTokensCapsTheProbe) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 4);
     EXPECT_EQ(op->input_lengths.at(0), 8);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/8, /*start=*/5));
-    const auto& row = op->block_tables.at("full").at(0);
+    const auto row = op->BlockTables().at("full").at(0);
     ASSERT_GE(row.size(), 3u);
     EXPECT_EQ(row[0], first_rows.at("full")[0]);
     EXPECT_EQ(row[1], first_rows.at("full")[1]);
@@ -5658,8 +5721,8 @@ TEST_F(PrefixHitDisabledSuite, DisablePrefixCacheSkipsMatch) {
     EXPECT_EQ(op->input_lengths.at(0), 12) << "no hit -> the whole prompt is the input";
     EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
     EXPECT_EQ(op->input_ids, r2_tokens);
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 7u) << "six prompt pages plus one preallocated decode page";
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 7u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 7u) << "six prompt pages plus one preallocated decode page";
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 7u);
     // Pool: 6 live pages plus one physically reserved decode page per group.
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 14);
 
@@ -5693,13 +5756,13 @@ TEST_F(PrefixHitSuite, PartialHit) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 4);
     EXPECT_EQ(op->input_ids, tail);
     // 2 claimed + 4 fresh + 1 preallocated decode page per group.
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 7u);
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 7u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 7u);
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 7u);
 
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 2);
     const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 2);
-    ExpectRowPrefixEq(op->block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op->block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op->BlockTables().at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->BlockTables().at("swa").at(0), swa_prefix, "swa row");
 
     // Pool: 2 hit + 4 fresh + 1 reserved block per group.
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 14);
@@ -5745,17 +5808,17 @@ TEST_F(PrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
     EXPECT_EQ(op->input_ids, tail);
     // 4 claimed slots (real or hole) + 1 fresh + 1 preallocated decode page.
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 6u);
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 6u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 6u);
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 6u);
 
-    const auto& full_row = op->block_tables.at("full").at(0);
+    const auto full_row = op->BlockTables().at("full").at(0);
     ASSERT_EQ(full_row.size(), 6u);
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
     ExpectRowPrefixEq(full_row, full_prefix, "full row");
     EXPECT_GT(full_row[4], 0);
     EXPECT_GT(full_row[5], 0);
 
-    const auto& swa_row = op->block_tables.at("swa").at(0);
+    const auto swa_row = op->BlockTables().at("swa").at(0);
     ASSERT_EQ(swa_row.size(), 6u);
     EXPECT_EQ(swa_row[0], 0) << "out-of-window slot claimed as a null hole";
     EXPECT_EQ(swa_row[1], 0) << "out-of-window slot claimed as a null hole";
@@ -5876,7 +5939,7 @@ protected:
         EXPECT_NE(op, nullptr);
         std::map<std::string, std::vector<std::int32_t>> rows;
         if (op != nullptr) {
-            for (const auto& [gid, table] : op->block_tables) {
+            for (const auto& [gid, table] : op->BlockTables()) {
                 rows[gid] = table.at(0);
             }
         }
@@ -5947,14 +6010,14 @@ TEST_F(DecodeCachingSuite, DecodeFilledPageBecomesHittable) {
     EXPECT_EQ(op->prefill_lengths.at(0), 10);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
     // 4 claimed + 1 fresh + 1 preallocated decode page.
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 6u);
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 6u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 6u);
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 6u);
 
     // Slots 2,3 are the pages r1's decode filled, beyond its prompt boundary.
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
     const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 4);
-    ExpectRowPrefixEq(op->block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op->block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op->BlockTables().at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->BlockTables().at("swa").at(0), swa_prefix, "swa row");
 
     // Pool: claim 4/group (8) + 1 fresh/group (2) + 1 reserved/group (2).
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 12);
@@ -6004,14 +6067,14 @@ TEST_F(DecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     EXPECT_EQ(op3->prefill_lengths.at(0), 16);
     EXPECT_EQ(op3->input_ids, (std::vector<std::int32_t>{203, 951, 952, 953}));
     // 6 claimed + 2 fresh + 1 preallocated decode page.
-    EXPECT_EQ(op3->block_tables.at("full").at(0).size(), 9u);
-    EXPECT_EQ(op3->block_tables.at("swa").at(0).size(), 9u);
+    EXPECT_EQ(op3->BlockTables().at("full").at(0).size(), 9u);
+    EXPECT_EQ(op3->BlockTables().at("swa").at(0).size(), 9u);
 
     // Slots 0..3 are r1's blocks (re-freed cached by r2), 4..5 r2's own pages.
     const std::vector<std::int32_t> full_prefix(r2_rows.at("full").begin(), r2_rows.at("full").begin() + 6);
     const std::vector<std::int32_t> swa_prefix(r2_rows.at("swa").begin(), r2_rows.at("swa").begin() + 6);
-    ExpectRowPrefixEq(op3->block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op3->block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op3->BlockTables().at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op3->BlockTables().at("swa").at(0), swa_prefix, "swa row");
 
     // Pool: 6 claimed/group (12) + 2 fresh/group (4) + 1 reserved/group (2).
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 18);
@@ -6073,14 +6136,14 @@ TEST_F(DecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
     EXPECT_EQ(op->input_lengths.at(0), 2);
     EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 6u);
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 6u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 6u);
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 6u);
 
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
-    ExpectRowPrefixEq(op->block_tables.at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->BlockTables().at("full").at(0), full_prefix, "full row");
 
     // Slot 2's expected id was captured at the +105 round, before the punch.
-    const auto& swa_row = op->block_tables.at("swa").at(0);
+    const auto swa_row = op->BlockTables().at("swa").at(0);
     ASSERT_EQ(swa_row.size(), 6u);
     EXPECT_EQ(swa_row[0], 0) << "out-of-window slot claimed as a null hole";
     EXPECT_EQ(swa_row[1], 0) << "out-of-window slot claimed as a null hole";
@@ -6461,7 +6524,7 @@ TEST_F(HostHitSuite, AHostTailLoadsIntoPrivatePagesWithoutRepublication) {
     EXPECT_EQ(lb->src_pages.at(0).size(), 7u)
         << "4 full pages and the full tail block; the SWA lookback behind token 9 is page block [6,8) and the tail";
     EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "a Host tail is loaded, not copied";
-    const auto& full_row = op->block_tables.at("full").at(0);
+    const auto full_row = op->BlockTables().at("full").at(0);
     EXPECT_EQ(lb->dst_pages.at(0).at(4), full_row.at(4)) << "the tail block lands in the hitter's own slot 4";
     EXPECT_EQ(scheduler_->TailEntries(), 3u) << "r1's and the churns' tails stay enumerable while Host holds them";
 
@@ -6505,12 +6568,12 @@ TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
     EXPECT_EQ(op->prefill_lengths.at(0), 10);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/9));
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 6u) << "4 extension + 2 fresh pages, all new to the table";
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 6u);
+    EXPECT_EQ(op->BlockTables().at("full").at(0).size(), 6u) << "4 extension + 2 fresh pages, all new to the table";
+    EXPECT_EQ(op->BlockTables().at("swa").at(0).size(), 6u);
 
     // Wire pairs are group-major: full ext slots 0..3, then SWA slots 2..3.
-    const auto& full_row = op->block_tables.at("full").at(0);
-    const auto& swa_row = op->block_tables.at("swa").at(0);
+    const auto full_row = op->BlockTables().at("full").at(0);
+    const auto swa_row = op->BlockTables().at("swa").at(0);
     ASSERT_EQ(full_row.size(), 6u);
     ASSERT_EQ(swa_row.size(), 6u);
     const auto& dst = lb->dst_pages.at(0);
@@ -6843,7 +6906,7 @@ TEST_F(HostTailBelowWindowSuite, ATailBlockBelowTheWindowStaysAHoleAndCostsNothi
     ASSERT_EQ(loads.size(), 1u);
     EXPECT_EQ(std::get<LoadBackBatch>(loads.front()).src_pages.at(0).size(), 3u)
         << "page 0 and the tail block of the full group; the window block [6, 7) of the sliding group";
-    const auto& swa = r2->block_tables.at("swa").at(0);
+    const auto swa = r2->BlockTables().at("swa").at(0);
     ASSERT_GE(swa.size(), 4u);
     EXPECT_EQ(swa.at(0), 0);
     EXPECT_EQ(swa.at(1), 0);
@@ -7010,7 +7073,7 @@ protected:
         std::map<std::string, std::vector<std::int32_t>> rows;
         if (op != nullptr) {
             EXPECT_EQ(op->extend_replay_lens.at(0), 0) << "a cold prompt re-feeds nothing";
-            for (const auto& [gid, table] : op->block_tables) {
+            for (const auto& [gid, table] : op->BlockTables()) {
                 rows[gid] = table.at(0);
             }
         }
@@ -7063,7 +7126,7 @@ TEST_F(BoundedReplaySuite, FirstChunkAfterHitReplaysWindow) {
     EXPECT_EQ(op->input_ids, Slice(tokens, 16, 40));
 
     // Closed group: r1's four pages are shared, then fresh pages follow.
-    const auto& full_row = op->block_tables.at("full").at(0);
+    const auto full_row = op->BlockTables().at("full").at(0);
     ASSERT_GE(full_row.size(), 5u);
     for (std::size_t slot = 0; slot < 4; ++slot) {
         EXPECT_EQ(full_row[slot], r1_rows.at("full").at(slot)) << "full slot " << slot;
@@ -7071,8 +7134,8 @@ TEST_F(BoundedReplaySuite, FirstChunkAfterHitReplaysWindow) {
     EXPECT_GT(full_row[4], 0);
     // Replayable groups: holes below s=16, private pages from there through
     // the 40 computed tokens plus the decode slot.
-    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/41 / 4 + 1, "swa");
-    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/41 / 2 + 1, "tail");
+    ExpectHolesThenPages(op->BlockTables().at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/41 / 4 + 1, "swa");
+    ExpectHolesThenPages(op->BlockTables().at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/41 / 2 + 1, "tail");
 
     // Progress is the chunk, not the replay: r2 decodes from position 40 and
     // frees everything on finish.
@@ -7102,7 +7165,7 @@ TEST_F(BoundedReplaySuite, HitShorterThanWindowReplaysWholePrefix) {
     EXPECT_EQ(op->extend_replay_lens.at(0), 8);
     EXPECT_EQ(op->input_lengths.at(0), 16);
     EXPECT_EQ(op->input_ids, tokens);
-    EXPECT_GT(op->block_tables.at("swa").at(0).at(0), 0) << "no hole: the private suffix starts at 0";
+    EXPECT_GT(op->BlockTables().at("swa").at(0).at(0), 0) << "no hole: the private suffix starts at 0";
 }
 
 TEST_F(BoundedReplaySuite, NoHitNoReplay) {
@@ -7318,8 +7381,8 @@ TEST_F(BoundedReplayPrefillRoleSuite, LocalHitReplaysAndTheTailIsWhatTransfers) 
     EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
     EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 8);
     EXPECT_EQ(op->input_ids, Slice(tokens, 16, 40));
-    ExpectHolesThenPages(op->block_tables.at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/40 / 4, "swa");
-    ExpectHolesThenPages(op->block_tables.at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/40 / 2, "tail");
+    ExpectHolesThenPages(op->BlockTables().at("swa").at(0), /*first_page=*/16 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(op->BlockTables().at("tail").at(0), /*first_page=*/16 / 2, /*min_pages=*/40 / 2, "tail");
 }
 
 class BoundedReplayDecodeRoleSuite : public BoundedReplayPrefillRoleSuite {
@@ -7340,13 +7403,14 @@ TEST_F(BoundedReplayDecodeRoleSuite, RemoteAdmissionLandsTheRetainedTailAndRepla
     // The closed group lands the whole prompt; the replayable groups land
     // exactly the tail their retention keeps (swa window 16 -> from token 25,
     // page 6; tail window 2 -> from token 39, page 19), as any sliding group.
-    const auto& full_row = admission->block_tables.at("full").at(0);
+    const auto full_row = admission->BlockTables().at("full").at(0);
     ASSERT_GE(full_row.size(), 5u);
     for (std::size_t slot = 0; slot < 5; ++slot) {
         EXPECT_GT(full_row[slot], 0) << "full slot " << slot;
     }
-    ExpectHolesThenPages(admission->block_tables.at("swa").at(0), /*first_page=*/25 / 4, /*min_pages=*/40 / 4, "swa");
-    ExpectHolesThenPages(admission->block_tables.at("tail").at(0), /*first_page=*/39 / 2, /*min_pages=*/40 / 2, "tail");
+    ExpectHolesThenPages(admission->BlockTables().at("swa").at(0), /*first_page=*/25 / 4, /*min_pages=*/40 / 4, "swa");
+    ExpectHolesThenPages(admission->BlockTables().at("tail").at(0), /*first_page=*/39 / 2, /*min_pages=*/40 / 2,
+                         "tail");
     EXPECT_EQ(FindForwardBatch(plan)->request_ids.size(), 0u) << "the peer prefills; nothing runs locally";
 }
 

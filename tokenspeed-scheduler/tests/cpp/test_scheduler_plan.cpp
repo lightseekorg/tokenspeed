@@ -177,7 +177,7 @@ TEST_F(CopySourceRegrantSuite, ACopySourceEvictedInTheSameRoundIsBothCopiedAndZe
     const auto& copies = plan.pages_to_copy.at("full_attention");
     ASSERT_EQ(copies.size(), 1u);
     const auto [source, destination] = copies.front();
-    EXPECT_EQ(batch->block_tables.at("full_attention").at(0).at(1), destination);
+    EXPECT_EQ(batch->BlockTables().at("full_attention").at(0).at(1), destination);
     const auto& zeroed = plan.pages_to_zero.at("full_attention");
     EXPECT_NE(std::ranges::find(zeroed, source), zeroed.end()) << "r3 took the source once the copy left it cache-only";
     EXPECT_EQ(std::ranges::find(zeroed, destination), zeroed.end()) << "the copy fills the destination whole";
@@ -780,7 +780,7 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
     EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
     for (std::int32_t i = 0; i < 3; ++i) {
-        const auto& row = reuse->block_tables.at("linear_attention_" + std::to_string(i)).at(0);
+        const auto row = reuse->BlockTables().at("linear_attention_" + std::to_string(i)).at(0);
         EXPECT_GT(row.at(0), 0) << "the junction checkpoint is the chunk's input";
     }
 }
