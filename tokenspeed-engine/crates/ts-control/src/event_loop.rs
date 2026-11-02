@@ -833,10 +833,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 }
             }
         }
+        let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
         if plan.needs_device() || idle_forward {
             if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
-                let batch = forward.clone().expect("a pending forward has a batch");
+                // The batch itself waits for its commit: nothing below reads it.
+                let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
                 self.in_flight.push_back((batch, input_logprobs, pending));
                 forwarded = true;
@@ -846,7 +848,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
         // Commit from the head once the queue exceeds the depth; a round with
         // no new work drains fully so results never wait on future traffic.
-        let depth = if forward.is_some() {
+        let depth = if has_forward {
             self.config.in_flight_depth
         } else {
             0
@@ -979,6 +981,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// one: a prefill chunk that does not complete the
     /// prompt samples a token the commit discards.
     fn grammar_advance(&self, batch: &ForwardBatchView) -> Option<Vec<bool>> {
+        // Only an engine with a grammar backend gives requests grammars.
+        self.grammars.as_ref()?;
         let any = batch.request_ids.iter().any(|rid| {
             self.outputs
                 .state(rid)
