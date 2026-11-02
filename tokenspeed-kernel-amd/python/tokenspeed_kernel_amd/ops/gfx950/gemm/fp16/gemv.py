@@ -535,6 +535,10 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (32, 5120): frozenset({1, 4, 16}),
     # Attention QKV with the output gate, 8192-wide hidden.
     (2304, 8192): frozenset({4, 16}),
+    # 8192-hidden MLP at TP8 (gate/up and down): beat hipBLASLt at 8 and 16
+    # rows in cold-weight graph replay on MI355X.
+    (7168, 8192): frozenset({16}),
+    (8192, 3584): frozenset({16}),
 }
 
 
