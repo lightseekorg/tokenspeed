@@ -1616,9 +1616,7 @@ def _qwen4_exp_qsa_score_blocks_kernel(
                 tl.int64
             )
         else:
-            # Like ragged rows, uniform rows scale query and logits strides in
-            # int64.
-            row = group.to(tl.int64) * QUERY_GROUP_SIZE
+            row = group * QUERY_GROUP_SIZE
             group_size = QUERY_GROUP_SIZE
             request = tl.load(request_indices + row).to(tl.int64)
         row_mask = query_offsets < group_size
