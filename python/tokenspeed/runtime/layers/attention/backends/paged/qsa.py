@@ -37,7 +37,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     current_valid_rows,
     slice_to_real_tokens,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
+    PagedAttentionBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSALayout,
     QSASelection,
@@ -78,6 +82,11 @@ class QSAAttnBackend(MHAAttnBackend):
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
         self._metadata_capacity_rows = max_bs * self.spec_num_tokens
+
+    def tree_support(self) -> TreeSupport:
+        # The sparse layers do not read the tree mask; keep the base blockers
+        # instead of the MHA tree cascade.
+        return PagedAttentionBackend.tree_support(self)
 
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         # The sparse kernel reads an FP8 cache at unit scale.

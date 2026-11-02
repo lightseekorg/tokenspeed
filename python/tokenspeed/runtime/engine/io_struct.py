@@ -208,6 +208,9 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     output_top_logprobs_idx: list[list] = []
     # Resident LCM blocks, including reclaimable prefix-cache entries.
     kv_used_pages: int = 0
+    # Appended diagnostic tail: per-token cumulative probability mass, parallel
+    # to output_token_logprobs_val. Empty for frames without this diagnostic.
+    output_token_cumulative_probs_val: list[list[float]] = []
 
 
 class FlushCacheReqInput(BaseReq, kw_only=True):

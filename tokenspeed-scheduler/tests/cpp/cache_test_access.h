@@ -81,6 +81,10 @@ struct CacheCoordinatorTestAccess {
         return coordinator.boundary_tree_;
     }
 
+    static auto NodeEntries(const CacheCoordinator& coordinator, const BlockPool& pool, const ContentHash& hash) {
+        return coordinator.NodeEntries(pool, *coordinator.boundary_tree_.Find(hash));
+    }
+
     static std::size_t NumAccessClockSamples(const CacheCoordinator& coordinator) {
         return coordinator.access_clock_samples_.size();
     }

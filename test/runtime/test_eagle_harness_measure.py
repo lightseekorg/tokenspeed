@@ -208,18 +208,34 @@ def test_measurement_counts_rounds_from_the_last_prefill_and_ends_with_eos(
     assert counts == {"model_slm": MEASURED_ROUNDS, "model_llm": MEASURED_ROUNDS}
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="trtllm-gen attention needs SM100",
+@pytest.mark.parametrize(
+    "attention_backend",
+    [
+        pytest.param(
+            "trtllm",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or torch.version.hip is not None
+                or torch.cuda.get_device_capability()[0] != 10,
+                reason="trtllm-gen attention needs SM100",
+            ),
+        ),
+        pytest.param(
+            "mha",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs a GPU"
+            ),
+        ),
+    ],
 )
-def test_attention_samples_cover_the_context_grid() -> None:
+def test_attention_samples_cover_the_context_grid(attention_backend) -> None:
     from tokenspeed.runtime.execution.drafter.eagle_harness.measure_run import (
         attention_samples,
     )
 
     for sliding_window in (0, 256):
         records = attention_samples(
-            batch_size=2, rows=4, window=16, num_q_heads=8, num_kv_heads=2,
+            attention_backend=attention_backend, batch_size=2, rows=4, window=16, num_q_heads=8, num_kv_heads=2,
             head_dim=128, sliding_window=sliding_window, context_step=64,
             context_stop=1024, fast=True, repeat=2, widths=[1, 4],
             category="cache_llm",

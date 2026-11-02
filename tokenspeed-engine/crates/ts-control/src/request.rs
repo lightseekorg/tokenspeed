@@ -194,6 +194,9 @@ pub struct RequestState {
     pub output_ids: Vec<i32>,
     /// Their logprobs, when requested.
     pub output_logprobs: Vec<f64>,
+    /// Selected tokens' cumulative probability mass, when diagnostics and
+    /// logprobs are enabled.
+    pub output_token_cumulative_probs: Vec<f64>,
     /// Their top-k alternatives' logprobs and ids, when requested.
     pub output_top_logprobs: Option<TopLogprobs>,
     /// The prompt positions' logprobs as the chunks deliver them, over
@@ -288,6 +291,7 @@ impl RequestState {
             computed_length: 0,
             output_ids: Vec::new(),
             output_logprobs: Vec::new(),
+            output_token_cumulative_probs: Vec::new(),
             output_top_logprobs: None,
             input_logprob_rows: None,
             input_top_logprob_rows: None,

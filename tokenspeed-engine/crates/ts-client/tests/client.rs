@@ -111,6 +111,9 @@ async fn streams_tokens_until_finished() {
     assert_eq!(last.finish_reason.as_deref(), Some("length"));
     assert_eq!((last.prompt_tokens, last.completion_tokens), (3, 3));
     assert!(chunks[..2].iter().all(|c| c.finish_reason.is_none()));
+    assert!(chunks
+        .iter()
+        .all(|c| c.output_token_cumulative_probs.is_empty()));
     assert_eq!(client.in_flight(), [0]);
     assert_eq!(client.loads()[0].kv_total_pages, 100);
     let snapshots = client.fresh_loads(Duration::from_secs(3));
@@ -119,6 +122,40 @@ async fn streams_tokens_until_finished() {
     assert_eq!(snapshots[0].1.kv_used_pages, 7);
     assert_eq!(snapshots[0].1.kv_active_pages, 0);
     assert!(client.fresh_loads(Duration::ZERO).is_empty());
+}
+
+#[tokio::test]
+async fn selected_token_probabilities_survive_the_wire_and_owned_output_chunks() {
+    let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
+    let chunks = collect(
+        client
+            .generate(TokenizedGenerateReqInput {
+                return_logprob: true,
+                ..request("scored", Some(3))
+            })
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(tokens(&chunks), [1, 2, 3]);
+    assert_eq!(
+        chunks
+            .iter()
+            .flat_map(|c| c.output_token_logprobs.iter().copied())
+            .collect::<Vec<_>>(),
+        [-0.1, -0.2, -0.3],
+    );
+    assert_eq!(
+        chunks
+            .iter()
+            .flat_map(|c| c.output_token_cumulative_probs.iter().copied())
+            .collect::<Vec<_>>(),
+        [0.1, 0.2, 0.3],
+    );
+    assert_eq!(
+        chunks.last().unwrap().finish_reason.as_deref(),
+        Some("length")
+    );
 }
 
 #[tokio::test]

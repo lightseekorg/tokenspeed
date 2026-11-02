@@ -65,6 +65,12 @@ kernel. Verify runs it with `R = W = N`. Draft lanes run it with `R = K`
 over the `(S - 1) * K`-key lane window (below). There is no size-dependent
 second path.
 
+The `mha` leaf (the AMD path) runs the same cascade with a portable prefix
+half: the Triton extend, causal over `q_len = R` rows with its log-sum-exp
+(scaled to base 2 for the merge). It is pinned to Triton because its causal
+mask keeps row `r` at key `P - R + r` even when `P < R`, which the window
+kernel's merge assumes.
+
 Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
 sliding-window draft layer see in every lane row the window frozen at the
 round's prefix end: each row decodes the prefix alone (`q_len = 1` at the
@@ -211,7 +217,7 @@ executor refuses tree drafting with them at startup.
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup) and EAGLE4; `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
-attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
+attention backend, the `mha` backend with bf16 KV, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
@@ -255,6 +261,8 @@ workspace), so nothing here is a cache group for the C++ scheduler to own.
 * `test/runtime/test_tree_attention_cascade.py` — verify and lanes through the
   `trtllm`, `trtllm_mla`, and `tokenspeed_mla` leaves (each leaf's prefix decode plus
   the window kernel) against fp32.
+* `test/runtime/test_tree_attention_cascade_mha.py` — the same through the
+  `mha` leaf's Triton prefix half.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.
 * `test/runtime/test_tree_spec.py` — hidden-row and position compaction; the
