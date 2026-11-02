@@ -1188,9 +1188,10 @@ TEST_F(DropDeadCheckpointsSuite, NoTailOrStateIsCachedAtACoveredPromptEndOrAtThe
 }
 
 // A prompt that fits one chunk has no pre-tail checkpoint, so nothing covers
-// its prompt end, which the first decode publishes. Its finish past the
-// prompt end is dead all the same: with the in-forward checkpoint a prompt
-// repeating the reply resumes at the prompt end, without it at the finish.
+// its prompt end, which the first decode publishes. With the in-forward
+// checkpoint its finish past the prompt end is dead all the same, and a
+// prompt repeating the reply resumes at the prompt end; without it, at the
+// finish.
 TEST_F(DropDeadCheckpointsSuite, AnUncoveredPromptEndIsCachedButNotTheFinish) {
     for (const bool in_forward : {false, true}) {
         SCOPED_TRACE(in_forward);
@@ -1342,6 +1343,53 @@ TEST_F(DropDeadCheckpointsSuite, ARequestThatResumedPastItsCheckpointKeepsItsPro
     SendFinish("next");
     AckWriteBacks(PlanOnce());
     EXPECT_EQ(Probe("longer", Extended(next, {602, 603, 604})).prefix_tokens, 27);
+}
+
+// The checkpoint covers the prompt end only while the cache holds it. Under
+// a 2-token budget the 23-token prompt's chunk [18, 20) ends at its boundary
+// 20; the next chunk's admission publishes the live slot there, and the
+// request holds that checkpoint while it runs, but only as an optional hold.
+// In the default pool the checkpoint stays: the first decode drops the
+// prompt end and a longer prompt resumes at 20. In the smallest pool that
+// admits the prompt, the last chunk [22, 23) needs the room: its admission
+// lets the hold go and evicts the checkpoint, so the first decode publishes
+// the prompt end, where the longer prompt resumes.
+TEST_F(DropDeadCheckpointsSuite, AnEvictedCheckpointNoLongerCoversThePromptEnd) {
+    constexpr std::int32_t kPrompt = 23;
+    constexpr std::int32_t kLimit = kPrompt + 32;  // RequestWithTokens' budget
+    const std::vector<std::int32_t> tokens = MakeTokens(kPrompt);
+    for (const bool smallest_pool : {false, true}) {
+        SCOPED_TRACE(smallest_pool);
+        for (std::int32_t pages = smallest_pool ? kLimit / kP : 257;; ++pages) {
+            config_ = MakeConfig();
+            config_.device_allocator.total_pages = pages;
+            for (CacheGroupConfig& group : config_.cache_groups) {
+                group.total_pages = pages;
+            }
+            SetTestSnapshotPool(config_);
+            config_.max_scheduled_tokens = 2;
+            config_.decode_input_tokens = 1;
+            scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+            if (scheduler_->MaxSingleRequestTokens() >= kLimit) {
+                break;
+            }
+        }
+        Submit(RequestWithTokens("seed", tokens));
+        const std::vector<Chunk> chunks = RunPrefill("seed", kPrompt);
+        ASSERT_EQ(chunks.size(), 12u);
+        EXPECT_EQ(chunks[10].prefix_tokens, 20);
+        EXPECT_EQ(chunks[10].state_rows[0].at(0), chunks[9].state_rows[0].at(1)) << "the live slot published at 20";
+        EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, smallest_pool ? 3u : 0u)
+            << "the checkpoint's block in each State group";
+
+        const ExecutionPlan first = Decode("seed", 1);
+        EXPECT_EQ(first.pages_to_copy.at("full").size(), smallest_pool ? 1u : 0u)
+            << "the owner moves off a published prompt end's partial page";
+        EXPECT_EQ(scheduler_->TailEntries(), smallest_pool ? 1u : 0u);
+        SendFinish("seed");
+        AckWriteBacks(PlanOnce());
+        EXPECT_EQ(Probe("longer", Extended(tokens, {600})).prefix_tokens, smallest_pool ? kPrompt : 20);
+    }
 }
 
 // With Host L2 neither reaches Host: once the Device cache is cleared, Host
@@ -3094,10 +3142,10 @@ TEST_F(StateCheckpointFusedHostSuite, TheFusedRoleMarksTheInputAheadOfBothTailsO
 // page. f1's first chunk needs the room of one tail's checkpoints: the input
 // leaves, as h's reclaim, and h's next turn, the reply sent back as it was
 // generated, resumes at 28 on the Device. (Unmarked, the input ranks level
-// with h's prompt end and block location decides; here it leaves as an
-// admission victim.)
+// with h's prompt end, and both leave as admission victims: that turn starts
+// over.)
 TEST_F(StateCheckpointFusedHostSuite, AFinishThatPublishesNoEndStateStillMarksTheInput) {
-    device_pages_ = 18;
+    device_pages_ = 17;
     write_policy_ = SchedulerConfig::HostWritePolicy::kWriteThrough;
     in_forward_ = true;
     Reset(/*host_cache=*/false, /*decode_width=*/1);
