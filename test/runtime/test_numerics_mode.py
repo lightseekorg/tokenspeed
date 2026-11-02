@@ -279,13 +279,26 @@ class TestNumericsMode:
         with pytest.raises((ValueError), match=("--logprob-order")):
             ServerArgs(model="x", logprob_order="apex")
 
-    def test_rl_bitwise_reduces_dsa_slots_sorted(self):
-        assert (ServerArgs(model="x").dsa_slot_order) == ("selection")
-        assert (ServerArgs(model="x", numerics="rl-bitwise").dsa_slot_order) == (
-            "sorted"
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    @pytest.mark.parametrize("order", [None, "selection", "sorted"])
+    def test_dsa_slot_order_resolution(self, numerics, order):
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        kwargs = {} if order is None else {"dsa_slot_order": order}
+        argv = ["--model", "x", "--numerics", numerics]
+        if order is not None:
+            argv.extend(["--dsa-slot-order", order])
+        expected = "selection" if numerics == "rl-bitwise" else order or "selection"
+        assert (
+            ServerArgs(model="x", numerics=numerics, **kwargs).dsa_slot_order
+            == expected
         )
-        with pytest.raises((ValueError), match=("--dsa-slot-order")):
-            ServerArgs(model="x", dsa_slot_order="shuffled")
+        assert prepare_server_args(argv).dsa_slot_order == expected
+
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    def test_invalid_dsa_slot_order_is_rejected(self, numerics):
+        with pytest.raises(ValueError, match="--dsa-slot-order"):
+            ServerArgs(model="x", numerics=numerics, dsa_slot_order="shuffled")
 
     def test_rl_bitwise_combines_moe_slots_in_the_leaf(self):
         assert (ServerArgs(model="x").moe_combine_order) == ("rank")

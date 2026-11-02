@@ -146,7 +146,7 @@ MOE_COMBINE_ORDERS = ("rank", "slot")
 
 # ``--dsa-slot-order``: the order the sparse attention cores reduce a token's
 # selected KV slots in — ``selection``: as the top-k leaf emitted them (what
-# every core does); ``sorted``: ascending slot order, so the reduction is
+# every core does); ``sorted``: ascending token position, so the reduction is
 # batch-invariant whenever the selected set is; served only by cores
 # declaring the ``slot_order`` trait (registered batch-invariant leaves). Mirrors
 # ``tokenspeed_kernel``'s ``attention.dsa.SLOT_ORDERS``.
