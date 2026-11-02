@@ -47,8 +47,6 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=60,
     suite="runtime-2gpu",
-    disabled_on_runners=["amd-*"],
-    disabled_on_runners_reason="the EAGLE-4 candidate head kernels are NVIDIA-only",
 )
 
 # Shards of 8192 tokens: wide enough that startup prepares the fused distributed argmax.
@@ -142,14 +140,19 @@ def _check_greedy_candidate(rank, world_size, device):
     low_rank = hidden @ down_proj.to(device, torch.bfloat16).T
     scores = (low_rank @ scores_head.to(device, torch.bfloat16).T).float()
     shard_vocab = VOCAB // world_size
-    pools = [
-        torch.topk(scores[:, r * shard_vocab : (r + 1) * shard_vocab], NUM_CANDIDATES)
-        .indices.add(r * shard_vocab)
-        .tolist()
-        for r in range(world_size)
-    ]
-    for row in range(ROWS):
-        assert set(ids[row].tolist()) <= set().union(*(p[row] for p in pools))
+    # Each id is among its shard's top candidates: at least the shard's k-th
+    # largest score (ties at it may be any of them).
+    kth = torch.stack(
+        [
+            torch.topk(
+                scores[:, r * shard_vocab : (r + 1) * shard_vocab], NUM_CANDIDATES
+            ).values[:, -1]
+            for r in range(world_size)
+        ],
+        dim=-1,
+    )
+    assert bool((scores.gather(-1, ids) >= kth.gather(-1, ids // shard_vocab)).all())
+    assert bool((ids.sort(-1).values.diff(dim=-1) > 0).all())  # distinct ids
     assert torch.equal(best, ids.gather(-1, logits.argmax(-1, keepdim=True)).view(-1))
     gathered = [torch.empty_like(best) for _ in range(world_size)]
     dist.all_gather(gathered, best)

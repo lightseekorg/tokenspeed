@@ -1023,11 +1023,12 @@ def test_routed_lamport_polling_codegen(rank):
     read would serialize seven memory round trips. The retry decision must
     be the subgroup's lane mask rather than a cross-lane reduction.
     """
-    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
         iris_fused_lamport_allreduce_routed_rmsnorm_sum as fn,
     )
 
+    policy = iris_arch_policy(ArchVersion(9, 5))
     types = {
         "routes": "*bf16",
         "route_map": "*i32",
@@ -1048,9 +1049,8 @@ def test_routed_lamport_polling_codegen(rank):
             "EPS": 1e-5,
             "MAX_ELEMENTS": 43 * 4096,
             "PORTABLE_MATH": False,
-            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
-                ArchVersion(9, 5)
-            ).peer_signal_store,
+            "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+            "WAIT_STORES": policy.wait_stores,
         },
         num_warps=1,
     )
@@ -1077,7 +1077,7 @@ def test_attntail_lamport_polling_codegen():
     barriers into every retry; the subgroup ballot keeps them out.
     """
     rank = 5
-    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
         iris_fused_lamport_allreduce_muse_attntail as fn,
     )
@@ -1113,7 +1113,7 @@ def test_attntail_lamport_polling_codegen():
             "ROTATE_PEERS": False,
             "ELEMENTS_PER_THREAD": 8,
             "NUM_WARPS": 16,
-            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
         },
@@ -1136,8 +1136,9 @@ def test_gather_lamport_polling_codegen():
     from tokenspeed_kernel.ops.communication._iris.all_gather import (
         iris_fused_lamport_allgather_rmsnorm_mxfp4 as fn,
     )
-    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
 
+    policy = iris_arch_policy(ArchVersion(9, 5))
     types = {
         "local_input": "*bf16",
         "weight": "*bf16",
@@ -1159,9 +1160,8 @@ def test_gather_lamport_polling_codegen():
             "eps": 1e-6,
             "weight_offset": 1.0,
             "max_elements": 43 * 4096,
-            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
-                ArchVersion(9, 5)
-            ).peer_signal_store,
+            "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+            "WAIT_STORES": policy.wait_stores,
         },
         num_warps=1,
     )
@@ -1188,7 +1188,7 @@ def test_moetail_lamport_codegen(block_m):
     subgroup's lane mask. The mailbox pointer is compiled without alignment
     specialization: no 32-bit word may be split into 16-bit accesses.
     """
-    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
         iris_fused_gemv_lamport_allgather_muse_moetail as fn,
     )
@@ -1225,7 +1225,7 @@ def test_moetail_lamport_codegen(block_m):
             "PRE_EPS": 1e-5,
             "PRE_WEIGHT_OFFSET": 1.0,
             "HAS_PRE": True,
-            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
         },
@@ -1263,7 +1263,7 @@ def test_moetail_lamport_codegen(block_m):
 
 def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
         iris_lamport_bf16_allreduce,
     )
     from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
@@ -1289,7 +1289,7 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
             total_elements=raw_input.numel(),
             MAX_ELEMENTS=state.reduction.lamport_max_numel,
             NUM_STAGES=3,
-            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
         )
 
@@ -1370,7 +1370,7 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
 
 def _muse_routed_lamport_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
         iris_lamport_bf16_allreduce,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -1402,7 +1402,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             total_elements=value.numel(),
             MAX_ELEMENTS=state.reduction.lamport_max_numel,
             NUM_STAGES=3,
-            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
         )
 

@@ -20,8 +20,12 @@
 
 """Exact source edits and numerical isolation for the private SM90 MoE adapter."""
 
+import ctypes
 import difflib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from functools import partial
 from pathlib import Path
@@ -255,8 +259,277 @@ def test_prefix_scan_with_more_experts_than_threads_matches_original(
         torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
-def _activation_quantization_launches(call):
-    """Kernel names and grids of the grouped activation quantization in one call."""
+@pytest.fixture(scope="module")
+def fusion_implementations():
+    _require_private_sm90()
+    # Selecting fusion tests must not build all six general-purpose modules.
+    return (
+        prepare_sm90_fp8_moe(mode="default"),
+        prepare_sm90_fp8_moe(
+            mode="optimized", max_num_stages_fc1=4, max_num_stages_fc2=-1
+        ),
+    )
+
+
+@pytest.fixture(scope="module")
+def fusion_weights(fusion_implementations):
+    return _make_expert_weights(384, 512, 1024)
+
+
+def _assert_bitwise(actual, expected):
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    torch.testing.assert_close(
+        actual.contiguous().view(torch.uint8),
+        expected.contiguous().view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+
+
+def _check_fusion_routes(implementations, arguments, concentrated):
+    reference, candidate = implementations
+    tokens, top_k = arguments["token_selected_experts"].shape
+    experts = arguments["fc1_expert_weights"].shape[0]
+    hint = max(1, -(-tokens * top_k // experts))
+    call = partial(candidate, **arguments, expected_m=hint)
+    graph, output = _capture_calls([call])[0]
+    for shift in (0, experts // 2, experts - top_k):
+        ids = torch.arange(tokens * top_k, device="cuda").view(tokens, top_k)
+        if concentrated:
+            ids.remainder_(top_k)
+        arguments["token_selected_experts"].copy_((ids + shift) % experts)
+        arguments["input"].normal_(0, 0.1)
+        if shift == experts // 2:
+            arguments["input"][0].zero_()
+        arguments["token_final_scales"].copy_(
+            torch.softmax(torch.randn_like(arguments["token_final_scales"]), dim=-1)
+        )
+        expected = reference(**arguments)[0].clone()
+        assert torch.isfinite(expected).all()
+        if shift == experts // 2:
+            assert torch.count_nonzero(expected[0]) == 0
+        _assert_bitwise(call()[0], expected)
+        for _ in range(2):
+            graph.replay()
+            _assert_bitwise(output, expected)
+
+
+@pytest.mark.parametrize("tokens", (1, 8, 32, 128, 256))
+@pytest.mark.parametrize("enable_pdl", (False, True))
+@pytest.mark.parametrize("concentrated", (False, True))
+def test_fused_gated_block_fp8_matches_upstream(
+    fusion_implementations, fusion_weights, tokens, enable_pdl, concentrated
+):
+    """Fused FC1/quantized FC2 preserve bytes as graph inputs and routes change."""
+    arguments = _arguments(fusion_weights, tokens, 384, 512, 12, concentrated)
+    arguments["enable_pdl"] = enable_pdl
+    _check_fusion_routes(fusion_implementations, arguments, concentrated)
+
+
+@pytest.mark.parametrize("tokens,top_k", ((1, 1), (1, 2), (1, 3), (2, 1)))
+@pytest.mark.parametrize("enable_pdl", (False, True))
+def test_fused_gated_block_fp8_unaligned_rows(
+    fusion_implementations, fusion_weights, tokens, top_k, enable_pdl
+):
+    """Short FP8 inputs must zero-fill tail loads within this call's row capacity."""
+    arguments = _arguments(fusion_weights, tokens, 384, 512, top_k, False)
+    arguments["enable_pdl"] = enable_pdl
+    _check_fusion_routes(fusion_implementations, arguments, False)
+
+
+@pytest.mark.parametrize("enable_pdl", (False, True))
+def test_fused_gated_block_fp8_graph_lifecycle(
+    fusion_implementations, fusion_weights, enable_pdl
+):
+    """Captured fusion survives nonfused calls, layout changes and empty EP work."""
+    reference, candidate = fusion_implementations
+    arguments = _arguments(fusion_weights, 8, 384, 512, 12, False)
+    arguments.update(enable_pdl=enable_pdl, ep_size=8, ep_rank=7)
+    arguments["token_selected_experts"].add_(7 * 384)
+    call = partial(candidate, **arguments, expected_m=1)
+    graph, output = _capture_calls([call])[0]
+    # M512 disables fusion; hints 31/32 straddle SwapAB/regular GEMM selection.
+    for tokens, hint in ((512, 16), (8, 31), (8, 32)):
+        other = _arguments(fusion_weights, tokens, 384, 512, 12, False)
+        other.update(enable_pdl=enable_pdl, ep_size=8, ep_rank=7)
+        other["token_selected_experts"].add_(7 * 384)
+        _assert_bitwise(
+            candidate(**other, expected_m=hint)[0], reference(**other)[0].clone()
+        )
+        graph.replay()
+        _assert_bitwise(output, reference(**arguments)[0].clone())
+
+    for routing in ("local", "mixed", "no-local"):
+        ids = torch.arange(8 * 12, device="cuda").view(8, 12) % 384
+        if routing == "local":
+            ids.add_(7 * 384)
+        elif routing == "mixed":
+            ids[:, :6].add_(7 * 384)
+        arguments["token_selected_experts"].copy_(ids)
+        arguments["input"].normal_(0, 0.1)
+        arguments["input"][0].zero_()
+        arguments["token_final_scales"].copy_(
+            torch.softmax(torch.randn_like(arguments["token_final_scales"]), dim=-1)
+        )
+        expected = reference(**arguments)[0].clone()
+        assert torch.isfinite(expected).all()
+        if routing == "no-local":
+            assert torch.count_nonzero(expected) == 0
+        _assert_bitwise(call()[0], expected)
+        for _ in range(2):
+            graph.replay()
+            _assert_bitwise(output, expected)
+
+
+@pytest.mark.parametrize("enable_pdl", (False, True))
+def test_fused_gated_block_fp8_multichunk_scan(fusion_implementations, enable_pdl):
+    # 512 experts span two chunks of the 384-thread grouped scan.
+    weights = _make_expert_weights(512, 512, 1024)
+    for tokens, concentrated in ((8, False), (256, True)):
+        arguments = _arguments(weights, tokens, 512, 512, 12, concentrated)
+        arguments["enable_pdl"] = enable_pdl
+        _check_fusion_routes(fusion_implementations, arguments, concentrated)
+
+
+@pytest.mark.parametrize("enable_pdl", (False, True))
+@pytest.mark.parametrize("use_graph", (False, True))
+def test_fused_gated_block_fp8_launches(
+    fusion_implementations, fusion_weights, enable_pdl, use_graph
+):
+    """Inspect executed kernels and require FC1 completion before FC2 without PDL."""
+    arguments = _arguments(fusion_weights, 8, 384, 512, 12, False)
+    arguments["enable_pdl"] = enable_pdl
+    reference, candidate = fusion_implementations
+    calls = [
+        partial(reference, **arguments),
+        partial(candidate, **arguments, expected_m=1),
+    ]
+    graphs = _capture_calls(calls)
+    traces = [
+        _kernel_events(graph.replay if use_graph else call)
+        for call, (graph, _) in zip(calls, graphs)
+    ]
+    upstream, fused = traces
+    activation = "doActivationKernel"
+    quantization = "fp8_blockscale_gemm::scale_1x128_kernel<"
+    assert any(activation in event["name"] for event in upstream)
+    assert not any(activation in event["name"] for event in fused)
+    assert sum(quantization in event["name"] for event in upstream) == 2
+    assert sum(quantization in event["name"] for event in fused) == 1
+    grouped = sorted(
+        (
+            event
+            for event in fused
+            if "fp8_gemm_kernel" in event["name"]
+            and "GroupedWithOffset" in event["name"]
+        ),
+        key=lambda event: event["ts"],
+    )
+    assert len(grouped) == 2, [event["name"] for event in fused]
+    if not enable_pdl:
+        fc1, fc2 = grouped
+        assert fc2["ts"] >= fc1["ts"] + fc1["dur"], grouped
+
+
+def _graph_edges(graph):
+    """Read edge data into owned buffers before inspecting graph nodes."""
+    from cuda.bindings import driver as cu
+
+    class EdgeData(ctypes.Structure):
+        _fields_ = [
+            ("from_port", ctypes.c_ubyte),
+            ("to_port", ctypes.c_ubyte),
+            ("type", ctypes.c_ubyte),
+            ("reserved", ctypes.c_ubyte * 5),
+        ]
+
+    # cuda-python's returned edge structs can reference released array storage.
+    # Keep the CUDA driver's output arrays alive until their values are copied.
+    driver = ctypes.CDLL("libcuda.so.1")
+    get_edges = driver.cuGraphGetEdges_v2
+    get_edges.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(EdgeData),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    get_edges.restype = ctypes.c_int
+    raw = ctypes.c_void_p(graph.raw_cuda_graph())
+    count = ctypes.c_size_t()
+    assert get_edges(raw, None, None, None, ctypes.byref(count)) == 0
+    sources = (ctypes.c_void_p * count.value)()
+    targets = (ctypes.c_void_p * count.value)()
+    edges = (EdgeData * count.value)()
+    assert get_edges(raw, sources, targets, edges, ctypes.byref(count)) == 0
+    return (
+        [cu.CUgraphNode(node) for node in sources[: count.value]],
+        [cu.CUgraphNode(node) for node in targets[: count.value]],
+        [int(edge.type) for edge in edges[: count.value]],
+    )
+
+
+def _grouped_gemm_edges(graph):
+    """(source is a grouped GEMM, edge type) for each edge into a grouped GEMM."""
+    from cuda.bindings import driver as cu
+
+    def checked(result):
+        assert result[0] == cu.CUresult.CUDA_SUCCESS, result
+        return result[1:]
+
+    def is_grouped_gemm(node):
+        (kind,) = checked(cu.cuGraphNodeGetType(node))
+        if kind != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            return False
+        (params,) = checked(cu.cuGraphKernelNodeGetParams(node))
+        # Library kernels launched as cudaKernel_t may leave func null.
+        if int(params.func):
+            (name,) = checked(cu.cuFuncGetName(params.func))
+        else:
+            (name,) = checked(cu.cuKernelGetName(params.kern))
+        name = name.decode() if isinstance(name, bytes) else name
+        return "fp8_gemm_kernel" in name and "GroupedWithOffset" in name
+
+    sources, targets, types = _graph_edges(graph)
+    nodes = {int(node): node for node in sources + targets}
+    grouped = {key for key, node in nodes.items() if is_grouped_gemm(node)}
+    assert len(grouped) == 2, grouped  # FC1 and FC2
+    return sorted(
+        (int(source) in grouped, edge_type)
+        for source, target, edge_type in zip(sources, targets, types)
+        if int(target) in grouped
+    )
+
+
+@pytest.mark.parametrize(
+    "tokens,enable_pdl,expected",
+    (
+        # 512 rows exceed the fusion cap but still run swapAB grouped GEMMs.
+        (512, True, [(False, 0), (False, 0)]),
+        (8, True, [(False, 1), (True, 1)]),
+        (8, False, [(False, 0), (True, 0)]),
+    ),
+)
+def test_only_fused_chain_launches_as_programmatic_dependent(
+    fusion_implementations, fusion_weights, tokens, enable_pdl, expected
+):
+    """Only the fused FC1 -> FC2 chain is written to start before its
+    predecessor finishes; other grouped GEMMs keep stream order with PDL on."""
+    _, candidate = fusion_implementations
+    arguments = _arguments(fusion_weights, tokens, 384, 512, 12, False)
+    arguments["enable_pdl"] = enable_pdl
+    call = partial(candidate, **arguments, expected_m=1 if tokens <= 256 else 16)
+    for _ in range(3):
+        call()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        call()
+    # Programmatic (type 1) edges come from launches with PDL enabled.
+    assert _grouped_gemm_edges(graph) == expected
+
+
+def _kernel_events(call):
+    """Executed CUDA kernels, including device timestamps, from one call."""
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as profile:
@@ -266,11 +539,15 @@ def _activation_quantization_launches(call):
         trace = Path(directory) / "trace.json"
         profile.export_chrome_trace(str(trace))
         events = json.loads(trace.read_text())["traceEvents"]
+    return [event for event in events if event.get("cat") == "kernel"]
+
+
+def _activation_quantization_launches(call):
+    """Kernel names and grids of the grouped activation quantization in one call."""
     return [
         (event["name"], event["args"]["grid"])
-        for event in events
-        if event.get("cat") == "kernel"
-        and "fp8_blockscale_gemm::scale_1x128_kernel<" in event["name"]
+        for event in _kernel_events(call)
+        if "fp8_blockscale_gemm::scale_1x128_kernel<" in event["name"]
     ]
 
 
@@ -386,3 +663,47 @@ def test_invalid_stage_bound_is_rejected_before_initialization(stages, parameter
 def test_default_mode_rejects_an_explicit_stage_bound(parameter):
     with pytest.raises(ValueError, match="requires a private"):
         prepare_sm90_fp8_moe(mode="default", **{parameter: 4})
+
+
+_COLD_COMPILE = """
+import sys
+import torch
+sys.path.insert(0, {test_dir!r})
+import test_sm90_moe as t
+from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
+
+default = prepare_sm90_fp8_moe(mode="default")
+weights = t._make_expert_weights(384, 512, 1024)
+default(**t._arguments(weights, 256, 384, 512, 12, False))
+if {load_private}:
+    prepare_sm90_fp8_moe(mode="optimized", max_num_stages_fc1=4, max_num_stages_fc2=-1)
+torch.manual_seed(0)
+output = default(**t._arguments(weights, 1, 384, 512, 12, False))[0]
+torch.save(output.cpu(), {output!r})
+"""
+
+
+def test_private_module_leaves_original_cold_compiles_unchanged(tmp_path):
+    """Loading a private module must not point the installed module's DeepGEMM
+    JIT at patched headers: a shape it compiles afterwards matches a process
+    that never loaded one."""
+    _require_private_sm90()
+    outputs = []
+    for load_private in (False, True):
+        # A fresh process and DeepGEMM cache make the M=1 shape compile cold.
+        name = f"load_private_{load_private}"
+        script = _COLD_COMPILE.format(
+            test_dir=str(Path(__file__).resolve().parent),
+            load_private=load_private,
+            output=str(tmp_path / f"{name}.pt"),
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=dict(os.environ, TRTLLM_DG_CACHE_DIR=str(tmp_path / name)),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        assert result.returncode == 0, result.stderr[-4000:]
+        outputs.append(torch.load(tmp_path / f"{name}.pt"))
+    _assert_bitwise(outputs[1], outputs[0])

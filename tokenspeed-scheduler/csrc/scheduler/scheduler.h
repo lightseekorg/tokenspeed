@@ -178,9 +178,13 @@ private:
     bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
-        std::vector<std::string> candidate_prefix_hashes;
-        std::vector<std::string> extension_hashes;
-        std::vector<std::string> prefix_hashes;
+        bool waits_for_eviction_store{false};
+        std::string prefix_diagnostic;
+        // Views of the request's immutable prompt hashes. Only an admitted
+        // request copies its reused prefix into mutable execution progress.
+        std::span<const std::string> candidate_prefix_hashes;
+        std::span<const std::string> extension_hashes;
+        std::span<const std::string> prefix_hashes;
     };
 
     struct KvEventHashProgress {
@@ -235,10 +239,12 @@ private:
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
     };
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
-                                                std::int32_t remaining, std::int32_t decode_input_tokens);
+                                                std::int32_t remaining, std::int32_t decode_input_tokens,
+                                                std::int64_t kv_token_limit);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
-                                                             std::int32_t reserve_num_tokens_in_next_schedule_event);
+                                                             std::int32_t reserve_num_tokens_in_next_schedule_event,
+                                                             std::int64_t kv_token_limit);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            Request* request);
 
@@ -257,7 +263,7 @@ private:
                                                            std::optional<std::uint64_t> request_access_epoch,
                                                            bool evict_blocks_past_segments);
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
-        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
+        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
         std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
@@ -330,6 +336,7 @@ private:
         // the same candidates -- its first decode is next round's work).
         std::unordered_set<const Request*> scheduled;
         std::int32_t token_budget{0};
+        std::int32_t kv_page_budget{0};
         // Budget the decode batch must leave untouched for a pending local
         // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
         // fused mixed mode only).
@@ -358,6 +365,12 @@ private:
         // decode steps run against no chunk budget.
         if constexpr (std::is_same_v<Operation, PrefillOperation>) {
             build.token_budget -= operation.input_length;
+            if (config_.max_kv_page_num > 0) {
+                const std::int64_t end =
+                    static_cast<std::int64_t>(operation.extend_prefix_len) + operation.input_length;
+                build.kv_page_budget -=
+                    static_cast<std::int32_t>((end + config_.prefix_granularity - 1) / config_.prefix_granularity);
+            }
             build.pushed_prefill = true;
         } else if (config_.role != Role::kD) {
             build.token_budget -= operation.input_length;
@@ -373,7 +386,8 @@ private:
     std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
-                                                             std::vector<LoadBackOperation>& load_backs);
+                                                             std::vector<LoadBackOperation>& load_backs,
+                                                             std::int32_t kv_page_budget);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated

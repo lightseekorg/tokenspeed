@@ -73,7 +73,6 @@ def test_flashmla_prefill_plans_without_device_downloads(
         device="cuda",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        prefix_granularity=128,
         kernel_page_size=64,
         context_len=512,
         max_bs=4,

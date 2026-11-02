@@ -777,6 +777,7 @@ class HostDataPlane:
         tuple[int, float] | None,
         list[int] | None,
         tuple | None,
+        list[float] | None,
     ]:
         """Wait for a forward's host copies to land (the control thread: the
         event wait releases the interpreter lock), and return its sampled
@@ -817,6 +818,11 @@ class HostDataPlane:
             ),
             resolve_grammar_completion(results),
             _logprob_lists(results),
+            (
+                results.output_token_cumulative_probs.tolist()
+                if results.output_token_cumulative_probs is not None
+                else None
+            ),
         )
 
     def note_committed(self, dispatched: _Dispatched) -> None:
@@ -889,6 +895,14 @@ class HostDataPlane:
             )
         )
 
+    def check_weight_update(self, payload: bytes) -> tuple[bool, str]:
+        """Check a weight load's local prerequisites (a msgpack control
+        struct) for the replica-wide admission before any rank loads."""
+        ok, message = self._device.check_weight_update(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
+
     def update_weights(self, payload: bytes) -> tuple[bool, str]:
         """Apply one weight operation (a msgpack control struct), ordered
         behind the forwards dispatched before it."""
@@ -896,6 +910,10 @@ class HostDataPlane:
             zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
         )
         return bool(ok), str(message)
+
+    def commit_weight_update(self, success: bool) -> None:
+        """Publish a weight load only after the Rust rank agreement."""
+        self._device.commit_weight_update(success)
 
     def profile(self, payload: bytes) -> tuple[bool, str]:
         """Start or stop the profiler (a msgpack ``ProfileReq``)."""
@@ -1127,6 +1145,12 @@ class HostBootstrap:
                 context_len=model_config.context_len,
                 max_single_request_tokens=self._max_single_request_tokens,
                 decode_input_tokens=decode_input_tokens,
+                max_kv_page_num=(
+                    0
+                    if server_args.chunk_prefill_kv_size is None
+                    else scheduler_config.max_kv_page_num
+                ),
+                prefix_granularity=geometry.prefix_granularity,
             )
             self._max_total_num_tokens = geometry.token_capacity
             self._max_model_len = max_model_len
@@ -1398,13 +1422,25 @@ class HostBootstrap:
         self._device.shutdown_cache()
 
 
-def bootstrap(control_fd: int, pd_outbox) -> HostBootstrap | EncodeBootstrap:
+def bootstrap(
+    control_fd: int, pd_outbox, weight_update_commit_protocol: int = 0
+) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
     host's encode mode instead (``epd/encode_host.py``)."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
+    # Reject an older host binary before constructing a model or process
+    # group. Protocol 1 publishes the replica-wide decision that makes locally
+    # loaded weights usable; protocol 2 also agrees the load prerequisites
+    # before any rank starts loading. A binary without protocol 1 calls
+    # bootstrap with two arguments.
+    if server_args.enable_memory_saver and weight_update_commit_protocol < 2:
+        raise RuntimeError(
+            "Memory saver requires a ts-host binary with weight-update commit "
+            "protocol 2; rebuild tokenspeed-engine together with this runtime"
+        )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(

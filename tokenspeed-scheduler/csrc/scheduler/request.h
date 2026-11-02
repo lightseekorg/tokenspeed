@@ -218,6 +218,9 @@ public:
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
+    // Immutable input-page identities, owned by this request. Admission may
+    // retry against changing cache contents without hashing the input again.
+    std::span<const std::string> PromptPrefixHashes();
     std::span<const std::int32_t> TokenSlice(std::int32_t begin, std::int32_t size) const {
         return token_container_.TokenSlice(TokenContainer::Window{.begin = begin, .size = size});
     }
@@ -323,6 +326,7 @@ private:
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
+    std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
     fsm::State state_;
 };
 

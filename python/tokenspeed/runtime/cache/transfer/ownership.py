@@ -78,7 +78,13 @@ class BlockOwnerTranslation:
 
     @classmethod
     def for_host_pool(
-        cls, layout, contract, *, num_host_lcm_blocks: int, rank: int
+        cls,
+        layout,
+        contract,
+        *,
+        num_host_lcm_blocks: int,
+        host_group_packing: Sequence[int],
+        rank: int,
     ) -> BlockOwnerTranslation:
         """The translation between the arena and a Host pool of ``num_host_lcm_blocks``.
 
@@ -88,6 +94,8 @@ class BlockOwnerTranslation:
             contract: The arena's ``CacheRuntimeContract`` (shard counts and
                 Device bounds).
             num_host_lcm_blocks: The Host pool's LCM blocks, null excluded.
+            host_group_packing: Physical Host children per parent in layout
+                order, independent of the Device packing.
             rank: This rank in the owner subgroup.
         """
         shard_by_id = {
@@ -95,14 +103,18 @@ class BlockOwnerTranslation:
         }
         device_counts = contract.virtual_block_counts
         shard_counts = [shard_by_id[group.group_id] for group in layout.groups]
+        if len(host_group_packing) != len(layout.groups):
+            raise ValueError("Host packing must cover every layout group")
+        if any(packing <= 0 for packing in host_group_packing):
+            raise ValueError("Host packing must be positive")
         return cls(
             shard_counts=shard_counts,
             device_virtual_counts=[
                 device_counts[group.group_id] for group in layout.groups
             ],
             host_virtual_counts=[
-                1 + num_host_lcm_blocks * group.cache_blocks_per_lcm_block * shard
-                for group, shard in zip(layout.groups, shard_counts)
+                1 + num_host_lcm_blocks * packing * shard
+                for packing, shard in zip(host_group_packing, shard_counts)
             ],
             rank=rank,
         )

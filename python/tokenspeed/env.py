@@ -69,7 +69,6 @@ PACKAGE_LIST = [
     "pillow",
     "prometheus-client",
     "psutil",
-    "pybase64",
     "pybind11",
     "pydantic",
     "py-spy",

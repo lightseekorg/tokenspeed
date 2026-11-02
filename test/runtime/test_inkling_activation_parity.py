@@ -204,7 +204,6 @@ class _Harness:
             device=device,
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
-            prefix_granularity=PAGE_SIZE,
             kernel_page_size=PAGE_SIZE,
             context_len=1024,
             max_bs=4,

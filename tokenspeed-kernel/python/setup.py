@@ -375,7 +375,6 @@ KERNEL_GROUPS = [
     (
         "dsv4_attention",
         [
-            CUDA_CSRC_DIR / "dsv4_attention.cu",
             CUDA_CSRC_DIR / "dsv4_topk.cu",
             CUDA_CSRC_DIR / "dsv4_attention_binding.cu",
         ],

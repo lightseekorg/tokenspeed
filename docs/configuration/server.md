@@ -250,6 +250,12 @@ Real rollout log probabilities require `--enable-output-logprobs`.
 
 #### Releasing GPU memory (`--enable-memory-saver`)
 
+Set `--weight-memory-policy cpu_backup|discard` explicitly whenever
+`--enable-memory-saver` is enabled. The host Python package, native host and
+kernel package must be built from matching sources; an older native host is
+rejected before device initialization. See [weight memory policies](../serving/weight-memory.md)
+for the update contract and validation procedure.
+
 `ReleaseMemoryOccupationReqInput` frees GPU memory between rollouts so a
 trainer colocated on the same GPUs can use it;
 `ResumeMemoryOccupationReqInput` maps it back. Both take optional `tags`; a
@@ -259,7 +265,7 @@ restores whatever is released:
 | Tag | Memory | On resume |
 | --- | --- | --- |
 | `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
-| `weights` | model and draft parameters | restored from their CPU backup |
+| `weights` | model and draft parameters | CPU backup, or remapped and invalid until a complete update; frozen draft allocations retain CPU backup |
 | `cuda_graph` | the decode CUDA graphs' memory pool | discarded; replays rewrite it |
 | `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
 
@@ -271,7 +277,12 @@ disaggregated engine finishes new requests with an abort. Weight updates are
 refused while `weights` or `nccl` is released, so the RL order is: release
 everything, train, resume `["nccl", "cuda_graph", "weights"]` (without `nccl`
 on an older NCCL), push the new
-weights (`UpdateWeightsFromMooncakeReqInput`), resume `["kv_cache"]`. Sparse KV
+weights (`UpdateWeightsFromMooncakeReqInput`), resume `["kv_cache"]`. With `discard`,
+KV must be released before the weight update and cannot resume until every rank
+has loaded and committed the complete version. Under either policy, a weight
+load that fails after it started requires a restart; an update that any rank
+refuses before loading runs on no rank and can be retried. A bare resume of all
+tags immediately after discard is therefore invalid. Sparse KV
 offload keeps its pinned Host history mapped across a release and zeroes it on
 resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
@@ -410,8 +421,7 @@ Trainer-side contract:
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
-| `--prefix-granularity` | Scheduler prefix granularity in tokens — the identity boundary of cache reuse (`--block-size` is a deprecated alias). |
-| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. Requires prefix caching; startup refuses it unless every State group is GDN (FlashInfer prefill, a `--prefix-granularity` that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
+| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. Requires prefix caching; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
@@ -449,7 +459,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Aggregated and PD decode engines require matching `--decode-context-parallel-size`. PD sides shard their caches independently (a transfer edge copies only the pages both its prefill rank and decode rank own); the prefill role writes them with or without `--query-context-parallel-size`. GPU MLA/DSA speculative decoding is supported within each backend's device, dtype and draft-attention capabilities: the recipe shards the draft group like the target's, FlashMLA verification uses per-query local causal lengths and GPU DSA uses causal Top-K selection; non-causal DSA block drafts remain unsupported. The Host KVStore, retraction snapshot pool and L3 storage (`--kvstore-storage-backend`) use the same cyclic owner translation. L3 keys name a payload replica so an allocation may restore on a different owner; startup rejects head-partitioned fields in page-sharded groups. For Device/Host copies, the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
+| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4.1 global KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Aggregated and PD decode engines require matching `--decode-context-parallel-size`. PD sides shard their caches independently (a transfer edge copies only the pages both its prefill rank and decode rank own); the prefill role writes them with or without `--query-context-parallel-size`. GPU MLA/DSA speculative decoding is supported within each backend's device, dtype and draft-attention capabilities: the recipe shards the draft group like the target's, FlashMLA verification uses per-query local causal lengths and GPU DSA uses causal Top-K selection; non-causal DSA block drafts remain unsupported. The Host KVStore, retraction snapshot pool and L3 storage (`--kvstore-storage-backend`) use the same cyclic owner translation. L3 keys name a payload replica so an allocation may restore on a different owner; startup rejects head-partitioned fields in page-sharded groups. For Device/Host copies, the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
 | `--decode-context-parallel-size` | Decode context parallelism (DCP) in aggregated or PD decode engines: every rank attends the KV pages it owns under `--kv-parallel-size` and the partials are merged across the KVP group by their log-sum-exp (`docs/serving/parallelism.md`). Requires `--disaggregation-mode null` (the default) or `decode` and must equal `--kv-parallel-size`, which requires it in turn on those roles: a sharded cache has no other decode, so the launch names the compute explicitly. Aggregated DCP rejects `--enable-mixed-batch`. The backends key the DCP path on the mapping's KVP size, which the drafter's decode-shaped steps on a sharded prefill engine take as well. 1 (default) is off. |
 | `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--query-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--query-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
@@ -565,7 +575,7 @@ parser option keeps its existing behavior.
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees and chains (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
-| `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. |
+| `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
 | `--speculative-data-path` | EAGLE-Harness run directory: the cost data exec modes 0 and 1 read, which exec mode 2 writes. |
 | `--speculative-compute-intensity` | EAGLE-Harness policy tier: `high_intensity` (default) or `low_intensity` for trees, `chain_intensity` for chains (`--speculative-eagle-topk 1`). |
@@ -791,10 +801,10 @@ layerwise; startup still rejects a drafter class without that guarantee
 there).
 
 A block drafter writes its KV at the target's cache locations, so it shares the
-target's page table: `--prefix-granularity` is a target-side choice and the draft
-follows it. Any sliding window the draft checkpoint declares is an attention
-mask that the draft's own layers apply, never a cache-retention policy of its
-own. Only the backends that forward that mask to their kernels can serve such a
+target's page table: the prefix granularity is the target cache recipe's and
+the draft follows it. Any sliding window the draft checkpoint declares is an
+attention mask that the draft's own layers apply, never a cache-retention policy
+of its own. Only the backends that forward that mask to their kernels can serve such a
 draft: `mla` and `tokenspeed_mla` (`gluon` on AMD) for MLA drafts, and
 `mha`/`fa3`/`fa4`/`triton`/`flashinfer`/`trtllm_mha` for GQA drafts. Startup
 rejects any other `--drafter-attention-backend` rather than quietly widening
@@ -1107,6 +1117,14 @@ Host pinned buffer (L2 / flat KV)
 Mooncake Store (L3)
 ```
 
+Host L2 and the retraction snapshot pool pack each group's payload independently
+of Device strides. A shared Host parent fits the largest single group payload;
+each group fits as many whole children in it as possible. Empty parents are
+available to every group, including recurrent State; no group has reserved
+capacity.
+Mirrored ranks must have the same Host packing; startup refuses local layouts
+that would give the same Host block ID different meanings across ranks.
+
 **Write policy.** `--kvstore-write-policy` chooses when pages of the GPU
 prefix cache are copied to Host L2:
 
@@ -1166,17 +1184,31 @@ fused role,
 [§3.3](../design/scheduler.md#33-fused--one-engine-everything-local).
 
 **Sizing.** `--kvstore-size` (gigabytes per rank) wins over
-`--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).
+`--kvstore-ratio` (a multiple of this rank's Device LCM block count, 2 by
+default). Host parents use compact payload geometry, so the ratio counts
+parents rather than allocated bytes. Use `--kvstore-size` to request a byte
+budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
-allocator rounds every allocation up to a power of two, so a 140 GB L2
-takes 274.88 GB. A ratio size larger than that share is capped to the
-largest L2 every rank's share holds beside its snapshot pool -- the whole
-LCM blocks in the largest power of two that fits, and one size on every
-rank, since the ranks' schedulers mirror each other -- and each rank logs a
-warning with the requested and the capped size. An explicit
+headroom per rank. Each buffer counts at the size its configured pinned
+allocator reserves. On CUDA/ROCm, the launcher defaults
+`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
+up to 1 GiB round to a power of two; larger buffers use their requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
+and other allocator options are preserved. To override the default, set
+`PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
+the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
+take precedence, in that order. The check reads the effective allocator
+settings. A `pinned_max_cached_size_mb` limit also disables rounding above
+its threshold and releases those blocks when unused; it limits individual
+block size, not total cached bytes. Device backends without allocator
+snapshots retain the conservative power-of-two estimate.
+
+A ratio size larger than a rank's share is capped to the largest whole-LCM
+buffer that fits under those allocator settings beside its snapshot pool,
+with one size agreed across ranks. Each rank logs the requested and capped
+size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
 startup, as is a share without room for a single LCM block. Every rank
 must also resolve the same page counts: startup compares them across the

@@ -42,6 +42,7 @@ from tokenspeed.runtime.multimodal.encoder_batching import (  # noqa: E402
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (  # noqa: E402
     EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
+    pad_cu_seqlens,
 )
 
 
@@ -222,3 +223,22 @@ def test_budget_graph_ignores_what_an_earlier_replay_left_in_its_padding():
         expected = tower.forward_blocks(tokens, tower.prepare_metadata(grid))
     assert sorted(runner.budget_graphs) == [16, 32, 64, 128, 256]
     torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cu_seqlens_padding_does_not_synchronize():
+    # A budget graph's replay pads its cu_seqlens on the forward thread,
+    # behind the step in flight.
+    cu_seqlens = torch.tensor([0, 10, 25], dtype=torch.int32).to("cuda")
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        padded = pad_cu_seqlens(cu_seqlens, 25, 64, 4, "vision")
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    # Padding rows 25..64 run as sequences of at most PADDING_SEQUENCE_ROWS;
+    # the tail repeats the last offset up to the graph's fixed shape.
+    assert padded.tolist()[:3] == [0, 10, 25]
+    assert padded.tolist()[-1] == 64
+    assert padded.tolist() == sorted(padded.tolist())

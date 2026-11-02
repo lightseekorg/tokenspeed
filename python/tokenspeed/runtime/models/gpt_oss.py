@@ -366,19 +366,6 @@ class GptOssSparseMoeBlock(nn.Module):
         ]
 
 
-class _WeightCreator:
-    def __init__(self, fn):
-        self._fn = fn
-
-    @staticmethod
-    def maybe_materialize(obj):
-        if isinstance(obj, _WeightCreator):
-            output = obj._fn()
-            obj._fn = None
-            return output
-        return obj
-
-
 class GptOssConfig(PretrainedConfig):
     model_type = "gpt_oss"
 
@@ -476,10 +463,7 @@ class GptOssModel(BaseTransformerModel):
 
 class GptOssForCausalLM(BaseCausalLM):
     model_cls = GptOssModel
-    fall_back_to_pt_during_load = False
-
-    def get_attention_sliding_window_size(self):
-        return get_attention_sliding_window_size(self.config)
+    supports_aux_capture = True
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
@@ -546,15 +530,12 @@ class GptOssForCausalLM(BaseCausalLM):
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
-        is_nextn: bool = False,
         weight_name_mapping: dict = None,
     ):
 
         quant_config_name = (
             self.quant_config.get_name() if self.quant_config is not None else None
         )
-        if is_nextn:
-            raise ValueError("GPT-OSS does not support nextn weight loading.")
 
         if quant_config_name == "mxfp4":
             self._load_mxfp4_weights(weights, weight_name_mapping=weight_name_mapping)
@@ -609,8 +590,6 @@ class GptOssForCausalLM(BaseCausalLM):
         params_checker = {k: False for k in params_dict}
 
         for name, loaded_weight in weights:
-            loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
-
             if weight_name_mapping and name in weight_name_mapping:
                 name = weight_name_mapping[name]
 
@@ -749,8 +728,6 @@ class GptOssForCausalLM(BaseCausalLM):
                     mxfp4_block=mxfp4_block,
                 )
                 continue
-            weight = _WeightCreator.maybe_materialize(weight)
-
             if "gate_up_proj_blocks" in name:
                 new_name = name.replace("gate_up_proj_blocks", "w13_weight")
                 weight = weight.view(
@@ -844,8 +821,6 @@ class GptOssForCausalLM(BaseCausalLM):
         )
 
         for name, weight in weights:
-            weight = _WeightCreator.maybe_materialize(weight)
-
             match = per_expert_re.match(name)
             if match is None:
                 # ``router`` and other non-expert weights are emitted to the

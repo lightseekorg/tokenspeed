@@ -23,6 +23,7 @@ import torch
 from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.execution.weight_memory import backup_weights
 from tokenspeed.runtime.model_loader import get_model
 from tokenspeed.runtime.model_loader.weight_utils import require_unit_kv_scale_file
 from tokenspeed.runtime.utils import (
@@ -52,6 +53,7 @@ class WeightLoader:
         gpu_id: int,
         memory_saver_adapter: TorchMemorySaverAdapter,
         checkpoint_load_group: tuple[int, ...] | None,
+        is_draft_worker: bool,
     ):
         """Load model from disk.
 
@@ -64,6 +66,8 @@ class WeightLoader:
             checkpoint_load_group: Global ranks loading this model together,
                 for a distributed loader's collectives; None means every
                 rank. See ``LoadConfig.checkpoint_load_group``.
+            is_draft_worker: Whether these are draft allocations; frozen drafts
+                keep CPU backup even when target weights use discard.
 
         Returns:
             LoadedModel with model and dtype
@@ -95,9 +99,16 @@ class WeightLoader:
             checkpoint_load_group=checkpoint_load_group,
         )
 
-        # Load model with memory saver context. Tag as "weights" with CPU backup
-        # so release_memory_occupation offloads (and restores) them byte-exact.
-        with memory_saver_adapter.region(tag="weights", enable_cpu_backup=True):
+        # Shared target/draft tensors keep their original allocation policy.
+        # Frozen draft allocations are backed up even when the target is discarded.
+        with memory_saver_adapter.region(
+            tag="weights",
+            enable_cpu_backup=backup_weights(
+                policy=server_args.weight_memory_policy,
+                is_draft=is_draft_worker,
+                draft_policy=server_args.model_update_draft_weights,
+            ),
+        ):
             model = get_model(
                 model_config=model_config,
                 load_config=load_config,

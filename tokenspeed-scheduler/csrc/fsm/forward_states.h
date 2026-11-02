@@ -67,6 +67,11 @@ struct CacheProgress {
     // index keeps them cached. A retraction drops them once its publication
     // is applied (a Retracted request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
+    // One aligned input checkpoint and its non-replayable sliding windows.
+    // Kept while the request runs: restricted State cannot publish a decode
+    // frontier to replace it. Admission may release this optional hold for
+    // capacity, and retraction drops it before imaging the request.
+    std::vector<CacheBlockRef> retained_input_checkpoint;
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -99,6 +104,9 @@ struct AdmissionResources {
     std::int32_t prefix_granularity;
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    // Fixed prompt identities for admission retries, never residency. Leaving
+    // the pre-admission states releases them together with the storage hold.
+    PreparedPrefixKeys prefix_keys;
 };
 
 // Eligible for ordinary admission. A pending L3 dependency is Prefetching.

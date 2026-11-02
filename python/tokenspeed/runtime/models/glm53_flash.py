@@ -86,7 +86,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3MoE,
     MoEGate,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 from tokenspeed.runtime.models.glm5 import (
     GlmDsaDecodeTopK,
@@ -97,12 +97,10 @@ from tokenspeed.runtime.models.glm5 import (
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -950,10 +948,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         self._absorbed_kv_b_version = -1
 
     def _prepare_absorbed_mla_weights(self) -> None:
-        self.w_kc, self.w_vc = _prepare_mla_kv_b_proj_weights(
-            self.kv_b_proj.weight,
-            self,
-        )
+        absorb_mla_kv_b_proj(self)
         self._absorbed_kv_b_version = self.kv_b_proj.weight._version
 
     @break_point
@@ -1276,6 +1271,9 @@ class Glm53FlashDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
             self.self_attn.is_nextn = is_nextn
+            if is_nextn and config.index_share_for_mtp_iteration:
+                # Later draft steps reuse the first step's sparse selection.
+                self.self_attn.skip_indexer_topk = True
 
         if self.is_moe_layer:
             self.mlp = Glm53FlashMoE(
@@ -1473,8 +1471,6 @@ class Glm53FlashDecoderLayer(nn.Module):
 class Glm53FlashModel(nn.Module):
     """GLM-5.3-Flash text backbone with alternating KDA and sparse MLA layers."""
 
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: Glm53FlashTextConfig,
@@ -1508,7 +1504,6 @@ class Glm53FlashModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers_to_capture: list[int] = []
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -1817,13 +1812,6 @@ class Glm53FlashForConditionalGeneration(nn.Module):
                 "GLM-5.3-Flash encoder-only mode does not expose an LM head"
             )
         return self.language_model.lm_head
-
-    def pad_input_ids(
-        self,
-        input_ids: list[int],
-        mm_inputs: MultimodalInputs,
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def multimodal_input_embeds(

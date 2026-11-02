@@ -178,6 +178,35 @@ TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
     EXPECT_THROW(transfers.StartPrefixLoad(std::move(crossed)), std::runtime_error);
 }
 
+TEST(CacheOperationTest, ALoadExportsEachTiersBlockIdWithItsOwnPacking) {
+    BlockPool device_pool{2, {4}};
+    BlockPool host_pool{2, {6}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 4,
+        .block_granularity = 2,
+        .shard_count = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager manager{coordinator};
+    const std::array<std::int32_t, 8> buckets{0, 1, 0, 1, 0, 1, 0, 1};
+    const auto device = device_pool.AcquireBlocksInBuckets(0, std::span{buckets}.first(6));
+    auto host = host_pool.AcquireBlocksInBuckets(0, buckets);
+    ASSERT_EQ(device.size(), 6);
+    ASSERT_EQ(host.size(), 8);
+    const CacheKey key{.group_id = 0, .content_hash = "compact-host"};
+    coordinator.CacheHostBlock(host.back(), key, std::nullopt);
+    std::vector<BlockTransfer> rows;
+    rows.push_back(BlockTransfer{.group_id = 0, .source = host.back(), .destination = device.back(), .key = key});
+    const auto load = manager.StartPrefixLoad(std::move(rows));
+    ASSERT_EQ(load.transfers.size(), 1);
+    EXPECT_EQ(load.transfers.front().source_page, 8);
+    EXPECT_EQ(load.transfers.front().destination_page, 6);
+    manager.CompleteLoadBack(load.op_id);
+}
+
 TEST(CacheOperationTest, SamePagesInDifferentGroupsAreDistinctTransfers) {
     WriteBackOperation op;
     op.op_id = 10;
@@ -265,12 +294,12 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
     SchedulerConfig disabled = make_config();
     disabled.disable_l2_cache = true;
     SetTestSnapshotPool(disabled);
-    EXPECT_NO_THROW(Scheduler{std::move(disabled)});
+    EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(std::move(disabled))});
 
     SchedulerConfig empty = make_config();
     empty.host_allocator.total_pages = 1;
     SetTestSnapshotPool(empty);
-    EXPECT_NO_THROW(Scheduler{std::move(empty)});
+    EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(std::move(empty))});
 }
 
 TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
@@ -291,7 +320,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
             .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
         SetTestSnapshotPool(config);
-        return config;
+        return WithHostPackingFromDevice(config);
     };
 
     Scheduler small_host{make_config(/*host_pages=*/2)};
@@ -505,7 +534,7 @@ TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
         GroupAllocator& allocator = coordinator.Allocator(static_cast<std::int32_t>(key.group_id));
         CacheBlockRef block = pool.AcquireBlock(key.group_id);
         EXPECT_TRUE(block);
-        const std::int32_t page = allocator.ResolveCacheBlockId(block->Location());
+        const std::int32_t page = allocator.ResolveDeviceCacheBlockId(block->Location());
         coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
             .Register(pool, block, key, /*access_epoch=*/1, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
                       /*newly_cached=*/nullptr);
@@ -651,7 +680,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     SetTestSnapshotPool(config);
-    Scheduler scheduler{std::move(config)};
+    Scheduler scheduler{WithHostPackingFromDevice(std::move(config))};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec spec{
         .request_id = "too-large-for-device",
@@ -679,7 +708,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     SetTestSnapshotPool(config);
-    Scheduler scheduler{std::move(config)};
+    Scheduler scheduler{WithHostPackingFromDevice(std::move(config))};
     // Four usable blocks: three for the prompt and the decode width the P
     // reserves for its drafter, one for a tail changing hands.
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
@@ -780,7 +809,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
         .attn_kind = AttnKind::kFull,
     });
     SetTestSnapshotPool(config);
-    EXPECT_THROW(Scheduler{std::move(config)}, std::invalid_argument);
+    EXPECT_THROW(Scheduler{WithHostPackingFromDevice(std::move(config))}, std::invalid_argument);
 }
 
 TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
@@ -801,7 +830,7 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
     SetTestSnapshotPool(config);
     config.storage_config = StorageConfig{
         8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
-    EXPECT_NO_THROW(Scheduler{std::move(config)});
+    EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(std::move(config))});
 }
 
 TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {

@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import builtins
+import functools
 from typing import NamedTuple
 
 import torch
@@ -95,7 +97,7 @@ class AttentionConfig:
         assert NUM_BUFFERS == 2
 
         warp_bases = [[1, 0], [2, 0]]
-        instr_shape = [16, 16, 128] if IS_FP8 else [16, 16, 32]
+        instr_shape = [16, 16, 64] if IS_FP8 else [16, 16, 32]
         qk_layout = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
@@ -248,10 +250,10 @@ class AttentionProgram:
         lse_ptr,
         cu_seqlens_q_ptr,
         cu_seqlens_kv_ptr,
+        q_block,
     ):
-        batch = gl.program_id(0)
-        q_head = gl.program_id(1)
-        q_block = gl.program_id(2)
+        q_head = gl.program_id(0)
+        batch = gl.program_id(2)
         kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
         seq_base_q = gl.load(cu_seqlens_q_ptr + batch)
         q_len = gl.load(cu_seqlens_q_ptr + batch + 1) - seq_base_q
@@ -560,7 +562,7 @@ def _attend_tile_fp8(
     q_smem,
     q_rope_smem,
     tile_idx,
-    num_tiles,
+    tile_end,
     m_i,
     l_i,
     acc,
@@ -568,7 +570,7 @@ def _attend_tile_fp8(
 ):
     cfg = program.cfg
     buffer_index = tile_idx % cfg.NUM_BUFFERS
-    if tile_idx + 1 < num_tiles:
+    if tile_idx + 1 < tile_end:
         cdna5.tdm.async_wait(3)
     else:
         cdna5.tdm.async_wait(0)
@@ -598,7 +600,7 @@ def _attend_tile_fp8(
     v = program.shared_load_v(buffer_index)
     acc = program.compute_pv(p, v, acc)
 
-    if tile_idx + 2 < num_tiles:
+    if tile_idx + 2 < tile_end:
         next_tile_idx = tile_idx + 2
         program.issue_tile_loads(
             next_tile_idx * cfg.BLOCK_N, next_tile_idx % cfg.NUM_BUFFERS
@@ -607,8 +609,9 @@ def _attend_tile_fp8(
 
 
 @gluon.jit
-def process_query_block_fp8(program: AttentionProgram, num_tiles, main_end):
-    # Q is re-read from LDS on every tile so that a wave fits the register
+def attend_tiles_fp8(program: AttentionProgram, tile_start, masked_start, tile_end):
+    # Attends tiles [tile_start, tile_end); those from masked_start on need the
+    # mask. Q is re-read from LDS on every tile so that a wave fits the register
     # budget of three waves per SIMD.
     cfg = program.cfg
     q = program.load_q_nope()
@@ -631,26 +634,82 @@ def process_query_block_fp8(program: AttentionProgram, num_tiles, main_end):
     q_rope_smem.store(q_rope)
     m_i, l_i, acc = program.init_state()
 
-    program.issue_tile_loads(0, 0)
-    if num_tiles > 1:
-        program.issue_tile_loads(cfg.BLOCK_N, 1)
+    program.issue_tile_loads(tile_start * cfg.BLOCK_N, tile_start % cfg.NUM_BUFFERS)
+    if tile_start + 1 < tile_end:
+        program.issue_tile_loads(
+            (tile_start + 1) * cfg.BLOCK_N, (tile_start + 1) % cfg.NUM_BUFFERS
+        )
 
     # Separate loops keep the mask out of the fully visible tiles: a masked
     # branch inside one loop is flattened into selects on every tile.
-    for tile_idx in range(0, main_end):
+    for tile_idx in range(tile_start, masked_start):
         m_i, l_i, acc = _attend_tile_fp8(
-            program, q_smem, q_rope_smem, tile_idx, num_tiles, m_i, l_i, acc, False
+            program, q_smem, q_rope_smem, tile_idx, tile_end, m_i, l_i, acc, False
         )
-    for tile_idx in range(main_end, num_tiles):
+    for tile_idx in range(masked_start, tile_end):
         m_i, l_i, acc = _attend_tile_fp8(
-            program, q_smem, q_rope_smem, tile_idx, num_tiles, m_i, l_i, acc, True
+            program, q_smem, q_rope_smem, tile_idx, tile_end, m_i, l_i, acc, True
         )
+    return m_i, l_i, acc
 
+
+@gluon.jit
+def process_query_block_fp8(program: AttentionProgram, num_tiles, main_end):
+    cfg = program.cfg
+    m_i, l_i, acc = attend_tiles_fp8(program, 0, main_end, num_tiles)
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
+
+
+@gluon.jit
+def process_query_block_split_fp8(
+    program: AttentionProgram,
+    num_tiles,
+    main_end,
+    split,
+    num_splits,
+    slot,
+    partial_o_ptr,
+    partial_lse_ptr,
+):
+    """Attend one of ``num_splits`` KV ranges of a query block.
+
+    A block that is not split stores its output directly. Otherwise each split
+    publishes its normalized output and base-2 LSE to workspace slot
+    ``slot + split`` for ``gluon_mla_prefill_merge_gfx1250`` to combine.
+    """
+    cfg = program.cfg
+    tiles_per_split = (num_tiles + num_splits - 1) // num_splits
+    tile_start = split * tiles_per_split
+    tile_end = gl.minimum(tile_start + tiles_per_split, num_tiles)
+    masked_start = gl.minimum(gl.maximum(main_end, tile_start), tile_end)
+    m_i, l_i, acc = attend_tiles_fp8(program, tile_start, masked_start, tile_end)
+
+    valid_l = l_i > 0.0
+    safe_l = gl.where(valid_l, l_i, 1.0)
+    output = gl.convert_layout(acc * (1.0 / safe_l)[:, None], cfg.store_layout)
+    if num_splits == 1:
+        program.store_lse(l_i, m_i)
+        program.store_output(output)
+    else:
+        rows = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        cols = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        cdna5.buffer_store(
+            output.to(partial_o_ptr.dtype.element_ty),
+            partial_o_ptr + (slot + split) * (cfg.BLOCK_M * cfg.HEAD_DIM),
+            rows[:, None] * cfg.HEAD_DIM + cols[None, :],
+        )
+        # The LSE stays in the accumulator's row layout: converting it costs
+        # the tile loop registers.
+        lse = gl.where(valid_l, m_i * cfg.SM_SCALE + gl.log2(safe_l), -float("inf"))
+        cdna5.buffer_store(
+            lse,
+            partial_lse_ptr + (slot + split) * cfg.BLOCK_M,
+            gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)),
+        )
 
 
 @gluon.jit
@@ -663,6 +722,98 @@ def store_empty_query_block(program: AttentionProgram):
 
 
 @gluon.jit
+def _block_tiles(
+    q_len,
+    kv_len,
+    q_start,
+    IS_CAUSAL: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """Return a query block's key tile count and its first masked tile."""
+    if IS_CAUSAL:
+        kv_end = kv_len - q_len + q_start + BLOCK_M
+        kv_end = gl.minimum(kv_end, kv_len)
+        kv_end = gl.maximum(kv_end, 0)
+        # Tiles strictly below the first query row's causal limit are fully
+        # visible, so they can skip masking entirely.
+        main_end = kv_len - q_len + q_start
+        main_end = gl.maximum(main_end, 0) // BLOCK_N
+        main_end = gl.minimum(main_end, kv_len // BLOCK_N)
+    else:
+        kv_end = kv_len
+        main_end = kv_len // BLOCK_N
+    num_tiles = (kv_end + BLOCK_N - 1) // BLOCK_N
+    return num_tiles, main_end
+
+
+@gluon.jit
+def _split_count(
+    cu_seqlens_q_ptr,
+    cu_seqlens_kv_ptr,
+    batch,
+    q_head,
+    q_block,
+    num_tiles,
+    num_seqs,
+    num_q_blocks,
+    max_splits,
+    split_tiles,
+    split_programs,
+    N_HEADS: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+):
+    """Return a query block's KV split count and its first workspace slot."""
+    if IS_CAUSAL:
+        # Heavy blocks split into pieces of about split_tiles tiles.
+        num_splits = (num_tiles + split_tiles - 1) // split_tiles
+        num_splits = gl.minimum(num_splits, max_splits)
+        slot = ((batch * N_HEADS + q_head) * num_q_blocks + q_block) * max_splits
+    else:
+        # Every block with keys splits the same way, so that blocks and their
+        # splits together fill split_programs workgroups.
+        active = 0
+        rank = 0
+        prev_q = gl.load(cu_seqlens_q_ptr)
+        prev_kv = gl.load(cu_seqlens_kv_ptr)
+        for seq in range(0, num_seqs):
+            next_q = gl.load(cu_seqlens_q_ptr + seq + 1)
+            next_kv = gl.load(cu_seqlens_kv_ptr + seq + 1)
+            blocks = gl.where(
+                next_kv > prev_kv, (next_q - prev_q + BLOCK_M - 1) // BLOCK_M, 0
+            )
+            active += blocks
+            rank += gl.where(seq < batch, blocks, 0)
+            prev_q = next_q
+            prev_kv = next_kv
+        # Slots are strided by the launch-wide split count, before the
+        # per-block clamp, so blocks of different key lengths never overlap.
+        stride = gl.minimum(split_programs // (active * N_HEADS), max_splits)
+        num_splits = gl.minimum(stride, num_tiles // split_tiles)
+        num_splits = gl.maximum(num_splits, 1)
+        slot = ((rank + q_block) * N_HEADS + q_head) * stride
+    # Drop empty trailing splits.
+    tiles_per_split = (num_tiles + num_splits - 1) // num_splits
+    num_splits = (num_tiles + tiles_per_split - 1) // tiles_per_split
+    return num_splits, slot
+
+
+def _prefill_launch_metadata(grid, kernel, args):
+    """Describe the launch without reading device-resident sequence lengths."""
+    return {"name": f"{kernel.name}[D={args['HEAD_DIM']},H={args['N_HEADS']}]"}
+
+
+_SPLIT_ARGS = [
+    "num_seqs",
+    "num_q_blocks",
+    "max_splits",
+    "split_tiles",
+    "split_programs",
+]
+
+
+@gluon.jit(do_not_specialize=_SPLIT_ARGS, launch_metadata=_prefill_launch_metadata)
 def gluon_mla_prefill_gfx1250(
     q_ptr,
     k_ptr,
@@ -671,6 +822,13 @@ def gluon_mla_prefill_gfx1250(
     lse_ptr,
     cu_seqlens_q_ptr,
     cu_seqlens_kv_ptr,
+    partial_o_ptr,
+    partial_lse_ptr,
+    num_seqs,
+    num_q_blocks,
+    max_splits,
+    split_tiles,
+    split_programs,
     Q_STRIDE_T: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     K_STRIDE_T: gl.constexpr,
@@ -691,6 +849,7 @@ def gluon_mla_prefill_gfx1250(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     IS_FP8: gl.constexpr,
+    SPLIT_KV: gl.constexpr,
 ):
     cfg = AttentionConfig(
         N_HEADS,
@@ -710,6 +869,19 @@ def gluon_mla_prefill_gfx1250(
         InputStrides(O_STRIDE_T, O_STRIDE_H, 1),
         InputStrides(LSE_STRIDE_T, LSE_STRIDE_H, 1),
     )
+    if SPLIT_KV:
+        z = gl.program_id(1)
+        if IS_CAUSAL:
+            # Later query blocks see more keys; dispatch them first.
+            q_block = num_q_blocks - 1 - z // max_splits
+            split = z % max_splits
+        else:
+            # Split-major order puts every block's first split in the first wave.
+            q_block = z % num_q_blocks
+            split = z // num_q_blocks
+    else:
+        q_block = gl.program_id(1)
+        split = 0
     program = AttentionProgram.create(
         cfg,
         q_ptr,
@@ -719,28 +891,165 @@ def gluon_mla_prefill_gfx1250(
         lse_ptr,
         cu_seqlens_q_ptr,
         cu_seqlens_kv_ptr,
+        q_block,
     )
     if program.q_start < program.q_len:
-        if cfg.IS_CAUSAL:
-            kv_end = program.kv_len - program.q_len + program.q_start + cfg.BLOCK_M
-            kv_end = gl.minimum(kv_end, program.kv_len)
-            kv_end = gl.maximum(kv_end, 0)
-            # Tiles strictly below the first query row's causal limit are fully
-            # visible, so they can skip masking entirely.
-            main_end = program.kv_len - program.q_len + program.q_start
-            main_end = gl.maximum(main_end, 0) // cfg.BLOCK_N
-            main_end = gl.minimum(main_end, program.kv_len // cfg.BLOCK_N)
-        else:
-            kv_end = program.kv_len
-            main_end = program.kv_len // cfg.BLOCK_N
-        num_tiles = (kv_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N
-        if num_tiles > 0:
+        num_tiles, main_end = _block_tiles(
+            program.q_len, program.kv_len, program.q_start, IS_CAUSAL, BLOCK_M, BLOCK_N
+        )
+        if SPLIT_KV:
+            if IS_CAUSAL:
+                split_limit = max_splits
+            else:
+                # This sequence's blocks alone bound the split count, so most
+                # surplus workgroups exit without the per-sequence loop.
+                own_blocks = (program.q_len + BLOCK_M - 1) // BLOCK_M
+                split_limit = gl.maximum(split_programs // (own_blocks * N_HEADS), 1)
+            if num_tiles > 0 and split < split_limit:
+                num_splits, slot = _split_count(
+                    cu_seqlens_q_ptr,
+                    cu_seqlens_kv_ptr,
+                    gl.program_id(2),
+                    program.q_head,
+                    q_block,
+                    num_tiles,
+                    num_seqs,
+                    num_q_blocks,
+                    max_splits,
+                    split_tiles,
+                    split_programs,
+                    N_HEADS,
+                    IS_CAUSAL,
+                    BLOCK_M,
+                )
+                if split < num_splits:
+                    process_query_block_split_fp8(
+                        program,
+                        num_tiles,
+                        main_end,
+                        split,
+                        num_splits,
+                        slot,
+                        partial_o_ptr,
+                        partial_lse_ptr,
+                    )
+            elif split == 0:
+                store_empty_query_block(program)
+        elif num_tiles > 0:
             if cfg.IS_FP8:
                 process_query_block_fp8(program, num_tiles, main_end)
             else:
                 process_query_block(program, num_tiles, main_end)
         else:
             store_empty_query_block(program)
+
+
+@gluon.jit(do_not_specialize=_SPLIT_ARGS, launch_metadata=_prefill_launch_metadata)
+def gluon_mla_prefill_merge_gfx1250(
+    output_ptr,
+    lse_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_kv_ptr,
+    partial_o_ptr,
+    partial_lse_ptr,
+    num_seqs,
+    num_q_blocks,
+    max_splits,
+    split_tiles,
+    split_programs,
+    O_STRIDE_T: gl.constexpr,
+    O_STRIDE_H: gl.constexpr,
+    LSE_STRIDE_T: gl.constexpr,
+    LSE_STRIDE_H: gl.constexpr,
+    N_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    HAS_LSE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """Combine the published splits of every query block that was split."""
+    q_head = gl.program_id(0)
+    q_block = gl.program_id(1)
+    batch = gl.program_id(2)
+    seq_base_q = gl.load(cu_seqlens_q_ptr + batch)
+    q_len = gl.load(cu_seqlens_q_ptr + batch + 1) - seq_base_q
+    kv_len = gl.load(cu_seqlens_kv_ptr + batch + 1) - gl.load(cu_seqlens_kv_ptr + batch)
+    q_start = q_block * BLOCK_M
+    if q_start < q_len:
+        num_tiles, _ = _block_tiles(q_len, kv_len, q_start, IS_CAUSAL, BLOCK_M, BLOCK_N)
+        if num_tiles > 0:
+            num_splits, slot = _split_count(
+                cu_seqlens_q_ptr,
+                cu_seqlens_kv_ptr,
+                batch,
+                q_head,
+                q_block,
+                num_tiles,
+                num_seqs,
+                num_q_blocks,
+                max_splits,
+                split_tiles,
+                split_programs,
+                N_HEADS,
+                IS_CAUSAL,
+                BLOCK_M,
+            )
+            if num_splits > 1:
+                layout: gl.constexpr = gl.BlockedLayout(
+                    [1, 8], [2, 16], [gl.num_warps(), 1], [1, 0]
+                )
+                row_layout: gl.constexpr = gl.SliceLayout(1, layout)
+                rows = gl.arange(0, BLOCK_M, layout=row_layout)
+                cols = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, layout))
+                tile_offsets = rows[:, None] * HEAD_DIM + cols[None, :]
+                m_run = gl.full(
+                    [BLOCK_M], value=-float("inf"), dtype=gl.float32, layout=row_layout
+                )
+                l_run = gl.zeros([BLOCK_M], dtype=gl.float32, layout=row_layout)
+                o_run = gl.zeros([BLOCK_M, HEAD_DIM], dtype=gl.float32, layout=layout)
+                for s in range(0, num_splits):
+                    lse_s = cdna5.buffer_load(
+                        partial_lse_ptr + (slot + s) * BLOCK_M, rows
+                    )
+                    o_s = cdna5.buffer_load(
+                        partial_o_ptr + (slot + s) * (BLOCK_M * HEAD_DIM),
+                        tile_offsets,
+                    )
+                    m_new = gl.maximum(m_run, lse_s)
+                    m_safe = gl.where(m_new == -float("inf"), 0.0, m_new)
+                    alpha = gl.exp2(m_run - m_safe)
+                    weight = gl.exp2(lse_s - m_safe)
+                    l_run = l_run * alpha + weight
+                    o_run = (
+                        o_run * alpha[:, None] + o_s.to(gl.float32) * weight[:, None]
+                    )
+                    m_run = m_new
+                valid = l_run > 0.0
+                denom = gl.where(valid, l_run, 1.0)
+                offs_m = q_start + rows
+                live = offs_m < q_len
+                o_offsets = (
+                    (seq_base_q + offs_m[:, None]) * O_STRIDE_T
+                    + q_head * O_STRIDE_H
+                    + cols[None, :]
+                ).to(gl.int32)
+                cdna5.buffer_store(
+                    (o_run * (1.0 / denom)[:, None]).to(output_ptr.dtype.element_ty),
+                    output_ptr,
+                    o_offsets,
+                    mask=live[:, None],
+                )
+                if HAS_LSE:
+                    lse = gl.where(
+                        valid,
+                        (gl.where(valid, m_run, 0.0) + gl.log2(denom)) * _LN2,
+                        -float("inf"),
+                    )
+                    lse_offsets = (
+                        (seq_base_q + offs_m) * LSE_STRIDE_T + q_head * LSE_STRIDE_H
+                    ).to(gl.int32)
+                    cdna5.buffer_store(lse, lse_ptr, lse_offsets, mask=live)
 
 
 class LaunchConfig(NamedTuple):
@@ -754,10 +1063,42 @@ class LaunchConfig(NamedTuple):
     num_warps: int
     waves_per_eu: int
     grid: tuple[int, ...]
+    num_q_blocks: int
+    split_kv: bool
+    max_splits: int
+    split_tiles: int
+    split_programs: int
+    split_slots: int
+    llvm_fn_attrs: str | None
+
+
+# Launches that leave workgroup slots idle split each query block's keys over
+# up to _MAX_SPLITS workgroups of at least _SPLIT_MIN_TILES key tiles.
+_MAX_SPLITS = 8
+_SPLIT_MIN_TILES = 16
+# Bounds the per-sequence loop that sizes the splits on device.
+_MAX_SPLIT_SEQS = 16
+# Causal launches cut heavy blocks into this many pieces per two resident
+# workgroups, so the triangular tail is short.
+_CAUSAL_PIECES_PER_TWO_SLOTS = 3
 
 
 def _cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
+
+
+@functools.cache
+def _num_cus(device: int) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _causal_tiles(q_len: int, kv_len: int, block_m: int, block_n: int) -> list[int]:
+    """Key tiles each causal query block attends to."""
+    tiles = []
+    for q_start in range(0, q_len, block_m):
+        kv_end = min(builtins.max(kv_len - q_len + q_start + block_m, 0), kv_len)
+        tiles.append(_cdiv(kv_end, block_n))
+    return tiles
 
 
 def get_config(
@@ -766,18 +1107,58 @@ def get_config(
     k: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
+    max_seqlen_kv: int,
     softmax_scale: float,
+    is_causal: bool,
 ) -> LaunchConfig:
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
     block_m = 128
     block_n = 64
     num_warps = 4
+    is_fp8 = q.dtype in _FP8_DTYPES
     # The FP8 loop is sized for three waves per SIMD, so other workgroups'
     # waves run while one waits. 16-bit operands need more registers than that
     # allows.
-    waves_per_eu = 3 if q.dtype in _FP8_DTYPES else 1
+    waves_per_eu = 3 if is_fp8 else 1
     batch_size = cu_seqlens_q.numel() - 1
+    num_q_blocks = _cdiv(max_seqlen_q, block_m)
+    split_programs = _num_cus(q.device.index) * waves_per_eu
+    max_splits = 1
+    split_tiles = _SPLIT_MIN_TILES
+    split_slots = 0
+    if is_fp8 and is_causal and batch_size == 1:
+        # One sequence spans all tokens, so the host sees every block's work.
+        tiles = _causal_tiles(q.shape[0], k.shape[0], block_m, block_n)
+        total_pieces = split_programs * _CAUSAL_PIECES_PER_TWO_SLOTS // 2
+        split_tiles = builtins.max(
+            _SPLIT_MIN_TILES, _cdiv(n_heads * sum(tiles), total_pieces)
+        )
+        max_splits = min(
+            _MAX_SPLITS, _cdiv(builtins.max(tiles, default=0), split_tiles)
+        )
+        split_slots = n_heads * num_q_blocks * max_splits
+    elif is_fp8 and not is_causal and batch_size <= _MAX_SPLIT_SEQS:
+        # Every block of a single sequence is active; with more sequences only
+        # the device knows which have keys, so allow the most splits.
+        active = n_heads * (num_q_blocks if batch_size == 1 else 1)
+        max_splits = min(
+            _MAX_SPLITS,
+            split_programs // active,
+            _cdiv(max_seqlen_kv, block_n) // _SPLIT_MIN_TILES,
+        )
+        split_slots = split_programs
+    split_kv = max_splits > 1
+    if not split_kv:
+        max_splits = 1
+        split_slots = 0
+    # Short FP8 prefixes give each block a few key tiles, so a launch is
+    # bound by one block's latency, worst next to the output-only blocks of
+    # new sequences. Clustering memory instructions shortens a block; at
+    # longer prefixes it costs 3-5%.
+    llvm_fn_attrs = None
+    if is_fp8 and not is_causal and max_seqlen_kv <= _SPLIT_MIN_TILES * block_n:
+        llvm_fn_attrs = "amdgpu-sched-strategy=max-memory-clause"
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -788,7 +1169,17 @@ def get_config(
         block_n=block_n,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
-        grid=(batch_size, n_heads, _cdiv(max_seqlen_q, block_m)),
+        # Sequences are the slowest grid axis, so that one sequence's blocks
+        # are dispatched together rather than interleaved with the other
+        # sequences' blocks, many of which have no keys or exit at once.
+        grid=(n_heads, num_q_blocks * max_splits, batch_size),
+        num_q_blocks=num_q_blocks,
+        split_kv=split_kv,
+        max_splits=max_splits,
+        split_tiles=split_tiles,
+        split_programs=split_programs,
+        split_slots=split_slots,
+        llvm_fn_attrs=llvm_fn_attrs,
     )
 
 
@@ -814,7 +1205,7 @@ def launch_gluon_mla_prefill_gfx1250(
     ``v`` is ``[total_tokens, num_kv_heads, 128]``. Output is
     ``[total_tokens, num_heads, 128]``.
     """
-    del max_seqlen_kv, seq_lens_kv
+    del seq_lens_kv
     if logit_cap != 0.0:
         raise NotImplementedError(
             "gluon MLA prefill gfx1250 does not support logit_cap"
@@ -867,7 +1258,28 @@ def launch_gluon_mla_prefill_gfx1250(
         k=k,
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
         softmax_scale=softmax_scale,
+        is_causal=is_causal,
+    )
+    batch_size = cu_seqlens_q.numel() - 1
+    if config.split_kv:
+        partial_o = torch.empty(
+            (config.split_slots, config.block_m, config.head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            (config.split_slots, config.block_m), dtype=torch.float32, device=q.device
+        )
+    else:
+        partial_o, partial_lse = out, lse_arg
+    split_args = (
+        batch_size,
+        config.num_q_blocks,
+        config.max_splits,
+        config.split_tiles,
+        config.split_programs,
     )
     gluon_mla_prefill_gfx1250[config.grid](
         q,
@@ -877,6 +1289,9 @@ def launch_gluon_mla_prefill_gfx1250(
         lse_arg,
         cu_seqlens_q,
         cu_seqlens_kv,
+        partial_o,
+        partial_lse,
+        *split_args,
         q.stride(0),
         q.stride(1),
         k.stride(0),
@@ -897,9 +1312,34 @@ def launch_gluon_mla_prefill_gfx1250(
         config.block_m,
         config.block_n,
         is_fp8,
+        config.split_kv,
         num_warps=config.num_warps,
         waves_per_eu=config.waves_per_eu,
+        **({"llvm_fn_attrs": config.llvm_fn_attrs} if config.llvm_fn_attrs else {}),
     )
+    if config.split_kv:
+        gluon_mla_prefill_merge_gfx1250[
+            (config.n_heads, config.num_q_blocks, batch_size)
+        ](
+            out,
+            lse_arg,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            partial_o,
+            partial_lse,
+            *split_args,
+            out.stride(0),
+            out.stride(1),
+            lse_arg.stride(0),
+            lse_arg.stride(1),
+            config.n_heads,
+            config.head_dim,
+            is_causal,
+            return_lse,
+            config.block_m,
+            config.block_n,
+            num_warps=4,
+        )
     if return_lse:
         return out, lse
     return out

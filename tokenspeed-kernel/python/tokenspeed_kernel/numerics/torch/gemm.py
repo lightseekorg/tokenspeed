@@ -24,10 +24,6 @@ import math
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.numerics.torch.embedding import rotate
-from tokenspeed_kernel.numerics.torch.quantization import (
-    quantize_fp8_groups,
-)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -627,66 +623,3 @@ def torch_simt_gemm_fp32(
         out.copy_(total)
         return out
     return total.to(device)
-
-
-@register_kernel(
-    "gemm",
-    "dsv4_grouped_output_projection",
-    name="torch_dsv4_grouped_output_projection",
-    solution="torch",
-    signatures=frozenset(
-        format_signature(
-            attention=dense_tensor_format(input_dtype),
-            weight=dense_tensor_format(fp8_dtype),
-        )
-        for input_dtype in (torch.float16, torch.bfloat16)
-    ),
-    traits={},
-    priority=Priority.REFERENCE,
-)
-def torch_dsv4_grouped_output_projection(
-    *,
-    attention: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    heads_per_group: int,
-    output_dim: int,
-    nope_dim: int,
-    rope_dim: int,
-    block_size: tuple[int, int],
-) -> torch.Tensor:
-    """DeepSeek-V4 grouped output projection of the attention output.
-
-    Inverse-rotates the last ``rope_dim`` features of each head (GPT-J pairs),
-    quantizes each group's FP32 row to FP8 with power-of-two scales per
-    ``block_size[1]`` columns (no intermediate BF16 rounding), and multiplies
-    by the canonical ``[num_groups * output_dim, heads_per_group * head_dim]``
-    FP8 weight dequantized with its ``block_size`` FP32 scales.
-
-    Returns:
-        ``[tokens, num_groups, output_dim]`` in FP32, unrounded.
-    """
-    tokens = attention.shape[0]
-    values = attention.float().clone()
-    cos, sin = cos_sin_cache[positions].float().unsqueeze(1).chunk(2, dim=-1)
-    values[..., nope_dim : nope_dim + rope_dim] = rotate(
-        values[..., nope_dim : nope_dim + rope_dim], cos, -sin, is_neox=False
-    )
-    block_n, block_k = block_size
-    codes, scales = quantize_fp8_groups(
-        values.reshape(tokens, num_groups, -1),
-        block_k,
-        power_of_two_scale=True,
-        min_scale=1e-10 / 448.0,
-    )
-    dequantized = codes.float() * scales.repeat_interleave(block_k, dim=-1)
-    dequantized_weight = weight.float() * weight_scale.repeat_interleave(
-        block_n, dim=0
-    ).repeat_interleave(block_k, dim=1)
-    grouped_weight = dequantized_weight.reshape(num_groups, output_dim, -1)
-    return torch.bmm(
-        dequantized.transpose(0, 1), grouped_weight.transpose(1, 2)
-    ).transpose(0, 1)

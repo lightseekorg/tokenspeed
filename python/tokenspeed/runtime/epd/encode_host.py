@@ -55,6 +55,11 @@ from tokenspeed.runtime.cache.embedding_cache import (
     TieredEmbeddingCache,
 )
 from tokenspeed.runtime.engine import zmq_wire
+from tokenspeed.runtime.engine.gc_hooks import (
+    FULL_COLLECTION_INTERVAL,
+    GcHooks,
+    freeze_startup_heap,
+)
 from tokenspeed.runtime.engine.io_struct import MsgpackDecoder
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
@@ -293,6 +298,7 @@ class EncodeDataPlane:
         # thread.
         self._copies: list[tuple[torch.cuda.Event | None, list[tuple]]] = []
         self._lock = threading.Lock()
+        self._gc_hooks = GcHooks(full_collection_interval=FULL_COLLECTION_INTERVAL)
 
     def enter_forward_thread(self) -> None:
         """Called once by the host's forward thread, before its first
@@ -408,6 +414,9 @@ class EncodeDataPlane:
             event.record()
         with self._lock:
             self._copies.append((event, outcomes))
+        # Every rank embeds the same batches, so the ranks collect in the
+        # same one.
+        self._gc_hooks.note_round(forwarded=True)
 
     def encoded(self) -> list[tuple]:
         """The items whose rows reached their slots since the last call:
@@ -612,5 +621,7 @@ class EncodeBootstrap:
         )
 
     def enter_serving(self) -> None:
-        """End startup: from here on a kernel compilation is a stall."""
+        """End startup: from here on a kernel compilation is a stall, and
+        full garbage collections run between batches (``GcHooks``)."""
         mark_jit_compile_serving()
+        freeze_startup_heap()

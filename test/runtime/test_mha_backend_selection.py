@@ -63,7 +63,6 @@ def test_mha_preserves_target_and_block_draft_geometry(draft, heads, name, solut
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=64,
         context_len=50176,
         max_bs=16,
         speculative_num_draft_tokens=16,
@@ -72,7 +71,7 @@ def test_mha_preserves_target_and_block_draft_geometry(draft, heads, name, solut
         components=(spec,),
     )
     cls = _get_backend_cls(name, AttentionArch.MHA)
-    page_size = cls.resolve_kernel_page_size(config, config.prefix_granularity)
+    page_size = cls.resolve_kernel_page_size(config, 64)
     assert page_size == 64
     backend = cls(config, spec, kernel_page_size=page_size)
     assert backend.kernel_solution == solution

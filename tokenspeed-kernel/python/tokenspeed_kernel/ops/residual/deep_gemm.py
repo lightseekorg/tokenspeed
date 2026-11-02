@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 from tokenspeed_kernel.ops.residual.triton import (
     _mhc_mixes_impl,
@@ -128,7 +130,7 @@ def deep_gemm_mhc_shifted_post_pre_norm(
     )
 
 
-if platform.is_hopper_plus:
+if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         get_pdl,

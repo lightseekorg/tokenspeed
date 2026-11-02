@@ -360,18 +360,42 @@ class ExtendProgram:
         return cdna4.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
 
     @gluon.jit
-    def load_page(self, start_n):
+    def load_page_indices(self, start_n, last_page, count: gl.constexpr):
+        """Physical pages of the count pages starting at token start_n.
+
+        Pages past last_page repeat it (an L2 hit): a masked copy becomes a
+        branch after which the compiler waits for every outstanding load
+        (s_waitcnt vmcnt(0)). Every lane loads all count entries of the
+        read-only (tl.const) table, so these are scalar loads (s_load), counted
+        by lgkmcnt and never waiting for the page copies. Each costs a
+        scalar-cache round trip at its use.
+        """
         cfg = self.cfg
-        page_index = start_n // cfg.PAGE_SIZE
-        valid = start_n < self.cache_len
+        layout: gl.constexpr = gl.BlockedLayout([count], [64], [cfg.NUM_WARPS], [0])
+        offs = gl.arange(0, count, layout=layout)
+        page_index = gl.minimum(start_n // cfg.PAGE_SIZE + offs, last_page)
         return gl.load(
-            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index,
-            mask=valid,
-            other=0,
+            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index
         )
 
     @gluon.jit
-    def issue_load_page(self, cache_ptr, physical_page, smem):
+    def select_page(self, pages, index: gl.constexpr):
+        """Entry index of load_page_indices' result."""
+        offs = gl.arange(0, pages.shape[0], layout=pages.type.layout)
+        return max(gl.where(offs == index, pages, 0), axis=0)
+
+    @gluon.jit
+    def page_tile_offsets(self):
+        """Element offsets of a [BLOCK_N, HEAD_DIM] tile within a page, before
+        the KV head's offset."""
+        cfg = self.cfg
+        offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
+        return offs_n[:, None] * (cfg.N_KV_HEADS * cfg.HEAD_DIM) + offs_d[None, :]
+
+    @gluon.jit
+    def load_page_to_shared(self, cache_ptr, physical_page, tile_offsets, smem):
+        """Copy this KV head's tile of one page into LDS; the caller commits."""
         cfg = self.cfg
         # One page holds BLOCK_N tokens. A descriptor based at the page keeps
         # the 64-bit page address in SGPRs, so each lane needs only its int32
@@ -382,19 +406,18 @@ class ExtendProgram:
             cache_ptr + physical_page.to(gl.int64) * page_elems,
             page_elems * elem_bytes,
         )
-        offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
-        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        offsets = offs_n[:, None] * (cfg.N_KV_HEADS * cfg.HEAD_DIM) + offs_d[None, :]
-        buffer.load_to_shared(smem, page, offsets, soffset=self.kv_head * cfg.HEAD_DIM)
+        buffer.load_to_shared(
+            smem, page, tile_offsets, soffset=self.kv_head * cfg.HEAD_DIM
+        )
+
+    @gluon.jit
+    def issue_load_kv(self, physical_page, tile_offsets, k_smem, v_smem):
+        """Copy one page of K and V into LDS as one async group each. The page
+        index is already in an SGPR from its scalar load."""
+        self.load_page_to_shared(self.k_cache_ptr, physical_page, tile_offsets, k_smem)
         async_copy.commit_group()
-
-    @gluon.jit
-    def issue_load_k(self, physical_page, k_smem):
-        self.issue_load_page(self.k_cache_ptr, physical_page, k_smem)
-
-    @gluon.jit
-    def issue_load_v(self, physical_page, v_smem):
-        self.issue_load_page(self.v_cache_ptr, physical_page, v_smem)
+        self.load_page_to_shared(self.v_cache_ptr, physical_page, tile_offsets, v_smem)
+        async_copy.commit_group()
 
     @gluon.jit
     def shared_load_k(self, k_smem):
@@ -418,6 +441,25 @@ class ExtendProgram:
     @gluon.jit
     def compute_pv(self, p, v, acc):
         return cdna4.mfma(p, v, acc)
+
+    @gluon.jit
+    def mask_kv(self, qk, start_n, kv_end):
+        """Mask keys at or past kv_end, past each row's causal diagonal and
+        before its sliding window."""
+        cfg = self.cfg
+        offs_n = start_n + gl.arange(
+            0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+        )
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
+        # The packed heads of a query position share its visibility.
+        diag_row = self.prefix + self.row_qpos(offs_m)
+        mask = offs_n[None, :] < kv_end
+        if cfg.IS_CAUSAL:
+            mask &= offs_n[None, :] <= diag_row[:, None]
+        if cfg.WINDOW_LEFT >= 0:
+            # Inclusive left edge, flash-attn window_size=(W, 0): W + 1 keys.
+            mask &= offs_n[None, :] >= diag_row[:, None] - cfg.WINDOW_LEFT
+        return gl.where(mask, qk, -float("inf"))
 
     @gluon.jit
     def init_attention_state(self):
@@ -568,6 +610,121 @@ class ExtendProgram:
 
 
 @gluon.jit
+def _stream_kv(
+    program,
+    q,
+    m_i,
+    l_i,
+    acc,
+    kv_start,
+    kv_end,
+    k_cache_ptr,
+    v_cache_ptr,
+    NUM_STAGES: gl.constexpr,
+    ALLOW_INVALID: gl.constexpr,
+):
+    """Attend this tile's rows to the keys in [kv_start, kv_end).
+
+    K/V page loads are pipelined NUM_STAGES deep: page p + NUM_STAGES - 1 is
+    copied into the buffer page p - 1 freed while page p is consumed. Each
+    iteration consumes NUM_STAGES pages, one per buffer. NUM_STAGES == 1, or a
+    range with fewer pages than buffers, is single-buffered.
+    """
+    cfg = program.cfg
+    k_smem = gl.allocate_shared_memory(
+        k_cache_ptr.dtype.element_ty,
+        [NUM_STAGES, cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.k_smem_layout,
+    )
+    v_smem = gl.allocate_shared_memory(
+        v_cache_ptr.dtype.element_ty,
+        [NUM_STAGES, cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.v_smem_layout,
+    )
+    # Keys before mask_start are visible to every row of the tile, so pages
+    # that end by it need no mask.
+    if cfg.WINDOW_LEFT >= 0:
+        mask_start = kv_start
+    elif cfg.IS_CAUSAL:
+        mask_start = min(program.prefix + program.q_pos_base, kv_end)
+    else:
+        mask_start = kv_end
+    last_page = (kv_end - 1) // cfg.PAGE_SIZE
+    tile_offsets = program.page_tile_offsets()
+    iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
+
+    if NUM_STAGES == 1 or kv_end - kv_start < iteration_tokens:
+        for start_n in range(kv_start, kv_end, cfg.BLOCK_N):
+            pages = program.load_page_indices(start_n, last_page, 1)
+            program.issue_load_kv(
+                program.select_page(pages, 0),
+                tile_offsets,
+                k_smem.index(0),
+                v_smem.index(0),
+            )
+            async_copy.wait_group(1)
+            k = program.shared_load_k(k_smem.index(0))
+            qk = program.compute_qk(q, k)
+            if start_n + cfg.BLOCK_N > mask_start:
+                qk = program.mask_kv(qk, start_n, kv_end)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc, ALLOW_INVALID)
+            async_copy.wait_group(0)
+            v = program.shared_load_v(v_smem.index(0))
+            acc = program.compute_pv(p, v, acc)
+        return m_i, l_i, acc
+
+    # Prologue: prefetch the first NUM_STAGES - 1 pages.
+    pages = program.load_page_indices(kv_start, last_page, NUM_STAGES)
+    next_pages = program.load_page_indices(
+        kv_start + iteration_tokens, last_page, NUM_STAGES
+    )
+    for stage in gl.static_range(NUM_STAGES - 1):
+        program.issue_load_kv(
+            program.select_page(pages, stage),
+            tile_offsets,
+            k_smem.index(stage),
+            v_smem.index(stage),
+        )
+    for iteration_start in range(kv_start, kv_end, iteration_tokens):
+        later_pages = program.load_page_indices(
+            iteration_start + 2 * iteration_tokens, last_page, NUM_STAGES
+        )
+        for stage in gl.static_range(NUM_STAGES):
+            # Prefetch the page NUM_STAGES - 1 ahead into the buffer the
+            # previous page freed.
+            if stage == 0:
+                prefetch_page = program.select_page(pages, NUM_STAGES - 1)
+            else:
+                prefetch_page = program.select_page(next_pages, stage - 1)
+            program.issue_load_kv(
+                prefetch_page,
+                tile_offsets,
+                k_smem.index((stage + NUM_STAGES - 1) % NUM_STAGES),
+                v_smem.index((stage + NUM_STAGES - 1) % NUM_STAGES),
+            )
+            start_n = iteration_start + stage * cfg.BLOCK_N
+            # The last iteration can run past kv_end: its prefetches repeat
+            # the last page, and the pages past kv_end are not consumed.
+            if start_n < kv_end:
+                # Wait for this page's K; its V and the K and V groups of the
+                # NUM_STAGES - 1 prefetched pages stay outstanding.
+                async_copy.wait_group(2 * NUM_STAGES - 1)
+                k = program.shared_load_k(k_smem.index(stage))
+                qk = program.compute_qk(q, k)
+                if start_n + cfg.BLOCK_N > mask_start:
+                    qk = program.mask_kv(qk, start_n, kv_end)
+                p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc, ALLOW_INVALID)
+                async_copy.wait_group(2 * NUM_STAGES - 2)
+                v = program.shared_load_v(v_smem.index(stage))
+                acc = program.compute_pv(p, v, acc)
+        pages = next_pages
+        next_pages = later_pages
+    # Epilogue: wait for the prefetches past kv_end before LDS is reused.
+    async_copy.wait_group(0)
+    return m_i, l_i, acc
+
+
+@gluon.jit
 def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -598,6 +755,7 @@ def gluon_mha_extend_gfx950(
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
     RAGGED: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     cfg = ExtendConfig(
         N_HEADS,
@@ -648,23 +806,9 @@ def gluon_mha_extend_gfx950(
     # Over-provisioned tile past this request's real query rows: nothing to do.
     if program.q_pos_base >= program.seq_len:
         return
-    k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-    )
-    v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-    )
 
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
-
-    # Each position packs PADDED_GROUP_SIZE head lanes; unused lanes are masked.
-    # the causal/sliding masks key off the per-row query position only (heads in
-    # a group share visibility), so diag_row broadcasts across the packed heads.
-    offs_m_q = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-    q_pos = program.row_qpos(offs_m_q)
-    offs_n_q = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
-    diag_row = program.prefix + q_pos
 
     if IS_CAUSAL:
         # Deepest diagonal in this tile is the last packed query position.
@@ -686,44 +830,19 @@ def gluon_mha_extend_gfx950(
     else:
         kv_start = 0
 
-    for start_n in range(kv_start, kv_end, cfg.BLOCK_N):
-        physical_page = program.load_page(start_n)
-        program.issue_load_k(physical_page, k_smem)
-        program.issue_load_v(physical_page, v_smem)
-
-        async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-
-        if cfg.WINDOW_LEFT >= 0:
-            # Window lower edge + cache bound always apply; causal upper edge only
-            # when IS_CAUSAL (independent layering keeps non-causal + window correct).
-            offs_n_abs = start_n + offs_n_q
-            mask = (offs_n_abs[None, :] >= diag_row[:, None] - cfg.WINDOW_LEFT) & (
-                offs_n_abs[None, :] < program.cache_len
-            )
-            if IS_CAUSAL:
-                mask &= offs_n_abs[None, :] <= diag_row[:, None]
-            qk = gl.where(mask, qk, -float("inf"))
-        elif IS_CAUSAL:
-            if start_n + cfg.BLOCK_N > program.prefix + program.q_pos_base:
-                offs_n_abs = start_n + offs_n_q
-                mask = (offs_n_abs[None, :] <= diag_row[:, None]) & (
-                    offs_n_abs[None, :] < program.cache_len
-                )
-                qk = gl.where(mask, qk, -float("inf"))
-        else:
-            if start_n + cfg.BLOCK_N > program.cache_len:
-                offs_n_abs = start_n + offs_n_q
-                qk = gl.where(
-                    offs_n_abs[None, :] < program.cache_len, qk, -float("inf")
-                )
-
-        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-        async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem)
-        acc = program.compute_pv(p, v, acc)
+    m_i, l_i, acc = _stream_kv(
+        program,
+        q,
+        m_i,
+        l_i,
+        acc,
+        kv_start,
+        kv_end,
+        k_cache_ptr,
+        v_cache_ptr,
+        NUM_STAGES,
+        False,
+    )
 
     l_i = program.apply_sinks(l_i, m_i, sink_log2)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
@@ -764,6 +883,7 @@ def gluon_mha_extend_split_gfx950(
     IS_CAUSAL: gl.constexpr,
     IS_FP8: gl.constexpr,
     RAGGED: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     # Split-K compute pass. Two grids share the body:
     #   * ragged (total_num_q_blocks, n_kv_heads, NUM_KV_SPLITS): program_id(0)
@@ -846,50 +966,22 @@ def gluon_mha_extend_split_gfx950(
     split_start = split_start_page * cfg.PAGE_SIZE
     split_end = min(split_end_page * cfg.PAGE_SIZE, kv_end)
 
-    k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-    )
-    v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-    )
-
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
-
-    offs_m_q = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-    q_pos = program.row_qpos(offs_m_q)
-    offs_n_q = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
-    diag_row = program.prefix + q_pos
-
-    for start_n in range(split_start, split_end, cfg.BLOCK_N):
-        physical_page = program.load_page(start_n)
-        program.issue_load_k(physical_page, k_smem)
-        program.issue_load_v(physical_page, v_smem)
-
-        async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-
-        if IS_CAUSAL:
-            if start_n + cfg.BLOCK_N > program.prefix + program.q_pos_base:
-                offs_n_abs = start_n + offs_n_q
-                mask = (offs_n_abs[None, :] <= diag_row[:, None]) & (
-                    offs_n_abs[None, :] < program.cache_len
-                )
-                qk = gl.where(mask, qk, -float("inf"))
-        else:
-            if start_n + cfg.BLOCK_N > program.cache_len:
-                offs_n_abs = start_n + offs_n_q
-                qk = gl.where(
-                    offs_n_abs[None, :] < program.cache_len, qk, -float("inf")
-                )
-
-        # allow_invalid: a whole split can sit above a row's causal diagonal.
-        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc, allow_invalid=True)
-
-        async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem)
-        acc = program.compute_pv(p, v, acc)
+    # allow_invalid: a whole split can sit above a row's causal diagonal.
+    m_i, l_i, acc = _stream_kv(
+        program,
+        q,
+        m_i,
+        l_i,
+        acc,
+        split_start,
+        split_end,
+        k_cache_ptr,
+        v_cache_ptr,
+        NUM_STAGES,
+        True,
+    )
 
     program.store_partial(
         acc, l_i, m_i, split_id, NUM_KV_SPLITS, mid_o_ptr, mid_lse_ptr
@@ -966,6 +1058,51 @@ def gluon_mha_extend_reduce_gfx950(
 
 
 _GFX950_SM_COUNT = 256
+# Pipeline depth of the extend K/V page loads: LDS buffers per workgroup, so
+# NUM_STAGES - 1 pages are prefetched while one is consumed.
+_EXTEND_STAGES = 4
+# The pipeline's K and V buffers may take at most 64 KB of the CU's 160 KB of
+# LDS, so two workgroups stay resident: head dim 64 at 16 bits fits; 16-bit
+# head dim 128 (128 KB) would leave one workgroup per CU and stays
+# single-buffered.
+_EXTEND_PIPELINE_MAX_LDS_BYTES = 64 * 1024
+# Resident workgroups per CU at head dim 64 (4-wave, 128-row tile): two
+# pipelined (LDS-bound); single-buffered, three for the unsplit kernel and two
+# for the split kernel. VGPRs are allocated in groups of 8 (CDNA4 ISA 3.6.4):
+# the unsplit kernel's 167 round to 168, so three waves fit a SIMD's 512; the
+# split kernel's 169 round to 176. MI355X, 16 query / 2 KV heads over a 131k
+# prefix: unsplit grids of 640 and 768 workgroups ran 5% faster
+# single-buffered, 512 and 1024 7% faster pipelined.
+_EXTEND_PIPELINED_WORKGROUPS_PER_CU = 2
+_EXTEND_SINGLE_WORKGROUPS_PER_CU = 3
+
+
+def _extend_stages(
+    *,
+    num_workgroups: int,
+    split: bool,
+    head_dim: int,
+    page_size: int,
+    element_size: int,
+) -> int:
+    """Pipeline depth of the K/V page loads for an extend launch.
+
+    Pipelining hides load latency but can lower occupancy, so an unsplit
+    launch of num_workgroups workgroups pipelines only when the grid then needs
+    no more rounds of resident workgroups than single-buffered.
+    """
+    pipeline_bytes = 2 * _EXTEND_STAGES * page_size * head_dim * element_size
+    if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES:
+        return 1
+    if split:
+        return _EXTEND_STAGES
+    pipelined_rounds = triton.cdiv(
+        num_workgroups, _EXTEND_PIPELINED_WORKGROUPS_PER_CU * _GFX950_SM_COUNT
+    )
+    single_rounds = triton.cdiv(
+        num_workgroups, _EXTEND_SINGLE_WORKGROUPS_PER_CU * _GFX950_SM_COUNT
+    )
+    return _EXTEND_STAGES if pipelined_rounds <= single_rounds else 1
 
 
 def launch_gluon_mha_extend_gfx950(
@@ -1049,6 +1186,17 @@ def launch_gluon_mha_extend_gfx950(
             sm_count=_GFX950_SM_COUNT,
         )
 
+    # Bound on q-blocks with query rows: the dense count plus one partial
+    # block for each further request.
+    num_q_blocks = min(rect_num_q_blocks, triton.cdiv(total_q, block_q) + batch - 1)
+    num_stages = _extend_stages(
+        num_workgroups=num_q_blocks * n_kv_heads,
+        split=num_kv_splits > 1,
+        head_dim=head_dim,
+        page_size=page_size,
+        element_size=k_cache.element_size(),
+    )
+
     if num_kv_splits > 1:
         mid_o = torch.empty(
             (total_q, n_heads, num_kv_splits, head_dim),
@@ -1092,6 +1240,7 @@ def launch_gluon_mha_extend_gfx950(
             is_causal,
             is_fp8,
             use_ragged,
+            num_stages,
             num_warps=num_warps,
         )
         reduce_grid = (total_q, n_heads)
@@ -1146,6 +1295,7 @@ def launch_gluon_mha_extend_gfx950(
         window_left,
         is_fp8,
         use_ragged,
+        num_stages,
         num_warps=num_warps,
     )
     if return_lse:

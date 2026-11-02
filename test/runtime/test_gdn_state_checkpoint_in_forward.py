@@ -80,6 +80,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             enable_l3_storage=False,
             role="fused",
             num_snapshot_pages=1,
+            host_group_packing=(),
             max_retracted_requests=0,
             host_write_policy="write_through",
             storage_config=None,
@@ -462,8 +463,6 @@ def test_startup_refuses_a_state_consumer_that_cannot_store_the_checkpoint(
     # refuses the option unless each State consumer writes it: GDN only with
     # a checkpointing scan whose chunk divides the prefix granularity, never
     # the families without one.
-    import dataclasses
-
     from tokenspeed_kernel.ops.attention.gdn import (
         gdn_chunk_prefill_stores_state_checkpoints,
     )
@@ -489,10 +488,14 @@ def test_startup_refuses_a_state_consumer_that_cannot_store_the_checkpoint(
     config, spec = _mamba_config_pair(
         torch, heads=16, head_dim=128, max_bs=4, device="cuda"
     )
-    config = dataclasses.replace(config, prefix_granularity=prefix_granularity)
-    pool = _ContractPool({0: ("linear_attention", None, None)})
+    conv = torch.zeros(9, 3 * 16 * 128, 3, dtype=torch.bfloat16, device="cuda")
+    ssm = torch.zeros(9, 16, 128, 128, dtype=torch.float32, device="cuda")
+    pool = _ContractPool({0: ("linear_attention", conv, ssm)})
+    # The checkpoints sit at multiples of the bound pool's prefix granularity.
+    pool.arena.runtime_contract.prefix_granularity = prefix_granularity
 
     gdn = GdnAttnBackend(config, spec)
+    gdn.set_cache_pool(pool)
     if prefix_granularity % 64 == 0:
         validate_state_checkpoint_in_forward(attn_backend=gdn, kv_pool=pool)
     else:

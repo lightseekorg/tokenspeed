@@ -1110,7 +1110,7 @@ class PrefillGraph:
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot; per-group table widths come from
         :meth:`_dummy_group_tables`. Backends with extra cache groups
-        (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every group
+        (DeepSeek V4.1: SWA + compressor + indexer state) need every group
         table, or their extend metadata is incomplete.
 
         On a query-sharding engine (``config.query_shard_size > 1``) the

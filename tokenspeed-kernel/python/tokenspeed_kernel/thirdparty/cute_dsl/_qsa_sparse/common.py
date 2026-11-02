@@ -168,25 +168,20 @@ def _can_group_six_queries(output_tiles: int, sm_count: int) -> bool:
     return shared_ctas >= sm_count and shared_ctas * 5 >= waves * sm_count * 3
 
 
-def _select_head_tile(heads_per_kv: int, bf16_kv: bool, query_group: int):
-    return (
-        72
-        if bf16_kv and query_group == 6 and (heads_per_kv == 72)
-        else (
-            96
-            if bf16_kv and query_group == 8 and (heads_per_kv == 96)
-            else (
-                48
-                if bf16_kv and query_group in (3, 4) and (heads_per_kv == 48)
-                else (
-                    32
-                    if query_group in (3, 4)
-                    or (query_group == 2 and heads_per_kv == 24)
-                    else 16 if bf16_kv and heads_per_kv == 12 else _GROUPED_HEAD_TILE
-                )
-            )
-        )
-    )
+def _head_tile_for_geometry(grouped_heads: int, bf16_kv: bool, query_group: int) -> int:
+    """Return a tile for fixed head packing, without device or grid policy."""
+    if bf16_kv:
+        if query_group == 6 and grouped_heads == 72:
+            return 72
+        if query_group == 8 and grouped_heads == 96:
+            return 96
+        if query_group in (3, 4) and grouped_heads == 48:
+            return 48
+    if query_group in (3, 4) or (query_group == 2 and grouped_heads == 24):
+        return 32
+    if bf16_kv and grouped_heads == 12:
+        return 16
+    return _GROUPED_HEAD_TILE
 
 
 @dsl_user_op

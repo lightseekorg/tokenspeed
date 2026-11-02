@@ -47,6 +47,9 @@ existing Decode operators. Prefill keeps token-local queries and all heads;
 there is no query/output AllToAll or TopK/LSE exchange. Persistent KV remains
 owner-sharded.
 
+Index-K RMS normalization uses the checkpoint's `rms_norm_eps` in both the
+composed path and the fused Decode prologue.
+
 The CANN 9.0/A2 CP runtime additionally loads ABI 2
 `libdsa_cp_prefill.so`, built from the operator repository's standalone
 `cann-flash-ops/src/dsa_cp_prefill` CMake project. Set
@@ -60,10 +63,26 @@ One device metadata launch prepares the compact page table shared by Indexer
 and sparse attention, cumulative lengths, causal scans and current-page aliases.
 Complete aligned pages are read directly at their receive address; only
 boundary pages are stitched. The DSA copy kernel also commits persistent owner
-rows. No CPU page plan, unique-page scan, count readback or full receive-plane
-repacking is used. Reserve history/current receive planes and bounded uneven-row
-send padding before sizing the cache arena. Decode and the shared cache writer
-keep their existing contracts.
+rows. The unbounded configuration gathers the full cache without a CPU page
+plan. With `--chunk-prefill-kv-size`, the scheduler limits the sum of per-request
+KV page counts, including each cached prefix. Native Prefill reuses the host
+page table to compact referenced owner pages once per batch and gathers unequal
+contributions with HCCL AllGatherV; no device count readback is needed. This
+requires the library's `DsaCpAllGatherV` and `DsaCpPatchMapped` exports. Reserve
+the bounded history send/receive planes, a null page and current-row padding
+before sizing the cache arena. Decode and the shared cache writer keep their
+existing contracts.
+The scheduler wheel and `ts-host` must both be rebuilt when adding this
+scheduler option, since the host embeds its own copy of the scheduler.
+Native commits borrow int64 write-slot scratch from the runtime's main-stream
+`WorkspacePool`. Startup warms its peak before KV memory profiling. The model
+recipe only declares `AscendPrefillWorkspace`; TS derives and deducts the
+communication budget before agreeing on cache capacity. Each attention backend
+allocates its communication planes together through a frozen `WorkspacePool`
+and retains that owner across layers. Those side-stream buffers stay separate
+from main-stream scratch. The native transport borrows the supplied views.
+Every commit obtains a fresh scratch view, so another main-stream user cannot
+invalidate its slot allocation.
 
 Ascend dense MLA Prefill reuses this ABI with only the 576-wide KV plane;
 it allocates no Index-K plane and retains the original head-sharded weights.
@@ -77,6 +96,9 @@ projects its local-head output with the original O shard. CommManager retains
 the output ReduceScatter. No additional LSE merge or complete-weight copy is
 needed. Causal attention with a cached prefix uses bottom-right alignment;
 CPU scheduler lengths are passed directly, without a device length readback.
+
+MLA decode partial packing reuses its compiled kernel across changing batch
+sizes and preserves empty-shard masks during Graph replay.
 
 Run the operator correctness suite on a visible NPU with:
 

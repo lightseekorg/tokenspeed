@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 
 @triton.jit
@@ -1853,7 +1854,7 @@ def _quantize_fp8_group32_swizzled(
         programs = max(
             triton.cdiv(m * (k // 32), groups), triton.cdiv(scale_count, zero_block)
         )
-        _fp8_group32_ue8m0_quantize_swizzled[(programs,)](
+        kernel_launcher(_fp8_group32_ue8m0_quantize_swizzled, (programs,))(
             x,
             quantized,
             scales,
@@ -1866,3 +1867,9 @@ def _quantize_fp8_group32_swizzled(
             num_stages=1,
         )
     return quantized, scales
+
+
+register_triton_warmup(
+    _fp8_group32_ue8m0_quantize_swizzled,
+    variants=({"GROUPS": (4, 16, 32, 64)},),
+)

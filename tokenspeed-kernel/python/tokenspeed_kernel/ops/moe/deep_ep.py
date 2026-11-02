@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -76,7 +77,7 @@ logger = logging.getLogger(__name__)
 
 _warned_about_requantization = False
 
-if platform.is_hopper_plus:
+if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         get_mn_major_tma_aligned_tensor,
@@ -88,7 +89,7 @@ if platform.is_hopper_plus:
     )
 
 
-if platform.is_hopper_plus:
+if platform.is_hopper_plus and importlib.util.find_spec("deep_gemm") is not None:
     from tokenspeed_kernel.ops.activation.triton import (
         fused_swiglu_fp8_ue8m0,
         fused_swiglu_fp8_ue8m0_masked_packed,

@@ -57,10 +57,10 @@ def _compile_allgather_columns(arch_name):
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris import all_gather as ag
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
     )
 
-    policy = iris_cache_policy(_ARCH_VERSIONS[arch_name])
+    policy = iris_arch_policy(_ARCH_VERSIONS[arch_name])
     subgroup_size = triton.backends.amd.compiler.HIPOptions(arch=arch_name).warp_size
     fn = ag.iris_pull_allgather_columns
     pointers = ("input_ptr", "input_sym_ptr", "output_ptr", "ready_flags")
@@ -151,8 +151,8 @@ _ISA = {
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_iris_cache_policy_codegen(arch, tmp_path):
-    """Peer accesses carry their architecture's IrisCachePolicy.
+def test_iris_arch_policy_codegen(arch, tmp_path):
+    """Peer accesses carry their architecture's IrisArchPolicy.
 
     gfx950 reads peer data non-temporally and writes peer barrier epochs
     write-through. On gfx1250 both carry no cache policy. Flag polls and epoch

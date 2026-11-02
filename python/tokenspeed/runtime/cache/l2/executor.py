@@ -64,7 +64,9 @@ from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
+    compute_host_group_packing,
     compute_host_lcm_block_bytes,
+    validate_host_group_packing,
 )
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 from tokenspeed.runtime.cache.l2.sizing import (
@@ -230,6 +232,17 @@ class HostCacheExecutor:
             group_ids=scheduler_group_ids or None,
         )
         host_lcm_block_bytes = compute_host_lcm_block_bytes(self.layout)
+        shard_by_id = {
+            spec.group_id: int(spec.shard_count) for spec in contract.group_specs
+        }
+        self.host_group_packing = tuple(
+            packing * shard_by_id[group.group_id]
+            for group, packing in zip(
+                self.layout.groups,
+                compute_host_group_packing(self.layout),
+                strict=True,
+            )
+        )
 
         # --- L2 prefix tier -------------------------------------------------
         host_lcm_blocks = 0
@@ -261,14 +274,17 @@ class HostCacheExecutor:
         share_bytes = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
-        # Each buffer takes the power of two its pinned allocation rounds to.
+        # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
         )
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
         fitting_l2_blocks = _min_over_ranks(
-            largest_pinned_fit(share_bytes - pool_pinned_bytes) // host_lcm_block_bytes,
+            largest_pinned_fit(
+                share_bytes - pool_pinned_bytes, block_bytes=host_lcm_block_bytes
+            )
+            // host_lcm_block_bytes,
             world_cpu_group,
         )
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
@@ -282,7 +298,7 @@ class HostCacheExecutor:
                 "rank, the most every rank's share of its node holds: "
                 f"--kvstore-ratio {host_ratio} asks for more. The "
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
-                "and each pinned buffer takes a power of two; this rank's share "
+                "under the pinned allocator settings; this rank's share "
                 f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
                 "memory over its ranks, less "
                 f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
@@ -313,12 +329,23 @@ class HostCacheExecutor:
                     "--retraction-snapshot-ratio rather than "
                     "--retraction-snapshot-host-gb"
                 )
+        validate_host_group_packing(
+            self.host_group_packing,
+            cpu_group=world_cpu_group,
+        )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
+        l2_pinned_bytes = pinned_host_bytes(l2_bytes)
         check_host_memory(
-            pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
+            l2_pinned_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
             purpose="the compact Host cache",
+        )
+        logger.info(
+            f"Host pinned memory budget: L2 payload={l2_bytes / 1e9:.2f} GB, "
+            f"L2 reservation={l2_pinned_bytes / 1e9:.2f} GB, "
+            f"snapshot reservation={pool_pinned_bytes / 1e9:.2f} GB, "
+            f"rank share={share_bytes / 1e9:.2f} GB"
         )
 
         self.host_storage: HostCacheStorage | None = None
@@ -334,6 +361,7 @@ class HostCacheExecutor:
                 self.layout,
                 contract,
                 num_host_lcm_blocks=host_lcm_blocks,
+                host_group_packing=self.host_storage.group_packing,
                 rank=kvp_rank,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its counts;
@@ -353,6 +381,7 @@ class HostCacheExecutor:
                 self.layout,
                 contract,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
+                host_group_packing=self.snapshot_storage.group_packing,
                 rank=kvp_rank,
             )
             # One row per retracted request, indexed by the op's snapshot_slot.
@@ -481,6 +510,38 @@ class HostCacheExecutor:
                         )
         self.write_stream.synchronize()
         self.load_stream.synchronize()
+
+        if snapshot_lcm_blocks and io_backend == "kernel":
+            self._warmup_restore_transfers()
+
+    def _warmup_restore_transfers(self) -> None:
+        """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
+        # Host blocks must still be unassigned for this scratch round trip.
+        # Use one group so compact Host-parent writes cannot overlap.
+        group_index = next(
+            i for i, group in enumerate(self.layout.groups) if group.fields
+        )
+        for storage, geometry, lane in (
+            (self.host_storage, self._transfer_geometry, self._restore_l2_lane),
+            (
+                self.snapshot_storage,
+                self._snapshot_geometry,
+                self._restore_pool_lane,
+            ),
+        ):
+            if storage is None:
+                continue
+            launch = dict(
+                device_buffers=self.layout.buffers,
+                host_buffer=storage.host_buffer,
+                geometry=geometry,
+                stream=self.load_stream,
+                prerequisite_stream=device_module.current_stream(),
+                backend=self.transfer_backend,
+            )
+            lane.start_d2h([(group_index, 1, 1)], **launch)
+            lane.start_h2d([(group_index, 1, 1)], **launch)
+            self.load_stream.synchronize()
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream

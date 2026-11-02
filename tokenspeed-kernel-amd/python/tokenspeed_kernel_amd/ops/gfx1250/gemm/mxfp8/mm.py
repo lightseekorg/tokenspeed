@@ -51,7 +51,7 @@ _BK256_MIN_M = 512
 
 
 @gluon.constexpr_function
-def _bk512_layouts(tile, cluster):
+def _bk512_layouts(tile, cluster, fp32_scales):
     """LDS and WMMA layouts of a ``cluster x cluster`` group of square tiles."""
     block = tile * cluster
     # CTA-id bits walk M first, then N; the same bases as
@@ -100,13 +100,27 @@ def _bk512_layouts(tile, cluster):
         slice_m=tile,
         slice_n=tile,
     )
-    scale_cols = _BK512 // _SCALE_BLOCK
-    shared_a_scale = gl.PaddedSharedLayout.with_identity_for(
-        [[scale_cols, 8]], [block, scale_cols], [1, 0], cga_a
-    )
-    shared_b_scale = gl.PaddedSharedLayout.with_identity_for(
-        [[scale_cols, 8]], [block, scale_cols], [1, 0], cga_b
-    )
+    if fp32_scales:
+        scale_cols = _BK512 // 128
+        shared_a_scale = gl.PaddedSharedLayout.with_identity_for(
+            [[scale_cols, 2]], [block, scale_cols], [1, 0], cga_a
+        )
+        # One weight-scale row per 128 output columns; CTAs inside one
+        # weight block share it.
+        shared_b_scale = gl.PaddedSharedLayout.with_identity_for(
+            [[scale_cols, 2]],
+            [triton.cdiv(block, 128), scale_cols],
+            [1, 0],
+            [[n // 128, k] for n, k in cga_b],
+        )
+    else:
+        scale_cols = _BK512 // _SCALE_BLOCK
+        shared_a_scale = gl.PaddedSharedLayout.with_identity_for(
+            [[scale_cols, 8]], [block, scale_cols], [1, 0], cga_a
+        )
+        shared_b_scale = gl.PaddedSharedLayout.with_identity_for(
+            [[scale_cols, 8]], [block, scale_cols], [1, 0], cga_b
+        )
     shared_out = gl.PaddedSharedLayout.with_identity_for(
         [[tile, 8]], [block, block], [1, 0], cga
     )
@@ -270,9 +284,11 @@ def _bk512_launch_metadata(grid, kernel, args):
 
 def _bk512_repr(specialization):
     constants = specialization.constants
+    scales = "_fp32" if constants.get("FP32_SCALES") else ""
+    walk = "_k1" if constants.get("SINGLE_K_TILE") else ""
     return (
-        f"gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250_t{constants.get('TILE')}_"
-        f"c{constants.get('CLUSTER')}_sk{constants.get('SPLIT_K')}"
+        f"gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250{scales}_t{constants.get('TILE')}_"
+        f"c{constants.get('CLUSTER')}_sk{constants.get('SPLIT_K')}{walk}"
     )
 
 
@@ -288,6 +304,7 @@ def _bk512_refill(
     b_scale_smem,
     slot,
     BLOCK_K: gl.constexpr,
+    SCALE_K: gl.constexpr,
 ):
     # Waves 0-3 issue A and B; the fused scale load splits its two planes
     # across waves 0-1 and 2-3.
@@ -308,10 +325,10 @@ def _bk512_refill(
         b_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
     )
     a_scale_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
-        a_scale_desc, add_offsets=[0, BLOCK_K // 32], clamp_bounds=True
+        a_scale_desc, add_offsets=[0, BLOCK_K // SCALE_K], clamp_bounds=True
     )
     b_scale_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
-        b_scale_desc, add_offsets=[0, BLOCK_K // 32], clamp_bounds=True
+        b_scale_desc, add_offsets=[0, BLOCK_K // SCALE_K], clamp_bounds=True
     )
     return a_desc, b_desc, a_scale_desc, b_scale_desc
 
@@ -328,12 +345,70 @@ def _bk512_operands(
     DOT_B: gl.constexpr,
     SCALE_A: gl.constexpr,
     SCALE_B: gl.constexpr,
+    SCALE_K: gl.constexpr,
 ):
     a = a_smem.index(slot).slice(k, 128, 1).load(layout=DOT_A)
-    a_scale = a_scale_smem.index(slot).slice(k // 32, 4, 1).load(layout=SCALE_A)
+    a_scale = (
+        a_scale_smem.index(slot)
+        .slice(k // SCALE_K, 128 // SCALE_K, 1)
+        .load(layout=SCALE_A)
+    )
     b = b_smem.index(slot).slice(k, 128, 1).permute([1, 0]).load(layout=DOT_B)
-    b_scale = b_scale_smem.index(slot).slice(k // 32, 4, 1).load(layout=SCALE_B)
+    if SCALE_K == 128:
+        # Widen each weight-scale row to the 128 output columns it covers.
+        cols: gl.constexpr = b_smem.type.shape[1]
+        rows: gl.constexpr = b_scale_smem.type.shape[1]
+        grid: gl.constexpr = (
+            gl.zeros([1, cols], gl.float32, SCALE_B)
+            .reshape([1, rows, cols // rows])
+            .type.layout
+        )
+        b_rows = (
+            b_scale_smem.index(slot)
+            .slice(k // SCALE_K, 1, 1)
+            .permute([1, 0])
+            .load(layout=gl.SliceLayout(2, grid))
+        )
+        b_scale = gl.convert_layout(
+            gl.expand_dims(b_rows, 2)
+            .broadcast_to([1, rows, cols // rows])
+            .reshape([1, cols]),
+            SCALE_B,
+            assert_trivial=True,
+        )
+    else:
+        b_scale = (
+            b_scale_smem.index(slot)
+            .slice(k // SCALE_K, 128 // SCALE_K, 1)
+            .load(layout=SCALE_B)
+        )
     return a, a_scale, b, b_scale
+
+
+@gluon.jit
+def _bk512_mma(a, a_scale, b, b_scale, acc, SCALE_K: gl.constexpr):
+    if SCALE_K == 128:
+        # FP32 block scales: scale the unscaled 128-wide partial, activation
+        # scale first, before accumulating.
+        partial = gl.amd.cdna5.wmma(a, b, gl.zeros_like(acc))
+        acc = acc + partial * a_scale * b_scale
+    else:
+        acc = gl.amd.cdna5.wmma_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc)
+    return acc
+
+
+@gluon.jit
+def _bk512_pin(acc, SCALE_K: gl.constexpr):
+    # LLVM sinks pure math to its first use when a branch separates them. The
+    # warp pipeline's closing barrier and the one-wave cluster arrive both
+    # branch, so the FP32 scale math would leave its stage and every partial
+    # would stay live and spill. An empty asm with side effects consumes the
+    # sum inside the stage and emits no instruction.
+    if SCALE_K == 128:
+        acc = gl.inline_asm_elementwise(
+            "", "=v,0", [acc], dtype=gl.float32, is_pure=False, pack=1
+        )
+    return acc
 
 
 @gluon.jit
@@ -354,6 +429,7 @@ def _bk512_consume_refill(
     SCALE_B: gl.constexpr,
     BLOCK_K: gl.constexpr,
     CLUSTER_SYNC: gl.constexpr,
+    SCALE_K: gl.constexpr,
 ):
     # One 512-wide K tile in five stages: the two waves sharing a SIMD
     # alternate LDS reads of one half with the scaled WMMAs of the other, and
@@ -371,6 +447,7 @@ def _bk512_consume_refill(
             DOT_B,
             SCALE_A,
             SCALE_B,
+            SCALE_K,
         )
         a1, as1, b1, bs1 = _bk512_operands(
             a_smem,
@@ -383,10 +460,11 @@ def _bk512_consume_refill(
             DOT_B,
             SCALE_A,
             SCALE_B,
+            SCALE_K,
         )
     with gl.amd.warp_pipeline_stage("stage1_compute_k0"):
-        acc = gl.amd.cdna5.wmma_scaled(a0, as0, "e4m3", b0, bs0, "e4m3", acc)
-        acc = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1, bs1, "e4m3", acc)
+        acc = _bk512_mma(a0, as0, b0, bs0, acc, SCALE_K)
+        acc = _bk512_pin(_bk512_mma(a1, as1, b1, bs1, acc, SCALE_K), SCALE_K)
     with gl.amd.warp_pipeline_stage("stage2_load_k2"):
         a2, as2, b2, bs2 = _bk512_operands(
             a_smem,
@@ -399,6 +477,7 @@ def _bk512_consume_refill(
             DOT_B,
             SCALE_A,
             SCALE_B,
+            SCALE_K,
         )
         a3, as3, b3, bs3 = _bk512_operands(
             a_smem,
@@ -411,14 +490,15 @@ def _bk512_consume_refill(
             DOT_B,
             SCALE_A,
             SCALE_B,
+            SCALE_K,
         )
         if CLUSTER_SYNC:
             # Keep the cluster's CTAs within one K tile of each other so each
             # multicast refill finds every destination slot free.
             gl.amd.cdna5.cluster.arrive()
     with gl.amd.warp_pipeline_stage("stage3_compute_k2"):
-        acc = gl.amd.cdna5.wmma_scaled(a2, as2, "e4m3", b2, bs2, "e4m3", acc)
-        acc = gl.amd.cdna5.wmma_scaled(a3, as3, "e4m3", b3, bs3, "e4m3", acc)
+        acc = _bk512_mma(a2, as2, b2, bs2, acc, SCALE_K)
+        acc = _bk512_pin(_bk512_mma(a3, as3, b3, bs3, acc, SCALE_K), SCALE_K)
     with gl.amd.warp_pipeline_stage("stage4_wait_refill"):
         if CLUSTER_SYNC:
             gl.amd.cdna5.cluster.wait()
@@ -433,6 +513,7 @@ def _bk512_consume_refill(
             b_scale_smem,
             slot,
             BLOCK_K,
+            SCALE_K,
         )
     return a_desc, b_desc, a_scale_desc, b_scale_desc, acc
 
@@ -450,6 +531,7 @@ def _bk512_consume_tail(
     SCALE_A: gl.constexpr,
     SCALE_B: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    SCALE_K: gl.constexpr,
 ):
     for k in gl.static_range(0, BLOCK_K, 128):
         with gl.amd.warp_pipeline_stage("tail_load"):
@@ -464,9 +546,10 @@ def _bk512_consume_tail(
                 DOT_B,
                 SCALE_A,
                 SCALE_B,
+                SCALE_K,
             )
         with gl.amd.warp_pipeline_stage("tail_compute"):
-            acc = gl.amd.cdna5.wmma_scaled(a, a_scale, "e4m3", b, b_scale, "e4m3", acc)
+            acc = _bk512_pin(_bk512_mma(a, a_scale, b, b_scale, acc, SCALE_K), SCALE_K)
     return acc
 
 
@@ -497,14 +580,23 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
     SPLIT_K: gl.constexpr,
     GROUP_M: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    FP32_SCALES: gl.constexpr,
+    SINGLE_K_TILE: gl.constexpr,
 ):
-    """Clustered eight-wave ``[1,32]`` E4M3/UE8M0 GEMM over 512-wide K tiles.
+    """Clustered eight-wave E4M3 GEMM over 512-wide K tiles.
+
+    Scales are raw ``[1,32]`` UE8M0 bytes for the scaled WMMA or, with
+    ``FP32_SCALES``, canonical FP32 ``[128,128]`` block scales: each 128-wide
+    raw WMMA partial takes its rows' activation scales, then its weight
+    block's scale, before accumulation. FP32 weight scales hold one row per
+    128 output columns.
 
     Each program is a ``CLUSTER x CLUSTER`` group of CTAs, one
-    ``TILE x TILE`` output tile each, that share A, B and their raw
-    UE8M0 scale planes through TDM multicast into two LDS slots. The K walk
-    covers at least two tiles, and a partial last tile and any tile past K
-    zero-fill. CTAs wholly past the M or N edge still run the loop, so every
+    ``TILE x TILE`` output tile each, that share A, B and their scale
+    planes through TDM multicast into two LDS slots. A walk of one K tile
+    (``SINGLE_K_TILE``) loads it alone; longer walks cover at least two
+    tiles, and a partial last tile and any tile past K zero-fill. CTAs wholly
+    past the M or N edge still run the loop, so every
     cluster barrier completes. With ``SPLIT_K`` above one, unclustered
     programs on grid axis 1 each walk ``K / SPLIT_K`` and store FP32
     partials ``stride_ok`` apart.
@@ -514,9 +606,13 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
     gl.static_assert(SPLIT_K == 1 or CLUSTER == 1, "split K runs unclustered")
     BLOCK: gl.constexpr = TILE * CLUSTER
     BLOCK_K: gl.constexpr = 512
-    SCALE_COLS: gl.constexpr = BLOCK_K // 32
+    # K columns per scale, and output columns per weight-scale row.
+    SCALE_K: gl.constexpr = 128 if FP32_SCALES else 32
+    B_ROW: gl.constexpr = 128 if FP32_SCALES else 1
+    B_SCALE_ROWS: gl.constexpr = (BLOCK + B_ROW - 1) // B_ROW
+    SCALE_COLS: gl.constexpr = BLOCK_K // SCALE_K
     CLUSTER_SYNC: gl.constexpr = CLUSTER > 1
-    layouts: gl.constexpr = _bk512_layouts(TILE, CLUSTER)
+    layouts: gl.constexpr = _bk512_layouts(TILE, CLUSTER, FP32_SCALES)
     SHARED_A: gl.constexpr = layouts[0]
     SHARED_B: gl.constexpr = layouts[1]
     SHARED_A_SCALE: gl.constexpr = layouts[2]
@@ -532,8 +628,12 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
     k_start = gl.program_id(1) * k_split
     dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 16)
-    scale_a: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(dot_a, [BLOCK, 4])
-    scale_b: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(dot_b, [BLOCK, 4])
+    if FP32_SCALES:
+        scale_a: gl.constexpr = WMMA_LAYOUT
+        scale_b: gl.constexpr = WMMA_LAYOUT
+    else:
+        scale_a: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(dot_a, [BLOCK, 4])
+        scale_b: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(dot_b, [BLOCK, 4])
     a_smem = gl.allocate_shared_memory(
         a_ptr.dtype.element_ty, [2, BLOCK, BLOCK_K], SHARED_A
     )
@@ -544,7 +644,7 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
         a_scale_ptr.dtype.element_ty, [2, BLOCK, SCALE_COLS], SHARED_A_SCALE
     )
     b_scale_smem = gl.allocate_shared_memory(
-        b_scale_ptr.dtype.element_ty, [2, BLOCK, SCALE_COLS], SHARED_B_SCALE
+        b_scale_ptr.dtype.element_ty, [2, B_SCALE_ROWS, SCALE_COLS], SHARED_B_SCALE
     )
     a_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=a_ptr + off_m * stride_am + k_start,
@@ -561,20 +661,20 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
         layout=SHARED_B,
     )
     a_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-        base=a_scale_ptr + off_m * stride_asm + k_start // 32,
-        shape=(M - off_m, k_split // 32),
+        base=a_scale_ptr + off_m * stride_asm + k_start // SCALE_K,
+        shape=(M - off_m, k_split // SCALE_K),
         strides=(stride_asm, 1),
         block_shape=(BLOCK, SCALE_COLS),
         layout=SHARED_A_SCALE,
     )
     b_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-        base=b_scale_ptr + off_n * stride_bsn + k_start // 32,
-        shape=(N - off_n, k_split // 32),
+        base=b_scale_ptr + off_n // B_ROW * stride_bsn + k_start // SCALE_K,
+        shape=(gl.cdiv(N - off_n, B_ROW), k_split // SCALE_K),
         strides=(stride_bsn, 1),
-        block_shape=(BLOCK, SCALE_COLS),
+        block_shape=(B_SCALE_ROWS, SCALE_COLS),
         layout=SHARED_B_SCALE,
     )
-    for slot in gl.static_range(2):
+    for slot in gl.static_range(1 if SINGLE_K_TILE else 2):
         a_desc, b_desc, a_scale_desc, b_scale_desc = _bk512_refill(
             a_desc,
             b_desc,
@@ -586,19 +686,57 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
             b_scale_smem,
             slot,
             BLOCK_K,
+            SCALE_K,
         )
-    num_k_tiles = gl.maximum(gl.cdiv(k_split, BLOCK_K), 2)
-    gl.assume(num_k_tiles >= 2)
     acc = gl.zeros((BLOCK, BLOCK), dtype=gl.float32, layout=WMMA_LAYOUT)
-    # Unrolling six tiles keeps the two-slot parity static in the body.
-    for _ in range((num_k_tiles - 2) // 6):
-        for inner in gl.static_range(6):
+    if SINGLE_K_TILE:
+        gl.amd.cdna5.tdm.async_wait(0)
+        acc = _bk512_consume_tail(
+            a_smem,
+            b_smem,
+            a_scale_smem,
+            b_scale_smem,
+            0,
+            acc,
+            dot_a,
+            dot_b,
+            scale_a,
+            scale_b,
+            BLOCK_K,
+            SCALE_K,
+        )
+    else:
+        num_k_tiles = gl.maximum(gl.cdiv(k_split, BLOCK_K), 2)
+        gl.assume(num_k_tiles >= 2)
+        # Unrolling six tiles keeps the two-slot parity static in the body.
+        for _ in range((num_k_tiles - 2) // 6):
+            for inner in gl.static_range(6):
+                a_desc, b_desc, a_scale_desc, b_scale_desc, acc = _bk512_consume_refill(
+                    a_smem,
+                    b_smem,
+                    a_scale_smem,
+                    b_scale_smem,
+                    inner % 2,
+                    a_desc,
+                    b_desc,
+                    a_scale_desc,
+                    b_scale_desc,
+                    acc,
+                    dot_a,
+                    dot_b,
+                    scale_a,
+                    scale_b,
+                    BLOCK_K,
+                    CLUSTER_SYNC,
+                    SCALE_K,
+                )
+        for tile in range((num_k_tiles - 2) // 6 * 6, num_k_tiles - 2):
             a_desc, b_desc, a_scale_desc, b_scale_desc, acc = _bk512_consume_refill(
                 a_smem,
                 b_smem,
                 a_scale_smem,
                 b_scale_smem,
-                inner % 2,
+                tile % 2,
                 a_desc,
                 b_desc,
                 a_scale_desc,
@@ -610,54 +748,38 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
                 scale_b,
                 BLOCK_K,
                 CLUSTER_SYNC,
+                SCALE_K,
             )
-    for tile in range((num_k_tiles - 2) // 6 * 6, num_k_tiles - 2):
-        a_desc, b_desc, a_scale_desc, b_scale_desc, acc = _bk512_consume_refill(
+        gl.amd.cdna5.tdm.async_wait(3)
+        acc = _bk512_consume_tail(
             a_smem,
             b_smem,
             a_scale_smem,
             b_scale_smem,
-            tile % 2,
-            a_desc,
-            b_desc,
-            a_scale_desc,
-            b_scale_desc,
+            num_k_tiles % 2,
             acc,
             dot_a,
             dot_b,
             scale_a,
             scale_b,
             BLOCK_K,
-            CLUSTER_SYNC,
+            SCALE_K,
         )
-    gl.amd.cdna5.tdm.async_wait(3)
-    acc = _bk512_consume_tail(
-        a_smem,
-        b_smem,
-        a_scale_smem,
-        b_scale_smem,
-        num_k_tiles % 2,
-        acc,
-        dot_a,
-        dot_b,
-        scale_a,
-        scale_b,
-        BLOCK_K,
-    )
-    gl.amd.cdna5.tdm.async_wait(0)
-    acc = _bk512_consume_tail(
-        a_smem,
-        b_smem,
-        a_scale_smem,
-        b_scale_smem,
-        (num_k_tiles - 1) % 2,
-        acc,
-        dot_a,
-        dot_b,
-        scale_a,
-        scale_b,
-        BLOCK_K,
-    )
+        gl.amd.cdna5.tdm.async_wait(0)
+        acc = _bk512_consume_tail(
+            a_smem,
+            b_smem,
+            a_scale_smem,
+            b_scale_smem,
+            (num_k_tiles - 1) % 2,
+            acc,
+            dot_a,
+            dot_b,
+            scale_a,
+            scale_b,
+            BLOCK_K,
+            SCALE_K,
+        )
     if CLUSTER_SYNC:
         gl.amd.cdna5.cluster.arrive()
         gl.amd.cdna5.cluster.wait()
@@ -1283,21 +1405,25 @@ def _bk512_split_k(m: int, n: int, k: int) -> int:
     )
 
 
-def _cluster_mm_config(m: int, n: int, k: int) -> tuple[int, int, int]:
+def _cluster_mm_config(
+    m: int, n: int, k: int, *, fp32_scales: bool
+) -> tuple[int, int, int]:
     """Return the clustered kernel's ``(tile, cluster, split_k)`` for a shape.
 
-    A 256 tile is the BK256 kernel, which needs N divisible by 256; it takes
-    batches from 512 rows whose 256 x 256 tiles exceed half the CUs. The
-    BK512 kernel takes the rest. It uses 64-row tiles while those fit one
-    wave of CUs, then 128-row tiles. Both run unclustered up to 128 rows,
-    where the cluster barriers cost more than the shared loads save. 128-row
-    tiles also run unclustered for two K tiles, too few to hide the
-    cluster's first multicast. A single row of 64-row tiles over at least
-    eight K tiles splits K into the most partitions of two or more tiles
-    that still fit one wave of CUs, and an FP32 reduction writes the output.
+    A 256 tile is the BK256 kernel, which needs UE8M0 scales and N divisible
+    by 256; it takes batches from 512 rows whose 256 x 256 tiles exceed half
+    the CUs. The BK512 kernel takes the rest. It uses 64-row tiles while
+    those fit one wave of CUs, then 128-row tiles. Both run unclustered up to
+    128 rows, where the cluster barriers cost more than the shared loads
+    save. 128-row tiles also run unclustered for two K tiles, too few to hide
+    the cluster's first multicast; a single K tile clusters, which measured
+    faster from 512 rows. A single row of 64-row tiles over at least eight K
+    tiles splits K into the most partitions of two or more tiles that still
+    fit one wave of CUs, and an FP32 reduction writes the output.
     """
     if (
-        m >= _BK256_MIN_M
+        not fp32_scales
+        and m >= _BK256_MIN_M
         and n % _BK256_TILE == 0
         and triton.cdiv(m, 512) * triton.cdiv(n, 512) * 4 > _NUM_CUS // 2
     ):
@@ -1306,7 +1432,7 @@ def _cluster_mm_config(m: int, n: int, k: int) -> tuple[int, int, int]:
         if m > 128:
             return 64, 2, 1
         return 64, 1, _bk512_split_k(m, n, k)
-    return 128, 1 if m <= 128 or k <= 2 * _BK512 else 2, 1
+    return 128, 1 if m <= 128 or _BK512 < k <= 2 * _BK512 else 2, 1
 
 
 def _launch_cluster_mm(
@@ -1319,12 +1445,15 @@ def _launch_cluster_mm(
     tile: int,
     cluster: int,
     split_k: int,
+    fp32_scales: bool,
 ) -> None:
     """Run the clustered kernel ``_cluster_mm_config`` chose into ``out``."""
     m, k = A.shape
     n = B.shape[0]
-    if tile == _BK256_TILE and n % _BK256_TILE:
-        raise ValueError(f"BK256 requires N divisible by {_BK256_TILE}, got N={n}")
+    if tile == _BK256_TILE and (fp32_scales or n % _BK256_TILE):
+        raise ValueError(
+            f"BK256 requires UE8M0 scales and N divisible by {_BK256_TILE}, got N={n}"
+        )
     if split_k > 1 and (
         tile == _BK256_TILE or cluster > 1 or k % _BK512 or (k // _BK512) % split_k
     ):
@@ -1360,6 +1489,8 @@ def _launch_cluster_mm(
             SPLIT_K=split_k,
             GROUP_M=_GROUP_M,
             NUM_XCDS=_NUM_XCDS,
+            FP32_SCALES=fp32_scales,
+            SINGLE_K_TILE=k // split_k <= _BK512,
             num_warps=8,
             num_ctas=cluster * cluster,
             waves_per_eu=2,
@@ -1482,11 +1613,116 @@ def launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250(
             f"out must be row-major GPU {out_dtype} ({m}, {n}) colocated with A"
         )
 
-    tile, cluster, split_k = _cluster_mm_config(m, n, k)
+    tile, cluster, split_k = _cluster_mm_config(m, n, k, fp32_scales=False)
     _launch_cluster_mm(
-        A, B, A_scales, B_scales, out, tile=tile, cluster=cluster, split_k=split_k
+        A,
+        B,
+        A_scales,
+        B_scales,
+        out,
+        tile=tile,
+        cluster=cluster,
+        split_k=split_k,
+        fp32_scales=False,
     )
     return out
 
 
-__all__ = ["launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250"]
+def launch_gluon_mm_fp8_blockscale_largem_gfx1250(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project E4M3 matrices with canonical FP32 ``[128,128]`` block scales.
+
+    Args:
+        A: Row-major E4M3 activation matrix ``[M,K]``; K divisible by 512.
+        B: Row-major E4M3 weight matrix ``[N,K]``; N divisible by 128.
+        A_scales: Per-row FP32 scales ``[M,K/128]`` with unit column stride.
+        B_scales: FP32 scales ``[N/128,K/128]`` with unit column stride.
+        out_dtype: Explicit output dtype; only BF16 is supported.
+        alpha: Unsupported global output scale.
+        block_size: Explicit scale block, which must be ``[128,128]``.
+        out: Optional BF16 output buffer ``[M,N]`` with unit column stride.
+
+    Returns:
+        The caller-owned ``out`` tensor or a newly allocated BF16 result.
+    """
+    if alpha is not None:
+        raise ValueError("gfx1250 FP8 block-scale GEMM does not support alpha")
+    if block_size is None or tuple(block_size) != (128, 128):
+        raise ValueError("gfx1250 FP8 block-scale GEMM requires block_size=[128, 128]")
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError("A and B must be 2D")
+    m, k = A.shape
+    n = B.shape[0]
+    if B.shape[1] != k:
+        raise ValueError(f"B must be [N, {k}], got {tuple(B.shape)}")
+    for name, tensor in (("A", A), ("B", B)):
+        if (
+            tensor.dtype != torch.float8_e4m3fn
+            or not tensor.is_cuda
+            or tensor.device != A.device
+            or tensor.stride(-1) != 1
+        ):
+            raise ValueError(f"{name} must be row-major GPU E4M3 colocated with A")
+    if m < 1 or k < _BK512 or k % _BK512 or n % 128:
+        raise ValueError(
+            "gfx1250 FP8 block-scale GEMM requires M >= 1, N divisible by 128 "
+            f"and K by {_BK512}, got M={m}, N={n}, K={k}"
+        )
+    if A_scales is None or B_scales is None:
+        raise ValueError("A_scales and B_scales are required")
+    for name, scales, shape in (
+        ("A_scales", A_scales, (m, k // 128)),
+        ("B_scales", B_scales, (n // 128, k // 128)),
+    ):
+        if (
+            scales.dtype != torch.float32
+            or tuple(scales.shape) != shape
+            or scales.device != A.device
+            or scales.stride(-1) != 1
+        ):
+            raise ValueError(
+                f"{name} must be row-major GPU FP32 {shape} colocated with A"
+            )
+    if out_dtype != torch.bfloat16:
+        raise ValueError(
+            f"gfx1250 FP8 block-scale GEMM requires BF16 output, got {out_dtype}"
+        )
+    if out is None:
+        out = A.new_empty((m, n), dtype=out_dtype)
+    elif (
+        tuple(out.shape) != (m, n)
+        or out.dtype != out_dtype
+        or out.device != A.device
+        or out.stride(-1) != 1
+    ):
+        raise ValueError(
+            f"out must be row-major GPU {out_dtype} ({m}, {n}) colocated with A"
+        )
+    tile, cluster, split_k = _cluster_mm_config(m, n, k, fp32_scales=True)
+    _launch_cluster_mm(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        out,
+        tile=tile,
+        cluster=cluster,
+        split_k=split_k,
+        fp32_scales=True,
+    )
+    return out
+
+
+__all__ = [
+    "launch_gluon_mm_fp8_blockscale_largem_gfx1250",
+    "launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250",
+]

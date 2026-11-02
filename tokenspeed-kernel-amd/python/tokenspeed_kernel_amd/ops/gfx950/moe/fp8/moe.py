@@ -144,6 +144,8 @@ def launch_gluon_fp8_packed_moe_gfx950(
         )
     block_m = 64 if schedule == "large" else 16
     use_nt = num_tokens * topk // num_experts < 64 if schedule == "large" else False
+    # Stage 2 accumulates into the output with atomics; the alignment launch
+    # clears it, replacing a separate fill launch.
     out = torch.empty_like(hidden_states)
     if schedule == "large" or num_tokens > 16:
         ids, experts, weights, num_valid = moe_align_block_size_device(
@@ -152,6 +154,7 @@ def launch_gluon_fp8_packed_moe_gfx950(
             num_experts,
             block_m,
             expert_start=expert_start,
+            output_to_zero=out,
         )
     else:
         from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
@@ -164,8 +167,8 @@ def launch_gluon_fp8_packed_moe_gfx950(
             num_experts,
             block_m,
             expert_start=expert_start,
+            output_to_zero=out,
         )
-    out.zero_()
     x_fp8, x_scales = quantize_activation(hidden_states)
     em = ids.numel()
     use_reciprocal = (

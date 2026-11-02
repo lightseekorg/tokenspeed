@@ -194,6 +194,7 @@ def l3_settings(
     cache_signature = cache_layout_signature(
         host_cache,
         cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
+        checkpoint_granularities=host_cache.checkpoint_granularities,
     )
     config = StorageRuntimeConfig.from_extra_config(
         server_args.kvstore_storage_backend_extra_config,

@@ -46,10 +46,13 @@ enum class PublicationPoint {
 // Hashes the full prefix pages num_computed_tokens has filled since the
 // previous publication, and at a non-chunk point the partial page beyond
 // them, and states the request's progress for the coordinator. A non-chunk
-// point with nothing new to hash still publishes the frontier's state. The
-// returned spans view cache_progress, which must outlive their use.
+// point may publish the live state only when allow_state_checkpoint is true.
+// A retained in-forward checkpoint is published whenever its frontier has been
+// reached, independently of the live-state policy. The returned spans view
+// cache_progress, which must outlive their use.
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
-                                       bool stream_completed_to_host, PublicationPoint point);
+                                       bool stream_completed_to_host, PublicationPoint point,
+                                       bool allow_state_checkpoint);
 
 }  // namespace tokenspeed

@@ -749,6 +749,13 @@ def test_b200v2_tasks_set_cache_and_jit_check_defaults(
         "env": task_env,
         "ut": {"commands": ["run test"]},
     }
+    env = _task_run_env(monkeypatch, tmp_path, task)
+    assert env.get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+    assert env[cache_env] == str(cache_root / "tokenspeed" / "flashinfer-autotune")
+
+
+def _task_run_env(monkeypatch, tmp_path, task):
+    """The environment ``execute_task`` sets up for ``task`` on a b200v2 runner."""
     captured = {}
 
     class FakeProcessGroupManager:
@@ -776,10 +783,62 @@ def test_b200v2_tasks_set_cache_and_jit_check_defaults(
         result_json=None,
         setup_mode="ci",
     )
-    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
-    assert captured["env"][cache_env] == str(
-        cache_root / "tokenspeed" / "flashinfer-autotune"
+    return captured["env"]
+
+
+@pytest.mark.parametrize(
+    ("task_type", "inherited", "expected"),
+    [
+        ("eval", None, "error"),
+        ("perf", None, "error"),
+        ("server_smoke", None, "error"),
+        ("eval", "warn", "error"),
+        ("ut", None, None),
+        ("ut", "warn", "warn"),
+    ],
+)
+def test_serving_tasks_raise_on_data_plane_syncs(
+    monkeypatch, tmp_path, task_type, inherited, expected
+):
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", inherited)
+    task = {
+        "name": "sync-check",
+        "type": task_type,
+        "runner": {"labels": ["b200v2-1gpu"]},
+        "env": {},
+        "ut": {"commands": ["run test"]},
+    }
+    env = _task_run_env(monkeypatch, tmp_path, task)
+    assert env.get("TOKENSPEED_DATA_PLANE_SYNC_DEBUG") == expected
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "env:\n  TOKENSPEED_DATA_PLANE_SYNC_DEBUG: warn\n",
+        "env:\n  TOKENSPEED_DATA_PLANE_SYNC_DEBUG: error\n",
+    ],
+)
+def test_validate_task_rejects_a_task_setting_the_sync_check(tmp_path, extra):
+    import yaml as _yaml
+
+    path = _write_task_yaml(
+        tmp_path, "task.yaml", _default_body("ut-a", ["b300-1gpu"], extra=extra)
     )
+    with pytest.raises(ValueError, match="TOKENSPEED_DATA_PLANE_SYNC_DEBUG"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_a_runner_env_setting_the_sync_check():
+    import yaml as _yaml
+
+    task = _yaml.safe_load(_default_body("ut-a", ["b300-1gpu"]))
+    task["runner"]["env"] = {"b300-1gpu": {"TOKENSPEED_DATA_PLANE_SYNC_DEBUG": "warn"}}
+    with pytest.raises(ValueError, match=r"runner\.env\['b300-1gpu'\]"):
+        validate_task(task, Path("task.yaml"))
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):

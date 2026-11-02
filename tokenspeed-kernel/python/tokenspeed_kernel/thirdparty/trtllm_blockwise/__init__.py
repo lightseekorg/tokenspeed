@@ -18,120 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TRT-LLM blockwise FP8 adapter. All scales retain their original FP32 values."""
-
-import ctypes
-import threading
-
-import torch
-
-_compiled = {}
-_compile_lock = threading.Lock()
-
-
-def _compile_arguments(a, b, sa, sb, out):
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack, make_ptr
-
-    m, k = a.shape
-    n = b.shape[0]
-    pointers = tuple(
-        make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-        for dtype, tensor in (
-            (cutlass.Float8E4M3FN, a),
-            (cutlass.Float8E4M3FN, b),
-            (cutlass.Float32, sa),
-            (cutlass.Float32, sb),
-        )
-    )
-    c = from_dlpack(out.view(1, m, n).permute(1, 2, 0), enable_tvm_ffi=True)
-    c = c.mark_layout_dynamic(leading_dim=1)
-    return (m, n, k, m, n // 128, k // 128, 1, *pointers, c)
-
-
-def _arguments(a, b, sa, sb, out):
-    """Pass live storage directly through TVM-FFI after the types are compiled."""
-    m, k = a.shape
-    n = b.shape[0]
-    addresses = (a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr())
-    if any(address % 16 for address in addresses) or out.data_ptr() % 16:
-        raise ValueError("TRT-LLM CuTe-DSL tensor pointers must be 16-byte aligned")
-    # Compile-time CuTe descriptors establish dtype/layout/alignment. At runtime
-    # TVM-FFI accepts opaque pointers and a Torch tensor without rebuilding them.
-    return (
-        m,
-        n,
-        k,
-        m,
-        n // 128,
-        k // 128,
-        1,
-        *(ctypes.c_void_p(address) for address in addresses),
-        out.as_strided((m, n, 1), (n, 1, m * n)),
-    )
-
-
-def _compile(a, b, sa, sb, out, tile_m):
-    import cutlass
-    import cutlass.cute as cute
-    import cutlass.utils as utils
-    from cutlass.runtime import make_fake_stream
-    from tokenspeed_kernel.thirdparty.trtllm_blockwise._kernel import (
-        Sm100BlockwiseGemmKernel,
-    )
-
-    two = tile_m == 256
-    cluster = (2, 1) if two else (1, 1)
-    kernel = Sm100BlockwiseGemmKernel(cutlass.Float32, two, (tile_m, 128), cluster)
-    active = utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
-    return cute.compile(
-        kernel.wrapper,
-        *_compile_arguments(a, b, sa, sb, out),
-        active,
-        make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-
-
-def prepare(device):
-    """Compile reusable dynamic-shape variants on device before graph capture."""
-    with torch.cuda.device(device), _compile_lock:
-        if (device.index, 64) in _compiled:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Prepare TRT-LLM CuTe-DSL before CUDA graph capture")
-        a = torch.empty((256, 128), device=device, dtype=torch.float8_e4m3fn)
-        b = torch.empty((128, 128), device=device, dtype=torch.float8_e4m3fn)
-        sa = torch.empty((1, 256), device=device, dtype=torch.float32)
-        sb = torch.empty((1, 1), device=device, dtype=torch.float32)
-        out = torch.empty((256, 128), device=device, dtype=torch.bfloat16)
-        compiled = {
-            (device.index, tile): _compile(a, b, sa, sb, out, tile)
-            for tile in (64, 128, 256)
-        }
-        _compiled.update(compiled)
+"""Public entry points for TRT-LLM blockwise FP8 GEMM."""
 
 
 def blockwise_gemm(a, b, a_scales, b_scales, out):
-    """Run FP8 [M,K] @ [N,K].T with 1x128/128x128 FP32 scales into BF16 out."""
-    # A scales are logically [M,K/128], but this kernel reads MN-major.
-    sa = a_scales.T.contiguous()
-    sb = b_scales.contiguous()
-    m = a.shape[0]
-    if m == 0:
-        return out
-    tile = 64 if m <= 64 else (128 if m <= 128 else 256)
-    key = (a.device.index, tile)
-    if key not in _compiled:
-        prepare(a.device)
-    from cuda.bindings.driver import CUstream
+    """Run block-FP8 GEMM with startup-tuned tiles and the current CUDA stream.
 
-    # Query the stream at every launch, including capture on an auxiliary
-    # stream. Read the raw handle without constructing a temporary Torch Stream.
-    # Never bind the stream or pointers used during compilation.
-    _compiled[key](
-        *_arguments(a, b, sa, sb, out),
-        CUstream(torch._C._cuda_getCurrentRawStream(a.device.index)),
-    )
-    return out
+    Args:
+        a: E4M3 activations [M,K].
+        b: E4M3 weights [N,K].
+        a_scales: FP32 activation scales [M,K/128].
+        b_scales: FP32 weight scales [N/128,K/128].
+        out: Contiguous BF16 output [M,N].
+
+    Returns:
+        The supplied output tensor. Tuning follows the shared autotune context.
+    """
+    if a.shape[0] == 0:
+        return out
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise.runner import run
+
+    return run(a, b, a_scales, b_scales, out)

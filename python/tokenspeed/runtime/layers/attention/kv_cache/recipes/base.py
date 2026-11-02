@@ -327,9 +327,14 @@ class CacheRecipe(ABC):
     # ------------------------------------------------------------------
 
     @property
+    @abstractmethod
     def prefix_granularity(self) -> int:
-        """Scheduler-wide identity grain in tokens."""
-        return int(self.attn_config.prefix_granularity)
+        """Scheduler-wide identity grain in tokens.
+
+        Every recipe declares its own: a multiple of each history group's
+        ``block_granularity``, sized for the kernels that read those blocks.
+        No launch option overrides it; the memory plan carries it from here.
+        """
 
     @property
     def alignment(self) -> int:

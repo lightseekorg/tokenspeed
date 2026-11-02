@@ -28,7 +28,7 @@ import pytest
 pytest.importorskip("smg")
 
 
-def test_smg_exposes_deepseek_v4_parsers():
+def test_smg_exposes_deepseek_v41_parsers():
     proc = subprocess.run(
         [sys.executable, "-m", "smg", "launch", "--help"],
         check=True,
@@ -37,5 +37,6 @@ def test_smg_exposes_deepseek_v4_parsers():
         text=True,
     )
 
+    # serve_smg selects deepseek_v41; the V4.1 GB300 CI gateway uses deepseek_v31.
     assert "deepseek_v31" in proc.stdout
-    assert "deepseek_v4" in proc.stdout
+    assert "deepseek_v41" in proc.stdout

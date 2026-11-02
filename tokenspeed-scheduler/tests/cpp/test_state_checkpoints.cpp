@@ -74,10 +74,10 @@ protected:
     }
 
     void Reset(bool host_cache, std::int32_t decode_width) {
-        config_ = MakeConfig();
+        config_ = WithHostPackingFromDevice(MakeConfig());
         config_.disable_l2_cache = !host_cache;
         config_.decode_input_tokens = decode_width;
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     }
 
     static RequestSpec RequestWithTokens(const std::string& id, std::vector<std::int32_t> tokens) {
@@ -157,6 +157,368 @@ protected:
         return resume;
     }
 };
+
+class AlignedStateCheckpointSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.prefix_granularity = 128;
+        cfg.max_scheduled_tokens = 16384;
+        // An aligned grain requires the consumer that writes the checkpoint block.
+        cfg.state_checkpoint_in_forward = true;
+        for (auto& group : cfg.cache_groups) {
+            if (group.attn_kind == AttnKind::kState) {
+                group.checkpoint_granularity = 4096;
+            } else {
+                group.block_granularity = 128;
+            }
+        }
+        return cfg;
+    }
+};
+
+TEST_F(AlignedStateCheckpointSuite, FullPromptAlwaysRecomputesTheLastSegmentAndNeverHitsATail) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    Submit(RequestWithTokens("seed", MakeTokens(8192)));
+    std::map<std::int32_t, std::int32_t> checkpoints;
+    {
+        ExecutionPlan plan;
+        auto state = PlanAndStateRow("seed", &plan);
+        const auto* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        ASSERT_EQ(batch->extend_prefix_lens.size(), 1u);
+        EXPECT_EQ(batch->extend_prefix_lens[0], 0);
+        EXPECT_EQ(batch->input_lengths[0], 8192);
+        ASSERT_EQ(state.size(), 3u);
+        EXPECT_NE(state[2], state[0]);
+        EXPECT_NE(state[2], state[1]);
+        EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("state0"), state[2]), 1);
+        checkpoints[4096] = state.at(2);
+        checkpoints[8192] = state.at(1);
+        SendForwardDone("seed", {99});
+    }
+    SendFinish("seed");
+    PlanOnce();
+    // Cache lookup is real: no manufactured hits or injected checkpoint keys.
+    for (const auto [length, expected] : std::vector<std::pair<int, int>>{
+             {4096, 0}, {4097, 4096}, {8191, 4096}, {8192, 4096}, {8193, 8192}, {12288, 8192}}) {
+        const Resume hit = Probe("probe-" + std::to_string(length), MakeTokens(length));
+        EXPECT_EQ(hit.prefix_tokens, expected) << "prompt=" << length;
+        if (expected != 0) {
+            EXPECT_EQ(hit.state_row.at(0), checkpoints.at(expected));
+        }
+    }
+}
+
+TEST_F(AlignedStateCheckpointSuite, OnlyTheLastSegmentEntranceIsPublishedBeforeThePromptEnd) {
+    for (const std::int32_t budget : {4096, 16384, 32768}) {
+        SCOPED_TRACE(budget);
+        config_ = MakeConfig();
+        config_.max_scheduled_tokens = budget;
+        config_.device_allocator.total_pages = 1025;
+        config_.host_allocator.total_pages = 1025;
+        for (auto& group : config_.cache_groups) {
+            group.total_pages = 1025;
+        }
+        SetTestSnapshotPool(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+        Submit(RequestWithTokens("seed", MakeTokens(16385)));
+        std::int32_t saved_state = -1;
+        for (std::int32_t begin = 0; begin < 16385;) {
+            ExecutionPlan plan;
+            const auto state = PlanAndStateRow("seed", &plan);
+            const auto* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr);
+            EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{begin});
+            const std::int32_t length = std::min(budget, 16385 - begin);
+            EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{length});
+            begin += length;
+            if (begin >= 16384 && saved_state < 0) {
+                saved_state = state.at(begin == 16384 ? 1 : 2);
+            }
+            SendForwardDone("seed", begin == 16385 ? std::vector<std::int32_t>{99} : std::vector<std::int32_t>{});
+        }
+        SendFinish("seed");
+        PlanOnce();
+        for (const auto [length, expected] : std::vector<std::pair<int, int>>{
+                 {4097, 0}, {8193, 0}, {12289, 0}, {16384, 0}, {16385, 16384}, {20480, 16384}}) {
+            const Resume hit = Probe("probe-" + std::to_string(length), MakeTokens(length));
+            EXPECT_EQ(hit.prefix_tokens, expected) << "prompt=" << length;
+            if (expected != 0) {
+                EXPECT_EQ(hit.state_row.at(0), saved_state);
+            }
+        }
+    }
+}
+
+TEST_F(AlignedStateCheckpointSuite, A4097TokenRequestSavesItsInteriorCheckpointInOneForward) {
+    config_ = MakeConfig();
+    config_.max_scheduled_tokens = 8192;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    Submit(RequestWithTokens("a", MakeTokens(1808)));
+    Submit(RequestWithTokens("b", MakeTokens(4097, 100000)));
+    const ExecutionPlan first = PlanOnce();
+    const auto* batch = FindForwardBatch(first);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, std::vector<std::string>({"a", "b"}));
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>({1808, 4097}));
+    EXPECT_LE(StateRow(*batch, "state0", "a").at(2), 0) << "padding is not an allocated checkpoint";
+    const auto checkpoint = StateRow(*batch, "state0", "b").at(2);
+    SendForwardDone("a", {99});
+    SendFinish("a");
+    SendForwardDone("b", {99});
+    SendFinish("b");
+    PlanOnce();
+    const Resume hit = Probe("probe", MakeTokens(4097, 100000));
+    EXPECT_EQ(hit.prefix_tokens, 4096);
+    EXPECT_EQ(hit.state_row.at(0), checkpoint);
+}
+
+TEST_F(AlignedStateCheckpointSuite, RejectsBudgetSmallerThanOneSegment) {
+    auto cfg = MakeConfig();
+    cfg.max_scheduled_tokens = 4095;
+    EXPECT_THROW(Scheduler{cfg}, std::invalid_argument);
+}
+
+TEST_F(AlignedStateCheckpointSuite, InteriorCheckpointSurvivesRotationAndHostOffload) {
+    for (const bool host_cache : {false, true}) {
+        Reset(host_cache, /*decode_width=*/1);
+        Submit(RequestWithTokens("seed", MakeTokens(8192)));
+        ExecutionPlan plan;
+        const auto first = PlanAndStateRow("seed", &plan);
+        ASSERT_EQ(first.size(), 3u);
+        SendForwardDone("seed", {99});
+        const auto decode = PlanAndStateRow("seed", &plan);
+        ASSERT_EQ(decode.size(), 2u) << "the transient output leaves the request after publication";
+        EXPECT_EQ(decode[0], first[1]);
+        EXPECT_NE(decode[1], first[2]) << "the published checkpoint is immutable";
+        SendForwardDone("seed", {100});
+        SendFinish("seed");
+        AckWriteBacks(PlanOnce());
+        if (host_cache) {
+            ASSERT_TRUE(scheduler_->ClearL1Cache());
+        }
+        const Resume hit = Probe("hit", MakeTokens(8192));
+        EXPECT_EQ(hit.prefix_tokens, 4096);
+        if (host_cache) {
+            EXPECT_GE(hit.load_rows, 32 + 3) << "KV pages plus the interior state of every group";
+        } else {
+            EXPECT_EQ(hit.state_row.at(0), first[2]);
+        }
+    }
+}
+
+TEST_F(AlignedStateCheckpointSuite, AbortDoesNotPublishTheInteriorOutput) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    const auto empty = scheduler_->EmptyLcmBlocks();
+    Submit(RequestWithTokens("seed", MakeTokens(8192)));
+    ASSERT_EQ(PlanAndStateRow("seed").size(), 3u);
+    SendForwardDone("seed", {99});
+    SendAbortEvent("seed");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), empty);
+    EXPECT_EQ(Probe("miss", MakeTokens(8192)).prefix_tokens, 0);
+}
+
+TEST_F(AlignedStateCheckpointSuite, PrefillResultsDoNotPublishWithoutAFollowingAdmission) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    Submit(RequestWithTokens("seed", MakeTokens(8192)));
+    ASSERT_EQ(PlanAndStateRow("seed").size(), 3u);
+    SendForwardDone("seed", {8193});
+    // A result advances the request, but publication remains in admission.
+    // Abort before the next admission drops the still-private checkpoint.
+    SendAbortEvent("seed");
+    PlanOnce();
+    EXPECT_EQ(Probe("miss", MakeTokens(8193)).prefix_tokens, 0);
+}
+
+TEST_F(AlignedStateCheckpointSuite, FirstDecodeAdmissionDeliversThePrecedingPrefillCheckpoints) {
+    for (const bool prefill_landed : {false, true}) {
+        SCOPED_TRACE(prefill_landed);
+        Reset(/*host_cache=*/false, /*decode_width=*/1);
+        Submit(RequestWithTokens("seed", MakeTokens(8192)));
+        const auto prefill_state = PlanAndStateRow("seed");
+        ASSERT_EQ(prefill_state.size(), 3u);
+        if (prefill_landed) {
+            SendForwardDone("seed", {8193});
+        }
+        const auto decode_state = PlanAndStateRow("seed");
+        ASSERT_EQ(decode_state.size(), 2u);
+        EXPECT_EQ(decode_state[0], prefill_state[1]);
+        EXPECT_NE(decode_state[1], prefill_state[1]);
+        // Stream order permits publication of the previous plan's outputs
+        // before its CPU result lands. No checkpoint travels on that result.
+        SendAbortEvent("seed");
+        PlanOnce();
+        const Resume interior = Probe("interior", MakeTokens(8192));
+        EXPECT_EQ(interior.prefix_tokens, 4096);
+        ASSERT_FALSE(interior.state_row.empty());
+        EXPECT_EQ(interior.state_row[0], prefill_state[2]);
+        const Resume endpoint = Probe("endpoint", MakeTokens(8193));
+        EXPECT_EQ(endpoint.prefix_tokens, 8192);
+        ASSERT_FALSE(endpoint.state_row.empty());
+        EXPECT_EQ(endpoint.state_row[0], prefill_state[1]);
+    }
+}
+
+TEST_F(AlignedStateCheckpointSuite, DecodeRoleDoesNotPublishTheTransferredPromptState) {
+    config_ = MakeConfig();
+    config_.role = Role::kD;
+    for (auto& group : config_.cache_groups) {
+        group.transfer_policy =
+            group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+    }
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    Submit(RequestWithTokens("seed", MakeTokens(8192)));
+    ExecutionEvent bootstrap;
+    bootstrap.With(pd::BootstrappedEvent{"seed"});
+    scheduler_->Advance(std::move(bootstrap));
+    ASSERT_TRUE(PlanOnce().remote_prefill.has_value());
+    ExecutionEvent remote_done;
+    remote_done.With(pd::RemotePrefillDoneEvent{"seed", 8193});
+    scheduler_->Advance(std::move(remote_done));
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("seed", {8194});
+    SendFinish("seed");
+    PlanOnce();
+    Submit(RequestWithTokens("probe", MakeTokens(8192)));
+    ExecutionEvent probe_bootstrap;
+    probe_bootstrap.With(pd::BootstrappedEvent{"probe"});
+    scheduler_->Advance(std::move(probe_bootstrap));
+    const ExecutionPlan probe = PlanOnce();
+    ASSERT_TRUE(probe.remote_prefill.has_value());
+    // D may still reuse KV pages. A cached prompt-end State would instead
+    // appear in slot 0 and cause that group's transfer to be omitted.
+    EXPECT_LE(StateRow(*probe.remote_prefill, "state0", "probe").at(0), 0);
+}
+
+TEST_F(AlignedStateCheckpointSuite, DecodeCannotPublishAnAlignedFrontierAtFinish) {
+    for (const bool host_cache : {false, true}) {
+        for (const bool finish_in_flight : {false, true}) {
+            for (const std::int32_t prompt : {4095, 8191}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "host=" << host_cache << " in_flight=" << finish_in_flight << " prompt=" << prompt);
+                config_ = MakeConfig();
+                config_.disable_l2_cache = !host_cache;
+                config_.enable_mixed_prefill_decode = true;
+                config_.decode_input_tokens = 1;
+                scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+                Submit(RequestWithTokens("seed", MakeTokens(prompt)));
+                const ExecutionPlan prefill = PlanOnce();
+                ASSERT_NE(FindForwardBatch(prefill), nullptr);
+                SendForwardDone("seed", {prompt + 1});
+                AckWriteBacks(PlanOnce());  // may publish the preceding prefill checkpoint only
+                if (finish_in_flight) {
+                    SendFinish("seed");
+                }
+                SendForwardDone("seed", {prompt + 2});  // decode consumed one token: frontier 4096 or 8192
+                if (!finish_in_flight) {
+                    SendFinish("seed");
+                }
+                AckWriteBacks(PlanOnce());
+                if (host_cache) {
+                    ASSERT_TRUE(scheduler_->ClearL1Cache());
+                }
+                EXPECT_EQ(Probe("hit", MakeTokens(prompt + 2)).prefix_tokens, prompt / 4096 * 4096)
+                    << "only the prefill-created entrance may be reused, not the aligned decode state";
+            }
+        }
+    }
+}
+
+TEST_F(AlignedStateCheckpointSuite, RetractedDecodeStateRestoresPrivatelyWithoutBecomingAPrefixHit) {
+    config_ = MakeConfig();
+    config_.disable_l2_cache = false;
+    config_.debug_force_retraction_interval = 3;
+    config_.decode_input_tokens = 1;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    Submit(RequestWithTokens("seed", MakeTokens(4095)));
+    const ExecutionPlan prefill = PlanOnce();  // plan 1: prefill
+    ASSERT_NE(FindForwardBatch(prefill), nullptr);
+    AckWriteBacks(prefill);
+    SendForwardDone("seed", {4096});
+    const ExecutionPlan decode = PlanOnce();  // plan 2: decode consumes token 4096
+    ASSERT_NE(FindForwardBatch(decode), nullptr);
+    AckWriteBacks(decode);
+    SendForwardDone("seed", {4097});
+    const ExecutionPlan retraction = PlanOnce();  // plan 3: frontier 4096
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    ASSERT_NE(FindSnapshotStore(retraction), nullptr);
+    AckImageStores(retraction);
+    const ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    AckRestores(readmit);
+    const auto restored_state = PlanAndStateRow("seed");
+    ASSERT_GT(restored_state.at(1), 0) << "the request can still resume its private decode state";
+    SendForwardDone("seed", {4098});
+    SendAbortEvent("seed");
+    EXPECT_EQ(Probe("miss", MakeTokens(4097)).prefix_tokens, 0)
+        << "the decode image is not a canonical prefill checkpoint";
+}
+
+TEST_F(AlignedStateCheckpointSuite, AFinalTailDoesNotAlignTheNextRequestsPackedOffset) {
+    for (const bool resumed : {false, true}) {
+        for (const std::int32_t budget : {4096, 8192}) {
+            for (const std::int32_t tail : {1, 63, 64, 65, 1808, 4095, 4096}) {
+                SCOPED_TRACE(::testing::Message() << "resumed=" << resumed << " budget=" << budget << " tail=" << tail);
+                config_ = MakeConfig();
+                config_.max_scheduled_tokens = budget;
+                scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+                if (resumed) {
+                    Submit(RequestWithTokens("seed", MakeTokens(4096)));
+                    const ExecutionPlan first = PlanOnce();
+                    const auto* batch = FindForwardBatch(first);
+                    ASSERT_NE(batch, nullptr);
+                    EXPECT_EQ(batch->request_ids, std::vector<std::string>{"seed"});
+                    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{4096});
+                    SendForwardDone("seed", {99});
+                    SendFinish("seed");
+                    PlanOnce();
+                }
+                Submit(RequestWithTokens("a", MakeTokens((resumed ? 4096 : 0) + tail)));
+                Submit(RequestWithTokens("b", MakeTokens(8193, 100000)));
+                const ExecutionPlan plan = PlanOnce();
+                const auto* batch = FindForwardBatch(plan);
+                ASSERT_NE(batch, nullptr);
+                const bool b_fits = budget - tail >= 4096;
+                EXPECT_EQ(batch->request_ids,
+                          b_fits ? std::vector<std::string>({"a", "b"}) : std::vector<std::string>({"a"}));
+                EXPECT_EQ(batch->input_lengths,
+                          b_fits ? std::vector<std::int32_t>({tail, 4096}) : std::vector<std::int32_t>({tail}));
+                EXPECT_EQ(batch->extend_prefix_lens, b_fits ? std::vector<std::int32_t>({resumed ? 4096 : 0, 0})
+                                                            : std::vector<std::int32_t>({resumed ? 4096 : 0}));
+                auto expected_ids = MakeTokens(tail, resumed ? 4097 : 1);
+                if (b_fits) {
+                    const auto b_ids = MakeTokens(4096, 100000);
+                    expected_ids.insert(expected_ids.end(), b_ids.begin(), b_ids.end());
+                }
+                EXPECT_EQ(batch->input_ids, expected_ids);
+                const std::string key = std::string(resumed ? "resumed" : "cold") + "_budget_" +
+                                        std::to_string(budget) + "_tail_" + std::to_string(tail);
+                RecordProperty(key, b_fits ? "a=" + std::to_string(tail) +
+                                                 ",b=4096,b_packed_offset=" + std::to_string(tail) + ",b_prefix=0"
+                                           : "a=" + std::to_string(tail) + ",b=wait");
+                // There is no batch padding after A. B waits only when its
+                // complete next segment cannot fit in the remaining budget.
+                SendForwardDone("a", {99});
+                SendFinish("a");
+                if (b_fits) {
+                    SendForwardDone("b");
+                }
+                const ExecutionPlan next = PlanOnce();
+                const auto* next_batch = FindForwardBatch(next);
+                ASSERT_NE(next_batch, nullptr);
+                EXPECT_EQ(next_batch->request_ids, std::vector<std::string>{"b"});
+                const std::int32_t next_length = b_fits && budget == 8192 ? 4097 : (budget == 8192 ? 8192 : 4096);
+                EXPECT_EQ(next_batch->input_lengths, std::vector<std::int32_t>{next_length});
+                EXPECT_EQ(next_batch->extend_prefix_lens, std::vector<std::int32_t>{b_fits ? 4096 : 0});
+                EXPECT_EQ(next_batch->input_ids, MakeTokens(next_length, b_fits ? 104096 : 100000));
+                SendAbortEvent("b");
+                PlanOnce();
+            }
+        }
+    }
+}
 
 TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
@@ -278,6 +640,57 @@ protected:
         return chunks;
     }
 };
+
+class ReservedDecodeCheckpointSuite : public StateCheckpointInForwardSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = StateCheckpointInForwardSuite::MakeConfig();
+        cfg.prefix_granularity = 64;
+        cfg.max_scheduled_tokens = 256;
+        cfg.decode_input_tokens = 4;
+        cfg.overlap_schedule_depth = 1;
+        cfg.disable_l2_cache = false;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        for (auto& group : cfg.cache_groups) {
+            if (group.attn_kind != AttnKind::kState) {
+                group.block_granularity = 64;
+            }
+        }
+        return cfg;
+    }
+};
+
+TEST_F(ReservedDecodeCheckpointSuite, ReservedStepsKeepGeneratedHashesAndTheFinalStateReusable) {
+    std::vector<std::int32_t> tokens = MakeTokens(385);
+    auto owner = RequestWithTokens("owner", tokens);
+    owner.max_new_tokens = 512;
+    Submit(owner);
+    const auto chunks = RunPrefill("owner", 385);
+    ASSERT_EQ(chunks.size(), 2u);
+    EXPECT_EQ(chunks.back().checkpoint_len, 128);
+    tokens.push_back(900);
+
+    std::int32_t live_state = 0;
+    for (std::int32_t round = 0; round < 80; ++round) {
+        const auto row = PlanAndStateRow("owner");
+        ASSERT_EQ(row.size(), 2u);
+        ASSERT_GT(row[1], 0);
+        live_state = row[1];
+        const std::vector<std::int32_t> accepted{1000 + 2 * round, 1001 + 2 * round};
+        SendForwardDone("owner", accepted);
+        tokens.insert(tokens.end(), accepted.begin(), accepted.end());
+    }
+    SendFinish("owner");
+    AckWriteBacks(PlanOnce());
+
+    const auto computed_tokens = static_cast<std::int32_t>(tokens.size()) - 1;
+    tokens.push_back(2000);
+    const auto resumed = Probe("reuse", tokens);
+    EXPECT_EQ(resumed.prefix_tokens, computed_tokens);
+    ASSERT_EQ(resumed.state_row.size(), 2u);
+    EXPECT_EQ(resumed.state_row[0], live_state);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+}
 
 // Under the 8-token budget a 22-token prompt keeps its plain chunks 8, 8 and
 // 6. The last one spans the boundary 20 and writes the state after its first
@@ -1170,7 +1583,7 @@ TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTai
 TEST_F(StateRestoreClaimSuite, ARetractionAtAPageBoundaryRestoresUnderWriteBack) {
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 4});
     AckWriteBacks(PlanOnce());  // plan 1: the prefill
     SendForwardDone("r", {101});
@@ -1683,9 +2096,9 @@ TEST_P(StateCheckpointPrefillHostShardSuite, NoEvictionRecordCrossesAPlan) {
 // h resumes at s1's checkpoint on the Device and prefills [22, 38) in two
 // chunks. The second chunk's rotation releases that checkpoint, and with no
 // other room in the pool the admission reclaims it -- with its tail's KV
-// block, the request's own copy of which it keeps -- as the request's own:
-// dropped, never written back.
-TEST_P(StateCheckpointPrefillHostShardSuite, RequestReclaimedCheckpointIsDropped) {
+// block, the request's own copy of which it keeps. Its published checkpoint
+// remains reusable and is written back as the request releases it.
+TEST_P(StateCheckpointPrefillHostShardSuite, RequestReclaimedCheckpointIsWrittenBack) {
     device_pages_ = 10;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     std::vector<std::int32_t> tokens = MakeTokens(22);
@@ -1699,10 +2112,11 @@ TEST_P(StateCheckpointPrefillHostShardSuite, RequestReclaimedCheckpointIsDropped
     ASSERT_EQ(chunks.size(), 2u);
     EXPECT_EQ(chunks[0].prefix_tokens, 22);
     const HostCacheStats stats = scheduler_->GetHostCacheStats();
-    EXPECT_EQ(stats.eviction_stores.ops, 0u);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+    EXPECT_EQ(stats.eviction_stores.ops, 1u);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
     // The tail's KV block and its three checkpoints.
     EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, 4u);
+    EXPECT_EQ(stats.device_evictions.request_reclaim_for_write_back, 4u);
     EXPECT_EQ(stats.device_evictions.admission.blocks, 0u);
 }
 
@@ -2289,7 +2703,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         const bool write_back = policy == SchedulerConfig::HostWritePolicy::kWriteBack;
         Reset(host_cache, /*decode_width=*/1);
         config_.max_batch_size = 3;  // x, h and g in flight together
-        scheduler_ = std::make_unique<Scheduler>(config_);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
         std::vector<std::int32_t> o = MakeTokens(22, 3000);
         CompleteSession("o", o);
         const std::vector<std::int32_t> s1 = MakeTokens(22);
@@ -2356,7 +2770,7 @@ TEST_F(StateCheckpointPrefillHostSuite, ARestoredInputIsStillMarkedByItsOwnFinis
     role_ = Role::kFused;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.debug_force_retraction_interval = -7;  // the oldest Prefilling request, every seventh plan
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::vector<std::int32_t> s1 = MakeTokens(22);
     Submit(RequestWithTokens("s1", s1));
     ASSERT_EQ(RunPrefill("s1", 22).size(), 3u);  // plans 1-3
@@ -2987,7 +3401,7 @@ TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesW
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.enable_mixed_prefill_decode = true;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const std::vector<std::int32_t> s1 = MakeTokens(22);
     Submit(RequestWithTokens("s1", s1));
     RunPrefill("s1", 22);
@@ -3234,7 +3648,7 @@ TEST_F(StateCheckpointFusedHostSuite, ARestoresEvictionStoreRunsBeforeTheRestore
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.debug_force_retraction_interval = 5;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(RequestWithTokens("r", MakeTokens(14)));
     std::optional<ExecutionPlan> image;
     std::optional<ExecutionPlan> restore;
@@ -3304,6 +3718,237 @@ TEST_F(StateCheckpointFusedHostSuite, ARestoresEvictionStoreRunsBeforeTheRestore
         reused = reused || read.contains({restored.group_ids[0][row], restored.dst_pages[0][row]});
     }
     EXPECT_TRUE(reused);
+}
+
+class ActiveInputCheckpointSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 128;
+        cfg.host_allocator.total_pages = 32;
+        cfg.disable_l2_cache = false;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        cfg.state_checkpoint_in_forward = true;
+        cfg.max_scheduled_tokens = 16;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+            if (group.attn_kind == AttnKind::kState) {
+                group.checkpoint_granularity = kP;
+            }
+        }
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "recent",
+            .block_granularity = kP,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kSlidingWindow,
+            .sliding_window_tokens = kP,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(ActiveInputCheckpointSuite, AnInteriorCheckpointPublishesItsOwnRecentWindow) {
+    for (const bool host_cache : {false, true}) {
+        for (const std::int32_t grain : {1, kP, 2 * kP}) {
+            for (const std::int32_t prompt_tokens : {1, 4, 5, 8, 31, 32, 35, 37, 40}) {
+                SCOPED_TRACE(host_cache);
+                SCOPED_TRACE(grain);
+                SCOPED_TRACE(prompt_tokens);
+                config_ = WithHostPackingFromDevice(MakeConfig());
+                config_.disable_l2_cache = !host_cache;
+                config_.host_write_policy = host_cache ? SchedulerConfig::HostWritePolicy::kWriteBack
+                                                       : SchedulerConfig::HostWritePolicy::kWriteThrough;
+                config_.decode_input_tokens = 1;
+                for (CacheGroupConfig& group : config_.cache_groups) {
+                    if (group.attn_kind == AttnKind::kState) {
+                        group.checkpoint_granularity = grain;
+                    }
+                }
+                scheduler_ = std::make_unique<Scheduler>(config_);
+                const std::vector<std::int32_t> prompt = MakeTokens(prompt_tokens);
+                Submit(RequestWithTokens("live", prompt));
+                for (std::int32_t step = 0; step < 8 && scheduler_->DecodingSize() == 0; ++step) {
+                    const ExecutionPlan plan = PlanOnce();
+                    AckWriteBacks(plan);
+                    const ForwardBatch* batch = FindForwardBatch(plan);
+                    ASSERT_NE(batch, nullptr);
+                    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"live"});
+                    const bool prefill_left =
+                        batch->NumExtends() > 0 &&
+                        batch->extend_prefix_lens[0] + batch->input_lengths[0] < batch->prefill_lengths[0];
+                    SendForwardDone("live",
+                                    prefill_left ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{900});
+                }
+                ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+                SendFinish("live");
+                PlanOnce();
+                // Diverging in the last input page needs the interior
+                // checkpoint's window, which can precede the endpoint window.
+                std::vector<std::int32_t> next = prompt;
+                next.back() = 777;
+                next.push_back(778);
+                const std::int32_t boundary_grain = std::max(kP, grain);
+                // Unrestricted State only saves an interior checkpoint for
+                // prompts longer than one chunk's budget.
+                const std::int32_t expected = grain == 1 && prompt_tokens <= config_.max_scheduled_tokens
+                                                  ? 0
+                                                  : (prompt_tokens - 1) / boundary_grain * boundary_grain;
+                EXPECT_EQ(Probe("next", std::move(next)).prefix_tokens, expected);
+                EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
+                EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+                EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+            }
+        }
+    }
+}
+
+TEST_F(ActiveInputCheckpointSuite, ALongDecodeKeepsAnInputCheckpointForTheNextTurn) {
+    // The 31-token prompt writes its checkpoint inside a forward; the
+    // 35-token prompt reaches the boundary at a prefill chunk end instead.
+    for (const std::int32_t prompt_tokens : {31, 32, 35, 36}) {
+        SCOPED_TRACE(prompt_tokens);
+        Reset(/*host_cache=*/true, /*decode_width=*/1);
+        const std::vector<std::int32_t> prompt = MakeTokens(prompt_tokens);
+        Submit(RequestSpec{.request_id = "live", .tokens = prompt, .max_new_tokens = 192});
+        const auto run_step = [&]() {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
+                for (const std::uint32_t id : std::get<LoadBackBatch>(operation).op_ids) {
+                    SendLoadBackDone(id);
+                }
+            }
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            for (std::size_t row = 0; batch != nullptr && row < batch->request_ids.size(); ++row) {
+                const std::string& id = batch->request_ids[row];
+                if (row < batch->NumExtends() &&
+                    batch->extend_prefix_lens[row] + batch->input_lengths[row] < batch->prefill_lengths[row]) {
+                    SendForwardDone(id);
+                } else {
+                    SendForwardDone(id, {900});
+                    if (id != "live") {
+                        SendFinish(id);
+                    }
+                }
+            }
+            EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+        };
+        for (std::int32_t i = 0; i < 4; ++i) {
+            run_step();
+        }
+        ASSERT_GT(scheduler_->RequestTokenSize("live"), prompt_tokens);
+        for (std::int32_t i = 0; i < 80; ++i) {
+            SCOPED_TRACE(i);
+            const std::string id = "pressure-" + std::to_string(i);
+            Submit(RequestWithTokens(id, MakeTokens(12, 1000 + i * 32)));
+            for (std::int32_t step = 0; step < 8 && scheduler_->RequestTokenSize(id) >= 0; ++step) {
+                run_step();
+            }
+            ASSERT_EQ(scheduler_->RequestTokenSize(id), -1);
+        }
+        ASSERT_GT(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
+        ASSERT_GT(scheduler_->RequestTokenSize("live"), prompt_tokens + 20);
+        SendFinish("live");
+        run_step();
+        for (std::int32_t i = 0; i < 2; ++i) {
+            const std::string id = "between-turns-" + std::to_string(i);
+            Submit(RequestWithTokens(id, MakeTokens(12, 10000 + i * 32)));
+            for (std::int32_t step = 0; step < 8 && scheduler_->RequestTokenSize(id) >= 0; ++step) {
+                run_step();
+            }
+            ASSERT_EQ(scheduler_->RequestTokenSize(id), -1);
+        }
+        std::vector<std::int32_t> next = prompt;
+        next.back() = 777;
+        next.push_back(778);
+        EXPECT_EQ(Probe("next", next).prefix_tokens, (prompt_tokens - 1) / kP * kP);
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+        EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+    }
+}
+
+TEST_F(StateCheckpointInForwardRetractionPoolSuite, RetainingAnInputCannotBlockItsOwnersGeneration) {
+    pool_pages_ = 22;
+    prefix_replay_tokens_ = 0;
+    force_retraction_interval_ = 0;
+    for (const bool host_cache : {false, true}) {
+        SCOPED_TRACE(host_cache);
+        Reset(host_cache, /*decode_width=*/1);
+        const Outcome out = DriveOne(RequestWithTokens("r", MakeTokens(22)), /*finish_after=*/32);
+        EXPECT_TRUE(out.finished);
+        EXPECT_FALSE(out.stalled);
+        EXPECT_EQ(out.retractions, 0);
+        ExpectEveryBlockFreeOrCacheOnly();
+    }
+}
+
+TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIncompleteOnes) {
+    // The cached window crosses a prefix boundary. The replayable group has
+    // no cached blocks and must not prevent retaining the complete input.
+    for (const std::int32_t missing : {-1, 0, 4}) {
+        SCOPED_TRACE(missing);
+        BlockPool device(16, {1, 1, 1, 1, 1});
+        BlockPool host(16, {1, 1, 1, 1, 1});
+        const std::vector<CacheGroupSpec> specs{
+            {.attn_kind = AttnKind::kFull, .block_granularity = 4},
+            {.attn_kind = AttnKind::kState},
+            {.attn_kind = AttnKind::kState},
+            {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .block_granularity = 2},
+            {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .replayable = true, .block_granularity = 2},
+        };
+        auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true);
+        const std::vector<std::string> hashes{"first", "second"};
+        const std::vector<CacheKey> keys{
+            {.group_id = 1, .content_hash = hashes[1]},
+            {.group_id = 2, .content_hash = hashes[1]},
+            {.group_id = 3, .content_hash = hashes[0], .page_offset = 1},
+            {.group_id = 3, .content_hash = hashes[1], .page_offset = 0},
+            {.group_id = 3, .content_hash = hashes[1], .page_offset = 1},
+        };
+        std::vector<std::uint64_t> epochs;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<std::int32_t>(i) == missing) {
+                epochs.push_back(0);
+                continue;
+            }
+            BlockPool& pool = i % 2 == 0 ? device : host;
+            auto blocks = pool.AcquireBlocks(keys[i].group_id, 1);
+            ASSERT_EQ(blocks.size(), 1u);
+            if (&pool == &device) {
+                coordinator.CacheDeviceBlock(blocks[0], keys[i], 1, CacheBoundaryKind::kEndpoint, 0);
+            } else {
+                coordinator.CacheHostBlock(blocks[0], keys[i], std::nullopt);
+            }
+            epochs.push_back(
+                coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i])->metadata.last_access_epoch);
+        }
+        auto retained = coordinator.RetainInputCheckpoint(hashes, 8);
+        EXPECT_EQ(retained.size(), missing == -1 ? keys.size() : 0u);
+        coordinator.RefreshRetainedCheckpoint(retained);
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<std::int32_t>(i) == missing) {
+                continue;
+            }
+            const BlockPool& pool = i % 2 == 0 ? device : host;
+            const auto entry = coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i]);
+            ASSERT_TRUE(entry);
+            EXPECT_EQ(entry->pinned, missing == -1);
+            EXPECT_FALSE(entry->metadata.was_acquired) << "retention is not a prefix hit";
+            if (missing == -1) {
+                EXPECT_GT(entry->metadata.last_access_epoch, epochs[i]);
+            } else {
+                EXPECT_EQ(entry->metadata.last_access_epoch, epochs[i]);
+            }
+        }
+        retained.clear();
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<std::int32_t>(i) != missing) {
+                const BlockPool& pool = i % 2 == 0 ? device : host;
+                EXPECT_FALSE(coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i])->pinned);
+            }
+        }
+    }
 }
 
 }  // namespace tokenspeed::test

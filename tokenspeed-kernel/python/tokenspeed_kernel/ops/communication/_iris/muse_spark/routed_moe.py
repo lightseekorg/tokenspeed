@@ -28,7 +28,6 @@ sum the normalized routes. The Lamport and write-through variants specialize
 
 from tokenspeed_kernel._triton import gl, gluon, tl
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    _iris_drain_subgroup_vmem,
     _iris_group_heap_base,
     _iris_sanitize_lamport_bf16,
     _iris_sync_peers,
@@ -140,6 +139,7 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
     MAX_ELEMENTS: gl.constexpr,
     PORTABLE_MATH: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Normalize eight local routes per token and all-reduce their weighted sum.
 
@@ -255,7 +255,7 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
             sentinel, region, stage_base + peer * MAX_ELEMENTS + offsets, cache=".wt"
         )
     # Finish resetting the mailbox before advancing this tile's epoch.
-    _iris_drain_subgroup_vmem()
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.store(epochs + program, ((stage + 1) % 3).to(gl.int32))
 
 
@@ -269,6 +269,7 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
     row_stride,
     EPS: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Normalize and sum weighted expert routes using write-through output stores.
 
@@ -300,5 +301,5 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
         combined.to(gl.bfloat16), output, token * 4096 + columns, cache=".wt"
     )
     # Finish every subgroup's write-through stores before returning.
-    _iris_drain_subgroup_vmem()
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.barrier()

@@ -122,14 +122,17 @@ class EngineMetrics:
         self.jit_serving_compiles = factory.counter(
             name="tokenspeed:jit_serving_compiles",
             documentation=(
-                "Triton kernel compilations after startup; each one stalls the "
-                "forward thread."
+                "Triton and CuTe DSL kernel compilations after startup; each "
+                "one stalls the forward thread."
             ),
             labelnames=labelnames,
         )
         self.jit_serving_compile_seconds = factory.counter(
             name="tokenspeed:jit_serving_compile_seconds",
-            documentation="Wall time spent in Triton kernel compilations after startup.",
+            documentation=(
+                "Wall time spent in Triton and CuTe DSL kernel compilations "
+                "after startup."
+            ),
             labelnames=labelnames,
         )
         self.num_nan_aborted_requests = factory.counter(

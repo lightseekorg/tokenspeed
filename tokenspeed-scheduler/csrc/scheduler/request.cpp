@@ -37,6 +37,15 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
 
+std::span<const std::string> Request::PromptPrefixHashes() {
+    if (!prompt_prefix_hashes_) {
+        auto pages = FullPrefixPages(false);
+        pages.resize(static_cast<std::size_t>(submitted_prompt_size_ / prefix_granularity_));
+        prompt_prefix_hashes_ = ComputePrefixHashes(pages, "");
+    }
+    return *prompt_prefix_hashes_;
+}
+
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(
         Overloaded{

@@ -241,8 +241,35 @@ _QRITA_PERCENTILE_TO_STD_TABLE = [
 
 
 @triton.jit
+def _unpack_top_k_candidates(top_packed, vocab_size: tl.constexpr):
+    # uint64 key: ordered float bits in the high part, inverted ID in low 31 bits.
+    # Larger keys rank higher logits first, then lower token IDs for ties.
+    # Recover the ID as (2**31 - 1) minus the low 31 bits.
+    top_ids = (2147483647 - (top_packed & 2147483647).to(tl.uint32)).to(tl.int32)
+    # IDs beyond the vocabulary come from padding, not valid candidates.
+    top_valid = top_ids < vocab_size
+    # Remove the ID field to recover the ordered float bits.
+    top_ordered_bits = (top_packed >> 31).to(tl.uint32)
+    top_sign = top_ordered_bits & 0x80000000
+    # A set high bit means the original sign bit was clear: undo its flip.
+    # Otherwise, undo the bitwise NOT used when the original sign bit was set.
+    top_bits = tl.where(
+        top_sign != 0,
+        top_ordered_bits ^ 0x80000000,
+        ~top_ordered_bits,
+    )
+    # Reinterpret the restored bits as FP32, then mask invalid candidates.
+    top_vals = top_bits.to(tl.float32, bitcast=True)
+    top_vals = tl.where(top_valid, top_vals, float("-inf"))
+    top_ids = tl.where(top_valid, top_ids, 2147483647)
+    return top_vals, top_ids
+
+
+@triton.jit
 def _top_k_top_p_candidates_stage1_kernel(
     logits_ptr,
+    req_pool_indices_ptr,
+    top_k_pool_ptr,
     candidate_ids_ptr,
     candidate_logits_ptr,
     logits_row_stride: tl.constexpr,
@@ -250,6 +277,7 @@ def _top_k_top_p_candidates_stage1_kernel(
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     TOPK_PAD: tl.constexpr,
+    NUM_TOKENS_PER_REQ: tl.constexpr,
 ):
     row = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -261,31 +289,38 @@ def _top_k_top_p_candidates_stage1_kernel(
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
+    pool_idx = tl.load(req_pool_indices_ptr + row // NUM_TOKENS_PER_REQ)
+    top_k = tl.load(top_k_pool_ptr + pool_idx)
+
+    # Reinterpret logits as bits. Invert bits when the sign bit is set,
+    # otherwise flip the sign bit, so unsigned keys follow logit order.
     bits = vals.to(tl.uint32, bitcast=True)
     sign = bits & 0x80000000
     ordered_bits = tl.where(sign != 0, ~bits, bits ^ 0x80000000)
+    # Zero the ordered bits for vocabulary padding so it sorts last.
     ordered_bits = tl.where(mask, ordered_bits, 0)
+    # Invert the token ID in the low 31 bits so lower IDs win tied logits.
     stable_id_key = (2147483647 - token_offsets).to(tl.uint32)
+    # Pack both fields into uint64: ordered float bits above the ID field.
     packed = (ordered_bits.to(tl.uint64) << 31) | stable_id_key.to(tl.uint64)
-    top_packed = tl.topk(packed, TOPK_PAD)
 
-    top_ids = (2147483647 - (top_packed & 2147483647).to(tl.uint32)).to(tl.int32)
-    top_valid = top_ids < vocab_size
-    top_ordered_bits = (top_packed >> 31).to(tl.uint32)
-    top_sign = top_ordered_bits & 0x80000000
-    top_bits = tl.where(
-        top_sign != 0,
-        top_ordered_bits ^ 0x80000000,
-        ~top_ordered_bits,
-    )
-    top_vals = top_bits.to(tl.float32, bitcast=True)
-    top_vals = tl.where(top_valid, top_vals, float("-inf"))
-    top_ids = tl.where(top_valid, top_ids, 2147483647)
-
-    rank_offsets = tl.arange(0, TOPK_PAD)
     out_base = row * candidate_row_stride + block_idx * TOPK_PAD
-    tl.store(candidate_logits_ptr + out_base + rank_offsets, top_vals)
-    tl.store(candidate_ids_ptr + out_base + rank_offsets, top_ids)
+    # The sort stays in the first branch: on gfx950, placing it second made
+    # the sort about 2 us slower at small batches.
+    if top_k > 1:
+        top_vals, top_ids = _unpack_top_k_candidates(
+            tl.topk(packed, TOPK_PAD), vocab_size
+        )
+        rank_offsets = tl.arange(0, TOPK_PAD)
+        tl.store(candidate_logits_ptr + out_base + rank_offsets, top_vals)
+        tl.store(candidate_ids_ptr + out_base + rank_offsets, top_ids)
+    else:
+        # Stage 2 reads only the first rank of each block for greedy rows, so
+        # the block maximum replaces the sort. It is the sort's first element:
+        # the packed key orders by logit, then by lowest token id.
+        best_val, best_id = _unpack_top_k_candidates(tl.max(packed, axis=0), vocab_size)
+        tl.store(candidate_logits_ptr + out_base, best_val)
+        tl.store(candidate_ids_ptr + out_base, best_id)
 
 
 @triton.jit
@@ -336,7 +371,8 @@ def _top_k_top_p_gumbel_stage2_kernel(
 
     # Stage 1 writes a sorted top-K list per vocab block. Merge those per-block
     # lists directly instead of repeatedly scanning the full candidate scratch.
-    for rank in tl.range(0, TOPK_PAD):
+    # Ranks at or past the row's top_k are never kept, so the merge stops there.
+    for rank in tl.range(0, tl.minimum(top_k, TOPK_PAD)):
         pos = block_offsets * TOPK_PAD + block_cursors
         active_blocks = block_mask & (block_cursors < TOPK_PAD)
         head_logits = tl.load(
@@ -363,16 +399,9 @@ def _top_k_top_p_gumbel_stage2_kernel(
             axis=0,
         )
 
-        active_rank = rank < top_k
-        top_logits = tl.where(
-            (rank_offsets == rank) & active_rank, best_logit, top_logits
-        )
-        top_ids = tl.where((rank_offsets == rank) & active_rank, best_id, top_ids)
-        block_cursors += tl.where(
-            active_rank & (block_offsets == best_block),
-            1,
-            0,
-        )
+        top_logits = tl.where(rank_offsets == rank, best_logit, top_logits)
+        top_ids = tl.where(rank_offsets == rank, best_id, top_ids)
+        block_cursors += tl.where(block_offsets == best_block, 1, 0)
 
     scaled_logits = top_logits / temperature
     max_logit = tl.max(scaled_logits, axis=0)
@@ -545,6 +574,8 @@ def gumbel_sample_top_k_top_p_from_pools(
 
     _top_k_top_p_candidates_stage1_kernel[(rows, num_blocks)](
         logits,
+        req_pool_indices,
+        top_k_pool,
         candidate_ids,
         candidate_logits,
         logits_row_stride=logits.stride(0),
@@ -552,6 +583,7 @@ def gumbel_sample_top_k_top_p_from_pools(
         vocab_size=vocab_size,
         BLOCK_SIZE=block_size,
         TOPK_PAD=top_k_pad,
+        NUM_TOKENS_PER_REQ=num_tokens_per_req,
         num_warps=stage1_num_warps,
     )
     _top_k_top_p_gumbel_stage2_kernel[(rows,)](

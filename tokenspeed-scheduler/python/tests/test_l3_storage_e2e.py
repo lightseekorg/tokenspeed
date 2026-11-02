@@ -49,6 +49,9 @@ def config(*, host=32, grain=2, groups=None):
         ts.StoragePressure(4, 524288, 500),
     )
     c.cache_groups = groups or [group("full", grain, ts.AttnKind.Full)]
+    c.host_group_packing = [
+        entry.cache_blocks_per_lcm_block for entry in c.cache_groups
+    ]
     return c
 
 

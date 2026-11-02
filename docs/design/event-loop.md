@@ -303,14 +303,18 @@ synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
 the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
-copies and an event the commit waits on. Torch's sync-debug mode enforces this
-rule, and `HostBootstrap.enter_serving` arms it once the rank finished
+copies and an event the commit waits on; host-built metadata goes the other
+way through `host_to_device` (`utils/host_sync.py`), a non-blocking copy from
+contiguous pinned memory. Torch's sync-debug mode enforces this
+rule, and `HostBootstrap.enter_serving` always arms it once the rank finished
 startup and the frontend handshake (weight loading, tuning, capture, the
-transfer and L2 builders all synchronize on purpose):
-`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
-Python location, `error` raises there. CI runs the serving paths with
-`error`; the commit's event wait and the non-blocking copies pass
-unflagged, so a report is always a real stall.
+transfer and L2 builders all synchronize on purpose); there is no switch to
+leave it off. `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` (the default) reports
+each offending site with its Python location, `error` raises there. CI
+serves every `server_smoke`, `eval`, and `perf` task with `error`, which a
+task cannot relax; the commit's event wait and the non-blocking copies pass
+unflagged, so a report is always a real stall. A deliberate wait off the
+per-round path is wrapped in `allow_host_sync` (`utils/host_sync.py`).
 
 One named exception: a drafter may leave its round pending after the forward
 (`BaseDrafter.finish_round`) and finish it in the next forward's `settle`,
@@ -330,18 +334,21 @@ compile-cache key. Startup compiles on purpose (graph capture, tuning), so
 the bootstrap installs `tokenspeed_kernel.compile_monitor` before building
 anything and `enter_serving` marks the end of startup right after arming the
 sync-debug mode; an encode rank marks it once it reported ready. From then
-on the monitor logs every Triton compilation with its duration and cause and
-reports by name any compile-time kernel parameter that keeps taking new
-values from one call site -- a per-batch value passed as `tl.constexpr`;
-each commit reports the compilation counts and durations, which the control
-plane exports as `tokenspeed:jit_serving_compiles` /
-`tokenspeed:jit_serving_compile_seconds`. `TOKENSPEED_JIT_COMPILE_CHECK=error`
-raises there instead, and CI serving jobs run with it.
+on the monitor logs every Triton and CuTe DSL compilation with its duration
+and cause and reports by name any compile-time kernel parameter that keeps
+taking new values from one call site (a per-batch value passed as
+`tl.constexpr` or as a static CuTe DSL dimension), a call site that keeps
+recompiling specializations the kernel already has, and a direct `@cute.jit`
+call, which traces the kernel in Python on every call; each commit reports
+the compilation counts and durations, which the control plane exports as
+`tokenspeed:jit_serving_compiles` / `tokenspeed:jit_serving_compile_seconds`.
+`TOKENSPEED_JIT_COMPILE_CHECK=error` raises there instead, and CI serving
+jobs run with it.
 The same mark closes the kernel package's compile switch
 (`compile_monitor.is_serving()`), installed monitor or not. A kernel whose
-library compiles once per batch shape outside Triton -- FlashInfer's joint BF16
-GEMM and the ll_bf16 router's dot-product kernel compile once per exact row
-count -- runs only before it:
+library compiles once per batch shape with no key to bucket -- FlashInfer's
+joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
+exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
 compiles instead of compiling on the forward thread.
 
@@ -356,10 +363,11 @@ JIT mark: it collects once, freezes the survivors (`gc.freeze`: no later
 collection walks them) and raises the generation-2 threshold far enough that
 CPython does not start full collections by itself. The data plane's
 `GcHooks` runs one on the forward thread every `FULL_COLLECTION_INTERVAL`
-forwarded rounds, a count that is the
-same on every rank, so the ranks collect in the same round and each
-collection walks only what serving keeps alive. The young generations still
-collect automatically.
+forwarded rounds, a count that is the same on every rank, so the ranks
+collect in the same round and each collection walks only what serving keeps
+alive. An EPD encode rank does the same and counts its vision-tower batches,
+which every rank of its attention-TP group forms alike. The young
+generations still collect automatically.
 
 ### Profiling the issuing thread
 
@@ -577,9 +585,19 @@ same kind at its head (a mismatch is an error — the frontend sends every
 operation to every engine in one order). The device call blocks the control
 thread in a collective the trainer drives or an SDK read; a DP peer that had
 not yet dequeued its copy would keep looping and wait for this rank in the
-per-round agreement, a deadlock. One operation completes per round, and the
-replica MIN-reduces its result before the loop publishes the L3 weight
-version or sends the reply. The same gate carries the online expert
+per-round agreement, a deadlock. One operation completes per round. Before a
+weight load's cache flush and load, the replica MIN-reduces each rank's device
+prerequisites (weights resident, KV released under discard, an SDK update
+under discard): a refusal on any rank means no rank flushes or loads, so a
+ready rank never enters a loading collective its peer skips, and every rank's
+weights and caches stay untouched for a retry. A refused cache flush likewise
+loads nothing. After the load the replica MIN-reduces its result before the
+loop publishes the L3 weight version or sends the reply, and commits that
+final result on all forward threads before replying. Under the discard
+policy, local loading success is pending: only the successful replica-wide
+commit marks parameters usable. A failed load invalidates every rank,
+including ranks that loaded locally; KV wake and forwarding remain blocked
+until deployment restart. The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at
@@ -805,3 +823,13 @@ cleanup runs outside the callback.
   the same round, decided from rank-identical state (counts the ranks keep
   the same, agreed flags), never from a rank's own view; a rank-local error
   inside such a sequence goes into the agreement instead of out of the round.
+
+## Frontend load reports
+
+After the round's scheduler mutations and releases, the replica's frontend owner
+publishes its current request and cache load. Token outputs carry that snapshot;
+a changed snapshot is also sent in an empty output batch. Client cancellation
+can reap the final request without producing a final token, so reporting only
+nonempty outputs would leave routing and drain checks with a stale running
+count. An unchanged idle load is sent at most once per second as a heartbeat,
+so the frontend can distinguish an idle engine from a stale connection.

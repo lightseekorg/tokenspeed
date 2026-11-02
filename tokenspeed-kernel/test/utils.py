@@ -111,6 +111,30 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
         )
 
 
+@contextmanager
+def assert_no_cute_compile() -> Iterator[None]:
+    """Fail if any CuTe DSL kernel is traced or compiled in the block.
+
+    ``cute.compile`` traces and compiles on every call, and calling a
+    ``@cute.jit`` function directly traces it on every call, so launches must
+    reuse the compiled functions their caller cached. Warm the caller's cache
+    before entering, then launch with shapes that vary the way serving does; a
+    trace means the cache keys on a per-batch value or the launch bypasses it.
+    """
+    from cutlass.base_dsl.dsl import BaseDSL
+
+    with patch.object(
+        BaseDSL, "generate_mlir", autospec=True, side_effect=BaseDSL.generate_mlir
+    ) as traces:
+        yield
+    # generate_mlir(dsl, funcBody, ...): the traced @cute.jit function.
+    kernels = sorted({call.args[1].__qualname__ for call in traces.call_args_list})
+    assert not kernels, (
+        f"traced CuTe DSL kernel(s) {', '.join(kernels)} {traces.call_count} "
+        "time(s); a per-batch value likely keys the compile cache"
+    )
+
+
 def move_pages_past_int32(
     caches: tuple[torch.Tensor, ...], page_table: torch.Tensor
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:

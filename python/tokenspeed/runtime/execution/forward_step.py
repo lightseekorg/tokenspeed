@@ -111,17 +111,23 @@ def freeze_gc(enable_cudagraph_gc: bool):
 def get_batch_sizes_to_capture(config: ModelExecutorConfig):
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+    effective_max = min(config.max_cudagraph_capture_size, max_bs)
 
     if capture_bs is None:
         if config.disable_cuda_graph_padding:
             capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+            stride = 32
         else:
             capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            stride = 16
+        # The default ladder ends at 160; carry it up to a larger capture cap.
+        if effective_max > capture_bs[-1]:
+            capture_bs += list(range(capture_bs[-1] + stride, effective_max, stride))
+            capture_bs.append(effective_max)
 
     if max(capture_bs) > max_bs:
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
-    effective_max = min(config.max_cudagraph_capture_size, max_bs)
     # Ascending and unique: padding bisects the ladder for a batch's graph.
     return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
@@ -180,6 +186,29 @@ class DeepEPCudaGraphRunnerAdapter:
         if cls is None or cls._buffer is None:
             return
         cls.set_dispatch_mode_as_low_latency()
+
+
+def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tuple:
+    """A captured decode graph's outputs, sliced to the live batch.
+
+    ``outputs`` is what the captured forward returned: ``(output_tokens,
+    output_lengths, output_logprobs, output_cumulative_probs,
+    forward_logprobs)`` for the padded batch. The sampled-token columns keep
+    ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
+    never gathers prompt logprobs or top-k alternatives, so its last output is
+    None.
+    """
+    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
+    if forward_logprobs is not None:
+        raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
+    rows = bs * max_tokens_per_req
+    return (
+        tokens[:rows],
+        lengths[:bs],
+        None if logprobs is None else logprobs[:rows],
+        None if cumulative_probs is None else cumulative_probs[:rows],
+        None,
+    )
 
 
 class ForwardStepRunner:
@@ -1082,10 +1111,12 @@ class ForwardStepRunner:
         first.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        forward_logprobs)``; the last is an extend/mixed forward's
-        ``ForwardLogprobs`` (the prompt-logprob gather of
-        ``ctx.input_logprob_rows`` and the top-k alternatives
-        ``ctx.sampled_top_k`` asks for) and None otherwise.
+        output_cumulative_probs, forward_logprobs)``; the last is an
+        extend/mixed forward's ``ForwardLogprobs`` (the prompt-logprob gather
+        of ``ctx.input_logprob_rows`` and the top-k alternatives
+        ``ctx.sampled_top_k`` asks for) and None otherwise. The sampled
+        tokens' logprobs and cumulative probabilities (None when not enabled)
+        share the tokens' rows on both paths.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1215,24 +1246,8 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # A decode graph never gathers prompt logprobs or top-k
-            # alternatives (its captured fourth output is None).
-            (
-                output_tokens,
-                output_lengths,
-                output_logprobs,
-                _forward_logprobs,
-            ) = self.output_buffers[graph_key]
-
-            result = (
-                output_tokens[: bs * self.max_tokens_per_req],
-                output_lengths[:bs],
-                (
-                    output_logprobs[: bs * self.max_tokens_per_req]
-                    if output_logprobs is not None
-                    else None
-                ),
-                None,
+            result = live_graph_outputs(
+                self.output_buffers[graph_key], bs, self.max_tokens_per_req
             )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)

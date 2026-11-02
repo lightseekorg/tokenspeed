@@ -112,8 +112,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
                 "Host store pairs blocks of different owners");
         transfers.push_back(CacheTransfer{
             .group_id = group_ids[i],
-            .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
-            .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
+            .source_page = manager.ResolveCacheBlockId(*device_block_refs[i]),
+            .destination_page = manager.ResolveCacheBlockId(*host_block_ref),
             .content_hash = keys[i].content_hash,
             .page_offset = keys[i].page_offset,
         });
@@ -303,8 +303,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
             }
             transfers.push_back(CacheTransfer{
                 .group_id = member.key.group_id,
-                .source_page = allocator.ResolveCacheBlockId(member.device_location),
-                .destination_page = allocator.ResolveCacheBlockId(host_block->Location()),
+                .source_page = allocator.ResolveDeviceCacheBlockId(member.device_location),
+                .destination_page = allocator.ResolveCacheBlockId(*host_block),
                 .content_hash = member.key.content_hash,
                 .page_offset = member.key.page_offset,
             });
@@ -677,8 +677,8 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
                 "cache transfer pairs blocks of different owners");
         transfers.push_back(CacheTransfer{
             .group_id = block_transfer.group_id,
-            .source_page = manager.ResolveCacheBlockId(block_transfer.source->Location()),
-            .destination_page = manager.ResolveCacheBlockId(block_transfer.destination->Location()),
+            .source_page = manager.ResolveCacheBlockId(*block_transfer.source),
+            .destination_page = manager.ResolveCacheBlockId(*block_transfer.destination),
             .content_hash = block_transfer.key.content_hash,
             .page_offset = block_transfer.key.page_offset,
         });

@@ -1241,6 +1241,8 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         tokenizer_mode="auto",
         trust_remote_code=False,
         revision="revision",
+        weight_memory_policy=None,
+        model_update_draft_weights=None,
     )
     config = SimpleNamespace(
         dtype=torch.bfloat16,
@@ -1254,6 +1256,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         gpu_id=0,
         memory_saver_adapter=SimpleNamespace(region=region),
         checkpoint_load_group=None,
+        is_draft_worker=False,
     )
     assert result is model
     assert events == (

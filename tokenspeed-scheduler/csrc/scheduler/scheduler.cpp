@@ -94,8 +94,8 @@ Scheduler::Scheduler(SchedulerConfig config)
       req_pool_allocator_{config_.max_batch_size},
       snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
-      host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
-      snapshot_pool_{snapshotPoolBlocks(config_), slotsPerParentByGroup(config_)},
+      host_pool_{hostPoolBlocks(config_), config_.host_group_packing},
+      snapshot_pool_{snapshotPoolBlocks(config_), config_.host_group_packing},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
@@ -297,9 +297,10 @@ void Scheduler::registerKvEventPublication(const Request& request, std::span<con
     }
     const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
     const KvEventHashProgress& progress = kv_event_hash_progress_.at(request.Id());
-    _assert(progress.block_hashes.size() == prefix_hashes.size(), "the tail's parent page has its KV event hash");
+    // Admission can hash beyond an early junction or retraction frontier.
+    _assert(progress.block_hashes.size() >= prefix_hashes.size(), "the tail's parent page has its KV event hash");
     const std::optional<std::uint64_t> parent_hash =
-        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes.back()};
+        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[full_pages - 1]};
     const std::span<const std::int32_t> tail_tokens =
         request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
     const CacheKey key{.content_hash = completed.tail->hash};
@@ -336,6 +337,12 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (const RequestSpec& spec : request_specs) {
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
+        }
+        if (config_.role != Role::kD && config_.max_kv_page_num > 0 &&
+            (static_cast<std::int64_t>(spec.tokens.size()) + config_.prefix_granularity - 1) /
+                    config_.prefix_granularity >
+                config_.max_kv_page_num) {
+            throw std::invalid_argument("Scheduler: prompt exceeds max_kv_page_num");
         }
         if (requests_by_id_.contains(spec.request_id) || !request_ids.insert(spec.request_id).second) {
             throw std::invalid_argument("Scheduler: duplicate request id '" + spec.request_id + "'");
