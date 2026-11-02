@@ -433,10 +433,22 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         const std::int32_t floor_pages = GroupIsState(i) ? 0 : floor_tokens / geometry_[i].BlockGranularity();
         out.per_group[i] =
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
+        if constexpr (Tier == CacheTier::kDevice) {
+            if (host_pool_ != nullptr) {
+                groups_[i].Index().TouchExisting(*host_pool_, std::span{group_keys[i]}.subspan(floor_pages),
+                                                 out.per_group[i].blocks, access_epoch);
+            }
+        }
         if (probe.tail && !probe.tail->group_keys[i].empty()) {
             // The tail's blocks follow the full pages in the same table.
             PrefixMatch tail_match = groups_[i].Index().AcquireMatched(
                 pool, probe.tail->group_keys[i], /*begin_blocks=*/0, probe.tail->per_group[i], access_epoch);
+            if constexpr (Tier == CacheTier::kDevice) {
+                if (host_pool_ != nullptr) {
+                    groups_[i].Index().TouchExisting(*host_pool_, probe.tail->group_keys[i], tail_match.blocks,
+                                                     access_epoch);
+                }
+            }
             out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
                                            std::make_move_iterator(tail_match.blocks.begin()),
                                            std::make_move_iterator(tail_match.blocks.end()));
@@ -1160,6 +1172,10 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
             PrefixMatch match = groups_[i].Index().AcquireMatched(
                 pool_, probe.state_at_prompt_end->group_keys[i],
                 /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i], access_epoch);
+            if (host_pool_ != nullptr) {
+                groups_[i].Index().TouchExisting(*host_pool_, probe.state_at_prompt_end->group_keys[i], match.blocks,
+                                                 access_epoch);
+            }
             out.state_at_prompt_end[i] = std::move(match.blocks.front());
             if (BoundaryTree::Node* node = boundary_tree_.Find(probe.state_at_prompt_end->hash)) {
                 node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
@@ -1398,6 +1414,9 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
                                                     Tier == CacheTier::kDevice ? &newly_cached : nullptr);
     if constexpr (Tier == CacheTier::kHost) {
         return;
+    }
+    if (host_pool_ != nullptr) {
+        groups_[group_index].Index().TouchExisting(*host_pool_, keys, blocks, access_epoch);
     }
     for (auto& [key, block_ref] : newly_cached) {
         // Every hash an index holds has a tree node: a publication linked its

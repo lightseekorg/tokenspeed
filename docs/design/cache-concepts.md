@@ -1072,6 +1072,10 @@ Its responsibilities:
   unpinned State groups; Host KV eviction does not take Device checkpoints
   along. The plan accounts for the full State cascade before picking another
   victim. Every placed block retains its requested owner bucket.
+  Device prefix hits and publications refresh existing Host copies of the
+  same entries without allocating, pinning, or transferring blocks. A refresh
+  never lowers the Host access epoch. Touching history alone does not refresh
+  an unused State checkpoint at the same boundary.
   No group has a fixed share of the pool; capacity follows the access pattern,
   without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the

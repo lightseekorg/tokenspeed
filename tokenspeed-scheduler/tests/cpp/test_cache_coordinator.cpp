@@ -2952,6 +2952,71 @@ TEST(CacheCoordinatorHostReplacement, SameGroupUsesLastAccessAfterPrefixHits) {
     }
 }
 
+TEST(CacheCoordinatorHostReplacement, DeviceUseRefreshesExistingHostRecency) {
+    enum class Use { kHit, kPublication, kLatePublication };
+    for (const bool state : {false, true}) {
+        for (const Use use : {Use::kHit, Use::kPublication, Use::kLatePublication}) {
+            SCOPED_TRACE(state);
+            SCOPED_TRACE(static_cast<int>(use));
+            BlockPool device_pool(8, {1});
+            BlockPool host_pool(2, {1});
+            const std::array specs{CacheGroupSpec{.attn_kind = state ? AttnKind::kState : AttnKind::kFull,
+                                                  .cache_blocks_per_lcm_block = 1,
+                                                  .block_granularity = state ? 0 : 4}};
+            CacheCoordinator coordinator = MakeCoordinator(
+                specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+            const auto a = ContentHashes({{1, 2, 3, 4}});
+            const auto b = ContentHashes({{5, 6, 7, 8}});
+            const auto publish = [&](std::span<const std::string> hashes) {
+                std::vector<BlockTable> tables(1);
+                const auto admitted = AdmitForTest(coordinator, tables, 4);
+                ASSERT_TRUE(admitted);
+                CacheCompletedBlocksForTest(coordinator, tables, hashes, admitted->access_epoch, 0, 4,
+                                            CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                            /*publish_state=*/state);
+                coordinator.Free(tables);
+            };
+            for (const auto* hashes : {&a, &b}) {
+                ASSERT_NO_FATAL_FAILURE(publish(*hashes));
+                CacheBlockRef host = host_pool.AcquireBlock(0);
+                ASSERT_TRUE(host);
+                coordinator.CacheHostBlock(host, Key(hashes->front(), 0), std::nullopt);
+            }
+            if (use == Use::kHit) {
+                std::vector<BlockTable> tables(1);
+                const auto admitted = AdmitForTest(coordinator, tables, coordinator.ProbePrefix(a),
+                                                   GroupDemand{.extent = DenseGrowth{4}});
+                ASSERT_TRUE(admitted);
+                EXPECT_EQ(admitted->device_prefix_tokens, 4);
+                coordinator.Free(tables);
+            } else if (use == Use::kPublication) {
+                ASSERT_NO_FATAL_FAILURE(publish(a));
+            } else {
+                std::vector<BlockTable> tables(1);
+                const auto admitted = AdmitForTest(coordinator, tables, 4);
+                ASSERT_TRUE(admitted);
+                for (const auto* hashes : {&b, &a}) {
+                    CacheBlockRef host = coordinator.FindHostCachedBlock(Key(hashes->front(), 0));
+                    ASSERT_TRUE(host);
+                    coordinator.CacheHostBlock(host, Key(hashes->front(), 0), std::nullopt);
+                }
+                CacheCompletedBlocksForTest(coordinator, tables, a, admitted->access_epoch, 0, 4,
+                                            CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                            /*publish_state=*/state);
+                coordinator.Free(tables);
+            }
+            EXPECT_EQ(coordinator.NumHostCachedBlocks(), 2);
+            EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
+            EXPECT_TRUE(coordinator.TakePendingStores().empty());
+            CacheBlockRef incoming = coordinator.AcquireHostBlock(0, 0);
+            ASSERT_TRUE(incoming);
+            EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(a.front(), 0)));
+            EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(b.front(), 0)));
+        }
+    }
+}
+
 TEST(CacheCoordinatorHostReplacement, CrossGroupUsesMostRecentChildAccess) {
     for (const bool refresh_old : {false, true}) {
         SCOPED_TRACE(refresh_old);
@@ -12501,11 +12566,8 @@ TEST_F(WriteBackTransactionTest, ASegmentPublishesOnlyAtItsLastAck) {
     }
 }
 
-// The Host holds every block of X already: the eviction copies nothing and
-// issues no op, and the segment settles at once, each entry with the newer of
-// its Host and Device epochs -- the Device's for the pages, which a hit
-// touched after their Host copies were made, the Host's for the tail and its
-// checkpoints, copied after that hit.
+// Existing Host copies settle without transfers. The hit already refreshed
+// the pages, while later Host publications retain their newer epochs.
 TEST_F(WriteBackTransactionTest, ASegmentAlreadyOnTheHostSettlesWithoutAnOp) {
     const std::vector<std::int32_t> tokens = MakeTokens(18);
     std::vector<BlockTable> tables(4);
@@ -12524,13 +12586,15 @@ TEST_F(WriteBackTransactionTest, ASegmentAlreadyOnTheHostSettlesWithoutAnOp) {
         const PrefixCacheIndex& index = coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id));
         return index.MetadataFor(pool, index.Find(pool, key)->Location())->last_access_epoch;
     };
-    // The epochs each entry is published with: the Device's for a page, the
-    // Host's own for the rest.
     std::vector<std::uint64_t> expected;
     for (std::size_t member = 0; member < keys.size(); ++member) {
         const std::uint64_t device = epoch_on(pool_, keys[member]);
         const std::uint64_t host = epoch_on(host_pool_, keys[member]);
-        ASSERT_EQ(device > host, member < 4) << "member " << member;
+        if (member < 4) {
+            ASSERT_EQ(device, host) << "member " << member;
+        } else {
+            ASSERT_GE(host, device) << "member " << member;
+        }
         expected.push_back(std::max(device, host));
     }
 
