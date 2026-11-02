@@ -545,6 +545,11 @@ Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
+`active_lcm_blocks()` walks every live request's block tables, so a serving
+round reads the scheduler's counts once for the frontend's load report, and
+once more as it planned only when the metrics or a batch line read them (they
+share that read). The idle check reads them only when the loop holds no
+request, in-flight forward or open cache op.
 
 ## Subsystems in detail
 

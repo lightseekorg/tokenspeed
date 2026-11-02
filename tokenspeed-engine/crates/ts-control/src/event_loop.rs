@@ -59,7 +59,7 @@ use ts_metrics::{EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
-    Scheduler, StorageRound, StorageTickView,
+    Scheduler, SchedulerSizes, StorageRound, StorageTickView,
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
@@ -570,11 +570,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     fn idle(&self) -> bool {
+        // The scheduler's counts walk every live request's block tables: ask
+        // for them only once the loop's own state says nothing runs.
+        if !self.in_flight.is_empty()
+            || self.cache_ops.open() != 0
+            || self.outputs.num_running() != 0
+        {
+            return false;
+        }
         let sizes = self.scheduler.sizes();
-        self.in_flight.is_empty()
-            && self.cache_ops.open() == 0
-            && self.outputs.num_running() == 0
-            && sizes.waiting == 0
+        sizes.waiting == 0
             && sizes.prefilling == 0
             && sizes.decoding == 0
             && sizes.retracted == 0
@@ -744,6 +749,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
+        // The scheduler's counts as this round planned, for the metrics and
+        // the batch line: nothing between the two mutates the scheduler, and
+        // taking them walks every live request's block tables, so they are
+        // taken once, and only for a reader.
+        let mut planned_sizes: Option<SchedulerSizes> = None;
         if let Some(metrics) = &self.metrics {
             // A retraction victim's image store is the retraction signal.
             let retracted = cache_ops
@@ -756,7 +766,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             // A pre-dispatch snapshot: the running count still holds what
             // this round's commits end.
-            let sizes = self.scheduler.sizes();
+            let sizes = planned_sizes.insert(self.scheduler.sizes());
             let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
                 batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
             });
@@ -812,7 +822,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // empty plan per round and starve the device's own threads.
         let idle_forward = dp.as_ref().is_some_and(|dp| dp.idle_forward);
         if let Some(batch) = &forward {
-            self.log_dispatch(batch);
+            self.log_dispatch(batch, planned_sizes.as_ref());
             self.outputs.mark_scheduled(&batch.request_ids);
         }
         if let (Some(metrics), Some(batch)) = (&self.metrics, &forward) {
@@ -2035,26 +2045,29 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// The batch line of a dispatched forward.
-    fn log_dispatch(&mut self, batch: &ForwardBatchView) {
-        let sizes = self.scheduler.sizes();
-        let active = i64::from(sizes.active_lcm_blocks);
-        let stats = RoundStats {
-            queued: sizes.waiting,
-            active_pages: active,
-            cached_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks) - active,
-            pd: [
-                sizes.bootstrapping,
-                sizes.prefilling,
-                sizes.remote_prefilling,
-                sizes.decoding,
-                sizes.pd_transfer,
-            ],
-        };
+    /// The batch line of a dispatched forward, from the scheduler's counts
+    /// as the round planned (`planned_sizes`, if the round took them).
+    fn log_dispatch(&mut self, batch: &ForwardBatchView, planned_sizes: Option<&SchedulerSizes>) {
         let (outputs, scheduler) = (&self.outputs, &self.scheduler);
+        let kv_total_pages = self.config.kv_total_pages;
         self.batch_logger.log_dispatch(
             batch,
-            &stats,
+            || {
+                let sizes = planned_sizes.cloned().unwrap_or_else(|| scheduler.sizes());
+                let active = i64::from(sizes.active_lcm_blocks);
+                RoundStats {
+                    queued: sizes.waiting,
+                    active_pages: active,
+                    cached_pages: kv_total_pages - i64::from(sizes.empty_lcm_blocks) - active,
+                    pd: [
+                        sizes.bootstrapping,
+                        sizes.prefilling,
+                        sizes.remote_prefilling,
+                        sizes.decoding,
+                        sizes.pd_transfer,
+                    ],
+                }
+            },
             |rid| {
                 outputs
                     .state(rid)
