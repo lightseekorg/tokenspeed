@@ -250,8 +250,10 @@ class AutoBackend(CommBackend):
         """Whether the Iris heap, which spans the world, can map every rank.
 
         Distributed initialization decides this on AMD; None before it does,
-        or off AMD.
+        or off AMD, where the Iris module is never loaded.
         """
+        if not current_platform().is_amd:
+            return None
         from tokenspeed_kernel.ops.communication.iris import iris_maps_world
 
         return iris_maps_world()

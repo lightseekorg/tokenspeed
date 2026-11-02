@@ -313,6 +313,31 @@ class TestAutoBackendTopology:
             backend.acquire_all_reduce_outputs(((1,),), like, group) == "iris"
         ) is acquires
 
+    def test_routing_off_amd_leaves_the_iris_module_unloaded(
+        self, backend, monkeypatch
+    ):
+        import sys
+
+        import tokenspeed_kernel.ops.communication.iris as kernel_iris
+
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto
+
+        monkeypatch.setattr(
+            auto,
+            "current_platform",
+            lambda: SimpleNamespace(is_amd=False, is_cdna5=False),
+        )
+        monkeypatch.delitem(sys.modules, kernel_iris.__name__)
+        backend._iris.can_reduce_outputs.return_value = False
+        backend._iris.can_run.return_value = True
+        backend._iris.all_reduce.return_value = "iris"
+        backend._nccl.all_reduce.return_value = "nccl"
+
+        # Node-local groups keep their path; groups spanning nodes stay on NCCL.
+        assert backend.all_reduce(torch.empty(1), (0, 1, 2, 3)) == "iris"
+        assert backend.all_reduce(torch.empty(1), tuple(range(8))) == "nccl"
+        assert kernel_iris.__name__ not in sys.modules
+
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
     import tokenspeed_kernel.ops.communication.fabric as fabric

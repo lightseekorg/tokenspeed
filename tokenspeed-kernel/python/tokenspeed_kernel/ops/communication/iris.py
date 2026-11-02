@@ -76,9 +76,7 @@ def discover_iris_world() -> bool:
 
 
 def iris_maps_world() -> bool | None:
-    """``discover_iris_world``'s cached answer, or None before it ran or off AMD."""
-    if not _platform.is_amd:
-        return None
+    """``discover_iris_world``'s cached answer, or None before it ran."""
     from tokenspeed_kernel.ops.communication._iris import maps_world
 
     return maps_world()
