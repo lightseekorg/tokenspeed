@@ -139,7 +139,13 @@ public:
             }
         }
         if (plan.suffix_start < 0) {
-            table.blocks_.reserve(table.blocks_.size() + block_refs.size());
+            const auto needed = table.blocks_.size() + block_refs.size();
+            const auto capacity = table.blocks_.capacity();
+            if (needed > capacity) {
+                // Reserve before moving refs, and amortize small appends to a long table.
+                table.blocks_.reserve(
+                    std::max(needed, capacity + std::min(capacity, table.blocks_.max_size() - capacity)));
+            }
             for (CacheBlockRef& block_ref : block_refs) {
                 table.blocks_.push_back(std::move(block_ref));
             }

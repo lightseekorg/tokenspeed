@@ -795,6 +795,11 @@ page ids, and executes retention (`ReclaimExpired` punches the first *N*
 slots to null holes). It is deliberately token-free: every token quantity is
 converted to block counts before it reaches the manager.
 
+Dense `Acquire` appends grow the table's host vector geometrically. Spare
+capacity does not add logical slots or acquire cache blocks. Capacity is
+reserved before moving new references, so a host-allocation failure cannot
+partially append to the table.
+
 The conversion is `GroupGeometry` in the coordinator layer:
 
 * `PlanAcquire(table, demand)` turns a token demand into a token-free
