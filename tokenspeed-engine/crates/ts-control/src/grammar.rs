@@ -221,12 +221,20 @@ impl Entry {
     }
 }
 
+/// The compiled grammars, keyed by source: what every admission reads.
 #[derive(Default)]
-struct Shared {
-    cache: HashMap<GrammarKey, Entry>,
+struct Cache {
+    entries: HashMap<GrammarKey, Entry>,
+}
+
+/// The compile bookkeeping: what only a compile's completion, a timeout,
+/// or the round's retain touches. Split from the cache so its writers
+/// never hold the lock the hot admission path needs.
+#[derive(Default)]
+struct Bookkeeping {
     /// Timeouts per grammar since its last successful compile.
     timeout_history: HashMap<GrammarKey, u32>,
-    /// Grammars a worker compiled into `cache`; dropped from it once no
+    /// Grammars a worker compiled into the cache; dropped from it once no
     /// queued request waits for them.
     compiled_keys: HashSet<GrammarKey>,
 }
@@ -235,7 +243,8 @@ struct Shared {
 /// (`XGrammarGrammarBackend`).
 pub struct Grammars {
     config: GrammarConfig,
-    shared: Arc<Mutex<Shared>>,
+    cache: Arc<Mutex<Cache>>,
+    bookkeeping: Arc<Mutex<Bookkeeping>>,
     jobs: mpsc::Sender<GrammarKey>,
     /// Compiled grammars requests were admitted with, least recently used
     /// first, and their sizes. Changed only on the control thread, in the
@@ -334,11 +343,17 @@ impl Grammars {
     pub fn new(config: GrammarConfig) -> Result<Self, String> {
         let info = TokenizerInfo::from_json(&config.tokenizer_info).map_err(|e| e.to_string())?;
         let compiler = Arc::new(Compiler::new(&info, COMPILE_THREADS).map_err(|e| e.to_string())?);
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let bookkeeping = Arc::new(Mutex::new(Bookkeeping::default()));
         let (jobs, queue) = mpsc::channel::<GrammarKey>();
         let queue = Arc::new(Mutex::new(queue));
         for worker in 0..COMPILE_WORKERS {
-            let (compiler, shared, queue) = (compiler.clone(), shared.clone(), queue.clone());
+            let (compiler, cache, bookkeeping, queue) = (
+                compiler.clone(),
+                cache.clone(),
+                bookkeeping.clone(),
+                queue.clone(),
+            );
             let any_whitespace = config.any_whitespace;
             thread::Builder::new()
                 .name(format!("ts-grammar-{worker}"))
@@ -346,28 +361,39 @@ impl Grammars {
                     let Ok(key) = queue.lock().expect("compile queue lock").recv() else {
                         return;
                     };
-                    if let Some(Entry::Compiling { started_at }) = shared
+                    if let Some(Entry::Compiling { started_at }) = cache
                         .lock()
                         .expect("grammar cache lock")
-                        .cache
+                        .entries
                         .get_mut(&key)
                     {
                         *started_at = Some(Instant::now());
                     }
                     let compiled = compile(&compiler, &key, any_whitespace);
-                    let mut state = shared.lock().expect("grammar cache lock");
-                    // A timeout may have replaced the entry meanwhile; a
-                    // finished compile still wins, as `record_timeout`
-                    // leaves a valid grammar be.
+                    // The compile result takes the hot cache briefly; the
+                    // bookkeeping (timeout history, compiled keys) waits
+                    // behind its own lock, so neither holds the other's.
                     match compiled {
                         Ok(grammar) => {
-                            state.timeout_history.remove(&key);
-                            state.compiled_keys.insert(key.clone());
-                            state.cache.insert(key, Entry::Ready(Arc::new(grammar)));
+                            bookkeeping
+                                .lock()
+                                .expect("grammar bookkeeping lock")
+                                .timeout_history
+                                .remove(&key);
+                            bookkeeping
+                                .lock()
+                                .expect("grammar bookkeeping lock")
+                                .compiled_keys
+                                .insert(key.clone());
+                            cache
+                                .lock()
+                                .expect("grammar cache lock")
+                                .entries
+                                .insert(key, Entry::Ready(Arc::new(grammar)));
                         }
                         Err(message) => {
                             tracing::warn!(kind = key.kind, %message, "grammar does not compile");
-                            state.cache.insert(
+                            cache.lock().expect("grammar cache lock").entries.insert(
                                 key,
                                 Entry::Invalid {
                                     message,
@@ -381,7 +407,8 @@ impl Grammars {
         }
         Ok(Self {
             config,
-            shared,
+            cache,
+            bookkeeping,
             jobs,
             retained: VecDeque::new(),
             retained_grammars: HashMap::new(),
@@ -404,24 +431,24 @@ impl Grammars {
             self.retained.push_back(key.clone());
             return (Lookup::Ready(grammar), true);
         }
-        let mut state = self.shared.lock().expect("grammar cache lock");
+        let mut cache = self.cache.lock().expect("grammar cache lock");
         if let Some(Entry::Invalid {
             expires_at: Some(expires_at),
             ..
-        }) = state.cache.get(key)
+        }) = cache.entries.get(key)
         {
             if Instant::now() >= *expires_at {
-                state.cache.remove(key);
+                cache.entries.remove(key);
             }
         }
-        match state.cache.get(key) {
+        match cache.entries.get(key) {
             Some(entry @ (Entry::Ready(_) | Entry::Invalid { .. })) => (entry.lookup(), true),
             Some(Entry::Compiling { .. }) => (Lookup::Compiling, false),
             None => {
-                state
-                    .cache
+                cache
+                    .entries
                     .insert(key.clone(), Entry::Compiling { started_at: None });
-                drop(state);
+                drop(cache);
                 let _ = self.jobs.send(key.clone());
                 (Lookup::Compiling, false)
             }
@@ -434,10 +461,10 @@ impl Grammars {
             return Lookup::Ready(grammar.clone());
         }
         match self
-            .shared
+            .cache
             .lock()
             .expect("grammar cache lock")
-            .cache
+            .entries
             .get(key)
         {
             Some(entry) => entry.lookup(),
@@ -448,10 +475,10 @@ impl Grammars {
     /// When a worker began compiling `key`, if one did.
     pub fn started_at(&self, key: &GrammarKey) -> Option<Instant> {
         match self
-            .shared
+            .cache
             .lock()
             .expect("grammar cache lock")
-            .cache
+            .entries
             .get(key)
         {
             Some(Entry::Compiling { started_at }) => *started_at,
@@ -467,12 +494,19 @@ impl Grammars {
         if self.retained_grammars.contains_key(key) {
             return;
         }
-        let mut state = self.shared.lock().expect("grammar cache lock");
-        if matches!(state.cache.get(key), Some(Entry::Ready(_))) {
+        if matches!(
+            self.cache
+                .lock()
+                .expect("grammar cache lock")
+                .entries
+                .get(key),
+            Some(Entry::Ready(_))
+        ) {
             return;
         }
         let count = {
-            let count = state.timeout_history.entry(key.clone()).or_insert(0);
+            let mut bookkeeping = self.bookkeeping.lock().expect("grammar bookkeeping lock");
+            let count = bookkeeping.timeout_history.entry(key.clone()).or_insert(0);
             *count += 1;
             *count
         };
@@ -487,13 +521,17 @@ impl Grammars {
                 Some(Instant::now() + self.config.compile_timeout),
             )
         };
-        state.cache.insert(
-            key.clone(),
-            Entry::Invalid {
-                message,
-                expires_at,
-            },
-        );
+        self.cache
+            .lock()
+            .expect("grammar cache lock")
+            .entries
+            .insert(
+                key.clone(),
+                Entry::Invalid {
+                    message,
+                    expires_at,
+                },
+            );
     }
 
     /// Keep the grammars requests were just admitted with, most recently
@@ -528,17 +566,23 @@ impl Grammars {
                 self.retained_bytes -= size;
             }
         }
-        let mut state = self.shared.lock().expect("grammar cache lock");
-        let done: Vec<GrammarKey> = state
-            .compiled_keys
-            .iter()
-            .filter(|key| !waiting.contains(*key))
-            .cloned()
-            .collect();
+        let done: Vec<GrammarKey> = {
+            let mut bookkeeping = self.bookkeeping.lock().expect("grammar bookkeeping lock");
+            let done: Vec<GrammarKey> = bookkeeping
+                .compiled_keys
+                .iter()
+                .filter(|key| !waiting.contains(*key))
+                .cloned()
+                .collect();
+            for key in &done {
+                bookkeeping.compiled_keys.remove(key);
+            }
+            done
+        };
+        let mut cache = self.cache.lock().expect("grammar cache lock");
         for key in done {
-            state.compiled_keys.remove(&key);
-            if matches!(state.cache.get(&key), Some(Entry::Ready(_))) {
-                state.cache.remove(&key);
+            if matches!(cache.entries.get(&key), Some(Entry::Ready(_))) {
+                cache.entries.remove(&key);
             }
         }
     }
@@ -546,9 +590,9 @@ impl Grammars {
     /// Whether any compiled grammar awaits `retain`'s cleanup.
     pub fn has_compiled(&self) -> bool {
         !self
-            .shared
+            .bookkeeping
             .lock()
-            .expect("grammar cache lock")
+            .expect("grammar bookkeeping lock")
             .compiled_keys
             .is_empty()
     }
