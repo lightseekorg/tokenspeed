@@ -2477,9 +2477,9 @@ def _qsa_bf16_kv_scratch_remap_kernel(
     scratch_page = tl.load(
         page_map + page, mask=mask & valid & (page < num_pool_pages), other=0
     ).to(tl.int64)
-    # Only entries this call's copy wrote are read; a slot outside its
-    # request's pages (a caller error) becomes padding instead of addressing
-    # past the scratch.
+    # Valid slots read only entries this call's copy wrote. A slot outside
+    # its request's pages (a caller error) reads a stale entry: it becomes
+    # padding or another page of this call, never an address past the copy.
     mapped = (scratch_page > 0) & (scratch_page < scratch_pages)
     remapped = tl.where(mapped, scratch_page * PAGE_SIZE + physical % PAGE_SIZE, -1)
     # Padding keeps its value: kernels mask every non-positive slot.

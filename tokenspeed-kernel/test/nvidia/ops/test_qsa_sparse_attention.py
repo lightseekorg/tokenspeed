@@ -1280,6 +1280,69 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
         assert torch.count_nonzero(output[live_rows:]) == 0
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qsa_sparse_attention_blackwell_writes_a_caller_output(
+    device: str, cache_dtype: torch.dtype
+) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+    ):
+        pytest.skip("CuTe DSL QSA requires SM100 or SM103")
+    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+        cute_dsl_blackwell_qsa_sparse_attention,
+    )
+
+    torch.manual_seed(127)
+    rows = 3
+    q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
+    # Cache size is a compile key; 4096 slots reuse the cluster tests' kernels.
+    k_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    v_cache = (
+        torch.randn(4096, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    selected = torch.full((rows, 2051), -1, device=device, dtype=torch.int32)
+    selected[:, :19] = torch.arange(64, 83, device=device)
+    selected[:, -3] = 128
+    unit = 1.0 if cache_dtype is torch.float8_e4m3fn else None
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=1,
+        metadata_capacity_rows=None,
+        k_scale=unit,
+        v_scale=unit,
+    )
+
+    out = torch.full_like(q, float("nan"))
+    result = cute_dsl_blackwell_qsa_sparse_attention(
+        q, k_cache, v_cache, selected, **kwargs, out=out
+    )
+    assert result is out
+    torch.testing.assert_close(
+        out, _reference(q, k_cache, v_cache, selected, 1 / 16), atol=1e-3, rtol=1e-2
+    )
+    for wrong in (
+        q.new_empty((rows + 1, 6, 256)),
+        torch.empty_like(q, dtype=torch.float16),
+        q.new_empty((rows, 6, 512))[..., ::2],
+        torch.empty_like(q, device="cpu"),
+    ):
+        with pytest.raises(ValueError, match="contiguous tensor like the query"):
+            cute_dsl_blackwell_qsa_sparse_attention(
+                q, k_cache, v_cache, selected, **kwargs, out=wrong
+            )
+    empty = q.new_empty((0, 6, 256))
+    assert (
+        cute_dsl_blackwell_qsa_sparse_attention(
+            q[:0], k_cache, v_cache, selected[:0], **kwargs, out=empty
+        )
+        is empty
+    )
+
+
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 4, 9])
 @pytest.mark.parametrize(

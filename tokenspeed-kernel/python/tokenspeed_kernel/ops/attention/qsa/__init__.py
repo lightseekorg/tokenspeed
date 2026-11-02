@@ -355,7 +355,8 @@ def qsa_bf16_kv_scratch(
         selected_slots: Int32 physical slots ``[rows, width]`` with contiguous
             columns; non-positive entries are padding. Every positive slot
             must lie in its request's first ``n_r`` pages; one that does not
-            becomes padding.
+            reads a stale ``page_map`` entry and becomes padding or another
+            page of this call, never an address past the copied pages.
         page_table: Physical page ids ``[>= num_requests, pages]`` with
             contiguous columns.
         seq_lens: Device lengths ``[>= num_requests]``, equal to the host
@@ -368,9 +369,9 @@ def qsa_bf16_kv_scratch(
             head_dim]`` holding at least ``scratch_pages`` whole pages.
         v_scratch: BF16 values with the scratch keys' shape.
         page_map: Contiguous int32 workspace with at least one entry per
-            cache page. Its prior contents are never read: the copy writes
-            every entry the remap reads, so it may alias memory that is free
-            until the remap finishes.
+            cache page. For valid slots and lengths its prior contents are
+            never read: the copy writes every entry the remap reads, so it may
+            alias memory that is free until the remap finishes.
         out_slots: Int32 output ``[rows, width]`` with contiguous columns.
         enable_pdl: Use programmatic dependent launch where supported.
         override: Optional registered kernel name or solution override.

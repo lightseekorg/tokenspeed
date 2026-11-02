@@ -289,8 +289,9 @@ large KV offsets and execution without further compilation after warmup.
 `qsa_bf16_kv_scratch` copies the FP8 E4M3 KV pages one call can read into a
 caller-owned BF16 scratch and rewrites the call's selected slots to it, so a
 large prefill call over an FP8 cache can run the direct-slot CuTe kernel's
-BF16 path, with its asynchronous copy ring, instead of the FP8 path's
-synchronous gather and in-register conversion. The runtime uses it behind
+BF16 path, one query row at a time (`max_seqlen_q=1`), instead of the FP8
+prefill kernel that selection picks (FlashInfer FA2 on NVIDIA; the CuTe
+kernel's FP8 path serves decode only). The runtime uses it behind
 `--enable-qsa-prefill-bf16-scratch`.
 
 Request `r` owns scratch pages `[first_r, first_r + n_r)`, with
@@ -306,11 +307,13 @@ still address slot 1.
 The page map has one int32 entry per cache page. The copy writes every entry
 the remap then reads, so its prior contents are never read and it may alias
 memory that is free until the remap finishes; the runtime uses the attention
-output buffer, which the kernel writes after the remap. A positive slot
-outside its request's pages becomes padding instead of addressing past the
-scratch. Page, slot and row offsets are 64-bit. Request and slot counts and
-the table and slot-row strides opt out of scalar specialization; the page
-size, slot width and PDL are compile-time.
+output buffer, which the kernel writes after the remap. This holds when every
+positive slot lies in its request's pages and the device lengths match the
+host lengths the launch was sized from. A slot outside them reads a stale
+entry and becomes padding or another page of the call, never an address past
+the copied pages. Page, slot and row offsets are 64-bit. Request and slot
+counts and the table and slot-row strides opt out of scalar specialization;
+the page size, slot width and PDL are compile-time.
 
 The direct-slot CuTe kernel's BF16 gathers zero-fill padded entries, a
 `cp.async` with zero source bytes, instead of reading slot 1, a line every CTA

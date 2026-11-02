@@ -215,7 +215,10 @@ def test_bf16_kv_scratch_matches_reference(
         )
 
 
-def test_bf16_kv_scratch_drops_slots_outside_the_plan(device):
+# The runtime's page map aliases the previous layer's output, so a stale entry
+# may hold any value, including a page of the current call.
+@pytest.mark.parametrize("stale", [-7, 2])
+def test_bf16_kv_scratch_keeps_slots_outside_the_plan_inside_the_copy(device, stale):
     generator = torch.Generator(device=device).manual_seed(5)
     requests, page_size = [(600, 20), (300, 30)], 64
     pool_pages = 40
@@ -233,10 +236,11 @@ def test_bf16_kv_scratch_drops_slots_outside_the_plan(device):
         (pages * page_size, 2, 256), dtype=torch.bfloat16, device=device
     )
     v_scratch = torch.zeros_like(k_scratch)
-    page_map = torch.full((pool_pages,), -7, dtype=torch.int32, device=device)
+    page_map = torch.full((pool_pages,), stale, dtype=torch.int32, device=device)
     out = torch.empty_like(selected)
     # A launch three pages short leaves the second request's last pages out:
-    # their slots must become padding, never an address past the copy.
+    # their slots read stale entries and must become padding or a copied
+    # page, never an address past the copy.
     qsa_bf16_kv_scratch_triton(
         k,
         v,
@@ -254,8 +258,10 @@ def test_bf16_kv_scratch_drops_slots_outside_the_plan(device):
     )
     valid = selected > 0
     remapped = out[valid]
-    assert bool(((remapped == -1) | (remapped < (pages - 3) * page_size)).all())
-    assert bool((remapped == -1).any())
+    copied = (remapped >= page_size) & (remapped < (pages - 3) * page_size)
+    assert bool(((remapped == -1) | copied).all())
+    # Entries naming no page of this call turn their slots into padding.
+    assert bool((remapped == -1).any()) == (stale < 0)
 
 
 def test_bf16_kv_scratch_offsets_past_int32(device):
