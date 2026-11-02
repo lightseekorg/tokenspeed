@@ -70,6 +70,7 @@ from tokenspeed.runtime.models.muse_spark import (
     resolve_parameter_name,
     resolve_per_expert_tensor,
     restore_rotary_pairs,
+    shard_expert_projection,
 )
 from tokenspeed.runtime.models.muse_spark_vision import (
     FULL_ATTENTION as VISION_FULL_ATTENTION,
@@ -377,6 +378,7 @@ def test_muse_mxfp4_honors_quark_expert_exclusions(
     assert quantized.experts.w13_weight.dtype == torch.uint8
     assert quantized.experts.plan["solution"] == "triton"
     assert quantized.experts.supports_deferred_finalize is True
+    assert quantized.experts.deferred_output_is_token_order is False
 
 
 @requires_gpu
@@ -397,7 +399,7 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
     output, sentinel = module_(
-        hidden, router_input, hidden.shape[0], hidden.shape[0], None
+        hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
     )
     assert sentinel is None
 
@@ -433,6 +435,154 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
         combined.to(torch.bfloat16).float() @ module_.post_expert_proj.weight.float().T
     ).to(torch.bfloat16)
     torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+
+
+def test_tensor_parallel_expert_shards_reconstruct_full_routes() -> None:
+    generator = torch.Generator().manual_seed(173)
+    hidden, intermediate, experts, ranks = 32, 64, 3, 8
+    x = torch.randn(5, hidden, dtype=torch.float64, generator=generator)
+    w13 = torch.randn(
+        experts, 2 * intermediate, hidden, dtype=torch.float64, generator=generator
+    )
+    w2 = torch.randn(
+        experts, hidden, intermediate, dtype=torch.float64, generator=generator
+    )
+    gate, up = torch.einsum("mh,eih->mei", x, w13).chunk(2, dim=-1)
+    expected = torch.einsum("mei,ehi->meh", torch.nn.functional.silu(gate) * up, w2)
+    actual = torch.zeros_like(expected)
+    for rank in range(ranks):
+        local_w13 = torch.empty(experts, 2 * intermediate // ranks, hidden)
+        local_w2 = torch.empty(experts, hidden, intermediate // ranks)
+        gate_up = shard_expert_projection(
+            w13, local_w13, rank, ranks, gate_up=True, fused_gate_up=True
+        )
+        down = shard_expert_projection(
+            w2, local_w2, rank, ranks, gate_up=False, fused_gate_up=False
+        )
+        gate, up = torch.einsum("mh,eih->mei", x, gate_up).chunk(2, dim=-1)
+        actual += torch.einsum(
+            "mei,ehi->meh", torch.nn.functional.silu(gate) * up, down
+        )
+    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+
+
+@requires_gpu
+@pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp4"])
+def test_tensor_parallel_checkpoint_loading_preserves_gate_up_pairing(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, quantized: bool
+) -> None:
+    # Weight loading needs no active collective; only its absent process group
+    # is substituted. The real model and its parameter buffers are constructed.
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: None
+    )
+    rank, ranks, intermediate = 7, 8, 4096
+    config = _tiny_config()
+    config.moe_intermediate_size = intermediate
+    mapping = Mapping(
+        rank=rank,
+        world_size=ranks,
+        attn_tp_size=ranks,
+        attn_dp_size=1,
+        dense_tp_size=ranks,
+        dense_dp_size=1,
+        moe_tp_size=ranks,
+        moe_ep_size=1,
+        moe_dp_size=1,
+        vision_tp_size=1,
+        vision_dp_size=ranks,
+        linear_attn_tp_size=ranks,
+        pp_size=1,
+        pp_layer_partition=None,
+        nprocs_per_node=ranks,
+        nnodes=1,
+        base_gpu_id=0,
+        gpu_id_step=1,
+    )
+    quant_config = (
+        Mxfp4Config(
+            is_checkpoint_mxfp4_serialized=True,
+            use_dynamic_mxfp4_activations=True,
+        )
+        if quantized
+        else None
+    )
+    with torch.device("cuda"):
+        model = MuseSparkForConditionalGeneration(
+            config,
+            mapping,
+            quant_config,
+            is_multimodal_active=False,
+            mm_attention_backend=None,
+        )
+    moe = model.model.layers[0].mlp
+    if quantized and current_platform().is_cdna4:
+        assert (
+            moe.experts.plan["apply_kernel_name"]
+            == "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
+        )
+        assert moe.experts.deferred_output_is_token_order is True
+    local_intermediate = intermediate // ranks
+    weight_divisor = 2 if quantized else 1
+    specifications = [
+        ("gate_up_proj", "w13_weight", (4, 2 * intermediate, 128 // weight_divisor)),
+        ("down_proj", "w2_weight", (4, 128, intermediate // weight_divisor)),
+    ]
+    if quantized:
+        specifications += [
+            ("gate_up_proj_scale", "w13_weight_scale", (4, 2 * intermediate, 4)),
+            ("down_proj_scale", "w2_weight_scale", (4, 128, intermediate // 32)),
+        ]
+    checkpoint, expected_shards = {}, {}
+    for source_name, parameter_name, shape in specifications:
+        values = torch.arange(math.prod(shape), device="cuda").remainder(97)
+        values = values.to(torch.uint8 if quantized else torch.bfloat16).reshape(shape)
+        checkpoint[parameter_name] = values
+        model.load_weights(
+            [(f"model.language_model.layers.0.mlp.experts.{source_name}", values)]
+        )
+        parameter = dict(moe.experts.named_parameters())[parameter_name]
+        if parameter_name.startswith("w13"):
+            gate, up = values.chunk(2, dim=1)
+            expected = torch.cat(
+                (
+                    gate[
+                        :, rank * local_intermediate : (rank + 1) * local_intermediate
+                    ],
+                    up[:, rank * local_intermediate : (rank + 1) * local_intermediate],
+                ),
+                dim=1,
+            )
+        else:
+            columns = shape[-1] // ranks
+            expected = values[:, :, rank * columns : (rank + 1) * columns]
+        expected_shards[parameter_name] = expected.clone()
+        torch.testing.assert_close(parameter, expected, atol=0, rtol=0)
+
+    # Quark's separate expert projections must reload the same shards as the
+    # fused checkpoint, including byte-packed columns and E8M0 block scales.
+    updates = []
+    for parameter_name, values in checkpoint.items():
+        kind = "weight_scale" if parameter_name.endswith("_scale") else "weight"
+        values = values + 1
+        checkpoint[parameter_name] = values
+        for expert in range(4):
+            if parameter_name.startswith("w13"):
+                gate, up = values[expert].chunk(2, dim=0)
+                projections = (("gate_proj", gate), ("up_proj", up))
+            else:
+                projections = (("down_proj", values[expert]),)
+            updates.extend(
+                (
+                    f"model.language_model.layers.0.mlp.experts.{expert}.{projection}.{kind}",
+                    tensor,
+                )
+                for projection, tensor in projections
+            )
+    model.load_weights(updates)
+    for parameter_name, expected in expected_shards.items():
+        parameter = dict(moe.experts.named_parameters())[parameter_name]
+        torch.testing.assert_close(parameter, expected + 1, atol=0, rtol=0)
 
 
 @requires_gpu
@@ -1092,6 +1242,8 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
     """The experts get the prepared routing when it exists; otherwise one is prepared for next time."""
     moe = _stub(MuseSparkMoE)
     moe.expert_quant_kind = "nvfp4"
+    moe.iris_state = None
+    moe.tp_size, moe.ep_size = 1, 1
     moe.topk, moe.prepared_routing = 2, {}
     moe.ep_group = None
     moe.post_expert_norm = SimpleNamespace(
@@ -1308,6 +1460,35 @@ def test_attention_output_preserves_dense_projection(
         assert result.data_ptr() == output.data_ptr()
 
 
+@requires_gpu
+@pytest.mark.parametrize("tokens", [2, 16])
+def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
+    bf16_default_dtype, tokens: int
+) -> None:
+    """Multi-row decode batches land in the gather input, not a copy of a new result."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    if not current_platform().is_cdna4:
+        pytest.skip("the direct gather-slice projection is the CDNA4 path")
+    torch.manual_seed(5)
+    with torch.device("cuda"):
+        linear = _shard_linear(512, 8192, tp_rank=0, tp_size=1)
+    linear.weight.data.normal_(std=0.02)
+    x = torch.randn((tokens, 8192), device="cuda", dtype=torch.bfloat16)
+    local = torch.full((tokens, 512), torch.nan, device="cuda")
+    linear._project(x, linear.weight, local)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+
+    result = linear._project(x, linear.weight, local)
+
+    # Copying through a fresh [tokens, 512] result would raise the peak.
+    assert torch.cuda.max_memory_allocated() == before
+    assert result is local
+    assert torch.equal(local, mm(x, linear.weight))
+
+
 def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> None:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,
@@ -1325,6 +1506,7 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> N
         device = torch.device("cuda", rank)
         state = prepare_muse_communication(
             enable_lamport=False,
+            owned_route_max_rows=0,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,

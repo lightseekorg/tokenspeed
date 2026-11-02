@@ -94,6 +94,10 @@ class DeepseekV41DSpark(BaseDrafter):
         self.device = torch.device(draft_model_runner.device)
         self.draft_model = draft_model_runner.model
         self.model = self.draft_model.model
+        # Bound by wire_target.
+        self.target_model: torch.nn.Module | None = None
+        self.lm_head: torch.nn.Module | None = None
+        self.tp_group: tuple[int, ...] | None = None
         self.block_size = int(self.model.block_size)
         validate_block_widths(
             "DSPARK", self.block_size, spec_num_steps, spec_num_tokens
@@ -103,9 +107,6 @@ class DeepseekV41DSpark(BaseDrafter):
         max_bs = int(self.input_buffers.max_bs)
         self.next_tokens_buf = torch.empty(
             (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
-        )
-        self.draft_tokens_buf = torch.empty(
-            (max_bs, self.block_size), dtype=torch.int32, device=self.device
         )
         self.start_pos_buf = torch.empty(
             (max_bs,), dtype=torch.int64, device=self.device
@@ -218,9 +219,8 @@ class DeepseekV41DSpark(BaseDrafter):
             self.tp_group,
             self.candidates,
             self.partials,
-            self.draft_tokens_buf[:num_decodes],
+            next_tokens[num_extends:, 1:],
         )
-        next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])
 
     @nvtx_range("drafter:dspark", color="purple")
     def run(
@@ -230,7 +230,7 @@ class DeepseekV41DSpark(BaseDrafter):
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
-        if not hasattr(self, "target_model"):
+        if self.target_model is None:
             raise RuntimeError("DSPARK drafter is not bound to the target model.")
         hidden_states = logits_output.hidden_states
         if hidden_states is None:

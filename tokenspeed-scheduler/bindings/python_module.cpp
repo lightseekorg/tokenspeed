@@ -47,7 +47,7 @@ Writable types:
 2. RequestSpec
 3. ForwardEvent (ExtendResult, Finish, Abort, UpdateReserveNumTokens)
 4. PD::*Event
-5. cache::* ACKs (WriteBackDone, LoadBackDone, PrefetchDone, SnapshotDone, RestoreDone)
+5. cache::* ACKs (WriteBackDone, LoadBackDone, SnapshotDone, RestoreDone)
 
 All other types are produced by the scheduler and consumed by Python, so they do
 not need writable properties.
@@ -95,6 +95,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
+    nb::enum_<tokenspeed::SchedulerConfig::HostWritePolicy>(scheduler_config, "HostWritePolicy")
+        .value("Unspecified", tokenspeed::SchedulerConfig::HostWritePolicy::kUnspecified)
+        .value("WriteThrough", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteThrough)
+        .value("WriteBack", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteBack);
+
     nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
         .value("Full", tokenspeed::AttnKind::kFull)
         .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
@@ -112,17 +117,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
                std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
                std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
-               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable) {
+               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable,
+               std::int32_t checkpoint_granularity) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    attn_kind,           sliding_window_tokens, replayable,  transfer_policy,
-                    shard_count,
+                    std::move(group_id), block_granularity,      total_pages, cache_blocks_per_lcm_block,
+                    attn_kind,           sliding_window_tokens,  replayable,  transfer_policy,
+                    shard_count,         checkpoint_granularity,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
-            nb::arg("replayable") = false)
+            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -131,12 +137,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
+        .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
@@ -155,16 +163,15 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
+        .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
+        .def_rw("host_write_policy", &tokenspeed::SchedulerConfig::host_write_policy)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
-        // L3 only: the fewest whole prefix pages an L3 hit must add beyond the
-        // Host hit before the request waits for a pre-admission prefetch of
-        // them; required (>= 1) with L3, 0 without.
-        .def_rw("l3_prefetch_min_pages", &tokenspeed::SchedulerConfig::l3_prefetch_min_pages)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
-        .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
+        .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
+        .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -213,10 +220,165 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("reserve_num_tokens_in_next_schedule_event",
                 &tokenspeed::forward::UpdateReserveNumTokens::reserve_num_tokens_in_next_schedule_event);
 
+    nb::class_<tokenspeed::StoragePressure>(m, "StoragePressure")
+        .def(nb::init<std::int64_t, std::int64_t, std::int64_t>(), nb::arg("queued_operations"),
+             nb::arg("queued_bytes"), nb::arg("oldest_operation_us"))
+        .def_ro("queued_operations", &tokenspeed::StoragePressure::queued_operations)
+        .def_ro("queued_bytes", &tokenspeed::StoragePressure::queued_bytes)
+        .def_ro("oldest_operation_us", &tokenspeed::StoragePressure::oldest_operation_us);
+    nb::class_<tokenspeed::StorageConfig>(m, "StorageConfig")
+        .def(nb::init<std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int64_t,
+                      std::int64_t, tokenspeed::StoragePressure, tokenspeed::StoragePressure>(),
+             nb::arg("max_operations"), nb::arg("max_keys_per_operation"), nb::arg("max_host_blocks"),
+             nb::arg("metadata_entries"), nb::arg("max_prefetch_tokens"), nb::arg("min_prefetch_tokens"),
+             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("pressure_high"), nb::arg("pressure_low"))
+        .def_ro("max_operations", &tokenspeed::StorageConfig::max_operations)
+        .def_ro("max_keys_per_operation", &tokenspeed::StorageConfig::max_keys_per_operation)
+        .def_ro("max_host_blocks", &tokenspeed::StorageConfig::max_host_blocks)
+        .def_ro("metadata_entries", &tokenspeed::StorageConfig::metadata_entries)
+        .def_ro("max_prefetch_tokens", &tokenspeed::StorageConfig::max_prefetch_tokens)
+        .def_ro("min_prefetch_tokens", &tokenspeed::StorageConfig::min_prefetch_tokens)
+        .def_ro("wait_timeout_us", &tokenspeed::StorageConfig::wait_timeout_us)
+        .def_ro("ready_timeout_us", &tokenspeed::StorageConfig::ready_timeout_us)
+        .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
+        .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
+    scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
+        .value("Query", tokenspeed::StorageKind::kQuery)
+        .value("Get", tokenspeed::StorageKind::kGet)
+        .value("Put", tokenspeed::StorageKind::kPut)
+        .value("Cancel", tokenspeed::StorageKind::kCancel);
+    nb::class_<tokenspeed::StorageStats>(m, "StorageStats")
+        .def_ro("operations", &tokenspeed::StorageStats::operations)
+        .def_ro("held_blocks", &tokenspeed::StorageStats::held_blocks)
+        .def_ro("quarantined", &tokenspeed::StorageStats::quarantined)
+        .def_ro("negative_keys", &tokenspeed::StorageStats::negative_keys)
+        .def_ro("backup_candidates", &tokenspeed::StorageStats::backup_candidates)
+        .def_ro("waiting_requests", &tokenspeed::StorageStats::waiting_requests)
+        .def_ro("ready_requests", &tokenspeed::StorageStats::ready_requests)
+        .def_ro("wait_timeouts", &tokenspeed::StorageStats::wait_timeouts)
+        .def_ro("ready_expirations", &tokenspeed::StorageStats::ready_expirations)
+        .def_ro("pressure_gate_closed", &tokenspeed::StorageStats::pressure_gate_closed)
+        .def_ro("pressure_bypasses", &tokenspeed::StorageStats::pressure_bypasses)
+        .def_ro("pressure_dropped_backup_keys", &tokenspeed::StorageStats::pressure_dropped_backup_keys)
+        .def_ro("overflow_dropped_backup_keys", &tokenspeed::StorageStats::overflow_dropped_backup_keys)
+        .def_ro("unavailable_dropped_backup_keys", &tokenspeed::StorageStats::unavailable_dropped_backup_keys)
+        .def_ro("disabled_dropped_backup_keys", &tokenspeed::StorageStats::disabled_dropped_backup_keys)
+        .def_ro("cleanup_dropped_backup_keys", &tokenspeed::StorageStats::cleanup_dropped_backup_keys);
+
+    // Host L2 counters (Scheduler.host_cache_stats), read-only. Every by-group
+    // list is indexed like SchedulerConfig.cache_groups.
+    nb::class_<tokenspeed::CacheCoordinator::HostEvictionCounts>(m, "HostEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheCoordinator::HostEvictionCounts::blocks)
+        .def_ro("device_resident", &tokenspeed::CacheCoordinator::HostEvictionCounts::device_resident);
+    nb::class_<tokenspeed::CacheCoordinator::HostEvictionStats>(m, "HostEvictionStats")
+        .def_ro("lru", &tokenspeed::CacheCoordinator::HostEvictionStats::lru)
+        .def_ro("duplicate", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate)
+        .def_ro("superseded", &tokenspeed::CacheCoordinator::HostEvictionStats::superseded)
+        .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
+        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
+        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush)
+        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv);
+    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
+        .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);
+    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionStats>(m, "DeviceEvictionStats")
+        .def_ro("admission", &tokenspeed::CacheCoordinator::DeviceEvictionStats::admission)
+        .def_ro("request_reclaim", &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim)
+        .def_ro("request_reclaim_for_write_back",
+                &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim_for_write_back)
+        .def_ro("stranded_suffix", &tokenspeed::CacheCoordinator::DeviceEvictionStats::stranded_suffix)
+        .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
+        .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
+        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
+        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection);
+    nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
+        .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
+        .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
+        .def_ro("host_cached", &tokenspeed::TierTransferManager::WriteBackStats::host_cached)
+        .def_ro("in_flight", &tokenspeed::TierTransferManager::WriteBackStats::in_flight)
+        .def_ro("evicted_before_drain", &tokenspeed::TierTransferManager::WriteBackStats::evicted_before_drain)
+        .def_ro("no_placement", &tokenspeed::TierTransferManager::WriteBackStats::no_placement)
+        .def_ro("snapshot_fallback", &tokenspeed::TierTransferManager::WriteBackStats::snapshot_fallback)
+        .def_ro("image_refused", &tokenspeed::TierTransferManager::WriteBackStats::image_refused)
+        .def_ro("recopied", &tokenspeed::TierTransferManager::WriteBackStats::recopied)
+        .def_ro("cancelled", &tokenspeed::TierTransferManager::WriteBackStats::cancelled);
+    nb::class_<tokenspeed::TierTransferManager::LoadBackStats>(m, "LoadBackStats")
+        .def_ro("ops", &tokenspeed::TierTransferManager::LoadBackStats::ops)
+        .def_ro("blocks", &tokenspeed::TierTransferManager::LoadBackStats::blocks);
+    nb::class_<tokenspeed::PrefixHitStats>(m, "PrefixHitStats")
+        .def_ro("prompt_tokens", &tokenspeed::PrefixHitStats::prompt_tokens)
+        .def_ro("device_hit_tokens", &tokenspeed::PrefixHitStats::device_hit_tokens)
+        .def_ro("host_hit_tokens", &tokenspeed::PrefixHitStats::host_hit_tokens)
+        .def_ro("host_gain_tokens", &tokenspeed::PrefixHitStats::host_gain_tokens)
+        .def_ro("unresumable_kv_tokens", &tokenspeed::PrefixHitStats::unresumable_kv_tokens);
+    nb::class_<tokenspeed::HostCacheStats>(m, "HostCacheStats")
+        .def_ro("prefix_hits", &tokenspeed::HostCacheStats::prefix_hits)
+        .def_ro("publication_stores", &tokenspeed::HostCacheStats::publication_stores)
+        .def_ro("finish_stores", &tokenspeed::HostCacheStats::finish_stores)
+        .def_ro("retraction_stores", &tokenspeed::HostCacheStats::retraction_stores)
+        .def_ro("eviction_stores", &tokenspeed::HostCacheStats::eviction_stores)
+        .def_ro("prefix_loads", &tokenspeed::HostCacheStats::prefix_loads)
+        .def_ro("restore_loads", &tokenspeed::HostCacheStats::restore_loads)
+        .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
+        .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
+        .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
+        .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions);
+
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
     nb::module_ pd = m.def_submodule("PD");
     nb::module_ cache = m.def_submodule("Cache");
+
+    const auto storage_keys = [](const std::vector<tokenspeed::CacheKey>& values) {
+        nb::list keys;
+        for (const auto& key : values) keys.append(nb::make_tuple(key.group_id, key.content_hash, key.page_offset));
+        return keys;
+    };
+
+    nb::class_<tokenspeed::StorageQueryOperation>(cache, "StorageQueryOp")
+        .def_ro("op_id", &tokenspeed::StorageQueryOperation::op_id)
+        .def_prop_ro("kind",
+                     [](const tokenspeed::StorageQueryOperation&) { return tokenspeed::StorageQueryOperation::kKind; })
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::StorageQueryOperation& op) { return storage_keys(op.keys); });
+
+    nb::class_<tokenspeed::StorageGetOperation>(cache, "StorageGetOp")
+        .def_ro("op_id", &tokenspeed::StorageGetOperation::op_id)
+        .def_prop_ro("kind",
+                     [](const tokenspeed::StorageGetOperation&) { return tokenspeed::StorageGetOperation::kKind; })
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::StorageGetOperation& op) { return storage_keys(op.keys); })
+        .def_ro("host_blocks", &tokenspeed::StorageGetOperation::host_blocks);
+
+    nb::class_<tokenspeed::StoragePutOperation>(cache, "StoragePutOp")
+        .def_ro("op_id", &tokenspeed::StoragePutOperation::op_id)
+        .def_prop_ro("kind",
+                     [](const tokenspeed::StoragePutOperation&) { return tokenspeed::StoragePutOperation::kKind; })
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::StoragePutOperation& op) { return storage_keys(op.keys); })
+        .def_ro("host_blocks", &tokenspeed::StoragePutOperation::host_blocks);
+
+    nb::class_<tokenspeed::StorageCancelOperation>(cache, "StorageCancelOp")
+        .def_ro("op_id", &tokenspeed::StorageCancelOperation::op_id)
+        .def_prop_ro("kind", [](const tokenspeed::StorageCancelOperation&) {
+            return tokenspeed::StorageCancelOperation::kKind;
+        });
+
+    nb::class_<tokenspeed::cache::StorageTick>(cache, "StorageTick")
+        .def(nb::init<std::int64_t, bool, bool, tokenspeed::StoragePressure>(), nb::arg("now_us"),
+             nb::arg("allow_forward"), nb::arg("allow_storage"), nb::arg("pressure"))
+        .def_ro("pressure", &tokenspeed::cache::StorageTick::pressure);
+    nb::class_<tokenspeed::cache::StorageDetach>(cache, "StorageDetach")
+        .def(nb::init<std::string>(), nb::arg("request_id"))
+        .def_ro("request_id", &tokenspeed::cache::StorageDetach::request_id);
+    nb::class_<tokenspeed::cache::StorageDone>(cache, "StorageDone")
+        .def(nb::init<std::uint64_t, std::vector<std::uint8_t>, bool, std::vector<std::uint8_t>>(), nb::arg("op_id"),
+             nb::arg("success"), nb::arg("retired"), nb::arg("object_failures"))
+        .def_ro("op_id", &tokenspeed::cache::StorageDone::op_id)
+        .def_ro("success", &tokenspeed::cache::StorageDone::success)
+        .def_ro("retired", &tokenspeed::cache::StorageDone::retired)
+        .def_ro("object_failures", &tokenspeed::cache::StorageDone::object_failures);
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
@@ -224,20 +386,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // A prefix load landed. Every source is a Host-warm entry, so there is no
     // failed load-back: an L3 object that is gone is discovered by the
-    // pre-admission prefetch (PrefetchDoneEvent), never by a load.
+    // pre-admission storage transaction, never by a load.
     nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
         .def(nb::init<>())
         .def(nb::init<std::uint32_t>(), nb::arg("op_id"))
         .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
 
-    // A pre-admission L3 prefetch (PrefetchOp) finished with its first
-    // landed_pages prefix pages fetched into their Host blocks
-    // (replica-converged); the rest did not land.
-    nb::class_<tokenspeed::cache::PrefetchDone>(cache, "PrefetchDoneEvent")
-        .def(nb::init<std::uint32_t, std::int32_t>(), nb::arg("op_id"), nb::arg("landed_pages"))
-        .def_rw("op_id", &tokenspeed::cache::PrefetchDone::op_id)
-        .def_rw("landed_pages", &tokenspeed::cache::PrefetchDone::landed_pages);
-
+    // The tail pages and slot-state blob of a retraction image landed.
     nb::class_<tokenspeed::cache::SnapshotDone>(cache, "SnapshotDoneEvent")
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::SnapshotDone::op_id);
@@ -289,6 +444,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         // group's prompt-end checkpoint sits in slot 0, so the peer omits the
         // latest-snapshot transfer.
         .def_ro("state_prefix_cached", &tokenspeed::ForwardBatch::state_prefix_cached)
+        // Per extend row: tokens of the chunk before its in-forward State
+        // checkpoint (0 for none); the State groups' rows then carry the
+        // checkpoint's block as a third entry.
+        .def_ro("extend_state_checkpoint_lens", &tokenspeed::ForwardBatch::extend_state_checkpoint_lens)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
@@ -326,24 +485,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
         .def_ro("content_hashes", &tokenspeed::LoadBackBatch::content_hashes)
         .def_ro("page_offsets", &tokenspeed::LoadBackBatch::page_offsets);
-
-    // A Submitted request's pre-admission L3 fill: one op per request, rows
-    // in prefix-page order (page_indices non-decreasing), each naming the
-    // object (content_hash, page_offset, group) and the Host page to fill.
-    // The runtime fetches in order, stops at the first page that fails or at
-    // its timeout, and acknowledges once with PrefetchDoneEvent(op_id,
-    // landed_pages): the largest n <= num_pages such that every row with
-    // page_index < first_page + n landed. No stream dependency.
-    nb::class_<tokenspeed::PrefetchBatch>(cache, "PrefetchOp")
-        .def_ro("op_ids", &tokenspeed::PrefetchBatch::op_ids)
-        .def_ro("request_ids", &tokenspeed::PrefetchBatch::request_ids)
-        .def_ro("first_pages", &tokenspeed::PrefetchBatch::first_pages)
-        .def_ro("num_pages", &tokenspeed::PrefetchBatch::num_pages)
-        .def_ro("group_ids", &tokenspeed::PrefetchBatch::group_ids)
-        .def_ro("host_pages", &tokenspeed::PrefetchBatch::host_pages)
-        .def_ro("content_hashes", &tokenspeed::PrefetchBatch::content_hashes)
-        .def_ro("page_offsets", &tokenspeed::PrefetchBatch::page_offsets)
-        .def_ro("page_indices", &tokenspeed::PrefetchBatch::page_indices);
 
     nb::class_<tokenspeed::WriteBackBatch>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
@@ -514,11 +655,26 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Published partial-page boundaries (hash@T) the prefix probe can resume at.")
         .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
              "Tails dropped because more than eight were published under one prior page.")
+        .def("can_abort_before_admission", &tokenspeed::Scheduler::CanAbortBeforeAdmission, nb::arg("id"))
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
+        .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
+        .def("host_pool_free_blocks", &tokenspeed::Scheduler::HostPoolFreeBlocks,
+             "Empty Host L2 pool parents; a parent with any occupied slot counts as used.")
+        .def("host_pool_total_blocks", &tokenspeed::Scheduler::HostPoolTotalBlocks,
+             "Host L2 pool parents (0 without a Host pool).")
+        .def("host_cache_stats", &tokenspeed::Scheduler::GetHostCacheStats,
+             "Host L2 counters and the Device evictions they are read against, cumulative since start. "
+             "Accounting only, for tests and inspection: no scheduling decision reads them, the runtime "
+             "exports none, and reading them changes nothing.")
+        .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
+        .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
+        .def("storage_held_blocks", &tokenspeed::Scheduler::StorageHeldBlocks)
+        .def("storage_quarantined", &tokenspeed::Scheduler::StorageQuarantined)
+        .def("storage_negative_keys", &tokenspeed::Scheduler::StorageNegativeKeys)
         .def("cache_group_total_pages", &tokenspeed::Scheduler::CacheGroupTotalPages, nb::arg("group_id"))
         .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"))
         .def("prefix_hashes_for_tokens", &tokenspeed::Scheduler::PrefixHashesForTokens, nb::arg("tokens"))
@@ -539,43 +695,5 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 }
                 return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};
             },
-            nb::arg("content_hashes"))
-        .def(
-            "register_storage_keys",
-            [](tokenspeed::Scheduler& scheduler, const std::vector<std::uint32_t>& group_ids,
-               const std::vector<std::string>& content_hashes, const std::vector<std::int32_t>& page_offsets) {
-                if (group_ids.size() != content_hashes.size() || group_ids.size() != page_offsets.size()) {
-                    throw std::invalid_argument("register_storage_keys requires aligned group/hash/offset lists");
-                }
-                std::vector<tokenspeed::CacheKey> keys;
-                keys.reserve(group_ids.size());
-                for (std::size_t i = 0; i < group_ids.size(); ++i) {
-                    keys.push_back(tokenspeed::CacheKey{
-                        .group_id = group_ids[i],
-                        .content_hash = content_hashes[i],
-                        .page_offset = page_offsets[i],
-                    });
-                }
-                scheduler.RegisterStorageKeys(keys);
-            },
-            nb::arg("group_ids"), nb::arg("content_hashes"), nb::arg("page_offsets"))
-        .def(
-            "unregister_storage_keys",
-            [](tokenspeed::Scheduler& scheduler, const std::vector<std::uint32_t>& group_ids,
-               const std::vector<std::string>& content_hashes, const std::vector<std::int32_t>& page_offsets) {
-                if (group_ids.size() != content_hashes.size() || group_ids.size() != page_offsets.size()) {
-                    throw std::invalid_argument("unregister_storage_keys requires aligned group/hash/offset lists");
-                }
-                std::vector<tokenspeed::CacheKey> keys;
-                keys.reserve(group_ids.size());
-                for (std::size_t i = 0; i < group_ids.size(); ++i) {
-                    keys.push_back(tokenspeed::CacheKey{
-                        .group_id = group_ids[i],
-                        .content_hash = content_hashes[i],
-                        .page_offset = page_offsets[i],
-                    });
-                }
-                scheduler.UnregisterStorageKeys(keys);
-            },
-            nb::arg("group_ids"), nb::arg("content_hashes"), nb::arg("page_offsets"));
+            nb::arg("content_hashes"));
 }

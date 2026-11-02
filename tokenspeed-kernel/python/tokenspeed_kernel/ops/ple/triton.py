@@ -45,16 +45,11 @@ kernels stay CUDA-graph friendly.
 from __future__ import annotations
 
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.warmup import register_triton_warmup
 
 
 @triton.jit(
     do_not_specialize=["total", "batch_size", "tail_block_rows", "uniform_length"],
-    do_not_specialize_on_alignment=[
-        "total",
-        "batch_size",
-        "tail_block_rows",
-        "uniform_length",
-    ],
 )
 def _ngram_ids_kernel(
     ids_ptr,
@@ -719,3 +714,17 @@ def _ple_gate_norm_kernel(
         normalized.to(normalized_ptr.dtype.element_ty),
         mask=mask,
     )
+
+
+# BLOCK also selects the launch's warp count. Both belong to the warmup key.
+register_triton_warmup(
+    _ngram_ids_kernel,
+    variants=tuple(
+        {"BLOCK": (block,), "num_warps": (1 if block <= 32 else 4,)}
+        for block in (32, 64, 128, 256)
+    ),
+)
+register_triton_warmup(
+    _ple_conv_state_kernel,
+    variants=({"TOTAL": (1, 16, 17), "BATCH": (1, 16, 17)},),
+)

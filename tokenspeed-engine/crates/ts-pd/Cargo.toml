@@ -1,0 +1,27 @@
+[package]
+name = "tokenspeed-pd"
+description = "TokenSpeed's PD transfer peer: the P/D handshake, room states and KV transfers over the Mooncake transfer engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lib]
+name = "ts_pd"
+
+[dependencies]
+bytes.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+ts-collective = { package = "tokenspeed-collective", version = "0.1.0", path = "../ts-collective" }
+ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-metrics" }
+ts-mooncake = { package = "tokenspeed-mooncake", version = "0.1.0", path = "../ts-mooncake" }
+ureq = { version = "2", default-features = false, features = ["json"] }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+[lints]
+workspace = true

@@ -9,6 +9,11 @@ execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
 
+`gather_moe_routes` restores token/route order from a deferred output map and
+zeros absent routes. A kernel declaring `deferred_output_is_token_order` writes
+each route it owns to row `token * topk + slot`; with EP > 1 the other rows are
+stale, so `gather_moe_routes` still zeros them.
+
 The solution modules register these operations. Shared Triton helpers live in
 `_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
 the same registry and public dispatchers as the other MoE operations.
@@ -61,9 +66,14 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.2 and compile isolated modules, operators, and tuning caches. They require
+0.7.2.post1 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
+Private cold JIT compilations bind their include path to that versioned source
+tree. FlashInfer shares one mutable include-directory store across native
+modules, so the private modules use their own: a module loaded later must not
+redirect private kernel compilation, and a private module must not redirect the
+installed module's cold compilation to patched headers.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
@@ -90,9 +100,48 @@ Regression tests compare eager and graph outputs with upstream at
 `atol=rtol=0`. Performance depends on shape and routing; the mean hint alone
 can regress on concentrated routes, so benchmark the intended settings.
 
+Both private modes also change how the SwapAB grouped GEMM moves data, without
+changing its accumulation order. When a weight-scale row is a multiple of 16
+bytes, the TMA thread prefetches each tile's weight scales with the tile's first
+pipeline stage, so the math warps no longer load scales and synchronize at every
+tile boundary. Weight loads carry an L2 evict-first hint: weights are read once
+per call, and evicting them first keeps the GEMM from evicting, and writing
+back, data that earlier kernels left in L2, which would otherwise fill the
+pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
+reads the expert offsets once into shared memory while its barriers are set up,
+and fills the lookup table per expert instead of searching per tile.
+
+### Fused SM90 gated FC1
+
+The private `optimized` mode fuses eligible block-FP8 SwiGLU calls with
+hidden size 512, intermediate size 1024, at most 256 input rows, and an
+`expected_m` value that is positive and less than 32. Bias, LoRA, AWQ,
+min-latency mode, and a separate FC2 FP8 quantization scale retain their
+existing paths. The supported paired tile has 128 output channels per half and
+at most 32 token rows; other shapes retain the existing execution path.
+
+A paired tile computes matching gate/up blocks and applies SwiGLU and 1x128
+FP8 quantization before writing its output. Both existing BF16 rounding points
+are preserved: after FC1 accumulation and after SwiGLU. FC2 consumes the dense
+FP8 buffer and padded scales directly. Its BF16 output uses separate workspace,
+and the input descriptor is bounded by the current invocation's capacity.
+
+With `enable_pdl=True`, only the fused FC1 and its FC2 launch as programmatic
+dependents; other grouped GEMMs stay stream-ordered, as upstream. The matching
+eight-stage FC2 can load its first weight tile and weight scales into shared
+memory before waiting for FC1. FC1 triggers dependents only after its own
+dependency wait and writes neither routing metadata nor weights; activation
+and activation-scale reads remain after the dependency wait.
+`enable_pdl=False` keeps all grouped launches ordered and disables this
+first-tile prefetch.
+
+Prepare and warm the callable before graph capture. Fusion and prefetch variants
+have distinct content-keyed kernel caches, and route metadata is refreshed on
+replay. Performance depends on routing; benchmark the intended workload.
+
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.2) initializes unused rows inside active
+The pinned FlashInfer version (0.7.2.post1) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -103,6 +152,9 @@ guard entry are not part of this initialization contract.
 `thirdparty/flashinfer/trtllm_moe.py` uses the upstream native module while
 retaining the private runner for the small-batch tactic policy described
 later. Warmup must finish before graph capture.
+
+Prepared routing gates PDL with the caller's `enable_pdl` and FlashInfer's public
+`utils.device_support_pdl` check, matching the upstream fused entry points.
 
 Regression coverage includes live and padded mapping entries, local expert
 partitions, PDL on/off, changing routing within one captured shape, graph replay
@@ -173,6 +225,8 @@ tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. If FlashInfer removes
 either tuning hook, changes the cache-key builder signature, or moves runner
 construction outside the cloned entry points, the adapter raises an error.
+When FlashInfer splits its module factory and runner-namespace builder, both
+are rebound so the operator closures keep the same private tactic policy.
 
 The cache-key builder derives the policy tag from the target profile.
 During autotuning, this is the profile that `p.get_opt_shapes()` selects; during
@@ -210,6 +264,17 @@ be wrong here. The kernel test checks non-unit input scales against a
 dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
 experts and top-22.
 
+### Packed FP8 expert intermediate
+
+The matrix-based routed-expert path converts the clamped gate/up result into
+E4M3 inputs for the down projection, with one FP32 scale per 128 activations.
+It preserves BF16 intermediate rounding and clipping before conversion.
+Unsplit projections
+fuse conversion into the activation producer; split projections combine their
+partial results before the nonlinear activation and conversion. Only FP8 values
+and scales are materialized. The first BF16 input conversion still uses the
+shared quantizer rather than an upstream model operation.
+
 ### Unquantized CUTLASS MoE workspace
 
 `flashinfer_cutlass_unquant_moe_apply` hands `cutlass_fused_moe` one
@@ -224,6 +289,15 @@ consecutive MoE layers through their activations, so one buffer per device
 is never in use by two calls at once; a model that overlapped two MoE calls on
 separate streams would need one buffer per stream. PDL stays off in this
 chain for the race described in the BF16 CUTLASS section of `flashinfer.py`.
+
+FP16/BF16 unquantized CUTLASS plans default to fused finalize. Fusing
+the top-k expert reduction into the GEMM2 epilogue uses floating-point
+atomics and does not preserve the reduction order across calls. The plan's
+`cutlass_fused_finalize` value is passed explicitly to both the workspace
+size query and the MoE call. Set it to `False` for a separate reduction.
+Choose the value before warmup and CUDA graph capture; changing it after
+capture does not update recorded kernels. This controls
+one reduction, rather than the complete deployment's determinism contract.
 
 ### FP8 per-channel experts
 
@@ -352,7 +426,7 @@ groups, the top 8 experts of the kept groups, their unbiased scores renormalized
   least one row, a scale that rounds to a finite zero or normal FP32). It
   launches as a programmatic dependent where `pdl_enabled()`.
 
-Beam calls the Triton kernel on NVIDIA SM100 to SM103 where the guard admits the
+Beam calls the Triton kernel on NVIDIA SM90 to SM103 where the guard admits the
 call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
@@ -373,3 +447,11 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## Kimi-K3 router
+
+On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
+over 896 experts. It consumes contiguous FP32 logits and bias and writes
+normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
+The routing-only kernel has no expert-plan workspace or 8,192-token limit.
+Other contracts retain their existing routers.

@@ -3,7 +3,7 @@ name: eval-inkling-nvfp4-mtp-aime25
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
+  - post-submit
   - manual
 runner:
   labels:
@@ -28,7 +28,6 @@ server:
     --moe-backend flashinfer_trtllm
     --enable-prefix-caching
     --disable-kvstore
-    --block-size 128
     --speculative-algorithm MTP
     --speculative-num-steps 3
     --speculative-eagle-topk 1

@@ -24,7 +24,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache, partial
+from functools import lru_cache
 from math import prod
 from types import MappingProxyType
 
@@ -73,7 +73,6 @@ from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
     SkinnyGemmConfig,
     shape_dynamic_skinny_gemm,
 )
-from tokenspeed_kernel.weights import get_weight_broker
 from tokenspeed_kernel.workspace import zeroed_state
 
 logger = logging.getLogger(__name__)
@@ -86,17 +85,14 @@ __all__ = [
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
-    # DeepSeek V4 projections
-    "dsv4_grouped_output_projection",
-    "dsv4_grouped_output_projection_plan",
-    "dsv4_grouped_output_projection_preprocessor",
-    "dsv4_grouped_output_projection_warmup",
-    "dsv4_grouped_output_projection_warmup_model",
+    # DeepSeek V4.1 projections
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
     "grouped_bf16_projection_quantize_fp8",
     # MV: small-M dense projection
     "mv",
+    "mv_weightless_rmsnorm_gated_sigmoid",
+    "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
@@ -571,13 +567,16 @@ def mm(
             ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
             also be E4M3 codes with canonical ``[M, K/32]`` UE8M0 ``A_scales``.
     """
-    if plan is not None and (
-        prepacked_scales
-        or quant not in (None, "none")
-        or A_scales is not None
-        or B_scales is not None
+    if plan is not None and prepacked_scales:
+        raise ValueError("A GEMM plan cannot use prepacked online quantization")
+    if (
+        plan is not None
+        and quant not in (None, "none")
+        and (A_scales is None or B_scales is None)
     ):
-        raise ValueError("A dense GEMM plan cannot use online quantization")
+        raise ValueError(
+            "A quantized GEMM plan requires prequantized operands and scales"
+        )
     override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
@@ -697,20 +696,52 @@ def mm(
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
+    # Supported online FP32/UE8M0 quantizers materialize contiguous FP8 operands.
+    # Describe the layout seen by GEMM, not the original dense activation view.
+    online_contiguous_a = (
+        quant == "mxfp8"
+        and A_scales is None
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and B_scales is not None
+        and block_size is not None
+        and (
+            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
+            or (
+                B_scales.dtype == torch.uint8
+                and block_size[1] == 32
+                and A.stride(-1) == 1
+            )
+        )
+    )
     traits: dict[str, object] = {
         "m": M,
         "n": N,
         "k": K,
         "b_layout": b_layout,
-        "a_inner_stride_one": A.stride(-1) == 1,
+        "a_contiguous": online_contiguous_a or A.is_contiguous(),
+        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
+        "b_contiguous": B.is_contiguous(),
         "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
         "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
         "block_scale_layout": block_scale_layout,
+        "has_alpha": alpha is not None,
+        "out_contiguous": out is None or out.is_contiguous(),
         "out_dtype": out_dtype,
         "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "pdl_enabled": enable_pdl,
     }
+    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
+        # Contiguous offset views can still violate a backend's pointer alignment.
+        # Online quantization allocates aligned activation values and scales.
+        traits["operands_aligned_16"] = (
+            online_contiguous_a or A.data_ptr() % 16 == 0
+        ) and B.data_ptr() % 16 == 0
+        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
+        traits["scales_aligned_16"] = (
+            A_scales is None or A_scales.data_ptr() % 16 == 0
+        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
@@ -1129,368 +1160,8 @@ def mxfp4_swiglu_linear(
 
 
 # ===-----------------------------------------------------------------------===#
-# DeepSeek V4 projections
+# DeepSeek V4.1 projections
 # ===-----------------------------------------------------------------------===#
-
-
-@dataclass(frozen=True)
-class _GroupedOutputProjectionPlan:
-    input_dtype: torch.dtype
-    weight_dtype: torch.dtype
-    weight_scale_dtype: torch.dtype
-    num_groups: int
-    heads_per_group: int
-    head_dim: int
-    nope_dim: int
-    rope_dim: int
-    output_dim: int
-    block_size: tuple[int, int]
-    scale_format: str | None
-
-
-def dsv4_grouped_output_projection_plan(
-    *,
-    input_dtype: torch.dtype,
-    weight_dtype: torch.dtype,
-    weight_scale_dtype: torch.dtype,
-    num_groups: int,
-    heads_per_group: int,
-    head_dim: int,
-    nope_dim: int,
-    rope_dim: int,
-    output_dim: int,
-    block_size: tuple[int, int] | list[int],
-    scale_format: str | None = None,
-) -> object:
-    """Create an opaque plan for the DeepSeek V4 grouped output projection.
-
-    The configuration records the projection geometry and source formats.
-
-    Args:
-        input_dtype: Attention output dtype before dynamic FP8 quantization.
-        weight_dtype: Storage dtype of the grouped projection weight.
-        weight_scale_dtype: Checkpoint storage dtype of the weight scales.
-        num_groups: Number of output-projection groups local to this rank.
-        heads_per_group: Number of local attention heads in each group.
-        head_dim: Width of each attention head.
-        nope_dim: Non-rotary width in each attention head.
-        rope_dim: Rotary width in each attention head.
-        output_dim: Output width of each grouped projection.
-        block_size: Logical weight-scale block shape ``[block_n, block_k]``.
-        scale_format: Logical checkpoint scale encoding, such as ``"ue8m0"``.
-
-    Returns:
-        An opaque plan accepted by the execution and warmup APIs.
-    """
-    if min(num_groups, heads_per_group, head_dim, output_dim) <= 0:
-        raise ValueError("grouped output projection dimensions must be positive")
-    if nope_dim < 0 or rope_dim <= 0 or nope_dim + rope_dim != head_dim:
-        raise ValueError("nope_dim and rope_dim must partition head_dim")
-    if len(block_size) != 2 or min(block_size) <= 0:
-        raise ValueError("block_size must contain two positive dimensions")
-    block_n, block_k = (int(block_size[0]), int(block_size[1]))
-    if head_dim & (head_dim - 1) or block_k & (block_k - 1):
-        raise ValueError("head_dim and block_k must be powers of two")
-    input_dim = heads_per_group * head_dim
-    if head_dim % block_k != 0 or input_dim % block_k != 0 or output_dim % block_n != 0:
-        raise ValueError(
-            "grouped output projection dimensions must be block aligned: "
-            f"input_dim={input_dim}, output_dim={output_dim}, "
-            f"block_size={(block_n, block_k)}"
-        )
-    if rope_dim % 2 != 0 or rope_dim > block_k:
-        raise ValueError(
-            "rope_dim must be even and fit in the final quantization block: "
-            f"rope_dim={rope_dim}, block_k={block_k}"
-        )
-
-    return _GroupedOutputProjectionPlan(
-        input_dtype=input_dtype,
-        weight_dtype=weight_dtype,
-        weight_scale_dtype=weight_scale_dtype,
-        num_groups=num_groups,
-        heads_per_group=heads_per_group,
-        head_dim=head_dim,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-        output_dim=output_dim,
-        block_size=(block_n, block_k),
-        scale_format=scale_format,
-    )
-
-
-def _require_grouped_output_projection_plan(
-    plan: object,
-) -> _GroupedOutputProjectionPlan:
-    if not isinstance(plan, _GroupedOutputProjectionPlan):
-        raise TypeError("plan must be returned by dsv4_grouped_output_projection_plan")
-    return plan
-
-
-def dsv4_grouped_output_projection_preprocessor(
-    plan: object,
-    *,
-    solution: str | None = None,
-) -> tuple[tuple[str, ...], Callable] | None:
-    """Select tensor preprocessing for a grouped output projection layer.
-
-    Args:
-        plan: Opaque grouped output projection plan.
-        solution: Optional implementation family preference for preparation.
-
-    Returns:
-        Source attribute names and their transformation with geometry bound,
-        or None when the layer should enroll canonical weights. The layer runs
-        the returned preprocessor through the shared weight broker.
-    """
-    typed_plan = _require_grouped_output_projection_plan(plan)
-    selected = select_kernel(
-        "gemm",
-        "dsv4_grouped_output_projection",
-        format_signature(
-            attention=dense_tensor_format(typed_plan.input_dtype),
-            weight=dense_tensor_format(typed_plan.weight_dtype),
-        ),
-        traits={
-            "block_size": typed_plan.block_size,
-            "scale_format": typed_plan.scale_format,
-            "weight_scale_dtype": typed_plan.weight_scale_dtype,
-        },
-        solution=solution,
-        ignore_layout=True,
-    )
-    spec = KernelRegistry.get().get_by_name(selected.name)
-    assert spec is not None
-    if spec.weight_preprocessor is None:
-        return None
-    names, transform = spec.weight_preprocessor
-    return names, partial(
-        transform,
-        config={
-            "num_groups": typed_plan.num_groups,
-            "output_dim": typed_plan.output_dim,
-            "input_dim": typed_plan.heads_per_group * typed_plan.head_dim,
-            "block_size": typed_plan.block_size,
-        },
-    )
-
-
-def _select_grouped_output_projection(
-    plan: _GroupedOutputProjectionPlan,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    *,
-    allow_unknown_layout: bool,
-    solution: str | None,
-) -> SelectedKernel:
-    broker = get_weight_broker()
-    layouts = frozenset(
-        broker.layout(tensor, allow_unknown=allow_unknown_layout)
-        for tensor in (weight, weight_scale)
-    )
-    return select_kernel(
-        "gemm",
-        "dsv4_grouped_output_projection",
-        format_signature(
-            layouts=layouts,
-            attention=dense_tensor_format(plan.input_dtype),
-            weight=dense_tensor_format(weight.dtype),
-        ),
-        traits={
-            "block_size": plan.block_size,
-            "scale_format": plan.scale_format,
-            "weight_scale_dtype": weight_scale.dtype,
-        },
-        solution=solution,
-    )
-
-
-def dsv4_grouped_output_projection(
-    plan: object,
-    attention: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    *,
-    allow_unknown_layout: bool,
-    solution: str | None = None,
-) -> torch.Tensor:
-    """Run inverse RoPE, FP8 quantization, and grouped ``wo_a`` projection.
-
-    Args:
-        plan: Opaque grouped output projection plan.
-        attention: Attention output shaped ``[tokens, local_heads, head_dim]``.
-        positions: Position index for each token.
-        cos_sin_cache: Rotary embedding cache used to undo output RoPE.
-        weight: Processed grouped FP8 projection weight.
-        weight_scale: Scales prepared by the layer.
-        allow_unknown_layout: Whether unenrolled storage may be treated as
-            canonical. Layers that preprocess weights must pass False.
-        solution: Optional implementation family preference for this call.
-
-    Returns:
-        Grouped BF16 output shaped ``[tokens, num_groups, output_dim]``.
-    """
-    typed_plan = _require_grouped_output_projection_plan(plan)
-    expected_attention_shape = (
-        typed_plan.num_groups * typed_plan.heads_per_group,
-        typed_plan.head_dim,
-    )
-    if attention.ndim != 3 or tuple(attention.shape[1:]) != expected_attention_shape:
-        raise ValueError(
-            "grouped output projection attention shape mismatch: expected "
-            f"[tokens, {expected_attention_shape[0]}, {expected_attention_shape[1]}], "
-            f"got {tuple(attention.shape)}"
-        )
-    if attention.dtype != typed_plan.input_dtype:
-        raise ValueError(
-            f"grouped output projection expected {typed_plan.input_dtype}, "
-            f"got {attention.dtype}"
-        )
-    if weight.dtype != typed_plan.weight_dtype:
-        raise ValueError(
-            f"grouped output projection expected weight dtype {typed_plan.weight_dtype}, "
-            f"got {weight.dtype}"
-        )
-
-    shape_params = {
-        "T": int(attention.shape[0]),
-        "G": typed_plan.num_groups,
-        "N": typed_plan.output_dim,
-        "K": typed_plan.heads_per_group * typed_plan.head_dim,
-    }
-    kernel = _select_grouped_output_projection(
-        typed_plan,
-        weight,
-        weight_scale,
-        allow_unknown_layout=allow_unknown_layout,
-        solution=solution,
-    )
-    ShapeCapture.get().record(
-        "gemm",
-        "dsv4_grouped_output_projection",
-        kernel.name,
-        attention.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "gemm",
-        "dsv4_grouped_output_projection",
-        attention.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            attention=attention,
-            positions=positions,
-            cos_sin_cache=cos_sin_cache,
-            weight=weight,
-            weight_scale=weight_scale,
-            num_groups=typed_plan.num_groups,
-            heads_per_group=typed_plan.heads_per_group,
-            output_dim=typed_plan.output_dim,
-            nope_dim=typed_plan.nope_dim,
-            rope_dim=typed_plan.rope_dim,
-            block_size=typed_plan.block_size,
-        )
-
-
-def dsv4_grouped_output_projection_warmup(
-    plan: object,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    max_tokens: int,
-    *,
-    allow_unknown_layout: bool,
-    solution: str | None = None,
-) -> None:
-    """Warm the implementation selected for the current prepared weights.
-
-    Args:
-        plan: Opaque grouped output projection plan.
-        weight: Processed grouped FP8 projection weight.
-        weight_scale: Scales prepared by the layer.
-        max_tokens: Largest token count to include in the warmup sweep.
-        allow_unknown_layout: Whether unenrolled storage may be treated as
-            canonical. Layers that preprocess weights must pass False.
-        solution: Optional implementation family preference for this call.
-
-    Returns:
-        None.
-    """
-    typed_plan = _require_grouped_output_projection_plan(plan)
-    kernel = _select_grouped_output_projection(
-        typed_plan,
-        weight,
-        weight_scale,
-        allow_unknown_layout=allow_unknown_layout,
-        solution=solution,
-    )
-    warmup = getattr(kernel.impl, "_tokenspeed_warmup", None)
-    if warmup is None:
-        return
-    warmup(
-        weight=weight,
-        weight_scale=weight_scale,
-        num_groups=typed_plan.num_groups,
-        output_dim=typed_plan.output_dim,
-        input_dim=typed_plan.heads_per_group * typed_plan.head_dim,
-        block_size=typed_plan.block_size,
-        max_tokens=max_tokens,
-    )
-
-
-def dsv4_grouped_output_projection_warmup_model(
-    model: torch.nn.Module,
-    max_tokens: int,
-    *,
-    allow_unknown_layout: bool,
-    solution: str | None = None,
-) -> None:
-    """Warm every distinct grouped output projection plan attached to a model.
-
-    Args:
-        model: Model containing layers with prepared grouped projection plans.
-        max_tokens: Largest token count to include in each backend warmup sweep.
-        allow_unknown_layout: Whether unenrolled storage may be treated as
-            canonical. Layers that preprocess weights must pass False.
-        solution: Optional implementation family preference for this call.
-
-    Returns:
-        None.
-    """
-    seen: set[tuple] = set()
-    for module in model.modules():
-        plan = getattr(module, "_dsv4_grouped_output_projection_plan", None)
-        if plan is None:
-            continue
-        typed_plan = _require_grouped_output_projection_plan(plan)
-        # Validate every layer even when another layer already warmed its shape.
-        kernel = _select_grouped_output_projection(
-            typed_plan,
-            module.weight,
-            module.weight_scale_inv,
-            allow_unknown_layout=allow_unknown_layout,
-            solution=solution,
-        )
-        key = (
-            typed_plan,
-            kernel.name,
-            module.weight_scale_inv.dtype,
-            module.weight.device,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        dsv4_grouped_output_projection_warmup(
-            typed_plan,
-            module.weight,
-            module.weight_scale_inv,
-            max_tokens,
-            allow_unknown_layout=allow_unknown_layout,
-            solution=solution,
-        )
 
 
 def grouped_bf16_projection(
@@ -1910,6 +1581,124 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
+
+
+def _select_mv_weightless_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> SelectedKernel | None:
+    """Select the one-launch gated GEMV for this row, or None."""
+    if (
+        not x.is_cuda
+        or x.ndim != 2
+        or x.shape[1] != num_heads * head_dim
+        or not x.is_contiguous()
+        or gate.shape != x.shape
+        or gate.stride(1) != 1
+        or weight.ndim != 2
+        or weight.shape[1] != x.shape[1]
+        or not weight.is_contiguous()
+        or gate.device != x.device
+        or weight.device != x.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    m, (n, k) = x.shape[0], weight.shape
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "mv_weightless_rmsnorm_gated_sigmoid",
+            dense_format_signature(
+                ("x", "gate", "weight"), (x.dtype, gate.dtype, weight.dtype)
+            ),
+            traits={"m": m, "n": n, "k": k, "head_dim": head_dim},
+        )
+    except NoKernelFoundError:
+        return None
+    # The launch reproduces the gated norm and GEMV it replaces bit for bit, so
+    # it only stands in where those two calls select the kernels it copies.
+    norm = select_kernel(
+        "layernorm",
+        "weightless_rmsnorm_gated_sigmoid",
+        dense_format_signature(("x", "gate"), (x.dtype, gate.dtype)),
+    )
+    gemv = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+    if (
+        norm.name != "triton_weightless_rmsnorm_gated_sigmoid"
+        or gemv is not KernelRegistry.get().get_impl("gluon_rowcta_bf16_gemv_gfx950")
+    ):
+        return None
+    return kernel
+
+
+def mv_weightless_rmsnorm_gated_sigmoid_supported(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Return whether :func:`mv_weightless_rmsnorm_gated_sigmoid` serves this row.
+
+    A registered kernel must take the shape, and the separate gated norm and
+    ``mv`` must select the kernels it reproduces.
+
+    Args:
+        x: Attention row ``[1, num_heads * head_dim]``.
+        gate: Gate logits with ``x``'s shape.
+        weight: Output projection weight ``[N, num_heads * head_dim]``.
+        num_heads: Heads in ``x``.
+        head_dim: Width of each head.
+
+    Returns:
+        ``True`` when one launch can replace the gated norm followed by ``mv``.
+    """
+    return (
+        _select_mv_weightless_rmsnorm_gated_sigmoid(
+            x, gate, weight, num_heads, head_dim
+        )
+        is not None
+    )
+
+
+def mv_weightless_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize, gate and project one row in one launch.
+
+    Computes ``mv(weightless_rmsnorm_gated_sigmoid(x, gate, ...), weight,
+    out)`` where :func:`mv_weightless_rmsnorm_gated_sigmoid_supported` holds.
+
+    Args:
+        x: Contiguous BF16 row ``[1, num_heads * head_dim]``.
+        gate: Gate logits with ``x``'s shape and a unit inner stride.
+        weight: ``[N, K]`` weight.
+        num_heads: Heads in ``x``.
+        eps: Epsilon added to each per-head variance.
+        out: ``[1, N]`` destination.
+
+    Returns:
+        ``out``.
+    """
+    head_dim = x.shape[-1] // max(num_heads, 1)
+    kernel = _select_mv_weightless_rmsnorm_gated_sigmoid(
+        x, gate, weight, num_heads, head_dim
+    )
+    if kernel is None:
+        raise ValueError(
+            "mv_weightless_rmsnorm_gated_sigmoid needs a supported gated row "
+            f"(see mv_weightless_rmsnorm_gated_sigmoid_supported), got x "
+            f"{tuple(x.shape)}, weight {tuple(weight.shape)}, {num_heads} heads"
+        )
+    return kernel(x, gate, weight, out, num_heads, eps)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -3817,6 +3606,7 @@ def fp32_router_gemv_plan(
     output_size: int,
     dtype: torch.dtype,
     solution: str | None,
+    batch_invariant: bool,
 ) -> object:
     """Select an FP32 router GEMV and its persistent weight layout.
 
@@ -3825,6 +3615,8 @@ def fp32_router_gemv_plan(
         output_size: Number of router outputs.
         dtype: Input and canonical weight dtype, which must be FP32.
         solution: Optional implementation family override.
+        batch_invariant: Require a provider declaring the ``batch_invariant``
+            feature, as bitwise numerics envelopes do.
 
     Returns:
         An opaque plan accepted by the related process and execute APIs.
@@ -3838,6 +3630,7 @@ def fp32_router_gemv_plan(
         "gemm",
         "prepared_fp32_router_gemv",
         signature,
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         solution=solution,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)

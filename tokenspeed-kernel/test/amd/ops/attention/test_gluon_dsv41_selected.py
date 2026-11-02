@@ -312,11 +312,11 @@ def test_fused_selected_attention_no_recompile_across_rows(with_rope):
         pytest.skip("AMD fused selected attention")
 
     device = torch.device("cuda:0")
-    segments = _decode_inputs(192, device, 3)
+    segments = _decode_inputs(320, device, 3)
     (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
-    q, sink = _padded_query(192, 16, 64, device, 5)
-    positions = torch.arange(192, dtype=torch.int64, device=device)
-    angles = torch.randn((192, 32), dtype=torch.float32, device=device)
+    q, sink = _padded_query(320, 16, 64, device, 5)
+    positions = torch.arange(320, dtype=torch.int64, device=device)
+    angles = torch.randn((320, 32), dtype=torch.float32, device=device)
     cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
 
     def run(tokens):
@@ -345,7 +345,12 @@ def test_fused_selected_attention_no_recompile_across_rows(with_rope):
 
     for tokens in (1, 24, 96, 192):
         run(tokens)
+    rows = (2, 5, 16, 17, 32, 33, 64, 150, 191)
+    if platform.is_cdna5:
+        # From 257 rows a row runs one split, which must reuse the kernel
+        # compiled for split launches.
+        rows += (257, 320)
     with assert_no_triton_compile(*kernels):
-        for tokens in (2, 5, 16, 17, 32, 33, 64, 150, 191):
+        for tokens in rows:
             run(tokens)
     torch.cuda.synchronize()

@@ -18,266 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING
 
-from tokenspeed.runtime.engine.request_types import ABORT_CODE, BaseFinishReason
 from tokenspeed.runtime.metrics.events import MetricEventSink
 from tokenspeed.runtime.metrics.reporter import MetricFactory
-from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.compile_monitor import CompileStats
 
-TOKENSPEED_TEST_REQUEST_TIME_STATS = envs.TOKENSPEED_TEST_REQUEST_TIME_STATS.get()
-
-
-def _raise_for_negative_durations(**durations: float) -> None:
-    negative_durations = [
-        f"{name}={duration} < 0" for name, duration in durations.items() if duration < 0
-    ]
-    if negative_durations:
-        raise ValueError(" or ".join(negative_durations))
-
-
-@dataclass
-class TimeStats:
-    """
-    Store the timestamps for each stage of a request.
-
-    Unified: wait_queue -> forward -> completion
-    Prefill: bootstrap_queue -> wait_queue -> forward -> transfer_queue -> completion
-    Decode: prealloc_queue -> transfer_queue -> wait_queue -> forward -> completion
-    """
-
-    lb_entry_time: float = 0.0
-    wait_queue_entry_time: float = 0.0
-    forward_entry_time: float = 0.0
-    completion_time: float = 0.0
-    prefill_bootstrap_queue_entry_time: float = 0.0
-    prefill_transfer_queue_entry_time: float = 0.0
-    decode_prealloc_queue_entry_time: float = 0.0
-    decode_transfer_queue_entry_time: float = 0.0
-
-    class RequestType(Enum):
-        UNIFIED = "unified"
-        PREFILL = "prefill"
-        DECODE = "decode"
-        INVALID = "invalid"
-
-    def get_queueing_time(self) -> float:
-        return self.forward_entry_time - self.wait_queue_entry_time
-
-    def __str__(self) -> str:
-        # if unified
-        _type = self.get_type()
-
-        if _type == self.RequestType.UNIFIED:
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                _raise_for_negative_durations(
-                    queue_duration=queue_duration,
-                    forward_duration=forward_duration,
-                )
-
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time}"
-        if _type == self.RequestType.PREFILL:
-            bootstrap_duration = (
-                self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
-            )
-
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                _raise_for_negative_durations(
-                    bootstrap_duration=bootstrap_duration,
-                    queue_duration=queue_duration,
-                    forward_duration=forward_duration,
-                )
-            return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time}"
-        # if decode
-        if _type == self.RequestType.DECODE:
-            prealloc_duration = (
-                self.decode_transfer_queue_entry_time
-                - self.decode_prealloc_queue_entry_time
-            )
-
-            transfer_duration = (
-                self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
-            )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                _raise_for_negative_durations(
-                    prealloc_duration=prealloc_duration,
-                    transfer_duration=transfer_duration,
-                    queue_duration=queue_duration,
-                    forward_duration=forward_duration,
-                )
-
-            return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time}"
-        return "Invalid Time Stats"
-
-    def format_duration(self, duration: float) -> str:
-        return f"{duration * 1e3:.2f}ms"
-
-    def get_type(self) -> RequestType:
-        """Determine the type of request based on timestamp values."""
-        if (
-            self.prefill_bootstrap_queue_entry_time == 0.0
-            and self.prefill_transfer_queue_entry_time == 0.0
-            and self.decode_prealloc_queue_entry_time == 0.0
-            and self.decode_transfer_queue_entry_time == 0.0
-        ):
-            return self.RequestType.UNIFIED
-        elif (
-            self.prefill_bootstrap_queue_entry_time > 0.0
-            and self.prefill_transfer_queue_entry_time > 0.0
-        ):
-            return self.RequestType.PREFILL
-        elif (
-            self.decode_prealloc_queue_entry_time > 0.0
-            and self.decode_transfer_queue_entry_time > 0.0
-            and self.wait_queue_entry_time > 0.0
-        ):
-            return self.RequestType.DECODE
-        else:
-            return self.RequestType.INVALID
-
-
-# Stable snake_case strings for the bounded ABORT_CODE enum, used in the
-# finish_reason label (never the unbounded abort message).
-_ABORT_REASON_LABELS = {
-    ABORT_CODE.TransferFailed: "transfer_failed",
-    ABORT_CODE.UnknownError: "unknown_error",
-    ABORT_CODE.NumericalError: "numerical_error",
-    ABORT_CODE.CapacityAbort: "capacity_abort",
-}
-
-
-def finish_reason_label(finished_reason: dict | BaseFinishReason | None) -> str:
-    """Map a finish reason to its bounded ``finish_reason`` label value.
-
-    Accepts the wire form (``BaseFinishReason.to_json()`` dicts) and the
-    object form alike. The label carries the bounded taxonomy only: the
-    type (``stop`` / ``length`` / ``abort``) and, for aborts, the bounded
-    ``ABORT_CODE`` subclass as ``abort:<code>``. An abort with an
-    unrecognized or missing ``err_type`` stays plain ``abort``; an
-    unrecognized form maps to ``unknown``. Unbounded payloads (abort
-    message, matched stop string/token) never become labels.
-    """
-    if finished_reason is None:
-        return "unknown"
-    reason = (
-        finished_reason
-        if isinstance(finished_reason, dict)
-        else finished_reason.to_json()
-    )
-    reason_type = reason.get("type")
-    if reason_type in ("stop", "length"):
-        return reason_type
-    if reason_type != "abort":
-        return "unknown"
-    err_type = reason.get("err_type")
-    try:
-        code = err_type if isinstance(err_type, ABORT_CODE) else ABORT_CODE(err_type)
-    except (ValueError, TypeError):
-        return "abort"
-    # A future ABORT_CODE member without a label entry stays plain "abort",
-    # like an unrecognized err_type; the mapping test guards against drift.
-    label = _ABORT_REASON_LABELS.get(code)
-    return f"abort:{label}" if label is not None else "abort"
-
-
-def stream_label(stream: bool) -> str:
-    """The ``stream`` label value for a request's streaming flag."""
-    return "true" if stream else "false"
-
-
-def build_1_2_5_buckets(max_value: int) -> list[float]:
-    """A 1-2-5 exponential bucket grid: 1, 2, 5 scaled by increasing powers
-    of ten, capped at ``max_value`` (e.g. 100 -> 1, 2, 5, 10, 20, 50, 100)."""
-    exponent = 0
-    buckets: list[float] = []
-    while True:
-        for m in (1, 2, 5):
-            value = m * 10**exponent
-            if value <= max_value:
-                buckets.append(float(value))
-            else:
-                return buckets
-        exponent += 1
-
-
-@dataclass
-class RequestFinishStats:
-    prompt_tokens: int
-    generation_tokens: int
-    e2e_latency: float
-    cached_prompt_tokens: int = 0
-    finished_ok: bool = True
-    # Bounded finish-reason label value (``finish_reason_label``).
-    finish_reason: str = "unknown"
-    # The request's streaming flag, exported as the "stream" label.
-    stream: bool = False
-
-
-_TIME_PER_OUTPUT_TOKEN_BUCKETS = [
-    0.002,
-    0.005,
-    0.010,
-    0.020,
-    0.030,
-    0.040,
-    0.050,
-    0.060,
-    0.070,
-    0.080,
-    0.090,
-    0.100,
-    0.150,
-    0.200,
-    0.300,
-    0.400,
-    0.600,
-    0.800,
-    1.000,
-    2.000,
-]
-
-_INTER_TOKEN_LATENCY_BUCKETS = [
-    0.002,
-    0.004,
-    0.006,
-    0.008,
-    0.010,
-    0.015,
-    0.020,
-    0.025,
-    0.030,
-    0.035,
-    0.040,
-    0.050,
-    0.075,
-    0.100,
-    0.150,
-    0.200,
-    0.300,
-    0.400,
-    0.500,
-    0.750,
-    1.000,
-    2.000,
-]
-
 
 class EngineMetrics:
+    """The scheduler loop's metrics: their names, labels and buckets.
+
+    Every engine rank records them in Rust (``ts-metrics``), which keeps
+    these definitions; its fixtures are generated from this class
+    (``tokenspeed-engine/crates/ts-metrics/tests/fixtures/generate.py``), so
+    a change here is a change of the Rust metrics too.
+    """
+
     def __init__(
         self,
         labels: dict[str, str],
@@ -364,14 +122,17 @@ class EngineMetrics:
         self.jit_serving_compiles = factory.counter(
             name="tokenspeed:jit_serving_compiles",
             documentation=(
-                "Triton kernel compilations after startup; each one stalls the "
-                "forward thread."
+                "Triton and CuTe DSL kernel compilations after startup; each "
+                "one stalls the forward thread."
             ),
             labelnames=labelnames,
         )
         self.jit_serving_compile_seconds = factory.counter(
             name="tokenspeed:jit_serving_compile_seconds",
-            documentation="Wall time spent in Triton kernel compilations after startup.",
+            documentation=(
+                "Wall time spent in Triton and CuTe DSL kernel compilations "
+                "after startup."
+            ),
             labelnames=labelnames,
         )
         self.num_nan_aborted_requests = factory.counter(
@@ -386,8 +147,10 @@ class EngineMetrics:
             name="tokenspeed:num_capacity_aborted_requests",
             documentation=(
                 "Requests the scheduler aborted because a capacity retraction "
-                "could not image its victim (retraction snapshot pool or image "
-                "rows exhausted); clients may resubmit them."
+                "could not image its victim (retraction snapshot pool, image "
+                "rows or Host L2 exhausted); clients may resubmit them. Forced "
+                "retractions from --debug-force-retraction-interval aborted "
+                "the same way count too."
             ),
             labelnames=labelnames,
         )
@@ -415,7 +178,7 @@ class EngineMetrics:
                 "to first dispatch into a forward batch, observed once per "
                 "request. Grammar-compile, pause-hold, and EPD embedding "
                 "waits precede submission and are excluded, as are "
-                "tokenizer-manager and IPC wait."
+                "frontend and IPC wait."
             ),
             labelnames=labelnames,
             buckets=[
@@ -529,246 +292,12 @@ class EngineMetrics:
         self.request_queue_time_seconds.labels(**self.labels).observe(queue_time)
 
 
-class RequestMetrics:
-    def __init__(
-        self,
-        labels: dict[str, str],
-        *,
-        enabled: bool,
-        max_model_len: int,
-        reporters: list[str],
-        event_sink: MetricEventSink | None = None,
-        registry=None,
-    ) -> None:
-        self.enabled = enabled
-        self.labels = labels
-
-        factory = MetricFactory(
-            enabled=enabled,
-            reporters=reporters,
-            event_sink=event_sink,
-            registry=registry,
-        )
-        labelnames = list(labels.keys())
-        # Per-request enrichment: counters additionally carry finish_reason
-        # and stream; histograms carry stream only.
-        finish_labelnames = [*labelnames, "finish_reason", "stream"]
-        stream_labelnames = [*labelnames, "stream"]
-
-        self.prompt_tokens_total = factory.counter(
-            name="tokenspeed:prompt_tokens",
-            documentation="Number of prefill tokens processed.",
-            labelnames=labelnames,
-        )
-
-        self.generation_tokens_total = factory.counter(
-            name="tokenspeed:generation_tokens",
-            documentation="Number of generation tokens processed.",
-            labelnames=labelnames,
-        )
-
-        # tokenspeed-only Counter that tracks every finished request
-        # regardless of finish reason.
-        self.num_requests_total = factory.counter(
-            name="tokenspeed:num_requests",
-            documentation="Number of requests processed.",
-            labelnames=finish_labelnames,
-        )
-
-        self.request_success_total = factory.counter(
-            name="tokenspeed:request_success",
-            documentation="Requests that finished without an abort-style finish.",
-            labelnames=finish_labelnames,
-        )
-
-        self.prefix_cache_hits_total = factory.counter(
-            name="tokenspeed:prefix_cache_hits",
-            documentation=(
-                "Prompt tokens served from prefix cache. Hit ratio = "
-                "prefix_cache_hits_total / prompt_tokens_total. This is the "
-                "cached leg of the cached/uncached split: cached tokens = "
-                "tokenspeed:prefix_cache_hits_total, uncached tokens = "
-                "tokenspeed:prompt_tokens_total - "
-                "tokenspeed:prefix_cache_hits_total."
-            ),
-            labelnames=labelnames,
-        )
-
-        self.histogram_time_to_first_token = factory.histogram(
-            name="tokenspeed:time_to_first_token_seconds",
-            documentation="Histogram of time to first token in seconds.",
-            labelnames=stream_labelnames,
-            buckets=[
-                0.1,
-                0.3,
-                0.5,
-                0.7,
-                0.9,
-                1,
-                2,
-                4,
-                6,
-                8,
-                10,
-                20,
-                40,
-                60,
-                80,
-                120,
-                160,
-            ],
-        )
-
-        self.histogram_time_per_output_token = factory.histogram(
-            name="tokenspeed:request_time_per_output_token_seconds",
-            documentation=(
-                "Histogram of end-to-end request latency divided by output "
-                "tokens in seconds (includes queueing and TTFT)."
-            ),
-            labelnames=labelnames,
-            buckets=_TIME_PER_OUTPUT_TOKEN_BUCKETS,
-        )
-
-        self.histogram_decode_time_per_output_token = factory.histogram(
-            name="tokenspeed:decode_time_per_output_token_seconds",
-            documentation=(
-                "Histogram of decode time per output token after the first "
-                "output in seconds (excludes queueing and TTFT)."
-            ),
-            labelnames=labelnames,
-            buckets=_TIME_PER_OUTPUT_TOKEN_BUCKETS,
-        )
-
-        self.histogram_inter_token_latency_seconds = factory.histogram(
-            name="tokenspeed:inter_token_latency_seconds",
-            documentation="Histogram of frontend wall-clock inter-token latency in seconds.",
-            labelnames=labelnames,
-            buckets=_INTER_TOKEN_LATENCY_BUCKETS,
-        )
-
-        self.histogram_scheduler_inter_token_latency_seconds = factory.histogram(
-            name="tokenspeed:scheduler_inter_token_latency_seconds",
-            documentation="Histogram of scheduler-side inter-token latency in seconds.",
-            labelnames=labelnames,
-            buckets=_INTER_TOKEN_LATENCY_BUCKETS,
-        )
-
-        self.histogram_e2e_request_latency = factory.histogram(
-            name="tokenspeed:e2e_request_latency_seconds",
-            documentation="Histogram of End-to-end request latency in seconds",
-            labelnames=stream_labelnames,
-            buckets=[
-                0.1,
-                0.2,
-                0.4,
-                0.8,
-                1,
-                2,
-                5,
-                10,
-                20,
-                40,
-                60,
-                80,
-                100,
-                150,
-                200,
-                250,
-                300,
-                350,
-                500,
-                1000,
-            ],
-        )
-
-        # Per-request token distributions at request finish, on a 1-2-5
-        # bucket grid capped at the model's max length.
-        request_token_buckets = build_1_2_5_buckets(max_model_len)
-        self.histogram_request_prompt_tokens = factory.histogram(
-            name="tokenspeed:request_prompt_tokens",
-            documentation=(
-                "Histogram of per-request prompt token counts at request "
-                "finish (1-2-5 bucket grid capped at the model's max length)."
-            ),
-            labelnames=stream_labelnames,
-            buckets=request_token_buckets,
-        )
-        self.histogram_request_generation_tokens = factory.histogram(
-            name="tokenspeed:request_generation_tokens",
-            documentation=(
-                "Histogram of per-request generation token counts at request "
-                "finish (1-2-5 bucket grid capped at the model's max length)."
-            ),
-            labelnames=stream_labelnames,
-            buckets=request_token_buckets,
-        )
-
-    def record_request_finish(self, stats: RequestFinishStats) -> None:
-        if not self.enabled:
-            return
-        self.prompt_tokens_total.labels(**self.labels).inc(stats.prompt_tokens)
-        self.generation_tokens_total.labels(**self.labels).inc(stats.generation_tokens)
-        finish_labels = {
-            **self.labels,
-            "finish_reason": stats.finish_reason,
-            "stream": stream_label(stats.stream),
-        }
-        self.num_requests_total.labels(**finish_labels).inc(1)
-        self.prefix_cache_hits_total.labels(**self.labels).inc(
-            stats.cached_prompt_tokens
-        )
-        if stats.finished_ok:
-            self.request_success_total.labels(**finish_labels).inc(1)
-        stream_labels = {**self.labels, "stream": stream_label(stats.stream)}
-        self.histogram_e2e_request_latency.labels(**stream_labels).observe(
-            stats.e2e_latency
-        )
-        self.histogram_request_prompt_tokens.labels(**stream_labels).observe(
-            stats.prompt_tokens
-        )
-        self.histogram_request_generation_tokens.labels(**stream_labels).observe(
-            stats.generation_tokens
-        )
-        if stats.generation_tokens >= 1:
-            self.histogram_time_per_output_token.labels(**self.labels).observe(
-                stats.e2e_latency / stats.generation_tokens
-            )
-
-    def observe_time_to_first_token(self, value: float, *, stream: bool) -> None:
-        if not self.enabled:
-            return
-        self.histogram_time_to_first_token.labels(
-            **self.labels, stream=stream_label(stream)
-        ).observe(value)
-
-    def observe_decode_time_per_output_token(self, value: float) -> None:
-        if not self.enabled:
-            return
-        self.histogram_decode_time_per_output_token.labels(**self.labels).observe(value)
-
-    def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
-        if not self.enabled or num_new_tokens <= 0:
-            return
-        self.histogram_inter_token_latency_seconds.labels(
-            **self.labels
-        ).observe_batched(interval, num_new_tokens)
-
-    def observe_scheduler_inter_token_latency(
-        self, interval: float, num_new_tokens: int
-    ) -> None:
-        if not self.enabled or num_new_tokens <= 0:
-            return
-        self.histogram_scheduler_inter_token_latency_seconds.labels(
-            **self.labels
-        ).observe_batched(interval, num_new_tokens)
-
-
 class KVTransferMetrics:
-    """PD KV transfer metrics, recorded by the transfer managers.
+    """PD KV transfer metrics: their names, labels and buckets.
 
-    Lives on every PD engine (prefill and decode roles each record their own
-    view); series from the node's transfer processes aggregate in Prometheus
-    multiprocess mode.
+    Every PD engine rank records them in Rust (``ts-metrics``; prefill and
+    decode roles each record their own view), which keeps these
+    definitions, as for ``EngineMetrics``.
     """
 
     def __init__(

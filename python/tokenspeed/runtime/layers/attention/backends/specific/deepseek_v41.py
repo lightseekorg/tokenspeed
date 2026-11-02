@@ -268,10 +268,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise NotImplementedError("V4.1 FlatKV implements target attention only")
         if config.kernel_page_size not in (None, 64):
             raise ValueError("V4.1 SWA/global readers require 64-row pages")
-        if config.prefix_granularity <= 0 or config.prefix_granularity % 128:
-            raise ValueError(
-                "V4.1 prefix granularity must be a positive multiple of 128"
-            )
         if (
             spec.head_dim != 512
             or spec.sliding_window_tokens != 128

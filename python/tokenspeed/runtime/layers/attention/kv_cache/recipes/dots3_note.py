@@ -41,9 +41,18 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     apply_pd_transfer_policies,
 )
 
+# A multiple of both groups' spans (64-row DSA, 32-row SWA) that exceeds each:
+# a grain equal to a field's page size would request a flat, unstrided view.
+_DOTS3_NOTE_PREFIX_GRANULARITY = 128
+
 
 class Dots3NoteRecipe(CacheRecipe):
     family = "dots3_note"
+
+    @property
+    @override
+    def prefix_granularity(self) -> int:
+        return _DOTS3_NOTE_PREFIX_GRANULARITY
 
     @property
     @override
@@ -70,9 +79,6 @@ class Dots3NoteRecipe(CacheRecipe):
             raise ValueError(
                 "dots3-note requires unit-scale E4M3 KV and scaled FP8 index-K"
             )
-        if self.prefix_granularity <= 0 or self.prefix_granularity % 128:
-            # A grain equal to a field's page size requests a flat, unstrided view.
-            raise ValueError("dots3-note prefix granularity must be a multiple of 128")
         if self.server_args.pipeline_parallel_size != 1:
             raise NotImplementedError("dots3-note cache currently requires PP=1")
         if (
@@ -95,7 +101,6 @@ class Dots3NoteRecipe(CacheRecipe):
             if (
                 draft.kv_cache_dtype != config.kv_cache_dtype
                 or draft.kv_cache_quant_method not in (None, "none")
-                or draft.prefix_granularity != self.prefix_granularity
                 or draft.kernel_page_size != 32
                 or draft_spec.kv_cache_dim != spec.swa.kv_cache_dim
                 or (draft_spec.kv_lora_rank, draft_spec.qk_rope_head_dim)
@@ -147,11 +152,8 @@ class Dots3NoteRecipe(CacheRecipe):
         return {"dsa": 2, "swa": 1}
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
-        )
-        return self.parents_needed(layout, self.token_capacity(layout, budgeted))
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
+        return self.parents_needed(layout, self.token_capacity(layout, max_lcm_blocks))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

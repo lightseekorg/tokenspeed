@@ -185,7 +185,6 @@ def _load_cute_dsl_topk():
 
 @triton.jit(
     do_not_specialize=["num_tokens"],
-    do_not_specialize_on_alignment=["num_tokens"],
 )
 def _kpool_decode_metadata_kernel(
     seq_lens,

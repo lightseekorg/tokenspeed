@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 # (decoded dimensions, quantization group, value bytes, total row bytes,
 #  quantized dimensions). QUANTIZED == D means the whole row is quantized. The
@@ -1324,7 +1325,7 @@ def index_topk(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "PAGES"])
 def _compressor_pool(
     CONTENT,
     SCORES,
@@ -1352,15 +1353,17 @@ def _compressor_pool(
     T3: tl.constexpr,
     O0: tl.constexpr,
     O1: tl.constexpr,
-    PAGES: tl.constexpr,
+    PAGES,
 ):
     row = tl.program_id(0)
     channels = tl.arange(0, 512)
     live = tl.load(ACTIVE + row * A0)
     previous = tl.load(PREVIOUS + row * P0)
-    slot = tl.load(SLOTS + row * S0)
+    slot = tl.load(SLOTS + row * S0).to(tl.int64)
     in_current = live & (previous >= 0) & (previous < N)
-    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES * 2)
+    # Pool capacity changes when startup replaces the probe arena. Widen
+    # before multiplying so a runtime int32 page count cannot wrap the bound.
+    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES.to(tl.int64) * 2)
     old_content = tl.load(CONTENT + previous * C0 + channels * C1, in_current, 0.0)
     old_scores = tl.load(SCORES + previous * G0 + channels * G1, in_current, 0.0)
     tail_offset = slot // 2 * T0 + slot % 2 * T1 + channels * T3
@@ -1477,7 +1480,7 @@ def _rotate_interleaved(value, partner, cosine, sine, odd):
     return tl.where(odd, first + second, first - second)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NP"], do_not_specialize_on_alignment=["POS", "SLOTS"])
 def _swa_rope_insert(
     X,
     W,
@@ -1488,16 +1491,16 @@ def _swa_rope_insert(
     CACHE,
     SLOTS,
     OUT,
-    X0: tl.constexpr,
+    X0,
     X1: tl.constexpr,
     POS0: tl.constexpr,
     CS0: tl.constexpr,
     C0: tl.constexpr,
     S0: tl.constexpr,
-    O0: tl.constexpr,
+    O0,
     O1: tl.constexpr,
     P: tl.constexpr,
-    NP: tl.constexpr,
+    NP,
     MAX_POS: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -1512,7 +1515,9 @@ def _swa_rope_insert(
         position_valid, "SWA RoPE position is outside the cosine/sine table"
     )
     slot = tl.load(SLOTS + token * S0).to(tl.int64)
-    live = (slot >= P) & (slot < NP * P)
+    # Capacity is a runtime bound, not kernel geometry. Promote before the
+    # product to retain the constexpr path's range for large pools.
+    live = (slot >= P) & (slot < NP.to(tl.int64) * P)
     x = tl.load(X + token * X0 + d * X1).to(tl.float32)
     normalized = x
     if HAS_NORM:
@@ -1684,9 +1689,18 @@ def _rope_inplace_kernel(
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
     B: tl.constexpr,
+    WEIGHTS,
+    W0,
+    W1,
+    WEIGHT_SCALE,
+    SCALE_WEIGHTS: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
+    if SCALE_WEIGHTS:
+        weight_ptr = WEIGHTS + token * W0 + head * W1
+        weight = tl.load(weight_ptr).to(tl.float32)
+        tl.store(weight_ptr, weight * WEIGHT_SCALE)
     # Keep padding/compressor sentinels in the caller's metadata. Only this
     # frequency-table lookup maps negative positions to the identity row.
     position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
@@ -1707,10 +1721,24 @@ def _rope_inplace_kernel(
 
 @_register_rope("dsv41_rope_inplace")
 def rope_inplace(values, positions, cache):
+    return _launch_rope_inplace(values, positions, cache, None, 1.0)
+
+
+@_register_rope("dsv41_rope_weights_inplace")
+def rope_weights_inplace(values, positions, cache, weights, weight_scale):
+    return _launch_rope_inplace(values, positions, cache, weights, weight_scale)
+
+
+def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
     if values.numel() == 0:
         return values
     rotary_dim = cache.shape[1]
     heads = 1 if values.ndim == 2 else values.shape[1]
+    # The extra scalar store helps small indexer launches, but loses its
+    # launch-saving benefit for larger grids on gfx950. Keep the ordinary RoPE
+    # launch there and scale the owned weights with the existing tensor op.
+    scale_separately = weights is not None and values.shape[0] * heads > 4096
+    fused_weights = None if scale_separately else weights
     _rope_inplace_kernel[(values.shape[0], heads)](
         values[..., -rotary_dim:],
         positions,
@@ -1722,10 +1750,17 @@ def rope_inplace(values, positions, cache):
         rotary_dim,
         cache.shape[0],
         max(triton.next_power_of_2(rotary_dim // 2), 16),
+        fused_weights,
+        0 if fused_weights is None else fused_weights.stride(0),
+        0 if fused_weights is None else fused_weights.stride(1),
+        weight_scale,
+        fused_weights is not None,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
     )
+    if scale_separately:
+        weights.mul_(weight_scale)
     return values
 
 
@@ -1798,6 +1833,51 @@ def _launch_query(values, positions, cache, output, heads_to_write):
 
 
 @triton.jit
+def _dspark_row_value(
+    X,
+    W,
+    POS,
+    CS,
+    token,
+    X0,
+    POS0,
+    CS0,
+    MAX_POS: tl.constexpr,
+    R: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+):
+    d = tl.arange(0, 512)
+    x = tl.load(X + token * X0 + d).to(tl.float32)
+    if HAS_NORM:
+        weight = tl.load(W + d).to(tl.float32)
+        # The reference rounds the normalized row to BF16 before rotating it.
+        x = reference_rmsnorm_row(x, weight, EPS, 512).to(tl.bfloat16).to(tl.float32)
+    if HAS_ROPE:
+        position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
+        valid = position < MAX_POS
+        tl.device_assert(valid, "DSpark RoPE position is outside the cosine/sine table")
+        partner = tl.gather(x, d ^ 1, axis=0)
+        tail = d >= 512 - R
+        pair = (d - (512 - R)) // 2
+        cosine = tl.load(CS + position * CS0 + pair, tail & valid, 1.0)
+        sine = tl.load(CS + position * CS0 + R // 2 + pair, tail & valid, 0.0)
+        rotated = _rotate_interleaved(x, partner, cosine, sine, (d & 1) != 0)
+        x = tl.where(tail, rotated.to(tl.bfloat16), x.to(tl.bfloat16)).to(tl.float32)
+    # All-channel 1x32 E4M3/E8M0 round trip, the reference SWA row codec.
+    values = tl.reshape(x, (16, 32))
+    amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
+    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
+    restored = tl.reshape(quantized.to(tl.float32) * scale[:, None], (512,)).to(
+        tl.bfloat16
+    )
+    return restored
+
+
+@triton.jit
 def _dspark_rows_kernel(
     X,
     W,
@@ -1825,30 +1905,20 @@ def _dspark_rows_kernel(
 ):
     token = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 512)
-    x = tl.load(X + token * X0 + d).to(tl.float32)
-    if HAS_NORM:
-        weight = tl.load(W + d).to(tl.float32)
-        # The reference rounds the normalized row to BF16 before rotating it.
-        x = reference_rmsnorm_row(x, weight, EPS, 512).to(tl.bfloat16).to(tl.float32)
-    if HAS_ROPE:
-        position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
-        valid = position < MAX_POS
-        tl.device_assert(valid, "DSpark RoPE position is outside the cosine/sine table")
-        partner = tl.gather(x, d ^ 1, axis=0)
-        tail = d >= 512 - R
-        pair = (d - (512 - R)) // 2
-        cosine = tl.load(CS + position * CS0 + pair, tail & valid, 1.0)
-        sine = tl.load(CS + position * CS0 + R // 2 + pair, tail & valid, 0.0)
-        rotated = _rotate_interleaved(x, partner, cosine, sine, (d & 1) != 0)
-        x = tl.where(tail, rotated.to(tl.bfloat16), x.to(tl.bfloat16)).to(tl.float32)
-    # All-channel 1x32 E4M3/E8M0 round trip, the reference SWA row codec.
-    values = tl.reshape(x, (16, 32))
-    amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
-    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
-    restored = tl.reshape(quantized.to(tl.float32) * scale[:, None], (512,)).to(
-        tl.bfloat16
+    restored = _dspark_row_value(
+        X,
+        W,
+        POS,
+        CS,
+        token,
+        X0,
+        POS0,
+        CS0,
+        MAX_POS,
+        R,
+        EPS,
+        HAS_NORM,
+        HAS_ROPE,
     )
     if HAS_OUT:
         tl.store(OUT + token * O0 + d, restored)
@@ -1949,6 +2019,196 @@ def triton_dsv41_dspark_rows(
         enable_fp_fusion=False,
         debug=True,
     )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "X0",
+        "POS0",
+        "CS0",
+        "W0",
+        "W1",
+        "P0",
+        "P1",
+        "R0",
+        "R1",
+        "O0",
+        "HISTORY",
+        "BLOCK",
+        "PAGES",
+        "PAGE_ROWS",
+    ],
+)
+def _dspark_workspace_kernel(
+    X,
+    NORM,
+    POS,
+    CS,
+    WINDOW,
+    PAGE,
+    ROW,
+    OUT,
+    X0,
+    POS0,
+    CS0,
+    W0,
+    W1,
+    P0,
+    P1,
+    R0,
+    R1,
+    O0,
+    HISTORY,
+    BLOCK,
+    PAGES,
+    PAGE_ROWS,
+    MAX_POS: tl.constexpr,
+    ROTARY: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+):
+    request = tl.program_id(0).to(tl.int64)
+    column = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, 512)
+    # One program writes a final workspace row. History is already decoded;
+    # only current rows pass through normalization, RoPE and the row codec.
+    if column < HISTORY:
+        # Preserve dummy-page contents; selection indices control visibility.
+        page = tl.load(PAGE + request * P0 + column * P1).to(tl.int64)
+        row = tl.load(ROW + request * R0 + column * R1).to(tl.int64)
+        valid = (page >= 0) & (page < PAGES) & (row >= 0) & (row < PAGE_ROWS)
+        tl.device_assert(valid, "DSpark workspace history address is outside its field")
+        value = tl.load(WINDOW + page * W0 + row * W1 + d, valid, 0)
+    else:
+        token = request * BLOCK + column - HISTORY
+        value = _dspark_row_value(
+            X,
+            NORM,
+            POS,
+            CS,
+            token,
+            X0,
+            POS0,
+            CS0,
+            MAX_POS,
+            ROTARY,
+            EPS,
+            HAS_NORM,
+            HAS_ROPE,
+        )
+    tl.store(OUT + request * O0 + column * 512 + d, value)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_dspark_workspace",
+    name="triton_dsv41_dspark_workspace",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_dspark_workspace(
+    values,
+    norm_weight,
+    norm_eps,
+    positions,
+    cos_sin_cache,
+    window,
+    page,
+    row,
+    block_size,
+):
+    if values.ndim != 2 or values.shape[1] != 512 or values.stride(1) != 1:
+        raise ValueError(
+            "DSpark workspace values must be BF16 [tokens,512] with unit column stride"
+        )
+    if page.ndim != 2:
+        raise ValueError("DSpark workspace pages must be [batch,history_width]")
+    batch, history = page.shape
+    _integers(page, (batch, history), "page")
+    _integers(row, (batch, history), "row")
+    if block_size < 1 or values.shape[0] != batch * block_size:
+        raise ValueError("DSpark workspace values must cover batch * block_size rows")
+    if (
+        window.ndim != 3
+        or window.dtype != torch.bfloat16
+        or window.shape[2] != 512
+        or window.stride(2) != 1
+    ):
+        raise ValueError(
+            "DSpark workspace history must be BF16 [pages,page_rows,512] with unit column stride"
+        )
+    if norm_weight is not None:
+        if (
+            norm_weight.shape != (512,)
+            or norm_weight.dtype != torch.bfloat16
+            or norm_weight.stride(0) != 1
+        ):
+            raise ValueError(
+                "DSpark workspace norm weight must be contiguous BF16 [512]"
+            )
+        if norm_eps is None:
+            raise ValueError("DSpark workspace normalization requires epsilon")
+    elif norm_eps is not None:
+        raise ValueError("DSpark workspace epsilon requires a norm weight")
+    has_rope = cos_sin_cache is not None
+    if has_rope:
+        if positions is None:
+            raise ValueError("DSpark workspace RoPE needs positions")
+        _integers(positions, (values.shape[0],), "positions")
+        if (
+            cos_sin_cache.ndim != 2
+            or cos_sin_cache.dtype != torch.float32
+            or cos_sin_cache.shape[1] % 2
+            or not 2 <= cos_sin_cache.shape[1] <= 512
+            or cos_sin_cache.stride(1) != 1
+        ):
+            raise ValueError(
+                "DSpark workspace RoPE table must be FP32 [positions,even rotary_dim]"
+            )
+    elif positions is not None:
+        raise ValueError("DSpark workspace without a RoPE table takes no positions")
+    _same_device(values, (norm_weight, positions, cos_sin_cache, window, page, row))
+    out = torch.empty(
+        (batch, history + block_size, 512), dtype=torch.bfloat16, device=values.device
+    )
+    if batch:
+        _dspark_workspace_kernel[(batch, history + block_size)](
+            values,
+            norm_weight if norm_weight is not None else values,
+            positions if has_rope else values,
+            cos_sin_cache if has_rope else values,
+            window,
+            page,
+            row,
+            out,
+            values.stride(0),
+            positions.stride(0) if has_rope else 0,
+            cos_sin_cache.stride(0) if has_rope else 0,
+            window.stride(0),
+            window.stride(1),
+            page.stride(0),
+            page.stride(1),
+            row.stride(0),
+            row.stride(1),
+            out.stride(0),
+            history,
+            block_size,
+            window.shape[0],
+            window.shape[1],
+            MAX_POS=cos_sin_cache.shape[0] if has_rope else 1,
+            ROTARY=cos_sin_cache.shape[1] if has_rope else 2,
+            EPS=norm_eps if norm_weight is not None else 0.0,
+            HAS_NORM=norm_weight is not None,
+            HAS_ROPE=has_rope,
+            num_warps=4,
+            enable_fp_fusion=False,
+            debug=True,
+        )
+    return out
 
 
 @triton.jit(do_not_specialize=["EXTENDS", "PREFILL_OUTPUTS"])
@@ -2142,11 +2402,12 @@ def triton_dsv41_dspark_block(
     return ids, positions, pre_mix, request_indices, page, row, indices
 
 
-@triton.jit(do_not_specialize=["X0", "X1"], do_not_specialize_on_alignment=["X0", "X1"])
+@triton.jit(do_not_specialize=["X0", "X1"])
 def _pack_index_queries(X, V, S, X0, X1):
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 128)
-    x = tl.load(X + row * X0 + d * X1).to(tl.float32)
+    # Widen before multiplication: large inner strides overflow int32 offsets.
+    x = tl.load(X + row * X0 + d.to(tl.int64) * X1).to(tl.float32)
     grouped = tl.reshape(x, (1, 4, 32))
     amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
     packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
@@ -2240,7 +2501,6 @@ def pack_index_queries(values):
 
 @triton.jit(
     do_not_specialize=["T0", "T1", "L0", "TC", "NP", "CAP"],
-    do_not_specialize_on_alignment=["T0", "T1", "L0", "TC", "NP", "CAP"],
 )
 def _safe_metadata(
     T, L, OT, OL, T0, T1, L0, TC, NP, CAP, P: tl.constexpr, B: tl.constexpr
@@ -2281,7 +2541,6 @@ def safe_metadata(table, lengths, pages, capacity, page_size):
 
 @triton.jit(
     do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
-    do_not_specialize_on_alignment=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
 )
 def _clean_logits(
     X,
@@ -2325,7 +2584,6 @@ def clean_logits(values, lengths, table, pages, capacity, page_size):
 
 @triton.jit(
     do_not_specialize=["L0", "N", "CAP"],
-    do_not_specialize_on_alignment=["L0", "N", "CAP"],
 )
 def _dense_ranges(L, START, END, L0, N, CAP, B: tl.constexpr):
     row = tl.program_id(0) * B + tl.arange(0, B)
@@ -2409,7 +2667,6 @@ def candidate_scores(logits, candidates):
 
 @triton.jit(
     do_not_specialize=["X0", "X1", "L0", "S0", "W", "SW"],
-    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "SW"],
 )
 def _prepare_dense(
     X,
@@ -2435,7 +2692,6 @@ def _prepare_dense(
 
 @triton.jit(
     do_not_specialize=["X0", "X1", "L0", "S0", "W", "SW"],
-    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "SW"],
 )
 def _reduce_blocks(
     X,
@@ -2477,7 +2733,6 @@ def _reduce_blocks(
 
 @triton.jit(
     do_not_specialize=["C0", "C1", "L0", "N", "W", "X0", "X1", "SW"],
-    do_not_specialize_on_alignment=["C0", "C1", "L0", "N", "W", "X0", "X1", "SW"],
 )
 def _normalize_candidates(
     C,
@@ -2528,7 +2783,6 @@ def _normalize_candidates(
 
 @triton.jit(
     do_not_specialize=["X0", "X1", "L0", "S0", "W", "NC", "SW"],
-    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "NC", "SW"],
 )
 def _gather_candidates(
     X,
@@ -2556,8 +2810,7 @@ def _gather_candidates(
 
 
 @triton.jit(
-    do_not_specialize=["I0", "S0", "NC", "W"],
-    do_not_specialize_on_alignment=["I0", "S0", "NC", "W"],
+    do_not_specialize=["I0", "S0", "NC", "K", "W"],
 )
 def _finish_selection(
     I,
@@ -2568,7 +2821,7 @@ def _finish_selection(
     I0,
     S0,
     NC,
-    K: tl.constexpr,
+    K,
     W,
     BLOCK_SIZE: tl.constexpr,
     HAS_CANDIDATES: tl.constexpr,
@@ -2595,7 +2848,6 @@ def _finish_selection(
 
 @triton.jit(
     do_not_specialize=["COUNT", "WIDTH", "L0"],
-    do_not_specialize_on_alignment=["COUNT", "WIDTH", "L0"],
 )
 def _clamp_selection_ends(L, E, COUNT, WIDTH, L0, TILE: tl.constexpr):
     row = tl.program_id(0) * TILE + tl.arange(0, TILE)
@@ -2731,9 +2983,12 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
 def finish_selection(
     indices, scores, lengths, candidates, width, block_size, sort_positions
 ):
-    """Filter masked native selections and return logical IDs with -1 padding."""
+    """Filter masked native selections and return logical IDs with -1 padding.
+
+    Selection width is runtime data; only its power-of-two tile specializes.
+    """
     output = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
-    _finish_selection[(indices.shape[0],)](
+    kernel_launcher(_finish_selection, (indices.shape[0],))(
         indices,
         scores,
         lengths,
@@ -2753,7 +3008,10 @@ def finish_selection(
     return output
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["selected_stride", "candidate_stride", "K", "C"],
+    do_not_specialize_on_alignment=["Lengths", "BlockLengths"],
+)
 def _write_selection(
     Selected,
     Candidates,
@@ -2761,10 +3019,10 @@ def _write_selection(
     Lengths,
     Blocks,
     BlockLengths,
-    selected_stride: tl.constexpr,
-    candidate_stride: tl.constexpr,
-    K: tl.constexpr,
-    C: tl.constexpr,
+    selected_stride,
+    candidate_stride,
+    K,
+    C,
     ROW_BLOCK: tl.constexpr,
     CANDIDATE_BLOCK: tl.constexpr,
 ):
@@ -2787,11 +3045,15 @@ def _write_selection(
 
 
 def write_selection(selected, candidates, out):
-    """Copy logical selections and count valid IDs in caller-owned output tiles."""
+    """Copy logical selections and count valid IDs in caller-owned output tiles.
+
+    Selection and candidate widths are runtime data; only their power-of-two
+    tiles specialize.
+    """
     rows, lengths, blocks, block_lengths = out
     if selected.shape[0] == 0:
         return
-    _write_selection[(selected.shape[0],)](
+    kernel_launcher(_write_selection, (selected.shape[0],))(
         selected,
         candidates if candidates is not None else selected,
         rows,
@@ -2873,7 +3135,10 @@ def decode_rows(
         )
 
 
-@triton.jit(do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS"])
+@triton.jit(
+    do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS", "SWA_PAGES"],
+    do_not_specialize_on_alignment=["Positions", "Requests", "Write"],
+)
 def _decode_window_kernel(
     Positions,
     Requests,
@@ -2887,7 +3152,7 @@ def _decode_window_kernel(
     TABLE_ROWS,
     PS: tl.constexpr,
     RS: tl.constexpr,
-    SWA_PAGES: tl.constexpr,
+    SWA_PAGES,
 ):
     row = tl.program_id(0)
     pos = tl.load(Positions + row * PS).to(tl.int64)
@@ -2949,7 +3214,10 @@ def decode_window(
         )
 
 
-@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TR", "TC", "TS0", "TS1", "PAGES"],
+    do_not_specialize_on_alignment=["Table", "P", "Req"],
+)
 def _global_slots_kernel(
     Rows,
     P,
@@ -2967,7 +3235,7 @@ def _global_slots_kernel(
     TS0,
     TS1,
     RATIO: tl.constexpr,
-    PAGES: tl.constexpr,
+    PAGES,
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -3017,7 +3285,10 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     return out
 
 
-@triton.jit(do_not_specialize=["N", "TC", "TR", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TC", "TR", "TS0", "TS1"],
+    do_not_specialize_on_alignment=["Table", "P", "Req"],
+)
 def _selection_table_kernel(
     P,
     Req,
@@ -3060,7 +3331,9 @@ def selection_table(positions, requests, table, ratio):
     out = torch.empty((n, table.shape[1]), dtype=torch.int32, device=table.device)
     lengths = torch.empty(n, dtype=torch.int32, device=table.device)
     if n:
-        _selection_table_kernel[(n, max(1, triton.cdiv(table.shape[1], 256)))](
+        kernel_launcher(
+            _selection_table_kernel, (n, max(1, triton.cdiv(table.shape[1], 256)))
+        )(
             positions,
             requests,
             table,
@@ -3078,7 +3351,10 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TR", "TC", "TS0", "TS1", "PAGES"],
+    do_not_specialize_on_alignment=["Table"],
+)
 def _compressor_metadata(
     Positions,
     Requests,
@@ -3098,7 +3374,7 @@ def _compressor_metadata(
     TC,
     TS0,
     TS1,
-    PAGES: tl.constexpr,
+    PAGES,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -3276,17 +3552,6 @@ def block_maxima_with_lengths(
         "blocks",
         "workers",
     ],
-    do_not_specialize_on_alignment=[
-        "width",
-        "score_stride",
-        "length_stride",
-        "table_stride",
-        "page_stride",
-        "table_width",
-        "num_pages",
-        "blocks",
-        "workers",
-    ],
 )
 def _clean_block_maxima_kernel(
     Scores,
@@ -3388,7 +3653,7 @@ def clean_block_maxima(
     return cleaned, maxima, ends
 
 
-@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["N"])
+@triton.jit(do_not_specialize=["N"])
 def _pack_index_inputs(
     X,
     W,
@@ -3529,12 +3794,6 @@ def _copy_attention_heads(dst, src, sink, sink_out):
         "Lengths",
         "Blocks",
         "BlockLengths",
-        "TS0",
-        "TS1",
-        "LS",
-        "TC",
-        "PAGES",
-        "C",
     ],
 )
 def _index_select_all(
@@ -3555,18 +3814,19 @@ def _index_select_all(
     ROW_BLOCK: tl.constexpr,
     CANDIDATE_BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     visible = tl.load(Visible + row * LS)
     ids = tl.arange(0, ROW_BLOCK)
     page = tl.load(
         Table + row * TS0 + (ids // 64) * TS1, (ids < K) & (ids // 64 < TC), other=-1
     )
     valid = (ids < K) & (ids < visible) & (page > 0) & (page < PAGES)
-    selected = tl.sort(tl.where(valid, ids, 2147483647))
-    tl.store(
-        Rows + row * K + ids, tl.where(selected == 2147483647, -1, selected), ids < K
-    )
-    tl.store(Lengths + row, tl.sum(valid.to(tl.int32)))
+    # Logical IDs are already ordered; compact holes without sorting them.
+    prefix = tl.cumsum(valid.to(tl.int32))
+    length = tl.sum(valid.to(tl.int32))
+    tl.store(Rows + row * K + prefix - 1, ids, valid)
+    tl.store(Rows + row * K + ids, -1, (ids < K) & (ids >= length))
+    tl.store(Lengths + row, length)
     count = tl.full((), 0, tl.int32)
     if C:
         candidate_ids = tl.arange(0, CANDIDATE_BLOCK)
@@ -3590,6 +3850,10 @@ def _index_select_all(
             tl.where(candidate_selected == 2147483647, -1, candidate_selected),
             candidate_ids < C,
         )
+        # Visible rows fit K; the larger candidate destination only needs padding.
+        for start in range(CANDIDATE_BLOCK, C, 1024):
+            padding = start + tl.arange(0, 1024)
+            tl.store(Blocks + row * C + padding, -1, padding < C)
         count = tl.sum(candidate_valid.to(tl.int32))
     tl.store(BlockLengths + row, count)
 
@@ -3635,7 +3899,7 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
             out[2].shape[1],
             candidate_block_size,
             triton.next_power_of_2(out[0].shape[1]),
-            triton.next_power_of_2(max(1, out[2].shape[1])),
+            triton.next_power_of_2(triton.cdiv(out[0].shape[1], candidate_block_size)),
             num_warps=4,
         )
     return out
@@ -3710,7 +3974,9 @@ def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr):
     return idx, key, valid
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+)
 def _index_block_select_kernel(
     logits,
     visible,
@@ -3721,11 +3987,14 @@ def _index_block_select_kernel(
     stride_block_out,
     k,
     cap,
+    visible_capacity,
     BLOCK: tl.constexpr,
 ):
     query = tl.program_id(0)
     row = logits + query.to(tl.int64) * stride_logits
-    seen = tl.load(visible + query).to(tl.int32)
+    seen = tl.minimum(
+        tl.maximum(tl.load(visible + query).to(tl.int64), 0), visible_capacity
+    ).to(tl.int32)
     latest = tl.where(seen > 0, (seen - 1) // 8, -1)
     # Logits past the visible rows are -inf, so only visible blocks are read.
     n = tl.minimum(width // 8, (tl.maximum(seen, 0) + 7) // 8)
@@ -3797,20 +4066,31 @@ def _radix_digits(hist, k, PASSES: tl.constexpr):
 
 
 @triton.jit
-def _visible_blocks(visible, query, n_blocks):
-    seen = tl.load(visible + query).to(tl.int32)
+def _visible_blocks(visible, query, n_blocks, visible_capacity):
+    seen = tl.minimum(
+        tl.maximum(tl.load(visible + query).to(tl.int64), 0), visible_capacity
+    ).to(tl.int32)
     return seen, tl.minimum(n_blocks, (tl.maximum(seen, 0) + 7) // 8)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+)
 def _block_keys_pass(
-    logits, visible, keys, hist, n_blocks, stride_logits, BLOCK: tl.constexpr
+    logits,
+    visible,
+    keys,
+    hist,
+    n_blocks,
+    stride_logits,
+    visible_capacity,
+    BLOCK: tl.constexpr,
 ):
     # Long rows, step 1: one key per visible block (0 marks no finite score),
     # and the histogram of the keys' top byte.
     query = tl.program_id(0)
     start = tl.program_id(1) * BLOCK
-    seen, n = _visible_blocks(visible, query, n_blocks)
+    seen, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     if start >= n:
         return
     latest = tl.where(seen > 0, (seen - 1) // 8, -1)
@@ -3837,15 +4117,24 @@ def _load_block_keys(keys, query, start, n, n_blocks, BLOCK: tl.constexpr):
     return idx, key, in_range & (key != 0)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+)
 def _block_hist_pass(
-    keys, visible, hist, n_blocks, k, PASS: tl.constexpr, BLOCK: tl.constexpr
+    keys,
+    visible,
+    hist,
+    n_blocks,
+    k,
+    visible_capacity,
+    PASS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     # Long rows, steps 2-4: histogram of byte PASS among the keys that match
     # the digits chosen so far.
     query = tl.program_id(0)
     start = tl.program_id(1) * BLOCK
-    _, n = _visible_blocks(visible, query, n_blocks)
+    _, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     if start >= n:
         return
     prefix, high, _, _ = _radix_digits(hist + query * 1024, k, PASS)
@@ -3862,14 +4151,24 @@ def _block_hist_pass(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+)
 def _block_count_pass(
-    keys, visible, hist, counts, n_blocks, k, chunks, BLOCK: tl.constexpr
+    keys,
+    visible,
+    hist,
+    counts,
+    n_blocks,
+    k,
+    chunks,
+    visible_capacity,
+    BLOCK: tl.constexpr,
 ):
     # Long rows, step 5: per chunk, keys above the threshold, ties, and valid keys.
     query = tl.program_id(0)
     chunk = tl.program_id(1)
-    _, n = _visible_blocks(visible, query, n_blocks)
+    _, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     if chunk * BLOCK >= n:
         return
     prefix, _, _, _ = _radix_digits(hist + query * 1024, k, 4)
@@ -3880,7 +4179,9 @@ def _block_count_pass(
     tl.store(out + 2, tl.sum(valid.to(tl.int32)))
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+)
 def _block_emit_pass(
     keys,
     visible,
@@ -3893,6 +4194,7 @@ def _block_emit_pass(
     k,
     cap,
     chunks,
+    visible_capacity,
     CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -3900,7 +4202,7 @@ def _block_emit_pass(
     # ties of earlier chunks taken from their counts.
     query = tl.program_id(0)
     chunk = tl.program_id(1)
-    _, n = _visible_blocks(visible, query, n_blocks)
+    _, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     prefix, _, remaining, total = _radix_digits(hist + query * 1024, k, 4)
     take_all = total <= k
     others = tl.arange(0, CHUNKS)
@@ -3937,13 +4239,17 @@ def _block_emit_pass(
     tl.store(out + position, idx, mask=take)
 
 
-def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
+def index_block_select(
+    logits, visible, candidate_topk, block_out, block_lens, *, visible_capacity
+):
     """Select each query's best 8-row blocks from scored logits, position-sorted.
 
     Args:
         logits: FP32 [Q, width] full-selection scores with unit inner stride;
             columns at or past ``visible[q]`` must be -inf and are not read.
-        visible: Int32/int64 [Q] visible row counts.
+        visible: Contiguous int32/int64 [Q] raw visible row counts.
+        visible_capacity: Page-table row capacity used to clamp lengths before
+            narrowing to int32. This may exceed compact Reindex logits width.
         candidate_topk: Number of blocks to keep.
         block_out: Int32 [Q, cap] destination with unit inner stride. Row q
             receives the ids of its ``min(candidate_topk, width // 8)`` best
@@ -3958,6 +4264,8 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
     queries, width = logits.shape
     if not queries:
         return
+    if queries > 1 and visible.stride(0) != 1:
+        raise ValueError("block select requires contiguous visible row counts")
     k = min(int(candidate_topk), width // 8)
     if k < 1:
         block_out.fill_(-1)
@@ -3978,14 +4286,29 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
             (queries, chunks, 3), dtype=torch.int32, device=logits.device
         )
         _block_keys_pass[grid](
-            logits, visible, keys, hist, n_blocks, logits.stride(0), BLOCK=chunk
+            logits,
+            visible,
+            keys,
+            hist,
+            n_blocks,
+            logits.stride(0),
+            visible_capacity,
+            BLOCK=chunk,
         )
         for p in range(1, 4):
             _block_hist_pass[grid](
-                keys, visible, hist, n_blocks, k, PASS=p, BLOCK=chunk
+                keys, visible, hist, n_blocks, k, visible_capacity, PASS=p, BLOCK=chunk
             )
         _block_count_pass[grid](
-            keys, visible, hist, counts, n_blocks, k, chunks, BLOCK=chunk
+            keys,
+            visible,
+            hist,
+            counts,
+            n_blocks,
+            k,
+            chunks,
+            visible_capacity,
+            BLOCK=chunk,
         )
         _block_emit_pass[grid](
             keys,
@@ -3999,6 +4322,7 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
             k,
             block_out.shape[1],
             chunks,
+            visible_capacity,
             CHUNKS=triton.next_power_of_2(chunks),
             BLOCK=chunk,
         )
@@ -4013,6 +4337,7 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
         block_out.stride(0),
         k,
         block_out.shape[1],
+        visible_capacity,
         BLOCK=1024,
         num_warps=8,
     )
@@ -4042,3 +4367,18 @@ def compact_slots(slots, lengths):
             BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
         )
     return out, counts
+
+
+# Candidate budgets vary with history and are bounded by 2048 in _index_topk_outputs.
+_SELECTION_BLOCKS = tuple(1 << bit for bit in range(12))
+register_triton_warmup(
+    _finish_selection,
+    variants=lambda args: () if args["POSITION_SORT"] else ({"B": _SELECTION_BLOCKS},),
+)
+register_triton_warmup(
+    _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
+)
+register_triton_warmup(
+    _selection_table_kernel,
+    variants=lambda args: ({"RATIO": tuple(sorted({1, args["RATIO"]}))},),
+)

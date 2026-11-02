@@ -282,7 +282,7 @@ def backend_factory(cuda_env, gpu_pool, cache_dtype):
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
-    def make(*, q_len: int):
+    def make(*, q_len: int, min_kv_split: int | None = None):
         # The CuteDSL leaf is SM100 (Blackwell) only; everywhere else the
         # generic MLA leaf serves the same interface, so the parity claims
         # under test are identical.
@@ -315,13 +315,13 @@ def backend_factory(cuda_env, gpu_pool, cache_dtype):
             qk_rope_head_dim=_QK_ROPE_DIM,
             v_head_dim=128,
             scaling=192**-0.5,
+            min_kv_split=min_kv_split,
             kv_cache_dim=_LATENT_DIM,
         )
         config = AttnConfig(
             device="cuda",
             dtype=torch.bfloat16,
             kv_cache_dtype=cache_dtype,
-            prefix_granularity=_KERNEL_PAGE,
             kernel_page_size=_KERNEL_PAGE,
             context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,
@@ -366,8 +366,9 @@ def _refresh_decode(backend, page_table, seq_lens_cpu):
 
 @requires_cuda
 @pytest.mark.parametrize("q_len", [1, 4])
+@pytest.mark.parametrize("min_kv_split", [None, 8])
 def test_decode_grouped_matches_single_table_and_reference(
-    backend_factory, gpu_pool, cache_dtype, q_len
+    backend_factory, gpu_pool, cache_dtype, q_len, min_kv_split
 ) -> None:
     pool = gpu_pool
     page_size = pool.arena.prefix_granularity
@@ -377,7 +378,7 @@ def test_decode_grouped_matches_single_table_and_reference(
     seq_lens_cpu = [page_size + 42, page_size]
     _write_history(pool, layer, logical_rows, seq_lens_cpu, seed=1)
 
-    grouped_backend = backend_factory(q_len=q_len)
+    grouped_backend = backend_factory(q_len=q_len, min_kv_split=min_kv_split)
     _refresh_decode(
         grouped_backend,
         _expand_via_stacks(grouped_backend, pool, logical_rows),
@@ -393,7 +394,7 @@ def test_decode_grouped_matches_single_table_and_reference(
     out_grouped = grouped_backend.forward_decode(q, None, None, layer, None, pool, bs)
 
     # Single-table arm: byte-equivalent hand-built kernel-page table.
-    single_table_backend = backend_factory(q_len=q_len)
+    single_table_backend = backend_factory(q_len=q_len, min_kv_split=min_kv_split)
     page_table = _kernel_page_table(
         logical_rows,
         page_size,

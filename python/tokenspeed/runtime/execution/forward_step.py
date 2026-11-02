@@ -23,7 +23,7 @@ from __future__ import annotations
 import bisect
 import gc
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -111,17 +111,23 @@ def freeze_gc(enable_cudagraph_gc: bool):
 def get_batch_sizes_to_capture(config: ModelExecutorConfig):
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+    effective_max = min(config.max_cudagraph_capture_size, max_bs)
 
     if capture_bs is None:
         if config.disable_cuda_graph_padding:
             capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+            stride = 32
         else:
             capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            stride = 16
+        # The default ladder ends at 160; carry it up to a larger capture cap.
+        if effective_max > capture_bs[-1]:
+            capture_bs += list(range(capture_bs[-1] + stride, effective_max, stride))
+            capture_bs.append(effective_max)
 
     if max(capture_bs) > max_bs:
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
-    effective_max = min(config.max_cudagraph_capture_size, max_bs)
     # Ascending and unique: padding bisects the ladder for a batch's graph.
     return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
@@ -163,16 +169,46 @@ class DeepEPCudaGraphRunnerAdapter:
         cls.set_dispatch_mode_as_low_latency()
 
     def replay(self):
-        """Call before every ``graph.replay()``; restores dispatch mode
-        and resets RDMA workspace so stale sync state doesn't corrupt
-        the combine kernel across replays."""
+        """Call before every ``graph.replay()``; restores the low-latency
+        dispatch mode.
+
+        The low-latency workspace is cleaned only on a real normal ->
+        low-latency transition (``set_dispatch_mode_as_low_latency``): a
+        normal-mode forward reuses the RDMA buffer the low-latency kernels
+        signal through. Between consecutive low-latency forwards each
+        dispatch / combine already clears the other half of its double
+        buffer for the next call, so cleaning before every replay only adds
+        a full-workspace kernel to every decode step.
+        """
         if not self._active:
             return
         cls = self._get_buffer_cls()
         if cls is None or cls._buffer is None:
             return
         cls.set_dispatch_mode_as_low_latency()
-        cls.clean_buffer()
+
+
+def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tuple:
+    """A captured decode graph's outputs, sliced to the live batch.
+
+    ``outputs`` is what the captured forward returned: ``(output_tokens,
+    output_lengths, output_logprobs, output_cumulative_probs,
+    forward_logprobs)`` for the padded batch. The sampled-token columns keep
+    ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
+    never gathers prompt logprobs or top-k alternatives, so its last output is
+    None.
+    """
+    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
+    if forward_logprobs is not None:
+        raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
+    rows = bs * max_tokens_per_req
+    return (
+        tokens[:rows],
+        lengths[:bs],
+        None if logprobs is None else logprobs[:rows],
+        None if cumulative_probs is None else cumulative_probs[:rows],
+        None,
+    )
 
 
 class ForwardStepRunner:
@@ -312,6 +348,8 @@ class ForwardStepRunner:
 
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+        # The padded batch the last call replayed a decode graph at (None: eager).
+        self.last_graph_bs: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
@@ -588,7 +626,7 @@ class ForwardStepRunner:
 
         # Bind whichever grammar buffer is active so the captured sampler
         # records the apply_vocab_mask call. At replay, runtime fills the
-        # bound buffer in place (hostfunc for capturable, sync H2D for
+        # bound buffer in place (host node for capturable, sync H2D for
         # eager) — the captured graph reads from the same memory.
         bind_grammar_mask_buf(
             sampling_info,
@@ -600,8 +638,8 @@ class ForwardStepRunner:
         )
 
         def run_once():
-            # Dummy add_batch keeps the grammar gate 1:1 with replays: the
-            # hostfunc pops one decision per forward.
+            # Dummy add_batch keeps grammar batches 1:1 with replays: the
+            # host node pops one batch per forward.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs,
@@ -670,16 +708,22 @@ class ForwardStepRunner:
                 stream=self.stream,
                 tag="cuda_graph",
             )
-        # The kernel state captured launches need lives as long as the graph.
-        with observer, capture_session(graph), graph_capture:
-            out = run_once()
+        with observer:
+            # The kernel state captured launches need lives as long as the graph.
+            with capture_session(graph), graph_capture:
+                out = run_once()
+            # The drafter's own graphs at this batch share the pool and the measure.
+            if self.drafter is not None and variant == CUDA_GRAPH_VARIANT_DEFAULT:
+                self.drafter.capture_round_graphs(
+                    bs, stream=self.stream, pool=graph.pool()
+                )
 
         self.device_module.synchronize()
         dist.barrier()
         _is_capture_mode = False
         _is_cuda_graph_phase = False
 
-        # Drop the capture's unconsumed gate decision; the first replay would pop it.
+        # Drop the capture's unconsumed batch; the first replay would pop it.
         if self.capturable_grammar is not None:
             self.capturable_grammar.reset_state()
 
@@ -842,6 +886,7 @@ class ForwardStepRunner:
         forward_mode: ForwardMode,
         *,
         use_graph: bool,
+        settle: Callable[[], None],
         block_tables: dict | None = None,
         **cache_kwargs,
     ):
@@ -867,6 +912,8 @@ class ForwardStepRunner:
             for_graph_replay=use_graph,
             **cache_kwargs,
         )
+        # A pending draft round drafts over the draft backend's metadata.
+        settle()
         if self.draft_attn_backend is not None:
             # Seed the drafter-owned buffer for the round: the DFLASH drafter
             # reads it directly, and the refresh below snapshots it into the
@@ -1036,6 +1083,8 @@ class ForwardStepRunner:
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         block_tables_cpu: dict,
+        settle: Callable[[], None],
+        extend_state_checkpoint_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
     ):
@@ -1056,11 +1105,18 @@ class ForwardStepRunner:
         backends that plan an extend from the tables without waiting on the
         device.
 
+        ``settle`` finishes what the inputs still wait on (a pending draft
+        round): a decode calls it once the target's decode metadata, which
+        that round does not read, is prepared; any other forward calls it
+        first.
+
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        forward_logprobs)``; the last is an extend/mixed forward's
-        ``ForwardLogprobs`` (the prompt-logprob gather of
-        ``ctx.input_logprob_rows`` and the top-k alternatives
-        ``ctx.sampled_top_k`` asks for) and None otherwise.
+        output_cumulative_probs, forward_logprobs)``; the last is an
+        extend/mixed forward's ``ForwardLogprobs`` (the prompt-logprob gather
+        of ``ctx.input_logprob_rows`` and the top-k alternatives
+        ``ctx.sampled_top_k`` asks for) and None otherwise. The sampled
+        tokens' logprobs and cumulative probabilities (None when not enabled)
+        share the tokens' rows on both paths.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1119,9 +1175,11 @@ class ForwardStepRunner:
                 seq_lens,
                 forward_mode=ctx.forward_mode,
                 use_graph=use_graph,
+                settle=settle,
                 block_tables=block_tables,
             )
         else:
+            settle()
             # Extend/mixed (and the never-in-practice eager idle): dynamic
             # shapes, fresh construction.
             self._init_forward_metadata(
@@ -1137,6 +1195,7 @@ class ForwardStepRunner:
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_replay_lens_cpu=extend_replay_lens_cpu,
                 extend_prompt_lens_cpu=extend_prompt_lens_cpu,
+                extend_state_checkpoint_lens_cpu=extend_state_checkpoint_lens_cpu,
                 query_shard=ctx.query_shard,
                 positions=positions,
                 global_num_tokens=ctx.global_num_tokens,
@@ -1158,11 +1217,13 @@ class ForwardStepRunner:
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
-                graph.update(
-                    cpu_update_input=[
-                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                    ]
-                )
+                # Update callbacks write the inference tensors created at capture.
+                with torch.inference_mode():
+                    graph.update(
+                        cpu_update_input=[
+                            {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                        ]
+                    )
             if self._expert_load_rows is not None:
                 # Every rank replays the same padded batch; the live rows are
                 # the DP-gathered live counts (this rank's own without DP).
@@ -1175,29 +1236,18 @@ class ForwardStepRunner:
                         else [ctx.input_num_tokens] * self.world_size
                     ),
                 )
-            with nvtx_range("graph_replay", color="red"):
-                graph.replay()
+            with (
+                torch.inference_mode() if self.device == "npu" else nullcontext()
+            ), nvtx_range("graph_replay", color="red"):
+                if self.drafter is not None:
+                    self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
+                else:
+                    graph.replay()
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # A decode graph never gathers prompt logprobs or top-k
-            # alternatives (its captured fourth output is None).
-            (
-                output_tokens,
-                output_lengths,
-                output_logprobs,
-                _forward_logprobs,
-            ) = self.output_buffers[graph_key]
-
-            result = (
-                output_tokens[: bs * self.max_tokens_per_req],
-                output_lengths[:bs],
-                (
-                    output_logprobs[: bs * self.max_tokens_per_req]
-                    if output_logprobs is not None
-                    else None
-                ),
-                None,
+            result = live_graph_outputs(
+                self.output_buffers[graph_key], bs, self.max_tokens_per_req
             )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
@@ -1206,17 +1256,16 @@ class ForwardStepRunner:
             ctx.bs = bs
             ctx.output_layout = live_output_layout
 
-        if self.drafter is not None and (
-            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
-        ):
-            self.attn_backend.commit_speculative_state_after_verify(
+        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
+            self.attn_backend.commit_state_after_acceptance(
                 result[1],
                 num_extends=ctx.num_extends,
                 accepted_path=(
                     self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
-                    if self.config.spec_topk > 1 and ctx.num_extends == 0
+                    if self.config.spec_draft_tree and ctx.num_extends == 0
                     else None
                 ),
             )
 
+        self.last_graph_bs = padded_bs if use_graph else None
         return result

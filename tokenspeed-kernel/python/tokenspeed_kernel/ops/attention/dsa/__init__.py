@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Callable
 
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -39,6 +41,23 @@ AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
+
+
+@dataclass(frozen=True)
+class DSAResources:
+    """Provider-owned communication window, buffer views and matching release."""
+
+    window: object
+    outputs: dict
+    tables: dict
+    release: Callable
+
+
+def prepare_dsa_resources(*, group, rank):
+    """Select and allocate DSA communication resources outside graph capture."""
+    return select_kernel("attention", "dsa_prepare_resources", format_signature())(
+        group=group, rank=rank
+    )
 
 
 def _attention_format_signature(**roles: torch.Tensor):
@@ -1393,6 +1412,8 @@ __all__ = [
     "CANDIDATE_LENS_CPU_FEATURE",
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
     "SLOT_ORDERS",
+    "DSAResources",
+    "prepare_dsa_resources",
     "dsa_decode",
     "dsa_interleave_rope",
     "dsa_prefill",

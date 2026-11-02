@@ -127,32 +127,61 @@ def _copy_geometry_slice(
                 + host_child * host_block_bytes
                 + host_field_offset
             )
-            byte_offsets = chunk_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            mask = byte_offsets < payload_bytes
-            device_ptr = tl.cast(
-                device_address + device_offset,
-                tl.pointer_type(tl.uint8),
-            )
-            host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
-            if DIRECTION == 0:
-                values = tl.load(
-                    device_ptr + byte_offsets,
-                    mask=mask,
-                    cache_modifier=".cg",
+            device_base = device_address + device_offset
+            host_base = host_address + host_offset
+            if ((device_base | host_base | payload_bytes) & 15) == 0:
+                # All addresses and the masked final group are 16-byte aligned.
+                # Word accesses avoid one memory instruction for every byte.
+                word_offsets = chunk_index * (BLOCK_SIZE // 4) + tl.arange(
+                    0, BLOCK_SIZE // 4
                 )
-                tl.store(
-                    host_ptr + byte_offsets,
-                    values,
-                    mask=mask,
-                    cache_modifier=".cs",
+                word_count = tl.multiple_of(payload_bytes // 4, 4)
+                word_mask = word_offsets < word_count
+                device_words = tl.cast(
+                    tl.multiple_of(device_base, 16), tl.pointer_type(tl.uint32)
                 )
+                host_words = tl.cast(
+                    tl.multiple_of(host_base, 16), tl.pointer_type(tl.uint32)
+                )
+                if DIRECTION == 0:
+                    word_values = tl.load(
+                        device_words + word_offsets,
+                        mask=word_mask,
+                        cache_modifier=".cg",
+                    )
+                    tl.store(
+                        host_words + word_offsets,
+                        word_values,
+                        mask=word_mask,
+                        cache_modifier=".cs",
+                    )
+                else:
+                    word_values = tl.load(
+                        host_words + word_offsets, mask=word_mask, cache_modifier=".cg"
+                    )
+                    tl.store(device_words + word_offsets, word_values, mask=word_mask)
             else:
-                values = tl.load(
-                    host_ptr + byte_offsets,
-                    mask=mask,
-                    cache_modifier=".cg",
-                )
-                tl.store(device_ptr + byte_offsets, values, mask=mask)
+                byte_offsets = chunk_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                byte_mask = byte_offsets < payload_bytes
+                device_bytes = tl.cast(device_base, tl.pointer_type(tl.uint8))
+                host_bytes = tl.cast(host_base, tl.pointer_type(tl.uint8))
+                if DIRECTION == 0:
+                    byte_values = tl.load(
+                        device_bytes + byte_offsets,
+                        mask=byte_mask,
+                        cache_modifier=".cg",
+                    )
+                    tl.store(
+                        host_bytes + byte_offsets,
+                        byte_values,
+                        mask=byte_mask,
+                        cache_modifier=".cs",
+                    )
+                else:
+                    byte_values = tl.load(
+                        host_bytes + byte_offsets, mask=byte_mask, cache_modifier=".cg"
+                    )
+                    tl.store(device_bytes + byte_offsets, byte_values, mask=byte_mask)
 
 
 @triton.jit
@@ -780,7 +809,14 @@ def copy_state_rows(
         )
 
 
-@triton.jit(do_not_specialize=["num_rows", "state_width"])
+@triton.jit(
+    do_not_specialize=["num_rows", "state_width"],
+    **(
+        {"do_not_specialize_on_alignment": ["blocks"]}
+        if current_platform().is_npu
+        else {}
+    ),
+)
 def _store_state_rows_kernel(
     states,
     slab,
@@ -857,7 +893,7 @@ def store_state_rows(
         blocks.numel() > 1 and blocks.stride(0) != 1
     ):
         raise ValueError("blocks must be a unit-stride int32/int64 vector")
-    if not states.is_cuda:
+    if states.device.type not in ("cuda", "npu"):
         live = blocks >= 0
         slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
         return
@@ -1263,7 +1299,6 @@ def _set_mla_kv_buffer_kernel(
 
 @triton.jit(
     do_not_specialize=["n_loc"],
-    do_not_specialize_on_alignment=["n_loc"],
 )
 def _set_mla_kv_buffer_per_loc_kernel(
     kv_buffer_ptr,

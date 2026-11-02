@@ -323,6 +323,7 @@ def test_v1_native_prediction_tile_boundary() -> None:
     "flashinfer quantize_mxfp8 JIT also needs an nvcc whose version matches the "
     "CUDA runtime headers (else CCCL's CTK compat guard errors at build).",
     strict=False,
+    run=False,
 )
 def test_v1_native_prediction_mxfp8(window_left) -> None:
     """MXFP8 blockscaled v1 with native prediction matches the bf16 v1 run

@@ -993,24 +993,25 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     assert not torch.any(actual[~active])
 
 
-def test_compressor_pool_token_count_does_not_recompile(device):
-    """Every prefill brings a new token count; the kernel must not key its
-    compile cache on the row count."""
-    tail = torch.randn(5, 2, 2, 512, device=device)
+def test_compressor_pool_token_count_and_capacity_do_not_recompile(device):
+    """Token counts and tail capacities must not key the compile cache."""
 
-    def run(count):
+    def run(count, pages):
+        tail = torch.empty(pages, 2, 2, 512, device=device)
+        tail[-1].normal_()
         projection = torch.randn(count, 1024, device=device)
         content, scores = projection[:, :512], projection[:, 512:]
         previous = torch.arange(count, device=device) - 1
-        slots = torch.full((count,), 2, device=device, dtype=torch.int32)
+        slots = torch.full((count,), pages * 2 - 1, device=device, dtype=torch.int32)
         active = torch.arange(count, device=device) % 2 == 1
+        active[0] = True
         pooled = dsv41.compressor_pool(
             content, scores, previous, tail, slots, active, None, None, 0.0
         )
         # Row 0 pairs with the tail slot; every later active row pairs with
         # its predecessor in this forward.
-        prior_content = torch.cat([tail[1, 0, 0][None], content[:-1]])
-        prior_scores = torch.cat([tail[1, 0, 1][None], scores[:-1]])
+        prior_content = torch.cat([tail[-1, 1, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[-1, 1, 1][None], scores[:-1]])
         maximum = torch.maximum(prior_scores, scores)
         old_exp = torch.exp(prior_scores - maximum)
         new_exp = torch.exp(scores - maximum)
@@ -1018,13 +1019,20 @@ def test_compressor_pool_token_count_does_not_recompile(device):
         expected[~active] = 0
         torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-6)
 
-    # Warm both integer-specialization classes (16-divisible and not); Triton
-    # still keys on those two properties for runtime scalars.
-    run(32)
-    run(33)
+    # Warm at a fixed capacity, then vary both token count and capacity.
+    run(32, 5)
+    run(33, 5)
     with assert_no_triton_compile(implementation._compressor_pool):
-        for count in (48, 97, 130, 1483, 4096):
-            run(count)
+        for count, pages in ((48, 3), (97, 16), (130, 17), (1483, 32), (4096, 33)):
+            run(count, pages)
+
+    # The last page starts at 2**31 FP32 elements, beyond int32 offsets.
+    pages = (1 << 20) + 1
+    required_bytes = pages * 2 * 2 * 512 * torch.float32.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires 8 GiB of free device memory")
+    # AMD may compile a separate variant for buffers larger than 2 GiB.
+    run(32, pages)
 
 
 def _native_available():
@@ -1645,3 +1653,89 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
     with assert_no_triton_compile(implementation._dspark_anchors_kernel):
         run(0)
         run(2)
+
+
+@pytest.mark.parametrize(
+    "heads,rows",
+    [(32, rows) for rows in (0, 6, 12, 24, 48, 96, 128, 129, 192, 257)]
+    + [(heads, 257) for heads in (4, 8, 16)],
+)
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_indexer_rope_weights_match_separate_operations(
+    device, heads, rows, strided, dtype
+):
+    torch.manual_seed(731)
+    dim = 128
+    query_storage = torch.randn(rows, heads * 2, dim, dtype=dtype, device=device)
+    weight_storage = torch.randn(rows, heads * 2, dtype=dtype, device=device)
+    queries = (
+        query_storage[:, ::2] if strided else query_storage[:, :heads].contiguous()
+    )
+    weights = (
+        weight_storage[:, ::2] if strided else weight_storage[:, :heads].contiguous()
+    )
+    original_q, original_w = queries.clone(), weights.clone()
+    query_gaps, weight_gaps = (
+        query_storage[:, 1::2].clone(),
+        weight_storage[:, 1::2].clone(),
+    )
+    angles = torch.randn(512, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    positions = torch.arange(rows, device=device, dtype=torch.int64) - 1
+    scale = dim**-0.5 * heads**-0.5
+    expected_q = dsv41.rope_inplace(original_q.clone(), positions, table, "triton")
+    expected_w = original_w * scale
+    q, w = dsv41.rope_weights_inplace(
+        queries, positions, table, weights, scale, "triton"
+    )
+    assert q is queries and w is weights
+    torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(w, expected_w, rtol=0, atol=0)
+    if strided:
+        torch.testing.assert_close(query_storage[:, 1::2], query_gaps, rtol=0, atol=0)
+        torch.testing.assert_close(weight_storage[:, 1::2], weight_gaps, rtol=0, atol=0)
+    # Changing batch rows must reuse the compiled scalar parameters.
+    if rows >= 12:
+        dsv41.rope_weights_inplace(
+            queries[:6], positions[:6], table, weights[:6], scale, "triton"
+        )
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
+            dsv41.rope_weights_inplace(
+                queries[:12], positions[:12], table, weights[:12], scale, "triton"
+            )
+
+    if heads == 32 and rows >= 192:
+        # Both grid sizes use separate scaling and share the ordinary RoPE JIT.
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
+            dsv41.rope_weights_inplace(
+                queries[:129], positions[:129], table, weights[:129], scale, "triton"
+            )
+
+
+@pytest.mark.parametrize("rows", [128, 129])
+def test_indexer_rope_weight_dispatch_graph_replay(device, rows):
+    torch.manual_seed(4096)
+    queries = torch.randn(rows, 32, 128, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(rows, 32, dtype=torch.bfloat16, device=device)
+    initial_q, initial_w = queries.clone(), weights.clone()
+    positions = torch.zeros(rows, dtype=torch.int64, device=device)
+    angles = torch.randn(64, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    scale = 128**-0.5 * 32**-0.5
+    dsv41.rope_weights_inplace(queries, positions, table, weights, scale, "triton")
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_q, actual_w = dsv41.rope_weights_inplace(
+            queries, positions, table, weights, scale, "triton"
+        )
+    for position in (-1, 0, 17):
+        queries.copy_(initial_q)
+        weights.copy_(initial_w)
+        positions.fill_(position)
+        expected_q = dsv41.rope_inplace(initial_q.clone(), positions, table, "triton")
+        graph.replay()
+        assert actual_q is queries and actual_w is weights
+        torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(actual_w, initial_w * scale, rtol=0, atol=0)

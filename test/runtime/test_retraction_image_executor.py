@@ -64,20 +64,13 @@ from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
     HostTier,
-    PrefetchOp,
-    PrefetchRow,
     RestoreOp,
     SnapshotOp,
 )
 from tokenspeed.runtime.cache.transfer.ownership import (  # noqa: E402
     BlockOwnerTranslation,
 )
-from tokenspeed.runtime.engine import (  # noqa: E402
-    scheduler_utils as scheduler_utils_module,
-)
-from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
-    cache_event_from_payload,
     cache_event_to_payload,
 )
 from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
@@ -262,11 +255,28 @@ def _build(
     lanes = {name: Mock(name=f"{name}_lane") for name in lane_names}
     storages = iter(
         [
-            SimpleNamespace(host_buffer="l2-host"),
-            SimpleNamespace(host_buffer="pool-host"),
+            SimpleNamespace(
+                host_buffer="l2-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            ),
+            SimpleNamespace(
+                host_buffer="pool-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            ),
         ]
         if l2_tier
-        else [SimpleNamespace(host_buffer="pool-host")]
+        else [
+            SimpleNamespace(
+                host_buffer="pool-host",
+                group_packing=tuple(
+                    group.cache_blocks_per_lcm_block for group in layout.groups
+                ),
+            )
+        ]
     )
     geometries = iter(
         ["l2-geometry", "pool-geometry"] if l2_tier else ["pool-geometry"]
@@ -277,7 +287,6 @@ def _build(
         patch.object(
             executor_module, "compute_host_lcm_block_bytes", return_value=1_000_000
         ),
-        patch.object(executor_module, "check_host_memory"),
         patch.object(
             executor_module,
             "HostCacheStorage",
@@ -297,6 +306,11 @@ def _build(
         ),
         patch.object(
             executor_module, "new_cache_stream", side_effect=[write_stream, load_stream]
+        ),
+        patch.object(
+            executor_module.device_module,
+            "stream",
+            side_effect=lambda _stream: nullcontext(),
         ),
         patch.object(
             executor_module, "HostTransferLane", side_effect=list(lanes.values())
@@ -349,9 +363,7 @@ def test_op_dataclasses_carry_the_wire_fields():
     for kind, op_id in (("SnapshotDoneEvent", 3), ("RestoreDoneEvent", 4)):
         event = getattr(executor_module.Cache, kind)()
         event.op_id = op_id
-        payload = cache_event_to_payload(event)
-        assert payload == {"kind": kind, "op_id": op_id}
-        assert _acks([cache_event_from_payload(payload)]) == [(kind, op_id)]
+        assert cache_event_to_payload(event) == {"kind": kind, "op_id": op_id}
 
 
 def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
@@ -399,57 +411,6 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
     assert executor.host_storage is None and executor._load_trackers == []
 
 
-def test_count_plan_ops_counts_each_request_of_a_snapshot_or_restore_batch():
-    hooks = CacheOpHooks(
-        SimpleNamespace(),
-        speculative_algorithm=None,
-        attn_tp_rank=0,
-        attn_tp_size=1,
-        attn_tp_cpu_group=None,
-        pp_size=1,
-        pp_cpu_group=None,
-        global_rank=0,
-    )
-
-    class _SnapshotBatch:
-        op_ids = [1, 2]
-        request_ids = ["a", "b"]
-        request_pool_indices = [1, 2]
-        snapshot_slots = [0, 1]
-        group_ids = [[0], []]
-        src_pages = [[1], []]
-        dst_pages = [[1], []]
-
-    class _RestoreBatch:
-        op_ids = [3]
-        request_ids = ["c"]
-        request_pool_indices = [4]
-        snapshot_slots = [2]
-        group_ids = [[0]]
-        src_pages = [[1]]
-        dst_pages = [[1]]
-        content_hashes = [["h"]]
-        page_offsets = [[0]]
-        source_tiers = [[0]]
-
-    plan = SimpleNamespace(cache=[_SnapshotBatch(), _RestoreBatch()])
-    with patch.object(
-        scheduler_utils_module,
-        "Cache",
-        SimpleNamespace(
-            WriteBackOp=(),
-            LoadBackOp=(),
-            SnapshotOp=_SnapshotBatch,
-            RestoreOp=_RestoreBatch,
-        ),
-    ):
-        num_retracted = hooks.count_plan_ops(plan)
-    assert hooks._num_inflight == 3
-    # The return counts retraction victims only: one per snapshot-store
-    # request, restores excluded — it feeds the preemption counter.
-    assert num_retracted == 2
-
-
 # ----------------------------------------------------------------------
 # Owner translation
 # ----------------------------------------------------------------------
@@ -487,7 +448,13 @@ def test_sharded_group_keeps_each_ranks_rows_on_both_ends():
     contract = _contract(layout, [2])
     owners = {
         rank: BlockOwnerTranslation.for_host_pool(
-            layout, contract, num_host_lcm_blocks=3, rank=rank
+            layout,
+            contract,
+            num_host_lcm_blocks=3,
+            rank=rank,
+            host_group_packing=tuple(
+                group.cache_blocks_per_lcm_block for group in layout.groups
+            ),
         )
         for rank in (0, 1)
     }
@@ -911,63 +878,6 @@ def test_kvp_ranks_store_their_owned_subsets_on_both_legs():
         executor.submit_write_backs([bad], prerequisite_stream="s", fence_stream=Mock())
 
 
-def test_kvp_rank_backs_up_and_prefetches_only_the_host_pages_it_owns():
-    """L3 sees the rows this rank owns, by local Host id: the L2 write's
-    backup list and a prefetch op's pages both pass the owner filter, so a
-    peer's page is neither put nor fetched from here."""
-    layout = _layout(2, [("full", 2)])
-    # Device 1 -> Host 3 is rank 0's (local Host 2); Device 2 -> Host 6 is
-    # rank 1's (local Host 3).
-    for rank, owned_page in ((0, (0, 2, "h3", 0)), (1, (0, 3, "h6", 1))):
-        executor, _, lanes = _build(layout=layout, shard_counts=[2], rank=rank)
-        store = _WriteBackOp([11], [[0, 0]], [[1, 2]], [[3, 6]], [True])
-        store.content_hashes = [["h3", "h6"]]
-        store.page_offsets = [[0, 1]]
-        finish = Mock()
-        finish.query.return_value = False
-        lanes["pinned"].start_d2h.return_value = finish
-        with patch.object(
-            executor_module.Cache, "WriteBackOp", _WriteBackOp, create=True
-        ):
-            executor.submit_write_backs(
-                [store],
-                prerequisite_stream="s",
-                fence_stream=Mock(),
-            )
-        ((pending_finish, ack),) = executor._completions._pending
-        assert pending_finish is finish
-        assert (ack.op_ids, ack.backup_pages) == ([11], [owned_page])
-        # The prefetch of the same two pages fetches only this rank's one; the
-        # peer's page counts as landed here so the replica MIN is the owners'.
-        executor.l3_store = Mock()
-        executor.l3_store.prefetch.return_value = [True]
-        executor._l3_prefetch_timeout_base_s = 10.0
-        executor._l3_prefetch_timeout_per_page_s = 0.0
-        executor._l3_prefetch_batch_pages = 4
-        executor.submit_prefetches(
-            [
-                PrefetchOp(
-                    op_id=12,
-                    request_id="r12",
-                    first_page=0,
-                    num_pages=2,
-                    rows=(
-                        PrefetchRow(0, 3, "h3", 0, 0),
-                        PrefetchRow(0, 6, "h6", 1, 1),
-                    ),
-                )
-            ]
-        )
-        for _ in range(200):
-            progress = executor.l3_prefetch_progress()
-            if progress[12][0]:
-                break
-            time.sleep(0.01)
-        assert progress[12] == (True, 2)
-        executor.l3_store.prefetch.assert_called_once_with([owned_page])
-        executor._l3_prefetch_lane.shutdown(wait=True)
-
-
 @pytest.mark.parametrize("backend", ["dma", "auto"])
 def test_a_lane_completes_a_zero_row_copy_without_touching_the_transport(backend):
     """An op whose every row belongs to other KVP ranks is an empty copy on
@@ -1095,7 +1005,7 @@ def _round_trip_two_ranks(io_backend, executors):
     # Per rank: 2 local LCM blocks x packing 2 = 4 local blocks of 8 B at
     # stride 16 from offset 8. The sharded group has 2 x 2 x 2 = 8 virtual
     # blocks; rank r owns v with (v - 1) % 2 == r at local (v - 1) // 2 + 1.
-    # Both Host pools hold 3 LCM blocks -> 12 virtual blocks each.
+    # Host packing is 1: 3 compact parents hold 6 virtual blocks across 2 owners.
     contract = SimpleNamespace(
         group_specs=(SimpleNamespace(group_id="full", shard_count=2),),
         virtual_block_counts={"full": 1 + 2 * 2 * 2},
@@ -1132,7 +1042,7 @@ def _round_trip_two_ranks(io_backend, executors):
                 l2_tier=True,
                 host_ratio=1.5,  # 3 L2 LCM blocks
                 host_size_gb=0,
-                snapshot_pool=_pool(3 * 16 / 1e9, 2),  # 3 pool LCM blocks of 2 x 8 B
+                snapshot_pool=_pool(3 * 8 / 1e9, 2),  # 3 compact Host parents of 8 B
                 slot_state_exporters=(slot_states[rank],),
                 io_backend=io_backend,
                 attn_tp_rank=0,
@@ -1153,10 +1063,10 @@ def _round_trip_two_ranks(io_backend, executors):
         # The second victim (slot 2) has nothing in the pool: slot state only.
         slot_states[rank].table[2].fill_(200 + rank)
     torch.cuda.synchronize()
-    # Device blocks 1..4 go to L2 blocks 5..8 (stream-ordered), 5..8 to pool
+    # Device blocks 1..4 go to L2 blocks 3..6 (stream-ordered), 5..8 to pool
     # blocks 1..4; every pair keeps its parity, i.e. its owner.
     l2_store = _WriteBackOp(
-        [21], [[0, 0, 0, 0]], [[1, 2, 3, 4]], [[5, 6, 7, 8]], [False]
+        [21], [[0, 0, 0, 0]], [[1, 2, 3, 4]], [[3, 4, 5, 6]], [False]
     )
     pool_store = _snapshot_op(
         1, 1, [_transfer(0, v, v - 4) for v in range(5, 9)], pool_index=1
@@ -1184,7 +1094,7 @@ def _round_trip_two_ranks(io_backend, executors):
     restore = _restore_op(
         2,
         1,
-        [(HostTier.L2, _transfer(0, v + 4, v, key=f"h{v}")) for v in range(1, 5)]
+        [(HostTier.L2, _transfer(0, v + 2, v, key=f"h{v}")) for v in range(1, 5)]
         + [(HostTier.SNAPSHOT_POOL, _transfer(0, v - 4, v)) for v in range(5, 9)],
         pool_index=3,
     )

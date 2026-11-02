@@ -39,6 +39,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import psutil
+import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferGeometry,
     HostTransferWorkspace,
@@ -90,19 +91,46 @@ def host_memory_share(*, nprocs_per_node: int, headroom_bytes: int) -> int:
     return psutil.virtual_memory().available // nprocs_per_node - headroom_bytes
 
 
+def _pinned_rounding_limit_bytes() -> int | None:
+    if device_module.__name__ != "torch.cuda" or (
+        torch.version.cuda is None and torch.version.hip is None
+    ):
+        return None
+    # Read effective settings, including changes made after Torch initialization.
+    try:
+        settings = device_module.memory._snapshot().get("allocator_settings", {})
+    except RuntimeError:
+        # Non-native device allocators may not provide memory snapshots.
+        return None
+    limits = [
+        int(settings.get(name, -1))
+        for name in ("max_round_threshold", "max_cached_size")
+    ]
+    return min((limit for limit in limits if limit >= 0), default=None)
+
+
 def pinned_host_bytes(nbytes: int) -> int:
-    """The Host memory a pinned buffer of ``nbytes`` takes.
+    """Conservatively estimate the configured pinned-buffer reservation."""
+    if nbytes <= 0:
+        return 0
+    limit = _pinned_rounding_limit_bytes()
+    if limit is not None and nbytes > limit:
+        return nbytes
+    return 1 << (nbytes - 1).bit_length()
 
-    PyTorch's pinned allocator rounds every allocation up to a power of two,
-    so a buffer just past one takes almost twice its size.
-    """
-    return 1 << (nbytes - 1).bit_length() if nbytes > 0 else 0
 
-
-def largest_pinned_fit(room_bytes: int) -> int:
-    """The largest buffer whose pinned size (``pinned_host_bytes``) fits in
-    ``room_bytes``: the largest power of two in it, 0 without room."""
-    return 1 << (room_bytes.bit_length() - 1) if room_bytes > 0 else 0
+def largest_pinned_fit(room_bytes: int, *, block_bytes: int) -> int:
+    """Largest whole-block buffer fitting the configured pinned allocator."""
+    if block_bytes <= 0:
+        raise ValueError("block_bytes must be positive")
+    if room_bytes <= 0:
+        return 0
+    aligned_bytes = room_bytes // block_bytes * block_bytes
+    if pinned_host_bytes(aligned_bytes) <= room_bytes:
+        return aligned_bytes
+    # Block alignment can cross back below a non-power-of-two rounding limit.
+    rounded_room = 1 << (room_bytes.bit_length() - 1)
+    return rounded_room // block_bytes * block_bytes
 
 
 def check_host_memory(requested_bytes: int, *, share_bytes: int, purpose: str) -> None:
@@ -120,8 +148,8 @@ def check_host_memory(requested_bytes: int, *, share_bytes: int, purpose: str) -
     if requested_bytes > share_bytes:
         raise ValueError(
             f"Not enough Host memory for {purpose}: requesting "
-            f"{requested_bytes / 1e9:.2f} GB pinned (each buffer rounded up to "
-            f"a power of two), available {share_bytes / 1e9:.2f} GB (this "
+            f"{requested_bytes / 1e9:.2f} GB pinned under the allocator settings, "
+            f"available {share_bytes / 1e9:.2f} GB (this "
             "rank's share of the Host memory available on its node)"
         )
 
@@ -185,7 +213,7 @@ def build_transfer_geometry(
                     field.block_stride_bytes,
                     host_storage.host_cache_block_bytes[group_index],
                     host_storage.host_field_offsets[group_index][field_index],
-                    group.cache_blocks_per_lcm_block,
+                    host_storage.group_packing[group_index],
                     field.payload_bytes,
                 )
             )
@@ -202,6 +230,7 @@ def build_transfer_geometry(
         group_packing=tuple(
             group.cache_blocks_per_lcm_block for group in layout.groups
         ),
+        host_group_packing=host_storage.group_packing,
         host_lcm_block_bytes=host_storage.host_lcm_block_bytes,
         num_host_lcm_blocks=host_storage.num_host_lcm_blocks,
         num_device_lcm_blocks=layout.num_lcm_blocks,

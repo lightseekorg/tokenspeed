@@ -69,7 +69,6 @@ def _backend(
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=16,
         context_len=1024,
         max_bs=16,
         speculative_num_draft_tokens=width,
@@ -528,6 +527,7 @@ def test_block_draft_mixed_to_decode_refreshes_all_owners_and_reordered_slots(
         next_lengths,
         ForwardMode.DECODE,
         use_graph=for_graph_replay,
+        settle=lambda: None,
         block_tables=next_tables,
     )
     assert drafter.round_block_tables is next_tables

@@ -43,6 +43,7 @@ from tokenspeed_kernel.selection import (
 )
 from tokenspeed_kernel.signature import (
     FormatSignature,
+    dense_format_signature,
     dense_tensor_format,
     format_signature,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "prepare_latent_expert_shared",
     "prepare_latent_input",
     "prepare_moe_apply",
+    "prepare_routed_input_scale_rmsnorm_sum",
     "prepare_sigmoid_bias_topk",
     "prepare_softmax_topk",
     "prepare_topk",
@@ -62,6 +64,7 @@ _IMPLEMENTED_MODEL_PROFILES = frozenset(
         "dsv41_flash_tp4",
         "glm53_flash_tp4",
         "kimi_k3_tp8",
+        "muse_spark_tp8",
         "qwen38_flash_tp2",
         "beam_fp8_tp4",
     }
@@ -92,6 +95,9 @@ _IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"global", "local"})
 _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input", "mxfp4"})
 _IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
 _MXFP4_GROUP_SIZE = 32
+# Muse Spark's pre-expert norm stores its gain as a deviation from one.
+_PREQUANTIZED_NORM_WEIGHT_OFFSET = 1.0
+_PREQUANTIZED_NORM_EPS = 1e-5
 _CHANNEL_WEIGHT_CONSTRUCTION = "per-output-channel-normal-0.02-v1"
 
 
@@ -421,8 +427,13 @@ def _ones(shape: tuple[int, ...]) -> torch.Tensor:
     return torch.ones(shape, dtype=torch.float32, device="cuda")
 
 
+def _noop_weight_loader(*args: object, **kwargs: object) -> None:
+    """Synthetic benchmark weights are already loaded and have no checkpoint."""
+
+
 def _make_fp8_weights(
     *,
+    num_experts: int,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size_per_partition: int,
@@ -444,10 +455,14 @@ def _make_fp8_weights(
         if activation == "swiglu"
         else None
     )
+    w13_weight = _zero_fp8(shapes["w13"], weight_dtype)
+    w2_weight = _zero_fp8(shapes["w2"], weight_dtype)
+    w13_weight.weight_loader = _noop_weight_loader
+    w2_weight.weight_loader = _noop_weight_loader
     return SimpleNamespace(
-        w13_weight=_zero_fp8(shapes["w13"], weight_dtype),
+        w13_weight=w13_weight,
         w13_weight_scale_inv=_ones(shapes["w13_scale"]),
-        w2_weight=_zero_fp8(shapes["w2"], weight_dtype),
+        w2_weight=w2_weight,
         w2_weight_scale_inv=_ones(shapes["w2_scale"]),
         w13_weight_bias=None,
         w2_weight_bias=None,
@@ -457,6 +472,7 @@ def _make_fp8_weights(
         w13_input_layout="concatenated",
         ep_rank=ep_rank,
         ep_size=ep_size,
+        num_experts=num_experts,
         num_local_experts=num_local_experts,
     )
 
@@ -643,6 +659,7 @@ def _prepare_routed_weights(
     if weight_dtype_name == "fp8":
         assert block_shape is not None
         weights = _make_fp8_weights(
+            num_experts=num_experts,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
@@ -939,7 +956,13 @@ def prepare_moe_apply(
     request: BenchmarkRequest,
     platform: PlatformInfo,
 ) -> PreparedBenchmark:
-    """Prepare one precomputed-routing MoE apply benchmark."""
+    """Prepare one precomputed-routing MoE apply benchmark.
+
+    ``do_finalize`` false returns the unweighted per-route outputs for the
+    caller to normalize and reduce, and ``prequantized_input`` true hands the
+    kernel MXFP4 rows the producer already normalized and quantized, as Muse
+    Spark does. Omitting them benchmarks a finalized apply of BF16 input.
+    """
 
     _validate_request_options(request)
     parameters = request.parameters
@@ -1019,6 +1042,18 @@ def prepare_moe_apply(
         parameters["internal_activation_dtype"],
         _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES,
     )
+    do_finalize = parameters.get("do_finalize", True)
+    prequantized_input = parameters.get("prequantized_input", False)
+    if type(do_finalize) is not bool or type(prequantized_input) is not bool:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MoE do_finalize and prequantized_input must be boolean",
+        )
+    if prequantized_input and weight_dtype_name != "mxfp4":
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MoE prequantized input requires MXFP4 weights",
+        )
     intermediate_size_per_partition = _intermediate_per_partition(
         intermediate_size,
         tp_size,
@@ -1122,6 +1157,16 @@ def prepare_moe_apply(
             BenchmarkStatus.REGISTRATION_MISSING,
             f"Selected registration {plan['apply_kernel_name']!r} is not available",
         )
+    if not do_finalize and not plan["supports_deferred_finalize"]:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.NOT_APPLICABLE,
+            f"Selected registration {spec.name!r} cannot defer finalization",
+        )
+    if prequantized_input and not plan["supports_prequantized_input"]:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.NOT_APPLICABLE,
+            f"Selected registration {spec.name!r} cannot take prequantized input",
+        )
 
     generator = _generator(request.seed)
     hidden_states = _randn(
@@ -1129,6 +1174,17 @@ def prepare_moe_apply(
         generator=generator,
         dtype=input_dtype,
     )
+    x_quantized = None
+    if prequantized_input:
+        from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
+
+        # The producer's fused norm and quantize runs once, outside the timing.
+        x_quantized = rmsnorm_mxfp4_quant(
+            hidden_states,
+            torch.zeros(hidden_size, dtype=input_dtype, device="cuda"),
+            _PREQUANTIZED_NORM_EPS,
+            _PREQUANTIZED_NORM_WEIGHT_OFFSET,
+        )
     route_experts = num_local_experts if route_scope == "local" else num_experts
     expert_start = ep_rank * num_local_experts if route_scope == "local" else 0
     routing_arguments = dict(
@@ -1196,7 +1252,8 @@ def prepare_moe_apply(
                 if token_count_scope == "local"
                 else math.ceil(tokens / token_partition_count)
             ),
-            do_finalize=True,
+            do_finalize=do_finalize,
+            x_quantized=x_quantized,
         )
 
     return PreparedBenchmark(
@@ -1227,6 +1284,8 @@ def prepare_moe_apply(
             "token_count_scope": token_count_scope,
             "routed_scaling_factor": routed_scaling_factor,
             "normalize_topk_weights": normalize_topk_weights,
+            "do_finalize": do_finalize,
+            "prequantized_input": prequantized_input,
             "fp8_scale_block_shape": block_shape,
             "mxfp4_group_size": (
                 _MXFP4_GROUP_SIZE if weight_dtype_name == "mxfp4" else None
@@ -1553,6 +1612,79 @@ def prepare_latent_expert_shared(
             "routed_scaling_factor": routed_scaling_factor,
             "normalize_topk_weights": normalize_topk_weights,
             "topk_generation": "sigmoid_bias_topk",
+        },
+        validation=None,
+    )
+
+
+def prepare_routed_input_scale_rmsnorm_sum(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one per-route RMSNorm and weighted top-k reduction.
+
+    Muse Spark normalizes each complete expert route ``[tokens, topk,
+    hidden_size]`` with the post-expert norm before the route-weighted sum,
+    so this runs once per MoE layer after the routes are reduced across ranks.
+    """
+
+    _validate_request_options(request)
+    parameters = request.parameters
+    model_profile = _implemented_value(
+        "model_profile",
+        parameters["model_profile"],
+        _IMPLEMENTED_MODEL_PROFILES,
+    )
+    tokens = parameters["tokens"]
+    topk = parameters["topk"]
+    hidden_size = parameters["hidden_size"]
+    input_dtype = _parse_dtype(
+        "input_dtype",
+        parameters["input_dtype"],
+        _IMPLEMENTED_INPUT_DTYPES,
+    )
+    eps = float(parameters["eps"])
+    weight_offset = float(parameters["weight_offset"])
+
+    load_builtin_kernels()
+    spec = _selected_spec(
+        request,
+        platform,
+        dense_format_signature(("routes",), (input_dtype,)),
+        {},
+    )
+    generator = _generator(request.seed)
+    routes = _randn((tokens, topk, hidden_size), generator=generator, dtype=input_dtype)
+    route_weights = torch.rand(
+        (tokens, topk), device="cuda", dtype=torch.float32, generator=generator
+    )
+    route_weights = route_weights / route_weights.sum(dim=-1, keepdim=True)
+    norm_weight = _randn((hidden_size,), generator=generator, dtype=input_dtype).mul_(
+        0.1
+    )
+
+    def invoke() -> object:
+        return moe_ops.routed_input_scale_rmsnorm_sum(
+            routes,
+            route_weights,
+            norm_weight,
+            eps,
+            weight_offset,
+            False,
+            None,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "topk": topk,
+            "hidden_size": hidden_size,
+            "input_dtype": str(input_dtype).removeprefix("torch."),
+            "eps": eps,
+            "weight_offset": weight_offset,
         },
         validation=None,
     )

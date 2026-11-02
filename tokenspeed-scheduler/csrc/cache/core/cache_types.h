@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,6 +44,9 @@ namespace tokenspeed {
 // ranks the kinds: a block republished at a later point keeps the higher one.
 enum class CacheBoundaryKind { kChunk, kEndpoint };
 
+// The tiers a prefix cache entry lives on: Device L1 and Host L2.
+enum class CacheTier { kDevice, kHost };
+
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -61,7 +65,10 @@ struct CacheKey {
 };
 
 struct CacheKeyHash {
-    std::size_t operator()(const CacheKey& key) const noexcept {
+    // Hashing the content digest is not a cheap integer operation. Without
+    // noexcept, libstdc++ retains each node's hash instead of recomputing it
+    // while traversing a bucket or erasing an entry.
+    std::size_t operator()(const CacheKey& key) const {
         std::size_t hash = std::hash<CacheNamespaceId>{}(key.namespace_id);
         const std::size_t group_hash = std::hash<std::uint32_t>{}(key.group_id);
         hash ^= group_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
@@ -71,6 +78,12 @@ struct CacheKeyHash {
         return hash ^ (offset_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
     }
 };
+
+// Immutable keys expanded for one prompt and one coordinator's group geometry.
+// These carry no residency or ownership information; every retry still probes
+// the current cache indexes. Sharing keeps a pending probe valid when its
+// request drops the prepared keys after successful admission.
+using PreparedPrefixKeys = std::shared_ptr<const std::vector<std::vector<CacheKey>>>;
 
 struct CacheGroupSpec {
     AttnKind attn_kind{AttnKind::kFull};
@@ -91,6 +104,10 @@ struct CacheGroupSpec {
     std::int32_t block_granularity{0};
     // Cyclic owners of the virtual blocks; must divide cache_blocks_per_lcm_block.
     std::int32_t shard_count{1};
+    // State checkpoints may only be reused/published at multiples of this
+    // token count and must be produced by prefill. 1 preserves arbitrary
+    // natural checkpoints, including decode endpoints. No row span.
+    std::int32_t checkpoint_granularity{1};
 };
 
 // How a group's table grows in one admission. The two shapes use different
@@ -143,6 +160,11 @@ struct StateStep {
         kLand,
     };
     Kind kind{Kind::kKeep};
+    // A rotating prefill chunk that also writes the state at a page boundary
+    // inside it (SchedulerConfig::state_checkpoint_in_forward): one more
+    // fresh block, held outside the two-slot table until the request's next
+    // publication point publishes it (AdmissionResult::state_checkpoint_blocks).
+    bool checkpoint{false};
 
     bool operator==(const StateStep&) const noexcept = default;
 };
@@ -195,6 +217,12 @@ struct CompletedPages {
     // under the point's hash (the chain hash when aligned, the tail hash
     // otherwise). Ordinary chunk ends and decode steps publish no state.
     bool publish_state{false};
+    // An in-forward State checkpoint an earlier forward wrote at the page
+    // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
+    // publishes its block from state_checkpoint_blocks (indexed by group, null
+    // elsewhere) under that page's chain hash. Zero pages means none.
+    std::int32_t state_checkpoint_pages{0};
+    std::span<CacheBlockRef> state_checkpoint_blocks{};
     // Which kind of boundary the publication ends on (eviction provenance).
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefill streams newly published history and state to Host. Decode

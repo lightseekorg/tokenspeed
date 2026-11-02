@@ -31,7 +31,10 @@ one vector per patch.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from itertools import accumulate
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +44,10 @@ from tokenspeed.runtime.configs.nemotron_omni_config import RadioVisionConfig
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+    PADDING_SEQUENCE_ROWS,
+    pad_cu_seqlens,
+)
 
 
 class RadioMLP(nn.Module):
@@ -162,6 +169,12 @@ class RadioVisionModel(nn.Module):
         self, patches: torch.Tensor, grids: list[tuple[int, int]]
     ) -> torch.Tensor:
         """Embed images given as concatenated ``[sum h*w, 3*p*p]`` patches."""
+        return self.encode(self.image_sequences(patches, grids))
+
+    def image_sequences(
+        self, patches: torch.Tensor, grids: list[tuple[int, int]]
+    ) -> list[torch.Tensor]:
+        """Each image's patch embeddings plus its position embedding."""
         embedded = self.embedder(patches.to(self.dtype))
         sequences = []
         start = 0
@@ -169,7 +182,7 @@ class RadioVisionModel(nn.Module):
             image = embedded[start : start + rows * cols]
             sequences.append(image + self.position_embedding(rows, cols))
             start += rows * cols
-        return self.encode(sequences)
+        return sequences
 
     def embed_video(
         self, patches: torch.Tensor, frames: int, rows: int, cols: int
@@ -202,16 +215,30 @@ class RadioVisionModel(nn.Module):
 
     def encode(self, sequences: list[torch.Tensor]) -> torch.Tensor:
         """Run the blocks over embedded sequences; drop each one's prefix tokens."""
-        lengths = [self.num_prefix_tokens + len(seq) for seq in sequences]
-        x = torch.cat([part for seq in sequences for part in (self.cls_token, seq)])
+        x, lengths = self.pack(sequences)
         cu_seqlens = torch.tensor(
             [0, *accumulate(lengths)], dtype=torch.int32, device=x.device
         )
-        max_seqlen = max(lengths)
+        return self.unpack(self.forward_blocks(x, cu_seqlens, max(lengths)), lengths)
+
+    def pack(self, sequences: list[torch.Tensor]) -> tuple[torch.Tensor, list[int]]:
+        """Prepend the prefix tokens to each sequence and concatenate them."""
+        lengths = [self.num_prefix_tokens + len(seq) for seq in sequences]
+        x = torch.cat([part for seq in sequences for part in (self.cls_token, seq)])
+        return x, lengths
+
+    def forward_blocks(
+        self, x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int
+    ) -> torch.Tensor:
+        """The blocks and final norm over packed sequences."""
         for block in self.blocks:
             x = block(x, cu_seqlens, max_seqlen)
         if self.norm is not None:
             x = self.norm(x)
+        return x
+
+    def unpack(self, x: torch.Tensor, lengths: list[int]) -> torch.Tensor:
+        """Drop each packed sequence's prefix tokens."""
         return torch.cat([seq[self.num_prefix_tokens :] for seq in x.split(lengths)])
 
     def load_weight(self, name: str, loaded: torch.Tensor) -> None:
@@ -222,3 +249,129 @@ class RadioVisionModel(nn.Module):
         param = self.get_parameter(name)
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded)
+
+
+@dataclass
+class RadioEncoderBatch:
+    """Images packed for the blocks: their prefixed sequences and patch grids."""
+
+    tokens: torch.Tensor
+    lengths: list[int]
+    grids: list[tuple[int, int]]
+
+    @property
+    def input_tensors(self) -> dict[str, torch.Tensor]:
+        return {"tokens": self.tokens}
+
+    @property
+    def encoder_output_tokens(self) -> list[int]:
+        return self.lengths
+
+    @property
+    def metadata_sequences(self) -> list[int]:
+        return [1] * len(self.lengths)
+
+    def num_items(self) -> int:
+        return len(self.lengths)
+
+    def select(self, indices: list[int]) -> "RadioEncoderBatch":
+        """Sub-batch at ``indices``, preserving order."""
+        sequences = self.tokens.split(self.lengths)
+        return RadioEncoderBatch(
+            torch.cat([sequences[i] for i in indices]),
+            [self.lengths[i] for i in indices],
+            [self.grids[i] for i in indices],
+        )
+
+
+@dataclass
+class RadioEncoderCudaGraphAdapter:
+    """Encoder CUDA graph adapter capturing the RADIO blocks over packed images.
+
+    Embedding runs eagerly before the graph, since the position embedding is
+    resized per image, and ``post_encode`` maps the unpacked patch features
+    to the model's output after it. Budgets count packed rows, prefix tokens
+    included; each image is one attention sequence.
+    """
+
+    tower: RadioVisionModel
+    post_encode: Callable[[torch.Tensor, list[tuple[int, int]]], torch.Tensor]
+    max_image_tokens: int
+    capture_tp_size: int
+    capture_tp_group: Any | None
+    modality_name: str = "vision"
+
+    @property
+    def device(self) -> torch.device:
+        return self.tower.embedder.weight.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.tower.dtype
+
+    def batch_from_items(self, items: list[Any]) -> RadioEncoderBatch:
+        grids = [tuple(item.image_grid_hw.reshape(-1).tolist()) for item in items]
+        patches = torch.cat([item.feature.to(self.device) for item in items])
+        tokens, lengths = self.tower.pack(self.tower.image_sequences(patches, grids))
+        if max(lengths) > self.max_image_tokens:
+            raise ValueError(
+                f"RADIO image of {max(lengths)} tokens exceeds the "
+                f"{self.max_image_tokens} the encoder cudagraph bounds attention by"
+            )
+        return RadioEncoderBatch(tokens, lengths, grids)
+
+    def capture_batch_for_budget(
+        self,
+        encoder_output_token_budget: int,
+        _max_batch_size: int,
+        _metadata_sequence_budget: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> RadioEncoderBatch:
+        hidden_size = self.tower.embedder.out_features
+        tokens = torch.zeros(
+            encoder_output_token_budget, hidden_size, device=device, dtype=dtype
+        )
+        full, rest = divmod(encoder_output_token_budget, self.max_image_tokens)
+        lengths = [self.max_image_tokens] * full + ([rest] if rest else [])
+        return RadioEncoderBatch(tokens, lengths, [])
+
+    def prepare_metadata(
+        self,
+        batch: RadioEncoderBatch,
+        encoder_output_token_budget: int | None,
+        metadata_sequence_budget: int,
+    ) -> dict[str, Any]:
+        cu_seqlens = torch.tensor(
+            [0, *accumulate(batch.lengths)], dtype=torch.int32, device=self.device
+        )
+        if encoder_output_token_budget is None:
+            return {"cu_seqlens": cu_seqlens, "max_seqlen": max(batch.lengths)}
+        return {
+            "cu_seqlens": pad_cu_seqlens(
+                cu_seqlens,
+                sum(batch.lengths),
+                encoder_output_token_budget,
+                metadata_sequence_budget,
+                self.modality_name,
+            ),
+            "max_seqlen": min(
+                encoder_output_token_budget,
+                max(self.max_image_tokens, PADDING_SEQUENCE_ROWS),
+            ),
+        }
+
+    def forward(
+        self, input_tensors: dict[str, torch.Tensor], metadata: dict[str, Any]
+    ) -> torch.Tensor:
+        return self.tower.forward_blocks(
+            input_tensors["tokens"], metadata["cu_seqlens"], metadata["max_seqlen"]
+        )
+
+    def postprocess(
+        self, encoder_outs: list[torch.Tensor], batch: RadioEncoderBatch
+    ) -> torch.Tensor:
+        features = torch.cat(
+            [out[self.tower.num_prefix_tokens :] for out in encoder_outs]
+        )
+        return self.post_encode(features, batch.grids)

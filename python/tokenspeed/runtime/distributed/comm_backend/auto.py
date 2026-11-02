@@ -50,6 +50,9 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     MAX_ONESHOT_BYTES,
     TrtllmAllReduceBackend,
 )
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -60,11 +63,20 @@ def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
     The association order depends only on the rank axis, never on the payload
     shape, so a row's folded value is bitwise identical at any batch size.
+    GPU partials whose last axis is contiguous fold in one kernel with the
+    same order and rounding.
     """
+    if parts.is_cuda and parts.stride(-1) == 1 and out.stride(-1) == 1:
+        from tokenspeed_kernel.ops.communication.triton import rank_ordered_fold
+
+        width = out.shape[-1] if out.dim() else 1
+        rank_ordered_fold(parts.reshape(parts.shape[0], -1, width), out.view(-1, width))
+        return out
     accumulator = parts[0].to(torch.float32)
     for rank in range(1, parts.shape[0]):
         accumulator = accumulator + parts[rank].to(torch.float32)
-    out.copy_(accumulator.to(out.dtype))
+    # A -0.0 sum leaves as +0.0, as the kernel stores it.
+    out.copy_((accumulator + 0.0).to(out.dtype))
     return out
 
 
@@ -112,6 +124,9 @@ class AutoBackend(CommBackend):
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
         # Projection fallbacks retain Auto's ordinary routing and numerics.
         self._projection = ProjectionBackend(fallback=self)
+        # Lamport token/channel-shard exchanges prepared by layers at build
+        # time (prepare_shard_exchange), keyed by (group, full channel width).
+        self._shard_exchanges: dict[tuple[Group, int], object] = {}
 
     @property
     def nccl(self) -> NcclBackend:
@@ -149,16 +164,29 @@ class AutoBackend(CommBackend):
         Every element folds rank 0..n-1 left to right in fp32 with one final
         rounding, independent of the tensor's shape -- unlike a ring
         all-reduce, whose per-element association order follows the
-        size-dependent chunking. In-place like the NCCL all-reduce.
+        size-dependent chunking. An armed trtllm workspace that holds the
+        rows folds the same way in one kernel and returns a new tensor; the
+        gather path works in place like the NCCL all-reduce.
         """
         if op is not None and op != torch.distributed.ReduceOp.SUM:
             raise ValueError("batch-invariant collectives fold SUM reductions only")
         world_size = len(group)
         if world_size == 1:
             return tensor
-        gathered = self._nccl.all_gather(tensor, group, dim=0)
-        parts = gathered.view((world_size, *tensor.shape))
-        return ordered_fold_sum(parts, tensor)
+        if not self._force_deterministic_rsag() and self._trtllm_ar.has_trtllm_ar(
+            group
+        ):
+            folded = self._trtllm_ar.ordered_all_reduce(tensor, group)
+            if folded is not None:
+                return folded
+        rows = tensor.contiguous().view(-1, tensor.shape[-1] if tensor.dim() else 1)
+        # Last-dim gather on the multicast kernels: [rows, world * width], rank-major.
+        gathered = self.all_gather(rows, group, dim=-1)
+        parts = gathered.view(rows.shape[0], world_size, rows.shape[1]).transpose(0, 1)
+        ordered_fold_sum(parts, rows)
+        if rows.data_ptr() != tensor.data_ptr():
+            tensor.copy_(rows.view(tensor.shape))
+        return tensor
 
     def _ordered_fold_reduce_scatter(
         self, tensor: torch.Tensor, group: Group
@@ -406,6 +434,22 @@ class AutoBackend(CommBackend):
             return self._iris.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        return (
+            not self._batch_invariant_collectives()
+            and not self._force_deterministic_rsag()
+            and self._trtllm_ar.supports_all_reduce_mhc_norm(x, norm_weight, group)
+        )
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._trtllm_ar.all_reduce_mhc_norm(
+            x, residual, post, comb, pre, weight, eps, group
+        )
+
     def all_reduce_mhc_post(
         self,
         tensor: torch.Tensor,
@@ -550,6 +594,62 @@ class AutoBackend(CommBackend):
         if self.route(Collective.REDUCE_SCATTER, tensor, group) is Route.ORDERED_FOLD:
             return self._ordered_fold_reduce_scatter(tensor, group)
         return self._nccl.reduce_scatter(tensor, group)
+
+    def prepare_shard_exchange(
+        self, group: Group, channels: int, max_rows: int, dtype: torch.dtype
+    ) -> bool:
+        # The Lamport exchange (tokenspeed_a2a_lamport): one NVLink hop per
+        # packet instead of NCCL's send/recv kernel, for the small decode
+        # exchanges of head / tensor parallel layouts. Pure data movement,
+        # every bit preserved, so no numerics envelope vetoes it.
+        world_size = len(group)
+        if (
+            not current_platform().is_nvidia
+            or dtype != torch.bfloat16
+            or world_size not in (2, 4, 8)
+            or channels % (2 * world_size)
+            or max_rows < 1
+            or 3 * max_rows * channels // 2 > 2**31 - 1
+            or self._group_spans_nodes(group)
+        ):
+            return False
+        prepared = self._shard_exchanges.get((group, channels))
+        if prepared is not None:
+            # Growing would move scratch that captured graphs hold.
+            return prepared.max_rows >= max_rows
+        from tokenspeed_kernel.ops.communication.cuda import TokenSpeedA2ALamportState
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self._shard_exchanges[(group, channels)] = TokenSpeedA2ALamportState(
+            pg_manager.get_device_process_group(group),
+            max_rows,
+            channels,
+            device,
+            min(128, sms),
+        )
+        return True
+
+    def try_shard_exchange(
+        self, tensor: torch.Tensor, group: Group, inverse: bool
+    ) -> torch.Tensor | None:
+        world_size = len(group)
+        rows = tensor.shape[0] // world_size if inverse else tensor.shape[0]
+        channels = tensor.shape[1] * world_size if inverse else tensor.shape[1]
+        state = self._shard_exchanges.get((group, channels))
+        # Only group-wide facts decide (preparation, rows, dtype): every rank
+        # takes the same path. Layout is fixed up locally.
+        if state is None or rows > state.max_rows or tensor.dtype != torch.bfloat16:
+            return None
+        from tokenspeed_kernel.ops.communication.cuda import tokenspeed_a2a_lamport
+
+        sent = tensor.contiguous()
+        if sent.data_ptr() % 16:
+            sent = sent.clone()
+        out = sent.new_empty(
+            (rows, channels) if inverse else (world_size * rows, channels // world_size)
+        )
+        return tokenspeed_a2a_lamport(state, sent, inverse=inverse, out=out)
 
     def all_to_all_single(
         self,

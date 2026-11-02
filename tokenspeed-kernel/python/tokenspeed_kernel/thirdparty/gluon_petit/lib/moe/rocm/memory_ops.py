@@ -25,8 +25,6 @@
 from enum import IntEnum
 from typing import NamedTuple
 
-import triton
-import triton.experimental.gluon as g
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
     BufferResourceFields,
@@ -35,12 +33,17 @@ from lib.gemm.rocm.intrinsics import (
     _resource_content,
     _uninitialized_like,
     kWarpSize,
+    lds_load,
+    lds_load_vector,
     llvm_amdgcn_raw_buffer_load_v4i32,
 )
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.host_device import host_device
-from triton.experimental.gluon import language as l
-from triton.experimental.gluon.language._core import builtin
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import tl, triton
+
+builtin = tl.core.builtin
 
 
 class MoeArchitecture(IntEnum):
@@ -86,13 +89,9 @@ def _uint4_words(v):
 @g.jit
 def _load_uint2(ptr):
     # A native LDS uint2 access: load two adjacent uint32 register words.
-    V: l.constexpr = l.BlockedLayout([1, 2], [64, 1], [4, 1], [1, 0])
-    word = l.arange(0, 2, layout=l.SliceLayout(0, V))
-    ptr = l.convert_layout(ptr, l.SliceLayout(1, V))
-    ptr = ptr.to(l.pointer_type(l.uint32, 3))
-    x, y = l.split(l.load(ptr[:, None] + word[None, :]))
     L: l.constexpr = l.BlockedLayout([1], [64], [4], [0])
-    return l.convert_layout(x, L), l.convert_layout(y, L)
+    x, y = lds_load_vector(l.convert_layout(ptr, L), "v2i32")
+    return x, y
 
 
 @g.jit
@@ -100,13 +99,8 @@ def _load_uint4(ptr, index):
     # The scalar-word pointer is an ABI view; index counts native uint4 elements.
     ptr = ptr + index * 4
     # Native uint4 activation reads lower to two i64 halves consumed by MFMA.
-    V: l.constexpr = l.BlockedLayout([1, 2], [64, 1], [4, 1], [1, 0])
-    half = l.arange(0, 2, layout=l.SliceLayout(0, V))
-    ptr = l.convert_layout(ptr, l.SliceLayout(1, V))
-    ptr = ptr.to(l.pointer_type(l.uint64, 3))
-    xy, zw = l.split(l.load(ptr[:, None] + half[None, :]))
     L: l.constexpr = l.BlockedLayout([1], [64], [4], [0])
-    xy, zw = l.convert_layout(xy, L), l.convert_layout(zw, L)
+    xy, zw = lds_load_vector(l.convert_layout(ptr, L), "v2i64")
     return (
         xy.to(l.uint32),
         (xy >> 32).to(l.uint32),
@@ -506,7 +500,7 @@ class InputLayout:
         for i in l.static_range(2):
             for j in l.static_range(kActivationFragments):
                 p = x + 2 * (i * kWarpSize * 2 + j * 4)
-                packed = l.load(p.to(l.pointer_type(l.uint64, 3)))
+                packed = lds_load(p.to(l.pointer_type(l.uint64)))
                 words += (packed.to(l.uint32), (packed >> 32).to(l.uint32))
         regs = ()
         for i in l.static_range(kActivationFragments):
@@ -533,7 +527,7 @@ class InputLayout:
         r = ()
         for i in l.static_range(4):
             r += (
-                l.load(shm_scale_x + tid + i * kWarpSize).to(l.float32, bitcast=True),
+                lds_load(shm_scale_x + tid + i * kWarpSize).to(l.float32, bitcast=True),
             )
         return r
 

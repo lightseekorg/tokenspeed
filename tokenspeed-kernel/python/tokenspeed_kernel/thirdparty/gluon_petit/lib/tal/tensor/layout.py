@@ -6,10 +6,13 @@ runtime Gluon tensors. This is address arithmetic, not a thread distribution.
 
 from dataclasses import dataclass
 
-import triton.experimental.gluon as g
 from lib.tal.tensor.stride import crd2idx
-from triton.experimental.gluon import language as l
-from triton.experimental.gluon.language._core import _unwrap_if_constexpr, builtin
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import tl
+
+builtin = tl.core.builtin
+_unwrap_if_constexpr = tl.core._unwrap_if_constexpr
 
 
 @g.constexpr_function

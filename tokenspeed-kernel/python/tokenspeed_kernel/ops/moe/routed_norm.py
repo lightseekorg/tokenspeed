@@ -26,6 +26,35 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_format_signature
 
 
+def gather_moe_routes(
+    routes: torch.Tensor,
+    route_map: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+    hidden_size: int,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather deferred expert rows into token/route order; absent routes are zero.
+
+    Args:
+        routes: Expert outputs ``[rows, padded_width]``.
+        route_map: Contiguous ``[tokens * topk]`` row indices; ``-1`` marks absence.
+        num_tokens: Number of tokens.
+        topk: Routes per token.
+        hidden_size: Output width (``<= padded_width``).
+        output: Optional contiguous destination that overlaps no input.
+
+    Returns:
+        ``[tokens, topk, hidden_size]`` routes in ``routes.dtype``.
+    """
+    kernel = select_kernel(
+        "moe",
+        "gather_moe_routes",
+        dense_format_signature(("routes",), (routes.dtype,)),
+    )
+    return kernel(routes, route_map, num_tokens, topk, hidden_size, output)
+
+
 def routed_input_scale_rmsnorm_sum(
     routes: torch.Tensor,
     route_weights: torch.Tensor,
@@ -33,6 +62,7 @@ def routed_input_scale_rmsnorm_sum(
     eps: float,
     weight_offset: float,
     enable_pdl: bool,
+    output: torch.Tensor | None,
 ) -> torch.Tensor:
     """Normalize each expert route before its weighted top-k reduction.
 
@@ -46,16 +76,20 @@ def routed_input_scale_rmsnorm_sum(
         eps: Epsilon for each route's variance.
         weight_offset: Center added to the checkpoint's norm weight.
         enable_pdl: Enable NVIDIA programmatic dependent launch.
+        output: Optional contiguous ``[tokens, width]`` destination in
+            ``routes.dtype`` that overlaps no input; None allocates.
 
     Returns:
-        Weighted route sum shaped ``[tokens, width]``.
+        Weighted route sum shaped ``[tokens, width]``, backed by ``output`` when given.
     """
     kernel = select_kernel(
         "moe",
         "routed_input_scale_rmsnorm_sum",
         dense_format_signature(("routes",), (routes.dtype,)),
     )
-    return kernel(routes, route_weights, norm_weight, eps, weight_offset, enable_pdl)
+    return kernel(
+        routes, route_weights, norm_weight, eps, weight_offset, enable_pdl, output
+    )
 
 
 def routed_input_scale_rmsnorm_sum_gathered(
@@ -128,6 +162,7 @@ def routed_input_scale_rmsnorm_sum_gathered(
 
 
 __all__ = [
+    "gather_moe_routes",
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
 ]

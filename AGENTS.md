@@ -123,6 +123,12 @@ change.
   boundary.
 * Third-party kernel libraries belong under `tokenspeed-kernel`; avoid direct
   runtime dependencies or imports that bypass it.
+* Runtime code (`python/tokenspeed/`) should dispatch kernels across hardware
+  platforms through the `tokenspeed-kernel` registry (`select_kernel`,
+  `KernelPlan.select()`, or the family-level ops built on them) rather than
+  importing a specific solution or branching on the platform at the call site.
+  When a call site must bypass the registry, add a comment there explaining
+  why.
 * If a dependency repeatedly breaks during version upgrades or slows project
   progress, consider removing it entirely or at least making it optional.
 
@@ -199,14 +205,42 @@ Inside the root `tokenspeed-kernel/` directory:
   widths, split counts computed from the batch size), must be runtime
   arguments, or be bucketed first (such as `next_power_of_2`) when the kernel
   needs a compile-time bound. The same holds for template arguments of other
-  JITs such as DeepGEMM. Reviews should check every new or changed kernel
-  signature and launch site for this. Kernels should have tests to guard
-  against excessive scalar parameter specialization with
-  `assert_no_triton_compile` from `test/utils.py`. Tensor parameters need no
-  such test. At runtime, `tokenspeed_kernel.compile_monitor` logs every
-  Triton compilation after startup and names a parameter that keeps taking
-  new values. CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
-  parameter fails the model tests.
+  JITs such as DeepGEMM, for static CuTe DSL tensor dimensions, and for the
+  key under which a caller caches a `cute.compile` result, which must hold
+  only what the kernel specializes on. Call CuTe DSL kernels through their
+  compiled functions; a direct `@cute.jit` call traces on every call. Reviews
+  should check every new or changed kernel signature and launch site for this.
+  Kernels should have tests to guard against excessive scalar parameter
+  specialization with `assert_no_triton_compile` or `assert_no_cute_compile`
+  from `test/utils.py`. Triton tensor parameters need no such test. At runtime,
+  `tokenspeed_kernel.compile_monitor` logs every Triton and CuTe DSL
+  compilation after startup and names a parameter that keeps taking new
+  values, a call site that keeps recompiling known specializations, and a
+  direct `@cute.jit` call. CI serves with
+  `TOKENSPEED_JIT_COMPILE_CHECK=error`, so any of these fails the model tests.
+* Integer offsets into global memory must not overflow int32. Compute in
+  int64 every offset whose bound grows with a runtime count: a token,
+  request, page, slot, or expert index times a stride, or a product of sizes
+  such as `num_tokens * vocab_size`. Cast a factor before multiplying
+  (`pid.to(tl.int64) * stride`, `Int64(page) * stride`); casting the product
+  is too late. Byte and bit counts reach 2^31 sooner than element counts.
+  Do not rely on argument types: Triton passes an integer argument as i32
+  while its value fits, so the product of two fitting values still wraps;
+  `tl.program_id`, `tl.arange`, CuTe DSL `Int32` values, and layout sizes
+  such as `cute.cosize` are 32-bit as well. Offsets bounded by model
+  dimensions, such as those inside a tile or row, stay int32: advance the
+  base pointer once per program in int64, then add int32 tile offsets. This
+  keeps 64-bit integer math out of inner loops and matches AMD buffer loads,
+  which take 32-bit offsets from a 64-bit base. A kernel that keeps a
+  runtime-scaled offset in int32 for speed must assert the bound on the host
+  where the tensor is sized, with a comment saying why. Kernels indexed by
+  runtime counts should have a test whose largest offset exceeds 2^31 in the
+  unit the kernel computes, touching only the far end (such as the last
+  pages of a large pool) to stay cheap. Reviews should check every new or
+  changed offset computation for this. To debug an illegal memory access in
+  a Triton or Gluon kernel, rerun it with `TRITON_DEBUG=1`, which asserts on
+  int32 overflow in `+`, `-`, and `*`. This rule applies to every kernel
+  package in the repository, including `tokenspeed-mla/`.
 
 ## tokenspeed-kernel-amd
 
@@ -216,8 +250,8 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * Add JIT `launch_metadata` for Proton use alongside the Triton/Gluon kernels.
 * AMD Gluon kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
-* The compile-time parameter rule in the `tokenspeed-kernel` section applies
-  to these kernels too.
+* The compile-time parameter rule and the int32 offset overflow rule in the
+  `tokenspeed-kernel` section apply to these kernels too.
 * Put per-kernel contract and algorithm details in
   `python/tokenspeed_kernel_amd/ops/README.md`.
 * For Triton/Gluon kernels, one name should thread the whole stack: the
