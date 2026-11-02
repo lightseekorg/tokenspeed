@@ -240,10 +240,23 @@ def _partial_worker(rank, degree, rendezvous):
     torch.cuda.set_device(rank)
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager,
     )
     from tokenspeed.runtime.layers.attention.dcp.comm import combine_attention_partials
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    # The packed LSE gather can select RSAG, whose workspace uses the same
+    # resolved capacity bounds as a serving worker, even in an NCCL test.
+    global_server_args_dict.update(
+        mapping=Mapping(rank=rank, world_size=degree, attn_tp_size=degree),
+        chunked_prefill_size=16,
+        max_prefill_tokens=16,
+        max_model_len=1024,
+        max_num_seqs=4,
+        speculative_algorithm=None,
+    )
 
     device = torch.device("cuda", rank)
     dist.init_process_group(

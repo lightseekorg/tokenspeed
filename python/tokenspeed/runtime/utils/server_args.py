@@ -253,11 +253,11 @@ def validate_context_parallel_roles(
                 "rank (the drafter's steps only), which no engine serving "
                 "steady-state decode should pay"
             )
-        if qcp_size != kvp_size:
+        if kvp_size not in (1, qcp_size):
             raise ValueError(
                 "--query-context-parallel-size must equal --kv-parallel-size "
-                f"(got qcp={qcp_size}, kvp={kvp_size}): the history gather "
-                "splits by the page owners of the whole shard group"
+                f"when KVP is enabled (got qcp={qcp_size}, kvp={kvp_size}): "
+                "page owners must span the whole query shard group"
             )
     if dcp_size > 1:
         if disaggregation_mode not in ("null", "decode"):
@@ -3947,11 +3947,14 @@ class ServerArgs:
             "every extend forward's query rows over the attention TP group, rank "
             "r computing a contiguous slice of the chunk's rows against the "
             "gathered KV history of its requests. Requires --disaggregation-mode "
-            "prefill and must equal both --attn-tp-size and --kv-parallel-size; "
-            "needs GPU DSA attention with a bf16 KV cache and keeps the prefill "
-            "eager. The attention weights are head-replicated unless "
-            "--attn-head-tp-size equals it, which shards them over the shard "
-            "group.",
+            "prefill, must equal --attn-tp-size and keeps the prefill eager. "
+            "--kv-parallel-size must be 1 or equal to it. GPU DSA attention "
+            "needs it equal to --kv-parallel-size and a bf16 KV cache; its "
+            "attention weights are head-replicated unless --attn-head-tp-size "
+            "equals it, which shards them over the shard group. DeepSeek V4.1 "
+            "keeps its attention weights head-replicated; this model-wide layout "
+            "is separate from its operator-level "
+            "--deepseek-v41-*-query-parallel-size options.",
         )
         parser.add_argument(
             "--dense-tp-size",
