@@ -168,7 +168,7 @@ VENDOR_WORKFLOWS = {
         ".github/workflows/amd-kernel-benchmark.yml",
     ),
     "amd-mi450": (".github/workflows/amd-mi450-tests.yml",),
-    "nvidia-arm": (".github/workflows/pr-test-nvidia-arm.yml",),
+    "nvidia-arm": (".github/workflows/nvidia-arm-tests.yml",),
     "nvidia-gb200-slurm": (".github/workflows/nvidia-gb200-tests.yml",),
     "nvidia-gb300-slurm": (".github/workflows/nvidia-gb300-tests.yml",),
     "nvidia-x86": (".github/workflows/nvidia-b200-tests.yml",),

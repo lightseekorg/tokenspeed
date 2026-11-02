@@ -24,7 +24,7 @@ PR_TEST_WORKFLOWS = (
     "amd-mi350-tests.yml",
     "amd-mi450-tests.yml",
     "nvidia-b200-tests.yml",
-    "pr-test-nvidia-arm.yml",
+    "nvidia-arm-tests.yml",
 )
 MI450_STACK_KEYS = (
     "ROCM_NIGHTLY_INDEX",
@@ -57,8 +57,8 @@ def load_yaml(path: Path) -> dict:
         "nvidia-b200-tests.yml",
         "nvidia-gb200-tests.yml",
         "nvidia-gb300-tests.yml",
-        "pr-test-ascendnpu-arm.yml",
-        "pr-test-nvidia-arm.yml",
+        "ascend-npu-tests.yml",
+        "nvidia-arm-tests.yml",
     ),
 )
 def test_test_workflows_cancel_only_pull_request_runs(name: str):
@@ -1233,7 +1233,7 @@ def test_gb300_slurm_per_commit_matrix_excludes_nightly_tp8_tasks(monkeypatch):
 
 
 def test_nvidia_arm_workflow_excludes_multi_node_tasks():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-arm-tests.yml")
     scan_script = next(
         step["run"]
         for step in workflow["jobs"]["scan"]["steps"]
@@ -1253,7 +1253,7 @@ def test_qwen35_agentic_allows_declared_80k_context():
 
 
 def test_nvidia_arm_model_tests_allow_runner_wait_time():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-arm-tests.yml")
 
     assert workflow["jobs"]["model-test"]["with"]["timeout_minutes"] >= 120
 
@@ -1543,7 +1543,7 @@ def test_pr_test_finish_ignores_the_union_of_gpu_workflow_paths():
         "amd-mi350-tests",
         "amd-mi450-tests",
         "nvidia-b200-tests",
-        "pr-test-nvidia-arm",
+        "nvidia-arm-tests",
     )
     union = set()
     for name in gpu_workflows:
