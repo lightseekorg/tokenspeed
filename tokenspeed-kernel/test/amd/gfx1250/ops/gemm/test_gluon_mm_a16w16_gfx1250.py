@@ -128,7 +128,7 @@ def test_dsv4_linear_fp32_wide_n_matches_reference() -> None:
     # request at CUDA graph batch sizes 1 to 16.
     n, k = 32320, 5120
     b = _operands(1, n, k, seed=0)[1]
-    for m in (5, 80):
+    for m in (5, 10, 20, 40, 80):
         a = _operands(m, n, k, seed=m)[0]
         actual = dsv4_linear_fp32(a, b, override="gluon_dsv4_linear_fp32_gfx1250")
         assert actual.dtype == torch.float32
