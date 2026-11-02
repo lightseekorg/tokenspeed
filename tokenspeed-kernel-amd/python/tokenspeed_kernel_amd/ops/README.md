@@ -1208,8 +1208,8 @@ projection and optional sigmoid gate into its split merge.
 
 #### Algorithm
 
-Each workgroup of two warps owns one sequence, a block of up to 16 query
-heads, and one split of the keys, and walks one 64-key page per tile. TDM
+Each workgroup owns one sequence, a block of up to 16 query heads, and one
+split of the keys, and walks one 64-key page per tile. TDM
 loads the latent and RoPE parts of each page into LDS as two loads. The
 splits write FP32 partials that a second kernel merges. Each merge program
 owns 128 latent columns of one token and head, so even a single request
@@ -1217,20 +1217,27 @@ spreads its merge over many programs. It streams up to 64 splits per step
 straight into registers, stopping at the last split that holds keys, and
 reduces across warps once at the end, so a few dependent loads cover even
 the largest split count and the merge has no split-count limit. The split
-count follows the query-block decode's rule below.
+count follows the query-block decode's rule below for blocks of up to 32
+rows.
 
-The QK product spreads rows over warps and the PV product spreads latent
-columns. When a block's rows really span several warps, each tile hands the
+The QK product spreads 16-row tiles over warps and the PV product spreads
+latent columns. A 16-row block is a single row tile, so 16-bit inputs use two
+warps that each compute all of it, while FP8 inputs use four warps that split
+its keys instead (`KEYS_SPLIT`): each warp loads and multiplies only its 16
+keys of every tile, and keeps per-key exponent sums that the split adds up
+once at the end. When QK really spans several warps, each tile hands the
 probabilities and rescale factors to every warp through two small LDS buffers
 behind a single barrier; that barrier also orders the tile's last LDS reads
 before the TDM load that reuses its slot.
 
 16-bit inputs load each tile into one LDS slot and wait for it before the
-math. FP8 inputs use two slots and two waves per SIMD: the next tile's page
-index and its two TDM loads go out before the current tile's math, and each
-split issues its first tile before loading the queries. The loop unrolls by
-two so each slot index is a compile-time constant; waiting until two loads
-remain then leaves the other slot's loads in flight.
+math. FP8 inputs use two slots: the next tile's page index and its two TDM
+loads go out before the current tile's math, and each split issues its first
+tile before loading the queries. The loop unrolls by two so each slot index
+is a compile-time constant; waiting until two loads remain then leaves the
+other slot's loads in flight. FP8 programs compile for two waves per SIMD
+only when the grid holds more programs than CUs; otherwise one wave per SIMD
+leaves the whole register file to one program.
 
 ### gfx1250 MLA query-block decode
 
@@ -1263,17 +1270,24 @@ The query-block decode reuses the flattened decode's scan and merge kernels.
 Each request's queries start at `request * queries`, so no query-start
 metadata is read. A program holds every head of a block of whole queries in
 16, 32, or 64 rows, the smallest that covers `queries * heads`. More than 64
-rows split the block by query; more than 64 heads split it by head. Each KV
-tile the program loads serves all of its rows, and per-query lengths apply the
-causal mask within the block. Programs of 16 rows use two warps and larger
-ones four; FP8 double-buffers its TDM loads as in the flattened decode.
+rows split the block by query; more than 64 heads split it by head. FP8
+blocks also halve by query while even 128 splits would leave CUs idle: Kimi
+K3 verify at one request (4 queries of 12 heads) runs as two 32-row halves,
+each reading the request's KV, which at one request is far from the
+bandwidth limit. Each KV tile the program loads serves all of its rows, and
+per-query lengths apply the causal mask within the block. FP8 blocks of up to
+32 rows use four warps that split QK by keys as in the flattened decode;
+16-bit blocks of 16 rows use two warps, and other blocks four. FP8
+double-buffers its TDM loads as in the flattened decode.
 
-FP8 programs fit two per CU (`waves_per_eu=2`), and a second resident program
-hides the first one's TDM and LDS waits. The KV split count first spreads the
-programs over every CU, then keeps doubling toward two programs per CU while
-each split still walks at least 12 pages of `max_seqlen_k`; shorter splits
-spend more on their prologue and FP32 partials than they save. It is a power
-of two of at most 128. A query that sees no key in a split stores a
+The KV split count first spreads the programs over every CU. A 64-row FP8
+program needs a whole CU's registers: two squeezed onto one CU
+(`waves_per_eu=2`) each run slower than the extra splits gain, so these
+programs stop at one per CU and compile for one wave per SIMD. Smaller and
+16-bit blocks keep doubling the splits toward two programs per CU while each
+split still walks at least 12 pages of `max_seqlen_k`; shorter splits spend
+more on their prologue and partials than they save. The count is a power of
+two of at most 128. A query that sees no key in a split stores a
 negative-infinity maximum, so the merge skips that split without producing
 NaN. The splits store their partials in BF16, halving the partial traffic
 that at 32 or more splits otherwise reaches a fifth of the KV bytes. The

@@ -57,7 +57,8 @@ class AttentionConfig:
     K_ROPE_SHARED_LAYOUT: gl.constexpr
     P_SHARED_LAYOUT: gl.constexpr
     ALPHA_SHARED_LAYOUT: gl.constexpr
-    ROWS_SPLIT_ACROSS_WARPS: gl.constexpr
+    QK_SPLIT_ACROSS_WARPS: gl.constexpr
+    KEYS_SPLIT: gl.constexpr
     kv_cache_modifier: gl.constexpr
 
     @gluon.constexpr_function
@@ -73,6 +74,7 @@ class AttentionConfig:
         WARP_SIZE,
         SCALE,
         K_WIDTH,
+        KEYS_SPLIT,
     ):
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
         self.QK_SCALE = gl.constexpr(SCALE * _INV_LN2_VALUE)
@@ -97,6 +99,7 @@ class AttentionConfig:
             NUM_WARPS,
             WARP_SIZE,
             K_WIDTH,
+            KEYS_SPLIT,
         )
         self.QK_WMMA_LAYOUT = gl.constexpr(qk_wmma_layout)
         self.PV_WMMA_LAYOUT = gl.constexpr(pv_wmma_layout)
@@ -118,8 +121,12 @@ class AttentionConfig:
         self.ALPHA_SHARED_LAYOUT = gl.constexpr(
             gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
         )
-        # The QK layout puts warps along rows in 16-row WMMA tiles.
-        self.ROWS_SPLIT_ACROSS_WARPS = gl.constexpr(BLOCK_M > 16 and NUM_WARPS > 1)
+        # The QK layout puts warps along 16-row WMMA tiles, or along 16-key
+        # tiles with KEYS_SPLIT; one row tile leaves extra warps replicated.
+        self.QK_SPLIT_ACROSS_WARPS = gl.constexpr(
+            (BLOCK_M > 16 or KEYS_SPLIT) and NUM_WARPS > 1
+        )
+        self.KEYS_SPLIT = gl.constexpr(KEYS_SPLIT)
         self.kv_cache_modifier = gl.constexpr(".cg")
 
 
@@ -136,6 +143,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "BLOCK_M",
         "NUM_HEAD_BLOCKS",
         "NUM_KV_SPLITS",
+        "KEYS_SPLIT",
         "num_warps",
         "num_stages",
     ],
@@ -225,19 +233,21 @@ def _attend_kv_tile(
     # P : (BLOCK_M, TILE_SIZE,)
     P = gl.exp2(S - m_j[:, None])
 
-    # l_j : (BLOCK_M,)
-    l_j = gl.sum(P, axis=1)
-
     # alpha : (BLOCK_M, )
     alpha = gl.exp2(M - m_j)
 
     # update constants
-    L = L * alpha + l_j
+    if cfg.KEYS_SPLIT:
+        # Each warp holds only some keys of a row, so L keeps per-key sums
+        # and the split adds them up once at the end.
+        L = L * alpha[:, None] + P
+    else:
+        L = L * alpha + gl.sum(P, axis=1)
     M = m_j
 
-    # The QK product splits rows across warps while the PV product splits
-    # latent columns, so every warp needs all rows' probabilities and rescale
-    # factors. When the rows really are spread over warps, exchanging both
+    # The QK product splits rows or keys across warps while the PV product
+    # splits latent columns, so every warp needs all of the probabilities and
+    # rescale factors. When QK really is spread over warps, exchanging both
     # through dedicated LDS buffers costs one barrier per tile instead of the
     # several a layout conversion adds. V is read before that barrier, so
     # passing it also means every warp is done with this KV slot before the
@@ -247,13 +257,13 @@ def _attend_kv_tile(
         P = P.to(KV_lora_trans.dtype)
     else:
         P = P.to(KV_lora_trans.dtype, fp_downcast_rounding="rtz")
-    if cfg.ROWS_SPLIT_ACROSS_WARPS:
+    if cfg.QK_SPLIT_ACROSS_WARPS:
         p_shared.store(P)
         alpha_shared.store(alpha)
         P = p_shared.load(layout=cfg.P_DOT_LAYOUT)
         alpha_pv = alpha_shared.load(layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
     else:
-        # Every warp already holds all rows; the conversions stay in registers.
+        # Every warp already holds all of QK; the conversions stay in registers.
         P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
         alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
 
@@ -301,6 +311,7 @@ def _mla_decode_fwd_kernel(
     ALL_DECODE: gl.constexpr = False,  # bool
     K_WIDTH: gl.constexpr = 0,  # int
     IS_FP8: gl.constexpr = False,
+    KEYS_SPLIT: gl.constexpr = False,
 ):
     assert not SHUFFLED_KV_CACHE
     assert NUM_BUFFERS == 1 or NUM_BUFFERS == 2
@@ -316,6 +327,7 @@ def _mla_decode_fwd_kernel(
         WARP_SIZE,
         SCALE,
         K_WIDTH,
+        KEYS_SPLIT,
     )
     q_block_global_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
@@ -498,9 +510,15 @@ def _mla_decode_fwd_kernel(
         dtype=gl.float32,
         layout=gl.SliceLayout(1, cfg.QK_WMMA_LAYOUT),
     )
-    L = gl.full(
-        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.QK_WMMA_LAYOUT)
-    )
+    if KEYS_SPLIT:
+        L = gl.zeros([BLOCK_M, TILE_SIZE], dtype=gl.float32, layout=cfg.QK_WMMA_LAYOUT)
+    else:
+        L = gl.full(
+            [BLOCK_M],
+            1.0,
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.QK_WMMA_LAYOUT),
+        )
     acc = gl.zeros([BLOCK_M, KV_LORA_RANK], dtype=gl.float32, layout=cfg.PV_WMMA_LAYOUT)
 
     # context length for this particular sequences
@@ -621,6 +639,8 @@ def _mla_decode_fwd_kernel(
 
     if kv_scale_ptr is not None:
         acc = acc * kv_scale
+    if KEYS_SPLIT:
+        L = gl.sum(L, axis=1)
 
     offs_q_m_pv = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
     offs_q_d_lora_pv = gl.arange(
@@ -1009,8 +1029,13 @@ def launch_gluon_mla_decode_gfx1250(
         # Two FP8 tiles fit in LDS beside a second resident wave; 16-bit
         # tiles are twice the size, so they keep one slot and one wave.
         NUM_BUFFERS=2 if is_fp8 else 1,
-        num_warps=2,
-        waves_per_eu=2 if is_fp8 else 1,
+        # A 16-row block is a single QK row tile, so FP8 warps split its keys
+        # rather than each computing the whole tile.
+        KEYS_SPLIT=is_fp8,
+        num_warps=4 if is_fp8 else 2,
+        waves_per_eu=_fp8_waves_per_eu(
+            total_num_q_blocks * num_kv_splits, num_sms, is_fp8
+        ),
         num_stages=2,
     )
 
@@ -1051,41 +1076,73 @@ def launch_gluon_mla_decode_gfx1250(
     return (out, lse) if return_lse else out
 
 
+_MAX_KV_SPLITS = 128
+
+
 def _select_num_kv_splits(
     *,
     num_sms: int,
     num_q_programs: int,
     max_seqlen_k: int,
     tile_size: int,
+    two_per_cu: bool = True,
 ) -> int:
     """Choose the KV split count for decode and query-block programs.
 
-    Splits first spread the programs over every CU. An FP8 program fits in
-    half a CU, and a second resident one hides the first one's TDM and LDS
-    waits, so splits keep doubling toward two programs per CU while each
-    split still walks at least 12 pages; shorter splits spend more on their
-    prologue and FP32 partials than they save. At most 128 splits.
+    Splits first spread the programs over every CU. A program of up to 32
+    FP8 rows fits in half a CU, and a second resident one hides the first
+    one's TDM and LDS waits, so with ``two_per_cu`` splits keep doubling
+    toward two programs per CU while each split still walks at least 12
+    pages; shorter splits spend more on their prologue and partials than
+    they save. A 64-row program needs a whole CU's registers, so squeezing
+    two onto a CU slows both more than the extra splits gain. At most 128
+    splits.
     """
     pages = max(1, math.ceil(max_seqlen_k / tile_size))
     programs = max(1, num_q_programs)
-    one_per_cu = min(128, pages, max(1, num_sms // programs))
-    two_per_cu = min(128, max(1, pages // 12), max(1, 2 * num_sms // programs))
-    splits = max(one_per_cu, two_per_cu)
+    splits = min(_MAX_KV_SPLITS, pages, max(1, num_sms // programs))
+    if two_per_cu:
+        splits = max(
+            splits,
+            min(_MAX_KV_SPLITS, max(1, pages // 12), max(1, 2 * num_sms // programs)),
+        )
     return 1 << (splits.bit_length() - 1)
 
 
-def _query_block_shape(num_query_heads: int, queries: int) -> tuple[int, int, int]:
+def _fp8_waves_per_eu(num_programs: int, num_sms: int, is_fp8: bool) -> int:
+    """Compile FP8 programs for two waves per SIMD only when two share a CU.
+
+    16-bit operands need the whole register file of one wave.
+    """
+    return 2 if is_fp8 and num_programs > num_sms else 1
+
+
+def _query_block_shape(
+    num_query_heads: int, queries: int, *, requests: int = 1, num_sms: int = 0
+) -> tuple[int, int, int]:
     """Return BLOCK_M, BLOCK_Q and head blocks for one request's query block.
 
     A program holds BLOCK_Q whole queries of every head, so each KV tile it
     loads serves all of them. Past 64 rows the block splits by query, and a
-    query with more than 64 heads splits by head.
+    query with more than 64 heads splits by head. When even the largest
+    split count would leave some of ``num_sms`` CUs idle, the block halves by
+    query until the programs cover them: each half reads the request's KV
+    again, but so few requests are far from the bandwidth limit, and a
+    program of half the rows finishes its tiles sooner.
     """
     rows = queries * num_query_heads
     block_m = 16 if rows <= 16 else 32 if rows <= 32 else 64
-    if num_query_heads <= block_m:
-        return block_m, block_m // num_query_heads, 1
-    return block_m, 1, math.ceil(num_query_heads / block_m)
+    if num_query_heads > block_m:
+        return block_m, 1, math.ceil(num_query_heads / block_m)
+    block_q = block_m // num_query_heads
+    while (
+        block_q > 1
+        and num_query_heads <= block_m // 2
+        and requests * triton.cdiv(queries, block_q) * _MAX_KV_SPLITS < num_sms
+    ):
+        block_m //= 2
+        block_q = block_m // num_query_heads
+    return block_m, block_q, 1
 
 
 def _launch_query_block_decode(
@@ -1097,10 +1154,14 @@ def _launch_query_block_decode(
     out: torch.Tensor,
     lse: torch.Tensor | None,
     *,
+    block_m: int,
+    block_q: int,
+    num_head_blocks: int,
     num_kv_splits: int,
     num_warps: int,
     num_buffers: int,
     waves_per_eu: int,
+    keys_split: bool,
     value_weight: torch.Tensor | None = None,
     gate: torch.Tensor | None = None,
     counters: torch.Tensor | None = None,
@@ -1115,7 +1176,6 @@ def _launch_query_block_decode(
     qk_rope_head_dim = q.shape[-1] - kv_lora_rank
     page_size = kv_cache.shape[1]
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    block_m, block_q, num_head_blocks = _query_block_shape(num_query_heads, queries)
     total_num_q_blocks = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
     num_tokens = batch_size * queries
     q_flat = q.reshape(num_tokens, num_query_heads, q.shape[-1])
@@ -1169,6 +1229,7 @@ def _launch_query_block_decode(
         K_WIDTH=16 if is_fp8 else 8,
         IS_FP8=is_fp8,
         NUM_BUFFERS=num_buffers,
+        KEYS_SPLIT=keys_split,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         num_stages=2,
@@ -1283,14 +1344,24 @@ def _launch_query_blocks(
 ) -> None:
     batch_size, queries, num_query_heads, _ = q.shape
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    block_m, block_q, num_head_blocks = _query_block_shape(num_query_heads, queries)
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    block_m, block_q, num_head_blocks = _query_block_shape(
+        num_query_heads,
+        queries,
+        requests=batch_size,
+        num_sms=num_sms if is_fp8 else 0,
+    )
     num_q_programs = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
     num_kv_splits = _select_num_kv_splits(
-        num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+        num_sms=num_sms,
         num_q_programs=num_q_programs,
         max_seqlen_k=max_seqlen_k,
         tile_size=kv_cache.shape[1],
+        two_per_cu=block_m <= 32 or not is_fp8,
     )
+    # FP8 blocks of up to 32 rows have fewer 16-row tiles than warps, so the
+    # warps split QK by keys.
+    keys_split = is_fp8 and block_m <= 32
     _launch_query_block_decode(
         q,
         kv_cache,
@@ -1299,12 +1370,14 @@ def _launch_query_blocks(
         softmax_scale,
         out,
         lse,
+        block_m=block_m,
+        block_q=block_q,
+        num_head_blocks=num_head_blocks,
         num_kv_splits=num_kv_splits,
-        num_warps=2 if block_m == 16 else 4,
+        num_warps=4 if keys_split or block_m > 16 else 2,
         num_buffers=2 if is_fp8 else 1,
-        # FP8 programs fit two per CU (see the split selection); 16-bit
-        # operands need the whole register file of one.
-        waves_per_eu=2 if is_fp8 else 1,
+        waves_per_eu=_fp8_waves_per_eu(num_q_programs * num_kv_splits, num_sms, is_fp8),
+        keys_split=keys_split,
         value_weight=value_weight,
         gate=gate,
         counters=counters,
