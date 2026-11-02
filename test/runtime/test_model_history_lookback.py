@@ -42,7 +42,6 @@ def _profile(**overrides) -> ModelProfile:
         cache_family="test_history",
         linear_attention=None,
         default_attention_backend=None,
-        default_prefix_granularity=None,
         request_token_history=True,
         is_multimodal=False,
         tokenizer_kwargs={},
