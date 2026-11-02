@@ -337,6 +337,27 @@ def test_dsa_workspace_conversion_reads_unsigned_int16_indices(device: str) -> N
         )
 
 
+def test_dsa_workspace_topk_int32_slots_match_int64_slots(device: str) -> None:
+    generator = torch.Generator(device=device).manual_seed(9)
+    slots = torch.randint(
+        -1, 2**31 - 1, (4096,), device=device, generator=generator, dtype=torch.int32
+    )
+    workspace_indices = torch.randint(
+        -1, 4096, (64, 2051), device=device, generator=generator, dtype=torch.int32
+    )
+
+    expected = dsa_workspace_topk_to_global_slots(
+        workspace_indices=workspace_indices,
+        kv_workspace_slots=slots.long(),
+    )
+    actual = dsa_workspace_topk_to_global_slots(
+        workspace_indices=workspace_indices,
+        kv_workspace_slots=slots,
+    )
+
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("total", [1, 255, 256, 257, 513])
 def test_dsa_workspace_conversion_tracks_runtime_total(device: str, total: int) -> None:
     storage = torch.arange(total * 2, device=device, dtype=torch.int32).view(1, -1)

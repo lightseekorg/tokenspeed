@@ -356,7 +356,7 @@ def mla_project_value(
             return kernel(attention=attention, weight=weight, gate=gate, out=out)
 
     output_view = out.view(batch, heads, value_dim)
-    if current_platform().is_nvidia:
+    if current_platform().is_nvidia or current_platform().is_cdna5:
         torch.bmm(
             attention.transpose(0, 1),
             weight,

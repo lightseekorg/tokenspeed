@@ -176,6 +176,51 @@ def test_kda_prefill_matches_packed_recurrent_reference(
     assert actual_state.stride()[-2:] == (dim, 1)
 
 
+def test_kda_prefill_reads_row_strided_beta() -> None:
+    """Raw betas sliced from a fused projection's columns (GLM-5.3-Flash's
+    q|k|v|beta|f|g rows) give the bits of their contiguous copy."""
+    torch.manual_seed(37)
+    lengths = [1, 15, 64, 65, 848]
+    total_tokens = sum(lengths)
+    heads = 16
+    dim = 128
+    q = torch.randn(1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    raw_g = torch.randn_like(q)
+    projection = torch.randn(1, total_tokens, 6416, device="cuda", dtype=torch.bfloat16)
+    beta = projection[..., 6144 : 6144 + heads]
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0
+    dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+    initial_state = torch.randn(
+        len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
+    )
+    cu_seqlens = torch.tensor(
+        [0, *accumulate(lengths)], device="cuda", dtype=torch.int32
+    )
+
+    def run(beta_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return launch_kda_prefill(
+            q,
+            k,
+            v,
+            raw_g,
+            beta_logits,
+            a_log,
+            dt_bias,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            lower_bound=-5.0,
+            cu_seqlens_cpu=cu_seqlens.cpu().long(),
+        )
+
+    expected_output, expected_state = run(beta.contiguous())
+    output, state = run(beta)
+
+    assert torch.equal(output, expected_output)
+    assert torch.equal(state, expected_state)
+
+
 def test_kda_prefill_new_batches_reuse_compiled_kernels() -> None:
     torch.manual_seed(41)
     heads = 2

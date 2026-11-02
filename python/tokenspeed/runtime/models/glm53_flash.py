@@ -668,8 +668,6 @@ class Glm53FlashKDA(nn.Module):
             dim=-1,
         )
         output_gate = self.g_b_proj(g_a)[0]
-        if not ctx.forward_mode.is_decode():
-            mixed_qkv = mixed_qkv.contiguous()
         conv_versions = (
             self.q_conv1d_weight._version,
             self.k_conv1d_weight._version,
