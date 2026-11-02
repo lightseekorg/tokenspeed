@@ -711,6 +711,14 @@ rows (one per request) before the LM head. Every QCP collective is data
 movement, so a row's bits do not depend on which rank computes it
 (`docs/design/numerics.md`).
 
+DSA packs whole request histories into contiguous groups within its reserved
+history workspace. It keeps the minimum group count that fits the workspace,
+then minimizes the largest group's history row count. Request order and query
+ownership stay unchanged. This reduces the peak rows presented to the indexer
+without adding history gathers; latency still depends on query distribution
+and the selected kernels. A request whose history exceeds the workspace is
+rejected.
+
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
 Host KVStore, the retraction snapshot pool and L3 storage, as every

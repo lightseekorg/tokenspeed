@@ -94,6 +94,50 @@ def _k_row_context_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
     return seq_lens.unsqueeze(1).expand(-1, k).reshape(-1, 1)
 
 
+def balanced_group_rows(lengths: list[int], cap: int) -> int:
+    """Minimize the largest contiguous group without increasing group count.
+
+    ``lengths`` are nonnegative request history row counts, each at most the
+    nonnegative workspace ``cap``. Requests stay whole and in input order.
+    Return the smallest row bound preserving greedy packing's group count
+    at ``cap``; return ``cap`` for an empty input.
+    """
+    if cap < 0:
+        raise ValueError(f"history workspace capacity must be nonnegative, got {cap}")
+    for length in lengths:
+        if length < 0:
+            raise ValueError(
+                f"request history length must be nonnegative, got {length}"
+            )
+        if length > cap:
+            raise RuntimeError(
+                f"request history of {length} rows exceeds the "
+                f"{cap}-row query-context-parallel gather workspace"
+            )
+    if not lengths:
+        return cap
+
+    def count(bound: int) -> int:
+        groups, rows = 1, 0
+        for length in lengths:
+            if rows + length > bound:
+                groups, rows = groups + 1, 0
+            rows += length
+        return groups
+
+    # For nonnegative lengths, greedy packing uses the fewest contiguous
+    # groups at a given bound. That count cannot rise as the bound grows.
+    target = count(cap)
+    lo, hi = max(lengths), cap
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if count(mid) <= target:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
 @dataclasses.dataclass(frozen=True)
 class QueryShardHistoryGroup:
     """One request group of a sharded extend: its history and this rank's queries.
@@ -727,8 +771,9 @@ class DSABackend(PagedAttentionBackend):
 
         Host arithmetic over the pinned length mirrors and the host page table
         (owned-row counts per rank); the device work is one slot build per
-        group. Greedy grouping by summed history length against the gather
-        workspace, a request never splits.
+        group. Keep the minimum number of contiguous groups that fit the gather
+        workspace, then minimize their largest summed history length. A
+        request never splits.
         """
         if self._history_workspace is None:
             raise RuntimeError(
@@ -744,6 +789,7 @@ class DSABackend(PagedAttentionBackend):
                 f"carry {sum(extend_lens)}"
             )
         history_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        bound = balanced_group_rows(history_lens, self._history_workspace.rows)
         placement = self.cache_placement(None)
         owned = owned_history_rows(
             page_table_cpu[:num_extends],
@@ -751,20 +797,14 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             placement=placement,
         )
-        cap = self._history_workspace.rows
         groups: list[QueryShardHistoryGroup] = []
         query_start = 0
         row_base = 0
         first = 0
         while first < num_extends:
-            if history_lens[first] > cap:
-                raise RuntimeError(
-                    f"request history of {history_lens[first]} rows exceeds the "
-                    f"{cap}-row query-context-parallel gather workspace"
-                )
             last = first
             rows = history_lens[first]
-            while last + 1 < num_extends and rows + history_lens[last + 1] <= cap:
+            while last + 1 < num_extends and rows + history_lens[last + 1] <= bound:
                 last += 1
                 rows += history_lens[last]
             requests = slice(first, last + 1)

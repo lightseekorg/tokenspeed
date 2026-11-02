@@ -31,6 +31,7 @@ workspace reservation agreeing with the recipe's plan in either format.
 
 from __future__ import annotations
 
+from itertools import product
 from test.runtime.dsa_index_k_test_utils import (
     expected_index_k_rows,
     index_k_pool,
@@ -150,7 +151,7 @@ def _init(backend: dsa.DSABackend, plan: QueryShardPlan) -> None:
 def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     backend = _backend(
         rank, workspace_rows=11, index_k_format="fp8_scaled"
-    )  # 6 + 5 fit, 6 + 5 + 5 do not
+    )  # two groups: balance 6 + 5, 5 into 6, 5 + 5
     plan = _plan(rank)
     delegate_calls = []
     backend._dense_backend.init_forward_metadata = (
@@ -162,13 +163,13 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     assert delegate_calls[0]["page_table_cpu"] is None
     meta = backend.require_query_shard_metadata()
     assert meta.plan is plan
-    assert [g.requests for g in meta.groups] == [slice(0, 2), slice(2, 3)]
-    assert [g.rows for g in meta.groups] == [11, 5]
-    assert [g.row_base for g in meta.groups] == [0, 11]
-    # Query rows 0-4 belong to the first group, 5-9 to the second; each
+    assert [g.requests for g in meta.groups] == [slice(0, 1), slice(1, 3)]
+    assert [g.rows for g in meta.groups] == [6, 10]
+    assert [g.row_base for g in meta.groups] == [0, 6]
+    # Query rows 0-3 belong to the first group, 4-9 to the second; each
     # rank's slice is its shard intersected with the group's span.
     start, end = plan.local_start, plan.local_end
-    for group, (lo, hi) in zip(meta.groups, ((0, 5), (5, 10))):
+    for group, (lo, hi) in zip(meta.groups, ((0, 4), (4, 10))):
         expected = slice(
             min(max(lo, start), end) - start, min(max(hi, start), end) - start
         )
@@ -178,6 +179,76 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
         assert group.gather.group == (0,)
         assert group.gather.owned_rows_per_rank == (group.rows,)
         assert group.gather.virtual_slots.numel() == group.rows
+
+
+@pytest.mark.parametrize(
+    "lengths,cap,expected",
+    [
+        ([], 11, 11),
+        ([], 0, 0),
+        ([0, 0], 0, 0),
+        ([0, 0], 11, 0),
+        ([0, 6, 5, 5], 11, 10),
+        ([6, 0, 5, 5, 0], 11, 10),
+        ([5], 11, 5),
+        ([5, 6], 11, 11),
+        ([11, 11], 11, 11),
+        ([3] * 5, 8, 6),
+        ([10, 1, 1, 1], 11, 10),
+        ([200000] * 8, 1048576, 800000),
+    ],
+)
+def test_balanced_group_bound(lengths, cap, expected):
+    assert dsa.balanced_group_rows(lengths, cap) == expected
+
+
+@pytest.mark.parametrize(
+    "lengths,cap,error,match",
+    [
+        ([], -1, ValueError, "capacity must be nonnegative"),
+        ([-1], 11, ValueError, "length must be nonnegative"),
+        ([6, -1, 5], 11, ValueError, "length must be nonnegative"),
+        ([12], 11, RuntimeError, "exceeds"),
+        ([0, 12], 11, RuntimeError, "exceeds"),
+        ([1], 0, RuntimeError, "exceeds"),
+    ],
+)
+def test_balanced_group_bound_rejects_invalid_lengths(lengths, cap, error, match):
+    with pytest.raises(error, match=match):
+        dsa.balanced_group_rows(lengths, cap)
+
+
+def test_balanced_group_bound_matches_all_contiguous_partitions():
+    # Independent oracle: enumerate every cut pattern, minimizing first the
+    # group count allowed by cap and then the largest group's row count.
+    for size in range(1, 6):
+        for lengths in product(range(3), repeat=size):
+            partitions = []
+            for cuts in product((False, True), repeat=size - 1):
+                sums = [lengths[0]]
+                for cut, length in zip(cuts, lengths[1:]):
+                    if cut:
+                        sums.append(length)
+                    else:
+                        sums[-1] += length
+                partitions.append((len(sums), max(sums)))
+            for cap in range(max(lengths), sum(lengths) + 2):
+                expected_count, expected_bound = min(
+                    (count, bound) for count, bound in partitions if bound <= cap
+                )
+                bound = dsa.balanced_group_rows(list(lengths), cap)
+                assert bound == expected_bound
+                # Build groups by consuming requests, including leading zeros.
+                remaining = list(lengths)
+                groups = []
+                while remaining:
+                    rows = remaining.pop(0)
+                    while remaining and rows + remaining[0] <= bound:
+                        rows += remaining.pop(0)
+                    groups.append(rows)
+                assert len(groups) == expected_count
+                assert sum(groups) == sum(lengths)
+                assert max(groups) <= cap
 
 
 def test_a_history_over_the_workspace_is_refused_and_an_unsharded_init_clears():
