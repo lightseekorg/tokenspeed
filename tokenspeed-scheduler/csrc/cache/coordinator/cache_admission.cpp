@@ -1126,9 +1126,46 @@ void CacheCoordinator::ReleaseStateInputs(std::span<BlockTable> tables) {
     }
 }
 
+bool CacheCoordinator::deferBehindOwnEvictionStores(std::size_t first_own_segment, std::vector<CacheBlockRef> host_pins,
+                                                    const StreamOrderedStoreQuery& stream_ordered_stores) {
+    // This admission waits behind an ACK only if one of its victims needs
+    // a store of its own. A victim the Host already holds, or an
+    // in-flight stream-ordered store already copies, needs none: the
+    // drain borrows that store for it (or finds it on the Host) and its
+    // publication rides the carrying op's ACK either way. Only a pinned
+    // store's coverage does not count -- that fence lifts at the ACK,
+    // which is exactly what a defer waits behind. The in-flight set
+    // cannot change before the plan's drain: completions land between
+    // plans.
+    for (std::size_t s = first_own_segment; s < evicted_segments_.size(); ++s) {
+        for (const EvictedBlock& member : evicted_segments_[s].members) {
+            if (!member.host_block && !stream_ordered_stores(member.key)) {
+                deferred_admission_host_pins_.insert(deferred_admission_host_pins_.end(),
+                                                     std::move_iterator(host_pins.begin()),
+                                                     std::move_iterator(host_pins.end()));
+                return true;
+            }
+        }
+    }
+    // Nothing holds the room for an ACK -- a superseded input's reclaim,
+    // a key the Host already had, one an in-flight stream-ordered store
+    // covers: the admission takes the room in place like any reclaimed
+    // victim's, so the pages return now rather than with the drain. The
+    // members stay recorded for the drain, which settles their Host
+    // presence against the carrying stores; their device refs must not
+    // ride that drain's pinned lane.
+    for (std::size_t s = first_own_segment; s < evicted_segments_.size(); ++s) {
+        for (EvictedBlock& member : evicted_segments_[s].members) {
+            member.device_ref.reset();
+        }
+    }
+    return false;
+}
+
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
-    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments) {
+    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments,
+    const StreamOrderedStoreQuery& stream_ordered_stores) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].table != nullptr, "group demand requires a block table");
@@ -1206,6 +1243,55 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const std::int32_t kv_tokens = std::max(plan.prefix.device.kv_tokens, plan.prefix.host.kv_tokens);
     const bool state_prefix_cached = plan.prefix.state_at_prompt_end.has_value();
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
+    // A write-back plan that funds itself only by evicting cache blocks lets
+    // the stores pin the evicted pages until their ACK instead of granting
+    // them back to this admission in place: evict now and acquire nothing --
+    // the admission retries against the freed pins in a later round, exactly
+    // as one whose plan found no fit. The prefix claim above still runs so a
+    // victim's eviction cascade cannot take a page this admission hit, and
+    // its pins drop with the return. A plan counting on the request's own
+    // released slots cannot wait (only this admission's table moves release
+    // them), so it takes the stream-ordered lane below, as does a restore.
+    const bool defers_behind_eviction_stores =
+        write_back_evictions_ && !plan.victims.empty() &&
+        std::ranges::none_of(plan.victims, [](const VictimSet& set) { return set.is_request_reclaim; });
+    if (defers_behind_eviction_stores) {
+        // The defer's matched Host prefix stays pinned through the plan's
+        // drain, so the stores' Host placement cannot evict the entries the
+        // retry loads -- the same cover an admitted plan's loads give. Copies:
+        // the acquisition below still reads acquired_prefix on the fall-through.
+        std::vector<CacheBlockRef> host_pins;
+        for (const auto& per_group : acquired_prefix.host.per_group) {
+            for (const CacheBlockRef& host_block : per_group.blocks) {
+                if (host_block) {
+                    host_pins.push_back(host_block);
+                }
+            }
+        }
+        // Segments an earlier deferred admission of this plan recorded sit
+        // below this mark; they are never empty, so the erase below keeps
+        // them and their order in place.
+        const std::size_t first_own_segment = evicted_segments_.size();
+        for (const VictimSet& set : plan.victims) {
+            EvictedSegment* segment = &evicted_segments_.emplace_back();
+            segment->pin_device_sources = true;
+            for (const auto& [group_id, location, in_stranded_suffix] : set.members) {
+                // Best effort: a member that cannot leave now stays cached and
+                // is scanned again at the retry.
+                evictCachedBlock(
+                    group_id, location,
+                    in_stranded_suffix ? &DeviceEvictionStats::stranded_suffix : &DeviceEvictionStats::admission,
+                    segment);
+            }
+        }
+        std::erase_if(evicted_segments_, [](const EvictedSegment& segment) { return segment.members.empty(); });
+        if (deferBehindOwnEvictionStores(first_own_segment, std::move(host_pins), stream_ordered_stores)) {
+            return std::nullopt;
+        }
+        // Fell through: the pages returned in place with their device refs
+        // released, and the victim loop below retries each member, finds it
+        // gone and records nothing.
+    }
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,

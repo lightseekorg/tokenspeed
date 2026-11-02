@@ -510,12 +510,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         plan.With(ForwardBatch{std::move(built.forward)});
     }
     // What the build's admissions and restores evicted under the write-back
-    // policy goes to the Host in this plan: their pages may already be granted
-    // again, so the copy is stream-ordered and the runtime runs it ahead of
-    // the plan's page reuse. Every eviction record is taken here, never in a
-    // later plan. A no-op with nothing recorded.
-    if (auto store = tier_transfers_.StartEvictionStores()) {
-        write_back_operations.push_back(std::move(*store));
+    // policy goes to the Host in this plan, drained into at most one op per
+    // guard (the lane contract is on StartEvictionStores). Every eviction
+    // record is taken here, never in a later plan. A no-op with nothing
+    // recorded.
+    for (WriteBackOperation& store : tier_transfers_.StartEvictionStores()) {
+        write_back_operations.push_back(std::move(store));
     }
     // The prefix entries the build's evictions (and everything since the last
     // plan) left dead on both tiers. Nothing is queued unless the Host

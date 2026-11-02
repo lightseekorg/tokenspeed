@@ -256,6 +256,10 @@ private:
     AdmissionMatch matchPrefixAtAdmission(Request* request);
     // Records an admission's fresh pages (to zero) and copies on the plan.
     void recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result);
+    // The coordinator's view of the transfer manager's in-flight
+    // stream-ordered stores: an admission weighing a wait behind eviction
+    // stores consults it for every victim.
+    CacheCoordinator::StreamOrderedStoreQuery streamOrderedStores() const;
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,

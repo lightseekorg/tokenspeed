@@ -138,7 +138,7 @@ public:
         return index_.Contains(pool, location);
     }
     std::optional<CacheKey> EvictCachedBlock(const BlockPool& pool, CacheBlockLocation location) {
-        return index_.Evict(pool, location);
+        return index_.Evict(pool, location, /*evicted_block=*/nullptr);
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const { return index_.NumEntries(pool); }
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {

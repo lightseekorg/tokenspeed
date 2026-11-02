@@ -131,30 +131,38 @@ protected:
         if (config_.role == Role::kP) {
             SendBootstrapped(id);
         }
-        const ExecutionPlan plan = PlanOnce();
-        const ForwardBatch* batch = FindForwardBatch(plan);
-        Resume resume;
-        if (batch == nullptr) {
-            return resume;
-        }
-        const auto it = std::ranges::find(batch->request_ids, id);
-        if (it == batch->request_ids.end()) {
-            return resume;
-        }
-        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
-        resume.prefix_tokens = batch->extend_prefix_lens.at(row);
-        resume.state_row = batch->block_tables.at("state0").at(row);
-        for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
-            const auto& load = std::get<LoadBackBatch>(operation);
-            for (std::size_t i = 0; i < load.op_ids.size(); ++i) {
-                resume.load_rows += static_cast<std::int32_t>(load.src_pages[i].size());
-                SendLoadBackDone(load.op_ids[i]);
+        for (;;) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch != nullptr) {
+                const auto it = std::ranges::find(batch->request_ids, id);
+                if (it != batch->request_ids.end()) {
+                    Resume resume;
+                    const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+                    resume.prefix_tokens = batch->extend_prefix_lens.at(row);
+                    resume.state_row = batch->block_tables.at("state0").at(row);
+                    for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
+                        const auto& load = std::get<LoadBackBatch>(operation);
+                        for (std::size_t i = 0; i < load.op_ids.size(); ++i) {
+                            resume.load_rows += static_cast<std::int32_t>(load.src_pages[i].size());
+                            SendLoadBackDone(load.op_ids[i]);
+                        }
+                    }
+                    AckWriteBacks(plan);
+                    SendAbortEvent(id);
+                    PlanOnce();
+                    return resume;
+                }
             }
+            // A plan that defers id's admission carries the eviction's
+            // pinned store instead; acknowledging it lets the next plan
+            // admit id. Any other plan without id admits nothing more.
+            if (!ExtractCacheOpsOfKind<WriteBackBatch>(plan).empty()) {
+                AckWriteBacks(plan);
+                continue;
+            }
+            return Resume{};
         }
-        AckWriteBacks(plan);
-        SendAbortEvent(id);
-        PlanOnce();
-        return resume;
     }
 };
 
@@ -616,14 +624,19 @@ protected:
     };
 
     // Plans `id`'s prefill from its hit to its end, alone in each batch,
-    // landing every forward (the last with a sampled token).
+    // landing every forward (the last with a sampled token). A round whose
+    // admission defers behind its eviction's pinned store runs no forward for
+    // `id`; the store's ACK admits the request in a later round.
     std::vector<Chunk> RunPrefill(const std::string& id, std::int32_t prompt_tokens) {
         std::vector<Chunk> chunks;
         std::int32_t scheduled = 0;
         for (int round = 0; scheduled < prompt_tokens && round < 16; ++round) {
             const ExecutionPlan plan = PlanOnce();
             const ForwardBatch* batch = FindForwardBatch(plan);
-            ASSERT_TRUE_OR_RETURN(batch != nullptr && batch->request_ids == std::vector<std::string>{id}, chunks);
+            if (batch == nullptr || batch->request_ids != std::vector<std::string>{id}) {
+                AckWriteBacks(plan);
+                continue;
+            }
             Chunk chunk{.prefix_tokens = batch->extend_prefix_lens.at(0),
                         .tokens = batch->input_lengths.at(0),
                         .checkpoint_len = batch->extend_state_checkpoint_lens.at(0),
@@ -1923,9 +1936,10 @@ protected:
 };
 
 // f1's first chunk needs the room of s1's checkpoints: s1's one segment --
-// everything it published, the checkpoints first -- leaves the Device and is
-// copied to the Host in the plan that evicts it, stream-ordered, its blocks
-// already granted to f1. Its Host entries appear at the ACK.
+// everything it published, the checkpoints first -- leaves the Device, and the
+// plan that evicts it carries the store pinned, f1's admission deferred behind
+// it rather than granted the pages in place. Its Host entries appear at the
+// ACK, which releases the pages; the next plan grants them to f1.
 TEST_P(StateCheckpointPrefillHostShardSuite, EvictionWritesBackInTheSamePlan) {
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     CompleteSession("s1", MakeTokens(22));
@@ -1938,25 +1952,34 @@ TEST_P(StateCheckpointPrefillHostShardSuite, EvictionWritesBackInTheSamePlan) {
     ASSERT_EQ(stores.size(), 1u);
     const WriteBackBatch& store = std::get<WriteBackBatch>(stores.front());
     ASSERT_EQ(store.op_ids.size(), 1u);
-    EXPECT_EQ(store.source_pinned, std::vector<bool>{false});
+    EXPECT_EQ(store.source_pinned, std::vector<bool>{true});
     std::map<std::uint32_t, std::int32_t> rows_by_group;
     for (const std::uint32_t group : store.group_ids[0]) {
         ++rows_by_group[group];
     }
     EXPECT_EQ(rows_by_group, (std::map<std::uint32_t, std::int32_t>{{0, 6}, {1, 1}, {2, 1}, {3, 1}}));
     const std::array<std::string, 4> group_names{"full", "state0", "state1", "state2"};
-    std::int32_t reused = 0;
-    for (std::size_t row = 0; row < store.src_pages[0].size(); ++row) {
-        reused += static_cast<std::int32_t>(
-            std::ranges::count(plan.pages_to_zero.at(group_names[store.group_ids[0][row]]), store.src_pages[0][row]));
-    }
-    EXPECT_EQ(reused, 2) << "the parents s1's group-2 and group-3 checkpoints left hold f1's fresh blocks";
+    const auto reused_in = [&](const ExecutionPlan& p) {
+        std::int32_t reused = 0;
+        for (std::size_t row = 0; row < store.src_pages[0].size(); ++row) {
+            reused += static_cast<std::int32_t>(
+                std::ranges::count(p.pages_to_zero.at(group_names[store.group_ids[0][row]]), store.src_pages[0][row]));
+        }
+        return reused;
+    };
+    EXPECT_EQ(reused_in(plan), 0) << "the deferred plan grants none of s1's pages to f1 yet";
     const HostCacheStats stats = scheduler_->GetHostCacheStats();
     EXPECT_EQ(stats.publication_stores.ops + stats.finish_stores.ops, 0u);
     EXPECT_EQ(stats.eviction_stores.ops, 1u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "published at the ACK, not before";
     AckWriteBacks(plan);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
+
+    const ExecutionPlan retry = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(retry);
+    ASSERT_TRUE(batch != nullptr && batch->request_ids == std::vector<std::string>{"f1"});
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(retry).empty())
+        << "the room the ACK released admits f1 without a second eviction";
 }
 
 // After the write-back lands, the session resumes from the Host alone: its
@@ -2054,8 +2077,9 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TailHintSurvivesTheWriteBackWindow)
     EXPECT_EQ(Probe("s1-next", tokens).prefix_tokens, 22);
 }
 
-// Each plan drains what its own admissions evicted: f1's first chunk evicts
-// s1, f2's s2, and no batch after the first carries any of s1's keys.
+// Each plan drains what its own admissions evicted: f1's first chunk defers
+// behind s1's pinned store, f2's behind s2's, and no batch after the first
+// carries any of s1's keys.
 TEST_P(StateCheckpointPrefillHostShardSuite, NoEvictionRecordCrossesAPlan) {
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
@@ -2083,6 +2107,9 @@ TEST_P(StateCheckpointPrefillHostShardSuite, NoEvictionRecordCrossesAPlan) {
     for (const auto& [id, start] : {std::pair{"f1", 1000}, std::pair{"f2", 2000}}) {
         Submit(RequestWithTokens(id, MakeTokens(22, start)));
         SendBootstrapped(id);
+        // The admission defers behind the eviction's pinned store; the next
+        // plan admits the request.
+        plan_and_ack();
         for (std::int32_t chunk = 0; chunk < 3; ++chunk) {
             plan_and_ack();
             SendForwardDone(id, chunk == 2 ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
@@ -2376,7 +2403,9 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputStaysWhenTheNextV
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     SendBootstrapped("f1");
     const ExecutionPlan plan = PlanOnce();
-    ASSERT_NE(FindForwardBatch(plan), nullptr);
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    EXPECT_TRUE(batch == nullptr || batch->request_ids.empty())
+        << "the eviction defers f1's admission behind its pinned store";
     const std::vector<CacheOperation> stores = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
     ASSERT_EQ(stores.size(), 1u);
     std::map<std::uint32_t, std::int32_t> rows_by_group;
@@ -2530,7 +2559,13 @@ TEST_F(StateCheckpointPrefillHostSuite, AHitUnmarksTheSupersededInputUntilTheHit
         Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
         SendBootstrapped("f1");
         const ExecutionPlan plan = PlanOnce();
-        ASSERT_NE(FindForwardBatch(plan), nullptr);
+        // The finished resend's room is its own reclaim of the dead
+        // checkpoint, granted in place; the aborted one's is o's pinned
+        // store, which defers the admission.
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        const bool admitted =
+            batch != nullptr && std::ranges::find(batch->request_ids, "f1") != batch->request_ids.end();
+        EXPECT_EQ(admitted, resend_finishes);
         const std::vector<CacheOperation> stores = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
         const HostCacheStats stats = scheduler_->GetHostCacheStats();
         if (resend_finishes) {
@@ -2901,6 +2936,12 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASegmentHostCannotPlaceIsDroppedWho
     tokens.push_back(77);
     Submit(RequestWithTokens("h", tokens));
     SendBootstrapped("h");
+    const ExecutionPlan deferred = PlanOnce();
+    const ForwardBatch* deferred_batch = FindForwardBatch(deferred);
+    EXPECT_TRUE(deferred_batch == nullptr ||
+                std::ranges::find(deferred_batch->request_ids, "h") == deferred_batch->request_ids.end())
+        << "s2's eviction defers h's admission though nothing is copied";
+    AckWriteBacks(deferred);
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
@@ -2995,12 +3036,13 @@ TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsKeepDeviceSemantics) {
 // s1's prompt is handed off and its KV transfer is out: its table pins its
 // pages. s2 sends s1's prompt and four tokens more; its third chunk is cut
 // at the junction 20, so the checkpoint published there hangs under s1's
-// pinned pages. f1's first chunk writes s2's suffix back, the segment's climb
-// stopping below them. The junction's checkpoint boundary is then the only
-// cache left and cannot leave without a pinned page: neither f1's next chunk
-// nor f2's first runs, and nothing is written back. Once the transfer finishes,
-// s1's pages go to the Host like any cache: f1's next chunk writes s1's prompt
-// end back, and the plan after the junction's segment, s1's pages with it.
+// pinned pages. f1's first admission defers behind s2's suffix store, the
+// segment's climb stopping below them, and runs once the copy lands. The
+// junction's checkpoint boundary is then the only cache left and cannot leave
+// without a pinned page: f2's first admission finds no victim and nothing is
+// written back. Once the transfer finishes, s1's pages go to the Host like
+// any cache: f2 defers behind s1's prompt end's store, then behind the
+// junction's, s1's pages with it, and is admitted after both land.
 TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictims) {
     device_pages_ = 15;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
@@ -3038,12 +3080,13 @@ TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictim
         << "s2 resumes on s1's five pages";
 
     // By plan: the requests that run, and the rows written back as (group,
-    // Device page).
+    // Device page). Every eviction defers its admission behind the pinned
+    // store, so a step's victims free their pages for the next step.
     using Rows = std::vector<std::pair<std::string, std::int32_t>>;
     std::vector<std::vector<std::string>> ran;
     std::vector<Rows> written_back;
     std::map<std::string, std::int32_t> computed;
-    for (std::int32_t step = 0; step < 4; ++step) {
+    for (std::int32_t step = 0; step < 5; ++step) {
         if (step < 2) {
             const std::string id = step == 0 ? "f1" : "f2";
             Submit(RequestWithTokens(id, MakeTokens(22, 1000 * (step + 1))));
@@ -3073,7 +3116,8 @@ TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictim
         }
         AckWriteBacks(plan);
     }
-    EXPECT_EQ(ran, (std::vector<std::vector<std::string>>{{"f1"}, {}, {"f1"}, {"f1", "f2"}}));
+    EXPECT_EQ(ran, (std::vector<std::vector<std::string>>{{}, {"f1"}, {"f1"}, {"f1"}, {"f2"}}))
+        << "f1 defers behind s2's suffix, then f2 behind s1's prompt end and the junction";
     // A segment's checkpoints first, a tail's KV block leaving with the first
     // of them, then its pages from the deepest up.
     const Rows s2_suffix{{"state0", s2_table["state0"][1]},
@@ -3093,7 +3137,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictim
                         {"full", s1_table["full"][2]},
                         {"full", s1_table["full"][1]},
                         {"full", s1_table["full"][0]}};
-    EXPECT_EQ(written_back, (std::vector<Rows>{s2_suffix, {}, s1_prompt_end, junction}))
+    EXPECT_EQ(written_back, (std::vector<Rows>{s2_suffix, {}, s1_prompt_end, junction, {}}))
         << "s1's pages leave only once its transfer finished";
 }
 
@@ -3169,11 +3213,10 @@ TEST_F(StateCheckpointPrefillHostSuite, APromptAloneEvictsTheCheckpointOnItsOwnP
 // back, writing back no page a's transfer pins. Then a's transfer fails
 // and b is aborted after its own hand-off: both free their tables at once
 // (their prompt pages stay cached; the prompt ends were never published).
-// In the next plan f1 and f2 take every block the two released -- each
-// one's KV block after its prompt and its three State blocks -- and the room
-// of s2, evicted and written back by a stream-ordered store in that same
-// plan, which reads the parents of s2's group-1 and group-2 checkpoints
-// while f1 and f2 are granted them. The plan after carries no record.
+// In the next plan f1 takes its blocks from what the two released while f2's
+// admission defers behind s2's eviction: s2 leaves by a pinned store in that
+// same plan, and the store's ACK frees the room f2's retry takes in the plan
+// after, zeroing among f2's grants the parent of s2's group-3 checkpoint.
 TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPagesForTheSamePlansWriteBack) {
     device_pages_ = 19;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
@@ -3203,6 +3246,14 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
                             << "b's admission writes back a page a's transfer pins";
                     }
                 }
+            }
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr || std::ranges::find(batch->request_ids, id) == batch->request_ids.end()) {
+                // The eviction defers id's chunk behind its pinned store; the
+                // ACK releases the pages for the retry.
+                AckWriteBacks(plan);
+                --chunk;
+                continue;
             }
             SendForwardDone(id, chunk == 2 ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
             AckWriteBacks(plan);
@@ -3236,41 +3287,52 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
-    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"f1", "f2"}));
+    EXPECT_EQ(batch->request_ids, std::vector<std::string>{"f1"}) << "f2's admission defers behind s2's pinned store";
     const std::vector<CacheOperation> stores = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
     ASSERT_EQ(stores.size(), 1u);
     const WriteBackBatch& store = std::get<WriteBackBatch>(stores.front());
     ASSERT_EQ(store.op_ids.size(), 1u);
-    EXPECT_EQ(store.source_pinned, std::vector<bool>{false});
+    EXPECT_EQ(store.source_pinned, std::vector<bool>{true});
     EXPECT_EQ(store.group_ids[0], (std::vector<std::uint32_t>{1, 0, 2, 3, 0, 0, 0, 0, 0}));
     EXPECT_EQ(store.src_pages[0], (std::vector<std::int32_t>{4, 62, 2, 18, 61, 60, 59, 58, 57}))
         << "s2: its three checkpoints and six KV blocks";
     // Every State block is a parent of its own, so a page id names the
-    // parent whichever State group takes it.
+    // parent whichever State group takes it. The defer splits the grants:
+    // this plan zeroes f1's alone; f2's land at the retry below.
     std::set<std::int32_t> state_zeroed;
     for (const std::string& group : {"state0", "state1", "state2"}) {
         state_zeroed.insert(plan.pages_to_zero.at(group).begin(), plan.pages_to_zero.at(group).end());
     }
-    EXPECT_EQ(state_zeroed, (std::set<std::int32_t>{2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 17}));
-    EXPECT_EQ(plan.pages_to_zero.at("full"), (std::vector<std::int32_t>{42, 26, 27, 28}))
-        << "the KV blocks after a's and b's prompts, then the free slots beside b's last page";
+    EXPECT_EQ(state_zeroed, (std::set<std::int32_t>{3, 6, 8, 9, 12, 13}));
+    std::set<std::int32_t> full_zeroed{plan.pages_to_zero.at("full").begin(), plan.pages_to_zero.at("full").end()};
+    EXPECT_EQ(full_zeroed, (std::set<std::int32_t>{26, 42})) << "the KV blocks after a's and b's prompts";
+    const HostCacheStats stats = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(stats.eviction_stores.ops, 2u);
+    EXPECT_EQ(stats.eviction_stores.no_placement, 0u);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 9) << "s1's nine blocks; s2's land at the ACK";
+    AckWriteBacks(plan);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 18) << "s1 and s2, nine blocks each";
+
+    const ExecutionPlan next = PlanOnce();
+    const ForwardBatch* admitted = FindForwardBatch(next);
+    ASSERT_NE(admitted, nullptr);
+    EXPECT_EQ(admitted->request_ids, std::vector<std::string>{"f2"}) << "the ACK admits f2's retry";
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(next).empty());
+    for (const std::string& group : {"state0", "state1", "state2"}) {
+        state_zeroed.insert(next.pages_to_zero.at(group).begin(), next.pages_to_zero.at(group).end());
+    }
+    full_zeroed.insert(next.pages_to_zero.at("full").begin(), next.pages_to_zero.at("full").end());
+    EXPECT_EQ(state_zeroed, (std::set<std::int32_t>{3, 5, 6, 8, 9, 10, 12, 13, 14, 15, 17, 18}));
+    EXPECT_EQ(full_zeroed, (std::set<std::int32_t>{26, 27, 28, 42}))
+        << "the free slots beside b's last page fund f2 as well";
     for (const std::string& id : {"a", "b"}) {
-        EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), pinned[id]["full"].back()), 1) << id;
+        EXPECT_EQ(full_zeroed.count(pinned[id]["full"].back()), 1u) << id;
         for (const std::string& group : {"state0", "state1", "state2"}) {
             EXPECT_EQ(pinned[id][group].at(0), 0) << id << " " << group;
             EXPECT_TRUE(state_zeroed.contains(pinned[id][group].at(1))) << id << " " << group;
         }
     }
-    EXPECT_TRUE(state_zeroed.contains(store.src_pages[0][0])) << "s2's group-1 checkpoint";
-    EXPECT_TRUE(state_zeroed.contains(store.src_pages[0][2])) << "s2's group-2 checkpoint";
-    const HostCacheStats stats = scheduler_->GetHostCacheStats();
-    EXPECT_EQ(stats.eviction_stores.ops, 2u);
-    EXPECT_EQ(stats.eviction_stores.no_placement, 0u);
-    AckWriteBacks(plan);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 18) << "s1 and s2, nine blocks each";
-
-    const ExecutionPlan next = PlanOnce();
-    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(next).empty());
+    EXPECT_TRUE(state_zeroed.contains(store.src_pages[0][3])) << "s2's group-3 checkpoint funds f2";
     EXPECT_EQ(scheduler_->GetHostCacheStats().eviction_stores.ops, 2u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 18);
 }
@@ -3295,6 +3357,13 @@ TEST_P(StateCheckpointPrefillHostShardSuite, WriteBackPlansMatchOnMirroredSchedu
                     batches.push_back(std::get<WriteBackBatch>(operation));
                 }
                 AckWriteBacks(plan);
+                const ForwardBatch* batch = FindForwardBatch(plan);
+                if (batch == nullptr || std::ranges::find(batch->request_ids, id) == batch->request_ids.end()) {
+                    // The eviction defers id's chunk behind its pinned store;
+                    // the ACK above releases the pages for the retry.
+                    --chunk;
+                    continue;
+                }
                 SendForwardDone(id, chunk == 2 ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
             }
             AckWriteBacks(PlanOnce());
@@ -3356,7 +3425,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, WriteBackHoldsMoreSessionsThanEithe
                 SendBootstrapped(id);
                 std::optional<std::int32_t> hit;
                 // Prefill to the hand-off, every copy acknowledged at once.
-                for (std::int32_t round = 0; round < 4; ++round) {
+                for (std::int32_t round = 0; round < 8; ++round) {
                     const ExecutionPlan plan = PlanOnce();
                     for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
                         for (const std::uint32_t op : std::get<LoadBackBatch>(operation).op_ids) {
@@ -3368,7 +3437,11 @@ TEST_P(StateCheckpointPrefillHostShardSuite, WriteBackHoldsMoreSessionsThanEithe
                         break;
                     }
                     const ForwardBatch* batch = FindForwardBatch(plan);
-                    ASSERT_NE(batch, nullptr);
+                    if (batch == nullptr || std::ranges::find(batch->request_ids, id) == batch->request_ids.end()) {
+                        // The eviction defers this turn's admission behind its
+                        // pinned store; the ACK above releases the pages.
+                        continue;
+                    }
                     ASSERT_EQ(batch->request_ids, std::vector<std::string>{id});
                     hit = hit.value_or(batch->extend_prefix_lens.at(0));
                     const bool completes =
@@ -3395,8 +3468,9 @@ TEST_P(StateCheckpointPrefillHostShardSuite, WriteBackHoldsMoreSessionsThanEithe
 // checkpoints -- and nothing streams to the Host. One decode later s1 no
 // longer reads those checkpoints, and f1's first chunk, beside s1's decode in
 // one mixed batch, takes their room: the plan that evicts the tail copies it
-// to the Host, stream-ordered, and the ACK publishes its four blocks there. A
-// prompt that leaves s1 at 22 loads them back.
+// to the Host pinned, f1's admission deferred behind the store while s1's
+// decode still runs, and the ACK publishes its four blocks there and releases
+// the pages for f1. A prompt that leaves s1 at 22 loads them back.
 TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesWithItsWriteBack) {
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
@@ -3414,22 +3488,28 @@ TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesW
     Submit(RequestWithTokens("f1", MakeTokens(4, 1000)));
     const ExecutionPlan plan = PlanOnce();
     ASSERT_NE(FindForwardBatch(plan), nullptr);
-    EXPECT_EQ(FindForwardBatch(plan)->request_ids, (std::vector<std::string>{"f1", "s1"}));
+    EXPECT_EQ(FindForwardBatch(plan)->request_ids, std::vector<std::string>{"s1"})
+        << "f1's admission defers behind the pinned store; s1's decode runs";
     const std::vector<CacheOperation> stores = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
     ASSERT_EQ(stores.size(), 1u);
     const WriteBackBatch& store = std::get<WriteBackBatch>(stores.front());
     ASSERT_EQ(store.op_ids.size(), 1u);
-    EXPECT_EQ(store.source_pinned, std::vector<bool>{false});
+    EXPECT_EQ(store.source_pinned, std::vector<bool>{true});
     EXPECT_EQ(store.group_ids[0], (std::vector<std::uint32_t>{1, 0, 2, 3})) << "the tail block and its checkpoints";
     const HostCacheStats stats = scheduler_->GetHostCacheStats();
     EXPECT_EQ(stats.publication_stores.ops + stats.finish_stores.ops, 0u);
     EXPECT_EQ(stats.eviction_stores.ops, 1u);
     EXPECT_EQ(stats.device_evictions.admission.blocks, 4u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "published at the ACK, not before";
+    SendForwardDone("s1", {902});
     AckWriteBacks(plan);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
 
-    SendForwardDone("s1", {902});
+    const ExecutionPlan retry = PlanOnce();
+    ASSERT_NE(FindForwardBatch(retry), nullptr);
+    EXPECT_EQ(FindForwardBatch(retry)->request_ids, (std::vector<std::string>{"f1", "s1"}));
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(retry).empty());
+    SendForwardDone("s1", {904});
     SendForwardDone("f1", {903});
     SendFinish("s1");
     SendFinish("f1");
@@ -3527,7 +3607,7 @@ TEST_F(StateCheckpointFusedHostSuite, AClearWaitsForTheEvictionWriteBackInFlight
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     const ExecutionPlan eviction = PlanOnce();
     ASSERT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(eviction).size(), 1u);
-    SendForwardDone("f1");
+    // f1 never ran: the eviction deferred its admission behind the pinned store.
     SendAbortEvent("f1");
     const ExecutionPlan after_abort = PlanOnce();
     EXPECT_FALSE(scheduler_->CanClearCache());
@@ -3573,7 +3653,11 @@ TEST_F(StateCheckpointFusedHostSuite, ARequestTheSizeOfTheDeviceRunsToItsEnd) {
         EXPECT_EQ(FindSnapshotStore(plan), nullptr) << "nothing is retracted";
         AckWriteBacks(plan);
         const ForwardBatch* batch = FindForwardBatch(plan);
-        ASSERT_NE(batch, nullptr);
+        if (batch == nullptr || std::ranges::find(batch->request_ids, "big") == batch->request_ids.end()) {
+            // A chunk's eviction defers its admission behind the pinned store;
+            // the ACK above releases the pages for the next plan.
+            continue;
+        }
         ASSERT_EQ(batch->request_ids, std::vector<std::string>{"big"});
         if (batch->NumExtends() == 1 &&
             batch->extend_prefix_lens[0] + batch->input_lengths[0] < batch->prefill_lengths[0]) {

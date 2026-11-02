@@ -319,7 +319,7 @@ TEST(StorageQueryTest, EvictedWarmObjectsCannotBeAssumedPresentByTheReadReservat
         ASSERT_TRUE(block);
         const auto location = block->Location();
         block.reset();
-        ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(0).Evict(cache.host, location));
+        ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(0).Evict(cache.host, location, /*evicted_block=*/nullptr));
     }
     EXPECT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 0);
     const auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, query.keys, 64);
@@ -473,7 +473,7 @@ TEST_P(StorageWarmLifetimeTest, ExistingDependenciesRemainEvictableAcrossTheGetL
     ASSERT_TRUE(block);
     const auto location = block->Location();
     block.reset();
-    ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(group).Evict(cache.host, location));
+    ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(group).Evict(cache.host, location, /*evicted_block=*/nullptr));
     if (stage == WarmReadStage::kRunning || stage == WarmReadStage::kDetached) complete(true);
     EXPECT_LT(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 8);
     if (stage == WarmReadStage::kDetached) {

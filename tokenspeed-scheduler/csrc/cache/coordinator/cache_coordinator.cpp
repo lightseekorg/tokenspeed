@@ -202,7 +202,7 @@ bool CacheCoordinator::ClearCache() {
         return false;
     }
     for (const auto& [group_id, location] : host_locations) {
-        _assert(groups_[group_id].Index().Evict(*host_pool_, location).has_value(),
+        _assert(groups_[group_id].Index().Evict(*host_pool_, location, /*evicted_block=*/nullptr).has_value(),
                 "clearable Host cache entry disappeared");
         ++host_evictions_.flush.blocks;
     }
@@ -1936,7 +1936,10 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
         reason = &DeviceEvictionStats::request_reclaim;
         write_back_segment = nullptr;
     }
-    std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
+    // A segment pinning its Device sources takes the page's reference with the
+    // erasure; anything else lets the page return to the pool here.
+    CacheBlockRef device_ref;
+    std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location, &device_ref);
     if (!removed) {
         return removed;  // pinned or gone: nothing to record
     }
@@ -1967,12 +1970,13 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
         if (dead) {
             ++dead_entries_not_written_back_;
         } else {
-            write_back_segment->members.push_back(
-                EvictedBlock{.key = *removed,
-                             .device_location = location,
-                             .metadata = *metadata,
-                             .host_block = FindHostCachedBlock(*removed),
-                             .written_back_before = (node->written_back_group_bits >> removed->group_id & 1U) != 0});
+            write_back_segment->members.push_back(EvictedBlock{
+                .key = *removed,
+                .device_location = location,
+                .metadata = *metadata,
+                .host_block = FindHostCachedBlock(*removed),
+                .written_back_before = (node->written_back_group_bits >> removed->group_id & 1U) != 0,
+                .device_ref = write_back_segment->pin_device_sources ? std::move(device_ref) : CacheBlockRef{}});
             write_back_segment->newest_access_epoch =
                 std::max(write_back_segment->newest_access_epoch, metadata->last_access_epoch);
             if (!pending_eviction_keys_.insert(*removed).second) {
@@ -2022,7 +2026,8 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
 bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                                             HostEvictionCounts HostEvictionStats::*reason) {
     const auto evict_entry = [&](std::uint32_t entry_group, CacheBlockLocation entry_location) {
-        std::optional<CacheKey> removed = groups_[entry_group].Index().Evict(*host_pool_, entry_location);
+        std::optional<CacheKey> removed = groups_[entry_group].Index().Evict(*host_pool_, entry_location,
+                                                                             /*evicted_block=*/nullptr);
         if (!removed) {
             return removed;
         }
@@ -2286,9 +2291,13 @@ void CacheCoordinator::CollectDeadEntries() {
     dead_candidates_.assign(std::make_move_iterator(waiting.begin()), std::make_move_iterator(waiting.end()));
 }
 
+std::vector<CacheBlockRef> CacheCoordinator::TakeDeferredAdmissionHostPins() {
+    return std::exchange(deferred_admission_host_pins_, {});
+}
+
 std::vector<CacheCoordinator::EvictedSegment> CacheCoordinator::TakeEvictedSegments() {
-    std::deque<EvictedSegment> recorded = std::exchange(evicted_segments_, {});
-    // Union-find over the recording order: merged_into[s] leads to the
+    std::deque<EvictedSegment> recorded =
+        std::exchange(evicted_segments_, {});  // Union-find over the recording order: merged_into[s] leads to the
     // segment s was merged with.
     std::vector<std::size_t> merged_into(recorded.size());
     std::iota(merged_into.begin(), merged_into.end(), std::size_t{0});
@@ -2382,6 +2391,11 @@ std::vector<HostPublication> CacheCoordinator::SettleEvictedSegment(EvictedSegme
             member.host_block.reset();
             evictHostCachedBlock(member.key.group_id, location, &HostEvictionStats::dead_entry);
         }
+        // Settlement ends the member's hold on its Device page. A member an op
+        // carries arrived here with its device_ref moved into the op's ticket;
+        // one settled without an op -- no Host room, or held there already --
+        // releases its pin here, as the eviction's old in-place release did.
+        member.device_ref.reset();
         --node->pending_host_stores;
         if (GroupIsState(member.key.group_id)) {
             --node->pending_host_checkpoint_stores;

@@ -423,7 +423,10 @@ public:
         return candidates;
     }
 
-    std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
+    // When evicted_block is non-null it takes a reference to the evicted
+    // entry's block with the erasure: the caller then owns the page's release
+    // instead of it returning to the pool here.
+    std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location, CacheBlockRef* evicted_block) {
         CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
             return std::nullopt;
@@ -433,6 +436,9 @@ public:
             return std::nullopt;
         }
         CacheKey key = entry_it->key;
+        if (evicted_block != nullptr) {
+            *evicted_block = entry_it->block_ref;
+        }
         eraseEntry(*cache_index, entry_it);
         return key;
     }

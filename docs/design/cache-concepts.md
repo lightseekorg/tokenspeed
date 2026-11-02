@@ -514,7 +514,7 @@ Each op says how the scheduler guards its Device sources
 (`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
 and unevictable until the ACK, so its copy overlaps whatever the round does
 next and nobody waits on it. An unpinned op's sources (a retraction image's
-pages, or what an admission or a restore evicted under the write-back policy)
+pages, or what an in-place plan evicted under the write-back policy)
 may be re-granted in the same plan, so it is launched first and the fence
 stream the caller names --
 the default stream, where the plan's page zeroing runs -- waits on its

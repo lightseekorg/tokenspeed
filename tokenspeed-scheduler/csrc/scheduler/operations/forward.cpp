@@ -375,14 +375,18 @@ void Scheduler::recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator:
     }
 }
 
+CacheCoordinator::StreamOrderedStoreQuery Scheduler::streamOrderedStores() const {
+    return [this](const CacheKey& key) { return tier_transfers_.FindStreamOrderedInFlightStore(key); };
+}
+
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   CacheCoordinator::PrefixProbe&& prefix,
                                                                   std::span<const GroupDemand> demands,
                                                                   const RequestProgress& progress,
                                                                   std::optional<std::uint64_t> request_access_epoch,
                                                                   bool evict_blocks_past_segments) {
-    std::optional<CacheCoordinator::AdmissionResult> result =
-        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch, evict_blocks_past_segments);
+    std::optional<CacheCoordinator::AdmissionResult> result = coordinator_.Admit(
+        std::move(prefix), demands, progress, request_access_epoch, evict_blocks_past_segments, streamOrderedStores());
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -554,7 +558,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
                                        chunk_demands(tokens_this_round, true), RequestProgress{},
                                        /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/false);
+                                       /*evict_blocks_past_segments=*/false, streamOrderedStores());
         if (!admission) {
             writes_checkpoint = false;
             tokens_this_round = state_checkpoint - hit_tokens;
@@ -563,7 +567,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     if (!admission) {
         admission = coordinator_.Admit(std::move(match.probe), chunk_demands(tokens_this_round, false),
                                        RequestProgress{}, /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/!others_hold_pages);
+                                       /*evict_blocks_past_segments=*/!others_hold_pages, streamOrderedStores());
     }
     if (!admission) {
         feedback.admission_failed = true;

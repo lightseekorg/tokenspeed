@@ -37,6 +37,10 @@ protected:
         return config;
     }
 
+    // Drives seed's eviction by pressure's admission and returns the plan of
+    // the store, pressure deferred behind it: the pages the store reads stay
+    // pinned until the caller acknowledges the copy, so nothing can reuse or
+    // grant them before that, and pressure's retry admits it once they land.
     ExecutionPlan StartSeedEviction() {
         Submit(RequestSpec{.request_id = "seed", .tokens = MakeTokens(8), .max_new_tokens = 1});
         const ExecutionPlan seed = PlanOnce();
@@ -46,11 +50,26 @@ protected:
 
         Submit(RequestSpec{.request_id = "pressure", .tokens = MakeTokens(23, 101), .max_new_tokens = 1});
         ExecutionPlan pressure = PlanOnce();
-        EXPECT_NE(FindForwardBatch(pressure), nullptr);
+        const ForwardBatch* batch = FindForwardBatch(pressure);
+        EXPECT_TRUE(batch == nullptr || std::ranges::find(batch->request_ids, "pressure") == batch->request_ids.end())
+            << "pressure's admission defers behind the pinned store";
         EXPECT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(pressure).empty());
-        SendForwardDone("pressure", {900});
-        SendFinish("pressure");
         return pressure;
+    }
+
+    // Plans until id's admission lands, acknowledging the pinned stores the
+    // retries defer behind, and returns the admitting plan.
+    ExecutionPlan PlanUntilAdmitted(const std::string& id) {
+        for (std::int32_t round = 0; round < 8; ++round) {
+            ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch != nullptr && std::ranges::find(batch->request_ids, id) != batch->request_ids.end()) {
+                return plan;
+            }
+            AckWriteBacks(plan);
+        }
+        ADD_FAILURE() << id << " was never admitted";
+        return PlanOnce();
     }
 };
 
@@ -69,7 +88,15 @@ TEST_F(PendingPrefixStoreTest, WaitsForItsCopyWhileAnUnrelatedPromptRuns) {
 
     AckWriteBacks(waiting);
     AckWriteBacks(store);
-    const ExecutionPlan resumed = PlanOnce();
+    const ExecutionPlan admitted = PlanOnce();
+    const ForwardBatch* retry = FindForwardBatch(admitted);
+    ASSERT_NE(retry, nullptr);
+    ASSERT_EQ(retry->request_ids, std::vector<std::string>{"pressure"}) << "the ACK admits pressure's retry";
+    SendForwardDone("pressure", {900});
+    SendFinish("pressure");
+    // hit's own eviction of pressure's cache defers it a round behind the
+    // pinned store; the ACK then lands it with its copy.
+    const ExecutionPlan resumed = PlanUntilAdmitted("hit");
     const ForwardBatch* hit = FindForwardBatch(resumed);
     ASSERT_NE(hit, nullptr);
     ASSERT_EQ(hit->request_ids, std::vector<std::string>{"hit"});
@@ -140,21 +167,24 @@ TEST_F(SamePlanPrefixStoreTest, WaitsForAnEarlierAdmissionInTheSamePlan) {
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
-    ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"pressure", "other"}));
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"other"})
+        << "pressure defers behind the branches' pinned store and hit waits for its copy";
     EXPECT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(plan).empty());
     EXPECT_TRUE(plan.aborts.empty());
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
     // Only the copy changes hit visibility. Keep pressure's allocation alive.
     AckWriteBacks(plan);
-    SendForwardDone("pressure", {900});
     SendForwardDone("other", {900});
     SendFinish("other");
-    const ExecutionPlan resumed = PlanOnce();
+    // The retries cascade: each round's eviction funds one victim set behind
+    // its pinned store, pressure first, then hit with its copy.
+    const ExecutionPlan resumed = PlanUntilAdmitted("hit");
     const ForwardBatch* hit = FindForwardBatch(resumed);
     ASSERT_NE(hit, nullptr);
     ASSERT_GE(hit->NumExtends(), 1u);
-    EXPECT_EQ(hit->request_ids.front(), "hit");
-    EXPECT_EQ(hit->extend_prefix_lens.front(), 8);
+    const auto hit_row =
+        static_cast<std::size_t>(std::ranges::find(hit->request_ids, "hit") - hit->request_ids.begin());
+    EXPECT_EQ(hit->extend_prefix_lens.at(hit_row), 8);
     EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(resumed).empty());
 }
 
@@ -166,9 +196,11 @@ TEST_F(SamePlanPrefixStoreTest, ARecordedStoreDoesNotDelayAPromptThatForbidsReus
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
-    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"pressure", "uncached"}));
-    EXPECT_EQ(batch->extend_prefix_lens, (std::vector<std::int32_t>{0, 0}));
+    EXPECT_EQ(batch->request_ids, std::vector<std::string>{"uncached"})
+        << "pressure defers behind the pinned store; the reuse-forbidding prompt does not wait";
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
     EXPECT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(plan).empty());
+    AckWriteBacks(plan);
 }
 
 }  // namespace

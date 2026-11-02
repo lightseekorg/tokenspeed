@@ -346,7 +346,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false);
+                                       /*evict_blocks_past_segments=*/false, kNoInFlightStores);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -387,7 +387,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false);
+                                       /*evict_blocks_past_segments=*/false, kNoInFlightStores);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -406,14 +406,14 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     std::vector<BlockTable> newcomer(1);
     std::vector<GroupDemand> newcomer_demands{{.table = &newcomer[0], .extent = DenseGrowth{2}}};
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, RequestProgress{}, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false))
+                                   /*evict_blocks_past_segments=*/false, kNoInFlightStores))
         << "the only Device block is pinned by the in-flight store";
 
     transfers.CompleteWriteBack(write_back->op_id);
     EXPECT_FALSE(transfers.HasPinnedStoresInFlight());
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
     EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, RequestProgress{}, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false))
+                                  /*evict_blocks_past_segments=*/false, kNoInFlightStores))
         << "the ACK released the pin; the block is evictable again";
 }
 
@@ -493,7 +493,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false);
+                                       /*evict_blocks_past_segments=*/false, kNoInFlightStores);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -617,7 +617,7 @@ TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
     coordinator.QueueCachedBlocksForStore(std::array{on_host.content_hash, stored.content_hash, stored.content_hash,
                                                      travelling.content_hash, evicted.content_hash});
     const CacheBlockLocation evicted_location = coordinator.GroupPrefixIndex(0).Find(device_pool, evicted)->Location();
-    ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(device_pool, evicted_location));
+    ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(device_pool, evicted_location, /*evicted_block=*/nullptr));
     const auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->transfers.size(), 1u);
@@ -652,7 +652,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false);
+                                       /*evict_blocks_past_segments=*/false, kNoInFlightStores);
     ASSERT_TRUE(admission);
     const std::array<std::string, 2> hashes{"h0", "h1"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -860,7 +860,8 @@ TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(std::move(probe), demands, RequestProgress{},
-                                       /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false);
+                                       /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
+                                       kNoInFlightStores);
     ASSERT_TRUE(admission);
     ASSERT_EQ(admission->load_pairs.size(), 1u);
     EXPECT_TRUE(admission->load_pairs[0].key.content_hash.empty());
@@ -933,7 +934,8 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(std::move(probe), demands, RequestProgress{},
-                                       /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false);
+                                       /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
+                                       kNoInFlightStores);
     ASSERT_TRUE(admission);
     ASSERT_FALSE(admission->load_pairs.empty());
     EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 2);
@@ -1497,7 +1499,8 @@ TEST(CacheOperationTest, ShardedL3PartialReadUsesOrdinaryOwnerPreservingAdmissio
             {.table = &tables[1], .extent = DenseGrowth{12}},
         };
         auto admission = coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{},
-                                           /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false);
+                                           /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
+                                           kNoInFlightStores);
         ASSERT_TRUE(admission);
         EXPECT_EQ(admission->host_prefix_tokens, 8);
         ASSERT_EQ(admission->load_pairs.size(), 6u);
@@ -1587,9 +1590,9 @@ TEST_F(AsyncStorageTransactionTest, AnIndependentPutStillProtectsAWarmGetDepende
     ASSERT_EQ(reads.size(), 1u);
     const auto get = std::get<StorageGetOperation>(reads[0]);
     EXPECT_EQ(storage.NumHeldBlocks(), put.keys.size() + get.keys.size());
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Evict(host, location));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Evict(host, location, /*evicted_block=*/nullptr));
     storage.Complete(cache::StorageDone{put.op_id, {1}, true, {0}});
-    ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(host, location));
+    ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(host, location, /*evicted_block=*/nullptr));
     EXPECT_EQ(storage.NumHeldBlocks(), get.keys.size());
     storage.Complete(cache::StorageDone{read, {1, 1}, true, {0, 0}});
     EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 0);

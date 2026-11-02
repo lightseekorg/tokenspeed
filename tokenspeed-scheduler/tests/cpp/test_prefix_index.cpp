@@ -102,7 +102,7 @@ TEST(PrefixCacheIndexInspectionTest, ReportsCurrentOwnershipWithoutPinningOrTouc
     EXPECT_FALSE(index.Inspect(pool, key)->pinned);
 
     // Keeping a snapshot alive must not prevent actual eviction.
-    EXPECT_EQ(index.Evict(pool, location), key);
+    EXPECT_EQ(index.Evict(pool, location, /*evicted_block=*/nullptr), key);
     EXPECT_FALSE(index.Inspect(pool, key));
 }
 
@@ -156,7 +156,7 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
     std::vector<CacheBlockLocation> remaining;
     for (std::int32_t i = 0; i < count; ++i) {
         if (i % 2 == 0) {
-            EXPECT_EQ(index.Evict(pool, locations[i]), keys[i]);
+            EXPECT_EQ(index.Evict(pool, locations[i], /*evicted_block=*/nullptr), keys[i]);
         } else {
             remaining.push_back(locations[i]);
         }
@@ -228,7 +228,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, EvictionCapacityBoundIncludesReleasedAnd
     EXPECT_GE(index.PotentiallyEvictableEntries(pool), 3u);
 
     for (const CacheBlockLocation location : DrainEvictionOrder(index, pool)) {
-        ASSERT_TRUE(index.Evict(pool, location));
+        ASSERT_TRUE(index.Evict(pool, location, /*evicted_block=*/nullptr));
     }
     EXPECT_EQ(index.PotentiallyEvictableEntries(pool), 0u);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
@@ -265,7 +265,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, MovingIndexKeepsReleasedEntriesEvictable
     assigned = std::move(moved);
     pinned.reset();
     EXPECT_EQ(DrainEvictionOrder(assigned, pool), (std::vector<CacheBlockLocation>{location}));
-    EXPECT_TRUE(assigned.Evict(pool, location));
+    EXPECT_TRUE(assigned.Evict(pool, location, /*evicted_block=*/nullptr));
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
 }
 
@@ -437,14 +437,14 @@ TEST(PrefixCacheIndexCommonOrderTest, TracksBothTiersAndUsesOnlySourceRecency) {
         EXPECT_FALSE(second->source.pinned);
         EXPECT_TRUE(second->peer.pinned);
         // Borrowed snapshots must not prevent removing the peer copy.
-        EXPECT_EQ(index.Evict(peer, peer_a), KeyOf("a"));
+        EXPECT_EQ(index.Evict(peer, peer_a, /*evicted_block=*/nullptr), KeyOf("a"));
     }
     EXPECT_EQ(common_keys(), (std::vector<std::string>{"b"}));
     Cache(index, peer, "a", 500);
     EXPECT_EQ(common_keys(), (std::vector<std::string>{"a", "b"}));
     source_pin.reset();
     peer_pin.reset();
-    EXPECT_EQ(index.Evict(source, b), KeyOf("b"));
+    EXPECT_EQ(index.Evict(source, b, /*evicted_block=*/nullptr), KeyOf("b"));
     EXPECT_EQ(common_keys(), (std::vector<std::string>{"a"}));
     Cache(index, source, "b", 0);
     EXPECT_EQ(common_keys(), (std::vector<std::string>{"a", "b"}));
@@ -528,7 +528,7 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
     EXPECT_EQ(seen, (std::vector<std::string>{"held", "old", "recent"}));
     EXPECT_EQ(pin.use_count(), 2u);
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{old, recent}));
-    EXPECT_FALSE(index.Evict(pool, held));
+    EXPECT_FALSE(index.Evict(pool, held, /*evicted_block=*/nullptr));
     pin = {};
     {
         CacheBlockRef block = index.Find(pool, KeyOf("held"));
@@ -540,8 +540,8 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
             EXPECT_EQ(entry.metadata.last_access_epoch, 10u);
         }
     });
-    EXPECT_EQ(index.Evict(pool, old), KeyOf("old"));
-    EXPECT_EQ(index.Evict(pool, held), KeyOf("held"));
+    EXPECT_EQ(index.Evict(pool, old, /*evicted_block=*/nullptr), KeyOf("old"));
+    EXPECT_EQ(index.Evict(pool, held, /*evicted_block=*/nullptr), KeyOf("held"));
     index.ForEachEntry(absent, [&](const CacheKey&, const PrefixCacheIndex::CachedBlockSnapshot&) {
         ADD_FAILURE() << "an absent tier contains no entries";
     });
@@ -624,7 +624,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, EvictedEntriesLeaveTheOrder) {
     const CacheBlockLocation evicted = Cache(index, pool, "evicted", /*access_epoch=*/10);
     const CacheBlockLocation kept = Cache(index, pool, "kept", /*access_epoch=*/20);
 
-    ASSERT_TRUE(index.Evict(pool, evicted).has_value());
+    ASSERT_TRUE(index.Evict(pool, evicted, /*evicted_block=*/nullptr).has_value());
 
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{kept}));
     EXPECT_EQ(index.NumEntries(pool), 1);

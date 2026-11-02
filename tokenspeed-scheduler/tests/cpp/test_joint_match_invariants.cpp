@@ -152,7 +152,8 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
                         break;
                     }
                     coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group))
-                        .Evict(pool, CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = 0});
+                        .Evict(pool, CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = 0},
+                               /*evicted_block=*/nullptr);
                 }
             }
 
@@ -501,6 +502,24 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
         std::int32_t hits = 0;
         std::int32_t chunked = 0;
         std::int32_t floods = 0;
+        // An admission deferring behind its eviction's pinned store retries
+        // against the pages the ACK frees, as the scheduler retries it in a
+        // later plan: drain, then admit again.
+        const auto admit = [&](std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe probe, GroupDemand demand,
+                               const RequestProgress& progress, StateStep state_step) {
+            std::optional<CacheCoordinator::AdmissionResult> result;
+            for (int attempt = 0; attempt < 8 && !result; ++attempt) {
+                result = AdmitForTest(coordinator, tables, CacheCoordinator::PrefixProbe{probe}, demand, progress,
+                                      state_step);
+                if (!result) {
+                    if (std::optional<WriteBackOperation> store = StartSingleEvictionStore(transfers)) {
+                        transfers.CompleteWriteBack(store->op_id);
+                    }
+                }
+            }
+            return result;
+        };
+        const StateStep rotate{StateStep::Kind::kRotate};
         for (int round = 0; round < 200; ++round) {
             const std::int32_t num_tokens = length_dist(rng);
             Session session{.tokens = test::MakeTokens(num_tokens, 1000 * (round + 1))};
@@ -545,8 +564,8 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             }
             std::vector<BlockTable> tables(4);
             const std::int32_t first_end = chunk_pages ? *chunk_pages * kP : num_tokens;
-            if (!AdmitForTest(coordinator, tables, std::move(probe),
-                              GroupDemand{.extent = DenseGrowth{first_end - hit}})) {
+            if (!admit(tables, std::move(probe), GroupDemand{.extent = DenseGrowth{first_end - hit}}, RequestProgress{},
+                       rotate)) {
                 coordinator.Free(tables);
                 continue;
             }
@@ -561,8 +580,8 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
                                        .boundary_kind = CacheBoundaryKind::kChunk},
                     .num_computed_tokens = first_end,
                 };
-                if (!AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}),
-                                  GroupDemand{.extent = DenseGrowth{num_tokens - first_end}}, chunk_end)) {
+                if (!admit(tables, coordinator.ProbePrefix({}),
+                           GroupDemand{.extent = DenseGrowth{num_tokens - first_end}}, chunk_end, rotate)) {
                     coordinator.Free(tables);
                     continue;
                 }
@@ -585,9 +604,9 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             // several checkpoint boundaries share leave too.
             if (flood(rng)) {
                 std::vector<BlockTable> flood_tables(4);
-                EXPECT_TRUE(AdmitForTest(coordinator, flood_tables, coordinator.ProbePrefix({}),
-                                         GroupDemand{.extent = DenseGrowth{96 * kP}}, RequestProgress{},
-                                         StateStep{.kind = StateStep::Kind::kKeep}))
+                EXPECT_TRUE(admit(flood_tables, coordinator.ProbePrefix({}),
+                                  GroupDemand{.extent = DenseGrowth{96 * kP}}, RequestProgress{},
+                                  StateStep{.kind = StateStep::Kind::kKeep}))
                     << "round " << round;
                 coordinator.Free(flood_tables);
                 ++floods;
@@ -598,7 +617,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             // checkpoints, so every segment is dropped -- and then the
             // collection; nothing is in use now, so every page left without a
             // checkpoint boundary under it goes.
-            if (std::optional<WriteBackOperation> store = transfers.StartEvictionStores()) {
+            if (std::optional<WriteBackOperation> store = StartSingleEvictionStore(transfers)) {
                 transfers.CompleteWriteBack(store->op_id);
             }
             if (collect) {

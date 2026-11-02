@@ -810,15 +810,18 @@ the D2H copies' completion ahead of everything else the plan does to those
 pages — that stream carries the zeroing, fences the forwards, and gates a
 granted remote prefill's RDMA trigger (see `DeviceHandle.execute` and
 `event-loop.md`) — so the copies read the old bytes whatever the scheduler
-does with the pages. The Host write-back policy's eviction stores (§3.1) are
-the third stream-ordered kind, for the same reason: the pages an admission or
-a restore evicts fund the admissions and restores of the same plan. These are
+does with the pages. An in-place plan's eviction stores under the Host
+write-back policy (§3.1) are the third stream-ordered kind, for the same
+reason: the pages the plan's own reclaims and restores evict fund the
+admissions and restores of the same plan. These are
 the only stores that pay for their ordering on the forward's critical path,
-and they have to: the pages are gone in the same round.
+and they have to: the pages are gone in the same round. A deferred
+admission's eviction stores are not of this kind — their pages fund a later
+round's retry, so they pin until the ACK (§3.1).
 
 **Every other store pins its Device sources until the ack.** Boundary
-publications of a live request and the finish-time flush (write-through only)
-are issued with
+publications of a live request, the finish-time flush (write-through only)
+and a deferred admission's eviction stores (§3.1) are issued with
 `StoreSourceGuard::kPinnedUntilAck`: the ticket holds a `CacheBlockRef` on
 each source, so the block stays cached and unevictable — the admission planner
 cannot take it, `ClearDeviceCache` refuses, `NumNewlyReleasableLcmBlocks` does
@@ -829,7 +832,8 @@ by its owner (prefix reuse already depends on that), so the pin alone makes
 the copy race-free. Both guards share one ticket (`StartPendingStores(guard,
 cause)` drains the publication queue; `StartRetractionStores` builds the
 image's L2 leg from the victim's tables; `StartEvictionStores` drains what the
-plan's admissions and restores evicted), and the op carries `source_pinned` to
+plan's admissions and restores evicted, into at most two ops — one per guard,
+never mixed), and the op carries `source_pinned` to
 the runtime, which branches on the guard and never on the cause. Whatever its
 guard or cause, the op is a `WriteBackOperation`, batched in the plan's
 `WriteBackBatch` (`WriteBackOp` in Python) and acknowledged by
@@ -853,7 +857,8 @@ writing pages its admission owns, and the victim policy cannot see that write.
 And an in-flight *pinned* store: it holds Device capacity the ack returns by
 itself, so retracting anyone for that capacity would be the thrash of §4 — the
 blocked admission retries against the released pins next round instead.
-Stream-ordered stores — both legs of an image, and eviction write-backs —
+Stream-ordered stores — both legs of an image, and an in-place plan's
+eviction write-backs —
 hold nothing and gate nothing, and an in-flight restore gates nothing: its
 request is `Restoring`, invisible to `chooseVictim`.
 
@@ -998,10 +1003,25 @@ L3, and in the runtime one pipeline stage and no
 query shard) nothing streams to the Host at publication. Instead what an
 admission evicts for the cache leaves by whole segments — or, for a request
 alone that whole segments cannot fund, block by block (§1.4) — and is
-written back in the same plan, by the drain right after the build (one
-stream-ordered op, §2);
+written back in the same plan, by the drain right after the build (§2);
 how a segment is recorded, placed, published or dropped is in [Cache
-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator). Every
+concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator).
+A plan that grants the evicted pages away in place — a request's own reclaim,
+a restore — rides the stream-ordered lane, like the image's legs: the runtime
+orders the copy ahead of the plan's page reuse. A plan funding itself only by
+evicting cache blocks defers instead: the eviction runs, the stores pin the
+pages until their ACK, and the admission retries against the freed pins in a
+later round, exactly as one whose plan found no fit. The defer falls through
+to the in-place path when no victim needs a store of its own — one the Host
+already holds, or one an in-flight stream-ordered store already copies: the
+drain borrows that store for the key, the page returns at once, and the
+borrowed member's publication rides the carrying op's ACK either way. Only a
+pinned store's coverage does not count, its fence being the ACK the defer
+waits behind. The defer's matched Host prefix stays pinned through the
+drain's Host placement, so the placement cannot evict the entries the retry
+loads. One drain emits at most two ops, one per guard: a deferred segment's
+rows ride the pinned op, whose tickets hold the pages until the ACK; an
+in-place plan's rows ride the stream-ordered op. Every
 attention-TP rank of the replica runs the same plan and copies the rows it
 owns, each Host block in its Device block's bucket (§5, "Every tier transfer
 pairs blocks of equal residue"), and each round's head hands the scheduler
@@ -1449,20 +1469,25 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   A sliding-window group's growth can outrun its reserve (1); the
   empty-round retraction keeps such a pool live (2).
 - A store either pins its Device sources until the ack or is stream-ordered;
-  never neither (2). Only the two legs of a retraction image and the Host
-  write-back policy's eviction stores are stream-ordered — their sources are
-  granted away in the same round — and only such ops may be fenced ahead of
-  the plan's page reuse by the runtime. A new store site chooses its guard
-  explicitly (`StartPendingStores` has no default). Under write-back no
-  store pins its sources.
+  never neither (2). Only the two legs of a retraction image and an in-place
+  plan's eviction stores under the Host write-back policy are stream-ordered
+  — their sources are granted away in the same round — and only such ops may
+  be fenced ahead of the plan's page reuse by the runtime. A new store site
+  chooses its guard explicitly (`StartPendingStores` has no default). Under
+  write-back, a deferred admission's stores pin until the ACK; only an
+  in-place plan's are stream-ordered (3.1).
 - What an admission or a restore evicts under write-back is drained in the
-  plan that evicted it (`StartEvictionStores`, right after the build); no
+  plan that evicted it (`StartEvictionStores`, right after the build, into at
+  most two ops — one per guard, §2); no
   record outlives its plan (by construction: only the build records, and that
   drain takes every record; `ClearDeviceCache`, which runs between plans,
   asserts none is left), and the segments of one plan that depend on each
   other — a later admission's segment taking pages an earlier one's
   checkpoint still needs — are merged before the Host places them, so they
-  arrive together or not at all (3.1).
+  arrive together or not at all (3.1). A member an in-flight store already
+  carries borrows that copy instead of storing twice; its page is fenced by
+  the carrying op only when that op is pinned, and returns at once when the
+  carrier is stream-ordered (3.1).
 - Every tier transfer pairs blocks of equal residue (bucket): L2 store, L2
   prefix load, both image legs and the restore; the transfer manager asserts
   it when it builds a batch, so under page-cyclic sharding the rank that owns

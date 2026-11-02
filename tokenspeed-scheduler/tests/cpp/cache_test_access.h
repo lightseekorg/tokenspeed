@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "cache/tier/transfer_manager.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -90,6 +91,17 @@ inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const st
     return CacheCoordinatorTestAccess::MatchPrefix(coordinator, content_hashes);
 }
 
+// Drains the recorded eviction stores expecting a single op (every build
+// here drains one store lane); null when nothing was copied.
+inline std::optional<WriteBackOperation> StartSingleEvictionStore(TierTransferManager& transfers) {
+    std::vector<WriteBackOperation> ops = transfers.StartEvictionStores();
+    _assert(ops.size() <= 1, "the build's eviction stores span both lanes");
+    if (ops.empty()) {
+        return std::nullopt;
+    }
+    return std::move(ops.front());
+}
+
 inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                    std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
@@ -121,6 +133,14 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
     coordinator.CacheCompletedBlocks(tables, progress, access_epoch);
 }
 
+// Tests driving a coordinator directly wire no transfer manager to it: an
+// admission weighing a wait behind eviction stores sees no in-flight
+// stream-ordered stores, so it never falls through on borrowed coverage.
+// Scheduler-level tests exercise the real lookup through the Scheduler.
+inline const CacheCoordinator::StreamOrderedStoreQuery kNoInFlightStores = [](const CacheKey&) {
+    return std::optional<CacheBlockRef>{};
+};
+
 // Admits every History group with the same demand prototype as a new request;
 // a State group takes `state_step` (kRotate: a prefill step, the shape of a
 // first admission).
@@ -139,7 +159,8 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
         }
         demands.push_back(demand);
     }
-    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt, /*evict_blocks_past_segments=*/false);
+    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt, /*evict_blocks_past_segments=*/false,
+                             kNoInFlightStores);
 }
 
 // The overloads without progress admit a request that has computed nothing

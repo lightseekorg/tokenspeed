@@ -67,19 +67,21 @@ public:
     // `cause` (kPublication or kFinish) only picks the counters.
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause);
     // Drains the segments this plan's admissions and restores recorded under
-    // the write-back policy (CacheCoordinator::TakeEvictedSegments) into one
-    // stream-ordered write-back op: their Device pages may be granted away
-    // in this same plan, so the runtime orders the copies ahead of the plan's
-    // page reuse. Segments go newest Device access first, so the oldest are
-    // the ones dropped when the Host cannot place every one
-    // (AcquireHostSegments); a dropped segment publishes nothing. A member
-    // the Host already holds is not copied, nor is one an unacknowledged
-    // store already carries (the segment waits for that store too) or one
-    // whose key another member of its segment copies. Each segment publishes
-    // once every op it waits for is acknowledged, less the members that
-    // became dead meanwhile; one that waits for none settles here. nullopt
-    // when nothing is copied.
-    std::optional<WriteBackOperation> StartEvictionStores();
+    // the write-back policy (CacheCoordinator::TakeEvictedSegments) into at
+    // most two write-back ops: members whose eviction pinned their Device
+    // page (EvictedBlock::device_ref, a deferred admission's) ride a pinned
+    // op whose tickets hold the pages until the ACK; members the evicting
+    // plan granted away in place ride a stream-ordered op, the runtime
+    // ordering the copies ahead of the plan's page reuse. Segments go newest
+    // Device access first, so the oldest are the ones dropped when the Host
+    // cannot place every one (AcquireHostSegments); a dropped segment
+    // publishes nothing. A member the Host already holds is not copied, nor
+    // is one an unacknowledged store already carries (the segment waits for
+    // that store too) or one whose key another member of its segment copies.
+    // Each segment publishes once every op it waits for is acknowledged, less
+    // the members that became dead meanwhile; one that waits for none settles
+    // here. Empty when nothing is copied.
+    std::vector<WriteBackOperation> StartEvictionStores();
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a
@@ -190,6 +192,13 @@ public:
     // the scheduler defers retraction while any is in flight rather than
     // sacrificing a request for capacity that is about to free.
     bool HasPinnedStoresInFlight() const;
+    // The Host block an in-flight stream-ordered store already carries for
+    // `key`, if one does: the runtime sequences that copy ahead of any later
+    // plan's reuse of the Device page, so an eviction of the same key can
+    // skip a copy of its own. Pinned stores are never reported: their copy
+    // is fenced only by the ACK, which an admission cannot wait behind in
+    // place.
+    std::optional<CacheBlockRef> FindStreamOrderedInFlightStore(const CacheKey& key) const;
     bool HasAnyInFlight() const {
         return !write_backs_.empty() || !load_backs_.empty() || !snapshot_stores_.empty() ||
                !snapshot_restores_.empty();
@@ -294,6 +303,9 @@ private:
         CacheBlockRef block;
         std::uint32_t op_id{0};
         bool publishes_at_ack{false};
+        // The carrying op's StoreSourceGuard: a pinned one still fences the
+        // Device source a borrowing member would release.
+        bool source_pinned{false};
     };
     using InFlightHostBlocks = std::unordered_map<CacheKey, InFlightHostBlock, CacheKeyHash>;
     InFlightHostBlocks inFlightHostBlocks() const;

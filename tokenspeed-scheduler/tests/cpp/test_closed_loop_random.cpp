@@ -354,8 +354,8 @@ struct ClosedLoop {
             }
             if (const auto* store = std::get_if<WriteBackBatch>(cache_operation)) {
                 for (std::size_t op = 0; op < store->op_ids.size(); ++op) {
-                    EXPECT_FALSE(write_back && store->source_pinned[op])
-                        << "round " << round << ": a write-back pinned a Device source";
+                    // A deferred admission's eviction pins its sources until
+                    // the ACK; everything else stays stream-ordered.
                     for (std::size_t row = 0; row < store->src_pages[op].size(); ++row) {
                         // A page's bucket is (page id - 1) % shard_count; the
                         // history group is group 0, the State groups unsharded.
@@ -611,13 +611,13 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     EXPECT_GT(handoffs, 0u);
 }
 
-// 16 seeds, each driving two schedulers as the ranks of one replica. Seeds 16
-// to 31 draw write-back at every shard count.
+// 29 seeds, each driving two schedulers as the ranks of one replica. Seeds 16
+// to 44 draw write-back at every shard count.
 TEST(ClosedLoopRandomTest, MirroredPrefillSchedulersPlanAlike) {
     // Per write policy and shard count: the eviction write-backs and the
     // prefix loads the runs made.
     std::map<std::pair<bool, std::int32_t>, std::pair<std::uint64_t, std::uint64_t>> exercised;
-    for (unsigned seed = 16; seed < 32; ++seed) {
+    for (unsigned seed = 16; seed < 45; ++seed) {
         ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true);
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
                                           << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);

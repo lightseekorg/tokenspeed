@@ -304,6 +304,13 @@ public:
     // transfer omits the state groups. prompt.prefix_hashes must cover the
     // prompt's last full page and prompt.tokens the whole prompt.
     PrefixProbe ProbeDecodeDevicePrefix(const PromptPrefix& prompt, std::int32_t prompt_end_tokens) const;
+    // Resolves a key to the Host block an in-flight stream-ordered store
+    // already carries for it, null when no such store carries it (the
+    // transfer manager's FindStreamOrderedInFlightStore, or nothing wired).
+    // A deferred-behind-stores admission consults it for every victim: a
+    // victim the Host or such a store already covers needs no store of its
+    // own, and a plan needing no stores has no ACK to wait behind.
+    using StreamOrderedStoreQuery = std::function<std::optional<CacheBlockRef>(const CacheKey&)>;
     // demands say what each group needs for the round ahead; progress says
     // what the request completed since its previous admission. Completed
     // pages are published and expired slots reclaimed inside this
@@ -321,7 +328,8 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments);
+                                         bool evict_blocks_past_segments,
+                                         const StreamOrderedStoreQuery& stream_ordered_stores);
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;
@@ -462,10 +470,12 @@ public:
         CacheKey key;
     };
     // A Device entry an admission or a restore evicted under the write-back
-    // policy, captured before the index let the block go: its page may be
-    // granted again in this same plan, so the copy rides the plan's
-    // stream-ordered lane ahead of that reuse, and nothing here pins the
-    // Device block.
+    // policy, captured before the index let the block go. When the evicting
+    // plan grants its pages again in place (a request-reclaim admission, a
+    // restore), nothing here pins the Device block: the copy rides the plan's
+    // stream-ordered lane ahead of that reuse. When the evicting admission
+    // defers its acquisition behind the store, device_ref pins the page from
+    // the eviction until the store's ACK, and no plan grants it meanwhile.
     struct EvictedBlock {
         CacheKey key;
         // The page id and the bucket follow from the location alone.
@@ -478,6 +488,11 @@ public:
         // Accounting only: an earlier write-back published this hash's block of
         // this group on the Host, so copying it again is a recopy.
         bool written_back_before{false};
+        // Set when the recording segment pins its Device sources
+        // (EvictedSegment::pin_device_sources): the drain moves it into the
+        // store ticket, which holds it until the ACK. Empty while the page
+        // returns to the pool with the eviction.
+        CacheBlockRef device_ref;
     };
     // One Host store transaction: what one victim set of an admission or a
     // restore evicted, or several that depend on each other once
@@ -490,6 +505,13 @@ public:
         // The newest Device access epoch among the members, raised as each
         // member is recorded.
         std::uint64_t newest_access_epoch{0};
+        // Set by an admission that evicts nothing but cache blocks and defers
+        // its acquisition behind the store: every member recorded pins its
+        // Device page (EvictedBlock::device_ref) until the store's ACK. A
+        // plan that grants its evicted pages in place (a request-reclaim
+        // admission, a restore) records with this unset and rides the
+        // stream-ordered lane instead.
+        bool pin_device_sources{false};
     };
     // The segments this plan's admissions and restores recorded, in the
     // order they were recorded, with every segment that hangs under the KV
@@ -501,6 +523,11 @@ public:
     // again in one build) are merged too: the drain copies the key once. The
     // write-back drain is its one consumer, once per plan.
     std::vector<EvictedSegment> TakeEvictedSegments();
+    // The Host prefix pins of the admissions this plan deferred behind their
+    // eviction stores (deferred_admission_host_pins_): the write-back drain
+    // takes them at its start so its Host placement cannot evict what those
+    // admissions' retries load, and releases them as its placement is done.
+    std::vector<CacheBlockRef> TakeDeferredAdmissionHostPins();
     // Ends a segment's Host store transaction, member by member in eviction
     // order: with placed_on_host, each member reaches the Host index as its
     // Device entry was (epoch -- the newer of that and an existing Host entry's
@@ -1049,6 +1076,16 @@ private:
     std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
                                                   DeviceEvictionCounts DeviceEvictionStats::*reason,
                                                   EvictedSegment* write_back_segment);
+    // Judges a defer candidate's own recorded victims ([first_own_segment,
+    // end) of evicted_segments_, sources pinned). True when one victim needs
+    // a store of its own: the admission defers behind the store's ACK and the
+    // matched Host prefix pins move to deferred_admission_host_pins_ until
+    // the drain. False when every victim is covered without a new store (the
+    // Host holds it, or an in-flight stream-ordered store copies it): the
+    // pages return in place, their device refs released so they cannot ride
+    // the drain's pinned lane.
+    bool deferBehindOwnEvictionStores(std::size_t first_own_segment, std::vector<CacheBlockRef> host_pins,
+                                      const StreamOrderedStoreQuery& stream_ordered_stores);
     // Evicts an unpinned Host entry and, for a State checkpoint, the other
     // State groups' unpinned entries at its hash. Each entry that left counts
     // under host_evictions_.*reason, as device_resident too when the Device
@@ -1158,6 +1195,13 @@ private:
     // keys recorded more than once need an additional-reference count.
     std::unordered_set<CacheKey, CacheKeyHash> pending_eviction_keys_;
     std::unordered_map<CacheKey, std::size_t, CacheKeyHash> pending_eviction_extra_refs_;
+    // The Host prefix of an admission deferred behind its eviction stores,
+    // held from the defer on so the plan drain's Host placement cannot evict
+    // entries the deferred admission matched and its retry loads: an admission
+    // granted in place pins them with its loads until the copies land, and the
+    // defer must not leave them younger than that. The drain takes the pins
+    // (TakeDeferredAdmissionHostPins), so they release with its placement.
+    std::vector<CacheBlockRef> deferred_admission_host_pins_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
     // Accounting only.
