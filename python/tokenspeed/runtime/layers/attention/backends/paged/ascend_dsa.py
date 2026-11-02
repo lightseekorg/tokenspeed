@@ -184,6 +184,7 @@ class AscendDSABackend(DSABackend):
         self._dcp = dcp
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_runtime = None
+        self._prefill_group = None
         self._prefill_slots: torch.Tensor | None = None
         self._prefill_options = None
 
@@ -211,16 +212,23 @@ class AscendDSABackend(DSABackend):
             if FULL_ATTENTION not in counts:
                 raise ValueError("DSA CP requires a full-attention cache group")
             self._dcp.bind_virtual_block_count(counts[FULL_ATTENTION])
+        # Every world rank creates the cache-owner groups before any forward.
+        if self.prefill_enabled and self._dcp.degree > 1:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager,
+            )
+
+            self._prefill_group = process_group_manager.get_dedicated_device_group(
+                self._dcp.ranks, "prefill-history"
+            )
+        else:
+            self._prefill_group = None
 
     def prepare_prefill(self) -> int:
         if not self.prefill_enabled or self._prefill_runtime is not None:
             return 0
         if self.cache_pool is None:
             raise RuntimeError("Bind the DSA cache before preparing Prefill")
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager,
-        )
-
         layer_id = min(self.cache_pool.history_group_by_layer())
         kv = self.cache_pool.get_key_buffer(layer_id)
         index = self.cache_pool.get_component(layer_id, "dsa_index_k")
@@ -228,9 +236,7 @@ class AscendDSABackend(DSABackend):
             kv,
             index,
             ranks=self._dcp.ranks,
-            bootstrap_group=process_group_manager.get_process_group(
-                "gloo", self._dcp.ranks
-            ),
+            history_group=self._prefill_group,
             max_current_rows=self._prefill_options.max_current_rows,
             history_null_rows=self._prefill_options.kv_page_size,
         )

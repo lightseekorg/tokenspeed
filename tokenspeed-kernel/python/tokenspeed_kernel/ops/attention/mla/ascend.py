@@ -40,7 +40,7 @@ def prepare_ascend_mla_prefill(
     cache,
     *,
     ranks,
-    bootstrap_group,
+    history_group,
     max_current_rows,
     history_null_rows,
 ):
@@ -51,7 +51,7 @@ def prepare_ascend_mla_prefill(
         cache,
         None,
         ranks=ranks,
-        bootstrap_group=bootstrap_group,
+        history_group=history_group,
         max_current_rows=max_current_rows,
         history_null_rows=history_null_rows,
     )
