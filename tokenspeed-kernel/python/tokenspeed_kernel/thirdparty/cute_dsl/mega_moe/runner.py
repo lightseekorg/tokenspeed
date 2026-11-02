@@ -574,10 +574,11 @@ class MegaMoERunner(TunableRunner):
         return chosen(inputs=inputs, tactic=tactic)
 
 
-def get_runner(
-    plan: dict, w: torch.nn.Module, *, prequantized: bool = True
-) -> MegaMoERunner:
-    """Return the shared runner; BF16 staging callers pass prequantized=False."""
+def get_runner(plan: dict, w: torch.nn.Module, *, prequantized: bool) -> MegaMoERunner:
+    """Return the shared runner with an explicit input contract.
+
+    Pass prequantized=True for NVFP4 inputs or False for fused BF16 staging.
+    """
     group = plan["process_group"]
     num_experts = w.num_experts
     hidden = w.hidden_size

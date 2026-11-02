@@ -305,9 +305,7 @@ def run_correctness(
     _check(output, expected, "eager")
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
 
-    runner = (
-        get_runner(plan, w) if prequantized else get_runner(plan, w, prequantized=False)
-    )
+    runner = get_runner(plan, w, prequantized=prequantized)
     if prequantized:
         staged_x, staged_sf, staged_ids, staged_weights = runner.input_buffers(
             x[0].shape[0], capacity

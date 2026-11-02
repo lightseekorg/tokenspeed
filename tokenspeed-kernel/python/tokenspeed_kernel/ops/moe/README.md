@@ -463,7 +463,10 @@ Kimi K3 SiTU. Gated SiLU selects the existing kernel epilogue with both SiTU
 parameters set to `None`. BF16 inputs are quantized and staged with routing
 directly into the symmetric workspace in one kernel, including masking unused
 capacity rows. Prequantized packed E2M1 inputs with linear E4M3 block scales
-remain supported for existing callers. Input format is part of the runner's
+remain supported for existing callers. `get_runner` requires an explicit
+`prequantized=True` for packed NVFP4 inputs (including direct workspace writes),
+or `prequantized=False` for fused BF16 quantization and staging.
+Input format is part of the runner's
 tuning key, and calibrated input scales stay runtime tensors across graph replay;
 weights are converted once to interleaved gate/up rows and blocked scales.
 Gate/up global weight scales must match. The adapter currently targets
