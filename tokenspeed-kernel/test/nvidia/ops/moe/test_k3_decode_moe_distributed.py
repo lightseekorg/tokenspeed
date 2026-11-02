@@ -278,6 +278,9 @@ def test_chain_matches_the_reference_eagerly(chain, batch):
 # Row counts of 40 consecutive steps: every count, crossing the experts' B<=8 /
 # B>8 modes in both directions.
 SEQUENCE = random.Random(7).choices(BATCHES, k=40)
+assert set(SEQUENCE) == set(BATCHES)
+assert any(a <= 8 < b for a, b in zip(SEQUENCE, SEQUENCE[1:]))
+assert any(a > 8 >= b for a, b in zip(SEQUENCE, SEQUENCE[1:]))
 
 
 def test_chain_follows_changing_row_counts_eagerly(chain):
