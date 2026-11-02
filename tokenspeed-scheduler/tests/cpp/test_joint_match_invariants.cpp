@@ -819,7 +819,7 @@ TEST(JointMatchInvariantsTest, AvailabilityIncludesUnalignedTailAndStateOnAnothe
     EXPECT_EQ(rows[0].host_missing, 1u);
 }
 
-TEST(JointMatchInvariantTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
+TEST(JointMatchInvariantsTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
     BlockPool device(16, {1, 1, 1});
     BlockPool host(16, {1, 1, 1});
     const std::array specs{
@@ -827,7 +827,9 @@ TEST(JointMatchInvariantTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
-    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true);
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/&host,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/true);
     const auto entries = [&](const BlockPool& pool) {
         return CacheCoordinatorTestAccess::NodeEntries(coordinator, pool, "page");
     };

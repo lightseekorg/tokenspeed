@@ -1001,11 +1001,28 @@ def test_two_ranks_round_trip_a_sharded_image_through_both_tiers(io_backend):
 
 
 def _round_trip_two_ranks(io_backend, executors):
+    compile_check = nullcontext()
     if io_backend == "kernel":
+        import importlib.util
+
         from tokenspeed_kernel.ops.kvcache.triton import _transfer_cache_blocks_kernel
 
         # Earlier tests must not hide a missing startup specialization.
         _transfer_cache_blocks_kernel.device_caches.clear()
+        helper_spec = importlib.util.spec_from_file_location(
+            "retraction_kernel_test_utils",
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "tokenspeed-kernel",
+                "test",
+                "utils.py",
+            ),
+        )
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        compile_check = helper.assert_no_triton_compile(_transfer_cache_blocks_kernel)
     torch.manual_seed(0)
     # Per rank: 2 local LCM blocks x packing 2 = 4 local blocks of 8 B at
     # stride 16 from offset 8. The sharded group has 2 x 2 x 2 = 8 virtual
@@ -1104,21 +1121,12 @@ def _round_trip_two_ranks(io_backend, executors):
         pool_index=3,
     )
     empty_restore = _restore_op(4, 2, [], pool_index=0)
-    compile_check = nullcontext()
-    if io_backend == "kernel":
-        compile_check = patch.object(
-            _transfer_cache_blocks_kernel,
-            "_do_compile",
-            wraps=_transfer_cache_blocks_kernel._do_compile,
-        )
-    with compile_check as compiles:
+    with compile_check:
         for executor in executors.values():
             executor.submit_load_backs(
                 [restore, empty_restore],
                 prerequisite_stream=stream,
             )
-    if io_backend == "kernel":
-        compiles.assert_not_called()
     torch.cuda.synchronize()
     assert [_acks(executor.poll_results()) for executor in executors.values()] == [
         _restore_done(2, 4),
