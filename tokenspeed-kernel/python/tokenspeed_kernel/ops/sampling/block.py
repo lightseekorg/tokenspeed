@@ -22,6 +22,28 @@
 
 Sun et al. (2024), https://arxiv.org/abs/2403.10444. Inputs are already
 normalized conditional distributions, including target sampling filters.
+
+Notation, per request: ``x_1..x_K`` are the proposed tokens, ``q_i`` the
+law that drew ``x_i`` and ``p_i`` the target law at the same position
+(row ``i - 1`` of ``draft_probs`` / ``target_probs``); row ``K`` of
+``target_probs`` is the bonus position.
+
+1. Prefix ratio: ``r_0 = 1``, ``r_i = min(1, r_{i-1} * p_i(x_i) / q_i(x_i))``.
+2. Residual mass after prefix ``i``:
+   ``z_i = sum_v max(r_i * p_{i+1}(v) - q_{i+1}(v), 0)``.
+3. Acceptance threshold of prefix ``i``: ``h_i = z_i / (z_i + 1 - r_i)``
+   for ``i < K`` and ``h_K = r_K``.
+4. With one independent coin per prefix, the accepted length ``tau`` is the
+   largest ``i`` whose coin is below ``h_i`` (``0`` if none). A later prefix
+   can be accepted after an earlier one failed; token-wise rejection stops at
+   the first failure.
+5. One more token: from the residual ``max(r_tau * p_{tau+1} - q_{tau+1}, 0)``
+   if ``tau < K``, else from ``p_{K+1}`` (bonus).
+
+The output then follows the target's joint law, and its expected length is at
+least that of token-wise rejection. A proposal whose recorded ``q`` is not in
+``(0, threshold]`` is a sentinel (no proposal in that slot) and truncates
+``K`` there.
 """
 
 import torch
@@ -116,10 +138,11 @@ def torch_block_verify(
     draft_probs,
     reject_draft_prob_threshold,
 ):
-    """CPU oracle for the block verifier's chain-layout output contract."""
+    """CPU oracle: the module docstring's steps 1-5, one request at a time."""
     bs, n, vocab = target_probs.shape
     accept_index.fill_(-1)
     for b in range(bs):
+        # Step 1: prefix ratios; k shrinks to the first sentinel proposal.
         k = n - 1
         ratios = [1.0]
         for i in range(k):
@@ -129,6 +152,8 @@ def torch_block_verify(
                 k = i
                 break
             ratios.append(min(1.0, ratios[-1] * float(target_probs[b, i, token]) / q))
+        # Steps 2-4: threshold h of each prefix length i + 1; keep the longest
+        # prefix whose coin passes.
         accepted = 0
         for i in range(k):
             r = ratios[i + 1]
@@ -146,6 +171,7 @@ def torch_block_verify(
             # when both its threshold and its coin are exactly zero.
             if float(uniform_samples[b, i]) < h:
                 accepted = i + 1
+        # Step 5: residual token after a rejection, bonus token otherwise.
         if accepted == k:
             law = target_probs[b, accepted]
         else:

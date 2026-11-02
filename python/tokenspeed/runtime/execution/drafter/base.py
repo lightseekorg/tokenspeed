@@ -116,10 +116,10 @@ class BaseDrafter:
 
         Called once by ``ModelExecutor`` after construction. A no-op unless
         the executor allocated ``RuntimeStates.draft_probs``
-        (--enable-speculative-sampling); then the drafter must record the conditional law of each proposal
-        in the shared pool. Chain drafters use ``sample_draft_step``; DSpark
-        records its sequential Markov-head draws through the same sampler. Sampling
-        needs the whole distribution, so the draft model's logits processor
+        (--enable-speculative-sampling); then the drafter must record the
+        conditional law of each proposal in the shared pool. Chain drafters
+        use ``sample_draft_step``; DSpark records its sequential Markov-head
+        draws through the same sampler. Sampling needs the whole distribution, so the draft model's logits processor
         is switched off its fused (TP-sharded) argmax here, before the first
         draft forward.
 
