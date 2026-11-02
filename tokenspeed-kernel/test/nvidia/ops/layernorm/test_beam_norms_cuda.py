@@ -61,13 +61,13 @@ pytestmark = pytest.mark.skipif(
 )
 # Beam calls the fused kernels there, and the Q/K kernel's guard admits only these
 # devices even by name.
-SM100_TO_SM103 = (
+SM90_TO_SM103 = (
     torch.cuda.is_available()
     and Platform.get().is_nvidia
-    and ArchVersion(10, 0) <= Platform.get().arch_version <= ArchVersion(10, 3)
+    and ArchVersion(9, 0) <= Platform.get().arch_version <= ArchVersion(10, 3)
 )
-requires_sm100_to_sm103 = pytest.mark.skipif(
-    not SM100_TO_SM103, reason="requires an NVIDIA SM100 to SM103 device"
+requires_sm90_to_sm103 = pytest.mark.skipif(
+    not SM90_TO_SM103, reason="requires an NVIDIA SM90 to SM103 device"
 )
 
 DEVICE = torch.device("cuda", 0)
@@ -450,7 +450,7 @@ QK_CELLS = (
 )
 
 
-@requires_sm100_to_sm103
+@requires_sm90_to_sm103
 def test_qk_triton_equals_torch_byte_for_byte():
     """Every cell: Beam's head pairs at decode and prefill token counts on ``qkv.split``
     views, a contiguous and an int32 cell, the edge rows (subnormal lanes stay non-zero,
@@ -492,7 +492,7 @@ def test_qk_triton_equals_torch_byte_for_byte():
     assert failures == []
 
 
-@requires_sm100_to_sm103
+@requires_sm90_to_sm103
 def test_qk_graph_replay_follows_live_inputs():
     """A captured fused launch reads the live ``qkv`` views and positions on replay (the
     NoPE path runs under CUDA-graph capture in decode): the edge rows with the boundary

@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """``tanh_softcap`` against Torch's ``(x.float() / cap).tanh() * cap`` on NVIDIA
-SM100 to SM103 (where Beam calls it), byte for byte.
+SM90 to SM103 (where Beam calls it), byte for byte.
 
 The function of one element has 65,536 BF16 (and FP16) inputs: every word is run,
 specials included, at Beam's cap 30.0, its integer form and 1/3 (not
@@ -37,8 +37,8 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not current_platform().is_nvidia
-    or not ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3),
-    reason="Beam calls the one-pass soft cap on NVIDIA SM100 to SM103",
+    or not ArchVersion(9, 0) <= current_platform().arch_version <= ArchVersion(10, 3),
+    reason="Beam calls the one-pass soft cap on NVIDIA SM90 to SM103",
 )
 
 DEVICE = torch.device("cuda", 0)
