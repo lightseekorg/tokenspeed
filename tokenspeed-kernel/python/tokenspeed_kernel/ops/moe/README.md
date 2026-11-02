@@ -455,3 +455,30 @@ over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
+
+## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
+
+On Blackwell with one TP8 group shared by attention and MoE, a decode forward
+(speculative verify included) of 1-8, 16, 32 or 64 token rows that a captured
+decode graph runs takes every MoE layer through one chain of vendored CuTe DSL
+kernels (`thirdparty/cute_dsl/k3_decode`).
+The kernels hand rows to each other through Lamport mailboxes in multicast
+symmetric memory instead of NCCL collectives:
+
+1. One GEMM computes this rank's 112 router logits and 448 latent-down rows
+   and multicasts both to every rank.
+2. One kernel takes the top-16 experts (sigmoid plus correction bias,
+   renormalized, scaled) and gathers the full latent row.
+3. Persistent MXFP4 experts compute this rank's intermediate slice of the
+   chosen experts and combine them into a weighted latent partial.
+4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
+   this rank's up-projection rows, adds the shared expert (run on a side
+   stream) and multicasts the output row.
+5. A ring kernel adds that row to the residual.
+
+Activations enter the experts as MXFP8, as in the TRT-LLM MoE. The routed SiTU
+uses the approximate `tanh`; the shared expert's is exact. A mailbox reader
+re-arms what it read, so the chain needs no separate reset and replays in a
+CUDA graph. Every rank must run the same batches, since each mailbox is shared
+by the group. Other row counts and every non-decode forward keep the TRT-LLM
+MoE.

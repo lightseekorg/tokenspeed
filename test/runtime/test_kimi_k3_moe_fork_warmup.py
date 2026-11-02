@@ -113,6 +113,7 @@ def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
         execution_plan=SimpleNamespace(use_native=False),
         native_latent_moe=None,
+        decode_moe=None,
         iris_state=None,
         stream_fork=fork,
         _topk_ready=None,
