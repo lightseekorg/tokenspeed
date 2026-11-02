@@ -4078,11 +4078,15 @@ class KimiLinearModel(nn.Module):
 
         def capture(layer_idx: int) -> None:
             if layer_idx in self.layers_to_capture:
+                # Only the AttnRes stream reads the snapshots, block-major.
+                block_residual = blocks.transpose(0, 1)
+                if self.dflash_aux_stream == "attn_res":
+                    block_residual = block_residual.contiguous()
                 self._capture_tap(
                     ctx,
                     layer_idx,
                     prefix,
-                    blocks.transpose(0, 1).contiguous(),
+                    block_residual,
                     projected_context,
                     aux_hidden_states,
                 )
