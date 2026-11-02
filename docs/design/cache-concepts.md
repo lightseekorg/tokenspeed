@@ -1643,8 +1643,8 @@ Qwen4-Exp also reuses the attention planes for PLE and QSA groups. A parent
 belongs to one cache group at a time, so these groups do not need separate
 planes reserved in every attention or recurrent-state parent. Compressed QSA
 keeps its exact page stride; PLE and recent QSA state consume the explicit
-strides chosen by the common packer, which differ between planes of different
-widths, so each layer's state is copied at its own stride.
+strides chosen by the common packer. PLE layers on planes of different widths
+get different strides, so PLE copies each layer's state at its own stride.
 Groups whose fields do not fit the widest decoder field of each plane, or whose
 exact strides require inconsistent packing ratios, retain separate planes. A
 group wider than one K page also retains them when sharing would make one of
