@@ -69,22 +69,15 @@ impl PromFile {
         })
     }
 
-    /// Write `cells` (a position and its value each), merging runs of
-    /// consecutive slots into one write.
+    /// Write `cells` (a position and its value each), one 16-byte write per
+    /// cell. Cells never sit adjacent — each is preceded by its key header —
+    /// so runs cannot merge.
     fn write_cells(&mut self, cells: &[(u64, f64)]) -> io::Result<()> {
-        let mut cells = cells.to_vec();
-        cells.sort_unstable_by_key(|&(position, _)| position);
-        let mut index = 0;
-        while index < cells.len() {
-            let start = cells[index].0;
-            let mut run = Vec::with_capacity(16);
-            while index < cells.len() && cells[index].0 == start + run.len() as u64 {
-                let (_, value) = cells[index];
-                run.extend_from_slice(&value.to_ne_bytes());
-                run.extend_from_slice(&0f64.to_ne_bytes());
-                index += 1;
-            }
-            self.file.write_all_at(&run, start)?;
+        for &(position, value) in cells {
+            let mut cell = [0u8; 16];
+            cell[..8].copy_from_slice(&value.to_ne_bytes());
+            cell[8..].copy_from_slice(&0f64.to_ne_bytes());
+            self.file.write_all_at(&cell, position)?;
         }
         Ok(())
     }
@@ -125,9 +118,8 @@ impl PromFiles {
     }
 
     /// The buffered updates of one flush: resolve every entry to its cell,
-    /// then write each file's cells in as few writes as runs of consecutive
-    /// slots allow — the keys a round touches were appended together, so
-    /// they mostly sit next to each other.
+    /// then write each file's cells — one write per distinct key, the
+    /// collapse a round's repeated updates were after.
     pub(crate) fn write_batch<I>(&mut self, entries: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (&'static str, String, f64)>,

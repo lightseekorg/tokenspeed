@@ -106,10 +106,15 @@ impl Exporter {
     }
 
     /// Write the buffered values out. Call once per serving round.
+    ///
+    /// The files lock comes first: it serializes concurrent flushes, so an
+    /// older buffered value can never overwrite a newer one. `write` only
+    /// ever takes the pending lock, so the order cannot deadlock.
     pub fn flush(&self) {
         let Some(prom) = &self.prom else {
             return;
         };
+        let mut files = prom.lock().expect("metrics files lock");
         let pending = std::mem::take(&mut *self.pending.lock().expect("pending metrics lock"));
         if pending.is_empty() {
             return;
@@ -117,7 +122,6 @@ impl Exporter {
         let entries = pending
             .into_iter()
             .map(|((prefix, key), value)| (prefix, key, value));
-        let mut files = prom.lock().expect("metrics files lock");
         if let Err(error) = files.write_batch(entries) {
             tracing::warn!(%error, "writing Prometheus multiprocess files failed");
         }
@@ -143,6 +147,14 @@ impl Exporter {
 
     fn emits(&self) -> bool {
         self.relay.is_some()
+    }
+}
+
+impl Drop for Exporter {
+    /// Whatever the last round buffered still lands: the files outlive the
+    /// process and the scrape keeps reading them.
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -183,8 +195,9 @@ pub struct Metric {
     /// Histogram bounds, `+Inf` last.
     bounds: Vec<f64>,
     exporter: Arc<Exporter>,
-    /// The metric's series — one per label set, a handful at most. A
-    /// scan comparing the label values allocates nothing, where a hashed
+    /// The metric's series — one per label set: one for the engine's
+    /// metrics, a few dozen for L3's kind-by-event counters. A scan
+    /// comparing the label values allocates nothing, where a hashed
     /// lookup would rebuild its `Vec<String>` key on every update.
     series: Mutex<Vec<Series>>,
 }
