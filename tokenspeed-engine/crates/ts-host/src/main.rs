@@ -731,19 +731,13 @@ fn main() -> ExitCode {
         }
         served
     })();
-    let mut status = match served {
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("{error}");
             ExitCode::FAILURE
         }
-    };
-    if let Err(error) = interpreter::run_exit_hooks() {
-        tracing::error!("{error}");
-        status = ExitCode::FAILURE;
     }
-    interpreter::hold_gil_for_process_exit();
-    status
 }
 
 #[cfg(test)]
