@@ -437,9 +437,13 @@ def xn_wait(view, launch, row, on_expiry: gl.constexpr, RANK: gl.constexpr):
 
 
 @gluon.constexpr_function
-def _whole_pairs(layout):
-    """Whether every lane of ``layout`` holds whole adjacent column pairs."""
-    return isinstance(layout, gl.BlockedLayout) and layout.size_per_thread[-1] % 2 == 0
+def _lanes_hold(layout, columns):
+    """Whether every lane of ``layout`` holds whole runs of ``columns``
+    adjacent columns."""
+    return (
+        isinstance(layout, gl.BlockedLayout)
+        and layout.size_per_thread[-1] % columns == 0
+    )
 
 
 @gluon.jit
@@ -449,50 +453,55 @@ def h4_sink(args, y, route, cols, col0):
     H4SinkArgs. Called from per-wave code, so it moves no data between
     lanes (no layout conversion, LDS or barrier).
 
-    ``y``: FP32 partial [R, C] in a BlockedLayout whose lanes each hold
-    whole adjacent column pairs (an even run of columns, such as
-    ``BlockedLayout([1, 4], [16, 4], [1, num_warps], [1, 0])``: a wave's
-    [16, 16] tile); ``route``: [R, 1] route row (token * 8 + pick), -1 to
-    skip; ``cols``: [1, C] output columns (0-4095, the first of each pair
-    even), both slices of y's layout. Each pair goes out as one 32-bit word
-    (receivers test a word's high half). Columns this rank owns go to the
-    local own slices (read by own4_complete), the rest to the owner's
-    mailbox (iris_column_routes_push_words, copy ``launch.copy``), no
-    wait."""
+    ``y``: FP32 partial [R, C] in a BlockedLayout whose waves each hold 16
+    adjacent columns and whose lanes each hold 4 of them (such as
+    ``BlockedLayout([1, 4], [16, 4], [1, num_warps], [0, 1])``);
+    ``route``: [R, 1] route row (token * 8 + pick), -1 to skip, a slice of
+    y's layout; ``cols`` is not read; ``col0``: this wave's first column
+    (a per-wave scalar, a multiple of 16), so its 16 columns lie in one
+    owner's 512-column slice. Each column pair goes out as one 32-bit word
+    (receivers test a word's high half), a lane's two words in one 8-byte
+    store. Columns this rank owns go to the local own slices (read by
+    own4_complete), the rest to the owner's mailbox
+    (iris_column_routes_push_words, copy ``launch.copy``), no wait."""
     gl.static_assert(
-        _whole_pairs(y.type.layout), "h4_sink: lanes must hold whole pairs"
+        _lanes_hold(y.type.layout, 4), "h4_sink: lanes must hold 4 columns"
     )
+    gl.static_assert(y.shape[1] == 16 * gl.num_warps(), "h4_sink: 16 columns a wave")
     view = args.view
     launch = args.launch
     RANK: gl.constexpr = args.RANK
     R: gl.constexpr = y.shape[0]
     C: gl.constexpr = y.shape[1]
     halves = y.to(gl.bfloat16).to(gl.uint16, bitcast=True)
-    zeros = gl.zeros([R, C], gl.int32, y.type.layout)
     low, high = gl.split(gl.reshape(halves, [R, C // 2, 2]))
     words = low.to(gl.uint32) | (high.to(gl.uint32) << 16)
-    column, _ = gl.split(gl.reshape(cols + zeros, [R, C // 2, 2]))
-    route_row, _ = gl.split(gl.reshape(route + zeros, [R, C // 2, 2]))
-    owner = column // 512
-    slice_words = (column % 512) // 2
-    valid = route_row >= 0
-    own = view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True)
-    gl.atomic_store(
-        own + launch.copy * _H4_OWN_WORDS + route_row * _SLICE + slice_words,
-        _iris_sanitize_lamport_bf16x2(words),
-        mask=valid & (owner == RANK),
-        sem="relaxed",
-        scope="gpu",
-    )
-    # The push body takes one owner per call (its mailbox base is a scalar
-    # buffer address), so each peer owner gets its own store, masked to the
-    # words holding its columns: exactly one of them writes each word.
-    regions = _peer_addresses(view.routes, view.heaps, RANK)
-    for distance in gl.static_range(1, _WORLD):
+    words_l: gl.constexpr = words.type.layout
+    route_row = gl.convert_layout(
+        gl.reshape(route, [R]), gl.SliceLayout(1, words_l), assert_trivial=True
+    )[:, None]
+    # This wave's 8 words of the owner's 512-column slice: built from an
+    # arange so the stores see each lane's two words as contiguous.
+    within = gl.arange(0, C // 2, gl.SliceLayout(0, words_l)) % 8
+    slice_words = (gl.multiple_of((col0 % 512) // 2, 8) + within)[None, :]
+    owner = col0 // 512
+    valid = (route_row >= 0) & (slice_words >= 0)
+    if owner == RANK:
+        own = gl.multiple_of(
+            view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16
+        )
+        gl.amd.cdna4.buffer_store(
+            _iris_sanitize_lamport_bf16x2(words),
+            own,
+            launch.copy * _H4_OWN_WORDS + route_row * _SLICE + slice_words,
+            mask=valid,
+            cache=".wt",
+        )
+    else:
         iris_column_routes_push_words(
-            words, route_row, slice_words, (RANK + distance) % _WORLD,
-            launch.copy, valid & (owner == (RANK + distance) % _WORLD),
-            regions, RANK, _WORLD, _MAX_ROWS, _ROUTES_WORDS, ".wt",
+            words, route_row, slice_words, owner, launch.copy, valid,
+            _peer_addresses(view.routes, view.heaps, RANK), RANK, _WORLD,
+            _MAX_ROWS, _ROUTES_WORDS, ".wt",
         )  # fmt: skip
 
 

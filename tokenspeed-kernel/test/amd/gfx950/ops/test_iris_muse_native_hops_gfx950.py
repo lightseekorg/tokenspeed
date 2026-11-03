@@ -454,6 +454,19 @@ def test_h4_sink_moves_no_data_between_lanes():
         assert not re.search(r"\bds_(write|read|bpermute)", loop)
 
 
+def test_h4_sink_stores_each_lanes_words_once():
+    """A wave's 16 columns have one owner (``col0``), so a strip is one
+    8-byte store per lane: to the own slice or to that owner's mailbox,
+    never one masked store per possible owner."""
+    signature = dict(_VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32")
+    assembly = _compile(_h4_per_wave_kernel, signature, {})
+    loops = [l for l in innermost_loops(assembly) if "sc0 sc1" in l]
+    assert loops
+    for loop in loops:
+        stores = re.findall(r"\b(?:buffer|global)_store_\w+", loop)
+        assert sorted(stores) == ["buffer_store_dwordx2"] * 2
+
+
 @gluon.jit
 def _fail_stop_kernel(errors, flags, copy):
     """iris_fail_stop called from the waves whose flag is set (a per-wave
