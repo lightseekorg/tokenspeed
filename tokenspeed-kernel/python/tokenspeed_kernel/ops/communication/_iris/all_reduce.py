@@ -43,6 +43,10 @@ from tokenspeed_kernel.ops.communication.iris import (
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 
+if current_platform().is_cdna4:
+    # Deadline and abort checks of the hop waits a persistent layer runs.
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import poll_check, poll_stop_site
+
 hip_utils = triton.language.extra.hip.utils
 
 _PULL_MAX_PROGRAMS = 84
@@ -723,13 +727,74 @@ def _iris_wait_lamport_slots(
     SLOT_ELEMENTS: gl.constexpr,
     LAYOUT: gl.constexpr,
 ):
+    """iris_wait_lamport_slots without a deadline."""
+    return iris_wait_lamport_slots(
+        slots, offsets, valid, None, None, 0, RANK, WORLD_SIZE, SLOT_ELEMENTS, LAYOUT
+    )
+
+
+@gluon.jit
+def _iris_lamport_slots_poll(
+    words_ptr,
+    word_offsets,
+    word_valid,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    SLOT_ELEMENTS: gl.constexpr,
+):
+    """One retry of iris_wait_lamport_slots: (every peer's words, waiting)."""
+    # Issue every peer's read before checking any; .cv bypasses stale
+    # cache lines. Arrived packs stay unchanged until this rank clears
+    # them, so all valid lanes simply reread them. The compiler regression
+    # tests check that these reads remain in the polling cycle.
+    loaded = ()
+    for delta in gl.static_range(1, WORLD_SIZE):
+        peer = (RANK + delta) % WORLD_SIZE
+        loaded += (
+            gl.amd.cdna4.buffer_load(
+                words_ptr + peer * (SLOT_ELEMENTS // 2),
+                word_offsets,
+                mask=word_valid[:, None],
+                cache=".cv",
+            ),
+        )
+    # Payloads never hold negative zero, so a word is still empty exactly
+    # when its high half is 0x8000.
+    missing = gl.full(
+        word_valid.shape,
+        False,
+        gl.int1,
+        gl.SliceLayout(1, word_offsets.type.layout),
+    )
+    for delta in gl.static_range(0, WORLD_SIZE - 1):
+        empty = (loaded[delta] >> 16) == 0x8000
+        missing |= word_valid & (gl.max(empty.to(gl.int32), 1) != 0)
+    return loaded, _iris_subgroup_any(missing.to(gl.int32))
+
+
+@gluon.jit
+def iris_wait_lamport_slots(
+    slots,
+    offsets,
+    valid,
+    launch,
+    on_expiry: gl.constexpr,
+    SITE: gl.constexpr,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    SLOT_ELEMENTS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
     """Wait for each peer's BF16 packs in its slot to replace the empty markers.
 
     Peer p's packs start at slots + p * SLOT_ELEMENTS. slots is 16-byte aligned,
     as Iris allocations are; each row of offsets indexes one pack of consecutive
     elements starting at a multiple of its width. Each subgroup polls the packs
     as 32-bit words until all of its valid lanes have every peer's pack, then
-    returns them as BF16 in LAYOUT.
+    returns them as BF16 in LAYOUT. With ``on_expiry`` (not None), every 64
+    retries the poll checks ``launch``'s deadline and abort word and, once
+    stopped, calls ``on_expiry(launch, site, 0)``; with None it waits without
+    a deadline.
     """
     ROWS: gl.constexpr = offsets.shape[0]
     WORDS: gl.constexpr = offsets.shape[1] // 2
@@ -746,34 +811,24 @@ def _iris_wait_lamport_slots(
     for _ in gl.static_range(1, WORLD_SIZE):
         loaded += (gl.zeros_like(word_offsets).to(gl.uint32),)
     waiting = _iris_subgroup_any(valid.to(gl.int32))
-    while waiting:
-        # Issue every peer's read before checking any; .cv bypasses stale
-        # cache lines. Arrived packs stay unchanged until this rank clears
-        # them, so all valid lanes simply reread them. The compiler regression
-        # tests check that these reads remain in the polling cycle.
-        loaded = ()
-        for delta in gl.static_range(1, WORLD_SIZE):
-            peer = (RANK + delta) % WORLD_SIZE
-            loaded += (
-                gl.amd.cdna4.buffer_load(
-                    words_ptr + peer * (SLOT_ELEMENTS // 2),
-                    word_offsets,
-                    mask=word_valid[:, None],
-                    cache=".cv",
-                ),
+    if on_expiry is None:
+        while waiting:
+            loaded, waiting = _iris_lamport_slots_poll(
+                words_ptr, word_offsets, word_valid, RANK, WORLD_SIZE, SLOT_ELEMENTS
             )
-        # Payloads never hold negative zero, so a word is still empty exactly
-        # when its high half is 0x8000.
-        missing = gl.full(
-            word_valid.shape,
-            False,
-            gl.int1,
-            gl.SliceLayout(1, word_offsets.type.layout),
-        )
-        for delta in gl.static_range(0, WORLD_SIZE - 1):
-            empty = (loaded[delta] >> 16) == 0x8000
-            missing |= word_valid & (gl.max(empty.to(gl.int32), 1) != 0)
-        waiting = _iris_subgroup_any(missing.to(gl.int32))
+    else:
+        start = gl.to_tensor(0).to(gl.int64)
+        retries = 0
+        stop = retries < 0
+        while waiting & (not stop):
+            loaded, waiting = _iris_lamport_slots_poll(
+                words_ptr, word_offsets, word_valid, RANK, WORLD_SIZE, SLOT_ELEMENTS
+            )
+            retries += 1
+            if retries % 64 == 0:
+                stop, start = poll_check(launch, start, retries, False)
+        if stop:
+            on_expiry(launch, poll_stop_site(launch, SITE), 0)
     values = ()
     for delta in gl.static_range(0, WORLD_SIZE - 1):
         low = loaded[delta].to(gl.uint16).to(gl.bfloat16, bitcast=True)
