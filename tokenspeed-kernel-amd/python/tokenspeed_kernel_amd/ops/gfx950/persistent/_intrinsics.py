@@ -164,10 +164,12 @@ def scalar_load_glc(word_ptr):
     """Load an int32 with a scalar load past the scalar cache (``glc``).
 
     Counts in ``lgkmcnt``: it never waits behind the wave's vector loads.
-    ``glc`` reads see same-XCD stores and uncached memory [measured, MB-S];
-    words written on another XCD to coarse memory are unmeasured."""
+    ``glc`` reads see same-XCD stores and uncached memory (measured); words
+    written on another XCD to coarse memory are unmeasured. The result never
+    shares registers with the address (early clobber), so the load cannot
+    overwrite its own base while it is in flight."""
     return gl.inline_asm(
-        "s_load_dword $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=s,s,~{memory}",
+        "s_load_dword $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=&s,s,~{memory}",
         [word_ptr], gl.int32, is_pure=False,
     )  # fmt: skip
 
@@ -176,9 +178,10 @@ def scalar_load_glc(word_ptr):
 def scalar_load_glc_i64(word_ptr):
     """Load an int64 with a scalar load past the scalar cache (``glc``).
 
-    Counts in ``lgkmcnt``, like :func:`scalar_load_glc`."""
+    Counts in ``lgkmcnt``, like :func:`scalar_load_glc` (and likewise never
+    shares registers with its address)."""
     return gl.inline_asm(
-        "s_load_dwordx2 $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=s,s,~{memory}",
+        "s_load_dwordx2 $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=&s,s,~{memory}",
         [word_ptr], gl.int64, is_pure=False,
     )  # fmt: skip
 
