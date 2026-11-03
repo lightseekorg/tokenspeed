@@ -56,7 +56,14 @@ if current_platform().is_cdna4:
 
 @gluon.constexpr_function
 def _send_layout(outputs: int, num_warps: int):
-    return gl.BlockedLayout([1, outputs], [64, 1], [num_warps, 1], [1, 0])
+    """[rows, outputs] with up to 8 adjacent outputs (16 B) per lane.
+
+    From 64 outputs on, 8 lanes cover a row's 128-byte line, so each push
+    instruction writes whole lines; fewer outputs put one row per lane.
+    """
+    per_lane = min(outputs, 8)
+    lanes = min(max(outputs // 8, 1), 8)
+    return gl.BlockedLayout([1, per_lane], [64 // lanes, lanes], [num_warps, 1], [1, 0])
 
 
 @gluon.constexpr_function

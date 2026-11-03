@@ -137,8 +137,10 @@ _MUSE_ATTNTAIL_RESERVED_LDS = 128 * 1024
 # graph replay: about 16 us against 19.4-20.5 us for the replicated
 # projection plus boundary; the column GEMV senders lost there.
 _MUSE_MOETAIL_COLUMN_MAX_ROWS = 16
-# Columns each column-input sender pushes per row.
-_MUSE_MOETAIL_COLUMN_OUTPUTS = 8
+# Columns each column-input sender pushes per row: 64 BF16 columns, so every
+# push instruction writes whole 128-byte lines. 8-rank graph replay, push and
+# reduce only: 9.70 -> 7.27 us at 16 rows, 8.11 -> 7.08 at 8 (8 columns).
+_MUSE_MOETAIL_COLUMN_OUTPUTS = 64
 
 
 class MuseIrisState:
