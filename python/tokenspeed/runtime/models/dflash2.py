@@ -23,15 +23,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
-from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
@@ -48,16 +46,6 @@ from tokenspeed.runtime.models.dflash import (
 )
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
 from tokenspeed.runtime.utils import add_prefix
-
-if TYPE_CHECKING:
-    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
-        LamportResidualRMSNorm,
-    )
-
-# Most rows one fused reduce + norm serves (16 requests of 8 block rows), the
-# most the row-owned kernel keeps resident; larger draft forwards keep the
-# unfused reduction.
-_FUSED_REDUCE_NORM_MAX_ROWS = 128
 
 
 def _dflash2_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -282,26 +270,17 @@ def _reduce_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     tp: MappingBase,
-    fused: LamportResidualRMSNorm | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce a shard-local partial, then add the residual and norm.
+    """Reduce a shard-local partial, then norm.
 
-    ``fused`` is the draft's prepared reduce + norm over ``tp``'s group, or
-    None; rows past its capacity take the reduction and the norm as two
-    launches. Each sums in FP32 rank order and rounds once to BF16, as the
-    group's Iris Lamport all-reduces do.
+    Deliberately the unfused path, matching
+    ``K3DSparkDecoderLayer._norm_with_allreduce``: the fused variant is sized
+    from the target's shapes and the draft's block forward is a different
+    width. This puts the reduction where that fusion can absorb it once it has
+    been verified at this width.
     """
     if tp.tp_size <= 1:
         return norm(hidden_states, residual)
-    rows = hidden_states.shape[0]
-    if fused is not None and 0 < rows <= fused.max_rows and norm.weight_offset == 0:
-        from tokenspeed_kernel.ops.communication.iris import (
-            iris_lamport_residual_rmsnorm,
-        )
-
-        return iris_lamport_residual_rmsnorm(
-            fused, hidden_states, residual, norm.weight, norm.variance_epsilon
-        )
     return norm(all_reduce(hidden_states, tp.tp_group), residual)
 
 
@@ -326,8 +305,6 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         self.layer_id = int(layer_id)
         self._uses_mla = _dflash2_uses_mla(config)
         self.comm_manager = None
-        # The draft's prepared reduce + norm, bound by the draft model.
-        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         if self._uses_mla:
             rope_theta, rope_scaling = _dflash2_mla_rope(config)
             self.self_attn = K3DSparkAttention(
@@ -404,7 +381,6 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
                 hidden_states,
                 residual,
                 self.mapping.dense,
-                self.fused_reduce_norm,
             )
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
@@ -422,7 +398,6 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             hidden_states,
             residual,
             self.mapping.attn,
-            self.fused_reduce_norm,
         )
 
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
@@ -454,8 +429,6 @@ class DFlash2DraftModel(DFlashDraftModel):
             _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
         self.block_size = int(_dflash2_config_value(config, "block_size"))
-        # The draft's prepared reduce + norm (prepare_communication_runtime).
-        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
@@ -476,62 +449,8 @@ class DFlash2DraftModel(DFlashDraftModel):
             hidden_states,
             residual,
             self.mapping.dense,
-            self.fused_reduce_norm,
         )
         return hidden_states
-
-    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
-        """Prepare the fused reduce + norm of the draft's layer boundaries.
-
-        Collective: every rank prepares or declines alike, before cache
-        sizing and graph capture. Taken on gfx950 at TP4/TP8 for a BF16 draft
-        when the attention and dense groups are one group whose performance
-        route is Iris and whose all-reduce is already prepared (the
-        target's): the mailboxes (4 MiB at 128 rows of 8192) come out of the
-        headroom of the heap that preparation sized, and an allocation past
-        it raises on every rank alike.
-
-        Args:
-            max_num_tokens: Most rows a forward carries; unused, the fused
-                path serves at most ``_FUSED_REDUCE_NORM_MAX_ROWS``.
-
-        Returns:
-            Whether the draft prepared anything.
-        """
-        del max_num_tokens
-        if self.fused_reduce_norm is not None:
-            return True
-        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-
-        mapping = self.mapping
-        group = mapping.attn.tp_group
-        backend = get_global_backend()
-        if (
-            not current_platform().is_cdna4
-            or mapping.attn.tp_size not in (4, 8)
-            or mapping.dense.tp_group != group
-            or self.fc.weight.dtype != torch.bfloat16
-            or not isinstance(backend, AutoBackend)
-            or not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
-        ):
-            return False
-        from tokenspeed_kernel.ops.communication.iris import (
-            iris_lamport_residual_rmsnorm_supported,
-            prepare_iris_lamport_residual_rmsnorm,
-        )
-
-        all_reduce_state = backend.iris.state(group, torch.bfloat16)
-        hidden_size = int(self.config.hidden_size)
-        if all_reduce_state is None or not iris_lamport_residual_rmsnorm_supported(
-            mapping.attn.tp_size, hidden_size, torch.bfloat16
-        ):
-            return False
-        self.fused_reduce_norm = prepare_iris_lamport_residual_rmsnorm(
-            all_reduce_state, _FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
-        )
-        for layer in self.layers:
-            layer.fused_reduce_norm = self.fused_reduce_norm
-        return True
 
     @property
     def _uses_mla(self) -> bool:
