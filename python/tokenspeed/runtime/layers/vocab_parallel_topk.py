@@ -23,16 +23,12 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.sampling import (
-    vocab_shard_topk,
-    vocab_shard_topk_supports,
-    vocab_topk_merge,
-    vocab_topk_merge_supports,
-)
 
-from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
-from tokenspeed.runtime.layers.logits_processor import should_apply_lm_head_quant_method
+from tokenspeed.runtime.layers.logits_processor import (
+    fused_softcap_generic,
+    should_apply_lm_head_quant_method,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -111,12 +107,6 @@ class VocabParallelTopK:
         ):
             return
         num_org = int(shard.num_org_elements)
-        if not vocab_topk_merge_supports(self.tp_size, self.top_k):
-            logger.info(
-                f"Vocab-parallel top-k disabled: no one-launch merge of "
-                f"{self.tp_size:d} ranks x top-{self.top_k:d}.",
-            )
-            return
         if self.vocab_size > _MAX_EXACT_ID:
             logger.info(
                 f"Vocab-parallel top-k disabled: a token id in a {self.vocab_size:d}"
@@ -244,32 +234,6 @@ class VocabParallelTopK:
             self._gather_buffers = buffers
         return buffers[0][:rows], buffers[1][: rows * self.tp_size]
 
-    def _gather_pairs(
-        self, staged: torch.Tensor, landing: torch.Tensor
-    ) -> torch.Tensor:
-        """Every rank's packed pairs, as an ``[R, rows, 2 * top_k]`` view.
-
-        A column gather the backend prepared for this group (Iris on gfx950)
-        moves the fp32 pairs as raw 16-bit words and lands rank r's pairs in
-        columns ``r * 2 * top_k`` onward of every row; otherwise the pairs
-        land rank-major in the resident pad.
-        """
-        rows, width = staged.shape
-        words = staged.view(torch.bfloat16)
-        gather = get_global_backend().get_prepared_all_gather(
-            self.tp_group, words.dtype
-        )
-        if gather is not None and gather.can_run(words):
-            # Borrowed collective storage: the caller's merge reads it next.
-            gathered = gather.run(words).view(torch.float32)
-            return gathered.as_strided(
-                (self.tp_size, rows, width),
-                (width, gathered.stride(0), 1),
-                gathered.storage_offset(),
-            )
-        all_gather_single(landing, staged, self.tp_group)
-        return landing.view(self.tp_size, rows, width)
-
     def _shard_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's slice of the logits row, however the head computes it.
 
@@ -304,29 +268,31 @@ class VocabParallelTopK:
         """
         shard = self.lm_head.shard_indices
         top_k = self.top_k
-        vocab_start = int(shard.org_vocab_start_index)
 
         logits = self._shard_logits(hidden_states)[:, : int(shard.num_org_elements)]
-        rows, columns = logits.shape
-        staged, landing = self._ensure_gather_buffers(rows, logits.device)
-        if self._radix_topk is None and vocab_shard_topk_supports(
-            logits.dtype, columns, top_k
-        ):
-            vocab_shard_topk(logits, top_k, self.logit_scale, vocab_start, staged)
-        else:
-            if self.logit_scale is not None:
-                logits.mul_(self.logit_scale)
-            values, ids = self._shard_topk(logits)
-            staged[:, :top_k].copy_(values)
-            # Global ids in fp32, in one launch: both terms are exact below 2**24.
-            torch.add(ids, float(vocab_start), out=staged[:, top_k:])
-        pairs = self._gather_pairs(staged, landing)
-        candidate_ids = torch.empty(
-            (rows, top_k), dtype=torch.int64, device=logits.device
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        values, ids = self._shard_topk(logits)
+
+        rows = int(values.shape[0])
+        staged, gathered = self._ensure_gather_buffers(rows, values.device)
+        staged[:, :top_k].copy_(values)
+        # Global ids in fp32, in one launch: both terms are exact below 2**24.
+        torch.add(ids, float(shard.org_vocab_start_index), out=staged[:, top_k:])
+        all_gather_single(gathered, staged, self.tp_group)
+
+        # Rank-major to row-major, so one row's candidates from every rank sit
+        # side by side for the final selection, values and ids each on a plane.
+        planes = (
+            gathered.view(self.tp_size, rows, 2, top_k)
+            .permute(1, 2, 0, 3)
+            .reshape(rows, 2, self.tp_size * top_k)
         )
-        values = torch.empty((rows, top_k), dtype=torch.float32, device=logits.device)
         # Sorted, so the surviving candidate order does not depend on which
-        # rank happened to contribute a value; the softcap is monotone, so it
-        # never changes which candidates survive.
-        vocab_topk_merge(pairs, top_k, self.softcapping, candidate_ids, values)
+        # rank happened to contribute a value.
+        values, lanes = torch.topk(planes[:, 0], top_k, dim=-1, sorted=True)
+        # Everything downstream indexes codebooks with these.
+        candidate_ids = torch.gather(planes[:, 1], 1, lanes).to(torch.int64)
+        if self.softcapping:
+            fused_softcap_generic(values, self.softcapping, 1.0)
         return candidate_ids, values
