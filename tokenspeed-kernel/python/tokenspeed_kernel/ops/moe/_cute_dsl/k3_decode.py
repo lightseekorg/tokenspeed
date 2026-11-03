@@ -18,15 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Kimi-K3 TP8 decode MoE chain over Lamport mailboxes.
+"""Kimi-K3 TP8 decode chain over Lamport mailboxes.
 
 Per MoE layer: one GEMM publishes this rank's router logits and latent-down
 block to every rank, one kernel routes top-16 and gathers the latent, the
 persistent experts compute and combine their rows and publish the latent
 partial, and one tail kernel all-reduces it, normalizes, up-projects, adds the
-shared expert and publishes the output row. A ring kernel adds that row to the
-residual. The shared expert runs on a side stream. Every rank must run the
-chain for the same batches, since the mailboxes are collective.
+shared expert, and publishes the output row. The shared expert runs on a side
+stream. Either a ring kernel adds that row to the residual, or the next layer's
+AttnRes entry reads it: per decoder layer, the entry mixes the residual into
+the attention input, a split-K GEMM runs the input projection, and the
+o-projection exit all-reduces the partials through a mailbox and applies the
+post-attention AttnRes. Every rank must run the chain for the same row counts,
+since the mailboxes are collective.
 """
 
 from __future__ import annotations
@@ -43,7 +47,11 @@ from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
     BATCHES,
     EXPERTS,
     HIDDEN,
+    KDA_ROWS,
     LATENT,
+)
+from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.attn_res.prepared import (
+    PreparedAttnRes,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.host import (
     OprojMailbox,
@@ -60,6 +68,10 @@ from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
     store_words,
     unpack_bf16,
 )
+from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.twoshot import TwoShot
+from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.gemm.projection import (
+    PreparedProjection,
+)
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe.experts_runtime import (
     PersistentExperts,
 )
@@ -71,6 +83,9 @@ from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe.prepared import (
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe.tail_runtime import (
     MoeTailBox,
     PreparedTail,
+)
+from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.oproj.prepared import (
+    PreparedOproj,
 )
 
 
@@ -302,4 +317,142 @@ class KimiK3DecodeMoELayer:
             return row
 
         self.chain.run(x, self.owner.tail_box.out.buffer, consume=consume)
+        return out
+
+    def publish(self, x: torch.Tensor) -> None:
+        """Run the chain for ``x``, leaving its output row in the tail's ring for
+        the next :class:`KimiK3DecodeAttentionLayer` or final AttnRes to consume."""
+        self.chain.run(x, self.owner.tail_box.out.buffer, consume=lambda row: row)
+
+
+def _projection_tactics(rows: int, batches) -> dict[int, tuple[int, int, int, int]]:
+    """Split-K (M tile, N tile, split, stages) per batch, by its next tested bin;
+    GB300 TP8 sweeps of the vendored kernels (KDA 6288 rows, MLA 3648)."""
+    tactics = {}
+    for batch in batches:
+        n = next(b for b in (8, 16, 32, 64) if batch <= b)
+        if rows == KDA_ROWS:
+            tactics[batch] = (
+                (64, 64, 1, 6) if n == 64 else (128, n, 2, 5 if n == 32 else 6)
+            )
+        else:
+            stages = {8: 8, 16: 10, 32: 8, 64: 5}[n]
+            tactics[batch] = (64, n, 4 if n == 8 else 2, stages)
+    return tactics
+
+
+class KimiK3DecodeAttention:
+    """Model-owned o-projection mailbox and the MoE ring the AttnRes kernels read.
+
+    Construct collectively on every rank of the attention TP8 group, after
+    :class:`KimiK3DecodeMoE`, whose output ring the AttnRes kernels consume.
+    """
+
+    def __init__(
+        self,
+        *,
+        group: dist.ProcessGroup,
+        batches: tuple[int, ...],
+        moe: KimiK3DecodeMoE,
+    ) -> None:
+        """Allocate the o-projection mailbox and the two-shot buffers.
+
+        Args:
+            group: The attention TP8 process group the mailboxes span.
+            batches: The token row counts the chain serves (the MoE chain's).
+            moe: The MoE chain, whose output ring the AttnRes entries read.
+        """
+        tp = dist.get_world_size(group)
+        if tp != 8:
+            raise ValueError(f"the K3 decode attention chain serves TP8, got TP{tp}")
+        self.batches, self.moe = tuple(sorted(batches)), moe
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        owner = (group, self.device, tp, dist.get_rank(group))
+        self.mailbox = OprojMailbox(*owner)
+        # Batches above 32 reduce the o-projection in two shots.
+        self.twoshot = TwoShot(*owner)
+
+    def layer(
+        self,
+        decoder,
+        *,
+        layer_idx: int,
+        mla: bool,
+        first: bool,
+        projection_weight: torch.Tensor,
+    ) -> "KimiK3DecodeAttentionLayer":
+        """One decoder layer's AttnRes entry, input projection and o-projection exit.
+
+        Args:
+            decoder: The decoder layer; its AttnRes norms and projections,
+                ``self_attn.o_proj`` (this rank's [7168, K] BF16 shard) and its
+                block-write position are read.
+            layer_idx: The layer's model index (selects the mailbox parity).
+            mla: Whether the attention is MLA (else KDA).
+            first: Whether this is the first layer, whose entry has no prefix.
+            projection_weight: The attention's packed BF16 input projection
+                [rows, 7168] (row pitch kept).
+        """
+        return KimiK3DecodeAttentionLayer(
+            self, decoder, layer_idx, mla, first, projection_weight
+        )
+
+    def final(self, *, res_norm, res_proj, out_norm, num_blocks: int):
+        """The model's closing AttnRes, which also applies the final norm.
+
+        Args:
+            res_norm: The closing AttnRes RMSNorm (``weight``, ``variance_epsilon``).
+            res_proj: The closing AttnRes scorer projection (``weight``).
+            out_norm: The model's final RMSNorm (``weight``, ``variance_epsilon``).
+            num_blocks: The number of block snapshots the mix reads.
+        """
+        weights = (res_norm.weight, res_proj.weight, out_norm.weight)
+        eps = (res_norm.variance_epsilon, out_norm.variance_epsilon)
+        entry = PreparedAttnRes(weights, (num_blocks, True, -1, True), eps)
+        entry.bind_ring(self.moe.tail_box.out.buffer)
+        return entry
+
+
+class KimiK3DecodeAttentionLayer:
+    """See :meth:`KimiK3DecodeAttention.layer`."""
+
+    def __init__(self, owner, decoder, layer_idx, mla, first, weight) -> None:
+        rows = weight.shape[0]
+        self.projection = PreparedProjection(
+            weight, _projection_tactics(rows, owner.batches)
+        ).prepare()
+        # The owner's mailbox and two-shot buffers back this layer's exit.
+        self.owner, self.rows = owner, rows
+        self.entry = PreparedAttnRes.for_target(decoder, has_delta=not first)
+        self.entry.bind_ring(owner.moe.tail_box.out.buffer)
+        target = SimpleNamespace(
+            self_attn=decoder.self_attn,
+            mlp_res_norm=decoder.mlp_res_norm,
+            mlp_res_proj=decoder.mlp_res_proj,
+            post_attention_layernorm=decoder.post_attention_layernorm,
+            layer_idx=layer_idx,
+            prev_valid_blocks=decoder.prev_valid_blocks,
+            is_block_write_layer=decoder.is_block_write_layer,
+        )
+        self.exit = PreparedOproj(
+            target, owner.mailbox, owner.batches, mla, twoshot=owner.twoshot
+        )
+
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """The packed input projection [B, rows] of the attention input ``x``."""
+        return self.projection.run(x, x.new_empty((x.shape[0], self.rows)))
+
+    def enter(self, delta, prefix, blocks, out, *, ring: bool) -> torch.Tensor:
+        """AttnRes into ``out``: add ``delta`` (or the MoE ring row) to ``prefix``.
+
+        ``blocks`` is token-major [B, num_blocks, 7168].
+        """
+        if ring:
+            return self.entry.run_ring(prefix, blocks, out)
+        return self.entry.run(delta, prefix, blocks, out)
+
+    def leave(self, local, prefix, blocks, out) -> torch.Tensor:
+        """O-projection of ``local`` [B, K], its all-reduce into ``prefix`` and the
+        post-attention AttnRes into ``out``, the feed-forward input."""
+        self.exit.run(local, prefix, blocks, out)
         return out

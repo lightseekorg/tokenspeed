@@ -576,3 +576,25 @@ decode graphs run a supported row count. Under speculative decoding the
 shared expert uses the splits tuned for verify steps. Each MoE layer keeps a contiguous copy
 of its router rows and latent-down shard (about 7.7 MiB per layer at TP8)
 beside the mailboxes and scratch.
+
+When every decoder layer's attention also qualifies, the model runs the whole
+decode step through the chain (`KimiK3DecodeAttention`). The model checks that
+the attention has no attention-side parallel communication, no FP8 o-projection
+input, and an output gate on MLA; `attention_supports()` in
+`_cute_dsl/k3_decode_support.py` checks the projections the kernels serve
+(BF16, this model's TP8 KDA and MLA input projections, and a 1536-wide
+o-projection shard). Each layer then does the following:
+
+1. Add the previous feed-forward output to the residual prefix and mix it
+   with the block snapshots (AttnRes), reading a MoE layer's output row
+   straight from the tail's ring.
+2. Run the packed input projection as a split-K GEMM with per-batch tactics.
+3. Run the attention core as usual.
+4. Multiply by this rank's o-projection shard and multicast the partial;
+   a consumer kernel sums the partials, updates the prefix, and applies the
+   post-attention AttnRes. Above 32 rows each rank sums its column share and
+   multicasts it back (two-shot) instead of reading every rank's partial.
+
+A closing AttnRes reads the last MoE row and applies the final norm. A layer's
+output exists as the residual prefix once the next entry (or the closing
+AttnRes) has added its feed-forward row, so drafter captures are taken there.
