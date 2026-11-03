@@ -29,11 +29,14 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/tier/storage.h"
+#include "cache/tier/storage_lease.h"
 
 namespace tokenspeed {
 
 // Owns Host references, never request scheduling or SDK calls. All methods run
 // on the scheduler thread. Runtime workers receive only immutable descriptors.
+// A query or GET is started for a request and returned as its StorageLease;
+// backups (PUT) belong to no request and retire on their own.
 class StorageTransferManager {
 public:
     StorageTransferManager(CacheCoordinator& coordinator, StorageConfig config);
@@ -53,13 +56,14 @@ public:
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
-    std::uint64_t StartQuery(std::vector<CacheKey> keys);
+    // An empty lease when nothing was started.
+    StorageLease StartQuery(std::vector<CacheKey> keys);
     bool Completed(std::uint64_t id) const;
     bool IsQuery(std::uint64_t id) const;
     std::vector<CacheKey> QueryHits(std::uint64_t id) const;
-    std::uint64_t StartRead(const CacheCoordinator::PromptPrefix& prompt, std::span<const CacheKey> hits);
+    // An empty lease when nothing was started.
+    StorageLease StartRead(const CacheCoordinator::PromptPrefix& prompt, std::span<const CacheKey> hits);
     void Complete(const cache::StorageDone& event);
-    void Detach(std::uint64_t id);
     void QueueBackups(std::span<const CacheKey> keys);
     void StartBackups();
     void DropBackups();
@@ -67,6 +71,8 @@ public:
     std::vector<StorageOperation> TakeCommands();
 
 private:
+    friend class StorageLease;
+
     struct Ticket {
         StorageKind kind;
         std::vector<CacheKey> keys;
@@ -79,6 +85,8 @@ private:
         bool quarantined{false};
     };
     std::uint64_t nextId();
+    // What dropping the operation's lease does.
+    void detach(std::uint64_t id) noexcept;
     void rememberNegative(const CacheKey& key);
     std::size_t availableHostCredits() const;
     CacheCoordinator& coordinator_;

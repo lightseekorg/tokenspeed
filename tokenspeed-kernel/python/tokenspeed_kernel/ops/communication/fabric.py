@@ -46,6 +46,7 @@ __all__ = [
     "gather_fabric_map",
     "group_has_fabric",
     "group_host_span",
+    "host_identity",
 ]
 
 logger = logging.getLogger(__name__)
@@ -186,7 +187,7 @@ def fabric_allocation_supported(device_index: int) -> bool:
     return cached
 
 
-def _host_identity() -> int:
+def host_identity() -> int:
     """An id every rank on one host computes identically, and no other host does.
 
     The boot id is the host's, not the container's: a launcher that gives each
@@ -239,7 +240,7 @@ def gather_fabric_map() -> list[bool]:
 
     device = torch.device("cuda", torch.cuda.current_device())
     local = torch.tensor(
-        [int(fabric_allocation_supported(device.index)), _host_identity()],
+        [int(fabric_allocation_supported(device.index)), host_identity()],
         dtype=torch.int64,
         device=device,
     )

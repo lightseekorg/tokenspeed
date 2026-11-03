@@ -34,7 +34,7 @@ permissions:
 
 concurrency:
   group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   select:
