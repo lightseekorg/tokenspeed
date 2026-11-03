@@ -37,6 +37,7 @@
 #include <spdlog/spdlog.h>
 
 #include "scheduler/operations/cache.h"
+#include "scheduler/operations/progress.h"
 #include "cache/core/cache_types.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
@@ -4575,6 +4576,63 @@ TEST(CacheProgressTest, JunctionSurvivesPrefillRounds) {
     });
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().junction_tokens, 8);
+}
+
+// A scheduling attempt advances the request's progress in place. A failed one
+// leaves the request as it found it -- the retry must see the same pages,
+// junction and pending checkpoint as due -- except for an input checkpoint
+// hold admission released for capacity.
+TEST(CacheProgressTest, AnAttemptThatDoesNotCommitRestoresWhatItAdvanced) {
+    BlockPool pool(/*num_lcm_blocks=*/4, {1});
+    const CacheBlockRef checkpoint = pool.AcquireBlock(0);
+    const CacheBlockRef published = pool.AcquireBlock(0);
+    fsm::CacheProgress progress{
+        .prefix_hashes = {"page0", "page1"},
+        .access_epoch = 7,
+        .junction_tokens = 6,
+        .resumed_tail_hash = "tail",
+        .state_checkpoint_tokens = 4,
+        .state_checkpoint_blocks = {checkpoint},
+        .published_state_checkpoint_blocks = {published},
+        .retained_input_checkpoint = {pool.AcquireBlock(0)},
+    };
+    {
+        StagedCacheProgress staged{progress};
+        // What AdvanceRequestProgress and the chunk planner change...
+        progress.prefix_hashes.push_back("page2");
+        progress.junction_tokens = 0;
+        progress.published_state_checkpoint_blocks = std::move(progress.state_checkpoint_blocks);
+        progress.state_checkpoint_blocks.clear();
+        progress.state_checkpoint_tokens = 0;
+        // ...fields no attempt changes today, restored all the same...
+        progress.access_epoch = 8;
+        progress.resumed_tail_hash.reset();
+        // ...and admission's release of the optional hold before its retry.
+        progress.retained_input_checkpoint.clear();
+    }
+
+    EXPECT_EQ(progress.prefix_hashes, (std::vector<std::string>{"page0", "page1"}));
+    EXPECT_EQ(progress.access_epoch, 7u);
+    EXPECT_EQ(progress.junction_tokens, 6);
+    EXPECT_EQ(progress.resumed_tail_hash, std::optional<std::string>{"tail"});
+    EXPECT_EQ(progress.state_checkpoint_tokens, 4);
+    EXPECT_EQ(progress.state_checkpoint_blocks, std::vector<CacheBlockRef>{checkpoint});
+    EXPECT_EQ(progress.published_state_checkpoint_blocks, std::vector<CacheBlockRef>{published});
+    EXPECT_TRUE(progress.retained_input_checkpoint.empty()) << "a released hold stays released";
+    EXPECT_EQ(pool.NumOccupiedSlots(), 2) << "the released hold's block went back to the pool";
+}
+
+TEST(CacheProgressTest, ACommittedAttemptKeepsWhatItAdvanced) {
+    fsm::CacheProgress progress{.prefix_hashes = {"page0"}, .junction_tokens = 2};
+    {
+        StagedCacheProgress staged{progress};
+        progress.prefix_hashes.push_back("page1");
+        progress.junction_tokens = 0;
+        staged.Commit();
+    }
+
+    EXPECT_EQ(progress.prefix_hashes, (std::vector<std::string>{"page0", "page1"}));
+    EXPECT_EQ(progress.junction_tokens, 0);
 }
 
 // A hybrid prompt whose KV is cached further than any state checkpoint is cut

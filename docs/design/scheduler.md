@@ -121,11 +121,12 @@ cache residency with this maintained key set; it does not rebuild the set or
 reuse a previous reachability result.
 
 Decode consumes an existing reserve in place when no page or pending State
-checkpoint became complete and no sliding-window block needs reclaiming. This
-does not copy the accumulated hash chain. Publication and capacity admission
-still use a progress copy so a failed admission leaves the request unchanged.
-Previously published checkpoint holders are released after the in-place step,
-as they are after a successful admission.
+checkpoint became complete and no sliding-window block needs reclaiming; such
+a step needs no admission. Any other step publishes and admits on progress
+staged in place (see "resources and publication progress land when an
+admission succeeds" in §2), so a failed admission still leaves the request
+unchanged. Previously published checkpoint holders are
+released after the in-place step, as they are after a successful admission.
 
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in
@@ -867,13 +868,18 @@ the way from one state to the next.
 The bundle follows one rule: **resources and publication progress land when
 an admission succeeds; a state transition only moves them, never modifies
 them.** The coordinator fills the block tables inside `Admit`; the scheduler
-advances the cache progress (prefix-hash chain, pending junction) on a
-copy, hands it to that same admission — which publishes the newly completed
-pages — and writes it back to the request only after the admission succeeds.
-A failed admission therefore leaves both untouched, and the retry re-derives
-the same completed pages and asks for their publication again. Committing
-progress before admission would record the pages as hashed while never
-publishing them.
+advances the cache progress (prefix-hash chain, pending junction) in place,
+hands it to that same admission — which publishes the newly completed pages —
+and keeps the advance only if the admission succeeds (`StagedCacheProgress`
+in `scheduler/operations/progress.h`). A failed attempt truncates the chain
+back to its length before the attempt, which only appended to it, and
+restores the other fields from copies. Staging in place instead of on a copy
+keeps a step's cost independent of the context length: the chain holds one
+hash string per page. A failed admission therefore leaves both untouched
+(except the optional retained input checkpoint, which admission may release
+for capacity), and the retry re-derives the same completed pages and asks for
+their publication again. Committing progress before admission would record
+the pages as hashed while never publishing them.
 The scheduling events carry nothing but the shape of the next state (chunk
 size, decode reserve). An intermediate prefill chunk produces no token but
 does write KV, so it reports back with an empty `ExtendResult`: the arrival
