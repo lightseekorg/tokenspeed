@@ -214,11 +214,16 @@ std::optional<CacheEvictor::EvictedEntry> CacheEvictor::EvictCachedBlockAlone(
         // Host before the pages above it are judged: no probe could resume
         // from a tail whose hint the cap dropped, nor, with State groups, from
         // a boundary with no checkpoint boundary at or under it on either tier
-        // and none on its way there.
+        // and none on its way there. A Device-only entry (a sliding group's
+        // slid-out page) never reaches Host, so it leaves unwritten too,
+        // counted on its own.
+        const bool device_only = !metadata.eviction.host_eligible;
         const bool dead =
             (node->tail_tokens > 0 && !store_.Boundaries().Tails().Contains(key.content_hash)) ||
             (store_.NumStateGroups() > 0 && !node->HasCheckpointBoundaryInSubtree() && node->PendingHostStores() == 0);
-        if (dead) {
+        if (device_only) {
+            ++device_only_entries_not_written_back_;
+        } else if (dead) {
             ++dead_entries_not_written_back_;
         } else {
             write_back_segment->members.push_back(

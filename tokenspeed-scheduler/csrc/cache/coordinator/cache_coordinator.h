@@ -446,6 +446,10 @@ public:
     // recording them. Like the dead ones, they count under the eviction's
     // cause.
     std::uint64_t DemotedEntriesNotWrittenBack() const { return evictor_.DemotedEntriesNotWrittenBack(); }
+    // The Device-only entries (a sliding group's slid-out pages, which never
+    // reach Host) an admission, a restore or a compaction evicted under the
+    // write-back policy; like dead entries, they are not written back.
+    std::uint64_t DeviceOnlyEntriesNotWrittenBack() const { return evictor_.DeviceOnlyEntriesNotWrittenBack(); }
 
     // Cumulative, never reset (accounting only).
     const CacheEvictor::DeviceEvictionStats& DeviceEvictions() const { return evictor_.DeviceEvictions(); }
@@ -530,17 +534,21 @@ private:
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
+    // `host_eligible`: the blocks may reach Host (stream when published,
+    // register on the Host tier, be stored at finish). False only for a
+    // sliding group's pages published because they slide out of the window,
+    // which stay Device prefix entries.
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host, bool host_eligible);
     // Registers blocks[j] under keys[j] (logical block first_logical_block + j)
     // and reports and streams what was newly cached; cacheFullBlocksForGroup
     // passes a table window, an in-forward State checkpoint its own block.
     template <CacheTier Tier>
     void cacheBlocksForGroup(std::size_t group_index, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
                              std::int32_t first_logical_block, std::uint64_t access_epoch,
-                             CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+                             CacheBoundaryKind boundary_kind, bool stream_completed_to_host, bool host_eligible);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                       std::uint64_t access_epoch);

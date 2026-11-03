@@ -147,9 +147,10 @@ void HostCache::QueueCachedBlocksForStore(std::span<const std::string> content_h
     }
     for (const CacheGroup& group : store_.Groups()) {
         const PrefixCacheIndex& index = group.Index();
-        // A tail hash holds fewer blocks than a page; Contains filters.
+        // A tail hash holds fewer blocks than a page, and a sliding group's
+        // slid-out pages stay Device-only; HostEligible filters both.
         for (CacheKey& key : store_.KeysForGroup(content_hashes, group.Id())) {
-            if (!index.Contains(store_.DevicePool(), key)) {
+            if (!index.HostEligible(store_.DevicePool(), key)) {
                 continue;
             }
             // Read only with demotion on: off, this stays one lookup.
@@ -372,6 +373,13 @@ void HostCache::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
     // DemoteInFlightEvictions) lands demoted, unless the entry is newer.
     if (metadata.demoted) {
         index.MarkDemoted(*store_.HostPool(), key, CacheStore::kDemotedAccessEpoch);
+    }
+    // Keep a Device-only entry's key off Host (see
+    // CacheCoordinator::cacheBlocksForGroup): an L3 GET can bring a slid-out
+    // page's key to Host, after which the Device copy is an ordinary one,
+    // written back and ranked like any other.
+    if (store_.Groups()[key.group_id].Spec().attn_kind == AttnKind::kSlidingWindow) {
+        index.SetHostEligible(store_.DevicePool(), std::span<const CacheKey>(&key, 1), true, /*changed=*/nullptr);
     }
     if (store_.GroupIsState(key.group_id)) {
         BoundaryTree::Node* node = store_.Boundaries().Find(key.content_hash);

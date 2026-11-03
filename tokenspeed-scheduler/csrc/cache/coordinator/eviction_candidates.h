@@ -56,8 +56,9 @@ public:
         CacheBlockLocation location;
         std::uint32_t group_id;
         BoundaryTier boundary_tier{BoundaryTier::kUncached};
-        // The epoch the candidate ranks at, and its distance when aged.
-        std::uint64_t rank_epoch{0};
+        // The PrefixCacheIndex::EvictionRank the candidate ranks at (the
+        // aging cutoff's for an aged checkpoint), and its distance when aged.
+        std::uint64_t rank{0};
         std::int32_t aged_distance{0};
     };
 
@@ -70,6 +71,7 @@ public:
           request_reclaim_locations_{request_reclaim_locations},
           aging_{aging},
           removed_checkpoints_{removed_checkpoints},
+          aged_rank_{PrefixCacheIndex::EvictionRank(aging.cutoff_epoch, false)},
           aged_floor_{aging.tree != nullptr ? aging.tree->LeafDistance() : 0},
           next_aged_distance_{aging.tree != nullptr ? CheckpointTree::kMaxDistance : 0} {
         cursors_.reserve(groups.size());
@@ -102,13 +104,13 @@ public:
             std::ranges::reverse(candidates);
             return;
         }
-        if (!radixSortLoadedEpoch(candidates, scratch)) {
+        if (!radixSortLoadedRank(candidates, scratch)) {
             std::ranges::sort(candidates, {}, [](const Candidate& candidate) { return evictionKey(candidate); });
         }
     }
 
     // Run the feasibility walk without policy reordering. Retain a bounded
-    // prefix of raw epochs for the later policy walk, which still filters,
+    // prefix of complete ranks for the later policy walk, which still filters,
     // ranks and sorts them normally. Snapshots own policy metadata, never
     // blocks or sessions, and die with this planner. Impossible admissions
     // cannot retain the entire cache: the cap counts vector capacity, not
@@ -123,15 +125,15 @@ public:
             const auto& index = groups_[group.group_id].Index();
             PrefixCacheIndex::EvictionCursor cursor;
             bool retaining = true;
-            while (const auto epoch = index.PeekEvictionEpoch(pool_, cursor)) {
+            while (const auto rank = index.PeekEvictionRank(pool_, cursor)) {
                 entries.clear();
-                index.NextEvictionEpoch(pool_, cursor, *epoch, entries);
+                index.NextEvictionRank(pool_, cursor, *rank, entries);
                 const bool fits =
                     enough_capacity(group.group_id, std::span<const PrefixCacheIndex::EvictionCandidate>{entries});
                 if (retaining && !entries.empty()) {
                     if (entries.capacity() <= kMaxRetainedEntries - retained_entries) {
                         retained_entries += entries.capacity();
-                        group.snapshots.push_back(EpochSnapshot{*epoch, std::move(entries)});
+                        group.snapshots.push_back(RankSnapshot{*rank, std::move(entries)});
                     } else {
                         retaining = false;
                     }
@@ -142,30 +144,30 @@ public:
         return false;
     }
 
-    // A request release can precede the cache; never inspect a newer epoch.
-    std::optional<Candidate> Next(std::uint64_t max_rank_epoch) {
+    // A request release can precede the cache; never inspect a later rank.
+    std::optional<Candidate> Next(std::uint64_t max_rank) {
         while (true) {
             const Candidate* best = nullptr;
             GroupCursor* best_group = nullptr;
             enum class Source { kGroup, kAged, kRequeued } source{Source::kGroup};
             const auto consider = [&](const Candidate& candidate, Source from, GroupCursor* group) {
-                if (candidate.rank_epoch <= max_rank_epoch && (best == nullptr || Before(candidate, *best))) {
+                if (candidate.rank <= max_rank && (best == nullptr || Before(candidate, *best))) {
                     best = &candidate;
                     source = from;
                     best_group = group;
                 }
             };
             GroupCursor* next_group = nullptr;
-            std::optional<std::uint64_t> next_epoch;
+            std::optional<std::uint64_t> next_rank;
             for (GroupCursor& group : cursors_) {
                 if (group.next_candidate < group.candidates.size()) {
                     consider(group.Current(), Source::kGroup, &group);
                 } else if (!group.index_exhausted) {
-                    const auto epoch = peekEpoch(group);
-                    if (!epoch) {
+                    const auto rank = peekRank(group);
+                    if (!rank) {
                         group.index_exhausted = true;
-                    } else if (*epoch <= max_rank_epoch && (!next_epoch || *epoch < *next_epoch)) {
-                        next_epoch = epoch;
+                    } else if (*rank <= max_rank && (!next_rank || *rank < *next_rank)) {
+                        next_rank = rank;
                         next_group = &group;
                     }
                 }
@@ -176,16 +178,16 @@ public:
             if (!requeued_.empty()) {
                 consider(requeued_.front(), Source::kRequeued, nullptr);
             }
-            // Read complete equal epochs before applying policy tie-breaks.
-            if (next_group != nullptr && (best == nullptr || *next_epoch <= best->rank_epoch)) {
-                loadEpoch(*next_group, *next_epoch);
+            // Read complete equal ranks before applying policy tie-breaks.
+            if (next_group != nullptr && (best == nullptr || *next_rank <= best->rank)) {
+                loadRank(*next_group, *next_rank);
                 continue;
             }
             // Each distance's aged checkpoints are read once those of every
             // larger distance are gone.
-            if (next_aged_distance_ > aged_floor_ && aging_.cutoff_epoch <= max_rank_epoch &&
-                (best == nullptr || best->rank_epoch > aging_.cutoff_epoch ||
-                 (best->rank_epoch == aging_.cutoff_epoch && best->aged_distance < next_aged_distance_))) {
+            if (next_aged_distance_ > aged_floor_ && aged_rank_ <= max_rank &&
+                (best == nullptr || best->rank > aged_rank_ ||
+                 (best->rank == aged_rank_ && best->aged_distance < next_aged_distance_))) {
                 loadAgedDistance();
                 continue;
             }
@@ -210,7 +212,8 @@ public:
                         return candidate;
                     }
                     Candidate own_rank = candidate;
-                    own_rank.rank_epoch = own_rank.last_access_epoch;
+                    // A State checkpoint is never a slid-out sliding-window page.
+                    own_rank.rank = PrefixCacheIndex::EvictionRank(own_rank.last_access_epoch, false);
                     own_rank.aged_distance = 0;
                     requeued_.push_back(own_rank);
                     std::ranges::push_heap(requeued_, after);
@@ -227,13 +230,13 @@ private:
     // The evictionKey fields before (boundary_tier, position_rank): the
     // radix path of Sort requires every candidate to share them.
     static std::tuple<std::uint64_t, std::int32_t, std::uint64_t> rankPrefix(const Candidate& candidate) {
-        return std::tuple{candidate.rank_epoch, -candidate.aged_distance, candidate.last_access_epoch};
+        return std::tuple{candidate.rank, -candidate.aged_distance, candidate.last_access_epoch};
     }
     static std::tuple<std::uint64_t, std::int32_t, std::uint64_t, BoundaryTier, std::int64_t, std::uint32_t,
                       std::int32_t, std::int32_t>
     evictionKey(const Candidate& candidate) {
-        const auto [rank_epoch, aged_order, last_access_epoch] = rankPrefix(candidate);
-        return std::tuple{rank_epoch,
+        const auto [rank, aged_order, last_access_epoch] = rankPrefix(candidate);
+        return std::tuple{rank,
                           aged_order,
                           last_access_epoch,
                           candidate.boundary_tier,
@@ -246,10 +249,10 @@ private:
 
     // A stable LSD radix sort by (boundary_tier, position_rank) for
     // candidates that share every evictionKey field before those (rankPrefix)
-    // and the group, and arrive in strictly increasing location order, as an
-    // epoch read from one index does: the location tie-break then holds
+    // and the group, and arrive in strictly increasing location order, as a
+    // rank read from one index does: the location tie-break then holds
     // without comparing it. False, leaving the candidates untouched, otherwise.
-    static bool radixSortLoadedEpoch(std::vector<Candidate>& candidates, std::vector<Candidate>& scratch) {
+    static bool radixSortLoadedRank(std::vector<Candidate>& candidates, std::vector<Candidate>& scratch) {
         // Smaller sets sort faster by comparison than by clearing the digit counts.
         constexpr std::size_t kMinRadixSortSize = 256;
         constexpr int kDigitBits = 11;
@@ -307,7 +310,7 @@ private:
                (request_reclaim_locations_ != nullptr && request_reclaim_locations_->contains(location));
     }
 
-    // The group facts a candidate's rank depends on, read once per epoch.
+    // The group facts a candidate's rank depends on, read once per rank.
     struct GroupRanking {
         // The group is prefix-closed.
         bool closed;
@@ -329,7 +332,7 @@ private:
         Candidate candidate{.last_access_epoch = metadata ? metadata->last_access_epoch : 0,
                             .location = location,
                             .group_id = group_id};
-        candidate.rank_epoch = candidate.last_access_epoch;
+        candidate.rank = metadata ? PrefixCacheIndex::EvictionRank(*metadata) : 0;
         const std::int32_t position = metadata ? metadata->logical_block_index : -1;
         const CacheBoundaryKind kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
         const bool closed = ranking.closed;
@@ -361,8 +364,8 @@ private:
         return key && aging_.tree->AgedDistance(key->content_hash, aging_.tier) != 0;
     }
 
-    struct EpochSnapshot {
-        std::uint64_t epoch;
+    struct RankSnapshot {
+        std::uint64_t rank;
         std::vector<PrefixCacheIndex::EvictionCandidate> entries;
     };
 
@@ -376,16 +379,16 @@ private:
         PrefixCacheIndex::EvictionCursor index_cursor;
         std::vector<Candidate> candidates;
         std::size_t next_candidate{0};
-        std::vector<EpochSnapshot> snapshots;
+        std::vector<RankSnapshot> snapshots;
         std::size_t next_snapshot{0};
     };
 
-    std::optional<std::uint64_t> peekEpoch(GroupCursor& group) const {
-        if (group.next_snapshot < group.snapshots.size()) return group.snapshots[group.next_snapshot].epoch;
-        return groups_[group.group_id].Index().PeekEvictionEpoch(pool_, group.index_cursor);
+    std::optional<std::uint64_t> peekRank(GroupCursor& group) const {
+        if (group.next_snapshot < group.snapshots.size()) return group.snapshots[group.next_snapshot].rank;
+        return groups_[group.group_id].Index().PeekEvictionRank(pool_, group.index_cursor);
     }
 
-    void loadEpoch(GroupCursor& group, std::uint64_t epoch) {
+    void loadRank(GroupCursor& group, std::uint64_t rank) {
         if (!group.started) {
             group.started = true;
             ++group_scans_;
@@ -396,13 +399,13 @@ private:
         const auto& index = groups_[group.group_id].Index();
         if (group.next_snapshot < group.snapshots.size()) {
             auto& snapshot = group.snapshots[group.next_snapshot++];
-            _assert(snapshot.epoch == epoch, "the replay preserves complete epoch order");
+            _assert(snapshot.rank == rank, "the replay preserves complete rank order");
             epoch_scratch_ = std::move(snapshot.entries);
             if (group.next_snapshot == group.snapshots.size()) {
-                index.SeekAfterEvictionEpoch(pool_, group.index_cursor, epoch);
+                index.SeekAfterEvictionRank(pool_, group.index_cursor, rank);
             }
         } else {
-            index.NextEvictionEpoch(pool_, group.index_cursor, epoch, epoch_scratch_);
+            index.NextEvictionRank(pool_, group.index_cursor, rank, epoch_scratch_);
         }
         scanned_candidates_ += epoch_scratch_.size();
         group.candidates.reserve(epoch_scratch_.size());
@@ -417,7 +420,7 @@ private:
     }
 
     // The unpinned State entries of the next distance's aged checkpoints,
-    // as loadEpoch skips them.
+    // as loadRank skips them.
     void loadAgedDistance() {
         const std::int32_t distance = next_aged_distance_--;
         aged_.clear();
@@ -435,7 +438,7 @@ private:
                 }
                 Candidate candidate =
                     makeCandidate(group_id, groupRanking(group_id), entry->location, &entry->metadata.eviction);
-                candidate.rank_epoch = aging_.cutoff_epoch;
+                candidate.rank = aged_rank_;
                 candidate.aged_distance = distance;
                 aged_.emplace_back(candidate, &hash);
             }
@@ -452,8 +455,10 @@ private:
     const RemovedCheckpoints* removed_checkpoints_;
     std::vector<GroupCursor> cursors_;
     std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
-    // The other buffer of a loaded epoch's radix sort (Sort).
+    // The other buffer of a loaded rank's radix sort (Sort).
     std::vector<Candidate> sort_scratch_;
+    // The rank aged checkpoints take: the aging cutoff as a kept entry's rank.
+    std::uint64_t aged_rank_;
     std::int32_t aged_floor_;
     // The aged candidates of the distance being read, and the next distance
     // to read (the leaf distance once every aged distance was read).

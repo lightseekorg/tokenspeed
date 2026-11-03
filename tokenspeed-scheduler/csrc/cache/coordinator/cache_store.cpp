@@ -229,8 +229,9 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
         completed.tail && completed.owner_tail != OwnerTail::kKept
             ? TailBlocksFor(static_cast<std::int32_t>(group_index), completed.tail->tail_tokens)
             : 0;
-    const auto history_range = [&](std::int32_t first_block, std::int32_t past_end_block) {
-        PublishedRange range{.first_cache_block = first_block, .boundary_kind = completed.boundary_kind};
+    const auto history_range = [&](std::int32_t first_block, std::int32_t past_end_block, bool host_eligible) {
+        PublishedRange range{
+            .first_cache_block = first_block, .boundary_kind = completed.boundary_kind, .host_eligible = host_eligible};
         for (std::int32_t block = first_block; block < past_end_block; ++block) {
             range.keys.push_back(historyBlockKey(group_index, completed, block));
         }
@@ -241,7 +242,7 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
         const std::int32_t first_block = completed.first_new_prefix_page * pages_per_prefix_hash;
         const std::int32_t past_end_block = hashed_prefix_pages * pages_per_prefix_hash + tail_blocks;
         if (past_end_block > first_block) {
-            ranges.push_back(history_range(first_block, past_end_block));
+            ranges.push_back(history_range(first_block, past_end_block, /*host_eligible=*/true));
         }
         return ranges;
     }
@@ -265,6 +266,22 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
         });
         return ranges;
     }
+    // A sliding window resumes at any boundary whose window blocks are all
+    // cached. The windows behind the in-forward checkpoint, the newest page
+    // boundary and, at an unaligned point, the tail publish and may reach Host
+    // as before (the newest window may reach pages an earlier point hashed but
+    // did not publish), each with its sink blocks. The new full pages then
+    // publish as Device-only entries, like a prefix-closed group's pages, so a
+    // block that later slides out of the request's window stays cached
+    // (evictable) instead of being freed, and a boundary below the newest one
+    // -- a resent page-aligned prompt probed up to n - 1, a shared prefix --
+    // stays resumable. Device-only keeps them off Host: they neither stream
+    // nor pin their blocks, so the request recycles them as soon as they
+    // slide out, as before. Only the new pages outside every window and sink
+    // publish Device-only, so no block registers twice. Publication runs
+    // before ReclaimExpired, so the table still holds these blocks; holes from
+    // a hit are skipped.
+    //
     // The in-forward checkpoint can precede the newest page boundary. Publish
     // its own window before the request reclaims the blocks behind its frontier.
     // That window is an endpoint's, like the checkpoint, even when a chunk end
@@ -283,18 +300,24 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
         boundaries.push_back(hashed_prefix_pages * prefix_granularity_ + completed.tail->tail_tokens);
     }
     const std::int32_t state_checkpoint_tokens = completed.state_checkpoint_pages * prefix_granularity_;
+    // The block runs the windows and sinks above register, Host-eligible.
+    std::vector<BlockRange> covered;
     for (const std::int32_t boundary_tokens : boundaries) {
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(group_index), boundary_tokens);
         const BlockRange sink_blocks = SinkBlocksBelow(static_cast<std::int32_t>(group_index), window);
         if (window.first >= window.past_end && sink_blocks.first >= sink_blocks.past_end) {
             continue;
         }
-        PublishedRange range = history_range(window.first, window.past_end);
+        PublishedRange range = history_range(window.first, window.past_end, /*host_eligible=*/true);
         if (state_checkpoint_tokens > 0 && boundary_tokens == state_checkpoint_tokens) {
             range.boundary_kind = CacheBoundaryKind::kEndpoint;
         }
+        if (window.first < window.past_end) {
+            covered.push_back(window);
+        }
         if (sink_blocks.first < sink_blocks.past_end) {
-            PublishedRange sink = history_range(sink_blocks.first, sink_blocks.past_end);
+            covered.push_back(sink_blocks);
+            PublishedRange sink = history_range(sink_blocks.first, sink_blocks.past_end, /*host_eligible=*/true);
             sink.boundary_kind = range.boundary_kind;
             sink.sink = true;
             ranges.push_back(std::move(sink));
@@ -302,6 +325,22 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
         if (!range.keys.empty()) {
             ranges.push_back(std::move(range));
         }
+    }
+    // The new pages' blocks outside every covered run, as gaps between them.
+    std::int32_t next_block = completed.first_new_prefix_page * pages_per_prefix_hash;
+    const std::int32_t past_new_blocks = hashed_prefix_pages * pages_per_prefix_hash;
+    std::ranges::sort(covered, {}, &BlockRange::first);
+    for (const BlockRange& run : covered) {
+        if (next_block >= past_new_blocks) {
+            break;
+        }
+        if (run.first > next_block) {
+            ranges.push_back(history_range(next_block, std::min(run.first, past_new_blocks), /*host_eligible=*/false));
+        }
+        next_block = std::max(next_block, run.past_end);
+    }
+    if (next_block < past_new_blocks) {
+        ranges.push_back(history_range(next_block, past_new_blocks, /*host_eligible=*/false));
     }
     return ranges;
 }

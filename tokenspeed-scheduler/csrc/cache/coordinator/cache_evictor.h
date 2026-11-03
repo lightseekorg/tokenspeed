@@ -259,8 +259,9 @@ public:
     // PendingHostStore holds the tree node, tail hint included, until the
     // segment settles. It is judged and recorded before the entry leaves, so
     // the node never looks empty in between. One no probe could resume from
-    // on the Host is dropped instead (DeadEntriesNotWrittenBack). nullptr
-    // drops it.
+    // on the Host is dropped instead (DeadEntriesNotWrittenBack), and so is a
+    // Device-only one, a sliding group's slid-out page that never reaches
+    // Host (DeviceOnlyEntriesNotWrittenBack). nullptr drops it.
     std::optional<EvictedEntry> EvictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
                                                       DeviceEvictionCounts DeviceEvictionStats::*reason,
                                                       EvictedSegment* write_back_segment);
@@ -316,6 +317,7 @@ public:
     const HostEvictionStats& HostEvictions() const { return host_evictions_; }
     std::uint64_t DeadEntriesNotWrittenBack() const { return dead_entries_not_written_back_; }
     std::uint64_t DemotedEntriesNotWrittenBack() const { return demoted_entries_not_written_back_; }
+    std::uint64_t DeviceOnlyEntriesNotWrittenBack() const { return device_only_entries_not_written_back_; }
 
 private:
     // Evicts every group's Device entries under a tail hash: a tail's blocks
@@ -343,6 +345,7 @@ private:
     bool demotes_checkpoints_{false};
     std::uint64_t dead_entries_not_written_back_{0};
     std::uint64_t demoted_entries_not_written_back_{0};
+    std::uint64_t device_only_entries_not_written_back_{0};
     DeviceEvictionStats device_evictions_;
     HostEvictionStats host_evictions_;
 };

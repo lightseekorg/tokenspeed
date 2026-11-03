@@ -120,7 +120,7 @@ TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnap
             std::vector<Key> result;
             while (const auto candidate = candidates.Next(std::numeric_limits<std::uint64_t>::max())) {
                 result.emplace_back(candidate->group_id, candidate->location.lcm_block_id,
-                                    candidate->location.slot_index, candidate->rank_epoch, candidate->position_rank);
+                                    candidate->location.slot_index, candidate->rank, candidate->position_rank);
             }
             return result;
         };
@@ -235,7 +235,7 @@ TEST(CacheEvictionCandidates, SortReachesTheKeyOrderFromAnyInput) {
                                                         .slot_index = static_cast<std::int32_t>(i % 2)},
                                            .group_id = 1,
                                            .boundary_tier = tier,
-                                           .rank_epoch = 9});
+                                           .rank = 9});
         }
         return candidates;
     };
@@ -265,12 +265,12 @@ TEST(CacheEvictionCandidates, SortReachesTheKeyOrderFromAnyInput) {
         // Not one loaded epoch: each breaks a different shared field or the page order.
         const std::vector<Candidate> base = inputs.back();
         inputs.push_back(base);
-        inputs.back()[size / 2].last_access_epoch = inputs.back()[size / 2].rank_epoch = 8;
+        inputs.back()[size / 2].last_access_epoch = inputs.back()[size / 2].rank = 8;
         inputs.push_back(base);
         inputs.back().back().group_id = 0;
         inputs.push_back(base);
         inputs.back().front().aged_distance = 2;
-        inputs.back().front().rank_epoch = 10;
+        inputs.back().front().rank = 10;
         inputs.push_back(base);
         inputs.back().back().position_rank = std::int64_t{1} << 40;
         inputs.push_back(base);
@@ -279,9 +279,9 @@ TEST(CacheEvictionCandidates, SortReachesTheKeyOrderFromAnyInput) {
 
     const auto same = [](const Candidate& lhs, const Candidate& rhs) {
         const auto fields = [](const Candidate& c) {
-            return std::tuple{c.last_access_epoch,   c.position_rank, c.location.lcm_block_id,
-                              c.location.slot_index, c.group_id,      c.boundary_tier,
-                              c.rank_epoch,          c.aged_distance};
+            return std::tuple{
+                c.last_access_epoch, c.position_rank, c.location.lcm_block_id, c.location.slot_index, c.group_id,
+                c.boundary_tier,     c.rank,          c.aged_distance};
         };
         return fields(lhs) == fields(rhs);
     };

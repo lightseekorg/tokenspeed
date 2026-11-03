@@ -238,21 +238,26 @@ public:
     // The Host tier's entry under `key`, held; empty without a Host tier.
     CacheBlockRef AcquireHostCachedBlock(const CacheKey& key) const;
     // One run of table slots a publication registers in a group, the key of
-    // each (keys[j] is slot first_cache_block + j), and the boundary kind it
-    // registers them under.
+    // each (keys[j] is slot first_cache_block + j), the boundary kind it
+    // registers them under, and whether the blocks may reach Host.
     struct PublishedRange {
         std::int32_t first_cache_block{0};
         std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        // False for a sliding group's new pages outside every window the
+        // publication registers: Device-only entries that never reach Host
+        // (PrefixCacheIndex::EvictionMetadata::host_eligible).
+        bool host_eligible{true};
         // A sliding group's sink blocks below a boundary's window: published
         // with an earlier boundary already, and registered with this one again
         // so they stay as recent as every boundary that needs them.
         bool sink{false};
     };
     // What publishing `completed` covers in one group -- every newly hashed
-    // page plus the tail's blocks of a prefix-closed group, the blocks holding
-    // the window behind the newest boundary of a sliding group, slot 1 of a
-    // State group at a non-chunk point, nothing for a replayable one.
+    // page plus the tail's blocks of a prefix-closed group; the windows (and
+    // sink blocks) behind the newest boundary and the tail, then every other
+    // newly hashed page as Device-only, of a sliding group; slot 1 of a State
+    // group at a non-chunk point; nothing for a replayable one.
     std::vector<PublishedRange> CompletedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
     // Asserts a request's progress is one the store can publish.
     void ValidateProgress(const RequestProgress& progress) const;
