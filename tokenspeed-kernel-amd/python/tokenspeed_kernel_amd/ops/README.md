@@ -168,6 +168,12 @@ Qwen3.8-Flash-Next decode batches.
   GEMM's measured config has no split-K
   (`supports_gluon_mm_a16w16_column_shard_gfx950`) each column equals the
   replicated GEMM's bitwise.
+- `column_relay_gfx950` is the column shard's 16-column chain as a device
+  function for a persistent kernel that keeps the weights in registers: wave
+  `w` holds the 512-deep K tile `w` (`column_relay_weights_gfx950`, 64
+  VGPRs), waits in LDS for wave `w - 1`'s FP32 accumulator, adds its 16
+  MFMAs and hands the accumulator on with one count bump. The chain and
+  its K order are the column shard's, so the columns are bitwise equal.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.
@@ -324,6 +330,10 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   wave-summed `[16, rows]` FP32 in the caller's layout;
   `gemv_a16w16_splitk_publish_gfx950` stores such sums as the finish's
   tagged words.
+- `gemv_a16w16_splitk_weights_paced_gfx950` issues the same loads with at
+  most `WINDOW` tiles in flight per wave (counted `vmcnt` waits), so a weight
+  stream overlapping a latency-bound chain stays below the fabric's knee;
+  `gemv_a16w16_splitk_finish_x_gfx950` finishes on a caller-built x.
 
 #### Algorithm
 
