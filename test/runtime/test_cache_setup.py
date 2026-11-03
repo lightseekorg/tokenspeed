@@ -1777,6 +1777,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
         (None, "flashmla", None),
+        (None, "gluon", None),
     ],
 )
 def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
