@@ -293,3 +293,17 @@ or independent graphs can overwrite each other's queries. Cross-stream users
 must still follow PyTorch's normal tensor synchronization/lifetime rules.
 Padding remains an exact copy of the original heads plus zero-filled extra
 heads; this changes neither arithmetic nor the supported numerics envelopes.
+
+## Ascend fused decode resources
+
+The fused Prolog returns query, index-query and score, or writes them through
+an explicit caller-output form. KV and Index-K caches remain caller-owned
+persistent state. QA is private operator workspace; auxiliary debug copies are
+not part of the production interface. RoPE accepts real positions and cos/sin;
+NoPE takes neither input.
+
+`DSAResources` retains the communication window and producer/statistics views.
+LSE merge takes those real data tensors and the communication group. Peer
+window addresses and shape offsets are resolved inside the operator; the
+framework never receives a pointer table. Destroy referencing Graphs and drain
+forwards before releasing the resources or their dedicated process group.

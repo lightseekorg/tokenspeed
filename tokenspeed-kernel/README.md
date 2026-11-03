@@ -46,6 +46,10 @@ For platform checks:
 from tokenspeed_kernel.platform  import current_platform
 ```
 
+Ascend platform detection enables timing by default for `torch.npu.Event()`.
+Explicit `enable_timing` arguments and the other event options retain their
+original behavior.
+
 ## Design goals
 
 TokenSpeed-kernel is designed with these functionality goals in mind:
