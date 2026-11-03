@@ -699,11 +699,22 @@ def muse_attntail_send(
     box_ptr = att_box.to(gl.pointer_type(gl.bfloat16), bitcast=True)
     offsets = pack[:, None] * PACK + lane[None, :]
     valid = pack * PACK // K < rows
-    # First wait on one pack per merged row block (the first token's first head
+    # First wait on one word per merged row block (the first token's first head
     # of each KV head: 8 heads of 64 apart), so 128 senders do not stream the
-    # whole box from memory while attention runs; then read every pack.
-    probe = valid & (pack * PACK % (8 * K) < K) & (pack * PACK % (8 * 64) == 0)
-    _muse_attntail_wait_box(box_ptr, offsets, probe, packs)
+    # whole box from memory while attention runs; then read every pack. The
+    # probe reads one word per lane: one load per poll.
+    words: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [WAVES, 1], [1, 0])
+    probe_pack = gl.arange(0, 256, layout=gl.SliceLayout(1, words))
+    probe = (
+        (probe_pack * PACK // K < rows)
+        & (probe_pack * PACK % (8 * K) < K)
+        & (probe_pack * PACK % (8 * 64) == 0)
+    )
+    probe_offsets = (
+        probe_pack[:, None] * PACK
+        + gl.arange(0, 2, layout=gl.SliceLayout(0, words))[None, :]
+    )
+    _muse_attntail_wait_box(box_ptr, probe_offsets, probe, words)
     box = _muse_attntail_wait_box(box_ptr, offsets, valid, packs)
     # [16 tokens, K] -> the MFMA B operand [waves, K / waves, 16 tokens].
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
