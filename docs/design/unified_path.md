@@ -2377,11 +2377,21 @@ indices and bidirectional row maps. A target graph's request capacity is
 query lengths and null state destinations. The actual request count remains
 on the outer forward. Qwen4-Exp packs model inputs once and keeps the static
 query bucket through HC, attention, GDN, PLE and MLP. The body returns compact
-hidden states and taps. The common model exit expands just the actual requests'
-maximum windows before the LM head and verification run outside the graph.
-The sampling interface remains request-major; this does not yet make the
-LM-head projection compact. Both eager and graph forwards use the same device
-row selection and expansion.
+hidden states and taps. With a compact-capable sampler, the common model exit
+keeps Q rows through the LM head and argmax. Bucket filler is zeroed before
+projection, and verification reads each request's predictions directly through
+device prefix offsets. It emits at most that prefix's length, including its
+target correction or bonus token; zero-length requests emit nothing. The final
+token buffers retain the maximum request window for stop processing and state
+commit. NaN attribution, grammar masks and optional scalar logprobs use the
+same row maps without expanding vocabulary scores.
+
+The greedy sampler supports this compact interface. Other samplers and
+synthetic-acceptance benchmarks retain their existing maximum-window score
+layout. Both eager and graph forwards use these same layout contracts. The LM
+head and verification remain outside the target graph. Returned draft taps
+are concatenated while compact and expanded once after projection; draft
+context projection continues to consume actual requests' maximum windows.
 
 Draft context projection consumes those returned taps outside the target graph;
 request-shaped incremental projection must not be captured inside a Q-only

@@ -101,7 +101,12 @@ class NanGuard:
         if logits.shape[0] == 0:
             return
         if logits_output.logits_layout_plan is None:
-            self._or_per_request(torch.isnan(logits.amax(dim=-1)), ctx)
+            invalid = torch.isnan(logits.amax(dim=-1))
+            if logits_output.query_layout is not None:
+                invalid = logits_output.query_layout.expand(
+                    invalid, token_dim=0, request_count=ctx.bs
+                )
+            self._or_per_request(invalid, ctx)
         torch.nan_to_num_(
             logits, nan=_NEG_SANITIZED, posinf=_POS_SANITIZED, neginf=_NEG_SANITIZED
         )

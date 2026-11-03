@@ -1785,6 +1785,7 @@ class ModelExecutor:
             stream=self.device_module.current_stream(),
         )
         ctx.dspark_context_producer = self.dspark_context_producer
+        ctx.logits_queries = None
         if ctx.verify_queries is not None:
             slots = self.input_buffers.state_write_req_pool_indices_buf[
                 : ctx.verify_queries.batch_size
@@ -1797,6 +1798,12 @@ class ModelExecutor:
                 states.spec_candidates_ready[slots],
                 active,
             )
+            if (
+                self.sampling_backend.supports_compact_verify
+                and self.sampling_backend.config.synthetic_acceptance_length is None
+                and self._simulated_accept_length is None
+            ):
+                ctx.logits_queries = ctx.verify_queries
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
