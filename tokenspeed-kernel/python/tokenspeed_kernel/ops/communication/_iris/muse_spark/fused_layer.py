@@ -437,12 +437,14 @@ def xn_wait(view, launch, row, on_expiry: gl.constexpr, RANK: gl.constexpr):
 
 
 @gluon.constexpr_function
-def _lanes_hold(layout, columns):
-    """Whether every lane of ``layout`` holds whole runs of ``columns``
-    adjacent columns."""
+def _wave_strips(layout, warps):
+    """Whether ``layout`` gives wave w columns [16 w, 16 w + 16) of every row,
+    4 adjacent columns per lane (the MoE stream's sink layout)."""
     return (
         isinstance(layout, gl.BlockedLayout)
-        and layout.size_per_thread[-1] % columns == 0
+        and layout.size_per_thread[-1] == 4
+        and layout.threads_per_warp[-1] == 4
+        and list(layout.warps_per_cta) == [1, warps]
     )
 
 
@@ -453,9 +455,9 @@ def h4_sink(args, y, route, cols, col0):
     H4SinkArgs. Called from per-wave code, so it moves no data between
     lanes (no layout conversion, LDS or barrier).
 
-    ``y``: FP32 partial [R, C] in a BlockedLayout whose waves each hold 16
-    adjacent columns and whose lanes each hold 4 of them (such as
-    ``BlockedLayout([1, 4], [16, 4], [1, num_warps], [0, 1])``);
+    ``y``: FP32 partial [R, 16 * num_warps] in a BlockedLayout where wave
+    w holds columns [16 w, 16 w + 16) of every row, 4 adjacent ones per lane
+    (``BlockedLayout([1, 4], [16, 4], [1, num_warps], [0, 1])``);
     ``route``: [R, 1] route row (token * 8 + pick), -1 to skip, a slice of
     y's layout; ``cols`` is not read; ``col0``: this wave's first column
     (a per-wave scalar, a multiple of 16), so its 16 columns lie in one
@@ -465,7 +467,8 @@ def h4_sink(args, y, route, cols, col0):
     own4_complete), the rest to the owner's mailbox
     (iris_column_routes_push_words, copy ``launch.copy``), no wait."""
     gl.static_assert(
-        _lanes_hold(y.type.layout, 4), "h4_sink: lanes must hold 4 columns"
+        _wave_strips(y.type.layout, gl.num_warps()),
+        "h4_sink: wave w must hold columns 16 w .. 16 w + 15, 4 per lane",
     )
     gl.static_assert(y.shape[1] == 16 * gl.num_warps(), "h4_sink: 16 columns a wave")
     view = args.view
