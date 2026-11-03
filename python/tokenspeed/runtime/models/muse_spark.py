@@ -2103,6 +2103,12 @@ class MuseSparkDecoderLayer(nn.Module):
             return module.weight, module.eps, module.weight_offset
 
         return {
+            # Core attention and the gated o-norm the regular path runs.
+            "attention": dict(
+                scale=attention.attn.scaling,
+                window_left=attention.attn.sliding_window_size,
+                gate_eps=attention.rms_norm_eps,
+            ),
             "o_proj": attention.o_proj.weight,
             "post_attention_norm": norm(self.post_attention_layernorm),
             "post_attention_gate": post_attention,
@@ -2112,6 +2118,7 @@ class MuseSparkDecoderLayer(nn.Module):
             "router": mlp.gate.weight,
             "router_multiplier": mlp.gate.multiplier,
             "router_bias": mlp.gate.e_score_correction_bias,
+            "routed_scaling_factor": mlp.route_scale,
             "pooler": mlp.pre_expert_proj.weight,
             "pooler_replicated": mlp.pre_expert_proj.replicated,
             "pooled_norm": norm(mlp.pre_expert_norm),
