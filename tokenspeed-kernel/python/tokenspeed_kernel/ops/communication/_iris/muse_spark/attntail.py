@@ -549,6 +549,20 @@ def muse_attntail_store_attention(program, gate, att_box, EPS: gl.constexpr):
 
 
 @gluon.jit
+def muse_attntail_gated_rows(merged, gate, EPS: gl.constexpr):
+    """Attention rows ``[rows, head_dim]`` (FP32 merges) through
+    weightless_rmsnorm_gated_sigmoid, as BF16 Lamport words: the rows round to
+    BF16, then per head x * rsqrt(mean(x^2) + EPS) * sigmoid(gate) in FP32,
+    rounded to BF16, negative zero stored as zero."""
+    x = merged.to(gl.bfloat16).to(gl.float32)
+    inv = gl.rsqrt(gl.sum(x * x, 1) / x.shape[1] + EPS)
+    g = gate.to(gl.float32)
+    return _iris_sanitize_lamport_bf16(
+        (x * inv[:, None] * (1.0 / (1.0 + gl.exp(-g)))).to(gl.bfloat16)
+    )
+
+
+@gluon.jit
 def muse_attntail_publish_attention(program, merged, gate, att_box, EPS: gl.constexpr):
     """Gate and normalize this row block's merged rows and publish them.
 
@@ -560,12 +574,7 @@ def muse_attntail_publish_attention(program, merged, gate, att_box, EPS: gl.cons
     them; negative zero is stored as zero.
     """
     cfg = program.cfg
-    x = merged.to(gl.bfloat16).to(gl.float32)
-    inv = gl.rsqrt(gl.sum(x * x, 1) / cfg.HEAD_DIM + EPS)
-    g = gate.to(gl.float32)
-    rows = _iris_sanitize_lamport_bf16(
-        (x * inv[:, None] * (1.0 / (1.0 + gl.exp(-g)))).to(gl.bfloat16)
-    )
+    rows = muse_attntail_gated_rows(merged, gate, EPS)
     # Eight contiguous BF16 per lane: whole 32-bit words in one 16-byte store.
     box_layout: gl.constexpr = gl.BlockedLayout(
         [1, 8], [8, 8], [cfg.NUM_WARPS, 1], [1, 0]
