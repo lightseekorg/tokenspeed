@@ -326,23 +326,45 @@ class MuseSparkFusedDecoderLayer:
     heap_bytes = staticmethod(MuseSparkDecoderLayerState.heap_bytes)
 
     def __init__(self, *, plan_keys, weights: dict, state: MuseSparkDecoderLayerState):
-        self._setup(plan_keys, weights, state, DEFAULT_PLAN_FIELDS, False)
+        self._setup(
+            plan_keys, weights, state, DEFAULT_PLAN_FIELDS, False, _DEADLINE_TICKS
+        )
 
     @classmethod
     def for_benchmark(
-        cls, *, plan_keys, weights: dict, state, plan_fields: dict, stamps: bool
+        cls,
+        *,
+        plan_keys,
+        weights: dict,
+        state,
+        plan_fields: dict,
+        stamps: bool,
+        deadline_ticks: int,
     ) -> MuseSparkFusedDecoderLayer:
-        """A layer with explicit plan fields (``DEFAULT_PLAN_FIELDS``' keys) and
-        clock stamps into ``state.stamps``, for NATIVE-DESIGN §12's runs."""
+        """A layer with explicit plan fields (``DEFAULT_PLAN_FIELDS``' keys),
+        clock stamps into ``state.stamps``, and the wait deadline in 10 ns
+        clock ticks (a test stops a withheld launch sooner than the serving
+        deadline), for NATIVE-DESIGN §12's runs."""
         layer = cls.__new__(cls)
-        layer._setup(plan_keys, weights, state, plan_fields, stamps)
+        layer._setup(plan_keys, weights, state, plan_fields, stamps, deadline_ticks)
         return layer
 
-    def _setup(self, plan_keys, weights, state, plan_fields: dict, stamps: bool):
+    def _setup(
+        self,
+        plan_keys,
+        weights,
+        state,
+        plan_fields: dict,
+        stamps: bool,
+        deadline_ticks: int,
+    ):
         if set(plan_fields) != set(DEFAULT_PLAN_FIELDS):
             raise ValueError(f"plan fields must be {sorted(DEFAULT_PLAN_FIELDS)}")
+        if deadline_ticks <= 0:
+            raise ValueError(f"deadline_ticks must be positive, got {deadline_ticks}")
         self.plan_fields = dict(plan_fields)
         self.stamps = stamps
+        self.deadline_ticks = deadline_ticks
         self.state = state
         self.plan_keys = tuple(plan_keys)
         kinds = {(key.layer_kind, key.next_kind) for key in self.plan_keys}
@@ -545,7 +567,7 @@ class MuseSparkFusedDecoderLayer:
             )  # fmt: skip
         gluon_decoder_layer_muse_spark_gfx950[(GRID,)](
             state.epochs, state.claims, state.iris.errors, state.arena, state.exchange,
-            state.xq, state.xs, _DEADLINE_TICKS, 0,
+            state.xq, state.xs, self.deadline_ticks, 0,
             *state.iris.view_args(),
             q, gate, gate.stride(0), cache.k_cache, cache.v_cache, cache.page_table,
             cache.seq_lens,
