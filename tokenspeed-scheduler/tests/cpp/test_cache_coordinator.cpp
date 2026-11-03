@@ -5723,14 +5723,16 @@ TEST(SwaRegistrationTest, TheWindowBehindAnInForwardStateCheckpointIsPublishedAs
         BlockPool pool(32, {1, 1});
         CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                  /*snapshot_pool=*/nullptr,
-                                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                                 /*checkpoint_retention_requests=*/0);
         std::vector<BlockTable> tables(coord.NumGroups());
         std::vector<GroupDemand> demands = {
             {.table = &tables[0], .extent = DenseGrowth{10}},
             {.table = &tables[1], .extent = StateStep{.kind = StateStep::Kind::kRotate, .checkpoint = checkpoint}},
         };
         std::optional<CacheCoordinator::AdmissionResult> admission =
-            coord.Admit(coord.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
+            coord.Admit(coord.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
+                        /*copy_in_point=*/std::nullopt, std::nullopt,
                         /*evict_blocks_past_segments=*/false, /*session_id=*/{});
         ASSERT_TRUE(admission);
         const RequestProgress chunk_end{
@@ -5771,7 +5773,8 @@ TEST(CacheCoordinatorStateCheckpointTest, EveryStateGroupMustHoldTheCheckpointOn
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                        /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes =
         ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}});
     const auto cache_on_host = [&](const std::string& hash, std::uint32_t group_id) {
@@ -5801,7 +5804,7 @@ TEST(CacheCoordinatorStateCheckpointTest, EveryStateGroupMustHoldTheCheckpointOn
     CacheCoordinator full_only =
         MakeCoordinator(std::span<const CacheGroupSpec>(specs).first(1), 4, full_pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     CacheForGroup(full_only, full_pool, hashes[0], /*group_id=*/0);
     EXPECT_FALSE(full_only.HoldsStateCheckpoint(hashes[0]));
 }
