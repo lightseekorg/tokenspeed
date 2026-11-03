@@ -162,6 +162,7 @@ def split_records_kernel(
     error_ptr,
     tag,
     deadline_ticks,
+    num_blocks,
     Q_STRIDE_B: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
@@ -184,9 +185,89 @@ def split_records_kernel(
     """The sliding split decode with records: every program streams its split
     and publishes its record; once all records carry ``tag``, split 0 merges
     the block (``MERGE`` ``"designated"``) or every split merges its share of
-    the rows, one row per wave (``"spread"``). The grid is
-    ``_mha_decode_sliding_split_atomic``'s; all programs must be
-    co-resident."""
+    the rows, one row per wave (``"spread"``). ``num_blocks`` is the number
+    of blocks, (request, KV head row block) pairs. All programs must be co-resident.
+
+    As in the layer, a block's splits all run on one XCD: the records are
+    ordinary (cached) memory, and a scalar poll on one XCD does not see
+    stores still held in another XCD's L2. The hardware dispatches program
+    ``p`` to XCD ``p % 8``, so the grid is ``(8 * ceil(num_blocks / 8) *
+    NUM_KV_SPLITS,)`` and program ``p`` runs split ``p // 8 %
+    NUM_KV_SPLITS`` of block ``p // (8 * NUM_KV_SPLITS) * 8 + p % 8``."""
+    pid = gl.program_id(0)
+    block = pid // (8 * NUM_KV_SPLITS) * 8 + pid % 8
+    if block < num_blocks:
+        _split_records_block(
+            q_ptr,
+            k_cache_ptr,
+            v_cache_ptr,
+            page_table_ptr,
+            cache_seqlens_ptr,
+            mid_o_ptr,
+            mid_lse_ptr,
+            out_ptr,
+            record_ptr,
+            error_ptr,
+            tag,
+            deadline_ticks,
+            block,
+            pid // 8 % NUM_KV_SPLITS,
+            Q_STRIDE_B,
+            Q_STRIDE_H,
+            Q_STRIDE_D,
+            SM_SCALE,
+            PAGE_TABLE_STRIDE,
+            PAGE_SIZE,
+            NUM_KV_SPLITS,
+            MAX_SEQLEN_Q,
+            NUM_Q_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_N,
+            NUM_WARPS,
+            WINDOW_LEFT,
+            IS_FP8,
+            NUM_STAGES,
+            MERGE,
+        )
+
+
+@gluon.jit
+def _split_records_block(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    page_table_ptr: tl.const,
+    cache_seqlens_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    out_ptr,
+    record_ptr,
+    error_ptr,
+    tag,
+    deadline_ticks,
+    block,
+    split,
+    Q_STRIDE_B: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    PAGE_TABLE_STRIDE: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    MAX_SEQLEN_Q: gl.constexpr,
+    NUM_Q_HEADS: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    MERGE: gl.constexpr,
+):
     cfg = AttentionConfig(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
@@ -214,9 +295,9 @@ def split_records_kernel(
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
-        gl.program_id(0),
-        gl.program_id(1),
-        gl.program_id(2),
+        block // (NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS),
+        block % (NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS),
+        split,
     )
     launch = test_launch(error_ptr, tag, deadline_ticks)
     mha_decode_sliding_split_gfx950(

@@ -914,8 +914,11 @@ def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool, merge: str) 
     )
     errors = torch.zeros(ERROR_WORDS, device="cuda", dtype=torch.int32)
     actual = torch.empty_like(expected)
+    blocks = config.num_requests * head_blocks
+    # Each block's splits on one XCD (see split_records_kernel).
+    grid = (8 * ((blocks + 7) // 8) * config.num_kv_splits,)
     for tag in (7, 8):  # a second use of the records with a new tag
-        split_records_kernel[(config.num_requests, head_blocks, config.num_kv_splits)](
+        split_records_kernel[grid](
             q,
             inputs["k_cache"],
             inputs["v_cache"],
@@ -928,6 +931,7 @@ def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool, merge: str) 
             errors,
             tag,
             2_000_000_000,
+            blocks,
             q.stride(0),
             q.stride(1),
             q.stride(2),
