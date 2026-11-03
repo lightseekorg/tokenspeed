@@ -2418,12 +2418,18 @@ TEST_F(StateRestoreClaimSuite, ARetractionAtAPageBoundaryRestoresUnderWriteBack)
 // holds on the Device any more, so the restore of r = [1..7] and r's
 // publications after it must register what they mutate again: the tail at 7
 // that slot 0's checkpoint (the first decode's input) is keyed under, and the
-// pages of r's that came back as private copies.
+// pages of r's that came back as private copies. One block more than the
+// claim tests: the startup bound charges r's 11-token limit a tail handover
+// and the copy-in block beside it.
 class StateRestoreKvEventsSuite : public StateRestoreClaimSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateRestoreClaimSuite::MakeConfig();
         cfg.enable_kv_cache_events = true;
+        cfg.device_allocator.total_pages = 8;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
         return cfg;
     }
 
@@ -2509,11 +2515,19 @@ TEST_F(StateRestoreKvEventsSuite, TheRestoreRegistersTheTailItsCheckpointIsKeyed
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 }
 
-// Under write-back the restore claims nothing (see the test above), so its
-// own admission evicts the tail at 7 before the ACK republishes slot 0 there.
+// Under write-back the restore claims nothing (see the write-back test of
+// StateRestoreClaimSuite, whose geometry this takes: nine usable blocks and a
+// second State group), so its own admission evicts the tail at 7 before the
+// ACK republishes slot 0 there.
 TEST_F(StateRestoreKvEventsSuite, AWriteBackRestoreRegistersTheTailItEvictedFirst) {
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    config_.device_allocator.total_pages = 10;
+    config_.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "state1", .block_granularity = 0, .total_pages = 0, .attn_kind = AttnKind::kState});
+    for (CacheGroupConfig& group : config_.cache_groups) {
+        group.total_pages = config_.device_allocator.total_pages;
+    }
     scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     AckImageStores(RetractAtEight());
     const ExecutionPlan readmit = PlanAndDrain();
@@ -2529,13 +2543,19 @@ TEST_F(StateRestoreKvEventsSuite, AWriteBackRestoreRegistersTheTailItEvictedFirs
 
 // Without a Host pool the image rides the snapshot pool whole: the restore
 // copies every slot back as a private copy, evicting r's entries, and
-// republishes nothing. The knob retracts r again before it decodes (plan 6),
-// at frontier 8 once more: no page is new, but the State checkpoint lands on
-// the deepest page [5 6 7 101], whose descriptor that retraction registers.
+// republishes nothing. o, admitted while r's image is in flight, finishes at
+// once, so its cache-only entries take the free blocks and are newer than
+// r's: the restore evicts every entry of r's first. The knob retracts r again
+// before it decodes (plan 6), at frontier 8 once more: no page is new, but
+// the State checkpoint lands on the deepest page [5 6 7 101], whose
+// descriptor that retraction registers.
 TEST_F(StateRestoreKvEventsSuite, ARetractionAfterAPoolRestoreRegistersThePageItsCheckpointLandsOn) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     const ExecutionPlan retraction = RetractAtEight();
-    PlanAndDrain();  // plan 4: the image's store has not landed
+    Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
+    PlanAndDrain();  // plan 4: o's prefill; the image's store has not landed
+    SendForwardDone("o", {300});
+    SendFinish("o");
     AckImageStores(retraction);
     const ExecutionPlan readmit = PlanAndDrain();  // plan 5
     const SnapshotRestoreBatch* restore = FindRestore(readmit);

@@ -739,7 +739,10 @@ protected:
         SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
         cfg.prefix_granularity = 4;
         cfg.max_scheduled_tokens = 8;
-        cfg.device_allocator.total_pages = 11;  // ten usable: r's six cache-only blocks beside o's four fill them
+        // Twelve usable: r's six cache-only blocks beside o's six fill them.
+        // The startup bound charges r's 14-token limit a tail handover and
+        // the copy-in block beside it in each group.
+        cfg.device_allocator.total_pages = 13;
         cfg.debug_force_retraction_interval = 5;
         CacheGroupConfig& full = cfg.cache_groups.front();
         full.block_granularity = cfg.prefix_granularity;
@@ -782,12 +785,12 @@ protected:
 
 // r = [1..8] is retracted at frontier 11 (plan 5), leaving its published
 // blocks cached: both prompt pages and the tail [101 102 103], in both
-// groups. o, admitted while r's image is in flight, takes the four free
-// blocks, so the restore (plan 7) funds its private copies by evicting every
-// one of those entries, and the drain drops their descriptors. r's page
-// completion at 12 (plan 9) publishes the window behind it, rows 7 to 11:
-// its private copy of page 1 goes into the index under page 1's hash, whose
-// descriptor that publication registers again.
+// groups. o = [200..207], admitted while r's image is in flight, takes the
+// six free blocks, so the restore (plan 7) funds its private copies by
+// evicting every one of those entries, and the drain drops their descriptors.
+// r's page completion at 12 (plan 9) publishes the window behind it, rows 7 to
+// 11: its private copy of page 1 goes into the index under page 1's hash,
+// whose descriptor that publication registers again.
 TEST_F(SlidingWindowRestoreKvCacheEventTestSuite,
        APageCompletionAfterAPoolRestoreRegistersThePageItsWindowReachesBackInto) {
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(8), .max_new_tokens = 6});
@@ -805,7 +808,7 @@ TEST_F(SlidingWindowRestoreKvCacheEventTestSuite,
     ASSERT_EQ(scheduler_->RetractedSize(), 1u);
     EXPECT_TRUE(Stored({101, 102, 103}));
 
-    Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(4, 200), .max_new_tokens = 2});
+    Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(8, 200), .max_new_tokens = 2});
     ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"o"});  // plan 6
     ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 0);
     ASSERT_TRUE(Stored({5, 6, 7, 8})) << "o's admission evicted nothing";
