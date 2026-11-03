@@ -33,6 +33,10 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
+from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import (
+    lds_spin_until,
+    lds_store_count,
+)
 
 cdna4 = gl.amd.cdna4
 async_copy = gl.amd.cdna4.async_copy
@@ -1884,6 +1888,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
 # 9.35 us for 256-deep tiles and 13.7 us for 1024-deep ones.
 _COLUMN_SHARD_BLOCK_K = 512
 _COLUMN_SHARD_BUFFERS = 3
+_RELAY_K = gl.constexpr(_COLUMN_SHARD_BLOCK_K)
 
 
 def supports_gluon_mm_a16w16_column_shard_gfx950(
@@ -1966,6 +1971,97 @@ def launch_gluon_mm_a16w16_column_shard_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return out
+
+
+@gluon.constexpr_function
+def _relay_mfma(waves: int):
+    # The column shard's 16x16x32 MFMA, one 16-token x 16-column tile per wave.
+    return gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[waves, 1, 1],
+    )
+
+
+@gluon.jit
+def column_relay_weights_gfx950(w_ptr, column0, K: gl.constexpr):
+    """Issue a 16-column relay's weights: rows ``[column0, column0 + 16)`` of
+    a ``[N, K]`` BF16 weight, wave w holding K range ``[512 w, 512 w + 512)``
+    (one column-shard K tile) as the MFMA B operand ``[waves, 512, 16]``, 16 KB
+    per wave. Loads are ``.cg``."""
+    WAVES: gl.constexpr = gl.num_warps()
+    gl.static_assert(K == WAVES * _RELAY_K)
+    b_l: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=_relay_mfma(WAVES), k_width=8
+    )
+    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, b_l)))
+    k = gl.arange(0, _RELAY_K, gl.SliceLayout(0, gl.SliceLayout(2, b_l)))
+    n = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, b_l)))
+    return gl.amd.cdna4.buffer_load(
+        w_ptr,
+        (column0 + n)[None, None, :] * K
+        + (wave * _RELAY_K)[:, None, None]
+        + k[None, :, None],
+        cache=".cg",
+    )
+
+
+@gluon.jit
+def column_relay_gfx950(s, w, relay, relay_count, OUT_LAYOUT: gl.constexpr):
+    """The column shard GEMM's 16-column tile, its K chain relayed across the
+    workgroup's waves; bitwise the shard's (and the replicated GEMM's) columns.
+
+    Every output of :func:`launch_gluon_mm_a16w16_column_shard_gfx950` runs one
+    accumulator through its 16x16x32 MFMAs in K order, 512 K per tile. Here
+    wave w runs K tile w on that accumulator: it waits until wave w - 1 has
+    handed its accumulator over through LDS, runs its 16 MFMAs on it and hands
+    it to wave w + 1. Only the issuing wave of each step changes, so the
+    result is the same, while each wave holds 1 / waves of the weights.
+
+    Args:
+        s: Activations as the A operand ``[waves, 16 tokens, 512]`` BF16 in
+            the relay's MFMA layout (wave w: K tile w of every token).
+        w: :func:`column_relay_weights_gfx950`'s B operand.
+        relay: Shared FP32 ``[waves, 16, 16]``, row-major (the hand-off
+            slots: wave w reads slot w and writes slot w + 1, the last wave
+            slot 0), and ``relay_count`` a shared int32 ``[1]`` that the caller
+            zeroes behind a barrier before the relay; neither is touched by
+            other code during it.
+        OUT_LAYOUT: The result's 2-D blocked layout.
+
+    Returns:
+        FP32 ``[16 tokens, 16 columns]`` in ``OUT_LAYOUT``, in every wave.
+    """
+    WAVES: gl.constexpr = gl.num_warps()
+    mfma: gl.constexpr = _relay_mfma(WAVES)
+    lanes_l: gl.constexpr = gl.BlockedLayout([1], [64], [WAVES], [0])
+    lane_wave = gl.arange(0, 64 * WAVES, lanes_l) // 64
+    zero = lane_wave * 0
+    # Wave w starts once waves 0 .. w - 1 have each added 64 (one per lane).
+    lds_spin_until(relay_count, zero, 64 * lane_wave)
+    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, mfma)))[
+        :, None, None
+    ]
+    slots = relay.load(mfma)  # wave w reads slot w
+    acc = gl.amd.cdna4.mfma(s, w, gl.where(wave == 0, 0.0, slots))
+    # Hand over: this wave's accumulator to slot w + 1 (the last wave's to
+    # slot 0, which wave 0 read before any hand-off), then its 64 adds.
+    r = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, mfma)))[None, :, None]
+    c = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, mfma)))[None, None, :]
+    offsets = ((((wave + 1) % WAVES) * 16 + r) * 16 + c) * 4
+    lds_store_count(relay, offsets, acc, relay_count, offsets * 0)
+    # Slot 0 holds the result; every wave reads it once all are done.
+    lds_spin_until(relay_count, zero, zero + 64 * WAVES)
+    out3: gl.constexpr = gl.BlockedLayout(
+        [1] + OUT_LAYOUT.size_per_thread,
+        [1] + OUT_LAYOUT.threads_per_warp,
+        [1] + OUT_LAYOUT.warps_per_cta,
+        [o + 1 for o in OUT_LAYOUT.order] + [0],
+    )
+    return gl.convert_layout(
+        gl.reshape(relay.slice(0, 1, 0).load(out3), [16, 16]), OUT_LAYOUT
+    )
 
 
 _GROUPED_M_BUCKETS = (4, 8, 16, 32, 64, 128)

@@ -37,6 +37,7 @@ pytest.importorskip("tokenspeed_kernel_amd")
 
 from asm_checks import instruction_lines  # noqa: E402
 from native_body_helpers import (  # noqa: E402
+    column_relay_kernel,
     compile_gfx950,
     head_task_kernel,
     kpart_pooler_kernel,
@@ -323,3 +324,32 @@ def test_head_task_prologue_runs_on_summed_partials():
     ]
     polls = [line for line in code if line.startswith("buffer_load_dwordx2")]
     assert polls and all(line.endswith("sc0 sc1") for line in polls), polls[:4]
+
+
+def test_column_relay_holds_its_k_tile_and_chains_one_accumulator():
+    """Each wave of the post-expert sender holds one 512-deep K tile (16 KB,
+    16 weight loads) and runs 16 MFMAs on one accumulator chain, between a
+    spin for its predecessor and a hand-off (LDS writes and one
+    ``ds_add_rtn``); no barrier inside the relay and no scratch."""
+    assembly = compile_gfx950(
+        column_relay_kernel,
+        {"x_ptr": "*bf16", "w_ptr": "*bf16", "out_ptr": "*bf16", "M": "i32"},
+        dict(K=4096),
+        num_warps=8,
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    code = instruction_lines(assembly)
+    weights = [
+        line
+        for line in code
+        if line.startswith("buffer_load_dwordx4") and line.endswith("sc0 nt")
+    ]
+    assert len(weights) == 16
+    mfmas = [i for i, line in enumerate(code) if line.startswith("v_mfma")]
+    assert len(mfmas) == 16
+    spins = [i for i, line in enumerate(code) if line.startswith("s_cbranch_vccnz")]
+    handoff = next(
+        i for i, line in enumerate(code) if line.startswith("ds_add_rtn_u32")
+    )
+    assert spins[0] < mfmas[0] and mfmas[-1] < handoff < spins[1]
+    assert not [line for line in code[spins[0] : spins[1]] if line == "s_barrier"]
