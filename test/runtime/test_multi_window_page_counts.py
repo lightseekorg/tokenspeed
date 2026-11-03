@@ -123,9 +123,11 @@ class TestMultiWindowPageCountsTest:
     and one in-flight prefill chunk adds its lookback -- the most pages a
     window can span at any alignment, ceil((W - 1 + page - 1) / page) -- plus
     ceil(chunk / page) rows before they slide out. Every group that publishes a prefix also
-    charges one tail-handover page per live request: the blocks a request
-    holds while its published tail changes hands at prompt end (a sliding
-    group at most its lookback, so a window of one charges none).
+    charges one tail-handover page per live request -- a hitter's copy of a
+    published tail while its source stays pinned -- and, on the fused role,
+    one copy-in page per live request -- the block a request reserves for the
+    tail its prompt end publishes (a sliding group at most its lookback for
+    each, so a window of one charges neither).
     """
 
     def test_each_window_budgets_independently(self):
@@ -137,16 +139,17 @@ class TestMultiWindowPageCountsTest:
             ]
         )
         # full: ceil(4096/64) dense + one unaligned tail page per request
-        # + one tail-handover page per request
-        assert (pages["full_attention"]) == (64 + 4 + 4)
+        # + one tail-handover and one copy-in page per request
+        assert (pages["full_attention"]) == (64 + 4 + 4 + 4)
         # W=128: ceil((127 + 1 + 63)/64) = 3 per request; lookback
         # ceil((127 + 63)/64) = 3 and ceil(512/64) = 8 rows for the chunk in
-        # flight; handover 1 per request
-        assert (pages["sliding_attention_128"]) == (4 * 3 + 3 + 8 + 4)
+        # flight; handover and copy-in 1 each per request
+        assert (pages["sliding_attention_128"]) == (4 * 3 + 3 + 8 + 4 + 4)
         # W=4: ceil((3 + 1 + 63)/64) = 2 per request -- a sub-page window can
         # still straddle two pages while its partial tail is live; lookback
-        # ceil((3 + 63)/64) = 2; handover min(1, lookback) = 1 per request
-        assert (pages["sliding_attention_4"]) == (4 * 2 + 2 + 8 + 4)
+        # ceil((3 + 63)/64) = 2; handover and copy-in min(1, lookback) = 1
+        # each per request
+        assert (pages["sliding_attention_4"]) == (4 * 2 + 2 + 8 + 4 + 4)
         assert (pages["sliding_attention_128"]) > (pages["sliding_attention_4"])
 
     def test_window_one_holds_only_the_token_being_written(self):
@@ -159,8 +162,8 @@ class TestMultiWindowPageCountsTest:
         wide = _pages([_spec("s", "sliding_window", window=128)], max_context_len=32)
         # min(127, 32) = 32 -> ceil((32 + 1 + 63)/64) = 2 pages per request
         # instead of 3; the resumable-boundary lookback still follows the
-        # window (3 pages); handover 1 per request.
-        assert (wide["s"]) == (4 * 2 + 3 + 8 + 4)
+        # window (3 pages); handover and copy-in 1 each per request.
+        assert (wide["s"]) == (4 * 2 + 3 + 8 + 4 + 4)
 
     def test_scheduled_tokens_capped_by_total(self):
         pages = _pages(
@@ -168,7 +171,7 @@ class TestMultiWindowPageCountsTest:
             max_scheduled_tokens=10_000,
             max_total_tokens=4096,
         )
-        assert (pages["s"]) == (4 * 3 + 3 + math.ceil(4096 / PAGE) + 4)
+        assert (pages["s"]) == (4 * 3 + 3 + math.ceil(4096 / PAGE) + 4 + 4)
 
 
 class TestSuffixedGroupIdFlowTest:

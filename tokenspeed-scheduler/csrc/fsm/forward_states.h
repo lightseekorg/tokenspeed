@@ -135,6 +135,14 @@ struct ForwardResources {
     std::int32_t prefix_granularity{};
     ReqPoolIndex req_pool_index;
     std::vector<BlockTable> block_tables;
+    // Per cache group, the copy-in blocks the request holds for its prompt
+    // end, which its first decode publishes and keeps writing past: aligned
+    // to CacheCoordinator::CopyInSlots, each reserved by the admission that
+    // allocated the block of its slot, null until then. The first decode
+    // spends them (CacheCoordinator::Admit); they go with the tables, so a
+    // retraction releases them and a restore reserves them again. Empty
+    // when the request reserves none.
+    std::vector<std::vector<CacheBlockRef>> copy_in_blocks;
     CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
     // More than one is normal under the overlap schedule, which plans the

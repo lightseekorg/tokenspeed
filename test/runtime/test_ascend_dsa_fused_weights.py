@@ -103,7 +103,9 @@ def test_score_pack_preserves_fp32_coefficient_bits():
 
 
 def test_indexer_keeps_fp32_score_weights():
-    config = PretrainedConfig(index_n_heads=2, index_head_dim=4, index_use_rope=False)
+    config = PretrainedConfig(
+        index_n_heads=2, index_head_dim=4, index_use_rope=False, rms_norm_eps=1e-6
+    )
     indexer = AscendDSAIndexer(
         config=config,
         hidden_size=8,

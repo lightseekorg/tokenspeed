@@ -88,9 +88,14 @@ def _prepend_env_path(name: str, path: Path) -> None:
 def _npu_is_available() -> bool:
     """Return whether torch-npu is installed and an Ascend device is visible."""
     try:
-        import torch_npu  # noqa: F401
+        import torch_npu
     except ImportError:
         return False
+    # Use timed completion events by default; preserve explicit constructor arguments.
+    torch_npu.npu.Event.__new__.__defaults__ = (
+        True,
+        *torch_npu.npu.Event.__new__.__defaults__[1:],
+    )
     return bool(torch.npu.is_available())
 
 

@@ -156,6 +156,7 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     if not is_cdna4():
         pytest.skip("requires gfx950")
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        _mha_decode_sliding_split_atomic,
         gluon_mha_decode_gfx950,
         gluon_mha_decode_reduce_gfx950,
         gluon_mha_decode_sliding_gfx950,
@@ -181,6 +182,7 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
         gluon_mha_decode_gfx950,
         gluon_mha_decode_reduce_gfx950,
         gluon_mha_decode_sliding_gfx950,
+        _mha_decode_sliding_split_atomic,
     ):
         # Eager dispatch under the guard verifies dynamic values do not become
         # specialization keys; graph replay alone could not establish that.

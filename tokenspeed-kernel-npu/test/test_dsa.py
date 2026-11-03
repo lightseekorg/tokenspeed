@@ -108,16 +108,13 @@ def test_lse_adapter_preserves_the_requested_cp_degree(degree):
     kernels = AscendDSAKernels.__new__(AscendDSAKernels)
     output = torch.empty((64, 64, 512), dtype=torch.float32, device="meta")
     statistics = torch.empty((1, 64, 64), dtype=torch.float32, device="meta")
-    peers = torch.empty(8, dtype=torch.int64, device="meta")
     with pytest.raises(RuntimeError, match="rank group"):
         kernels.merge_lse_direct(
             output,
             statistics,
             statistics,
-            peers,
             group="test-dsa-contract",
             rank_size=degree,
-            setup_mode=0,
         )
 
 

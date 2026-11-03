@@ -47,6 +47,12 @@ enum class CacheBoundaryKind { kChunk, kEndpoint };
 // The tiers a prefix cache entry lives on: Device L1 and Host L2.
 enum class CacheTier { kDevice, kHost };
 
+// The most new-request admissions an aged State checkpoint may rank behind
+// (SchedulerConfig::checkpoint_retention_requests).
+inline constexpr std::int64_t kMaxCheckpointRetentionRequests{std::int64_t{1} << 20};
+// Checkpoint distances from here on rank alike (CheckpointTree).
+inline constexpr std::int32_t kMaxCheckpointDistance{5};
+
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -192,6 +198,24 @@ struct TailPublication {
     ContentHash hash{};
 };
 
+// What the owner of a published partial page does with its blocks of that
+// page after the publication.
+enum class OwnerTail {
+    // The frontier is final (finish, retraction): the blocks are published in
+    // place.
+    kFinal,
+    // The owner keeps writing past the point (a prompt end followed by
+    // decode): its blocks are registered without taking another request's
+    // canonical block into the table, and the admission moves off every one
+    // it registered into the copy-in block the request holds for its slot,
+    // copying the published bytes into it.
+    kCopiedIn,
+    // The owner keeps writing past a point whose KV is cached already (a
+    // chunk end cut at a junction): its blocks stay unpublished, and only the
+    // State groups publish, under the tail's hash.
+    kKept,
+};
+
 // What a request completed since the coordinator last saw it, ready to
 // publish. prefix_hashes is the request's cumulative completed prefix-page
 // history; the pages from first_new_prefix_page on are the new ones. The
@@ -199,18 +223,17 @@ struct TailPublication {
 // range, a tail, or a state checkpoint. The request owns the storage behind
 // the spans.
 struct CompletedPages {
+    // The completed tokens, which order checkpoints inside a page.
+    std::span<const std::int32_t> tokens{};
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
     // The partial page at this publication point, absent when the point is
     // page-aligned (T = prefix_hashes.size() * P).
     std::optional<TailPublication> tail{};
-    // The owner keeps writing the partial page after this publication (a
-    // prompt end followed by decode, a junction-cut chunk end): the admission
-    // swaps a fresh block into the table slot and copies the published bytes
-    // into it. False at finish and retraction, where the block is final and
-    // is published in place. Only an admission may set it: the copy needs the
-    // transaction's capacity.
-    bool owner_continues{false};
+    // What the owner does with its blocks of the tail. Only an admission may
+    // publish anything but kFinal: the copy-in spends blocks the request
+    // holds (CacheCoordinator::Admit).
+    OwnerTail owner_tail{OwnerTail::kFinal};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
     // publishes slot 1 -- the block the forward that ended here wrote --

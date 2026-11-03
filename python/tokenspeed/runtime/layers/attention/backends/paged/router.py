@@ -917,7 +917,7 @@ class CacheGroupRouter(AttentionBackend):
             return out
         # CPU reference (unit tests): same slot rule, overflow/holes -> 0.
         bs = cache_start.shape[0]
-        steps = torch.arange(num_tokens, dtype=torch.int64)
+        steps = torch.arange(num_tokens, dtype=torch.int64, device=view.table.device)
         pos = cache_start.to(torch.int64).unsqueeze(1) + steps
         max_num_pages = view.table.shape[1]
         page_idx = (pos // view.page_size).clamp_max(max_num_pages - 1)
