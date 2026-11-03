@@ -737,8 +737,14 @@ def muse_attntail_send(
         columns += (gl.permute(gl.sum(partials[t].load(sums_layout), axis=0), [1, 0]),)
     out = gl.join(gl.join(columns[0], columns[1]), gl.join(columns[2], columns[3]))
     out = gl.reshape(gl.permute(out, [0, 3, 2, 1]), [16, OUTPUTS])
+    # Each wave stores whole token rows (OUTPUTS BF16 = one 128 B line), so
+    # no line crosses the link in partial writes.
+    PUSH_VECTOR: gl.constexpr = 16 * OUTPUTS // (64 * WAVES)
     push: gl.constexpr = gl.BlockedLayout(
-        [1, OUTPUTS // (4 * WAVES)], [16, 4], [1, WAVES], [1, 0]
+        [1, PUSH_VECTOR],
+        [64 * PUSH_VECTOR // OUTPUTS, OUTPUTS // PUSH_VECTOR],
+        [WAVES, 1],
+        [1, 0],
     )
     out = _iris_sanitize_lamport_bf16(gl.convert_layout(out, push).to(gl.bfloat16))
     token = gl.arange(0, 16, gl.SliceLayout(1, push))
@@ -893,15 +899,15 @@ def muse_attntail_own(
         ),
         [MAX_ROWS, PACKS_PER_ROW, VECTOR, 4],
     )  # last axis: sum b^2, B, A, C
-    sums_layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [WAVES, 1], [1, 0])
+    # Two words per lane, consecutive lanes consecutive: whole 128 B lines.
+    sums_layout: gl.constexpr = gl.BlockedLayout([1, 2], [32, 2], [WAVES, 1], [1, 0])
     sums = gl.convert_layout(gl.sum(gl.sum(four, 2), 1), sums_layout)  # [MAX_ROWS, 4]
     sum_row = gl.arange(0, MAX_ROWS, gl.SliceLayout(1, sums_layout))
     which = gl.arange(0, 4, gl.SliceLayout(0, sums_layout))
     OWNERS: gl.constexpr = OWNED // OWNER_COLUMNS
-    # [MAX_ROWS][every rank's owners][4] on every rank.
-    slot = (
-        sum_row[:, None] * (WORLD_SIZE * OWNERS) + RANK * OWNERS + owner
-    ) * 4 + which[None, :]
+    # [every rank's owners][MAX_ROWS][4] on every rank: an owner's rows are
+    # contiguous, so its store covers whole lines.
+    slot = ((RANK * OWNERS + owner) * MAX_ROWS + sum_row[:, None]) * 4 + which[None, :]
     packed = _muse_attntail_pack_sums(tag, sums)
     mask = (sum_row < rows)[:, None] & (which >= 0)[None, :]
     for peer in gl.static_range(WORLD_SIZE):
@@ -935,6 +941,7 @@ def muse_attntail_finish(
     WIDTH: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     MAX_SHARD_ELEMENTS: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
     OWNER_COLUMNS: gl.constexpr,
     POST_EPS: gl.constexpr,
     POST_WEIGHT_OFFSET: gl.constexpr,
@@ -1000,7 +1007,7 @@ def muse_attntail_finish(
     sums_layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [WAVES, 1], [1, 0])
     owner = gl.arange(0, OWNERS, gl.SliceLayout(1, sums_layout))
     which = gl.arange(0, 4, gl.SliceLayout(0, sums_layout))
-    index = (row * OWNERS + owner[:, None]) * 4 + which[None, :]
+    index = (owner[:, None] * MAX_ROWS + row) * 4 + which[None, :]
     gl.atomic_poll(
         sums.to(gl.pointer_type(gl.int32), bitcast=True) + index * 2 + 1,
         tag,
@@ -1283,6 +1290,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
             WIDTH,
             WORLD_SIZE,
             MAX_SHARD_ELEMENTS,
+            MAX_ROWS,
             OWNER_COLUMNS,
             POST_EPS,
             POST_WEIGHT_OFFSET,
