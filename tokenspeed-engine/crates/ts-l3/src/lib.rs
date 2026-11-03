@@ -30,6 +30,9 @@
 //! here takes the GIL, calls the scheduler or touches the GPU.
 
 pub mod executor;
+mod hf3fs_index;
+mod hf3fs_native;
+pub mod hf3fs_usrbio;
 pub mod keys;
 pub mod layout;
 pub mod mooncake;

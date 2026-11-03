@@ -16,6 +16,8 @@ python = ["dep:pyo3"]
 name = "ts_l3"
 
 [dependencies]
+libloading = "0.9"
+libc = "0.2"
 pyo3 = { version = "0.30", optional = true }
 sha2 = "0.10"
 thiserror.workspace = true
