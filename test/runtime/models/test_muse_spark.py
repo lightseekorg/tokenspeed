@@ -74,6 +74,7 @@ from tokenspeed.runtime.models.muse_spark import (
     restore_rotary_pairs,
     shard_expert_projection,
 )
+from tokenspeed.runtime.models.muse_spark_layer_stack import MuseSparkLayerStack
 from tokenspeed.runtime.models.muse_spark_vision import (
     FULL_ATTENTION as VISION_FULL_ATTENTION,
 )
@@ -301,7 +302,6 @@ class _AddLayer(torch.nn.Module):
     def __init__(self, value: float) -> None:
         super().__init__()
         self.value = value
-        self.fused = None
         self.input_layernorm = f"norm{value}"
         self.comm_manager = SimpleNamespace(
             gather_residual=lambda rows, ctx: rows,
@@ -326,7 +326,7 @@ class _AddLayer(torch.nn.Module):
 def test_forward_threads_attention_input_rows_between_layers() -> None:
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
-    model.fused_shapes = frozenset()
+    model.layer_stack = MuseSparkLayerStack()
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
@@ -357,15 +357,17 @@ class _FusedAddLayer(_AddLayer):
 
     def __init__(self, value: float) -> None:
         super().__init__(value)
-        self.fused = object()
+        self.received_query = None
 
     def prepare_fused_query(self, positions, attention_input, ctx):
         return ("query", attention_input)
 
-    def forward_fused(self, positions, prepared_query, hidden_states, ctx, next_layer):
+    def forward_fused(self, fused, positions, prepared_query, hidden_states, ctx, next_layer, next_fused,):  # fmt: skip
+        # The stack hands each layer its own prepared fused layer.
+        assert fused == f"fused{self.value}"
         self.received_query = prepared_query
         residual = hidden_states + self.value
-        if next_layer.fused is None:
+        if not next_fused:
             return residual, None, residual * 10.0
         return residual, ("query", residual), None
 
@@ -376,7 +378,13 @@ def _fused_model(served: frozenset):
     model.layers = torch.nn.ModuleList(
         [_AddLayer(1.0), _FusedAddLayer(2.0), _FusedAddLayer(3.0), _AddLayer(4.0)]
     )
-    model.fused_shapes = served
+    stack = MuseSparkLayerStack()
+    # What prepare leaves when the group serves ``served``; the fused
+    # kernels need a GPU, so names stand in for the prepared layers.
+    stack.fused_layers = ["fused2.0", "fused3.0"]
+    stack.fused_indices = range(1, 3)
+    stack.served_shapes = served
+    model.layer_stack = stack
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
@@ -401,7 +409,8 @@ def test_fused_layers_run_only_on_served_decode_shapes() -> None:
     # The first fused layer prepares its query from the regular boundary rows;
     # the next one gets the query the previous launch prepared.
     assert model.layers[1].received_query[1] is not None
-    torch.testing.assert_close(model.layers[1].received_query[1], after_regular * 1.0)
+    # (layer 0 emits its input times its value as the next attention input).
+    torch.testing.assert_close(model.layers[1].received_query[1], hidden * 1.0)
     torch.testing.assert_close(model.layers[2].received_query[1], after_regular + 2.0)
     # The last fused launch hands the regular layer its attention input rows.
     residual = after_regular + 2.0 + 3.0
@@ -414,7 +423,7 @@ def test_fused_layers_run_only_on_served_decode_shapes() -> None:
     out, _ = model.forward(
         torch.tensor([0, 1]), torch.tensor([0, 1]), one_request, hidden
     )
-    assert not hasattr(model.layers[1], "received_query")
+    assert model.layers[1].received_query is None
     torch.testing.assert_close(
         out, -(hidden + 1.0 + 2.0 + 3.0 + 4.0).to(torch.bfloat16)
     )
@@ -432,7 +441,7 @@ def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
-    model.fused_shapes = frozenset()
+    model.layer_stack = MuseSparkLayerStack()
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
