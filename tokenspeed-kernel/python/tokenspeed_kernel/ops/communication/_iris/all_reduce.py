@@ -1564,9 +1564,9 @@ def iris_pull_twoshot(
 
     # Every subgroup stored part of the partition. The barrier the compiler
     # inserts before the one-thread release does not wait for memory, and the
-    # release waits only for its own subgroup's stores before writing back L2.
-    # So each subgroup first waits until its stores reach L2 (s_waitcnt
-    # vmcnt(0) on gfx950).
+    # releasing thread's buffer_wbl2 and s_waitcnt vmcnt(0) cover only its own
+    # subgroup's stores. So each subgroup first waits until its stores reach
+    # L2 (s_waitcnt vmcnt(0) on gfx950).
     WAIT_STORES(args=[], constraints="=r,~{memory}")
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(

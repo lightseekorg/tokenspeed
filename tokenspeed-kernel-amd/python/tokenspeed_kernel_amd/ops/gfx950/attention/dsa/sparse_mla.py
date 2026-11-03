@@ -440,8 +440,8 @@ def _dsa_persistent_radix_topk_kernel(
         # them like stores).
         gl.inline_asm_elementwise(
             asm="s_waitcnt vmcnt(0)",
-            constraints="=v,0",
-            args=[local_counts],
+            constraints="=r,~{memory}",
+            args=[],
             dtype=gl.int32,
             is_pure=False,
             pack=1,

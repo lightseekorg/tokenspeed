@@ -233,18 +233,18 @@ def vmcnt_zero_before_barrier(
     """Check that other subgroups' memory accesses finished before ``target``.
 
     On gfx9 ``s_barrier`` does not wait for any counter, and a one-thread
-    release waits (``s_waitcnt vmcnt(0)``) only for its own subgroup's stores
-    to reach L2 before ``buffer_wbl2``. Walk every control-flow path of
-    ``kernel`` (branches that skip a block for inactive lanes model the
-    subgroups that do not run it; a call may access memory) and return each
-    line matching the ``target`` regex with two flags, each true when it holds
-    on all paths reaching it:
+    release's ``buffer_wbl2`` and ``s_waitcnt vmcnt(0)`` cover only its own
+    subgroup's stores. Walk every control-flow path of ``kernel`` (branches
+    that skip a block for inactive lanes model the subgroups that do not run
+    it; a call may access memory).
 
-    - waited: every vector store and atomic is followed by
-      ``s_waitcnt vmcnt(0)`` and then ``s_barrier``, as a payload release
-      needs;
-    - barrier: an ``s_barrier`` follows every vector memory access, as a
-      release reporting completed reads needs.
+    Returns:
+        One ``(line, waited, barrier)`` per line matching the ``target``
+        regex, each flag true when it holds on all paths reaching the line:
+        ``waited`` when every vector store and atomic is followed by
+        ``s_waitcnt vmcnt(0)`` and then ``s_barrier``, as a payload release
+        needs; ``barrier`` when an ``s_barrier`` follows every vector memory
+        access, as a release reporting completed reads needs.
     """
     lines = assembly.splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith(f"{kernel}:"))
