@@ -205,7 +205,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
         cfg.decode_input_tokens = 0;
-        cfg.device_allocator.total_pages = 5;
+        cfg.device_allocator.total_pages = 7;
         cfg.host_allocator.total_pages = 32;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.enable_l3_storage = false;
@@ -214,9 +214,10 @@ protected:
 
     // The seeds finish right after their prefill (a zero decode width plans
     // no decode step): the quiescent finish publishes the prompt pages, whose
-    // stream to Host rides the next plan. Of the four usable Device pages,
-    // r_fill's three evict r1's last page and r_fill2's one evicts r1's first,
-    // the least recently used, so r1's prompt stays on Host alone.
+    // stream to Host rides the next plan. Of the six usable Device pages,
+    // r_fill's five (four pages and the copy-in block of its prompt end at 7)
+    // evict one of r1's and r_fill2's two evict the other, the least recently
+    // used, so r1's prompt stays on Host alone.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
@@ -228,14 +229,14 @@ protected:
         AckWriteBacks(seed_stream);
         PlanOnce();
 
-        Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
+        Submit(RequestSpec{.request_id = "r_fill", .tokens = MakeTokens(7, 100)});
         PlanOnce();
         SendForwardDone("r_fill", {200});
         SendFinish("r_fill");
         AckWriteBacks(PlanOnce());
         PlanOnce();
 
-        Submit(MakeRequestSpec("r_fill2", /*num_pages=*/1, /*start=*/300));
+        Submit(MakeRequestSpec("r_fill2", /*num_pages=*/2, /*start=*/300));
         PlanOnce();
         SendForwardDone("r_fill2", {201});
         SendFinish("r_fill2");
@@ -275,7 +276,7 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     EXPECT_EQ(stats.prefix_hits.device_hit_tokens, 0u);
     EXPECT_EQ(stats.prefix_hits.host_hit_tokens, 2u);
     EXPECT_EQ(stats.prefix_hits.host_gain_tokens, 2u);
-    EXPECT_EQ(stats.prefix_hits.prompt_tokens, 4u + 6u + 2u + 4u);
+    EXPECT_EQ(stats.prefix_hits.prompt_tokens, 4u + 7u + 4u + 4u);
     EXPECT_EQ(stats.prefix_loads.ops, 1u) << "r2's load-back of the one page";
     EXPECT_EQ(stats.prefix_loads.blocks, (std::vector<std::uint64_t>{1}));
 }

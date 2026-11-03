@@ -213,12 +213,19 @@ struct CompletedPages {
     // page-aligned (T = prefix_hashes.size() * P).
     std::optional<TailPublication> tail{};
     // The owner keeps writing the partial page after this publication (a
-    // prompt end followed by decode, a junction-cut chunk end): the admission
-    // swaps a fresh block into the table slot and copies the published bytes
-    // into it. False at finish and retraction, where the block is final and
-    // is published in place. Only an admission may set it: the copy needs the
-    // transaction's capacity.
+    // prompt end followed by decode, a junction-cut chunk end): its tail
+    // blocks are registered without taking another request's canonical block
+    // into the table, and the admission moves off every one it registered
+    // into the copy-in block reserved for its slot (copy_in_blocks), copying
+    // the published bytes into it. False at finish and retraction, where the
+    // block is final and is published in place. Only an admission may set it.
     bool owner_continues{false};
+    // With owner_continues and a tail: per group, the copy-in blocks the
+    // admission whose forward reached this point reserved
+    // (CacheCoordinator::AdmissionResult::copy_in_blocks), one per slot of
+    // CacheCoordinator::CopyInSlots in slot order. The admission moves the
+    // ones it uses into the table; the caller releases the rest.
+    std::span<std::vector<CacheBlockRef>> copy_in_blocks{};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
     // publishes slot 1 -- the block the forward that ended here wrote --

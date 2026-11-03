@@ -44,8 +44,9 @@ enum class PublicationPoint {
     // page is published in place as a tail, and so is the state.
     kFinal,
     // The owner keeps writing past the frontier (a prompt end followed by
-    // decode): the partial page is published as a tail and the admission
-    // swaps a fresh block into the owner's table, copying the published rows.
+    // decode, a junction-cut chunk end): the partial page is published as a
+    // tail and the admission swaps into the owner's table the copy-in block
+    // reserved for each block it registered, copying the published rows.
     kOwnerContinues,
 };
 
@@ -66,9 +67,10 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
 // hash chain only grows during an attempt (AdvanceRequestProgress appends the
 // completed pages' hashes), so undoing truncates it: an attempt no longer
 // works on a copy of the whole chain, one string per page. The other fields
-// are restored from copies, except the retained input checkpoint: admission
-// may release that optional hold for capacity, and the release stands when
-// the attempt fails anyway.
+// are restored from copies, except two: the retained input checkpoint
+// (admission may release that optional hold for capacity, and the release
+// stands when the attempt fails anyway) and the copy-in blocks, which an
+// admission spends and the caller replaces only once the admission succeeds.
 class StagedCacheProgress {
 public:
     explicit StagedCacheProgress(fsm::CacheProgress& live)

@@ -61,6 +61,12 @@ struct VictimSet {
 struct AdmissionPlan {
     CacheCoordinator::PrefixProbe prefix;
     std::vector<VictimSet> victims;
+    // Per group, the bucket of each copy-in block the admission reserves, one
+    // per slot of CopyInSlots(i, next_copy_in_tokens) in slot order: the
+    // bucket of the block the slot holds once the prefix is in place, or for
+    // a slot the dense growth fills, the bucket the fit chose for that block
+    // and its copy-in block together. Empty without next_copy_in_tokens.
+    std::vector<std::vector<std::int32_t>> copy_in_buckets;
 };
 
 // The table shape a restore rebuilds before its dense demand is placed: how
@@ -95,11 +101,11 @@ public:
     AdmissionPlanner(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
                      std::span<const GroupGeometry> geometry, std::int32_t prefix_granularity, const BlockPool& pool,
                      const BlockPool* host_pool, std::span<const GroupDemand> demands,
-                     std::optional<std::int32_t> num_computed_tokens, const CompletedPages* completed,
+                     std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> next_copy_in_tokens,
                      const CacheCoordinator::PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
                      const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments,
-                     std::vector<VictimSet>& victims)
+                     std::vector<VictimSet>& victims, std::vector<std::vector<std::int32_t>>& copy_in_buckets)
         : coordinator_{coordinator},
           groups_{groups},
           geometry_{geometry},
@@ -108,7 +114,7 @@ public:
           host_pool_{host_pool},
           demands_{demands},
           num_computed_tokens_{num_computed_tokens},
-          completed_{completed},
+          next_copy_in_tokens_{next_copy_in_tokens},
           prefix_{prefix},
           shapes_{shapes},
           claimed_{claimed},
@@ -116,17 +122,46 @@ public:
           evicts_segments_{evicts_segments},
           evicts_blocks_past_segments_{evicts_blocks_past_segments},
           victims_{victims},
+          copy_in_buckets_{copy_in_buckets},
           eviction_plan_{pool, groups},
           shape_need_(groups.size()),
-          blocks_needed_(groups.size()) {}
+          blocks_needed_(groups.size()),
+          pair_need_(groups.size(), 0),
+          prefix_tail_buckets_(groups.size()) {}
 
     bool Plan() {
         victims_.clear();
         initializeCapacity();
+        if (!fitWithEviction()) {
+            return false;
+        }
+        // The fit chose a bucket for every pair against the shadow its
+        // victims leave; the copy-in blocks of the slots the growth fills
+        // take those buckets.
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (pair_need_[i] == 0) {
+                continue;
+            }
+            const std::vector<std::int32_t> pair_buckets =
+                AssignPairBuckets(shape_need_[i], eviction_plan_.HolesByBucket(i), pair_need_[i]);
+            auto next_pair = pair_buckets.begin();
+            for (std::int32_t& bucket : copy_in_buckets_[i]) {
+                if (bucket < 0) {
+                    bucket = *next_pair++;
+                }
+            }
+            _assert(next_pair == pair_buckets.end(), "every pair of the fit has a copy-in slot");
+        }
+        return true;
+    }
 
+private:
+    using VictimCandidate = CacheEvictionCandidates::Candidate;
+
+    bool fitWithEviction() {
         // Existing local holes plus empty parents are the zero-eviction
         // capacity. Do not discard cache merely to make placement denser.
-        if (eviction_plan_.Fits(shape_need_, blocks_needed_)) {
+        if (eviction_plan_.Fits(shape_need_, blocks_needed_, pair_need_)) {
             return true;
         }
         if (!couldFitAfterEviction()) {
@@ -157,7 +192,7 @@ public:
         // rules passed over, tried again block by block.
         bool blocks_alone = false;
         std::size_t next_passed_over = 0;
-        const bool fits = eviction_plan_.SelectUntilFits(shape_need_, blocks_needed_, [&] {
+        const bool fits = eviction_plan_.SelectUntilFits(shape_need_, blocks_needed_, pair_need_, [&] {
             while (true) {
                 std::optional<VictimCandidate> candidate = eviction_plan_.Next(request_reclaim_candidates_);
                 if (!candidate && next_deferred_shared_page < deferred_shared_pages_.size()) {
@@ -469,12 +504,9 @@ public:
         });
 
         if (!fits) return false;
-        eviction_plan_.Minimize(victims_, shape_need_, blocks_needed_);
+        eviction_plan_.Minimize(victims_, shape_need_, blocks_needed_, pair_need_);
         return true;
     }
-
-private:
-    using VictimCandidate = CacheEvictionCandidates::Candidate;
 
     void initializeCapacity() {
         _assert(demands_.size() == groups_.size(), "demands/groups size mismatch");
@@ -490,15 +522,17 @@ private:
                 shape_need_[i].assign(buckets, 0);
                 blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand) +
                                     tailBlocksNeeded(i, shape_need_[i]) + zeroStateBlocksNeeded(i);
-                if (collectOwnerCopyBuckets(i, shape_need_[i])) {
-                    owner_copy_changes_bucket_ = true;
-                }
                 if (!prefix_.host.per_group.empty()) {
                     collectHostHitBuckets(i, shape_need_[i]);
                 }
+                // After the prefix's blocks: a copy-in slot may hold one.
+                blocks_needed_[i] -= reserveCopyIns(i, shape_need_[i]);
             } else {
                 // A restore rebuilds the recorded shape, bucket for bucket,
-                // and grows the rebuilt table from its recorded tail.
+                // and grows the rebuilt table from its recorded tail. Its
+                // copy-in blocks are in the shape: each rebuilt slot's bucket
+                // is known (Restore).
+                _assert(!next_copy_in_tokens_, "a restore counts its copy-in blocks in its shape");
                 _assert(demand.table->NumBlocks() == 0, "a restore rebuilds into an empty table");
                 _assert(shapes_[i].blocks_by_bucket.size() == buckets,
                         "restore shape buckets must match the shard count");
@@ -521,16 +555,15 @@ private:
     // later published under the page's own hash, and one block carries one
     // key. So on a first admission every block of a Device tail becomes the
     // hitter's own (a copy of the shared block, or a fresh block where the
-    // probe left a hole), and an owner that keeps writing past a published
-    // tail moves every published tail block to a fresh one
-    // (collectOwnerCopyBuckets). A copy takes its fresh block in its source's
-    // bucket (SwapInFreshBlock), so it is added to `need` like a Host hit; a
-    // hole's fresh block takes any bucket and is returned with the growth. A
-    // dense growth starts from the capacity the last tail block leaves, which
-    // the live table cannot show yet; a sparse suffix (the D role's landing
-    // of a sliding window) starts at an absolute block past the tail and is
-    // costed whole by BlocksNeededFor.
-    std::int64_t tailBlocksNeeded(std::size_t i, std::vector<std::int64_t>& need) const {
+    // probe left a hole). A copy takes its fresh block in its source's bucket
+    // (SwapInFreshBlock), so it is added to `need` like a Host hit and
+    // recorded for its slot (prefix_tail_buckets_); a hole's fresh block takes
+    // any bucket and is returned with the growth. A dense growth starts from
+    // the capacity the last tail block leaves, which the live table cannot
+    // show yet; a sparse suffix (the D role's landing of a sliding window)
+    // starts at an absolute block past the tail and is costed whole by
+    // BlocksNeededFor.
+    std::int64_t tailBlocksNeeded(std::size_t i, std::vector<std::int64_t>& need) {
         if (!geometry_[i].HasTokenSpan()) {
             return 0;  // a State group's step is costed by BlocksNeededFor
         }
@@ -540,8 +573,17 @@ private:
         if (const auto& tail = prefix_.device.tail; tail && !tail->group_keys[i].empty()) {
             const std::vector<CacheBlockLocation> copied =
                 groups_[i].Index().MatchedLocations(pool_, tail->group_keys[i], /*begin_blocks=*/0, tail->per_group[i]);
-            for (const CacheBlockLocation& source : copied) {
-                ++need[static_cast<std::size_t>(allocator.BucketOf(source))];
+            // Key j of the tail is the j-th block of its page.
+            const std::int32_t first_slot =
+                tailSlots(geometry_[i], prefix_granularity_, prefix_.device.num_common_tokens).first;
+            auto source = copied.begin();
+            for (std::size_t j = 0; j < tail->per_group[i].hits.size(); ++j) {
+                if (tail->per_group[i].hits[j] == 0) {
+                    continue;
+                }
+                const std::int32_t bucket = allocator.BucketOf(*source++);
+                ++need[static_cast<std::size_t>(bucket)];
+                prefix_tail_buckets_[i].emplace_back(first_slot + static_cast<std::int32_t>(j), bucket);
             }
             blocks += static_cast<std::int64_t>(tail->group_keys[i].size()) - static_cast<std::int64_t>(copied.size()) -
                       FirstTailBlockNeeded(groups_[i].Spec(), block_granularity, tail->tail_tokens);
@@ -560,40 +602,56 @@ private:
         return blocks;
     }
 
-    // Adds to `need`, in its bucket, each block Admit's copy-in reads for an
-    // owner that keeps writing past the tail it publishes: the tail page's
-    // slots whose retention has not expired (Admit reclaims the expired ones
-    // first), each the canonical block when another request published the
-    // tail first (the publication swaps it into the table), else the owner's
-    // own. Returns whether a copy reads a canonical block in another bucket
-    // than the owner's own block (protectDedupedTail).
-    bool collectOwnerCopyBuckets(std::size_t i, std::vector<std::int64_t>& need) const {
-        if (completed_ == nullptr || !completed_->owner_continues || !completed_->tail ||
-            !geometry_[i].HasTokenSpan() || groups_[i].Spec().replayable) {
-            return false;
+    // Charges the copy-in blocks this admission reserves for the request's
+    // next publication point (next_copy_in_tokens_), one per slot of
+    // CopyInSlots: each must share the bucket of the block its slot holds
+    // when the point is reached, so its copy's two ends have one owner under
+    // page-cyclic sharding. A slot the table holds already keeps its block's
+    // bucket (a copy-in at this admission's own publication point moves it to
+    // a block in the same bucket), and so does one the prefix's tail fills (a
+    // hitter's copy, a Host load: prefix_tail_buckets_); those copy-in blocks
+    // are counted in `need`. A slot this admission's dense growth fills takes
+    // its block and its copy-in block in one bucket the fit chooses, as a pair
+    // (pair_need_), so the growth counts that block no more. Records each
+    // slot's bucket, -1 for a pair's until the fit chooses it, and returns the
+    // number of pairs.
+    std::int64_t reserveCopyIns(std::size_t i, std::vector<std::int64_t>& need) {
+        if (!next_copy_in_tokens_) {
+            return 0;
         }
-        const GroupAllocator& allocator = groups_[i].Allocator();
+        const CacheCoordinator::BlockRange slots = coordinator_.CopyInSlots(i, *next_copy_in_tokens_);
         const BlockTable& table = *demands_[i].table;
-        const std::int32_t computed = *num_computed_tokens_;
-        const TailSlots slots = tailSlots(geometry_[i], prefix_granularity_, computed);
-        bool copy_changes_bucket = false;
-        for (std::int32_t slot = std::max(slots.first, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), computed));
-             slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
-            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
-            if (!block) {
-                continue;
+        const GroupAllocator& allocator = groups_[i].Allocator();
+        // The slots a first admission's prefix fills: its claimed hits, a
+        // Device tail's copies, a Host extension.
+        const std::int32_t prefix_slots =
+            table.NumBlocks() == 0 && geometry_[i].HasTokenSpan()
+                ? tailSlots(geometry_[i], prefix_granularity_,
+                            std::max(prefix_.device.num_common_tokens, prefix_.host.num_common_tokens))
+                      .past_end
+                : 0;
+        std::vector<std::int32_t>& buckets = copy_in_buckets_[i];
+        buckets.clear();
+        for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
+            std::int32_t bucket = -1;
+            if (slot < table.NumBlocks()) {
+                const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
+                _assert(static_cast<bool>(block), "a copy-in slot the table holds is not a hole");
+                bucket = allocator.BucketOf(block->Location());
+            } else if (const auto it = std::ranges::find(prefix_tail_buckets_[i], slot,
+                                                         &std::pair<std::int32_t, std::int32_t>::first);
+                       it != prefix_tail_buckets_[i].end()) {
+                bucket = it->second;
+            } else {
+                _assert(slot >= prefix_slots, "a copy-in slot the prefix fills holds a copied or loaded block");
+                ++pair_need_[i];
             }
-            const CacheBlockRef canonical =
-                groups_[i].Index().Find(pool_, CacheKey{.group_id = groups_[i].Id(),
-                                                        .content_hash = completed_->tail->hash,
-                                                        .page_offset = slot - slots.first});
-            const std::int32_t bucket = allocator.BucketOf(canonical ? canonical->Location() : block->Location());
-            ++need[static_cast<std::size_t>(bucket)];
-            if (bucket != allocator.BucketOf(block->Location())) {
-                copy_changes_bucket = true;
+            if (bucket >= 0) {
+                ++need[static_cast<std::size_t>(bucket)];
             }
+            buckets.push_back(bucket);
         }
-        return copy_changes_bucket;
+        return pair_need_[i];
     }
 
     // Whether the probe matched a checkpoint for State group i on either
@@ -626,8 +684,9 @@ private:
     // the copy's two ends have one owner under page-cyclic sharding. A hit
     // with no Host block yet (an L3 prefetch, replicated groups only) takes
     // bucket 0, where its block will be allocated. A Host tail's blocks land
-    // the same way, into the hitter's private pages.
-    void collectHostHitBuckets(std::size_t group_index, std::vector<std::int64_t>& need) const {
+    // the same way, into the hitter's private pages, each recorded for its
+    // slot (prefix_tail_buckets_).
+    void collectHostHitBuckets(std::size_t group_index, std::vector<std::int64_t>& need) {
         _assert(host_pool_ != nullptr, "Host prefix hits require a Host pool");
         const GroupPrefixProbe& probe = prefix_.host.per_group[group_index];
         const std::span<const CacheKey> keys = (*prefix_.group_keys)[group_index];
@@ -642,11 +701,12 @@ private:
             // this source is already on Host or is an incoming L3 row.
             if (allocator.ShardCount() == 1) {
                 ++need[0];
-                return;
+                return 0;
             }
             const CacheBlockRef host_block = groups_[group_index].Index().Find(*host_pool_, key);
             const std::int32_t bucket = host_block ? allocator.BucketOf(host_block->Location()) : 0;
             ++need[static_cast<std::size_t>(bucket)];
+            return bucket;
         };
         for (std::size_t hit_index = 0; hit_index < probe.hits.size(); ++hit_index) {
             if (probe.hits[hit_index] == 0) {
@@ -658,9 +718,19 @@ private:
         }
         if (const auto& tail = prefix_.host.tail; tail && !tail->group_keys[group_index].empty()) {
             const GroupPrefixProbe& tail_probe = tail->per_group[group_index];
+            // Key j of the tail is the j-th block of its page; a State
+            // group's one block has no slot a copy-in could ask about.
+            const std::int32_t first_slot =
+                geometry_[group_index].HasTokenSpan()
+                    ? tailSlots(geometry_[group_index], prefix_granularity_, prefix_.host.num_common_tokens).first
+                    : 0;
             for (std::size_t j = 0; j < tail_probe.hits.size(); ++j) {
-                if (tail_probe.hits[j] != 0) {
-                    count_hit(tail->group_keys[group_index][j]);
+                if (tail_probe.hits[j] == 0) {
+                    continue;
+                }
+                const std::int32_t bucket = count_hit(tail->group_keys[group_index][j]);
+                if (geometry_[group_index].HasTokenSpan()) {
+                    prefix_tail_buckets_[group_index].emplace_back(first_slot + static_cast<std::int32_t>(j), bucket);
                 }
             }
         }
@@ -669,7 +739,7 @@ private:
     bool couldFitAfterEviction() const {
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            std::int64_t need = blocks_needed_[i];
+            std::int64_t need = blocks_needed_[i] + 2 * pair_need_[i];
             for (const std::int64_t bucket_need : shape_need_[i]) {
                 need += bucket_need;
             }
@@ -722,7 +792,6 @@ private:
                 protected_locations_.insert(state_hits.begin(), state_hits.end());
             }
         }
-        protectDedupedTail();
         for (const auto& [group_id, location] : claimed_) {
             (void)group_id;
             protected_locations_.insert(location);
@@ -742,7 +811,7 @@ private:
         for (const VictimCandidate& candidate : request_reclaim_candidates_) {
             maximum.Remove(candidate.group_id, candidate.location);
         }
-        if (maximum.Fits(shape_need_, blocks_needed_)) {
+        if (maximum.Fits(shape_need_, blocks_needed_, pair_need_)) {
             return true;
         }
         std::vector<PrefixCacheIndex::EvictionCandidate> entries;
@@ -758,34 +827,12 @@ private:
                         maximum.Remove(static_cast<std::uint32_t>(i), entry.location);
                     }
                 }
-                if (maximum.Fits(shape_need_, blocks_needed_)) {
+                if (maximum.Fits(shape_need_, blocks_needed_, pair_need_)) {
                     return true;
                 }
             }
         }
         return false;
-    }
-
-    // An owner's copy-in that reads the canonical block of a tail another
-    // request published first keeps that block cached until the publication
-    // dedupes onto it, and with it every other Device entry under the tail's
-    // hash, State checkpoints included: evicting any one of them evicts the
-    // whole tail (CacheCoordinator::evictCachedBlock), and the publication
-    // would then keep the owner's own block and copy that one, in its own
-    // bucket rather than the canonical block's. A canonical block in the
-    // owner's own bucket needs no protection: either copy lands in the bucket
-    // the plan charged.
-    void protectDedupedTail() {
-        if (!owner_copy_changes_bucket_) {
-            return;
-        }
-        const TailPublication& tail = *completed_->tail;
-        coordinator_.ForEachBoundaryKey(CacheKey{.content_hash = tail.hash}, tail.tail_tokens,
-                                        [&](std::size_t i, const CacheKey& key) {
-                                            if (const CacheBlockRef block = groups_[i].Index().Find(pool_, key)) {
-                                                protected_locations_.insert(block->Location());
-                                            }
-                                        });
     }
 
     // The request's own slots that its retention has expired at this
@@ -835,9 +882,8 @@ private:
     const BlockPool* host_pool_;
     std::span<const GroupDemand> demands_;
     std::optional<std::int32_t> num_computed_tokens_;
-    // The publication this admission carries (nullptr when none): an owner
-    // that keeps writing past a tail needs a fresh block for it.
-    const CompletedPages* completed_;
+    // The point the request's next admission copies in at (Admit).
+    std::optional<std::int32_t> next_copy_in_tokens_;
     const CacheCoordinator::PrefixProbe& prefix_;
     std::span<const PlannedShape> shapes_;
     // Device-cached blocks a restore claims instead of copying: protected
@@ -851,20 +897,27 @@ private:
     // leaves block by block (Admit's evict_blocks_past_segments).
     bool evicts_blocks_past_segments_;
     std::vector<VictimSet>& victims_;
+    // The plan's copy-in bucket per slot (AdmissionPlan::copy_in_buckets).
+    std::vector<std::vector<std::int32_t>>& copy_in_buckets_;
     // Lookup nodes live for this plan; returned victim vectors own their
     // storage independently. One arena avoids allocating each hash node from
     // the general heap while trying and rejecting candidate sets.
     std::pmr::monotonic_buffer_resource scratch_;
     // The pool as the tentative victims would leave it.
     CacheEvictionPlan eviction_plan_;
-    // Per group: the bucket-constrained blocks (a restore's rebuilt slots; an
-    // admission's Host-hit destinations and tail copies), and the dense
-    // blocks wanted in any bucket.
+    // Per group: the bucket-constrained blocks (a restore's rebuilt slots and
+    // copy-in blocks; an admission's Host-hit destinations, tail copies and
+    // the copy-in blocks of slots it holds), and the dense blocks wanted in
+    // any bucket.
     std::vector<std::vector<std::int64_t>> shape_need_;
     std::vector<std::int64_t> blocks_needed_;
-    // Whether an owner's copy-in reads a canonical block in another bucket
-    // than its own (collectOwnerCopyBuckets, protectDedupedTail).
-    bool owner_copy_changes_bucket_{false};
+    // Per group, the block pairs whose shared bucket the fit chooses: a tail
+    // block the dense growth fills and its copy-in block (reserveCopyIns).
+    std::vector<std::int64_t> pair_need_;
+    // Per group, the slots a first admission's prefix tail fills with a block
+    // in a known bucket -- a Device tail's copies, a Host tail's loads -- and
+    // that bucket, for a copy-in slot among them (reserveCopyIns).
+    std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> prefix_tail_buckets_;
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations_{&scratch_};
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> request_reclaim_locations_{&scratch_};
@@ -894,17 +947,17 @@ private:
     std::pmr::unordered_map<const BoundaryTree::Node*, std::int32_t> leaving_checkpoint_boundary_counts_{&scratch_};
 };
 
-std::optional<AdmissionPlan> planAdmission(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
-                                           std::span<const GroupGeometry> geometry, std::int32_t prefix_granularity,
-                                           const BlockPool& pool, const BlockPool* host_pool,
-                                           CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-                                           const RequestProgress& progress, std::span<const PlannedShape> shapes,
-                                           std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
-                                           const BoundaryTree& boundary_tree, bool evicts_segments,
-                                           bool evicts_blocks_past_segments) {
+std::optional<AdmissionPlan> planAdmission(
+    const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
+    std::int32_t prefix_granularity, const BlockPool& pool, const BlockPool* host_pool,
+    CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+    std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> next_copy_in_tokens,
+    std::span<const PlannedShape> shapes, std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
+    const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<VictimSet> victims;
+    std::vector<std::vector<std::int32_t>> copy_in_buckets(next_copy_in_tokens ? groups.size() : 0);
     AdmissionPlanner planner{coordinator,
                              groups,
                              geometry,
@@ -912,34 +965,21 @@ std::optional<AdmissionPlan> planAdmission(const CacheCoordinator& coordinator, 
                              pool,
                              host_pool,
                              demands,
-                             progress.num_computed_tokens,
-                             progress.completed_pages ? &*progress.completed_pages : nullptr,
+                             num_computed_tokens,
+                             next_copy_in_tokens,
                              prefix,
                              shapes,
                              claimed,
                              boundary_tree,
                              evicts_segments,
                              evicts_blocks_past_segments,
-                             victims};
+                             victims,
+                             copy_in_buckets};
     if (!planner.Plan()) {
         return std::nullopt;
     }
-    return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims)};
-}
-
-// The same progress without the tail it would publish: the full pages still
-// publish; the tail, the owner's move off it and the state checkpoint keyed
-// by it are dropped. Nothing left to publish leaves no CompletedPages.
-RequestProgress withoutTailPublication(const RequestProgress& progress) {
-    RequestProgress out = progress;
-    CompletedPages& completed = *out.completed_pages;
-    completed.tail.reset();
-    completed.owner_continues = false;
-    completed.publish_state = false;
-    if (completed.first_new_prefix_page >= static_cast<std::int32_t>(completed.prefix_hashes.size())) {
-        out.completed_pages.reset();
-    }
-    return out;
+    return AdmissionPlan{
+        .prefix = std::move(prefix), .victims = std::move(victims), .copy_in_buckets = std::move(copy_in_buckets)};
 }
 
 }  // namespace
@@ -969,7 +1009,8 @@ void CacheCoordinator::ReleaseStateInputs(std::span<BlockTable> tables) {
 
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
-    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments, const std::string& session_id) {
+    std::optional<std::int32_t> next_copy_in_tokens, std::optional<std::uint64_t> request_access_epoch,
+    bool evict_blocks_past_segments, const std::string& session_id) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].table != nullptr, "group demand requires a block table");
@@ -977,6 +1018,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 "a State group takes a StateStep; a token-spanned group a dense or sparse extent");
     }
     validateProgress(progress);
+    _assert(!next_copy_in_tokens || *next_copy_in_tokens > progress.num_computed_tokens.value_or(0),
+            "the next copy-in point lies past the computed frontier");
 
     // A replayable group claims no hit pages, so before a hit its table is
     // empty: materialize it as a sparse private suffix from the replay
@@ -1006,27 +1049,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         demands = replayed;
     }
 
-    // The publication this admission carries. An owner that keeps writing
-    // past a tail it publishes needs a fresh copy of every published block;
-    // when the pool cannot fund those copies the owner keeps its partial
-    // block private instead and publishes nothing at this point -- neither
-    // the tail nor the state checkpoint keyed by it -- so a request whose
-    // reserve covers its generation never waits on a block it did not
-    // reserve. Its finish publishes the frontier later. The copies never
-    // evict block by block: only the plan without them does.
-    RequestProgress effective = progress;
-    const bool copies_in =
-        progress.completed_pages && progress.completed_pages->owner_continues && progress.completed_pages->tail;
-    std::optional<AdmissionPlan> candidate = planAdmission(
-        *this, groups_, geometry_, prefix_granularity_, pool_, host_pool_,
-        copies_in ? PrefixProbe{prefix} : PrefixProbe{std::move(prefix)}, demands, effective,
-        /*shapes=*/{}, /*claimed=*/{}, boundary_tree_, write_back_evictions_, evict_blocks_past_segments && !copies_in);
-    if (!candidate && copies_in) {
-        effective = withoutTailPublication(progress);
-        candidate = planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix),
-                                  demands, effective, /*shapes=*/{}, /*claimed=*/{}, boundary_tree_,
-                                  write_back_evictions_, evict_blocks_past_segments);
-    }
+    // The publication this admission carries needs no block beyond the plan's:
+    // an owner that keeps writing past a tail copies into the blocks reserved
+    // for it (CompletedPages::copy_in_blocks).
+    std::optional<AdmissionPlan> candidate =
+        planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix), demands,
+                      progress.num_computed_tokens, next_copy_in_tokens, /*shapes=*/{}, /*claimed=*/{}, boundary_tree_,
+                      write_back_evictions_, evict_blocks_past_segments);
     if (!candidate) {
         return std::nullopt;
     }
@@ -1064,6 +1093,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
         .state_checkpoint_blocks = std::vector<CacheBlockRef>(groups_.size()),
+        .copy_in_blocks = std::vector<std::vector<CacheBlockRef>>(next_copy_in_tokens ? groups_.size() : 0),
         .session_access = std::move(session_access),
     };
     for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -1107,9 +1137,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
         groups_[i].Allocator().ShapeStateTable(*demands[i].table, std::move(input));
     }
-    // Gives the table a private block in `slot`: a copy of the block there
-    // (the hitter's copy-on-write, the owner's copy-in), or a fresh zeroed
-    // one where the slot was a hole.
+    // Gives a hitter's table a private block in `slot`: a copy of the shared
+    // block there (copy-on-write), or a fresh zeroed one where the slot was a
+    // hole.
     const auto privatize_slot = [&](std::size_t i, BlockTable& table, std::int32_t slot,
                                     std::int32_t available_tokens) {
         GroupAllocator& allocator = groups_[i].Allocator();
@@ -1142,13 +1172,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             }
         }
     }
-    if (effective.completed_pages) {
-        linkPublication(*effective.completed_pages);
+    if (progress.completed_pages) {
+        linkPublication(*progress.completed_pages);
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         BlockTable& table = *demands[i].table;
-        if (effective.completed_pages) {
-            cacheDeviceCompletedBlocksForGroup(i, table, *effective.completed_pages, access_epoch);
+        if (progress.completed_pages) {
+            cacheDeviceCompletedBlocksForGroup(i, table, *progress.completed_pages, access_epoch);
         }
         if (GroupIsState(i)) {
             // The step's release: slot 0 leaves the table (the index keeps it
@@ -1174,13 +1204,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             }
             continue;
         }
-        if (effective.num_computed_tokens) {
+        if (progress.num_computed_tokens) {
             groups_[i].Allocator().ReclaimExpired(
-                pool_, table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *effective.num_computed_tokens));
+                pool_, table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *progress.num_computed_tokens));
         }
     }
-    if (effective.completed_pages) {
-        const CompletedPages& completed = *effective.completed_pages;
+    if (progress.completed_pages) {
+        const CompletedPages& completed = *progress.completed_pages;
         // A model without a prefix-closed group may register nothing under
         // the deepest boundary linked (a chunk end of State groups alone).
         syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
@@ -1197,23 +1227,33 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     std::erase_if(evicted_segments_, [](const EvictedSegment& segment) { return segment.members.empty(); });
 
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        // A group's bucket-exact blocks (the owner's copy-in, a hitter's tail
-        // copies, the Host extension) are acquired before its dense growth,
-        // which is what the planner's fit assumes.
+        // A group's bucket-exact blocks (a hitter's tail copies, the Host
+        // extension, the copy-in blocks reserved below) are acquired before
+        // its dense growth, which is what the planner's fit assumes.
         const GroupDemand& demand = demands[i];
         BlockTable& table = *demand.table;
-        const CompletedPages* completed = effective.completed_pages ? &*effective.completed_pages : nullptr;
+        const CompletedPages* completed = progress.completed_pages ? &*progress.completed_pages : nullptr;
         // An owner that keeps writing past the publication point moves off
-        // every block it just published: a published block is never written
-        // again and never carries a second key. (A State group's published
-        // slot 1 moves to slot 0 by rotation instead.)
-        if (!GroupIsState(i) && completed != nullptr && completed->owner_continues && completed->tail &&
-            effective.num_computed_tokens) {
-            const TailSlots slots = tailSlots(geometry_[i], prefix_granularity_, *effective.num_computed_tokens);
-            for (std::int32_t slot = slots.first; slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
-                if (groups_[i].Index().Contains(table.Blocks()[static_cast<std::size_t>(slot)])) {
-                    privatize_slot(i, table, slot, table.AvailableTokens());
+        // every block it just registered into the copy-in block it reserved
+        // for the slot, in that block's bucket: a published block is never
+        // written again and never carries a second key. A slot whose key
+        // another request published first was not registered and stays the
+        // owner's to write; its copy-in block goes back unused. (A State
+        // group's published slot 1 moves to slot 0 by rotation instead.)
+        if (completed != nullptr && completed->owner_continues && completed->tail) {
+            const BlockRange slots = CopyInSlots(i, *progress.num_computed_tokens);
+            std::vector<CacheBlockRef>& reserved = completed->copy_in_blocks[i];
+            GroupAllocator& allocator = groups_[i].Allocator();
+            for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
+                if (!groups_[i].Index().Contains(table.Blocks()[static_cast<std::size_t>(slot)])) {
+                    continue;
                 }
+                CacheBlockRef& copy_in = reserved[static_cast<std::size_t>(slot - slots.first)];
+                _assert(static_cast<bool>(copy_in), "a copy-in block is spent once");
+                const CacheBlockRef published = allocator.SwapInBlock(table, slot, std::move(copy_in));
+                result.pages_to_copy[i].emplace_back(
+                    allocator.ResolveCacheBlockId(*published),
+                    allocator.ResolveCacheBlockId(*table.Blocks()[static_cast<std::size_t>(slot)]));
             }
         }
         // A first admission's table ends in the tail's blocks: shared full
@@ -1289,9 +1329,45 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             groups_[i].Allocator().AppendHostExtension(
                 pool_, table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs, available);
         }
+        // The copy-in blocks for the request's next publication point, each in
+        // the bucket the plan gave its slot: a slot the table holds now keeps
+        // its block's bucket; a slot the growth below fills takes its own
+        // block in that bucket too, acquired with the copy-in blocks and
+        // ahead of them, before the growth's other blocks.
+        std::int32_t first_paired_slot = demand.table->NumBlocks();
+        std::vector<CacheBlockRef> paired;
+        if (next_copy_in_tokens) {
+            const BlockRange slots = CopyInSlots(i, *next_copy_in_tokens);
+            const std::vector<std::int32_t>& copy_in_buckets = plan.copy_in_buckets[i];
+            _assert(copy_in_buckets.size() == static_cast<std::size_t>(slots.past_end - slots.first),
+                    "the plan buckets every copy-in slot");
+            std::vector<std::int32_t> buckets;
+            for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
+                const std::int32_t bucket = copy_in_buckets[static_cast<std::size_t>(slot - slots.first)];
+                if (slot < demand.table->NumBlocks()) {
+                    const CacheBlockRef& block = demand.table->Blocks()[static_cast<std::size_t>(slot)];
+                    _assert(block && groups_[i].Allocator().BucketOf(block->Location()) == bucket,
+                            "a copy-in block shares its slot's bucket");
+                    continue;
+                }
+                if (buckets.empty()) {
+                    first_paired_slot = slot;
+                }
+                buckets.push_back(bucket);
+            }
+            const std::size_t num_paired = buckets.size();
+            buckets.insert(buckets.end(), copy_in_buckets.begin(), copy_in_buckets.end());
+            std::vector<CacheBlockRef> acquired = pool_.AcquireBlocksInBuckets(groups_[i].Id(), buckets);
+            FatalCheck(acquired.size() == buckets.size(), "admission plan no longer fits the block pool");
+            const auto paired_end = acquired.begin() + static_cast<std::ptrdiff_t>(num_paired);
+            paired.assign(std::make_move_iterator(acquired.begin()), std::make_move_iterator(paired_end));
+            result.copy_in_blocks[i].assign(std::make_move_iterator(paired_end),
+                                            std::make_move_iterator(acquired.end()));
+        }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =
-            groups_[i].Allocator().Acquire(pool_, *demand.table, geometry_[i].PlanAcquire(*demand.table, demand));
+            groups_[i].Allocator().Acquire(pool_, *demand.table, geometry_[i].PlanAcquire(*demand.table, demand),
+                                           first_paired_slot, std::move(paired));
         FatalCheck(acquired, "admission plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
         for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {
@@ -1305,13 +1381,31 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     return result;
 }
 
-std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const RetractionImage& image,
-                                                                           std::span<const GroupDemand> demands,
-                                                                           std::uint64_t request_access_epoch) {
+std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(
+    const RetractionImage& image, std::span<const GroupDemand> demands, std::optional<std::int32_t> next_copy_in_tokens,
+    std::uint64_t request_access_epoch) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     _assert(image.tables.size() == groups_.size(), "image/groups size mismatch");
     _assert(request_access_epoch > 0 && request_access_epoch <= next_access_epoch_,
             "request access epoch was not issued by this coordinator");
+    // The rebuilt slot each copy-in block shares a bucket with: the partial
+    // page at the image's frontier, which the restore always copies (never
+    // claims), so its bucket is the imaged block's.
+    const auto copy_in_slots = [&](std::size_t i) {
+        std::vector<const ImageSlot*> slots;
+        if (!next_copy_in_tokens) {
+            return slots;
+        }
+        const BlockRange range = CopyInSlots(i, *next_copy_in_tokens);
+        const ImageTable& shape = image.tables[i];
+        for (std::int32_t slot = range.first; slot < range.past_end; ++slot) {
+            const auto it = std::ranges::find(shape.slots, slot, &ImageSlot::slot_index);
+            _assert(it != shape.slots.end() && writableImageSlot(i, shape, slot),
+                    "a copy-in slot is a rebuilt slot of the partial page at the image's frontier");
+            slots.push_back(&*it);
+        }
+        return slots;
+    };
     // A Host L2 slot whose key still has a Device-cached canonical block is
     // claimed instead of copied: the same bytes by construction (the victim's
     // own block, cache-only since it was freed, or the canonical block its
@@ -1352,11 +1446,14 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
                 }
                 ++shapes[i].blocks_by_bucket[static_cast<std::size_t>(allocator.BucketOf(slot.block->Location()))];
             }
+            for (const ImageSlot* slot : copy_in_slots(i)) {
+                ++shapes[i].blocks_by_bucket[static_cast<std::size_t>(allocator.BucketOf(slot->block->Location()))];
+            }
         }
-        candidate =
-            planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}), demands,
-                          RequestProgress{}, shapes, protected_locations, boundary_tree_, write_back_evictions_,
-                          /*evicts_blocks_past_segments=*/false);
+        candidate = planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}),
+                                  demands, /*num_computed_tokens=*/std::nullopt, /*next_copy_in_tokens=*/std::nullopt,
+                                  shapes, protected_locations, boundary_tree_, write_back_evictions_,
+                                  /*evicts_blocks_past_segments=*/false);
         if (candidate || protected_locations.empty() || !write_back_evictions_) {
             break;
         }
@@ -1407,6 +1504,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         .access_epoch = request_access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
+        .copy_in_blocks = std::vector<std::vector<CacheBlockRef>>(next_copy_in_tokens ? groups_.size() : 0),
     };
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         GroupAllocator& allocator = groups_[i].Allocator();
@@ -1443,10 +1541,22 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         if (GroupIsState(i)) {
             continue;  // the imaged two slots are the whole table
         }
+        // The copy-in blocks, each in the bucket of the rebuilt slot it serves,
+        // before the reserve's dense growth.
+        if (next_copy_in_tokens) {
+            std::vector<std::int32_t> buckets;
+            for (const ImageSlot* slot : copy_in_slots(i)) {
+                buckets.push_back(
+                    allocator.BucketOf(table.Blocks()[static_cast<std::size_t>(slot->slot_index)]->Location()));
+            }
+            result.copy_in_blocks[i] = pool_.AcquireBlocksInBuckets(groups_[i].Id(), buckets);
+            FatalCheck(result.copy_in_blocks[i].size() == buckets.size(), "restore plan no longer fits the block pool");
+        }
         // Only the reserve appended beyond the imaged shape is fresh, unfilled
         // Device memory for the plan to zero.
         const std::int32_t first_new_block = table.NumBlocks();
-        FatalCheck(allocator.Acquire(pool_, table, geometry_[i].PlanAcquire(table, demands[i])),
+        FatalCheck(allocator.Acquire(pool_, table, geometry_[i].PlanAcquire(table, demands[i]),
+                                     /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{}),
                    "restore plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         for (std::int32_t block = first_new_block; block < table.NumBlocks(); ++block) {

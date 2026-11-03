@@ -31,8 +31,8 @@ class AdmissionPromptHashSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 8;
-        cfg.cache_groups[0].total_pages = 8;
+        cfg.device_allocator.total_pages = 9;
+        cfg.cache_groups[0].total_pages = 9;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
         return cfg;
     }
@@ -68,7 +68,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
         cfg.decode_input_tokens = 0;
-        cfg.device_allocator.total_pages = 5;
+        cfg.device_allocator.total_pages = 7;
         cfg.host_allocator.total_pages = 32;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.enable_l3_storage = false;
@@ -77,7 +77,9 @@ protected:
 
     // Both seeds finish right after their prefill (a zero decode width plans
     // no decode step): the quiescent finish publishes the prompt pages, whose
-    // stream to Host rides the next plan.
+    // stream to Host rides the next plan. Of the six usable Device pages,
+    // r_fill's five (four pages and the copy-in block of its prompt end at 7)
+    // evict one of r_seed's.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r_seed", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
@@ -88,7 +90,7 @@ protected:
         AckWriteBacks(seed_stream);
         PlanOnce();
 
-        Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
+        Submit(RequestSpec{.request_id = "r_fill", .tokens = MakeTokens(7, 100)});
         PlanOnce();
         SendForwardDone("r_fill", {200});
         SendFinish("r_fill");
@@ -446,7 +448,7 @@ class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 8;
+        cfg.device_allocator.total_pages = 9;
         cfg.disable_l2_cache = true;
         cfg.enable_kv_cache_events = true;
         CacheGroupConfig second = cfg.cache_groups.front();
@@ -473,7 +475,7 @@ class SubpageKvCacheEventTestSuite : public SchedulerKvCacheEventTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 4;
+        cfg.device_allocator.total_pages = 5;
         auto& group = cfg.cache_groups.front();
         group.block_granularity = 1;
         group.total_pages = 2 * cfg.device_allocator.total_pages;
@@ -508,7 +510,9 @@ TEST_F(SubpageKvCacheEventTestSuite, PublishesRemovalWhenAnyChildBlockIsEvicted)
     const std::uint64_t first_stored_hash = std::get<KvBlockStoredEvent>(stored[0]).block_hashes.front();
     const std::uint64_t second_stored_hash = std::get<KvBlockStoredEvent>(stored[1]).block_hashes.front();
 
-    Submit(MakeRequestSpec("replacement", 2, 100));
+    // Five tokens, the decode slot and the copy-in block of its prompt end
+    // fill the four parents: both of seed's pages leave.
+    Submit(RequestSpec{.request_id = "replacement", .tokens = MakeTokens(5, 100)});
     PlanOnce();
 
     std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();

@@ -930,20 +930,27 @@ Its responsibilities:
   hole -- and a Host tail is loaded into fresh private pages like any Host
   hit and never republished on the Device. The owner's side of the same
   rule is **copy-in**: an admission whose publication point the owner
-  keeps writing past (`CompletedPages::owner_continues`, the fused role's
-  prompt end) registers the owner's tail blocks under `hash@T` and swaps a
-  fresh copy of each into the table, so the published bytes are exactly
-  what the prefill forward wrote and nothing writes them again. The copies
-  are the one thing such an admission may need beyond what the completing
-  chunk reserved, so they are best effort: when the plan does not fit with
-  them (under page-cyclic sharding a copy may need a parent while other
-  buckets still have holes), `Admit` replans without the tail -- the owner
-  keeps its partial block private and publishes neither the tail nor the
-  state checkpoint keyed by it at that point (its full pages still publish;
-  its finish publishes the frontier later). A request whose reserve covers
-  its generation therefore never waits on a block it did not reserve, which
-  is what keeps a pool full of such requests from wedging at their first
-  decodes. Copies are
+  keeps writing past (`CompletedPages::owner_continues`: the fused role's
+  prompt end, or a junction a chunk was cut at) registers the owner's tail
+  blocks under `hash@T` and swaps into the table, for each block it
+  registered, a copy in the copy-in block reserved for that slot, so the
+  published bytes are exactly what the prefill forward wrote and nothing
+  writes them again. The owner never takes another request's canonical
+  block into its table: where the key is published already it keeps
+  writing its own block, unregistered, and needs no copy. The copy-in
+  blocks are reserved by the admission whose forward reaches the point
+  (`Admit`'s `next_copy_in_tokens`; the request holds them in
+  `fsm::CacheProgress::copy_in_blocks` and the next admission spends them
+  or lets them go), one per slot the point publishes under the tail's hash
+  (`CacheCoordinator::CopyInSlots`), each in the bucket of the block the
+  slot holds then: a block the table holds already, or the hitter's copy or
+  Host load the prefix puts there. A slot that admission's growth fills
+  takes its block and its copy-in block together, in the one bucket the fit
+  chooses for the pair (below). The publication point therefore needs no
+  block it did not reserve -- a pool full of requests whose reserve covers
+  their generation never wedges at their first decodes -- and every such
+  point is published whatever the pool's pressure. A restore of a request
+  suspended at such a point reserves its copy-in blocks again. Copies are
   fire-and-forget: the runtime orders them on the forward thread's default
   stream after the execution stream's in-flight forwards and before the
   plan's zeroing, so a source another admission of the same round evicts
@@ -1548,9 +1555,9 @@ released slot of the request) and everything the Device holds under it,
 climbing nowhere, so the coverage stays closed (a boundary that keeps a block
 that cannot leave stays on the Device). Each such set is recorded and written
 back like a segment, a block no probe could resume from dropped. Only the
-last variant of an admission evicts so: what it may drop — the owner's
-copy-in (above), an in-forward State checkpoint's block (`scheduler.md` §1.2)
-— is dropped first and never pays for such an eviction. Waiting would never
+last variant of an admission evicts so: what it may drop — an in-forward
+State checkpoint's block (`scheduler.md` §1.2) — is dropped first and never
+pays for such an eviction. Waiting would never
 fund such an admission: the blocks in use are its own, as when it resumed
 from a checkpoint whose segment holds the pages under it (`scheduler.md`
 §1.4). The pass does not always fund it either: a prefix hit the admission
@@ -2116,8 +2123,8 @@ available. A failed acquire leaves both placement and request tables unchanged.
 
 Beside that balanced path, `BlockPool::AcquireBlocksInBuckets(group, buckets)`
 acquires blocks in **given** buckets — one per requested block — for the
-transfers above, for tail copies (a hitter's copy of a claimed tail block, an
-owner's copy-in; each in its source's bucket) and for
+transfers above, for tail copies (a hitter's copy of a claimed tail block in
+its source's bucket; an owner's copy-in block, in its slot's bucket) and for
 `GroupAllocator::AcquireShape`, which rebuilds a retracted request's table
 from its recorded shape (claimed blocks in place, fresh ones in the imaged
 buckets). Its exact check is per bucket with one shared empty-parent budget:
@@ -2127,9 +2134,17 @@ the parents needed are
 (`ParentsNeededForBuckets`, the formula the pool, the coordinator's image
 probe and the admission planner's shadow occupancy share). The planner counts
 every block an admission places in a given bucket — a Host hit's destination,
-a tail copy — as that bucket's demand, and only growth and a hole's fresh
-block as dense demand; a group's bucket-exact acquisitions precede its dense
-ones. `D = 1` passes bucket 0 everywhere and is the same path. No mutation on
+a tail copy, a copy-in block whose slot's block is known — as that bucket's
+demand, and only growth and a hole's fresh block as dense demand. A copy-in
+slot the admission's growth fills is a pair whose bucket is free: each pair
+takes the bucket with the most holes the demand leaves, one pair at a time
+(`AssignPairBuckets`), which needs no more parents than any other choice --
+the pairs add the same blocks whatever their buckets, and filling the least
+short bucket first keeps the largest shortfall smallest. The fit chooses the
+buckets again against every shadow it tries, and the plan keeps the choice
+the shadow of its victims gives. A group's bucket-exact acquisitions -- the
+pairs' blocks before the copy-in blocks -- precede its dense ones. `D = 1`
+passes bucket 0 everywhere and is the same path. No mutation on
 a failed check, and the choice is deterministic on every mirrored rank.
 
 `BlockPool` maintains the free-slot count of each group per bucket and an

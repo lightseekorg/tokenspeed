@@ -232,17 +232,25 @@ private:
 // carries a SnapshotRestore cache op, and nothing is schedulable until its
 // ACK. The request-pool row stays with that op until then (see Restoring).
 // Nothing is out against the pages yet.
+// copy_in_blocks are the restore's reservation for the publication point the
+// resumed request's next admission keeps writing past
+// (CacheProgress::copy_in_blocks), empty when that admission is no such point.
 struct ScheduleRestoreEvent : InvalidTransitionHandler<ScheduleRestoreEvent> {
     using InvalidTransitionHandler<ScheduleRestoreEvent>::operator();
 
-    ScheduleRestoreEvent(CacheCoordinator* coordinator, std::vector<BlockTable> block_tables, std::uint32_t restore_op)
-        : coordinator_{coordinator}, block_tables_{std::move(block_tables)}, restore_op_{restore_op} {}
+    ScheduleRestoreEvent(CacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
+                         std::vector<std::vector<CacheBlockRef>> copy_in_blocks, std::uint32_t restore_op)
+        : coordinator_{coordinator},
+          block_tables_{std::move(block_tables)},
+          copy_in_blocks_{std::move(copy_in_blocks)},
+          restore_op_{restore_op} {}
 
     Restoring operator()(Retracted&& state);
 
 private:
     CacheCoordinator* coordinator_{};
     std::vector<BlockTable> block_tables_;
+    std::vector<std::vector<CacheBlockRef>> copy_in_blocks_;
     std::uint32_t restore_op_{0};
 };
 

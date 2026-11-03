@@ -121,15 +121,33 @@ public:
 
     // Executes a GroupGeometry plan: acquires plan.num_blocks fresh blocks,
     // places them (dense append or sparse suffix), and stores the planned
-    // bookkeeping. Returns false without mutation when the pool is short.
-    bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan) {
+    // bookkeeping. A dense append may be handed `placed`: blocks the caller
+    // acquired in the buckets their slots must take, for table slots
+    // [first_placed_slot, first_placed_slot + placed.size()) of the appended
+    // run, so that every bucket-exact block is acquired before the plan's
+    // other blocks take any hole (the order the admission planner's fit
+    // assumes). Returns false when the pool is short of the other blocks,
+    // without mutating the table; the placed blocks go back then.
+    bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan, std::int32_t first_placed_slot,
+                 std::vector<CacheBlockRef> placed) {
         const std::int32_t old_num_blocks = table.NumBlocks();
+        _assert(placed.empty() || (plan.suffix_start < 0 && first_placed_slot >= old_num_blocks &&
+                                   first_placed_slot + static_cast<std::int64_t>(placed.size()) <=
+                                       static_cast<std::int64_t>(old_num_blocks) + plan.num_blocks),
+                "placed blocks fill slots of a dense append");
+        const std::int32_t num_others = plan.num_blocks - static_cast<std::int32_t>(placed.size());
         std::vector<CacheBlockRef> block_refs;
-        if (plan.num_blocks > 0) {
-            block_refs = pool.AcquireBlocks(group_id_, plan.num_blocks, BucketLoads(table));
-            if (static_cast<std::int32_t>(block_refs.size()) < plan.num_blocks) {
+        if (num_others > 0) {
+            block_refs = pool.AcquireBlocks(group_id_, num_others, BucketLoads(table));
+            if (static_cast<std::int32_t>(block_refs.size()) < num_others) {
                 return false;
             }
+        }
+        if (!placed.empty()) {
+            // Slot order: the placed run sits among the other appended slots.
+            const auto before = static_cast<std::ptrdiff_t>(first_placed_slot - old_num_blocks);
+            block_refs.insert(block_refs.begin() + before, std::make_move_iterator(placed.begin()),
+                              std::make_move_iterator(placed.end()));
         }
         if (plan.suffix_start < 0) {
             // Insert the batch together so allocation failure cannot leave a partial append.
@@ -195,8 +213,8 @@ public:
     // Swaps a fresh block into `slot`, in the bucket of the block it replaces
     // (any bucket when the slot was a hole), and sets the table's unconsumed
     // tail capacity. Returns the replaced block: a hitter's shared partial
-    // block or an owner's just-published one, which the caller copies into
-    // the fresh block; empty for a hole, which the caller zeroes instead.
+    // block, which the caller copies into the fresh block; empty for a hole,
+    // which the caller zeroes instead.
     CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
                                    std::int32_t available_tokens) {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
@@ -213,6 +231,18 @@ public:
         CacheBlockRef replaced = table.exchange(group_id_, static_cast<std::size_t>(slot), std::move(fresh.front()));
         table.available_tokens_ = available_tokens;
         return replaced;
+    }
+
+    // Swaps `block` -- an owner's copy-in block, held since the admission that
+    // reserved it in the bucket of the block in `slot` -- into `slot`. Returns
+    // the replaced block, the owner's just-published one, which the caller
+    // copies into `block`. The table's tail capacity is unchanged.
+    CacheBlockRef SwapInBlock(BlockTable& table, std::int32_t slot, CacheBlockRef block) {
+        _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
+        const CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
+        _assert(current && block && BucketOf(current->Location()) == BucketOf(block->Location()),
+                "a copy-in block shares the bucket of the block it replaces");
+        return table.exchange(group_id_, static_cast<std::size_t>(slot), std::move(block));
     }
 
     // Appends one Device destination per Host hit, each in its Host block's

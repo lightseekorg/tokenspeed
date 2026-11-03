@@ -337,6 +337,24 @@ CacheCoordinator::BlockRange CacheCoordinator::SlidingWindowBlocks(std::int32_t 
     return BlockRange{.first = first_row / block_granularity, .past_end = past_end};
 }
 
+CacheCoordinator::BlockRange CacheCoordinator::CopyInSlots(std::size_t i, std::int32_t tokens) const {
+    _assert(i < groups_.size() && tokens >= 0, "copy-in slots of a group at a non-negative frontier");
+    const auto group = static_cast<std::int32_t>(i);
+    const std::int32_t tail_tokens = tokens % prefix_granularity_;
+    if (tail_tokens == 0 || GroupIsState(i) || GroupIsReplayable(group)) {
+        return BlockRange{};
+    }
+    // The tail's page starts on a block edge: a page is whole blocks.
+    const std::int32_t page_first = (tokens - tail_tokens) / geometry_[i].BlockGranularity();
+    const std::int32_t past_end = page_first + TailBlocksFor(group, tail_tokens);
+    if (groups_[i].Matcher().IsPrefixClosed()) {
+        return BlockRange{.first = page_first, .past_end = past_end};
+    }
+    const BlockRange window = SlidingWindowBlocks(group, tokens);
+    _assert(window.past_end == past_end, "a sliding window behind a tail ends with the tail's blocks");
+    return BlockRange{.first = std::max(window.first, page_first), .past_end = past_end};
+}
+
 CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary,
                                                                               std::int32_t tail_tokens) const {
     std::int32_t cached = 0;
@@ -1451,6 +1469,15 @@ void CacheCoordinator::validateProgress(const RequestProgress& progress) const {
         _assert(*progress.num_computed_tokens == hashed_pages * prefix_granularity_ + completed.tail->tail_tokens,
                 "the tail ends at the request's computed frontier");
     }
+    if (completed.owner_continues && completed.tail) {
+        _assert(completed.copy_in_blocks.size() == groups_.size(),
+                "an owner that keeps writing past a tail carries its copy-in blocks");
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            const BlockRange slots = CopyInSlots(i, *progress.num_computed_tokens);
+            _assert(completed.copy_in_blocks[i].size() == static_cast<std::size_t>(slots.past_end - slots.first),
+                    "one copy-in block per copy-in slot");
+        }
+    }
 }
 
 void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
@@ -1592,11 +1619,18 @@ public:
 
     HostEvictionPlanner(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
                         const BlockPool& pool)
-        : coordinator_{coordinator}, groups_{groups}, pool_{pool}, plan_{pool, groups}, no_dense_need_(groups.size()) {
+        : coordinator_{coordinator},
+          groups_{groups},
+          pool_{pool},
+          plan_{pool, groups},
+          no_dense_need_(groups.size()),
+          no_pair_need_(groups.size()) {
         plan_.StartCandidates(&taken_, nullptr, coordinator.CheckpointAgingFor(CacheTier::kHost));
     }
 
-    bool Fits(std::span<const std::vector<std::int64_t>> needed) const { return plan_.Fits(needed, no_dense_need_); }
+    bool Fits(std::span<const std::vector<std::int64_t>> needed) const {
+        return plan_.Fits(needed, no_dense_need_, no_pair_need_);
+    }
 
     void Seed(std::uint32_t group_id, CacheBlockLocation location) {
         taken_.insert(location);
@@ -1604,7 +1638,7 @@ public:
     }
 
     bool Fit(std::span<const std::vector<std::int64_t>> needed) {
-        return plan_.SelectUntilFits(needed, no_dense_need_, [&] {
+        return plan_.SelectUntilFits(needed, no_dense_need_, no_pair_need_, [&] {
             while (const auto candidate = plan_.Next({})) {
                 if (taken_.contains(candidate->location)) continue;
                 VictimSet set;
@@ -1633,7 +1667,7 @@ public:
     }
 
     void Minimize(std::span<const std::vector<std::int64_t>> needed) {
-        plan_.Minimize(victims_, needed, no_dense_need_);
+        plan_.Minimize(victims_, needed, no_dense_need_, no_pair_need_);
     }
     const std::vector<VictimSet>& Victims() const { return victims_; }
     std::vector<VictimSet> TakeVictims() { return std::move(victims_); }
@@ -1648,7 +1682,9 @@ private:
     const std::vector<CacheGroup>& groups_;
     const BlockPool& pool_;
     CacheEvictionPlan plan_;
+    // Host rows land in their source's bucket: no dense blocks, no free-bucket pairs.
     std::vector<std::int64_t> no_dense_need_;
+    std::vector<std::int64_t> no_pair_need_;
     CacheEvictionCandidates::LocationSet taken_;
     std::vector<VictimSet> victims_;
 };
@@ -2523,9 +2559,36 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
 template <CacheTier Tier>
 void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                     const CompletedPages& completed, std::uint64_t access_epoch) {
+    // An owner that keeps writing past a tail registers its own tail blocks
+    // but never takes another request's canonical block into its table: the
+    // copy-in moves it off each block it registered, into the block reserved
+    // in that block's bucket, and it keeps writing a block whose key another
+    // request published first. Every other published block dedupes onto the
+    // canonical one, which the table then holds.
+    const BlockRange own_tail =
+        Tier == CacheTier::kDevice && completed.owner_continues && completed.tail
+            ? CopyInSlots(group_index, static_cast<std::int32_t>(completed.prefix_hashes.size()) * prefix_granularity_ +
+                                           completed.tail->tail_tokens)
+            : BlockRange{};
     for (const PublishedRange& range : completedBlockRanges(group_index, completed)) {
-        cacheFullBlocksForGroup<Tier>(group_index, table, range.keys, range.first_cache_block, access_epoch,
+        const std::int32_t past_end = range.first_cache_block + static_cast<std::int32_t>(range.keys.size());
+        const std::int32_t own_first = own_tail.first < own_tail.past_end
+                                           ? std::clamp(own_tail.first, range.first_cache_block, past_end)
+                                           : past_end;
+        const std::span<const CacheKey> keys{range.keys};
+        const auto shared = static_cast<std::size_t>(own_first - range.first_cache_block);
+        if (shared > 0) {
+            cacheFullBlocksForGroup<Tier>(group_index, table, keys.first(shared), range.first_cache_block, access_epoch,
+                                          range.boundary_kind, completed.stream_completed_to_host);
+        }
+        if (own_first < past_end) {
+            _assert(own_first == own_tail.first && past_end == own_tail.past_end,
+                    "the owner's tail blocks are registered whole");
+            // Registration may replace these references, never the table's.
+            std::vector<CacheBlockRef> own(table.Blocks().begin() + own_first, table.Blocks().begin() + past_end);
+            cacheBlocksForGroup<Tier>(group_index, own, keys.subspan(shared), own_first, access_epoch,
                                       range.boundary_kind, completed.stream_completed_to_host);
+        }
     }
     // An in-forward State checkpoint sits outside the table: its block is
     // published like a natural checkpoint's slot 1, under its page's hash.

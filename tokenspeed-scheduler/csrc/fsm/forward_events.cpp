@@ -188,6 +188,8 @@ Retracted SnapshotRetractEvent::retract(State&& state, ResumeShape shape) {
     _assert(coordinator_ != nullptr, "SnapshotRetractEvent requires a cache coordinator");
     _assert(state.resources.results_in_flight == 0, "a retraction victim must be quiescent");
     ForwardResources& resources = state.resources;
+    _assert(resources.cache_progress.copy_in_blocks.empty(),
+            "the retraction's publication drops the copy-in blocks (a Retracted request holds no Device block)");
     // The pages are released -- and may be granted away in this very round --
     // because the store reads them ahead of any reuse (stream-ordered).
     FreeRequest(*coordinator_, resources.block_tables);
@@ -229,6 +231,8 @@ Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {
     _assert(state.ImageLanded(), "a restore is issued only after the image landed");
     _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
             "ScheduleRestoreEvent requires one rebuilt table per cache group");
+    _assert(state.cache_progress.copy_in_blocks.empty(), "a Retracted request holds no copy-in block");
+    state.cache_progress.copy_in_blocks = std::move(copy_in_blocks_);
     return Restoring{
         .resources =
             ForwardResources{

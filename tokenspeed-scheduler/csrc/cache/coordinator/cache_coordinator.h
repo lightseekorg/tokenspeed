@@ -297,15 +297,23 @@ public:
         std::vector<std::vector<std::int32_t>> new_page_ids;
         // Device -> Device whole-block copies, aligned by group_id, as
         // (source, destination) virtual block ids: a hitter's private copy of
-        // the partial block containing its boundary, or an owner's fresh
-        // block at a publication point it keeps writing past. Both ends share
-        // a bucket; the destination sits in the request's table.
+        // the partial block containing its boundary, or an owner's copy-in at
+        // a publication point it keeps writing past (into the block it
+        // reserved for the slot). Both ends share a bucket; the destination
+        // sits in the request's table.
         std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
         // Aligned by group_id: the fresh block each State group's
         // StateStep::checkpoint acquired outside the table (also listed in
         // new_page_ids), null elsewhere. The caller holds it until the
         // request's next publication point publishes it.
         std::vector<CacheBlockRef> state_checkpoint_blocks;
+        // With next_copy_in_tokens: aligned by group_id, one fresh block per
+        // slot of CopyInSlots(i, next_copy_in_tokens), in slot order, each in
+        // the bucket of the block the slot holds after this admission. Held
+        // outside the table -- and not in new_page_ids: the copy-in fills a
+        // block whole -- until the next admission spends it
+        // (CompletedPages::copy_in_blocks). Empty without.
+        std::vector<std::vector<CacheBlockRef>> copy_in_blocks;
         // The tail whose checkpoints the Device supplied as the State groups'
         // slot 0: a first admission resuming inside a page, where an earlier
         // turn ended. The end state the request publishes supersedes it
@@ -353,19 +361,26 @@ public:
     // demands say what each group needs for the round ahead; progress says
     // what the request completed since its previous admission. Completed
     // pages are published and expired slots reclaimed inside this
-    // transaction, before the new pages are acquired. Under
-    // write_back_evictions each set of cache victims is recorded for the
-    // plan's drain (TakeEvictedSegments); each call erases the records it
-    // added that ended up empty. evict_blocks_past_segments (write-back only):
-    // once whole segments cannot fund the admission, what they passed over
-    // leaves block by block, written back like any set -- for a request no
-    // other one holds pages beside, which waiting would never fund
-    // (docs/design/scheduler.md §1.4). Only the plan without the copy-in
-    // evicts so: the copy-in is dropped first. A caller that may drop part of
-    // its demand (an in-forward State checkpoint's block) passes false for
-    // the attempt with it.
+    // transaction, before the new pages are acquired; an owner that keeps
+    // writing past the point moves off its published tail blocks into the
+    // copy-in blocks progress carries (CompletedPages::copy_in_blocks), so the
+    // publication needs no block it did not reserve. next_copy_in_tokens is
+    // the frontier this admission's forward reaches when the request's next
+    // admission publishes it and keeps writing past it (nullopt when it does
+    // not): this admission reserves that point's copy-in blocks
+    // (AdmissionResult::copy_in_blocks), so the next one never waits for
+    // them. Under write_back_evictions each set of cache victims is recorded
+    // for the plan's drain (TakeEvictedSegments); each call erases the records
+    // it added that ended up empty. evict_blocks_past_segments (write-back
+    // only): once whole segments cannot fund the admission, what they passed
+    // over leaves block by block, written back like any set -- for a request
+    // no other one holds pages beside, which waiting would never fund
+    // (docs/design/scheduler.md §1.4). A caller that may drop part of its
+    // demand (an in-forward State checkpoint's block) passes false for the
+    // attempt with it.
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
+                                         std::optional<std::int32_t> next_copy_in_tokens,
                                          std::optional<std::uint64_t> request_access_epoch,
                                          bool evict_blocks_past_segments, const std::string& session_id);
 
@@ -433,12 +448,17 @@ public:
     // snapshot_pairs the snapshot pool -> Device copies, new_page_ids only
     // the reserve pages appended
     // beyond the imaged shape (the copies fill their destinations whole, so
-    // the plan zeroes nothing it restores). request_access_epoch is the
-    // request's first-admission epoch, carried on. Under
-    // write_back_evictions each set of cache victims is recorded for the
-    // plan's drain as an admission's is; each call erases the records it
+    // the plan zeroes nothing it restores). next_copy_in_tokens is the
+    // image's own frontier when the resumed request's next admission
+    // publishes it and keeps writing past it (a prompt end or a junction the
+    // victim stopped at), nullopt otherwise: the restore reserves its copy-in
+    // blocks as the admission that reached it did (Admit).
+    // request_access_epoch is the request's first-admission epoch, carried
+    // on. Under write_back_evictions each set of cache victims is recorded for
+    // the plan's drain as an admission's is; each call erases the records it
     // added that ended up empty.
     std::optional<AdmissionResult> Restore(const RetractionImage& snapshot, std::span<const GroupDemand> demands,
+                                           std::optional<std::int32_t> next_copy_in_tokens,
                                            std::uint64_t request_access_epoch);
     bool HasHostPool() const { return host_pool_ != nullptr; }
     bool HasSnapshotPool() const { return snapshot_pool_ != nullptr; }
@@ -895,6 +915,14 @@ public:
         return tokenspeed::FirstTailBlockNeeded(groups_[index].Spec(), geometry_[index].BlockGranularity(),
                                                 tail_tokens);
     }
+    // The table slots of group i an owner copies in at a publication point
+    // ending at `tokens` that it keeps writing past: exactly the slots that
+    // point's publication registers under the tail's hash (completedBlockRanges)
+    // -- the page's blocks below `tokens`, from the window's first block on in
+    // a sliding group. None at a page boundary, for a State group (which moves
+    // off its published slot by rotation) or for a replayable one (which
+    // publishes nothing).
+    BlockRange CopyInSlots(std::size_t i, std::int32_t tokens) const;
 
 private:
     friend struct CacheCoordinatorTestAccess;
