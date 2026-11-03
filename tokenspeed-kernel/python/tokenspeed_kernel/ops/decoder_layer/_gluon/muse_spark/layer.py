@@ -1561,6 +1561,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     DN_ORDER: gl.constexpr,
     DN_LINES: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
+    TAG_POLL: gl.constexpr,
     SCALE_LANES: gl.constexpr,
     TAIL_NUM: gl.constexpr,
     TAIL_DEN: gl.constexpr,
@@ -1759,7 +1760,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     _stamp(stamps_ptr, launch.cta, _STAMP_XQ, STAMPS)
     run_moe(
         launch, handles, bufs, h4_sink, H4SinkArgs(view, launch, RANK), ROWS, _TOPK, N_PHYS1,
-        N_PHYS2, RING, QUAD_MAP, DN_ORDER, DN_LINES, ADDR_SOFFSET, True, SCALE_LANES,
+        N_PHYS2, RING, QUAD_MAP, DN_ORDER, DN_LINES, ADDR_SOFFSET, TAG_POLL, SCALE_LANES,
         SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
     )  # fmt: skip
 
@@ -2002,6 +2003,7 @@ def kernel_constexprs(
     dn_order: int,
     dn_lines: int,
     addr_soffset: int,
+    tag_poll: int,
     scale_lanes: int,
     tail_num: int,
     tail_den: int,
@@ -2054,6 +2056,7 @@ def kernel_constexprs(
         DN_ORDER=dn_order,
         DN_LINES=dn_lines,
         ADDR_SOFFSET=addr_soffset,
+        TAG_POLL=tag_poll,
         SCALE_LANES=scale_lanes,
         TAIL_NUM=tail_num,
         TAIL_DEN=tail_den,
@@ -2179,7 +2182,7 @@ def offline_compile_args(key: PlanKey, rank: int):
     fn = gluon_decoder_layer_muse_spark_gfx950
     constexprs = kernel_constexprs(
         key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=16, quad_map=0,
-        dn_order=0, dn_lines=0, addr_soffset=0, scale_lanes=0, tail_num=1, tail_den=2,
+        dn_order=0, dn_lines=0, addr_soffset=0, tag_poll=1, scale_lanes=0, tail_num=1, tail_den=2,
         n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False,
         next_rotary=key.next_kind == "sliding", qkv_window=2, att_merge="designated",
         entry="vector", stamps=False,

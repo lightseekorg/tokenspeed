@@ -138,7 +138,7 @@ def test_native_stream_is_bitwise_direct_decode(experts, variant, rows):
                 ids,
                 out,
                 state,
-                tag_glc=1,
+                tag_poll=1,
                 tail_num=1,
                 tail_den=2,
                 deadline_ticks=DEADLINE_TICKS,
@@ -194,7 +194,7 @@ def test_stale_tags_matching_the_launch_tag_are_never_seen(experts):
     def run(routes):
         launch_gluon_mxfp4_moe_native_stream_gfx950(
             xq, xs, weights, routes, out, state, ring=8, quad_map=0, dn_order=0,
-            dn_lines=0, addr_soffset=0, tag_glc=1, tail_num=1, tail_den=2,
+            dn_lines=0, addr_soffset=0, tag_poll=1, tail_num=1, tail_den=2,
             deadline_ticks=DEADLINE_TICKS, **SWIGLU
         )  # fmt: skip
 

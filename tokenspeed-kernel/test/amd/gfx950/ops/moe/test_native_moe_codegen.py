@@ -45,7 +45,9 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
 _LOAD = re.compile(r"^(buffer|global)_load_\w+")
 _STORE = re.compile(r"^(buffer|global)_store_\w+")
 
-_BASE = dict(QUAD_MAP=0, DN_ORDER=0, DN_LINES=0, ADDR_SOFFSET=0, SCALE_LANES=0)
+_BASE = dict(
+    QUAD_MAP=0, DN_ORDER=0, DN_LINES=0, ADDR_SOFFSET=0, TAG_POLL=1, SCALE_LANES=0
+)
 VARIANTS = [
     dict(_BASE, ROWS=8, RING=8, SCALE_LANES=1),
     dict(_BASE, ROWS=8, RING=8),
@@ -100,7 +102,6 @@ def _compile(fields, sink=native_stream.store_routes_sink):
         SINK=sink,
         **PHYS,
         TOPK=8,
-        TAG_GLC=1,
         TAIL_NUM=1,
         TAIL_DEN=2,
         SWIGLU_ALPHA=1.0,
@@ -289,3 +290,17 @@ def test_compiles_with_unit_scale_strides():
     ones = dict(stride_xslin=1, stride_s13lin=1, stride_s2lin=1)
     assembly = _compile(dict(_BASE, ROWS=8, RING=16, **ones))
     assert int(re.search(r"\.vgpr_spill_count:\s+(\d+)", assembly).group(1)) == 0
+
+
+def test_vector_tag_poll_reads_no_scalar_memory():
+    """With vector readiness polls the tag lines are read with uncached
+    vector loads, never scalar ones, and the gate/up loop keeps its ring."""
+    fields = dict(_BASE, ROWS=8, RING=16, TAG_POLL=2)
+    ins = _instructions(_compile(fields))
+    body = [s for s, _ in ins]
+    # A tag line is 16 words: the scalar polls read it in one dwordx16.
+    assert not any(s.startswith("s_load_dwordx16") for s in body)
+    assert any(s.startswith("global_load_dword ") and " sc0 sc1" in s for s in body)
+    start, end = _item_loops(ins)[32]
+    waits = _walk(ins[start : end + 1])[0]
+    assert min(n for n, before in waits if n < before) >= fields["RING"], waits

@@ -2326,7 +2326,7 @@ store each.
 - Bitwise equal to the direct decode: the same per-column MFMA chain,
   SwiGLU, 32-value MXFP4 mids and down chain.
 - Plan fields (constexpr): `RING`, `QUAD_MAP`, `DN_ORDER`, `DN_LINES`,
-  `ADDR_SOFFSET`, `TAG_GLC`, `SCALE_LANES`, `TAIL_NUM` / `TAIL_DEN`.
+  `ADDR_SOFFSET`, `TAG_POLL`, `SCALE_LANES`, `TAIL_NUM` / `TAIL_DEN`.
 
 #### Algorithm
 

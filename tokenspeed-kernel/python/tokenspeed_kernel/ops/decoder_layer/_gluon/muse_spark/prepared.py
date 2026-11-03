@@ -107,6 +107,9 @@ DEFAULT_PLAN_FIELDS = dict(
     dn_order=0,
     dn_lines=0,
     addr_soffset=0,
+    # MoE readiness polls: scalar loads past the scalar cache (1), or
+    # uncached vector loads (2), which wait behind the wave's weight loads.
+    tag_poll=1,
     tail_num=1,
     tail_den=2,
     num_stages=2,
