@@ -274,8 +274,8 @@ the prompt's key before rotating it into slot 0), a chunk end that falls on a
 junction (§1; the KV there is cached already, so only the state is
 published), and a finish or retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state),
-except the dead prompt ends and finishes the in-forward checkpoint skips
-(below). An ordinary chunk end or decode step publishes nothing for a State
+except the dead prompt ends and finishes that the in-forward checkpoint
+skips (below). An ordinary chunk end or decode step publishes nothing for a State
 group (`CompletedPages::publish_state` is false). The key is the key of the
 exact token count `T`: the chain hash of the last page when `T` is a page
 multiple, otherwise the tail hash `hash@T` the KV groups use — so one key
@@ -328,8 +328,8 @@ boundary, and so does one whose admission cannot also hold the extra block (a
 cache with no spare block): the next chunk's admission publishes its live slot
 there, at the cost of one more round. Multi-turn traffic whose next turn
 re-renders the end of the previous prompt then reuses the common prefix
-immediately, and the prompt ends and finishes such a turn cannot resume at
-are skipped (dead checkpoints, below).
+immediately, and the prompt ends and finishes that such a turn cannot
+resume at are skipped (dead checkpoints, below).
 
 An active request retains one such aligned input checkpoint and its cached,
 non-replayable sliding windows across both tiers. Its full-history tables
