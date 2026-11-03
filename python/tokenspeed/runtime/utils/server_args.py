@@ -423,6 +423,10 @@ class ServerArgs:
     # conversation published two turns back, which both cache tiers then evict
     # early (docs/design/scheduler.md section 1.2).
     enable_state_checkpoint_in_forward: bool = False
+    # Opt-in, prefill servers with the in-forward checkpoint: a prompt too
+    # short for that checkpoint whose end lies inside a page publishes no
+    # state and no KV tail there either (same section).
+    drop_short_prompt_end_checkpoints: bool = False
     # Hybrid models: a State checkpoint a later request's checkpoint extends
     # ranks, under cache pressure, as if last used this many new requests ago. None
     # is the scheduler's default, 16 times the per-rank batch size.
@@ -1491,6 +1495,19 @@ class ServerArgs:
         )
 
     @property
+    def drops_short_prompt_end_checkpoints(self) -> bool:
+        """Whether this engine's scheduler drops short prompts' end checkpoints.
+
+        This is the flag on a prefill server, which validation holds to the
+        in-forward checkpoint. Validation refuses it on a fused server; decode
+        and encode servers ignore it.
+        """
+        return (
+            self.drop_short_prompt_end_checkpoints
+            and self.disaggregation_mode == "prefill"
+        )
+
+    @property
     def retraction_snapshot_pool_disabled(self) -> bool:
         """Whether no image can ever be taken, so a capacity block aborts.
 
@@ -2328,6 +2345,30 @@ class ServerArgs:
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
                 )
+        if self.drop_short_prompt_end_checkpoints:
+            if not self.enable_state_checkpoint_in_forward:
+                raise ValueError(
+                    "--drop-short-prompt-end-checkpoints extends the dead "
+                    "checkpoints --enable-state-checkpoint-in-forward skips; "
+                    "it requires that flag"
+                )
+            # A PD launcher may pass the prefill flags to the other PD roles
+            # too, which ignore this one; a fused server is given it on
+            # purpose, but the drop is a prefill-server policy, so fused
+            # serving keeps its short prompt ends (docs/design/scheduler.md
+            # section 1.2).
+            if self.disaggregation_mode == "null":
+                raise ValueError(
+                    "--drop-short-prompt-end-checkpoints is a prefill-server "
+                    "policy; a fused server (--disaggregation-mode null) keeps "
+                    "short prompt ends"
+                )
+            if self.disaggregation_mode != "prefill":
+                logger.info(
+                    "--drop-short-prompt-end-checkpoints acts on prefill servers "
+                    "only; ignoring it with --disaggregation-mode "
+                    f"{self.disaggregation_mode}"
+                )
         _require_choice(
             "--kvstore-write-policy",
             self.kvstore_write_policy,
@@ -2952,6 +2993,23 @@ class ServerArgs:
             "republished it after the conversation's previous turn resumed "
             "there. Requires prefix caching; a decode server ignores it. See "
             "docs/design/scheduler.md section 1.2.",
+        )
+        parser.add_argument(
+            "--drop-short-prompt-end-checkpoints",
+            action="store_true",
+            dest="drop_short_prompt_end_checkpoints",
+            default=ServerArgs.drop_short_prompt_end_checkpoints,
+            help="Prefill servers, hybrid (recurrent-state) models: a prompt too "
+            "short for the in-forward checkpoint (no longer than the chunk "
+            "budget) whose end lies inside a prefix page publishes only its full "
+            "pages to the prefix cache, no recurrent state and no KV tail at its "
+            "end, since a next turn that re-renders the end of the prompt cannot "
+            "resume there; a longer prompt that repeats it whole resumes at an "
+            "earlier checkpoint instead. A page-aligned prompt end keeps its "
+            "state. Requires --enable-state-checkpoint-in-forward. A fused "
+            "server (--disaggregation-mode null) refuses it; decode and encode "
+            "servers ignore it, as a PD launcher may pass them the prefill "
+            "flags. Off by default. See docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
             "--checkpoint-retention-requests",

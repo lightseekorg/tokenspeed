@@ -331,6 +331,12 @@ private:
     std::int32_t promptEndCheckpoint(const Request& request, std::int32_t resume_tokens) const;
     bool promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const;
     bool finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const;
+    // SchedulerConfig::drop_short_prompt_end_checkpoints at a finish: whether
+    // the request's computed frontier is the end of a prompt too short for an
+    // in-forward checkpoint, inside a page, which the finish publishes like a
+    // chunk end (finishCheckpointIsDead) and which supersedes no input
+    // (MarkSupersededStateInput).
+    bool shortPromptEndIsDropped(const Request& request) const;
     // Whether the first decode of a request that resumed at resume_tokens
     // publishes its prompt end and keeps writing past it, and the copy-in
     // point every admission of its prompt reserves for that publication

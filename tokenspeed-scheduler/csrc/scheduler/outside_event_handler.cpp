@@ -139,8 +139,13 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     // that fails earlier (a failed PD transfer) publishes and marks nothing,
     // and an end state that is the input itself (a D request that claimed its
     // prompt-end checkpoint and leaves before any decode) supersedes nothing.
-    if (progress.resumed_tail_hash && !(completed.completed_pages && completed.completed_pages->tail &&
-                                        completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
+    // Nor does a short prompt end left unpublished (shortPromptEndIsDropped):
+    // such a prompt writes no in-forward checkpoint either, so the input can
+    // still be the deepest checkpoint a next turn extending the prompt resumes
+    // at, and it ages like any cache entry.
+    if (progress.resumed_tail_hash && !shortPromptEndIsDropped(request) &&
+        !(completed.completed_pages && completed.completed_pages->tail &&
+          completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
         coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
     }
     if (checkpoint_lineage_) {
@@ -213,6 +218,35 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
            coordinator_.HoldsStateCheckpoint(progress.prefix_hashes[checkpoint_pages - 1]);
 }
 
+// With drop_short_prompt_end_checkpoints (P role, in-forward checkpoint): a
+// prompt too short for a pre-tail checkpoint (PrefillStateCheckpointTokens
+// is 0) that ends inside a page ends in a tail a re-rendered next turn does
+// not resume at, and an identical prompt's probe stops short of its last
+// token; its state is keyed by that tail. The finish publishes the full pages
+// only. A page-aligned end keeps its state: it is a chain boundary a longer
+// prompt resumes from. A model without State groups keeps its tails. Unlike
+// a covered prompt end (promptEndIsCoveredByCheckpoint) it needs no
+// checkpoint to exist: it reads only the prompt, so it holds whatever the
+// cache holds. Nothing before the finish -- the PD ACK -- depends on it: the
+// P role reserves no copy-in block for its prompt end
+// (firstDecodePublishesPromptEnd), its remote decode publishes like a chunk
+// end, and it never retracts.
+bool Scheduler::shortPromptEndIsDropped(const Request& request) const {
+    const std::int32_t prompt = request.PrefillSize();
+    if (!config_.drop_short_prompt_end_checkpoints || request.NumComputedTokens() != prompt ||
+        prompt % coordinator_.PrefixGranularity() == 0 ||
+        PrefillStateCheckpointTokens(coordinator_, prompt, config_.max_scheduled_tokens,
+                                     config_.prefix_replay_tokens) != 0) {
+        return false;
+    }
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // With the in-forward checkpoint, a finish at a covered prompt end
 // publishes like a chunk end: its full pages and a pending in-forward
 // checkpoint, but no tail and no state. That is the P role's finish (the
@@ -225,17 +259,19 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
 // F past the prompt end publishes like a chunk end too: a next turn that
 // re-renders the generated reply diverges before F, and without its state the
 // tail is no point a hybrid model can resume at. The prompt end was the
-// first decode's to publish or skip (scheduleDecode). A model without State
-// groups keeps its tails: there they are resume points of their own. The D
-// role publishes its frontier as ever. (Validate requires prefix caching with
-// the in-forward checkpoint on the other roles.)
+// first decode's to publish or skip (scheduleDecode). With
+// drop_short_prompt_end_checkpoints the P role's finish also publishes a
+// short prompt's end like a chunk end (shortPromptEndIsDropped). A model
+// without State groups keeps its tails: there they are resume points of
+// their own. The D role publishes its frontier as ever. (Validate requires
+// prefix caching with the in-forward checkpoint on the other roles.)
 bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const {
     if (!config_.state_checkpoint_in_forward || config_.role == Role::kD) {
         return false;
     }
     const std::int32_t frontier = request.NumComputedTokens();
     if (frontier == request.PrefillSize()) {
-        return promptEndIsCoveredByCheckpoint(request, progress);
+        return shortPromptEndIsDropped(request) || promptEndIsCoveredByCheckpoint(request, progress);
     }
     if (frontier < request.PrefillSize()) {
         return false;

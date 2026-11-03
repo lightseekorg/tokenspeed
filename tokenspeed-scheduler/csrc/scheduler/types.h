@@ -125,6 +125,20 @@ struct SchedulerConfig {
     // unaffected. Requires prefix caching, except on the D role, which never
     // computes a prompt and publishes as ever.
     bool state_checkpoint_in_forward{false};
+    // P role, with state_checkpoint_in_forward: the finish of a prompt too
+    // short for the in-forward checkpoint (PrefillStateCheckpointTokens is 0:
+    // by default a prompt within one chunk budget) whose end lies inside a
+    // page publishes like a chunk end -- its full pages, no KV tail and no
+    // State checkpoint -- and marks no input superseded. A next turn that
+    // re-renders the end of the prompt cannot resume at that tail; a longer
+    // prompt that repeats the whole prompt resumes at an earlier checkpoint
+    // instead. A page-aligned prompt end, a prompt long enough for the
+    // in-forward checkpoint and a model without State groups are unaffected
+    // (docs/design/scheduler.md §1.2). The other roles refuse it. The fused
+    // role keeps its short prompt ends because this is a P-role policy,
+    // chosen from PD measurements; the same case exists at the fused first
+    // decode, and applying the drop there is a possible follow-up.
+    bool drop_short_prompt_end_checkpoints{false};
     // A finish that publishes an in-forward State checkpoint past the one it
     // resumed from, itself an in-forward checkpoint whose request resumed from
     // an earlier one, demotes that earlier one -- two turns back on the

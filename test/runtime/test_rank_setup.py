@@ -222,6 +222,77 @@ def test_checkpoint_retention_leaf_distance_is_passed_when_given(flags, leaf_dis
     assert cfg.checkpoint_retention_leaf_distance == leaf_distance
 
 
+@pytest.mark.parametrize(
+    "flags, enabled",
+    [([], False), (["--drop-short-prompt-end-checkpoints"], True)],
+)
+def test_a_prefill_server_drops_short_prompt_ends_only_with_the_flag(flags, enabled):
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-transfer-backend",
+            "mooncake",
+            "--enable-state-checkpoint-in-forward",
+            *flags,
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    )
+    assert cfg.state_checkpoint_in_forward
+    assert cfg.drop_short_prompt_end_checkpoints is enabled
+
+
+def test_dropping_short_prompt_ends_is_refused_without_the_in_forward_checkpoint():
+    # It extends the dead checkpoints that flag skips.
+    with pytest.raises(ValueError, match="requires that flag"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+            drop_short_prompt_end_checkpoints=True,
+        )
+
+
+def test_a_fused_server_refuses_to_drop_short_prompt_ends():
+    # The drop is a prefill-server policy; a fused server keeps short prompt
+    # ends, so the flag there is a mistake rather than a launcher's echo.
+    with pytest.raises(ValueError, match="prefill-server policy"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            enable_state_checkpoint_in_forward=True,
+            drop_short_prompt_end_checkpoints=True,
+        )
+
+
+@pytest.mark.parametrize("role, pool", [("decode", (5, 8)), ("encode", (1, 0))])
+def test_decode_and_encode_servers_take_the_short_prompt_end_flag_as_a_no_op(
+    role, pool
+):
+    # A PD launcher may pass the prefill flags to every role; the scheduler
+    # refuses the drop outside the P role, so these servers never set it.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode=role,
+        disaggregation_transfer_backend="mooncake",
+        enable_state_checkpoint_in_forward=True,
+        drop_short_prompt_end_checkpoints=True,
+    )
+    cfg = _config(
+        args,
+        _specs(num_host_pages=17, num_snapshot_pages=pool[0], max_retracted=pool[1]),
+    )
+    assert not cfg.drop_short_prompt_end_checkpoints
+
+
 def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
     # Its checkpoint is only reachable through a prefix hit.
     with pytest.raises(ValueError, match="requires prefix caching"):
