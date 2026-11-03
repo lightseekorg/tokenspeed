@@ -418,7 +418,7 @@ def test_direct_mfma_decode_stage2_matches_reference(
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
 @pytest.mark.parametrize(
     ("block_n", "pipeline_k"),
-    [(16, True), (32, False), (32, True)],
+    [(16, True), (32, False), (32, True), (64, True)],
 )
 def test_direct_mfma_decode_deferred_ep_routes(
     num_tokens: int,

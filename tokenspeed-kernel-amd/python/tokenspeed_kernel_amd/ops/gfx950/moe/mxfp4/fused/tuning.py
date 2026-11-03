@@ -198,6 +198,38 @@ def _select_direct_stage1_prefetch_tiles(
     return _DIRECT_STAGE1_PREFETCH_TILES.get(shape, 0)
 
 
+# Key: hidden width, intermediate width, local experts, global experts, top-k.
+# Entries: inclusive row bounds and the deferred direct decode stage 2's
+# BLOCK_N (columns per program; one route per program). Rows outside every
+# entry keep the default. Wider tiles give each program more weight columns
+# to stream per route.
+_DIRECT_STAGE2_DEFERRED_BLOCK_N = {
+    # EP1 (TP8 intermediate shard). Measured on MI355X against 16 columns
+    # with both MoE stages in graph replay over four cold weight copies and
+    # recorded verify and plain decode routing. 1-2 rows keep 16: wider
+    # tiles were slower there.
+    (4096, 512, 256, 256, 8): ((3, 5, 32), (6, 9, 64)),
+}
+
+
+def _select_direct_stage2_deferred_block_n(
+    num_tokens: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int | None,
+    top_k: int,
+) -> int | None:
+    """Return the deferred direct decode stage 2's ``BLOCK_N`` for this shape
+    and row count, or None for the default."""
+    shape = (hidden_dim, inter_dim, num_local_experts, num_experts, top_k)
+    for min_rows, max_rows, block_n in _DIRECT_STAGE2_DEFERRED_BLOCK_N.get(shape, ()):
+        if min_rows <= num_tokens <= max_rows:
+            return block_n
+    return None
+
+
 # Largest row count any route-tile entry serves; callers that do not want
 # route tiles pass 0 instead.
 _ROUTE_TILE_MAX_M = max(
