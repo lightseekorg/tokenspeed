@@ -2399,6 +2399,7 @@ def prepare_muse_communication(
     owned_route_max_rows: int,
     intermediate_gather_max_rows: int,
     all_reduce: IrisAllReduce | None,
+    reserved_heap_bytes: int,
     device: torch.device,
 ) -> MuseIrisState:
     """Prepare one group's generic operations and Muse fusions before capture.
@@ -2406,6 +2407,9 @@ def prepare_muse_communication(
     Capacities count elements. An existing generic all-reduce can be reused only
     if its fixed capacities cover the request. The first preparation sizes the
     shared heap; Iris's allocator enforces later allocations.
+    ``reserved_heap_bytes`` sizes the heap this call creates for states the
+    caller allocates from it next (fused decoder layers), so they do not come
+    out of the headroom kept for other operations.
     """
     if all_reduce is not None:
         if (
@@ -2435,6 +2439,7 @@ def prepare_muse_communication(
         )
         ctx = get_or_create_context(
             heap_size=max(MIN_HEAP_BYTES, size + HEAP_HEADROOM_BYTES)
+            + reserved_heap_bytes
         )
         peers = IrisGroup(ctx, group, rank_in_group, device)
         all_reduce = IrisAllReduce(peers, staged_max_numel, capacity, torch.bfloat16)

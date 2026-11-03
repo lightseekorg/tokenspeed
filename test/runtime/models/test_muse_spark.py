@@ -1746,6 +1746,7 @@ def _gathered_mxfp4_workspace_worker(
             owned_route_max_rows=0,
             intermediate_gather_max_rows=0,
             all_reduce=None,
+            reserved_heap_bytes=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=256 * 4096,
