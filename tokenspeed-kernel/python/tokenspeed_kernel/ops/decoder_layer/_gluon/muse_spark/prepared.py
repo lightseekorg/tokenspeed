@@ -224,6 +224,15 @@ class MuseSparkDecoderLayerState:
         return MuseNativeIrisState.heap_bytes()
 
 
+def _router_hi_lo(router: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The FP32 router ``[hidden, experts]`` as BF16 ``hi + lo`` rows
+    ``[experts, hidden]``: ``hi`` rounds each weight, ``lo`` rounds what
+    ``hi`` missed, so ``hi + lo`` keeps ~16 of its 24 significand bits."""
+    hi = router.t().contiguous().to(torch.bfloat16)
+    lo = (router.t() - hi.float()).to(torch.bfloat16).contiguous()
+    return hi, lo
+
+
 def _bf16_with_offset(weight: torch.Tensor | None, offset: float, width: int, device):
     """``bf16(fp32(weight) + offset)``: the norm multiplier the regular
     kernels form, rounded as they round it; ones for a weightless norm."""
@@ -393,8 +402,7 @@ class MuseSparkFusedDecoderLayer:
         alpha2, beta2 = weights["post_feedforward_gate"]
         # The router as BF16 hi + lo rows [experts, hidden] (a one-time copy).
         router = _require("router", weights["router"], (HIDDEN, 256), torch.float32)
-        router_hi = router.t().contiguous().to(torch.bfloat16)
-        router_lo = (router.t() - router_hi.float()).to(torch.bfloat16).contiguous()
+        router_hi, router_lo = _router_hi_lo(router)
         pooler = _require(
             "pooler", weights["pooler"], (POOLED, HIDDEN), torch.bfloat16
         )[rank * POOLED_LOCAL : (rank + 1) * POOLED_LOCAL]
