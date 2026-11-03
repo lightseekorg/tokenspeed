@@ -123,7 +123,8 @@ def wait_records_tags16(record_ptr, first, count: gl.constexpr, tag, launch):
     launch's ``fail_stop``."""
     gl.static_assert(count % 16 == 0)
     for line in gl.static_range(count // 16):
-        if not poll_tags16(record_ptr + first + 16 * line, tag, launch, True):
+        # Every wave polls every line itself, so each ends with its own acquire.
+        if not poll_tags16(record_ptr + first + 16 * line, tag, launch, True, False):
             fail_stop(launch, _RECORD_SITE, line)
 
 

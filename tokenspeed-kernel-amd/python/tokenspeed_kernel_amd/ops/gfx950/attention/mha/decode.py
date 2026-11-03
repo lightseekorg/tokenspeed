@@ -772,8 +772,10 @@ class AttentionProgram:
         the designated merger's alternative to ``finalize_splits``.
 
         ``WAIT_RECORDS(record_ptr, first, count, tag, launch)`` (constexpr)
-        returns once the ``count`` int32 records from ``first`` equal ``tag``,
-        behind a workgroup barrier, or stops the launch at its deadline. In
+        returns in every wave once that wave has seen the ``count`` int32
+        records from ``first`` equal ``tag`` (each wave polls them, or one
+        polls behind a workgroup barrier), or stops the launch at its
+        deadline. In
         the layer it is the scalar 16-tag poll (``poll_tags16``) over the
         block's 64-byte record lines. The splits merge in split order, as
         ``finalize_splits`` merges them, so the rows are bitwise the same; the
