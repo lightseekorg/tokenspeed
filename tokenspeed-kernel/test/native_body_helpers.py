@@ -35,10 +35,12 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     mha_decode_sliding_split_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
+    gemv_a16w16_splitk_finish_x_gfx950,
     gemv_a16w16_splitk_hi_lo_sums_gfx950,
     gemv_a16w16_splitk_publish_gfx950,
     gemv_a16w16_splitk_wave_sums_gfx950,
     gemv_a16w16_splitk_weights_gfx950,
+    gemv_a16w16_splitk_weights_paced_gfx950,
     gemv_a16w16_splitk_x_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.layernorm.deferred import (
@@ -389,3 +391,41 @@ def topk_keys_kernel(
     mask = (out_row < M)[:, None] & (pick >= 0)[None, :]
     gl.amd.cdna4.buffer_store(ids, ids_ptr, offsets, mask=mask)
     gl.amd.cdna4.buffer_store(weights, weights_ptr, offsets, mask=mask)
+
+
+@gluon.jit
+def qkv_task_kernel(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    w_ptr,
+    part_ptr,
+    tag,
+    M,
+    WIDTH: gl.constexpr,
+    N: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    WINDOW: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """The native layer's QKV task: one 144-row x WIDTH / 16 task per
+    program, its weights issued at most ``WINDOW`` tiles ahead, x built from
+    the FFN boundary's deferred norm, fp32 partials published for the head
+    tasks."""
+    task = gl.program_id(0)
+    ROWS: gl.constexpr = N // 16
+    tiles = gemv_a16w16_splitk_weights_paced_gfx950(
+        w_ptr, task, WIDTH, ROWS, 16, 16, WINDOW
+    )
+    _, x = _kpart_x(
+        b_ptr, sums_ptr, h_ptr, alpha_ptr, beta_ptr, post_ptr, pre_ptr, task, M,
+        WIDTH, PRODUCERS, 16, 16, POST_EPS, PRE_EPS,
+    )  # fmt: skip
+    gemv_a16w16_splitk_finish_x_gfx950(
+        tiles, x.to(gl.bfloat16), part_ptr, tag, task, M, N, ROWS, 16, ".wt"
+    )

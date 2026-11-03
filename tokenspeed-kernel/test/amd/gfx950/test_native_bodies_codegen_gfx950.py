@@ -40,6 +40,7 @@ from native_body_helpers import (  # noqa: E402
     compile_gfx950,
     kpart_pooler_kernel,
     kpart_router_kernel,
+    qkv_task_kernel,
     sender_kernel,
     split_records_kernel,
     topk_keys_kernel,
@@ -234,3 +235,52 @@ def test_topk_keys_stay_in_one_wave():
     assert not [line for line in code if line.startswith("ds_") or line == "s_barrier"]
     assert any(line.startswith("v_cmp_gt_i64") for line in code)
     assert _metadata(assembly, "private_segment_fixed_size") == 0
+
+
+@pytest.mark.parametrize("window", [3, 9], ids=["paced", "all-at-once"])
+def test_qkv_task_paces_its_weights_and_fits(window: int):
+    """The QKV task (144 rows x K/16, x built from the FFN boundary's
+    deferred norm) keeps at most ``window`` weight tiles in flight with
+    counted waits, never draining its stream while issuing, and fits the
+    budget with no scratch: NATIVE-DESIGN's one-task form (204 VGPRs [C])."""
+    assembly = compile_gfx950(
+        qkv_task_kernel,
+        {
+            "b_ptr": "*bf16",
+            "sums_ptr": "*fp32",
+            "h_ptr": "*fp32",
+            "alpha_ptr": "*fp32",
+            "beta_ptr": "*fp32",
+            "post_ptr": "*bf16",
+            "pre_ptr": "*bf16",
+            "w_ptr": "*bf16",
+            "part_ptr": "*i64",
+            "tag": "i32",
+            "M": "i32",
+        },
+        dict(
+            WIDTH=8192, N=2304, PRODUCERS=64, WINDOW=window, POST_EPS=1e-6, PRE_EPS=1e-5
+        ),
+        num_warps=8,
+        **persistent_compile_options(),
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    assert _metadata(assembly, "vgpr_count") <= 204
+    code = instruction_lines(assembly)
+    weights = [
+        i
+        for i, line in enumerate(code)
+        if line.startswith("buffer_load_dwordx4") and line.endswith("sc0 nt")
+    ]
+    assert len(weights) == 18  # 9 tiles x 2 loads per wave
+    waits = [
+        code[i]
+        for i in range(weights[0], weights[-1])
+        if code[i].startswith("s_waitcnt") and "vmcnt" in code[i]
+    ]
+    if window >= 9:
+        # Unpaced: other loads may be waited for in between, never the stream.
+        assert "s_waitcnt vmcnt(0)" not in waits, waits
+    else:
+        # Before each tile past the window: wait until (window - 1) tiles remain.
+        assert waits == [f"s_waitcnt vmcnt({2 * (window - 1)})"] * (9 - window), waits
