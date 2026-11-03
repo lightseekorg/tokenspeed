@@ -381,7 +381,7 @@ if current_platform().is_amd:
             "has_kv_cache": frozenset({False, True}),
             "has_sparse_kv_cache": frozenset({False, True}),
             "logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({False, True}),
             "topk_layout": frozenset({"global_slots"}),
         },
     )
@@ -415,7 +415,7 @@ if current_platform().is_amd:
             "has_kv_cache": frozenset({False, True}),
             "has_sparse_kv_cache": frozenset({False, True}),
             "logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({False, True}),
             "topk_layout": frozenset({"global_slots"}),
         },
     )
@@ -450,7 +450,7 @@ if current_platform().is_amd:
             "has_kv_cache": frozenset({True}),
             "has_sparse_kv_cache": frozenset({False}),
             "logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": frozenset({False, True}),
             "topk_layout": frozenset({"global_slots"}),
         },
     )

@@ -368,6 +368,7 @@ def _dsa_dense_mfma_kv_kernel(
     NATIVE_FP8: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
     SPLIT_KV: gl.constexpr,
+    STORE_LSE: gl.constexpr,
 ):
     # CDNA4 exposes the FP8 MFMA at K=32. Keeping FP8 operands native halves
     # the score/value instruction count and avoids per-tile BF16 expansion.
@@ -938,7 +939,7 @@ def _dsa_dense_mfma_kv_kernel(
         blk_out_phase,
         BLOCK_H,
     )
-    if SPLIT_KV:
+    if SPLIT_KV or STORE_LSE:
         lse = gl.where(l_new > 0.0, m_new + gl.log(l_new), -float("inf"))
         lse = gl.convert_layout(lse, gl.SliceLayout(1, mfma_s))
         offs_h_lse = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s))
@@ -946,8 +947,9 @@ def _dsa_dense_mfma_kv_kernel(
         lse_offsets = (
             token_idx.to(tl.int64) * stride_lse_t
             + offs_h_lse.to(tl.int64) * stride_lse_h
-            + split_idx.to(tl.int64) * stride_lse_s
         )
+        if SPLIT_KV:
+            lse_offsets += split_idx.to(tl.int64) * stride_lse_s
         gl.amd.cdna4.buffer_store(
             stored_value=lse,
             ptr=partial_lse,
@@ -1000,6 +1002,7 @@ def _dsa_sparse_prefill_fp8_kernel(
     D_ROPE: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
     SPLIT_KV: gl.constexpr,
+    STORE_LSE: gl.constexpr,
 ):
     """Native-FP8 sparse MLA for prefill rows, one key tile at a time.
 
@@ -1261,15 +1264,16 @@ def _dsa_sparse_prefill_fp8_kernel(
         blk_out_phase,
         BLOCK_H,
     )
-    if SPLIT_KV:
+    if SPLIT_KV or STORE_LSE:
         lse = gl.where(l_i > 0.0, m_i + gl.log(l_i), -float("inf"))
         lse = gl.convert_layout(lse, gl.SliceLayout(1, mfma_s))
         offs_h_lse = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s))
         lse_offsets = (
             token_idx.to(tl.int64) * stride_lse_t
             + offs_h_lse.to(tl.int64) * stride_lse_h
-            + split_idx.to(tl.int64) * stride_lse_s
         )
+        if SPLIT_KV:
+            lse_offsets += split_idx.to(tl.int64) * stride_lse_s
         gl.amd.cdna4.buffer_store(
             stored_value=lse,
             ptr=partial_lse,
@@ -1282,6 +1286,8 @@ def _dsa_sparse_prefill_fp8_kernel(
     do_not_specialize=(
         "stride_lse_t",
         "stride_lse_h",
+        "stride_lo_t",
+        "stride_lo_h",
         "num_kv_splits",
     )
 )
@@ -1289,6 +1295,7 @@ def _dsa_dense_mfma_reduce_kernel(
     partial_out,
     partial_lse,
     out,
+    lse_out,
     stride_po_t,
     stride_po_h,
     stride_po_s,
@@ -1297,9 +1304,12 @@ def _dsa_dense_mfma_reduce_kernel(
     stride_lse_s,
     stride_o_t,
     stride_o_h,
+    stride_lo_t,
+    stride_lo_h,
     num_kv_splits,
     D_V: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    STORE_LSE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -1340,6 +1350,11 @@ def _dsa_dense_mfma_reduce_kernel(
     safe_denom = tl.where(denom > 0.0, denom, 1.0)
     result = tl.where(denom > 0.0, acc / safe_denom, 0.0)
     tl.store(out + token_idx * stride_o_t + head_idx * stride_o_h + offs_v, result)
+    if STORE_LSE:
+        tl.store(
+            lse_out + token_idx * stride_lo_t + head_idx * stride_lo_h,
+            tl.where(denom > 0.0, safe_max_lse + tl.log(safe_denom), -float("inf")),
+        )
 
 
 @gluon.jit
@@ -1349,6 +1364,7 @@ def _dsa_dense_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    lse,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     kv_lora_rank: gl.constexpr,
@@ -1358,6 +1374,7 @@ def _dsa_dense_kv_kernel(
     softmax_scale: gl.constexpr,
     BLOCK_TOPK: gl.constexpr,
     BLOCK_V: gl.constexpr,
+    STORE_LSE: gl.constexpr,
 ):
     token = gl.program_id(0)
     head = gl.program_id(1)
@@ -1435,6 +1452,10 @@ def _dsa_dense_kv_kernel(
     result = gl.where(denom > 0.0, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     gl.store(out + out_base + v_offsets, result, mask=v_mask)
+    if STORE_LSE:
+        if v_block == 0:
+            row_lse = gl.where(denom > 0.0, max_score + gl.log(denom), -float("inf"))
+            gl.store(lse + token * num_heads + head, row_lse)
 
 
 @gluon.jit
@@ -1446,6 +1467,7 @@ def _dsa_packed_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    lse,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     kv_lora_rank: gl.constexpr,
@@ -1455,6 +1477,7 @@ def _dsa_packed_kv_kernel(
     softmax_scale: gl.constexpr,
     BLOCK_TOPK: gl.constexpr,
     BLOCK_V: gl.constexpr,
+    STORE_LSE: gl.constexpr,
 ):
     token = gl.program_id(0)
     head = gl.program_id(1)
@@ -1547,6 +1570,10 @@ def _dsa_packed_kv_kernel(
     result = gl.where(denom > 0.0, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     gl.store(out + out_base + v_offsets, result, mask=v_mask)
+    if STORE_LSE:
+        if v_block == 0:
+            row_lse = gl.where(denom > 0.0, max_score + gl.log(denom), -float("inf"))
+            gl.store(lse + token * num_heads + head, row_lse)
 
 
 def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
@@ -1731,6 +1758,7 @@ def _run_dense_kv(
     is_prefill: bool,
     out: torch.Tensor | None = None,
     warm_split_variants: bool = False,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is None:
         out = torch.empty(
@@ -1769,6 +1797,7 @@ def _run_dense_kv(
                 topk_lens[:1],
                 out[:1],
                 num_kv_splits=num_kv_splits,
+                lse=None if lse is None else lse[:1],
             )
     launch(
         q,
@@ -1777,6 +1806,7 @@ def _run_dense_kv(
         topk_lens,
         out,
         num_kv_splits=_select_num_kv_splits(num_tokens=q.shape[0], **schedule),
+        lse=lse,
     )
     return out
 
@@ -1804,6 +1834,7 @@ def _launch_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     is_prefill: bool,
+    lse: torch.Tensor | None = None,
 ) -> None:
     # Direct-to-shared copies preserve the source bits. Mixed inputs must
     # convert to the common BF16 compute format before their shared store.
@@ -1811,10 +1842,15 @@ def _launch_dense_kv(
     native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
     if num_kv_splits == 1:
         stage_out = out
-        partial_lse = out
         stride_o_t, stride_o_h = out.stride(0), out.stride(1)
         stride_o_s = 0
-        stride_lse_t = stride_lse_h = stride_lse_s = 0
+        if lse is None:
+            partial_lse = out
+            stride_lse_t = stride_lse_h = stride_lse_s = 0
+        else:
+            partial_lse = lse
+            stride_lse_t, stride_lse_h = lse.stride()
+            stride_lse_s = 0
     else:
         stage_out = torch.empty(
             (q.shape[0], q.shape[1], num_kv_splits, kv_lora_rank),
@@ -1867,6 +1903,7 @@ def _launch_dense_kv(
             D_ROPE=qk_rope_head_dim,
             NATIVE_E5M2=q.dtype == torch.float8_e5m2,
             SPLIT_KV=num_kv_splits > 1,
+            STORE_LSE=lse is not None and num_kv_splits == 1,
             num_warps=4,
             # Four CTAs per CU: their LDS fits, and 128 VGPRs hold the loop.
             waves_per_eu=4,
@@ -1884,6 +1921,7 @@ def _launch_dense_kv(
                 q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
             ),
             SPLIT_KV=num_kv_splits > 1,
+            STORE_LSE=lse is not None and num_kv_splits == 1,
             BLOCK_H=16,
             TILE_K=64 if qk_rope_head_dim == 0 else 32,
             num_warps=4,
@@ -1895,6 +1933,7 @@ def _launch_dense_kv(
             stage_out,
             partial_lse,
             out,
+            out if lse is None else lse,
             stage_out.stride(0),
             stage_out.stride(1),
             stage_out.stride(2),
@@ -1903,9 +1942,12 @@ def _launch_dense_kv(
             partial_lse.stride(2),
             out.stride(0),
             out.stride(1),
+            0 if lse is None else lse.stride(0),
+            0 if lse is None else lse.stride(1),
             num_kv_splits,
             D_V=kv_lora_rank,
             MAX_SPLITS=triton.next_power_of_2(num_kv_splits),
+            STORE_LSE=lse is not None,
             num_warps=4,
         )
 
@@ -1919,6 +1961,7 @@ def _run_dense_kv_scalar(
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
     out = torch.empty(
@@ -1932,6 +1975,7 @@ def _run_dense_kv_scalar(
         topk_slots,
         topk_lens,
         out,
+        out if lse is None else lse,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -1941,6 +1985,7 @@ def _run_dense_kv_scalar(
         float(softmax_scale),
         BLOCK_TOPK=32,
         BLOCK_V=64,
+        STORE_LSE=lse is not None,
         num_warps=4,
     )
     return out
@@ -1955,6 +2000,7 @@ def _run_packed_kv(
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     row_bytes = int(packed_kv.shape[1])
     out = torch.empty(
@@ -1970,6 +2016,7 @@ def _run_packed_kv(
         topk_slots,
         topk_lens,
         out,
+        out if lse is None else lse,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -1979,6 +2026,7 @@ def _run_packed_kv(
         float(softmax_scale),
         BLOCK_TOPK=32,
         BLOCK_V=64,
+        STORE_LSE=lse is not None,
         num_warps=4,
     )
     return out
@@ -2001,7 +2049,8 @@ def _run_dsa(
     max_seqlen_k: int,
     is_prefill: bool,
     warm_split_variants: bool,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     _check_inputs(
         q,
         topk_slots,
@@ -2044,6 +2093,13 @@ def _run_dsa(
         expected_numel = q.shape[0] * q.shape[1] * kv_lora_rank
         if out.numel() == expected_numel and out.dtype == _output_dtype(q):
             out_view = out.view(q.shape[0], q.shape[1], kv_lora_rank)
+    # Natural-log LSE of the scaled scores per (token, head); -inf for rows
+    # without a valid key, as the DCP partial merge expects.
+    lse = (
+        torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
     # The tiled kernel maps to dense BF16 or FP8 KV. TokenSpeed's packed sparse
     # FP8 rows use a different physical layout, so they use the packed sparse
     # implementation instead of the dense tiled implementation.
@@ -2056,6 +2112,7 @@ def _run_dsa(
             softmax_scale=softmax_scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            lse=lse,
         )
     elif kv_cache is not None:
         dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
@@ -2077,6 +2134,7 @@ def _run_dsa(
                 is_prefill=is_prefill,
                 out=out_view,
                 warm_split_variants=warm_split_variants,
+                lse=lse,
             )
         else:
             result = _run_dense_kv_scalar(
@@ -2087,14 +2145,15 @@ def _run_dsa(
                 softmax_scale=softmax_scale,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
+                lse=lse,
             )
     else:
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")
-    if out is None:
-        return result
-    if result is not out_view:
-        out.copy_(result.reshape_as(out))
-    return out
+    if out is not None:
+        if result is not out_view:
+            out.copy_(result.reshape_as(out))
+        result = out
+    return (result, lse) if return_lse else result
 
 
 def launch_gluon_dsa_decode_gfx950(
@@ -2115,10 +2174,10 @@ def launch_gluon_dsa_decode_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     warm_split_variants: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del q_len_per_req
-    if logit_cap != 0.0 or return_lse:
-        raise ValueError("Gluon DSA does not support logit_cap or return_lse")
+    if logit_cap != 0.0:
+        raise ValueError("Gluon DSA does not support logit_cap")
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -2135,6 +2194,7 @@ def launch_gluon_dsa_decode_gfx950(
         max_seqlen_k=max_seqlen_k,
         is_prefill=False,
         warm_split_variants=warm_split_variants,
+        return_lse=return_lse,
     )
 
 
@@ -2156,10 +2216,10 @@ def launch_gluon_dsa_prefill_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     warm_split_variants: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del q_len_per_req
-    if logit_cap != 0.0 or return_lse:
-        raise ValueError("Gluon DSA does not support logit_cap or return_lse")
+    if logit_cap != 0.0:
+        raise ValueError("Gluon DSA does not support logit_cap")
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -2176,4 +2236,5 @@ def launch_gluon_dsa_prefill_gfx950(
         max_seqlen_k=max_seqlen_k,
         is_prefill=True,
         warm_split_variants=warm_split_variants,
+        return_lse=return_lse,
     )
