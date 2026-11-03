@@ -48,19 +48,17 @@ wave; the caller runs ``on_expiry(launch, site, detail)`` otherwise, which
 must not return (:func:`fail_stop` is the local handler).
 """
 
-from tokenspeed_kernel_amd._scheduling import wave_uniform_i32
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
-    lane0_add_i64,
-    lane_mask,
-    lane_mask_differs_i64,
     memrealtime,
     release_drain,
+    scalar_add2_i64,
     scalar_load_glc,
     scalar_tags16_differ,
     trap,
     vote,
     wave_acquire,
+    wave_index,
     xcc_id,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
@@ -163,23 +161,21 @@ class Launch:
 @aggregate
 class Entry:
     """The launch entry between :func:`enter_issue` and :func:`enter_check`:
-    this workgroup's role and its two counters, still in flight."""
+    this workgroup's role and the addresses of this wave's two counters."""
 
     cta: gl.tensor
     xcd: gl.tensor
     slot: gl.tensor
-    epoch_old: gl.tensor
-    claim_old: gl.tensor
-    lane: gl.tensor
+    epoch_word: gl.tensor
+    claim_word: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, cta, xcd, slot, epoch_old, claim_old, lane):
+    def __init__(self, cta, xcd, slot, epoch_word, claim_word):
         self.cta = cta
         self.xcd = xcd
         self.slot = slot
-        self.epoch_old = epoch_old
-        self.claim_old = claim_old
-        self.lane = lane
+        self.epoch_word = epoch_word
+        self.claim_word = claim_word
 
 
 @gluon.jit
@@ -212,48 +208,45 @@ def _lanes():
 
 @gluon.jit
 def enter_issue(epoch_ptr, claim_ptr):
-    """Start the launch entry: lane 0 of wave 0 issues the two returning
-    counter increments (``epoch[pid]``, ``claim[xcd][slot]``, int64, device
-    scope). Call it first, then issue the role's first loads, then
-    :func:`enter_check`: the check then waits only for the counters
-    (``vmcnt(k)`` with k = the loads issued in between).
+    """Start the launch entry: this workgroup's role from the hardware XCD and
+    the program id, and its counters' addresses. No memory access: issue the
+    role's first loads after it, then call :func:`enter_check`.
 
     Args:
-        epoch_ptr: int64 words, one per program id at a 128 B stride
-            (``ENTRY_WORDS``).
-        claim_ptr: int64 words, one per ``(xcd, slot)`` at a 128 B stride.
-            Both are zeroed together once, when the state is created.
+        epoch_ptr: int64 words, one 128 B line per program id, a word per
+            wave in it (``ENTRY_WORDS``).
+        claim_ptr: int64 words, one 128 B line per ``(xcd, slot)``, a word
+            per wave in it. Both are zeroed together once, when the state is
+            created.
     """
     pid = gl.program_id(0)
     xcd = xcc_id()
     slot = pid // _XCDS
-    lane = _lanes()
-    one = gl.full([64 * gl.num_warps()], 1, gl.int64, lane.type.layout)
-    # Lane-indexed addresses (lane 0 -> the word); see lane0_add_i64.
-    epoch_old = lane0_add_i64(
-        (epoch_ptr + pid * _COUNTER_STRIDE + lane).to(gl.int64, bitcast=True), one, lane
-    )
-    claim_old = lane0_add_i64(
-        (claim_ptr + (xcd * _SLOTS + slot) * _COUNTER_STRIDE + lane).to(
-            gl.int64, bitcast=True
-        ),
-        one,
-        lane,
-    )
-    return Entry(slot * _XCDS + xcd, xcd, slot, epoch_old, claim_old, lane)
+    wave = wave_index()
+    epoch_word = epoch_ptr + pid * _COUNTER_STRIDE + wave
+    claim_word = claim_ptr + (xcd * _SLOTS + slot) * _COUNTER_STRIDE + wave
+    return Entry(slot * _XCDS + xcd, xcd, slot, epoch_word, claim_word)
 
 
 @gluon.jit
 def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry):
-    """Finish the launch entry; returns the workgroup's :class:`Launch`.
+    """Finish the launch entry; returns this wave's :class:`Launch`.
 
-    Every counter starts at 0 and gains exactly one increment per launch, so
-    at the start of launch L all of them hold L - 1. A second workgroup on a
-    role reads ``claim = L`` against ``epoch = L - 1`` and stops with
-    ``SITE_CLAIM``; a missing role implies a duplicate (256 workgroups, 256
-    roles). The compare and the stop run in wave 0 before the barrier of the
-    epoch broadcast, which holds the other waves, so no wave stores, pushes
-    or runs an atomic before the check.
+    Each wave adds 1 to its own two counters, ``epoch[pid][wave]`` and
+    ``claim[xcd][slot][wave]``, with returning scalar atomics, and waits for
+    them with ``lgkmcnt`` only: loads the role issued before (weights, KV)
+    stay in flight. Every counter starts at 0 and gains exactly one
+    increment per launch, so at the start of launch L all of them hold
+    L - 1. A wave of a second workgroup on a role reads ``claim = L``
+    against ``epoch = L - 1`` and stops with ``SITE_CLAIM`` (a missing role
+    implies a duplicate: 256 workgroups, 256 roles). Each wave checks
+    itself, so no wave stores, pushes or runs an atomic before its check,
+    and no barrier is needed. Every wave of every workgroup holds the same
+    epoch.
+
+    The claim words are always touched from their own XCD; an epoch word
+    follows its program id to whichever XCD runs it, so its coherence across
+    launches rests on the kernel boundary.
 
     Args:
         entry: From :func:`enter_issue`.
@@ -263,36 +256,16 @@ def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry):
         label: int32 recorded with a failure, such as the layer index.
         on_expiry: ``on_expiry(launch, site, detail)``; must not return.
     """
-    first = entry.lane == 0
-    # Only lane 0 of wave 0 holds the counters; other lanes' values are
-    # undefined, so the compare is masked to that lane.
-    duplicate = (
-        lane_mask_differs_i64(entry.epoch_old, entry.claim_old)
-        & lane_mask(first.to(gl.int32))
-    ) != 0
-    abort_ptr = error_ptr + _ERROR_ABORT
-    if duplicate:
-        # Before the broadcast barrier, which the other waves wait at: they
-        # cannot pass it before the queue stops. The epoch is not known
-        # across lanes yet; the record carries 0.
-        zero = gl.to_tensor(0)
-        unknown = Launch(
-            entry.cta, entry.xcd, entry.slot, zero.to(gl.int64), zero, zero,
-            gl.to_tensor(label), error_ptr, abort_ptr, deadline_ticks, arena_ptr,
-        )  # fmt: skip
-        on_expiry(unknown, _SITE_CLAIM, entry.slot)
-    # The epoch reaches every wave through LDS and one barrier. A value out
-    # of a cross-wave reduction stays in a VGPR; readfirstlane makes it a
-    # scalar, so loops and compares on the tag stay uniform branches.
-    epoch = gl.max(gl.where(first, entry.epoch_old + 1, 0), 0)
-    low = wave_uniform_i32((epoch & 0xFFFFFFFF).to(gl.int32))
-    high = wave_uniform_i32((epoch >> 32).to(gl.int32))
-    epoch = (high.to(gl.int64) << 32) | (low.to(gl.int64) & 0xFFFFFFFF)
+    epoch_old, claim_old = scalar_add2_i64(entry.epoch_word, entry.claim_word)
+    epoch = epoch_old + 1
     tag = launch_tag(epoch, 32).to(gl.int32)
     launch = Launch(
         entry.cta, entry.xcd, entry.slot, epoch, tag, (epoch & 1).to(gl.int32),
-        gl.to_tensor(label), error_ptr, abort_ptr, deadline_ticks, arena_ptr,
+        gl.to_tensor(label), error_ptr, error_ptr + _ERROR_ABORT, deadline_ticks,
+        arena_ptr,
     )  # fmt: skip
+    if epoch_old != claim_old:
+        on_expiry(launch, _SITE_CLAIM, entry.slot)
     return launch
 
 

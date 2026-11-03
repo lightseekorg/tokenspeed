@@ -25,10 +25,10 @@ CDNA4 scales into route order instead of quantizing the BF16 input again.
 Route-tiled GEMMs group each expert's routes into small tiles and preserve
 token/slot order for intermediates and outputs, so each expert's weights are
 read once however many tokens route to it. Matrix dimensions, top-k and expert
-counts are explicit kernel parameters. Up to 16 rows each GEMM program groups
-the routes itself from the top-k IDs (an expert then has at most 16 routes, one
-tile) and stage 1 writes the route map, so no separate launch builds
-descriptors. Above that each expert packs its routes into a fixed-length list
+counts are explicit kernel parameters. Up to 16 rows each stage 1 program
+groups the routes itself from the top-k IDs (an expert then has at most 16
+routes, one tile); stage 1 writes the route map and the grouping as
+descriptors, which stage 2 reads, so no separate launch builds them. Above that each expert packs its routes into a fixed-length list
 whose length is a power-of-two capacity no smaller than the row count (a
 token's top-k expert IDs are distinct, so an expert gets at most one route per
 row), and a second kernel splits the lists into `(start, count, expert)`

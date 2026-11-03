@@ -94,8 +94,8 @@ through memory instead of kernel boundaries.
   (`gl.atomic_poll`, no barrier in its loop); its closing workgroup barrier
   orders the loads after it. It checks the deadline and the abort word every
   50 us of polling.
-- `wave.py` holds the per-wave facts Gluon cannot state (inline asm, each in
-  the compiler TODO): per-wave SGPR values, an opaque index that keeps LDS
+- `wave.py` holds the per-wave facts Gluon cannot state yet (inline asm):
+  per-wave SGPR values, an opaque index that keeps LDS
   reads in a loop, a value ordered after a load (to publish after the wave's
   stores retire), and an LDS exchange among the waves of a workgroup without
   a barrier (its spin has no deadline: only same-workgroup waves that never
@@ -335,6 +335,17 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   most `WINDOW` tiles in flight per wave (counted `vmcnt` waits), so a weight
   stream overlapping a latency-bound chain stays below the fabric's knee;
   `gemv_a16w16_splitk_finish_x_gfx950` finishes on a caller-built x.
+- K-step forms for a caller that builds x itself (a deferred norm), so one
+  32-deep step of x and its inputs is live instead of the whole K range:
+  `gemv_a16w16_splitk_weight_steps_gfx950` returns `tiles[t][s]` (the same
+  loads and pacing); `gemv_a16w16_splitk_wave_sums_steps_gfx950`,
+  `gemv_a16w16_splitk_hi_lo_sums_steps_gfx950` and
+  `gemv_a16w16_splitk_finish_steps_gfx950` call an `X_STEP(args, s)` per
+  step and run each tile's MFMAs in K order (hi/lo: all `hi xh`, then
+  `lo xh`, then `hi xl`), bitwise the full-x forms. Inputs can wait in LDS:
+  `gemv_a16w16_splitk_k_vector_to_shared_gfx950` copies a per-K vector's
+  task slice LDS-direct, and `..._k_vector_step_gfx950` /
+  `..._b_step_gfx950` read one step back in the B operand layout.
 
 #### Algorithm
 
@@ -433,6 +444,35 @@ constexprs alone.
   uses eight waves instead of four.
 - Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
   register copy of a pending load waits for the load and serializes the chunks.
+
+### gfx950 weight-only FP8 decode GEMV
+
+`gluon_gemv_a16w8_gfx950` (`gemm/fp16/gemv.py`) computes
+`(x @ w.T) * s` with E4M3 weights and one FP32 scale per weight row.
+
+#### Contract
+
+- `x` is `[M, K]` BF16 or FP16 with unit inner stride and `1 <= M <= 128`;
+  `w` a contiguous `[N, K]` `float8_e4m3fn` matrix with `K` a multiple of 16
+  and at least 64; `s` a contiguous FP32 `[N]`; `out` `[M, N]` in `x`'s dtype
+  with unit inner stride.
+- Each E4M3 value upcasts exactly to `x`'s dtype, products sum in FP32, the
+  row scale multiplies the sum once, and the output rounds once.
+- `gemm.mv_fp8_weight` selects it up to 32 rows, where it measured 1.1-1.5x
+  faster than the BF16 GEMVs on 8192-hidden MLP, output-projection and
+  LM-head shards (MI355X, cold weights); larger calls run as 32-row chunks.
+- One binary per (shape, row bucket 16 / 32 / 64 / 128); `M` is a runtime
+  argument, and a row's bits do not depend on the other rows of its bucket.
+
+#### Algorithm
+
+The dense GEMV's MFMA tile with 16-byte weight loads of 16 E4M3 values. The
+tile's `BLOCK_M` covers every row, so each weight byte is read once; the K
+step shrinks with `BLOCK_M` to keep the activation tile within 32 VGPRs a
+buffer. At most 32 outputs per program, so wide outputs (a vocabulary shard)
+launch several programs per CU. Weights pass through LDS in E4M3 and upcast
+(`v_cvt_scalef32_pk_bf16_fp8`) in the MFMA operand layout. An LDS ring for
+the weight stream (two to eight stages) measured slower at every shape.
 
 ### gfx950 MXFP8 projection
 

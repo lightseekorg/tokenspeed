@@ -42,8 +42,11 @@ from native_body_helpers import (  # noqa: E402
     full_records_kernel,
     head_task_kernel,
     kpart_pooler_kernel,
+    kpart_pooler_steps_kernel,
     kpart_router_kernel,
+    kpart_router_steps_kernel,
     qkv_task_kernel,
+    qkv_task_steps_kernel,
     sender_kernel,
     sender_sums_kernel,
     split_records_kernel,
@@ -191,8 +194,21 @@ def test_sender_sums_waves_with_wide_lds_reads():
             dict(OUTPUTS=512, ROWS=64),
             224,
         ),
+        # x built one K step at a time: one step of x and its inputs live.
+        (
+            kpart_router_steps_kernel,
+            {"hi_ptr": "*bf16", "lo_ptr": "*bf16"},
+            dict(EXPERTS=256),
+            112,
+        ),
+        (
+            kpart_pooler_steps_kernel,
+            {"w_ptr": "*bf16"},
+            dict(OUTPUTS=512, ROWS=64),
+            144,
+        ),
     ],
-    ids=["router", "pooler"],
+    ids=["router", "pooler", "router-steps", "pooler-steps"],
 )
 def test_kpart_consumers_fit_their_register_budget(
     kernel, extra, constexprs, max_vgprs
@@ -245,14 +261,20 @@ def test_topk_keys_stay_in_one_wave():
     assert _metadata(assembly, "private_segment_fixed_size") == 0
 
 
+@pytest.mark.parametrize(
+    "kernel,max_vgprs",
+    [(qkv_task_kernel, 204), (qkv_task_steps_kernel, 136)],
+    ids=["full-x", "x-steps"],
+)
 @pytest.mark.parametrize("window", [3, 9], ids=["paced", "all-at-once"])
-def test_qkv_task_paces_its_weights_and_fits(window: int):
+def test_qkv_task_paces_its_weights_and_fits(window: int, kernel, max_vgprs: int):
     """The QKV task (144 rows x K/16, x built from the FFN boundary's
     deferred norm) keeps at most ``window`` weight tiles in flight with
     counted waits, never draining its stream while issuing, and fits the
-    budget with no scratch: the one-task-per-workgroup form (204 VGPRs)."""
+    budget with no scratch: the one-task-per-workgroup form (204 VGPRs),
+    less with x built one K step at a time."""
     assembly = compile_gfx950(
-        qkv_task_kernel,
+        kernel,
         {
             "b_ptr": "*bf16",
             "sums_ptr": "*fp32",
@@ -273,7 +295,7 @@ def test_qkv_task_paces_its_weights_and_fits(window: int):
         **persistent_compile_options(),
     ).asm["amdgcn"]
     assert _metadata(assembly, "private_segment_fixed_size") == 0
-    assert _metadata(assembly, "vgpr_count") <= 204
+    assert _metadata(assembly, "vgpr_count") <= max_vgprs
     code = instruction_lines(assembly)
     weights = [
         i

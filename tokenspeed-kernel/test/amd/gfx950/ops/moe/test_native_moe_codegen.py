@@ -207,29 +207,25 @@ def test_item_loops_keep_the_ring(fields):
         assert barriers == 0, f"{mfma}-MFMA loop holds a workgroup barrier"
         assert drains == 0, f"{mfma}-MFMA loop drains vmcnt"
         assert min(n for n, before in waits if n < before) >= floor, (mfma, waits)
-        chunks = [
+        # Read-once streams (weight chunks, lane-major scales) are
+        # nontemporal: every dwordx4 load in an item loop except the
+        # device-scope mids reads of the down units.
+        wide = [
             s
             for s, _ in ins[start:end]
-            if s.startswith("buffer_load_dwordx4") and s.endswith(" nt")
+            if s.startswith("buffer_load_dwordx4") and not s.endswith(" sc1")
         ]
-        assert (
-            len(chunks) == mfma
-        ), f"{mfma}-MFMA loop issues {len(chunks)} weight chunks"
+        assert all(s.endswith(" nt") for s in wide), wide
+        lane_scales = 2 if mfma == 32 and fields["SCALE_LANES"] else 0
+        assert len(wide) == mfma + lane_scales, len(wide)
         if mfma == 32:
-            # S-MOE2: each wave's group tag follows a wait covering its mids stores.
+            # Each wave's group tag follows a wait covering its mids stores.
             assert tags and all(tags), tags
             # Gate/up scales: two lane-major dwordx4 per strip, or one
             # swizzled dword per two steps.
             body = [s for s, _ in ins[start:end]]
-            if fields["SCALE_LANES"]:
-                scales = [
-                    s
-                    for s in body
-                    if s.startswith("buffer_load_dwordx4") and not s.endswith(" nt")
-                ]
-                assert len(scales) == 2, scales
-            else:
-                assert sum(s.startswith("buffer_load_dword ") for s in body) == 16
+            dwords = sum(s.startswith("buffer_load_dword ") for s in body)
+            assert dwords == (0 if fields["SCALE_LANES"] else 16), dwords
 
 
 def test_down_loop_sink_stays_in_the_wave():

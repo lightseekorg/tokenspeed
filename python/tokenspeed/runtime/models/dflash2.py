@@ -37,8 +37,15 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.layers.dense.fp8_weight_only import quantize_fp8_weight_rows
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.logits_processor import (
+    should_apply_lm_head_quant_method,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.fp8_weight_only import (
+    Fp8WeightOnlyConfig,
+)
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import absorb_mla_kv_b_proj
 from tokenspeed.runtime.models.dflash import (
@@ -450,6 +457,10 @@ class DFlash2DraftModel(DFlashDraftModel):
             prefix=prefix,
         )
         dtype = self.fc.weight.dtype
+        self.quant_config = quant_config
+        # The target head shard's weight-only FP8 copy (weight, scale) for the
+        # candidate GEMM, made in configure_target under fp8_weight_only.
+        self.fp8_head: tuple[torch.Tensor, torch.Tensor] | None = None
         self.input_embedding_scale = float(
             _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
@@ -463,6 +474,30 @@ class DFlash2DraftModel(DFlashDraftModel):
             top_k=int(_dflash2_config_value(config, "selector_top_k")),
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
+        )
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the capture inputs, and the FP8 head copy if quantized.
+
+        Under ``fp8_weight_only`` the draft's candidate GEMM reads an FP8
+        copy of the target's (16-bit) head shard: the head is the largest
+        weight a draft step streams. It is made here, before the KV-cache
+        budget is profiled, so the copy's memory is counted.
+        """
+        super().configure_target(target_model, target_config)
+        if not isinstance(self.quant_config, Fp8WeightOnlyConfig):
+            return
+        head = target_model.lm_head
+        shard = head.shard_indices
+        if head.weight.dtype not in (torch.bfloat16, torch.float16) or (
+            should_apply_lm_head_quant_method(head, head.quant_method)
+        ):
+            raise ValueError(
+                "fp8_weight_only drafting needs the target's 16-bit LM head, "
+                f"got {head.weight.dtype} with {type(head.quant_method).__name__}"
+            )
+        self.fp8_head = quantize_fp8_weight_rows(
+            head.weight[: int(shard.num_org_elements)]
         )
 
     def final_norm(

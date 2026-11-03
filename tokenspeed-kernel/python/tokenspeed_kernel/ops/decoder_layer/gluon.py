@@ -75,11 +75,19 @@ class GluonDecoderLayerMuseSparkGfx950:
 
     def __init__(self, *, plan_keys, weights, state) -> None:
         from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.prepared import (
+            DEADLINE_TICKS,
+            DEFAULT_PLAN_FIELDS,
             MuseSparkFusedDecoderLayer,
         )
 
+        # Serving: the default plan fields, no stamps, the serving deadline.
         self.layer = MuseSparkFusedDecoderLayer(
-            plan_keys=plan_keys, weights=weights, state=state
+            plan_keys=plan_keys,
+            weights=weights,
+            state=state,
+            plan_fields=DEFAULT_PLAN_FIELDS,
+            stamps=False,
+            deadline_ticks=DEADLINE_TICKS,
         )
 
     def decline_reasons(self, requests: int) -> list[str]:

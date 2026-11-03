@@ -47,14 +47,22 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.prologue.gqa import (
     gqa_prologue_value_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
+    gemv_a16w16_splitk_b_step_gfx950,
+    gemv_a16w16_splitk_finish_steps_gfx950,
     gemv_a16w16_splitk_finish_x_gfx950,
     gemv_a16w16_splitk_hi_lo_sums_gfx950,
+    gemv_a16w16_splitk_hi_lo_sums_steps_gfx950,
+    gemv_a16w16_splitk_k_vector_step_gfx950,
+    gemv_a16w16_splitk_k_vector_to_shared_gfx950,
     gemv_a16w16_splitk_publish_gfx950,
     gemv_a16w16_splitk_sum_gfx950,
     gemv_a16w16_splitk_wave_sums_gfx950,
+    gemv_a16w16_splitk_wave_sums_steps_gfx950,
+    gemv_a16w16_splitk_weight_steps_gfx950,
     gemv_a16w16_splitk_weights_gfx950,
     gemv_a16w16_splitk_weights_paced_gfx950,
     gemv_a16w16_splitk_x_gfx950,
+    gemv_a16w16_splitk_x_steps_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     mm_a16w16_column_relay_gfx950,
@@ -528,6 +536,181 @@ def kpart_pooler_kernel(
 
 
 @gluon.jit
+def _kpart_stage(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    task,
+    M,
+    WIDTH: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """:func:`_kpart_x`'s operands for a build one K step at a time: the norm
+    vectors and ``b`` in LDS, ``h`` as per-step registers, the scales.
+    Returns the state :func:`_kpart_x_step` takes."""
+    WAVES: gl.constexpr = gl.num_warps()
+    KW: gl.constexpr = WIDTH // PARTS // WAVES
+    flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    alpha_s = gl.allocate_shared_memory(gl.float32, [WAVES, KW], flat)
+    beta_s = gl.allocate_shared_memory(gl.float32, [WAVES, KW], flat)
+    post_s = gl.allocate_shared_memory(post_ptr.dtype.element_ty, [WAVES, KW], flat)
+    pre_s = gl.allocate_shared_memory(pre_ptr.dtype.element_ty, [WAVES, KW], flat)
+    # The vectors do not depend on the polls: copy them first.
+    gemv_a16w16_splitk_k_vector_to_shared_gfx950(
+        alpha_s, alpha_ptr, task, WIDTH, PARTS, GROUPS
+    )
+    gemv_a16w16_splitk_k_vector_to_shared_gfx950(
+        beta_s, beta_ptr, task, WIDTH, PARTS, GROUPS
+    )
+    gemv_a16w16_splitk_k_vector_to_shared_gfx950(
+        post_s, post_ptr, task, WIDTH, PARTS, GROUPS
+    )
+    gemv_a16w16_splitk_k_vector_to_shared_gfx950(
+        pre_s, pre_ptr, task, WIDTH, PARTS, GROUPS
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+    sums_l: gl.constexpr = gl.BlockedLayout(
+        [16 // WAVES, 1, 4], [1, 64, 1], [WAVES, 1, 1], [2, 1, 0]
+    )
+    t = gl.arange(0, 16, gl.SliceLayout(1, gl.SliceLayout(2, sums_l)))
+    p = gl.arange(0, PRODUCERS, gl.SliceLayout(0, gl.SliceLayout(2, sums_l)))
+    w = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(1, sums_l)))
+    t = gl.minimum(t, M - 1)
+    sums = gl.amd.cdna4.buffer_load(
+        sums_ptr,
+        (t[:, None, None] * PRODUCERS + p[None, :, None]) * 4 + w[None, None, :],
+    )
+    inv1, inv2 = deferred_norm_scales_gfx950(sums, WIDTH, POST_EPS, PRE_EPS)
+    b = gemv_a16w16_splitk_x_gfx950(b_ptr, WIDTH, task, M, WIDTH, PARTS, GROUPS, "")
+    b_s = gl.allocate_shared_memory(
+        b.dtype, [WAVES, KW, 16], gl.SwizzledSharedLayout(1, 1, 1, [1, 2, 0])
+    )
+    b_s.store(b)
+    h = gemv_a16w16_splitk_x_steps_gfx950(
+        h_ptr, WIDTH, task, M, WIDTH, PARTS, GROUPS, ""
+    )
+    token_l: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, h[0].type.layout))
+    inv1 = gl.convert_layout(inv1, token_l)[None, None, :]
+    inv2 = gl.convert_layout(inv2, token_l)[None, None, :]
+    gl.amd.cdna4.async_copy.wait_group(0)
+    gl.barrier()
+    return b_s, h, alpha_s, beta_s, post_s, pre_s, inv1, inv2
+
+
+@gluon.jit
+def _kpart_x_step(state, step):
+    """K step ``step`` of :func:`_kpart_x`'s x (FP32 ``[waves, 32, 16]``)."""
+    b_s, h, alpha_s, beta_s, post_s, pre_s, inv1, inv2 = state
+    _, x = deferred_norm_rows_gfx950(
+        gemv_a16w16_splitk_b_step_gfx950(b_s, step),
+        h[step],
+        gemv_a16w16_splitk_k_vector_step_gfx950(alpha_s, step),
+        gemv_a16w16_splitk_k_vector_step_gfx950(beta_s, step),
+        gemv_a16w16_splitk_k_vector_step_gfx950(post_s, step),
+        gemv_a16w16_splitk_k_vector_step_gfx950(pre_s, step),
+        inv1,
+        inv2,
+    )
+    return x
+
+
+@gluon.jit
+def _kpart_x_step_bf16(state, step):
+    return _kpart_x_step(state, step).to(gl.bfloat16)
+
+
+@gluon.jit
+def kpart_router_steps_kernel(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    hi_ptr,
+    lo_ptr,
+    part_ptr,
+    tag,
+    M,
+    WIDTH: gl.constexpr,
+    EXPERTS: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    PARTS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """:func:`kpart_router_kernel` with x built one K step at a time."""
+    task = gl.program_id(0)
+    GROUPS: gl.constexpr = EXPERTS // 16
+    hi = gemv_a16w16_splitk_weight_steps_gfx950(
+        hi_ptr, task, WIDTH, 16, PARTS, GROUPS, 1
+    )
+    lo = gemv_a16w16_splitk_weight_steps_gfx950(
+        lo_ptr, task, WIDTH, 16, PARTS, GROUPS, 1
+    )
+    state = _kpart_stage(
+        b_ptr, sums_ptr, h_ptr, alpha_ptr, beta_ptr, post_ptr, pre_ptr, task, M,
+        WIDTH, PRODUCERS, PARTS, GROUPS, POST_EPS, PRE_EPS,
+    )  # fmt: skip
+    layout: gl.constexpr = sums_layout(gl.num_warps(), 16, 2)
+    logits = gemv_a16w16_splitk_hi_lo_sums_steps_gfx950(
+        hi, lo, _kpart_x_step, state, layout
+    )
+    gemv_a16w16_splitk_publish_gfx950(
+        logits, part_ptr, tag, (task % GROUPS) * 16, task // GROUPS, M, EXPERTS, ".wt"
+    )
+
+
+@gluon.jit
+def kpart_pooler_steps_kernel(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    w_ptr,
+    part_ptr,
+    tag,
+    M,
+    WIDTH: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    ROWS: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    PARTS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """:func:`kpart_pooler_kernel` with x built one K step at a time."""
+    task = gl.program_id(0)
+    GROUPS: gl.constexpr = OUTPUTS // ROWS
+    tiles = gemv_a16w16_splitk_weight_steps_gfx950(
+        w_ptr, task, WIDTH, ROWS, PARTS, GROUPS, ROWS // 16
+    )
+    state = _kpart_stage(
+        b_ptr, sums_ptr, h_ptr, alpha_ptr, beta_ptr, post_ptr, pre_ptr, task, M,
+        WIDTH, PRODUCERS, PARTS, GROUPS, POST_EPS, PRE_EPS,
+    )  # fmt: skip
+    layout: gl.constexpr = sums_layout(gl.num_warps(), ROWS, 2)
+    pooled = gemv_a16w16_splitk_wave_sums_steps_gfx950(
+        tiles, _kpart_x_step_bf16, state, layout
+    )
+    gemv_a16w16_splitk_publish_gfx950(
+        pooled, part_ptr, tag, (task % GROUPS) * ROWS, task // GROUPS, M, OUTPUTS, ".wt"
+    )
+
+
+@gluon.jit
 def topk_keys_kernel(
     logits_ptr,
     bias_ptr,
@@ -595,6 +778,41 @@ def qkv_task_kernel(
     )  # fmt: skip
     gemv_a16w16_splitk_finish_x_gfx950(
         tiles, x.to(gl.bfloat16), part_ptr, tag, task, M, N, ROWS, 16, ".wt"
+    )
+
+
+@gluon.jit
+def qkv_task_steps_kernel(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    w_ptr,
+    part_ptr,
+    tag,
+    M,
+    WIDTH: gl.constexpr,
+    N: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    WINDOW: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """:func:`qkv_task_kernel` with x built one K step at a time."""
+    task = gl.program_id(0)
+    ROWS: gl.constexpr = N // 16
+    tiles = gemv_a16w16_splitk_weight_steps_gfx950(
+        w_ptr, task, WIDTH, ROWS, 16, 16, WINDOW
+    )
+    state = _kpart_stage(
+        b_ptr, sums_ptr, h_ptr, alpha_ptr, beta_ptr, post_ptr, pre_ptr, task, M,
+        WIDTH, PRODUCERS, 16, 16, POST_EPS, PRE_EPS,
+    )  # fmt: skip
+    gemv_a16w16_splitk_finish_steps_gfx950(
+        tiles, _kpart_x_step_bf16, state, part_ptr, tag, task, M, N, ROWS, 16, ".wt"
     )
 
 

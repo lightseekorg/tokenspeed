@@ -281,9 +281,9 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
 
     - Nothing invalidates or writes back L2.
     - With ``entry`` (a kernel that runs the launch entry): the two
-      returning counter increments are its first atomics, nothing is stored
-      before the claim compare, and the compare waits only for the counters,
-      not for the role's loads issued after them.
+      counters are returning scalar atomics waited for with lgkmcnt, no
+      store or vector atomic precedes them, and no vmcnt wait precedes them
+      (the role's loads issued before the entry stay in flight).
     - A store to the address of an earlier global load with a scalar base
       (a per-workgroup word such as the epoch) follows a full drain and a
       workgroup barrier after that load.
@@ -311,42 +311,25 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
         if re.search(r"\b(global|buffer)_(store|atomic)\w*", line)
     ]
     if entry:
-        # Entry v2: the two returning counter increments come first, the
-        # role's first loads after them, and the claim compare waits only for
-        # the counters (vmcnt(k), k = loads issued after them).
-        counters = [i for i in writes if "global_atomic_add_x2" in lines[i]][:2]
-        if len(counters) != 2 or any(i < counters[0] for i in writes):
-            problems.append("the entry counters are not the first atomics")
+        # The entry: two returning scalar atomics (the counters) with an
+        # lgkmcnt wait, before any vector store or atomic; no vmcnt wait
+        # from the kernel start to the counters, so loads issued before the
+        # entry stay in flight through it.
+        counters = [
+            i
+            for i, line in enumerate(lines)
+            if re.match(r"\s*s_atomic_add_x2 s\[\d+:\d+\], s\[\d+:\d+\], 0x0 glc", line)
+        ]
+        if len(counters) != 2:
+            problems.append("the entry counters are not two returning scalar atomics")
         else:
-            loads = [
-                i
-                for i in range(counters[1], len(lines))
-                if re.match(r"\s*(buffer|global)_load", lines[i])
-            ]
-            check = next(
-                (
-                    i
-                    for i in range(counters[1], len(lines))
-                    if "v_cmp_ne_u64_e64" in lines[i]
-                ),
-                None,
-            )
-            if check is None:
-                problems.append("no claim compare after the entry counters")
-            else:
-                if any(counters[0] < i < check and i not in counters for i in writes):
-                    problems.append("a store or atomic precedes the claim compare")
-                issued = sum(1 for i in loads if i < check)
-                waits = [
-                    int(m[1])
-                    for line in lines[counters[1] : check]
-                    if (m := re.search(r"s_waitcnt vmcnt\((\d+)\)", line))
-                ]
-                if not waits or min(waits) < issued:
-                    problems.append(
-                        f"the claim waits for the role's loads: vmcnt {waits}, "
-                        f"{issued} loads issued after the counters"
-                    )
+            if any(i < counters[1] for i in writes):
+                problems.append("a store or atomic precedes the entry counters")
+            if any("vmcnt" in line for line in lines[: counters[1]]):
+                problems.append("a vmcnt wait precedes the entry counters")
+            after = "\n".join(lines[counters[1] : counters[1] + 3])
+            if "s_waitcnt lgkmcnt(0)" not in after:
+                problems.append("the entry does not wait for its counters")
     problems += _unordered_read_then_write(lines)
     for position, index in enumerate(writes):
         if re.search(r"global_atomic_add\s", lines[index]) and " sc0" in lines[index]:

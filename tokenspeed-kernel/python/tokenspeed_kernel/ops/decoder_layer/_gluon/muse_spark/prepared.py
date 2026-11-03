@@ -47,18 +47,19 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
 from tokenspeed_kernel.ops.decoder_layer import PlanKey
 from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (
     ATT_BLOCK_M,
-    DIVISIBLE_ARGS,
     EXCHANGE_WORDS,
     FULL_PROGRAMS,
     HIDDEN,
     KV_HEADS,
     NUM_WARPS,
+    PART_ROWS,
     POOLED,
     POOLED_LOCAL,
     Q_HEADS,
     Q_WIDTH,
     QKV_PARTS,
     QKV_WIDTH,
+    RECORD_WORDS,
     SLIDING_SPLITS,
     STAMP_STRIDE,
     WORLD_SIZE,
@@ -67,11 +68,12 @@ from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (
     ModelConstants,
     gluon_decoder_layer_muse_spark_gfx950,
     kernel_constexprs,
+    offline_attrs,
     offline_signature,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
     INTER,
-    TAG_WORDS_PER_EXPERT,
+    TAG_WORDS,
     native_moe_weights,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
@@ -90,8 +92,10 @@ _LDS_RESERVE_BYTES = 96 * 1024
 _CU_LDS_BYTES = 160 * 1024
 # Registers per lane of a wave when 8 waves share a CU (2 per SIMD).
 _MAX_VGPRS = 256
-# Clock ticks (10 ns) a wait may last before the launch fail-stops: 2 s.
-_DEADLINE_TICKS = 200_000_000
+# Clock ticks (10 ns) a wait may last before the launch fail-stops: 60 s,
+# so a rank stalled between launches (a first compile, a host pause) is not
+# taken for a failure.
+DEADLINE_TICKS = 6_000_000_000
 # Plan fields of the default variant (benchmarks sweep them one at a time).
 DEFAULT_PLAN_FIELDS = dict(
     ring=8,
@@ -165,31 +169,42 @@ class MuseSparkDecoderLayerState:
         # splits, head dim] and a full layer's balanced items [items,
         # BLOCK_M rows, head dim].
         partial_rows = max(rows * Q_HEADS * SLIDING_SPLITS, FULL_PROGRAMS * ATT_BLOCK_M)
+        # Two copies by launch parity (each launch zeroes the other).
         self.att_records = torch.zeros(
-            max(max_requests * KV_HEADS * SLIDING_SPLITS, FULL_PROGRAMS) * NUM_WARPS,
-            dtype=torch.int32,
-            device=device,
+            2 * RECORD_WORDS, dtype=torch.int32, device=device
         )
         self.mid_o = torch.empty((partial_rows, 64), dtype=torch.float32, device=device)
         self.mid_lse = torch.empty(partial_rows, dtype=torch.float32, device=device)
-        # Tagged K-part partials (tag high): router, pooler, QKV.
+        # Tagged K-part partials (tag high): router, pooler, QKV; every
+        # launch rewrites all PART_ROWS token slots of each part.
         self.logits_parts = torch.zeros(
-            (8, rows, 256), dtype=torch.int64, device=device
+            (8, PART_ROWS, 256), dtype=torch.int64, device=device
         )
         self.pooled_parts = torch.zeros(
-            (8, rows, POOLED_LOCAL), dtype=torch.int64, device=device
+            (8, PART_ROWS, POOLED_LOCAL), dtype=torch.int64, device=device
         )
         self.qkv_parts = torch.zeros(
-            (QKV_PARTS, rows, QKV_WIDTH), dtype=torch.int64, device=device
+            (QKV_PARTS, PART_ROWS, QKV_WIDTH), dtype=torch.int64, device=device
         )
+        # Typed stand-ins for operands a variant does not read.
+        self.dummies = {
+            name: torch.zeros(64, dtype=dtype, device=device)
+            for name, dtype in (
+                ("bf16", torch.bfloat16),
+                ("fp8", torch.float8_e4m3fn),
+                ("fp32", torch.float32),
+                ("i64", torch.int64),
+            )
+        }
         routes = rows * 8
         self.mids = torch.zeros(routes * INTER // 2, dtype=torch.uint8, device=device)
         self.mids_scale = torch.zeros(
             routes * INTER // 32 // 4, dtype=torch.int32, device=device
         )
-        self.moe_tags = torch.zeros(
-            routes * TAG_WORDS_PER_EXPERT, dtype=torch.int32, device=device
-        )
+        # The MoE's readiness tags: written on one XCD, polled with scalar
+        # loads on any other, so uncached (scalar polls of cached device
+        # memory are only good for words written on the same XCD).
+        self.moe_tags = UncachedBuffer(TAG_WORDS, torch.int32, device)
         self.s_rows = torch.zeros(
             (MAX_ROWS, POOLED), dtype=torch.bfloat16, device=device
         )
@@ -260,15 +275,7 @@ def _compile_problems(constexpr_items: tuple) -> tuple[str, ...]:
     constexprs = dict(constexpr_items)
     fn = gluon_decoder_layer_muse_spark_gfx950
     signature = offline_signature(constexprs)
-    attrs = {}
-    for index, name in enumerate(fn.arg_names):
-        kind = signature.get(name)
-        if isinstance(kind, tuple):
-            attrs.update(
-                {(index, p): [["tt.divisibility", 16]] for p in range(len(kind))}
-            )
-        elif (isinstance(kind, str) and kind.startswith("*")) or name in DIVISIBLE_ARGS:
-            attrs[(index,)] = [["tt.divisibility", 16]]
+    attrs = offline_attrs(signature)
     full = {n: signature[n] for n in fn.arg_names if n in signature}
     full.update({n: "constexpr" for n in constexprs})
     compiled = triton.compile(
@@ -322,42 +329,21 @@ class MuseSparkFusedDecoderLayer:
         state: The group's :class:`MuseSparkDecoderLayerState`.
     """
 
-    prepare_state = staticmethod(MuseSparkDecoderLayerState)
-    heap_bytes = staticmethod(MuseSparkDecoderLayerState.heap_bytes)
-
-    def __init__(self, *, plan_keys, weights: dict, state: MuseSparkDecoderLayerState):
-        self._setup(
-            plan_keys, weights, state, DEFAULT_PLAN_FIELDS, False, _DEADLINE_TICKS
-        )
-
-    @classmethod
-    def for_benchmark(
-        cls,
+    def __init__(
+        self,
         *,
         plan_keys,
         weights: dict,
-        state,
-        plan_fields: dict,
-        stamps: bool,
-        deadline_ticks: int,
-    ) -> MuseSparkFusedDecoderLayer:
-        """A layer with explicit plan fields (``DEFAULT_PLAN_FIELDS``' keys),
-        clock stamps into ``state.stamps``, and the wait deadline in 10 ns
-        clock ticks (a test stops a withheld launch sooner than the serving
-        deadline), for the plan-field benchmark runs."""
-        layer = cls.__new__(cls)
-        layer._setup(plan_keys, weights, state, plan_fields, stamps, deadline_ticks)
-        return layer
-
-    def _setup(
-        self,
-        plan_keys,
-        weights,
-        state,
+        state: MuseSparkDecoderLayerState,
         plan_fields: dict,
         stamps: bool,
         deadline_ticks: int,
     ):
+        """``plan_fields``: :data:`DEFAULT_PLAN_FIELDS`' keys (serving passes
+        the defaults; benchmarks vary them); ``stamps``: store per-workgroup
+        clock stamps into ``state.stamps``; ``deadline_ticks``: how long a
+        wait may last, in 10 ns clock ticks (:data:`DEADLINE_TICKS` when
+        serving; a test stops a withheld launch sooner)."""
         if set(plan_fields) != set(DEFAULT_PLAN_FIELDS):
             raise ValueError(f"plan fields must be {sorted(DEFAULT_PLAN_FIELDS)}")
         if deadline_ticks <= 0:
@@ -372,6 +358,10 @@ class MuseSparkFusedDecoderLayer:
             raise ValueError("a fused layer's plan keys share its layer and next kinds")
         self.layer_kind, self.next_kind = kinds.pop()
         self.declines: dict[int, list[str]] = {}
+        # Variants whose launched binary passed the residency check, and the
+        # page-table stride every launch must keep (a compile-time value).
+        self.checked: set[tuple] = set()
+        self.page_table_stride: int | None = None
         self.tensors, self.model, problems = self._read_weights(weights, state.rank)
         # The lane-major gate/up scales cost a 32 MiB copy per layer: off
         # until a benchmark shows the win is worth the memory.
@@ -417,8 +407,10 @@ class MuseSparkFusedDecoderLayer:
             beta=_require("beta", beta, (HIDDEN,), torch.float32),
             # A weightless post-attention norm (Muse) passes the multiplier
             # vector of ones and no weight to OWN1.
+            # Without a weight (Muse), OWN1 reads none: the BF16 multiplier
+            # vector of ones stands in for the pointer.
             post_attn_norm=(
-                weights["o_proj"]
+                _bf16_with_offset(None, 0.0, HIDDEN, device)
                 if post_attn_w is None
                 else _require("post_attention_norm", post_attn_w, (HIDDEN,), torch.bfloat16)
             ),
@@ -460,7 +452,15 @@ class MuseSparkFusedDecoderLayer:
         return tensors, model, problems
 
     def _constexprs(
-        self, key, *, page_size, page_table_stride, qk_eps, qk_offset, kv_scaled
+        self,
+        key,
+        *,
+        page_size,
+        page_table_stride,
+        qk_eps,
+        qk_offset,
+        kv_scaled,
+        next_rotary,
     ):
         model = ModelConstants(
             page_size=page_size,
@@ -475,8 +475,8 @@ class MuseSparkFusedDecoderLayer:
         return kernel_constexprs(
             key, model, rank=self.state.rank, peer_cache=".wt",
             scale_lanes=int(self.moe.s13_lanes is not None), n_phys1=self.moe.n_phys1,
-            n_phys2=self.moe.n_phys2, kv_scaled=kv_scaled, stamps=self.stamps,
-            **self.plan_fields,
+            n_phys2=self.moe.n_phys2, kv_scaled=kv_scaled, next_rotary=next_rotary,
+            stamps=self.stamps, **self.plan_fields,
         )  # fmt: skip
 
     def _compile(self, key: PlanKey) -> list[str]:
@@ -488,11 +488,11 @@ class MuseSparkFusedDecoderLayer:
                 f"the device has {properties.multi_processor_count} CUs; a fused "
                 f"launch needs exactly {GRID}"
             ]
-        # Register, scratch and LDS use do not depend on the page geometry,
-        # which the first launch specializes; compile with the usual one.
+        # An early check with the usual page geometry, which the first
+        # launch specializes; that launch checks its own binary again.
         constexprs = self._constexprs(
             key, page_size=64, page_table_stride=4096, qk_eps=1e-6, qk_offset=0.0,
-            kv_scaled=False,
+            kv_scaled=False, next_rotary=key.next_kind == "sliding",
         )  # fmt: skip
         return [
             f"{key}: {reason}"
@@ -529,13 +529,23 @@ class MuseSparkFusedDecoderLayer:
                 "the fused prologue rotates interleaved (GPT-J) pairs only, without mrope"
             )
         scales = None if prologue is None else prologue.cache.scales
+        # The page-table width is fixed once the decode metadata exists (the
+        # graph buffers); the kernel specializes on its stride.
+        stride = int(cache.page_table.stride(0))
+        if self.page_table_stride is None:
+            self.page_table_stride = stride
+        elif stride != self.page_table_stride:
+            raise ValueError(
+                f"page table stride changed from {self.page_table_stride} to {stride}"
+            )
         constexprs = self._constexprs(
             key,
             page_size=int(cache.k_cache.shape[1]),
-            page_table_stride=int(cache.page_table.stride(0)),
+            page_table_stride=stride,
             qk_eps=0.0 if prologue is None else float(prologue.norm.eps),
             qk_offset=0.0 if prologue is None else float(prologue.norm.weight_offset),
             kv_scaled=scales is not None,
+            next_rotary=prologue is not None and prologue.rotary is not None,
         )
         if prologue is not None:
             next_q = torch.empty(
@@ -559,13 +569,15 @@ class MuseSparkFusedDecoderLayer:
             )  # fmt: skip
         else:
             next_q = next_gate = None
-            # The next layer is regular: no QKV or prologue operands.
+            # The next layer is regular: the QKV and prologue operands are
+            # unused stand-ins of their types.
+            d = state.dummies
             next_args = (
-                residual, state.qkv_parts, residual, residual, residual, residual,
-                residual, 0, positions, residual, residual, positions, 0, 1.0, 1.0,
+                d["bf16"], state.qkv_parts, d["fp8"], d["bf16"], d["bf16"], d["bf16"],
+                d["fp32"], 64, positions, d["fp8"], d["fp8"], d["i64"], 0, 1.0, 1.0,
                 normed_out,
             )  # fmt: skip
-        gluon_decoder_layer_muse_spark_gfx950[(GRID,)](
+        compiled = gluon_decoder_layer_muse_spark_gfx950[(GRID,)](
             state.epochs, state.claims, state.iris.errors, state.arena, state.exchange,
             state.xq, state.xs, self.deadline_ticks, 0,
             *state.iris.view_args(),
@@ -589,6 +601,14 @@ class MuseSparkFusedDecoderLayer:
             num_warps=NUM_WARPS,
             **persistent_compile_options(),
         )  # fmt: skip
+        variant = tuple(sorted(constexprs.items()))
+        if variant not in self.checked:
+            # The first launch of a variant compiled its binary (graph
+            # capture's warm-up, before serving): check that one too.
+            problems = check_compiled(compiled)
+            if problems:
+                raise RuntimeError(f"fused Muse layer {key}: {'; '.join(problems)}")
+            self.checked.add(variant)
         return next_q, next_gate
 
     def forward(self, prepared_query, residual, *, positions, cache, next_prologue):

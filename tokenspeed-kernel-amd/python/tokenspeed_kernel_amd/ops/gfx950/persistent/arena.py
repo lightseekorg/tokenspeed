@@ -83,6 +83,11 @@ class UncachedBuffer:
     def data_ptr(self) -> int:
         return self._pointer
 
+    def ptr_range(self) -> int:
+        """Bytes a kernel may address from :meth:`data_ptr` (a launch
+        specializes buffers within 2 GB for 32-bit buffer offsets)."""
+        return self.nbytes
+
     def read(self) -> torch.Tensor:
         """A host copy of the buffer (after the device work is synchronized)."""
         host = torch.empty(self.nbytes, dtype=torch.uint8)

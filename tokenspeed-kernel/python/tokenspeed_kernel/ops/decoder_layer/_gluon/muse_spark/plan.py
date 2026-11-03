@@ -31,7 +31,8 @@ balanced attention schedule list every possible producer.
 Per XCD, in launch order:
 
 - front: slots 0-15 SND (o_proj and router weights at entry; at full layers
-  after the first attention item) then RTR, slot 0 also OWN1 between them and
+  o_proj after the first attention item and the router weights after the
+  push) then RTR, slot 0 also OWN1 between them and
   slot 1 publishing h'[:, part xcd]; slots 16-23 POOL (slot 16 + T on XCD T
   reduces tile T); sliding attention blocks b on XCD b, slots 24-31 (split s
   on slot 24 + s, merger split 0); full layers run balanced items cta and cta
@@ -40,8 +41,10 @@ Per XCD, in launch order:
   (xcd r % 8, slot 25 + r // 8);
 - MoE: every workgroup, after the ids and xq tag lines (scalar polls);
 - tail: the QKV task's weights at the MoE end (not when the next layer is
-  regular), then OWN4 + FIN on slots 0 and 24-30 (tail index i, tokens i +
-  8 r), UNP on 16-23 (slot 16 also RED), then the QKV task (part 2 xcd + slot
+  regular; UNP workgroups issue the relay's weights, then the QKV task's
+  first window, and the rest of it after UNP and RED), then OWN4 + FIN on
+  slots 0 and 24-30 (tail index i, tokens i + 8 r), UNP on 16-23 (slot 16
+  also RED), then the QKV task (part 2 xcd + slot
   % 2, group slot // 2) on every workgroup, then HEAD i * 8 + xcd < 34 on tail
   workgroups; or BND2 on tail workgroups when the next layer is regular.
 """
@@ -144,9 +147,11 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
 
     if slot < 16:
         sender = xcd * 16 + slot
-        # o_proj (SND) and the router's hi / lo (RTR), issued together.
+        # Sliding: o_proj (SND) and the router's hi / lo (RTR) at entry.
+        # Full: o_proj at the attention items' hook, the router after the
+        # push (and OWN1).
         if full:
-            steps += items(("SND", "RTR"))
+            steps += items(("SND",))
         else:
             steps += [Load("SND", _ALL), Load("RTR", _ALL)]
         steps += [
@@ -156,12 +161,14 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
         ]
         if slot == 0:
             rs = (f"H1.rs[{2 * xcd}]", f"H1.rs[{2 * xcd + 1}]")
-            # The router weights are still in flight here; the plan paces
-            # them to land before this poll.
+            # At sliding layers the router weights are still in flight here;
+            # they are paced to land before this poll.
             steps += [
-                Wait("OWN1", _ALL, rs, "vector", _LANDED),
+                Wait("OWN1", _ALL, rs, "vector", "" if full else _LANDED),
                 Publish("OWN1", _ALL, (f"H1.ag[{xcd}]",)),
             ]
+        if full:
+            steps.append(Load("RTR", _ALL))
         # The router weights feed the K-part compute after this wait.
         steps.append(Wait("RTR", _ALL, ag, "vector", _IWC))
         if slot == 1:
@@ -243,7 +250,7 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
     unp = 16 <= slot < 24
     all_h4 = tuple(f"H4[{x}][{s}]" for x in range(XCDS) for s in range(SLOTS))
     red = tuple(f"red[{x}]" for x in range(XCDS))
-    if not regular:
+    if not regular and not unp:
         steps.append(Load("QKV", _ALL))  # paced, at this workgroup's MoE end
     if tail:
         index = TAIL_SLOTS.index(slot)
@@ -259,8 +266,12 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
     elif unp:
         sender = xcd * 8 + slot - 16
         s_lines = tuple(f"S[{p}][{t}]" for p in range(XCDS) for t in range(rows))
+        steps.append(Load("UNP", _ALL))  # the relay's post-expert weights
+        if not regular:
+            # The QKV task's first window of tiles, paced; the rest follow
+            # the relay's (and RED's) work.
+            steps.append(Load("QKV", _ALL))
         steps += [
-            Load("UNP", _ALL),  # the relay's post-expert weights
             Wait("UNP", _ALL, s_lines, "smem", ""),
             Publish("UNP", _ALL, (f"H6[{sender}]",)),
             Wait("UNP", _ALL, ("hprime[0]",), "smem", ""),
@@ -272,6 +283,8 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
                 Wait("RED", _ALL, partials, "vector", _LANDED),
                 Publish("RED", _ALL, (f"red[{xcd}]",)),
             ]
+        if not regular:
+            steps.append(Load("QKV", _ALL))  # the rest of the QKV tiles, paced
     if regular:
         if tail:
             h6 = tuple(f"H6[{u}]" for u in range(UNPS))
