@@ -26,7 +26,7 @@ box, each in two copies chosen by ``launch.copy = epoch & 1`` and sized for
 senders of the all-to-all H1 reduce-scatter (SND) re-arm copy ``(L + 1) & 1``
 of every area, each its 1 / 128 share, and drain the stores before their
 first push of L. A peer writes that copy again only in L + 1, which it reaches
-only after every one of this rank's L pushes (NATIVE-DESIGN §7.1).
+only after every one of this rank's L pushes.
 
 Device side: :class:`MuseNativeView` (local bases and the peers' heap bases),
 :func:`clear_next_copies`, and one function per hop end, each calling the
@@ -337,7 +337,8 @@ def own1(
     in rank order, push the AG words and the four norm sums (tagged with
     launch.tag) to every rank. Then zero its sums of rows [rows, MAX_ROWS)
     on every rank: 32-bit tags repeat after 2**32 - 1 launches, so a row a
-    later, wider launch reads must not keep a tag that old (TAG-LIVE)."""
+    later, wider launch reads must not keep a tag that old (tags repeat
+    after 2**32 - 1 launches)."""
     sums_peers = _peer_addresses(view.h1_sums, view.heaps, RANK)
     muse_attntail_own(
         owner, launch.cta, view.h1, _peer_addresses(view.h1, view.heaps, RANK),
@@ -594,7 +595,8 @@ def unp_sums_publish(view, launch, sums, sender, rows):
     ]
     valid = (row < rows)[:, None] & (which >= 0)[None, :]
     store_pairs(view.red_in + slot, values, launch, valid, "gpu")
-    # Rows past ``rows`` get tag 0, which never matches (TAG-LIVE).
+    # Rows past ``rows`` get tag 0, which never matches (tags repeat after
+    # 2**32 - 1 launches, so no slot may keep an old one).
     gl.atomic_store(
         view.red_in + slot,
         gl.zeros_like(slot).to(gl.int64),
@@ -609,7 +611,8 @@ def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PE
     """RED of this XCD: wait for its 8 senders' partials of rows < rows (at
     most 16), add them in FP32 (the same reduction on every rank), and push
     the [row][SUMS] totals as tagged int64 words to slot (RANK, xcd) of every
-    rank's h6_sums; rows [rows, MAX_ROWS) of the slot are zeroed (TAG-LIVE).
+    rank's h6_sums; rows [rows, MAX_ROWS) of the slot are zeroed (tags repeat
+    after 2**32 - 1 launches).
     Needs 8 waves (one pair per lane)."""
     gl.static_assert(gl.num_warps() == 8)
     poll: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [8, 1], [1, 0])

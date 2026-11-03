@@ -49,7 +49,7 @@ resident cannot deadlock and its hand-offs keep their contracts:
    all-to-all key, each before that publish (a peer reaches the next launch
    only after every one of those publishes, so every clear of the copy it
    will write has drained); the all-to-all key is present in every plan;
-5. P-QUEUE: a vector poll of another workgroup's key never sits behind the
+5. poll-behind-own-loads: a vector poll of another workgroup's key never sits behind the
    group's own loads in flight (a CU returns loads in order), unless the
    wait states why (``Wait.queued``); scalar polls are exempt;
 6. every region spans at least the plan's rows.
@@ -84,7 +84,7 @@ class Wait:
     Attributes:
         load: ``"vector"`` (``sc1``/``.cv``/Lamport words) or ``"smem"``.
         queued: Why a vector poll may sit behind the group's own loads in
-            flight (P-QUEUE), or ``""``: ``"issue-wait-compute"`` (the loads
+            flight (poll-behind-own-loads), or ``""``: ``"issue-wait-compute"`` (the loads
             feed the compute after this wait) or ``"landed"`` (the plan
             issues them early enough to land before this wait, a timing
             assumption the design states).
@@ -281,7 +281,7 @@ def check_plan(plan: LayerPlan) -> int:
         ):
             raise PlanError(
                 f"{plan.name}: {step.role} on {node[0]} polls {step.keys[0]} "
-                "behind its own loads in flight (P-QUEUE)"
+                "behind its own loads in flight (poll-behind-own-loads)"
             )
     for key, waiters in waits.items():
         if key not in publishers:

@@ -189,7 +189,7 @@ def launch_tag(epoch, BITS: gl.constexpr):
     Zero-filled and long-idle words never match a live tag, and consecutive
     launches always differ. Tags repeat after 2**BITS - 1 launches, so a
     tagged slot that a later launch may poll is rewritten or scrubbed in every
-    launch (research-sync TAG-LIVE).
+    launch.
     """
     return epoch % ((1 << BITS) - 1) + 1
 

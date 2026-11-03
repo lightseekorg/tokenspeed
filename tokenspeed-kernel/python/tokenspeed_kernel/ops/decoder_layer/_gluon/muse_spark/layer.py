@@ -24,21 +24,22 @@ One plain launch of ``GRID`` workgroups x 8 waves, one per CU, runs a whole
 decoder layer and the next layer's query projection. A workgroup's roles
 come from its physical place, ``(xcd, slot)`` (the hardware XCD and the
 program id // 8, see ``persistent.enter_issue``), and the plan key's
-constexprs; the role table is ``plan.py`` (NATIVE-DESIGN §4.1). Roles hand
-work to each other through memory (NATIVE-DESIGN §7): each hand-off is
-named by its §7 id at its producer and consumer below.
+constexprs; ``plan.py`` models the same roles and checks their waits. Roles
+hand work to each other through memory; each hand-off below states its
+producer's ordering (drain, barrier, flag or single-store tagged words) and
+its consumer's loads.
 
 Phases, in the order a workgroup runs its roles:
 
-- front: attention splits and their record merger (S1-S3), the o_proj
-  senders (SND, S4-S5) and owners (OWN1, S6-S7), the router and pooler K
-  parts (RTR, POOL, S8-S9), the top-k (TOPK, S10) and the pooled rows'
-  norm and MXFP4 quantization (XN, S11);
-- MoE: every workgroup streams its share of the experts (S12-S15);
-- tail: route owners (OWN4, S16-S17) and finishers (FIN, S18) on slots 0
-  and 24-30, post-expert senders (UNP, S20) and sum reducers (RED, S21) on
-  16-23, one QKV task of the next layer on every workgroup (S22-S23), then
-  the prologue heads (HEAD, S24) on the FIN workgroups; when the next layer
+- front: attention splits and their record mergers, the o_proj senders
+  (SND) and column owners (OWN1), the router and pooler K parts (RTR,
+  POOL), the top-k (TOPK) and the pooled rows' norm and MXFP4 quantization
+  (XN);
+- MoE: every workgroup streams its share of the experts;
+- tail: route owners (OWN4) and finishers (FIN) on slots 0 and 24-30,
+  post-expert senders (UNP) and sum reducers (RED) on 16-23, one QKV task
+  of the next layer on every workgroup, then the prologue heads (HEAD) on
+  the FIN workgroups; when the next layer
   is regular, BND2 on the FIN workgroups writes the regular boundary
   instead of QKV and HEAD.
 
@@ -357,13 +358,13 @@ def _reserve_lds():
 
 
 # ---------------------------------------------------------------------------
-# Front: attention (S1-S3)
+# Front: sliding attention
 # ---------------------------------------------------------------------------
 
 
 @gluon.jit
 def _wait_records(record_ptr, first, count: gl.constexpr, tag, launch):
-    """S2 consumer (same XCD, scalar ``glc``): every split's per-wave records
+    """The record merger's wait (same XCD, scalar ``glc``): every split's per-wave records
     carry ``tag``; 16 records per 64 B line."""
     gl.static_assert(count % 16 == 0)
     # Every wave polls and then reads the partials itself (no barrier).
@@ -395,9 +396,9 @@ def _attention_split(
     """One sliding split of block ``block`` = (request, KV head); split 0 is
     the block's merger.
 
-    S1: the split streams its pages and stores its partial (plain, read on
-    this XCD). S2: each wave drains its stores, then stores its record
-    (``publish_split_record``). S3: the merger polls the block's records,
+    The split streams its pages and stores its partial (plain, read on
+    this XCD); each wave drains its stores, then stores its record
+    (``publish_split_record``); the merger polls the block's records,
     merges in split order (bitwise to the last-arriver merge) and publishes
     the gated, normalized rows to the attention box (written through).
     """
@@ -438,13 +439,13 @@ def _attention_split(
 
 
 # ---------------------------------------------------------------------------
-# Front: full attention (S1-S3 of full layers)
+# Front: full attention
 # ---------------------------------------------------------------------------
 
 
 @gluon.jit
 def _wait_records_gpu(record_ptr, first, count, tag, launch):
-    """S2 consumer of full layers: ``count`` int32 records from ``first``,
+    """The full-layer merge's wait: ``count`` int32 records from ``first``,
     published on any XCD with device-scope stores; one per lane, relaxed
     device-scope polls (``poll_until_all`` ``"sc1"``)."""
     lanes = gl.arange(
@@ -509,7 +510,7 @@ def _full_items(
     ISSUE: gl.constexpr,
     issue_args,
 ):
-    """S1-S2 of a full layer: this workgroup's balanced decode items
+    """A full layer's splits: this workgroup's balanced decode items
     (program indices ``cta`` and ``cta + GRID``). Each partial is written
     through; its record (device scope) waits only for the partial's stores.
     The role's weights (``ISSUE(issue_args)``) issue after the first item's
@@ -569,7 +570,7 @@ def _full_merge(
     gate_stride,
     GATE_EPS: gl.constexpr,
 ):
-    """S3 of a full layer: merge task ``task`` (8 rows of one (request, KV
+    """A full layer's merge: task ``task`` (8 rows of one (request, KV
     head) block, one per wave) polls the block's records, merges bitwise
     the balanced reduce's way, then gates, normalizes and publishes its rows
     to the attention box (written through), as the sliding merger does."""
@@ -599,7 +600,7 @@ def _full_merge(
 
 
 # ---------------------------------------------------------------------------
-# Front: o_proj senders and owners (S4-S7)
+# Front: o_proj senders and column owners
 # ---------------------------------------------------------------------------
 
 
@@ -608,8 +609,8 @@ def _send(
     launch, view, sender, tiles, rows, RANK: gl.constexpr, PEER_CACHE: gl.constexpr
 ):
     """SND ``sender`` (0-127): re-arm its share of the next copies, wait for
-    the attention box (S4), multiply it by its resident o_proj rows and push
-    the partial to the columns' owner (S5)."""
+    the attention box, multiply it by its resident o_proj rows and push
+    the partial to the columns' owner rank."""
     clear_next_copies(view, launch, sender)
     x = muse_attntail_read_box(
         view.box + launch.copy * _BOX_WORDS, rows, _Q_WIDTH, launch, iris_fail_stop,
@@ -622,7 +623,7 @@ def _send(
 
 
 # ---------------------------------------------------------------------------
-# Front: router and pooler K parts (S8-S9), top-k (S10), XN (S11)
+# Front: router and pooler K parts, top-k, XN
 # ---------------------------------------------------------------------------
 
 
@@ -671,7 +672,7 @@ def _kpart_x(
 ):
     """K part ``part``'s x (FP32 B operand ``[waves, 128, 16]``): the
     deferred-norm build from the H1 all-gather words of owner rank ``part``
-    (S8, Lamport payload-as-flag) and every owner's four norm sums (tagged
+    (Lamport payload-as-flag) and every owner's four norm sums (tagged
     words). Returns ``(h', x)``."""
     inv1, inv2 = deferred_norm_scales_gfx950(
         _norm_sums(launch, view.h1_sums, rows, _SITE_SUMS), _HIDDEN, POST_EPS, PRE_EPS
@@ -715,7 +716,7 @@ def _topk(
     ROUTED_SCALING_FACTOR: gl.constexpr,
 ):
     """TOPK of rows ``8 group ..``, one wave per row: sum the router's K
-    parts in part order (S9 consumer, tagged words), pick the top 8 (S10),
+    parts in part order (tagged words), pick the top 8,
     publish ids and weights to the uncached exchange, then each row's tag
     (rows past ``rows`` tag too, so the MoE polls whole 16-row lines)."""
     WAVES: gl.constexpr = gl.num_warps()
@@ -752,7 +753,7 @@ def _topk(
     gl.amd.cdna4.buffer_store(
         weights.to(gl.int32, bitcast=True), exchange_ptr, _EX_WEIGHTS + slots, mask=mask
     )
-    # S10: each wave's tag after its own ids (uncached: no cache bits).
+    # Each wave's tag after its own ids (uncached: no cache bits).
     release_drain()
     _publish_row_tags(launch, exchange_ptr + _EX_IDS_TAGS, group * WAVES, rows)
 
@@ -786,8 +787,7 @@ def _xn(
     EPS: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
 ):
-    """XN of ``row``: wait for every rank's pooled columns (S11 consumer of
-    H3), RMSNorm, MXFP4 to the uncached exchange, then the row's tag."""
+    """XN of ``row``: wait for every rank's pooled columns (H3), RMSNorm, MXFP4 to the uncached exchange, then the row's tag."""
     quant_layout: gl.constexpr = gl.BlockedLayout(
         [1, 16], [1, 64], [gl.num_warps(), 1], [1, 0]
     )
@@ -836,7 +836,7 @@ def _publish_line(launch, line_ptr):
 
 @gluon.jit
 def _publish_hprime(launch, hp, part, rows, hprime_ptr, exchange_ptr):
-    """S16: h' of K part ``part`` (FP32 ``[waves, 128, 16]``, the B operand
+    """h' of K part ``part`` (FP32 ``[waves, 128, 16]``, the B operand
     layout of ``gemv_a16w16_splitk_x_gfx950``) to ``hprime [MAX_ROWS,
     HIDDEN]`` written through, then the part's flag line. Its readers (UNP,
     QKV, BND2) sit on any XCD and read it ``.cv``."""
@@ -863,7 +863,7 @@ def _publish_hprime(launch, hp, part, rows, hprime_ptr, exchange_ptr):
 
 @gluon.jit
 def _publish_s(launch, s, token, part, rows, s_rows_ptr, exchange_ptr):
-    """S18 -> S19: FIN's routed sum of (token, part) as BF16 (the post-expert
+    """FIN's routed sum of (token, part) as BF16 (the post-expert
     projection's input) to ``s_rows [MAX_ROWS, 4096]`` written through,
     then its tag in the S tags ``[part][row]`` (also row ``token + 8`` when
     the launch has at most 8 rows: UNP polls 16-row lines)."""
@@ -918,8 +918,8 @@ def _wait_b_operand(
 
 
 # ---------------------------------------------------------------------------
-# Tail: post-expert senders (S20), sum reducers (S21), QKV (S22-S23), HEAD
-# (S24), BND2 (the last fused layer's boundary)
+# Tail: post-expert senders, sum reducers, QKV, HEAD, BND2 (the last fused
+# layer's boundary)
 # ---------------------------------------------------------------------------
 
 
@@ -942,7 +942,7 @@ def _unp(
     """UNP ``sender`` (0-63 of this rank, 8 per XCD): its 16 hidden columns
     of the post-expert projection, bitwise the column GEMM's, relayed across
     the waves (``mm_a16w16_column_relay_gfx950``) from resident weights
-    ``w``. S20: every FIN part's S rows (global-tagged, read ``.cv``), push
+    ``w``. It waits for every FIN part's S rows (written through, flag lines; read ``.cv``), pushes
     the BF16 columns to every rank (H6) and their four norm-sum partials to
     this XCD's reducer."""
     WAVES: gl.constexpr = gl.num_warps()
@@ -1014,7 +1014,7 @@ def _ffn_x(
     POST_EPS: gl.constexpr,
     PRE_EPS: gl.constexpr,
 ):
-    """S22: QKV K part ``part``'s (512 columns) x'' and h'' (FP32 B operand
+    """QKV K part ``part``'s (512 columns) x'' and h'' (FP32 B operand
     ``[waves, 64, 16]``): the deferred FFN-boundary build from H6 (columns
     of rank ``part // 2``), h' and the 64 reducers' sums."""
     inv1, inv2 = deferred_norm_scales_gfx950(
@@ -1076,7 +1076,7 @@ def _store_rows_b(values, ptr, part, rows, PART: gl.constexpr):
 
 @gluon.jit
 def _head_rows(launch, qkv_parts, column0, rows):
-    """S24: one head's 16 x 64 rows from the 16 QKV K parts' tagged
+    """One head's 16 x 64 rows from the 16 QKV K parts' tagged
     partials, summed in part order and rounded once to BF16 (as FP32), in
     the prologue's rows layout."""
     rows_l: gl.constexpr = gqa_prologue_rows_layout(gl.num_warps())
@@ -1383,7 +1383,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     slot = entry.slot
     _stamp(stamps_ptr, entry.cta, _STAMP_ENTRY, STAMPS)
     if slot < 16:
-        # SND (S4-S5) -> OWN1 on slot 0 (S6-S7) -> RTR (S8-S9).
+        # SND -> OWN1 on slot 0 -> RTR.
         sender = xcd * 16 + slot
         task = xcd * _ROUTER_GROUPS + slot
         weights = (o_proj_ptr, sender, router_hi_ptr, router_lo_ptr, task)
@@ -1419,7 +1419,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             logits, logits_parts, launch.tag, slot * 16, xcd, rows, _EXPERTS, ".wt"
         )
     elif slot < 24:
-        # POOL (S8-S9); slot 16 + T on XCD T reduces tile T and pushes H3.
+        # POOL; slot 16 + T on XCD T reduces tile T and pushes H3.
         tile = slot - 16
         task = xcd * _POOL_TILES + tile
         if SLIDING:
@@ -1468,7 +1468,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
         if SLIDING:
             if xcd < 2 * REQUESTS:
-                # S1-S3: split (slot - 24) of block xcd.
+                # Split (slot - 24) of block xcd.
                 _attention_split(
                     launch, xcd, slot - _ATT_FIRST_SLOT, view, q_ptr, gate_ptr,
                     gate_stride, k_cache_ptr, v_cache_ptr, page_table_ptr,
@@ -1500,7 +1500,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             )  # fmt: skip
 
     _stamp(stamps_ptr, launch.cta, _STAMP_FRONT, STAMPS)
-    # MoE (S12-S15): every workgroup, once the ids and then the xq rows land.
+    # MoE: every workgroup, once the ids and then the xq rows land.
     if not poll_tags16(exchange + _EX_IDS_TAGS, launch.tag, launch, True, True):
         iris_fail_stop(launch, _SITE_IDS, 0)
     _stamp(stamps_ptr, launch.cta, _STAMP_IDS, STAMPS)
@@ -1527,7 +1527,8 @@ def gluon_decoder_layer_muse_spark_gfx950(
 
     _stamp(stamps_ptr, launch.cta, _STAMP_MOE, STAMPS)
     # Tail. Weights first, at this workgroup's MoE end: the post-expert
-    # relay's (UNP) and the next layer's QKV task (paced, P-PACE).
+    # relay's (UNP) and the next layer's QKV task (paced so the stream stays
+    # under the fabric's latency knee while the tail's exchanges run).
     is_tail = (slot == 0) | ((slot >= 24) & (slot < 31))
     is_unp = (slot >= 16) & (slot < 24)
     index = gl.where(slot == 0, 0, slot - 23)
@@ -1536,7 +1537,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         group = slot // 2
         task = part * _QKV_GROUPS + group
     if is_unp:
-        # UNP (S20), then this XCD's sum reducer (S21) on slot 16. The relay
+        # UNP, then this XCD's sum reducer on slot 16. The relay
         # weights go out first: the relay needs them before the QKV task.
         sender = xcd * 8 + slot - 16
         w = mm_a16w16_column_relay_weights_gfx950(
@@ -1561,7 +1562,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 QKV_WINDOW,
             )  # fmt: skip
         if is_tail:
-            # OWN4 (S16-S17) then FIN (S18) of pick / part xcd.
+            # OWN4 then FIN of pick / part xcd.
             for r in gl.static_range(REQUESTS):
                 token = index + 8 * r
                 own4_complete(
@@ -1578,7 +1579,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
     _stamp(stamps_ptr, launch.cta, _STAMP_TAIL, STAMPS)
     if NEXT_KIND != 2:
-        # QKV (S22-S23): x'' of K part ``part``; group 0 stores h'' for the
+        # QKV: x'' of K part ``part``; group 0 stores h'' for the
         # next layer (plain: the next launch reads it).
         h2, x2 = _ffn_x(
             launch, view, part, task, rows, hprime, exchange, alpha2_ptr, beta2_ptr,

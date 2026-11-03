@@ -55,7 +55,7 @@ def test_every_served_variant_is_accepted(key):
 def test_a_merge_task_on_a_weight_holding_slot_is_rejected():
     """At full layers SND workgroups hold their o_proj and router weights
     after their first attention item; a merge task placed there would poll
-    the records behind those loads (P-QUEUE)."""
+    the records behind those loads (poll-behind-own-loads)."""
     plan = muse_plan(PlanKey(1, "full", "sliding"))
     merge = [x for x in plan.programs[(0, 24)] if x.role == "MERGE"]
     assert merge
@@ -70,7 +70,9 @@ def test_a_merge_task_on_a_weight_holding_slot_is_rejected():
         return steps[:at] + merge + steps[at:]
 
     plan = _edit(_edit(plan, (0, 24), move_out), (0, 5), move_in)
-    with pytest.raises(PlanError, match="MERGE on \\(0, 5\\) polls .*P-QUEUE"):
+    with pytest.raises(
+        PlanError, match="MERGE on \\(0, 5\\) polls .*poll-behind-own-loads"
+    ):
         check_plan(plan)
 
 
@@ -115,7 +117,7 @@ def test_a_vector_poll_behind_its_own_loads_is_rejected():
             for x in steps
         ]
 
-    with pytest.raises(PlanError, match="P-QUEUE"):
+    with pytest.raises(PlanError, match="poll-behind-own-loads"):
         check_plan(_edit(muse_plan(_KEY), (3, 5), drop_flag))
 
 

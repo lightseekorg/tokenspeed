@@ -24,7 +24,7 @@ These compile without a GPU, so they run on any host with the AMD backend;
 the test tree's conftest needs a device, so on a GPU-less host run them with
 ``pytest --noconftest``.
 Each test names the instruction-level contract its body promises
-(NATIVE-DESIGN P-ISA): waits, cache bits, and what may not drain a stream.
+(the persistent layer's codegen rules): waits, cache bits, and what may not drain a stream.
 """
 
 from __future__ import annotations
@@ -198,7 +198,7 @@ def test_kpart_consumers_fit_their_register_budget(
     kernel, extra, constexprs, max_vgprs
 ):
     """The router and pooler K-part tasks hold their weights and build x
-    from the deferred norm within NATIVE-DESIGN's per-role budget, with no
+    from the deferred norm within the layer's per-role register budget, with no
     scratch (a spill would drain the resident weights)."""
     signature = {
         "b_ptr": "*bf16",
@@ -250,7 +250,7 @@ def test_qkv_task_paces_its_weights_and_fits(window: int):
     """The QKV task (144 rows x K/16, x built from the FFN boundary's
     deferred norm) keeps at most ``window`` weight tiles in flight with
     counted waits, never draining its stream while issuing, and fits the
-    budget with no scratch: NATIVE-DESIGN's one-task form (204 VGPRs [C])."""
+    budget with no scratch: the one-task-per-workgroup form (204 VGPRs)."""
     assembly = compile_gfx950(
         qkv_task_kernel,
         {

@@ -73,11 +73,11 @@ _ALL = "all"
 # Why some vector polls may sit behind loads in flight (plan.Wait.queued).
 _IWC = "issue-wait-compute"
 # The tail roles' QKV weights go out at their MoE end and land before the
-# first tail poll (NATIVE-DESIGN §4.1, assumption A2).
+# first tail poll (an assumption the phase stamps check).
 _LANDED = "landed"
 
 # Two-copy cross-GPU receive areas and the local attention box: re-armed by
-# the SND workgroups at entry (NATIVE-DESIGN §7.1). Tagged words: never cleared.
+# the SND workgroups at entry. Tagged words: never cleared.
 _CLEARED = ("att_box", "H1", "H3", "H4_own", "routes", "H6")
 _TAGGED = ("att_rec", "H1_sums", "rtr", "pool", "exchange", "S", "hprime",
            "red_in", "H6_sums", "qkv")  # fmt: skip
@@ -157,7 +157,7 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
         if slot == 0:
             rs = (f"H1.rs[{2 * xcd}]", f"H1.rs[{2 * xcd + 1}]")
             # The router weights are still in flight here; the plan paces
-            # them to land before this poll (NATIVE-DESIGN §4.1).
+            # them to land before this poll.
             steps += [
                 Wait("OWN1", _ALL, rs, "vector", _LANDED),
                 Publish("OWN1", _ALL, (f"H1.ag[{xcd}]",)),
