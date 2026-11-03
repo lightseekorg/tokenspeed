@@ -142,7 +142,6 @@ from tokenspeed.runtime.utils.failure_records import rank_record_path
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
-    from tokenspeed_kernel.ops.decoder_layer import DecoderLayerState
 
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
@@ -2447,7 +2446,7 @@ class MuseSparkModel(BaseTransformerModel):
         self.fused_shapes: frozenset[tuple[int, int]] = frozenset()
         # The launch state and communication regions every fused layer of
         # this group shares; allocated once, before the KV cache is sized.
-        self.fused_state: DecoderLayerState | None = None
+        self.fused_state: object | None = None
 
     def resolve_layers(
         self,
