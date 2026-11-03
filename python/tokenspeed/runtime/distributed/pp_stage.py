@@ -165,6 +165,10 @@ def pp_target_cache_windows(
 
     Returns:
         One ``[start, end)`` target cache-layer window per stage, in order.
+
+    Raises:
+        ValueError: the PP layer partition does not match the model, or the
+            scaled stage windows do not cover the declared cache layers.
     """
     if not mapping.has_pp:
         return [(0, num_target_cache_layers)]

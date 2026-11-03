@@ -340,7 +340,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 )
         groups = list(decoder_groups)
         # Indices in groups of shared side groups wider than a K page somewhere.
-        wider_than_k_page = []
+        wider_than_k_page: list[int] = []
         for spec, fields in extras:
             plane_bytes: dict[str, int] = {}
             for field in sorted(fields, key=lambda field: field.field_id):
