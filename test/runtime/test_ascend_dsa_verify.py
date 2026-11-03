@@ -1766,7 +1766,7 @@ def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(
 
     prepare()
     reference, live = resolve_cache_slots(locations, placement)
-    expected = torch.where(live, reference, -1)
+    expected = torch.where(live, reference, -1).to(torch.int64)
     local = owner.metadata(start=0, end=3 * width)
     address = local.page_table.data_ptr()
     assert torch.count_nonzero(local.seq_lens[-width:]) == 0
