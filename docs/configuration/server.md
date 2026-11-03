@@ -418,7 +418,7 @@ Trainer-side contract:
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
-| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
+| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. With speculative decoding (outside prefill-only roles), per-request decode state is still sized for at least one request per attention-TP peer per DP rank, for the draft decode warmup. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--prefill-decode-interval` | After a round that runs a prefill chunk, run this many decode rounds before the next prefill round, unless no decode can run. Every chunk starts a new interval, but no prompt is held back more than this many decode rounds in total, so TTFT grows by at most this many decode steps and running decodes stall less often. Aggregated serving only. `0` (default) is off ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
