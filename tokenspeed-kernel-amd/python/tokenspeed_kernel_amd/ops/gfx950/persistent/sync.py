@@ -54,6 +54,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     release_drain,
     scalar_add2_i64,
     scalar_load_glc,
+    scalar_pair_sums8,
     scalar_tags16_differ,
     trap,
     vote,
@@ -446,6 +447,31 @@ def store_pairs(pair_ptrs, values, launch, mask, SCOPE: gl.constexpr):
     """
     word = (launch.tag.to(gl.int64) << 32) | (values.to(gl.int64) & 0xFFFFFFFF)
     gl.atomic_store(pair_ptrs, word, mask=mask, sem="relaxed", scope=SCOPE)
+
+
+@gluon.jit
+def poll_pair_sums8(first_ptr, launch, STRIDE: gl.constexpr):
+    """Wait, in this wave, for eight lines of four (value, tag) pairs at
+    ``first_ptr + k * STRIDE`` bytes (k = 0..7, 32 B aligned, stored on this
+    XCD) to carry this launch's tag, with scalar loads only: the wait never
+    queues behind the wave's vector loads, so a wave may poll with weights
+    in flight. The values ride in the polled words, so nothing else is read.
+
+    Returns:
+        ``((sum_0, sum_1, sum_2, sum_3), seen)``, per wave: ``sum_i`` the FP32
+        sum of the lines' pair-i values in line order 0..7, and whether the
+        tags were seen.
+    """
+    s0, s1, s2, s3, differ = scalar_pair_sums8(first_ptr, launch.tag, STRIDE)
+    start = gl.to_tensor(0).to(gl.int64)
+    retries = 0
+    stop = retries < 0
+    while (differ != 0) & (not stop):
+        retries += 1
+        s0, s1, s2, s3, differ = scalar_pair_sums8(first_ptr, launch.tag, STRIDE)
+        if retries % _CHECK_RETRIES == 0:
+            stop, start = poll_check(launch, start, retries, True)
+    return (s0, s1, s2, s3), not stop
 
 
 @gluon.jit

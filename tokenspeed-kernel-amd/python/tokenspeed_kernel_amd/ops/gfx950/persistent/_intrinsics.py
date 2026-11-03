@@ -172,6 +172,53 @@ def scalar_load_glc(word_ptr):
     )  # fmt: skip
 
 
+# Eight lines of four tagged pairs (value low, tag high): loads into s16..s79,
+# the OR of (tag ^ $5) into $4 (s80 scratch), and the four sums in line order
+# into $0..$3. Line k holds pair i's value in s(16 + 8k + 2i), its tag in the
+# next register.
+@gluon.constexpr_function
+def _pair_sums8_text(stride):
+    loads = "\n\t".join(
+        f"s_load_dwordx8 s[{16 + 8 * k}:{23 + 8 * k}], $6, {hex(k * stride)} glc"
+        for k in range(8)
+    )
+    tags = ["s_xor_b32 $4, s17, $5"]
+    for k in range(8):
+        for i in range(4):
+            if k or i:
+                reg = 16 + 8 * k + 2 * i + 1
+                tags += [f"s_xor_b32 s80, s{reg}, $5", "s_or_b32 $4, $4, s80"]
+    sums = []
+    for i in range(4):
+        sums.append(f"v_mov_b32 ${i}, s{16 + 2 * i}")
+        sums += [f"v_add_f32 ${i}, s{16 + 8 * k + 2 * i}, ${i}" for k in range(1, 8)]
+    return "\n\t".join([loads, "s_waitcnt lgkmcnt(0)"] + tags + sums)
+
+
+_PAIR_SUMS8_CONSTRAINTS = gl.constexpr(
+    "=&v,=&v,=&v,=&v,=&s,s,s,~{memory},~{scc},~{s[16:79]},~{s80}"
+)
+
+
+@gluon.jit
+def scalar_pair_sums8(first_ptr, tag, STRIDE: gl.constexpr):
+    """Read eight lines of four tagged int64 pairs (``tag << 32 | value``)
+    at ``first_ptr + k * STRIDE`` bytes (k = 0..7, each line 32 B aligned)
+    with scalar loads past the scalar cache (``glc``: same-XCD words), so the
+    read never waits behind the wave's vector loads.
+
+    Returns ``(sum_0, sum_1, sum_2, sum_3, differ)``, per wave: ``sum_i`` the
+    FP32 sum of the lines' pair-i values added in line order 0..7
+    (``((v_0 + v_1) + v_2) + ...``), ``differ`` the OR of ``tag_ik ^ tag``
+    (0: all 32 tags match, and the sums are of current values).
+    Clobbers s[16:80]."""
+    TEXT: gl.constexpr = _pair_sums8_text(STRIDE)
+    return gl.inline_asm(
+        TEXT, _PAIR_SUMS8_CONSTRAINTS, [tag, first_ptr],
+        [gl.float32, gl.float32, gl.float32, gl.float32, gl.int32], is_pure=False,
+    )  # fmt: skip
+
+
 # OR of (tag_i ^ tag) over s64..s79 into $0, after the 16 tags were loaded.
 _XOR_TAGS16 = "s_xor_b32 $0, s64, $2" + "".join(
     f"\n\ts_xor_b32 s80, s{64 + i}, $2\n\ts_or_b32 $0, $0, s80" for i in range(1, 16)

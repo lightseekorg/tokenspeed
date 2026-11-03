@@ -42,10 +42,10 @@ Per XCD, in launch order:
 - MoE: every workgroup, after the ids and xq tag lines (scalar polls);
 - tail: the QKV task's weights at the MoE end (not when the next layer is
   regular; UNP workgroups issue the relay's weights, then the QKV task's
-  first window, and the rest of it after UNP and RED), then OWN4 + FIN on
-  slots 0 and 24-30 (tail index i, tokens i + 8 r), UNP on 16-23 (slot 16
-  also RED), then the QKV task (part 2 xcd + slot
-  % 2, group slot // 2) on every workgroup, then HEAD i * 8 + xcd < 34 on tail
+  first window, and the rest of it after UNP, before RED's scalar polls),
+  then OWN4 + FIN on slots 0 and 24-30 (tail index i, tokens i + 8 r), UNP
+  on 16-23 (slot 16 also RED), then the QKV task (part 2 xcd + slot % 2,
+  group slot // 2) on every workgroup, then HEAD i * 8 + xcd < 34 on tail
   workgroups; or BND2 on tail workgroups when the next layer is regular.
 """
 
@@ -274,14 +274,15 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
             Wait("UNP", _ALL, ("hprime[0]",), "smem", ""),
             Publish("UNP", _ALL, (f"red_in[{xcd}][{slot - 16}]",)),
         ]
-        if slot == 16:
-            partials = tuple(f"red_in[{xcd}][{b}]" for b in range(8))
-            steps += [
-                Wait("RED", _ALL, partials, "vector", _LANDED),
-                Publish("RED", _ALL, (f"red[{xcd}]",)),
-            ]
         if not regular:
             steps.append(Load("QKV", _ALL))  # the rest of the QKV tiles, paced
+        if slot == 16:
+            # Scalar polls: the tiles just issued stay in flight.
+            partials = tuple(f"red_in[{xcd}][{b}]" for b in range(8))
+            steps += [
+                Wait("RED", _ALL, partials, "smem", ""),
+                Publish("RED", _ALL, (f"red[{xcd}]",)),
+            ]
     if regular:
         if tail:
             h6 = tuple(f"H6[{u}]" for u in range(UNPS))

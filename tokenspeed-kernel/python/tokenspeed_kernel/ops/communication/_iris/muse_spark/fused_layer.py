@@ -74,10 +74,12 @@ if current_platform().is_cdna4:
         Launch,
         fail_stop,
         poll_check,
+        poll_pair_sums8,
         poll_pairs,
         poll_stop_site,
         store_pairs,
         vote,
+        wave_index,
     )
 else:  # host-side sizes only
     ERROR_ABORT, ERROR_CALLER, ERROR_WORDS, FIRST_KERNEL_SITE = 32, 64, 128, 16
@@ -619,50 +621,62 @@ def unp_sums_publish(view, launch, sums, sender, rows):
 @gluon.jit
 def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PEER_CACHE: gl.constexpr,):  # fmt: skip
     """RED of this XCD: wait for its 8 senders' partials of rows < rows (at
-    most 16), add them in FP32 (the same reduction on every rank), and push
-    the [row][SUMS] totals as tagged int64 words to slot (RANK, xcd) of every
-    rank's h6_sums; rows [rows, MAX_ROWS) of the slot are zeroed (tags repeat
-    after 2**32 - 1 launches).
-    Needs 8 waves (one pair per lane)."""
+    most 16), add them in FP32 in sender order 0..7 (the same reduction on
+    every rank), and push the [row][SUMS] totals as tagged int64 words to
+    slot (RANK, xcd) of every rank's h6_sums; rows [rows, MAX_ROWS) of the
+    slot are zeroed (tags repeat after 2**32 - 1 launches).
+
+    Wave w handles rows w and w + 8 (and zeroes w + 16, w + 24) on its own:
+    it reads the senders' pairs with scalar loads, so the wait does not
+    queue behind loads the workgroup has in flight (its QKV weights), and
+    no data crosses waves. Needs 8 waves."""
     gl.static_assert(gl.num_warps() == 8)
-    poll: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [8, 1], [1, 0])
-    sender = gl.arange(0, 8, layout=gl.SliceLayout(1, poll))
-    entry = gl.arange(0, 16 * _SUMS, layout=gl.SliceLayout(0, poll))
-    slot = ((launch.xcd * 8 + sender[:, None]) * _MAX_ROWS) * _SUMS + entry[None, :]
-    valid = (sender >= 0)[:, None] & (entry // _SUMS < rows)[None, :]
-    values, seen = poll_pairs(view.red_in + slot, valid, launch, "gpu")
-    if not seen:
-        on_expiry(launch, poll_stop_site(launch, _SITE_RED), 0)
-    totals = gl.sum(values.to(gl.float32, bitcast=True), 0)  # [16 * SUMS]
-    push: gl.constexpr = gl.BlockedLayout([1, 4], [32, 2], [gl.num_warps(), 1], [1, 0])
-    row = gl.arange(0, _MAX_ROWS, layout=gl.SliceLayout(1, push))
-    which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, push))
-    flat = row[:, None] * _SUMS + which[None, :]
-    total = gl.convert_layout(
-        gl.reshape(totals, [16, _SUMS]),
-        gl.BlockedLayout([1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]),
-    )
-    # Rows 16-31 of a [32, SUMS] slot hold zeros (and tag 0): never current.
-    padded = gl.join(total, gl.zeros_like(total))
-    padded = gl.convert_layout(
-        gl.reshape(gl.permute(padded, [2, 0, 1]), [_MAX_ROWS, _SUMS]), push
-    )
-    live = (row < rows)[:, None] & (which >= 0)[None, :]
+    gl.static_assert(_SUMS == 4)
+    wave = wave_index()
+    # One line per (sender, row): SUMS pairs; senders MAX_ROWS lines apart.
+    first = view.red_in + launch.xcd * (8 * _MAX_ROWS * _SUMS)
+    zero = gl.to_tensor(0.0)
+    sums = ()
+    for half in gl.static_range(2):
+        row = wave + 8 * half
+        totals = (zero, zero, zero, zero)
+        if row < rows:
+            totals, seen = poll_pair_sums8(
+                first + row * _SUMS, launch, _MAX_ROWS * _SUMS * 8
+            )
+            if not seen:
+                on_expiry(launch, poll_stop_site(launch, _SITE_RED), row)
+        sums += (totals,)
+    # Lane l < 16 of the wave stores entry l % SUMS of row wave + 8 (l // 4).
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    lane = gl.arange(0, 64 * gl.num_warps(), lanes) % 64
+    quarter = lane // _SUMS
+    which = lane % _SUMS
+    row = wave + 8 * quarter
+    value = gl.zeros([64 * gl.num_warps()], gl.float32, lanes)
+    for half in gl.static_range(2):
+        for i in gl.static_range(_SUMS):
+            value = gl.where((quarter == half) & (which == i), sums[half][i], value)
+    live = row < rows
     words = gl.where(
         live,
         (launch.tag.to(gl.int64) << 32)
-        | (padded.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF),
+        | (value.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF),
         0,
     )
-    destination_slot = (RANK * 8 + launch.xcd) * (_MAX_ROWS * _SUMS) + flat
+    destination_slot = (
+        (RANK * 8 + launch.xcd) * (_MAX_ROWS * _SUMS) + row * _SUMS + which
+    )
     peers = _peer_addresses(view.h6_sums, view.heaps, RANK)
     for peer in gl.static_range(_WORLD):
         destination = gl.multiple_of(peers[peer].to(gl.pointer_type(gl.int64)), 16)
         if peer == RANK:
-            gl.amd.cdna4.buffer_store(words, destination, destination_slot, cache=".wt")
+            gl.amd.cdna4.buffer_store(
+                words, destination, destination_slot, mask=lane < 16, cache=".wt"
+            )
         else:
             gl.amd.cdna4.buffer_store(
-                words, destination, destination_slot, cache=PEER_CACHE
+                words, destination, destination_slot, mask=lane < 16, cache=PEER_CACHE
             )
 
 

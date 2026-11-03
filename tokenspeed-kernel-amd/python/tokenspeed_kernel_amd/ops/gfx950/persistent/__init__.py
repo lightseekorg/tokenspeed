@@ -35,6 +35,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     vote,
     wait_vmcnt,
     wave_acquire,
+    wave_index,
     xcc_id,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
@@ -65,6 +66,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
     logical_cta,
     poll_check,
     poll_expired,
+    poll_pair_sums8,
     poll_pairs,
     poll_stop_site,
     poll_tags16,
@@ -110,6 +112,7 @@ __all__ = [
     "persistent_compile_options",
     "poll_check",
     "poll_expired",
+    "poll_pair_sums8",
     "poll_pairs",
     "poll_stop_site",
     "poll_tags16",
@@ -124,5 +127,6 @@ __all__ = [
     "vote",
     "wait_vmcnt",
     "wave_acquire",
+    "wave_index",
     "xcc_id",
 ]

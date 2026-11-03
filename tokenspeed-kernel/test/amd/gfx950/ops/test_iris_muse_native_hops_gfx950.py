@@ -362,6 +362,41 @@ def test_fused_layer_hop_compiles_at_8_waves(role):
         assert not any("vmcnt" in l for l in lines[lines.index(stores[0]) :])
 
 
+@gluon.jit
+def _red_behind_weights_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors, floats, copy, rows):  # fmt: skip
+    """RED with 32 KB of this workgroup's weight loads still in flight, as
+    on the UNP workgroup whose QKV tiles go out before it."""
+    view = MuseNativeView(
+        heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+    )
+    zero = gl.program_id(0) * 0
+    launch = Launch(
+        gl.program_id(0), zero, zero, copy.to(gl.int64) + 2, zero + 7, copy, zero,
+        errors, errors + 32, zero.to(gl.int64) + 1000, errors,
+    )  # fmt: skip
+    layout: gl.constexpr = gl.BlockedLayout([16], [64], [8], [0])
+    weights = gl.load(floats + gl.arange(0, 8192, layout=layout))
+    red_sums(view, launch, rows, iris_fail_stop, 3, ".wt")
+    gl.store(floats + gl.arange(0, 8192, layout=layout), weights * 2.0)
+
+
+def test_red_sums_does_not_wait_behind_the_workgroups_weights():
+    """RED polls its senders' pairs with scalar loads: no vector load and no
+    vmcnt wait before or inside its poll loop, so weights issued before it
+    stay in flight until their first use."""
+    signature = dict(_VIEW, errors="*i32", floats="*fp32", copy="i32", rows="i32")
+    assembly = _compile(_red_behind_weights_kernel, signature, {})
+    lines = instruction_lines(assembly)
+    first_poll = next(i for i, l in enumerate(lines) if l.startswith("s_load_dwordx8"))
+    assert not any("vmcnt" in l for l in lines[:first_poll])
+    loops = [l for l in innermost_loops(assembly) if "s_load_dwordx8" in l]
+    assert loops
+    for loop in loops:
+        assert "vmcnt" not in loop
+        assert not re.search(r"\b(buffer|global)_load", loop)
+        assert loop.count("s_load_dwordx8") == 8 and "glc" in loop
+
+
 def test_every_cleared_area_splits_into_whole_sender_shares():
     """128 senders clear equal 16-byte-multiple shares of every area copy, and
     the area sizes follow the 32-row geometry the hop bodies index."""

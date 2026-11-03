@@ -1780,17 +1780,18 @@ def gluon_decoder_layer_muse_spark_gfx950(
             launch, view, sender, rows, w, s_rows, hprime, exchange, alpha2_ptr,
             beta2_ptr, post2_bf16_ptr, stamps_ptr, RANK, PEER_CACHE, STAMPS,
         )  # fmt: skip
-        if slot == 16:
-            red_sums(view, launch, rows, iris_fail_stop, RANK, PEER_CACHE)
-            _stamp(stamps_ptr, launch.cta, _STAMP_RED, STAMPS)
         if NEXT_KIND != 2:
-            # The rest once the relay's weights are dead and UNP's (and the
-            # reducer's) pushes and polls are issued: loads complete in issue
-            # order, so earlier they would hold up those hand-offs.
+            # The rest once the relay's weights are dead and UNP's pushes and
+            # polls are issued: loads complete in issue order, so earlier
+            # they would hold up those hand-offs. The reducer below polls
+            # with scalar loads, which do not wait for them.
             qkv_tiles = qkv_first + gemv_a16w16_splitk_weight_step_tiles_gfx950(
                 qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
                 QKV_WINDOW, QKV_FIRST, _QKV_TASK_ROWS // 16 - QKV_FIRST,
             )  # fmt: skip
+        if slot == 16:
+            red_sums(view, launch, rows, iris_fail_stop, RANK, PEER_CACHE)
+            _stamp(stamps_ptr, launch.cta, _STAMP_RED, STAMPS)
     elif is_tail:
         if NEXT_KIND != 2:
             # Tail-role workgroups finish their MoE share early, inside the
