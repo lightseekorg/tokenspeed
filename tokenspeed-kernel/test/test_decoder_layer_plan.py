@@ -52,6 +52,28 @@ def test_every_served_variant_is_accepted(key):
     assert check_plan(muse_plan(key)) > 0
 
 
+def test_a_merge_task_on_a_weight_holding_slot_is_rejected():
+    """At full layers SND workgroups hold their o_proj and router weights
+    after their first attention item; a merge task placed there would poll
+    the records behind those loads (P-QUEUE)."""
+    plan = muse_plan(PlanKey(1, "full", "sliding"))
+    merge = [x for x in plan.programs[(0, 24)] if x.role == "MERGE"]
+    assert merge
+
+    def move_out(steps):
+        return [x for x in steps if x.role != "MERGE"]
+
+    def move_in(steps):
+        at = next(
+            i for i, x in enumerate(steps) if x.role == "SND" and isinstance(x, Clear)
+        )
+        return steps[:at] + merge + steps[at:]
+
+    plan = _edit(_edit(plan, (0, 24), move_out), (0, 5), move_in)
+    with pytest.raises(PlanError, match="MERGE on \\(0, 5\\) polls .*P-QUEUE"):
+        check_plan(plan)
+
+
 def test_the_v01_role_map_with_56_own4_is_rejected():
     """v0.1 placed OWN4 on 7 slots per XCD; the role table needs 8."""
     plan = muse_plan(_KEY)
@@ -86,7 +108,7 @@ def test_a_vector_poll_behind_its_own_loads_is_rejected():
     def drop_flag(steps):
         return [
             (
-                dataclasses.replace(x, issue_wait_compute=False)
+                dataclasses.replace(x, queued="")
                 if isinstance(x, Wait) and x.role == "RTR"
                 else x
             )
@@ -109,7 +131,7 @@ def test_a_wait_cycle_is_rejected():
                 for i, x in enumerate(steps)
                 if x.role == "OWN1" and isinstance(x, Publish)
             )
-            wait = Wait("OWN1", "all", (f"H1.ag[{(xcd + 1) % 8}]",), "vector", False)
+            wait = Wait("OWN1", "all", (f"H1.ag[{(xcd + 1) % 8}]",), "vector", "landed")
             return steps[:at] + [wait] + steps[at:]
 
         plan = _edit(plan, (xcd, 0), ring)
@@ -143,10 +165,10 @@ def test_a_region_missing_a_clearer_is_rejected():
 
 def test_a_key_with_two_publishers_is_rejected():
     def twice(steps):
-        return steps + [Publish("TOPK", "all", ("ids[0]",))]
+        return steps + [Publish("TOPK", "all", ("H3[0]",))]
 
     with pytest.raises(PlanError, match="published twice"):
-        check_plan(_edit(muse_plan(_KEY), (6, 24), twice))
+        check_plan(_edit(muse_plan(_KEY), (7, 24), twice))
 
 
 def test_regions_must_span_the_rows():
