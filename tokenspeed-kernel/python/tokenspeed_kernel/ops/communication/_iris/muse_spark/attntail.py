@@ -40,6 +40,7 @@ if current_platform().is_cdna4:
         AttentionConfig,
         AttentionProgram,
         InputStrides,
+        _stream_split_pipelined,
         _stream_split_single_buffer,
     )
 
@@ -577,9 +578,11 @@ def muse_attntail_attention(
     att_box,
     cfg: gl.constexpr,
     EPS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     """One sliding split of _mha_decode_sliding_split_atomic; the last split
-    publishes the gated, normalized rows (muse_attntail_store_attention)."""
+    publishes the gated, normalized rows (muse_attntail_store_attention).
+    NUM_STAGES pages stream in flight, as the split decode's launch config sets."""
     program = AttentionProgram.create(
         cfg,
         q_ptr,
@@ -604,17 +607,22 @@ def muse_attntail_attention(
         gate_rows[:, None] + d[None, :],
         mask=program.row_valid(m)[:, None] & (d >= 0)[None, :],
     )
-    k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-    )
-    v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-    )
     q = program.load_q()
     m_i, l_i, acc, _ = program.init_state(q_ptr, False)
-    m_i, l_i, acc = _stream_split_single_buffer(
-        program, q, m_i, l_i, acc, k_smem, v_smem
-    )
+    if NUM_STAGES == 1:
+        k_smem = gl.allocate_shared_memory(
+            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+        )
+        v_smem = gl.allocate_shared_memory(
+            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+        )
+        m_i, l_i, acc = _stream_split_single_buffer(
+            program, q, m_i, l_i, acc, k_smem, v_smem
+        )
+    else:
+        m_i, l_i, acc = _stream_split_pipelined(
+            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
     program.store_split(acc, l_i, m_i)
     if program.arrive(counters_ptr) == cfg.NUM_KV_SPLITS - 1:
         muse_attntail_store_attention(program, gate, att_box, EPS)
@@ -1123,6 +1131,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     PRE_WEIGHT_OFFSET: gl.constexpr,
     POST_HAS_WEIGHT: gl.constexpr,
     RESERVED_LDS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """Sliding decode attention through Muse's attention boundary in one launch.
@@ -1209,6 +1218,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
             att_box,
             cfg,
             GATE_EPS,
+            NUM_STAGES,
         )
     elif program < ATTENTION + SENDERS:
         block = program - ATTENTION

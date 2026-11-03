@@ -1555,6 +1555,7 @@ class MuseIrisState:
             PRE_WEIGHT_OFFSET=pre_weight_offset,
             POST_HAS_WEIGHT=post_weight is not None,
             RESERVED_LDS=_MUSE_ATTNTAIL_RESERVED_LDS,
+            NUM_STAGES=config.num_stages,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=config.num_warps,
             **sched_compile_options(),
