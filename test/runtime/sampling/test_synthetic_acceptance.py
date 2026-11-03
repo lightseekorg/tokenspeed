@@ -313,7 +313,10 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
         assert observed == {1, 2, 3}
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="FlashInfer chain verification requires an NVIDIA CUDA GPU",
+)
 @pytest.mark.parametrize("al", [1.0, 2.6, 4.0])
 def test_block_rejection_synthetic_verify_and_cuda_graph_replay(monkeypatch, al):
     """Probabilistic-draft synthetic mode on the real flashinfer verify path."""
