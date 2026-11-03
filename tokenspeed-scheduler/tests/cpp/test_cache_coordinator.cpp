@@ -1571,7 +1571,7 @@ TEST(CacheCoordinatorAdmissionTest, UnprovenStateCheckpointsLeadTheirOwnEpochSha
             };
             return coordinator
                 .Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
-                       /*evict_blocks_past_segments=*/false)
+                       /*evict_blocks_past_segments=*/false, /*session_id=*/{})
                 .has_value();
         };
         const auto cached = [&](std::uint32_t group_id, CacheBlockLocation location) {
@@ -1627,7 +1627,8 @@ TEST(CacheCoordinatorTrimTest, TrimUnprovenStateCheckpointsKeepsTheNewestDeepest
     for (const std::uint32_t group_id : {1U, 2U}) {
         const std::array<CacheKey, 1> keys{Key(hashes[4], group_id)};
         coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group_id))
-            .AcquireMatched(pool, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}}, /*access_epoch=*/1);
+            .AcquireMatched(pool, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}}, /*access_epoch=*/1,
+                            /*session=*/nullptr);
     }
     const auto cached = [&](std::size_t hash) {
         const bool in_first = coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[hash], 1));
@@ -1829,7 +1830,8 @@ TEST(CacheCoordinatorTrimTest, AProvenCheckpointIsImagedAsAnEndpoints) {
     {
         const std::array<CacheKey, 1> keys{Key(hashes[1], 1)};
         coordinator.GroupPrefixIndex(1).AcquireMatched(pool, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
-                                                       CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+                                                       CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                                       /*session=*/nullptr);
     }
     const std::vector<std::vector<ImageSlot>> published = coordinator.PublishedDataSlots(tables, /*num_tokens=*/8);
     ASSERT_EQ(published[1].size(), 1u);
@@ -1867,7 +1869,7 @@ TEST(CacheCoordinatorTrimTest, AnUnprovenCheckpointHoldsNoStateForTheCoverCheck)
 
     const std::array<CacheKey, 1> keys{Key(hashes[0], 1)};
     coordinator.GroupPrefixIndex(1).AcquireMatched(pool, keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
-                                                   /*access_epoch=*/2);
+                                                   /*access_epoch=*/2, /*session=*/nullptr);
     EXPECT_TRUE(coordinator.HoldsStateCheckpoint(hashes[0])) << "a hit proved it";
     EXPECT_FALSE(coordinator.HoldsUnprovenStateCheckpoint(hashes[0]));
 
@@ -2005,7 +2007,8 @@ TEST_F(FrequentCheckpointWriteBackTest, OnlyAProvenCheckpointRidesAnEvictionWrit
         const std::array<CacheKey, 1> keys{Key(proven[1], kState)};
         coordinator_.GroupPrefixIndex(kState).AcquireMatched(device_, keys, /*begin_blocks=*/0,
                                                              GroupPrefixProbe{.hits = {1}},
-                                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+                                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
+                                                             /*session=*/nullptr);
     }
     CacheCoordinator::EvictedSegment segment;
     ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(coordinator_, kState, StateLocationOf(unproven[1]),
