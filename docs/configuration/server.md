@@ -1382,3 +1382,11 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Pinned allocator compatibility
+
+The launcher defaults large pinned allocations to exact sizes when the installed
+PyTorch allocator supports `pinned_max_round_threshold_mb`. It probes the parser
+in a separate process so the check does not change the caller's allocator state.
+Older builds retain their existing allocation policy; explicitly supplied
+allocator options are preserved. Unexpected probe failures stop startup.
