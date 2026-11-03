@@ -37,6 +37,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "integration_test_helper.h"
@@ -2410,6 +2411,150 @@ TEST_F(StateRestoreClaimSuite, ARetractionAtAPageBoundaryRestoresUnderWriteBack)
     EXPECT_EQ(scheduler_->RequestTokenSize("r"), -1);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
     EXPECT_TRUE(scheduler_->CanClearCache());
+}
+
+// The same geometry with the KV-event feed on, drained after every plan as
+// the event loop does. A drain drops the descriptor of a boundary no group
+// holds on the Device any more, so the restore of r = [1..7] and r's
+// publications after it must register what they mutate again: the tail at 7
+// that slot 0's checkpoint (the first decode's input) is keyed under, and the
+// pages of r's that came back as private copies.
+class StateRestoreKvEventsSuite : public StateRestoreClaimSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateRestoreClaimSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+
+    // Applies the feed to the boundaries it reports stored: a removal names
+    // one stored before, and none is stored twice.
+    void Drain() {
+        for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+            if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                for (const std::uint64_t hash : removed->block_hashes) {
+                    EXPECT_EQ(stored_.erase(hash), 1u) << "a removal names a boundary never stored";
+                }
+                continue;
+            }
+            const auto& stored = std::get<KvBlockStoredEvent>(event);
+            EXPECT_TRUE(stored_.emplace(stored.block_hashes.front(), stored.token_ids).second)
+                << "a boundary is stored twice";
+        }
+    }
+    ExecutionPlan PlanAndDrain() {
+        ExecutionPlan plan = PlanOnce();
+        Drain();
+        return plan;
+    }
+    bool Stored(const std::vector<std::int32_t>& tokens) const {
+        return std::ranges::any_of(stored_, [&tokens](const auto& entry) { return entry.second == tokens; });
+    }
+    // Plans 1 to 3: r's prefill, its first decode (the tail at 7 and the
+    // checkpoint at 7, which rotates into slot 0) and the knob's retraction
+    // at frontier 8 (the page [5 6 7 101] and the checkpoint at 8).
+    ExecutionPlan RetractAtEight() {
+        Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 4});
+        AckWriteBacks(PlanAndDrain());
+        SendForwardDone("r", {101});
+        AckWriteBacks(PlanAndDrain());
+        EXPECT_TRUE(Stored({5, 6, 7}));
+        SendForwardDone("r", {102});
+        ExecutionPlan retraction = PlanAndDrain();
+        EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+        EXPECT_TRUE(Stored({5, 6, 7, 101}));
+        return retraction;
+    }
+    // Whether the restore copies a State row back from L2 under its key:
+    // slot 0, which the ACK republishes.
+    static bool RestoresAKeyedStateRow(const SnapshotRestoreBatch& restore) {
+        for (std::size_t i = 0; i < restore.group_ids.at(0).size(); ++i) {
+            if (restore.group_ids.at(0)[i] != 0 && !restore.content_hashes.at(0)[i].empty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::map<std::uint64_t, std::vector<std::int32_t>> stored_;
+};
+
+// Under write-through a prompt admitted before r's image lands evicts r's
+// cache-only entries, the tail at 7 among them. The restore copies slot 0
+// back from L2 and its ACK republishes the checkpoint under the tail's hash,
+// which no page of r's chain names: the retraction kept the tail's boundary
+// from its descriptor, and the restore registers it with the chain.
+TEST_F(StateRestoreKvEventsSuite, TheRestoreRegistersTheTailItsCheckpointIsKeyedUnder) {
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    const ExecutionPlan retraction = RetractAtEight();
+    Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(8, 200), .max_new_tokens = 1});
+    AckWriteBacks(PlanAndDrain());  // plan 4: o's prefill
+    ASSERT_FALSE(Stored({5, 6, 7})) << "o's admission evicted the tail's blocks";
+    AckImageStores(retraction);
+    SendForwardDone("o", {300});
+    SendFinish("o");
+    AckWriteBacks(PlanAndDrain());  // plan 5: o's finish streams its pages, pinned until this ACK
+    const ExecutionPlan readmit = PlanAndDrain();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_TRUE(RestoresAKeyedStateRow(*restore));
+    AckRestores(readmit);
+    Drain();
+
+    ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"r"});
+    SendForwardDone("r", {103});
+    SendFinish("r");
+    AckWriteBacks(PlanAndDrain());
+    EXPECT_EQ(scheduler_->RequestTokenSize("r"), -1);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+}
+
+// Under write-back the restore claims nothing (see the test above), so its
+// own admission evicts the tail at 7 before the ACK republishes slot 0 there.
+TEST_F(StateRestoreKvEventsSuite, AWriteBackRestoreRegistersTheTailItEvictedFirst) {
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    AckImageStores(RetractAtEight());
+    const ExecutionPlan readmit = PlanAndDrain();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_TRUE(RestoresAKeyedStateRow(*restore));
+    ASSERT_FALSE(Stored({5, 6, 7})) << "the restore evicted the tail's blocks";
+    AckWriteBacks(readmit);
+    AckRestores(readmit);
+    Drain();
+    ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"r"});
+}
+
+// Without a Host pool the image rides the snapshot pool whole: the restore
+// copies every slot back as a private copy, evicting r's entries, and
+// republishes nothing. The knob retracts r again before it decodes (plan 6),
+// at frontier 8 once more: no page is new, but the State checkpoint lands on
+// the deepest page [5 6 7 101], whose descriptor that retraction registers.
+TEST_F(StateRestoreKvEventsSuite, ARetractionAfterAPoolRestoreRegistersThePageItsCheckpointLandsOn) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    const ExecutionPlan retraction = RetractAtEight();
+    PlanAndDrain();  // plan 4: the image's store has not landed
+    AckImageStores(retraction);
+    const ExecutionPlan readmit = PlanAndDrain();  // plan 5
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    for (const std::string& hash : restore->content_hashes.at(0)) {
+        EXPECT_TRUE(hash.empty()) << "every row is a private copy";
+    }
+    ASSERT_FALSE(Stored({5, 6, 7, 101})) << "the restore evicted r's entries";
+    AckRestores(readmit);
+    Drain();
+
+    const ExecutionPlan again = PlanAndDrain();  // plan 6
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    AckImageStores(again);
+    const ExecutionPlan resumed = PlanAndDrain();
+    ASSERT_NE(FindRestore(resumed), nullptr);
+    AckRestores(resumed);
+    Drain();
+    ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"r"});
 }
 
 // Retraction after the forward that wrote the in-forward checkpoint, before
