@@ -651,22 +651,25 @@ class AttentionProgram:
     def finalize_splits(self, out_ptr, sink_ptr, counters_ptr, has_sink: gl.constexpr):
         """Let the last arriving split merge this row block and reset its counter."""
         if self.arrive(counters_ptr) == self.cfg.NUM_KV_SPLITS - 1:
-            output = self.merge_splits(sink_ptr, has_sink).to(out_ptr.dtype.element_ty)
-            cfg = self.cfg
-            offs_m = gl.arange(
-                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
-            )
-            offs_d = gl.arange(
-                0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout)
-            )
-            tokens = self.row_tokens(offs_m)
-            q_heads = self.row_heads(offs_m)
-            valid = self.row_valid(offs_m)
-            out_offsets = (
-                tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
-            ) * cfg.HEAD_DIM + offs_d[None, :]
-            cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
+            self.store_merged(out_ptr, self.merge_splits(sink_ptr, has_sink, ""))
             gl.store(counters_ptr + self.split_counter_offset(), 0)
+
+    @gluon.jit
+    def store_merged(self, out_ptr, merged):
+        """Store the row block's merged FP32 rows (``merge_splits``'s
+        ``[BLOCK_M, HEAD_DIM]``) to ``out_ptr`` ``[tokens, NUM_Q_HEADS,
+        HEAD_DIM]`` in its dtype."""
+        cfg = self.cfg
+        output = merged.to(out_ptr.dtype.element_ty)
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        tokens = self.row_tokens(offs_m)
+        q_heads = self.row_heads(offs_m)
+        valid = self.row_valid(offs_m)
+        out_offsets = (
+            tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
+        ) * cfg.HEAD_DIM + offs_d[None, :]
+        cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
 
     @gluon.jit
     def split_counter_offset(self):
@@ -714,10 +717,15 @@ class AttentionProgram:
         return old
 
     @gluon.jit
-    def merge_splits(self, sink_ptr, has_sink: gl.constexpr):
+    def merge_splits(
+        self, sink_ptr, has_sink: gl.constexpr, PARTIAL_CACHE: gl.constexpr
+    ):
         """Merge the row block's split partials (and the sink) into its FP32
         output rows, ``[BLOCK_M, HEAD_DIM]`` in ``cfg.store_layout``. Only the
-        last arriver (see ``arrive``) may call it."""
+        last arriver (see ``arrive``) may call it. ``PARTIAL_CACHE`` is the cache
+        modifier of the partial loads: ``""`` (plain pointer loads) after the
+        acq_rel arrival, which invalidates the CU's L1; otherwise buffer loads
+        with that modifier."""
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
@@ -755,19 +763,37 @@ class AttentionProgram:
                 * cfg.NUM_KV_SPLITS
                 + split
             ) * cfg.HEAD_DIM + offs_d[None, :]
-            part_o = gl.load(
-                self.mid_o_ptr + base,
-                mask=valid[:, None],
-                other=0.0,
-            ).to(gl.float32)
+            if PARTIAL_CACHE == "":
+                part_o = gl.load(
+                    self.mid_o_ptr + base,
+                    mask=valid[:, None],
+                    other=0.0,
+                ).to(gl.float32)
+            else:
+                part_o = cdna4.buffer_load(
+                    self.mid_o_ptr,
+                    base,
+                    mask=valid[:, None],
+                    other=0.0,
+                    cache=PARTIAL_CACHE,
+                ).to(gl.float32)
             lse_offset = (
                 tokens * cfg.NUM_Q_HEADS + q_heads
             ) * cfg.NUM_KV_SPLITS + split
-            part_lse = gl.load(
-                self.mid_lse_ptr + lse_offset,
-                mask=valid,
-                other=-float("inf"),
-            ).to(gl.float32)
+            if PARTIAL_CACHE == "":
+                part_lse = gl.load(
+                    self.mid_lse_ptr + lse_offset,
+                    mask=valid,
+                    other=-float("inf"),
+                ).to(gl.float32)
+            else:
+                part_lse = cdna4.buffer_load(
+                    self.mid_lse_ptr,
+                    lse_offset,
+                    mask=valid,
+                    other=-float("inf"),
+                    cache=PARTIAL_CACHE,
+                ).to(gl.float32)
             next_m = maximum(final_m, part_lse)
             if cfg.MAX_SEQLEN_Q > 1:
                 # A later query position's first splits can all precede
