@@ -34,8 +34,10 @@ from tokenspeed_kernel.ops.gemm import (
     _use_mv,
     fp32_router_gemv_counters,
     fp32_router_gemv_execute,
+    fp32_router_gemv_execute_with_mm,
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
+    fp32_router_gemv_with_mm_supported,
     mm,
     mv,
     mv_weightless_rmsnorm_gated_sigmoid,
@@ -1076,6 +1078,26 @@ class PreparedFP32RouterGEMV(nn.Module):
             enable_pdl,
         )
 
+    def supports_with_mm(
+        self, x: torch.Tensor, mm_a: torch.Tensor, mm_b: torch.Tensor
+    ) -> bool:
+        """Whether :meth:`forward_with_mm` serves these rows and GEMM."""
+        return self.prepared_weight is not None and fp32_router_gemv_with_mm_supported(
+            self._plan, x, mm_a, mm_b
+        )
+
+    def forward_with_mm(
+        self,
+        x: torch.Tensor,
+        mm_a: torch.Tensor,
+        mm_b: torch.Tensor,
+        mm_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project router rows and write ``mm(mm_a, mm_b)`` to ``mm_out`` in one launch."""
+        return fp32_router_gemv_execute_with_mm(
+            self._plan, x, self.prepared_weight, self.multiplier, mm_a, mm_b, mm_out
+        )
+
 
 class MuseSparkRouter(PreparedFP32RouterGEMV):
     """FP32 routing scores plus the bias that only steers the top-k selection."""
@@ -1571,6 +1593,70 @@ class MuseSparkMoE(nn.Module):
             columns, topk_weights, norm.weight, norm.eps, norm.weight_offset, rows
         )
 
+    def _route_and_quantize_inputs(
+        self, hidden_states: torch.Tensor, router_input: torch.Tensor
+    ) -> (
+        tuple[
+            torch.Tensor,
+            tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None
+    ):
+        """Route and quantize decode rows in two launches, or None.
+
+        The router shares a launch with this rank's pre-expert columns, and the
+        top-k shares one with the column gather, RMSNorm and MXFP4
+        quantization. Neither launch has a dependency between its halves, so
+        this replaces four launches with two. Returns the BF16 placeholder
+        rows, the MXFP4 rows, the router logits and the top-k weights and ids.
+        """
+        iris = self.iris_state
+        projection = self.pre_expert_proj
+        norm = self.pre_expert_norm
+        if (
+            iris is None
+            or self.expert_quant_kind != "mxfp4"
+            or not self.experts.supports_prequantized_input
+            or norm.weight is None
+            or projection.workspace is None
+            or hidden_states.shape[0]
+            > min(_GATHER_MXFP4_MAX_ROWS, projection.workspace.shape[0])
+        ):
+            return None
+        weight = projection._local_weight()
+        local = hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
+        bias = self.gate.e_score_correction_bias
+        if not (
+            self.gate.supports_with_mm(router_input, hidden_states, weight)
+            and iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
+                local, norm.weight, bias, self.topk
+            )
+        ):
+            return None
+        router_logits = self.gate.forward_with_mm(
+            router_input, hidden_states, weight, local
+        )
+        quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
+            local,
+            norm.weight,
+            norm.eps,
+            norm.weight_offset,
+            router_logits,
+            bias,
+            self.topk,
+            self.route_scale,
+        )
+        return (
+            projection.workspace[: hidden_states.shape[0]],
+            quantized,
+            router_logits,
+            topk_weights,
+            topk_ids,
+        )
+
     def _acquire_route_destination(
         self, num_tokens: int, owned_rows: bool
     ) -> torch.Tensor | None:
@@ -1664,73 +1750,88 @@ class MuseSparkMoE(nn.Module):
         Without ``project`` the combined expert rows are returned unprojected
         for a boundary that applies ``post_expert_proj`` itself.
         """
-        # Without an auxiliary stream (gfx950) the branch runs inline. Otherwise
-        # the graph phase warms the fork serially, so capture never first-touches it.
-        with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
-        ) as fork:
-            norm_weight = self.pre_expert_norm.weight
-            if owned_global_rows is not None:
-                local_rows = hidden_states.shape[0]
-                output = hidden_states.new_empty(
-                    (local_rows, self.pre_expert_proj.output_size)
-                )
-                compressed = self.pre_expert_proj.forward_owned_rows(
-                    hidden_states, output
-                )
-                if (
+        routed = (
+            self._route_and_quantize_inputs(hidden_states, router_input)
+            if owned_global_rows is None
+            else None
+        )
+        if routed is not None:
+            compressed, compressed_quantized, router_logits, topk_weights, topk_ids = (
+                routed
+            )
+            prepared = None
+        else:
+            # Without an auxiliary stream (gfx950) the branch runs inline. Otherwise
+            # the graph phase warms the fork serially, so capture never first-touches it.
+            with self.stream_fork.scope(
+                enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+            ) as fork:
+                norm_weight = self.pre_expert_norm.weight
+                if owned_global_rows is not None:
+                    local_rows = hidden_states.shape[0]
+                    output = hidden_states.new_empty(
+                        (local_rows, self.pre_expert_proj.output_size)
+                    )
+                    compressed = self.pre_expert_proj.forward_owned_rows(
+                        hidden_states, output
+                    )
+                    if (
+                        self.expert_quant_kind == "mxfp4"
+                        and self.experts.supports_prequantized_input
+                    ):
+                        compressed_quantized = rmsnorm_mxfp4_quant(
+                            compressed,
+                            norm_weight,
+                            self.pre_expert_norm.eps,
+                            self.pre_expert_norm.weight_offset,
+                        )
+                    else:
+                        compressed = self.pre_expert_norm(compressed, compressed.dtype)
+                        compressed_quantized = None
+                elif (
                     self.expert_quant_kind == "mxfp4"
                     and self.experts.supports_prequantized_input
+                    and norm_weight is not None
                 ):
-                    compressed_quantized = rmsnorm_mxfp4_quant(
+                    compressed, compressed_quantized = (
+                        self.pre_expert_proj.forward_mxfp4(
+                            hidden_states,
+                            norm_weight,
+                            self.pre_expert_norm.eps,
+                            self.pre_expert_norm.weight_offset,
+                        )
+                    )
+                elif self.expert_quant_kind == "nvfp4":
+                    width = self.pre_expert_proj.output_size
+                    compressed, sentinel = self.pre_expert_proj.forward_with_mailbox(
+                        hidden_states, width & (width - 1) == 0
+                    )
+                    compressed_quantized = rmsnorm_nvfp4_quant(
                         compressed,
                         norm_weight,
                         self.pre_expert_norm.eps,
                         self.pre_expert_norm.weight_offset,
+                        self.experts.w13_input_scale_quant,
+                        sentinel,
+                        pdl_enabled(),
                     )
                 else:
-                    compressed = self.pre_expert_norm(compressed, compressed.dtype)
+                    # MXFP4 kernels dynamically quantize this normalized BF16 row
+                    # into OCP E2M1 values with group-32 E8M0 scales.
+                    compressed = self.pre_expert_proj.forward_rmsnorm(
+                        hidden_states, self.pre_expert_norm
+                    )
                     compressed_quantized = None
-            elif (
-                self.expert_quant_kind == "mxfp4"
-                and self.experts.supports_prequantized_input
-                and norm_weight is not None
-            ):
-                compressed, compressed_quantized = self.pre_expert_proj.forward_mxfp4(
-                    hidden_states,
-                    norm_weight,
-                    self.pre_expert_norm.eps,
-                    self.pre_expert_norm.weight_offset,
-                )
-            elif self.expert_quant_kind == "nvfp4":
-                width = self.pre_expert_proj.output_size
-                compressed, sentinel = self.pre_expert_proj.forward_with_mailbox(
-                    hidden_states, width & (width - 1) == 0
-                )
-                compressed_quantized = rmsnorm_nvfp4_quant(
-                    compressed,
-                    norm_weight,
-                    self.pre_expert_norm.eps,
-                    self.pre_expert_norm.weight_offset,
-                    self.experts.w13_input_scale_quant,
-                    sentinel,
-                    pdl_enabled(),
-                )
-            else:
-                # MXFP4 kernels dynamically quantize this normalized BF16 row
-                # into OCP E2M1 values with group-32 E8M0 scales.
-                compressed = self.pre_expert_proj.forward_rmsnorm(
-                    hidden_states, self.pre_expert_norm
-                )
-                compressed_quantized = None
-            with fork.branch():
-                router_logits = self.gate(router_input, pdl_enabled())
-                prepared = (
-                    self.prepared_routing.get(hidden_states.shape[0])
-                    if owned_global_rows is None
-                    else None
-                )
-                topk_weights, topk_ids = self._select_experts(router_logits, prepared)
+                with fork.branch():
+                    router_logits = self.gate(router_input, pdl_enabled())
+                    prepared = (
+                        self.prepared_routing.get(hidden_states.shape[0])
+                        if owned_global_rows is None
+                        else None
+                    )
+                    topk_weights, topk_ids = self._select_experts(
+                        router_logits, prepared
+                    )
         if owned_global_rows is not None:
             iris = self.iris_state
             assert iris is not None

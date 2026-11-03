@@ -488,7 +488,8 @@ def invoke_sigmoid_bias_topk_route_gluon(
 # Large-M package prefill routing: one independent CTA per token.
 # ---------------------------------------------------------------------------
 @gluon.jit
-def gluon_sigmoid_bias_topk_gfx950(
+def sigmoid_bias_topk_row_gfx950(
+    token,
     logits_ptr,
     bias_ptr,
     topk_ids_ptr,
@@ -509,7 +510,11 @@ def gluon_sigmoid_bias_topk_gfx950(
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    token = gl.program_id(0)
+    """Select one token's biased-sigmoid top-k experts and write ids and weights.
+
+    The body of :func:`gluon_sigmoid_bias_topk_gfx950` for row ``token``, so a
+    kernel that runs other work in its other programs can route rows too.
+    """
     expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     topk_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     expert = gl.arange(0, EP, layout=expert_layout)
@@ -566,6 +571,52 @@ def gluon_sigmoid_bias_topk_gfx950(
         topk_weights_ptr,
         (token * stride_twm + topk_lane * stride_twk).to(gl.int32),
         mask=topk_mask,
+    )
+
+
+@gluon.jit
+def gluon_sigmoid_bias_topk_gfx950(
+    logits_ptr,
+    bias_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    stride_lm,
+    stride_le,
+    stride_be,
+    stride_tim,
+    stride_tik,
+    stride_twm,
+    stride_twk,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    EP: gl.constexpr,
+    TKP: gl.constexpr,
+    NORMALIZE_TOPK_WEIGHTS: gl.constexpr,
+    ROUTED_SCALING_FACTOR: gl.constexpr,
+    X_DTYPE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    sigmoid_bias_topk_row_gfx950(
+        gl.program_id(0),
+        logits_ptr,
+        bias_ptr,
+        topk_ids_ptr,
+        topk_weights_ptr,
+        stride_lm,
+        stride_le,
+        stride_be,
+        stride_tim,
+        stride_tik,
+        stride_twm,
+        stride_twk,
+        E,
+        TOPK,
+        EP,
+        TKP,
+        NORMALIZE_TOPK_WEIGHTS,
+        ROUTED_SCALING_FACTOR,
+        X_DTYPE,
+        NUM_WARPS,
     )
 
 
@@ -628,6 +679,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
 
 __all__ = [
     "gluon_topk_route_supported",
+    "sigmoid_bias_topk_row_gfx950",
     "invoke_sigmoid_bias_topk_route_gluon",
     "invoke_sigmoid_bias_topk_route_prefill_gluon",
     "invoke_softmax_topk_route_gluon",

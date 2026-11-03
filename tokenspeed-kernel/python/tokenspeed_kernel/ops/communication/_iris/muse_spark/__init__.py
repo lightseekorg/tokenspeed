@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
+    iris_fused_lamport_allgather_rmsnorm_mxfp4_topk,
     iris_pack_moe_inputs,
     iris_pull_allgather_moe_inputs,
 )
@@ -62,6 +63,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.column_split import (
     iris_pull_allgather_sorted_mxfp4_slices,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+    iris_columns_lamport_allgather_muse_moetail,
     iris_fused_gemv_lamport_allgather_muse_moetail,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -85,6 +87,10 @@ if current_platform().is_cdna4:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_geometry_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_mm_a16w16_column_shard_gfx950,
+        supports_gluon_mm_a16w16_column_shard_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         sorted_route_capacity,
@@ -114,10 +120,8 @@ _MUSE_INTERMEDIATE_GATHER_PROGRAMS = 64
 # The routed norm is latency bound: 256 programs were within 8% of the best
 # grid from 192 to 8192 tokens.
 _MUSE_COLUMN_NORM_PROGRAMS = 256
-# Most decode rows for the fused post-expert tail at TP8; it lost to the
-# replicated projection plus boundary at 16 rows in 8-rank graph replay.
-# Rows match the single-row tail bit for bit within 1-8 rows; 16 rows take
-# the replicated path.
+# Decode rows whose post-expert tail projects in the gather's senders (column
+# GEMV) at TP8. Rows match the single-row tail bit for bit within 1-8 rows.
 _MUSE_MOETAIL_MAX_ROWS = 8
 # Most decode rows of the fused sliding attention tail: 8 and 16 verify rows
 # (one or two requests). Its two-shot shards rows, so rows are a multiple of 8.
@@ -128,6 +132,13 @@ _MUSE_ATTNTAIL_PROGRAMS = 256
 # Columns one owner workgroup of the attention tail reduces (8 per rank).
 _MUSE_ATTNTAIL_OWNER_COLUMNS = 128
 _MUSE_ATTNTAIL_RESERVED_LDS = 128 * 1024
+# Up to this many rows, a decode GEMM over the rank's column shard (bitwise
+# the replicated GEMM's columns) feeds the same gather. At 16 rows in 8-rank
+# graph replay: about 16 us against 19.4-20.5 us for the replicated
+# projection plus boundary; the column GEMV senders lost there.
+_MUSE_MOETAIL_COLUMN_MAX_ROWS = 16
+# Columns each column-input sender pushes per row.
+_MUSE_MOETAIL_COLUMN_OUTPUTS = 8
 
 
 class MuseIrisState:
@@ -1560,10 +1571,15 @@ class MuseIrisState:
         beta: torch.Tensor,
         pre_weight: torch.Tensor | None,
     ) -> tuple[int, int] | None:
-        """Return the senders' GEMV geometry if the fused tail applies, else None."""
+        """Return the senders' geometry if the fused tail applies, else None.
+
+        The geometry is the column GEMV's (BLOCK_K, WAVES_PER_OUTPUT); above
+        ``_MUSE_MOETAIL_MAX_ROWS`` rows a column-shard decode GEMM projects the
+        rows instead and the geometry is unused.
+        """
         reduction = self.reduction
         # TP4 takes one row: more rows were not measured there.
-        max_rows = _MUSE_MOETAIL_MAX_ROWS if self.world_size == 8 else 1
+        max_rows = _MUSE_MOETAIL_COLUMN_MAX_ROWS if self.world_size == 8 else 1
         if (
             not current_platform().is_cdna4
             or self.world_size not in (4, 8)
@@ -1594,6 +1610,15 @@ class MuseIrisState:
             for value, dtype in vectors
         ):
             return None
+        if rows > _MUSE_MOETAIL_MAX_ROWS:
+            # The replicated path would run the decode GEMM; its column shard
+            # keeps every output's reduction.
+            local_width = _MUSE_BOUNDARY_WIDTH // self.world_size
+            if not supports_gluon_mm_a16w16_column_shard_gfx950(
+                rows, weight.shape[0], local_width, weight.shape[1]
+            ):
+                return None
+            return 0, 0
         # Senders repeat the replicated GEMV's per-output reduction, each
         # storing an even number of outputs in its 16 subgroups.
         block_k, waves = gluon_rowcta_bf16_gemv_geometry_gfx950(*weight.shape)
@@ -1615,7 +1640,7 @@ class MuseIrisState:
 
         ``weight`` is the replicated ``[8192, 4096]`` projection; the rows are
         gathered through the Lamport one-shot mailbox. TP8 takes up to
-        ``_MUSE_MOETAIL_MAX_ROWS`` rows, TP4 one.
+        ``_MUSE_MOETAIL_COLUMN_MAX_ROWS`` rows, TP4 one.
         """
         return (
             self._moetail_geometry(
@@ -1641,8 +1666,9 @@ class MuseIrisState:
         """Project this rank's columns of each row, gather the rows, update the residual.
 
         Returns the FP32 residual and, with ``pre_weight``, the BF16 input of
-        the next layer; each row is the replicated single-row projection of
-        that row followed by the Triton boundary.
+        the next layer; each row is the replicated projection of that row (the
+        single-row GEMV up to ``_MUSE_MOETAIL_MAX_ROWS`` rows, the decode GEMM
+        beyond) followed by the Triton boundary.
         """
         geometry = self._moetail_geometry(
             x.shape[0], weight, stream, post_weight, alpha, beta, pre_weight
@@ -1661,13 +1687,52 @@ class MuseIrisState:
             if pre_weight is not None
             else None
         )
+        local_weight = weight[rank * local_width : (rank + 1) * local_width]
+        if rows > _MUSE_MOETAIL_MAX_ROWS:
+            columns = torch.empty(
+                rows, local_width, dtype=torch.bfloat16, device=x.device
+            )
+            launch_gluon_mm_a16w16_column_shard_gfx950(x, local_weight, columns)
+            outputs = _MUSE_MOETAIL_COLUMN_OUTPUTS
+            # Sixteen-subgroup senders of `outputs` columns each, then one
+            # reducer per row.
+            iris_columns_lamport_allgather_muse_moetail[
+                (local_width // outputs + rows,)
+            ](
+                columns,
+                reduction.lamport_region,
+                reduction.lamport_epochs,
+                reduction.lamport_peer_addresses[: self.world_size],
+                stream,
+                post_weight,
+                alpha,
+                beta,
+                pre_weight if pre_weight is not None else post_weight,
+                out_stream,
+                pre_bf16 if pre_bf16 is not None else x,
+                rows,
+                RANK=rank,
+                WORLD_SIZE=self.world_size,
+                LOCAL_WIDTH=local_width,
+                MAX_ELEMENTS=reduction.lamport_max_numel,
+                BLOCK_M=1 << (rows - 1).bit_length(),
+                OUTPUTS=outputs,
+                POST_EPS=post_eps,
+                POST_WEIGHT_OFFSET=post_weight_offset,
+                PRE_EPS=pre_eps,
+                PRE_WEIGHT_OFFSET=pre_weight_offset,
+                HAS_PRE=pre_weight is not None,
+                PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+                num_warps=16,
+            )
+            return out_stream, pre_bf16
         # Sixteen-subgroup programs of 16 // waves outputs each, then one
         # reducer per row.
         iris_fused_gemv_lamport_allgather_muse_moetail[
             (local_width * waves // 16 + rows,)
         ](
             x,
-            weight[rank * local_width : (rank + 1) * local_width],
+            local_weight,
             reduction.lamport_region,
             reduction.lamport_epochs,
             reduction.lamport_peer_addresses[: self.world_size],
@@ -2141,6 +2206,107 @@ class MuseIrisState:
             num_warps=4,
         )
         return output
+
+    def can_all_gather_rmsnorm_mxfp4_quant_topk(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+    ) -> bool:
+        """Check the Lamport gather-and-quantize that also routes its rows.
+
+        The rows' FP32 logits must be contiguous ``[rows, bias.shape[0]]``.
+        """
+        experts = bias.shape[0] if bias.ndim == 1 else -1
+        return (
+            self.can_all_gather_rmsnorm_mxfp4_quant(local, weight)
+            and self._lamport_gathers_rmsnorm_mxfp4(local)
+            # The gfx950 top-k body takes power-of-two expert and top-k counts.
+            and triton.next_power_of_2(experts) == experts <= 1024
+            and triton.next_power_of_2(topk) == topk <= min(16, experts)
+            and bias.dtype == torch.float32
+            and bias.is_contiguous()
+            and bias.device == local.device
+        )
+
+    def all_gather_rmsnorm_mxfp4_quant_topk(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        routed_scaling_factor: float,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Gather and quantize the expert inputs, and route the rows, in one launch.
+
+        Returns the MXFP4 rows and scales of :meth:`all_gather_rmsnorm_mxfp4_quant`
+        and the FP32 weights and int32 ids of the gfx950 biased-sigmoid top-k
+        (normalized, then scaled by ``routed_scaling_factor``).
+        """
+        if not self.can_all_gather_rmsnorm_mxfp4_quant_topk(
+            local, weight, bias, topk
+        ) or (
+            logits.shape != (local.shape[0], bias.shape[0])
+            or logits.dtype != torch.float32
+            or not logits.is_contiguous()
+            or logits.device != local.device
+        ):
+            raise RuntimeError("unsupported Iris gather, MXFP4 and top-k fusion")
+        if local.data_ptr() % 4:
+            # Rank-local fallback could split ranks across protocols.
+            raise ValueError(
+                "iris_fused_lamport_allgather_rmsnorm_mxfp4_topk reads BF16 pairs "
+                f"as 32-bit words; local starts at byte {local.data_ptr() % 4} of a word"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+            empty_swizzled_cdna4_mxfp4_scale,
+        )
+
+        rows, local_width = local.shape
+        total_width = local_width * self.world_size
+        packed = torch.empty(
+            (rows, total_width // 2), dtype=torch.uint8, device=local.device
+        )
+        scales = empty_swizzled_cdna4_mxfp4_scale(
+            rows, total_width // 32, device=local.device
+        )
+        topk_ids = torch.empty((rows, topk), dtype=torch.int32, device=local.device)
+        topk_weights = torch.empty(
+            (rows, topk), dtype=torch.float32, device=local.device
+        )
+        iris_fused_lamport_allgather_rmsnorm_mxfp4_topk[(2 * rows,)](
+            local,
+            weight,
+            packed,
+            scales,
+            self.reduction.lamport_region,
+            self.reduction.lamport_epochs,
+            self.reduction.lamport_peer_addresses[: self.world_size],
+            scales.stride(0),
+            scales.stride(1),
+            logits,
+            bias,
+            topk_ids,
+            topk_weights,
+            rows,
+            rank=self.all_reduce.rank_in_group,
+            local_width=local_width,
+            total_width=total_width,
+            eps=eps,
+            weight_offset=weight_offset,
+            max_elements=self.reduction.lamport_max_numel,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            WAIT_STORES=self._arch.wait_stores,
+            EXPERTS=logits.shape[1],
+            TOPK=topk,
+            ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
+            num_warps=1,
+        )
+        return (packed, scales), topk_weights, topk_ids
 
     def all_gather_rmsnorm_mxfp4_quant(
         self,

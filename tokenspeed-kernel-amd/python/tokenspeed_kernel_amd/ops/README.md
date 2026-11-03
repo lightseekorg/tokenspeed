@@ -46,6 +46,55 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can increase cross-rank
 skew and regress performance even when the generated kernel remains correct.
 
+## Persistent kernels (gfx950)
+
+`gfx950/persistent/` holds device helpers for kernels that keep one
+workgroup on every CU for the whole launch and hand work between workgroups
+through memory instead of kernel boundaries.
+
+#### Contract
+
+- The kernel is a plain launch of `GRID` (256) workgroups that are all
+  resident: each reserves more than half of a CU's LDS.
+- `enter_launch(epochs, claims, errors, deadline_ticks, label, on_expiry)`
+  advances the workgroup's epoch word (one per program id, `.cv` load, `.wt`
+  store), reads its XCD from `HW_REG_XCC_ID`, and claims the logical id
+  `cta = (pid // 8) * 8 + xcd` by exchanging `(tag, pid)` into
+  `claims[xcd][pid // 8]`. It returns a `Launch`. Roles use `cta`, never
+  `pid % 8`: dispatch hands the XCDs workgroups in turn from a start that
+  depends on the kernels before. A claim that finds this launch's tag means
+  two workgroups took one role, and `on_expiry` runs before any
+  role-dependent store. Epoch and claim words are zeroed together, once.
+- `grid_join(joins, launch, on_expiry, SET)` waits until all workgroups
+  arrive; `SET` is the join's index in the launch modulo 2. Stores issued
+  before it are visible after it to `.cv` loads.
+- `wait_word(ptr, expected, launch, on_expiry, SITE)` waits until an int32
+  word equals `expected`, then joins the workgroup.
+- Every wait gives up at `deadline_ticks` (10 ns ticks) or when a peer has
+  set the abort word, then calls `on_expiry(launch, site, detail)`.
+  `fail_stop` records `(site, cta, detail, epoch, label)` in the error words
+  and runs `s_trap 2`, which aborts the process. Kernels pass handlers that
+  do not return; a handler that also stops peers belongs to the caller.
+
+#### Algorithm
+
+- Producers drain (`s_waitcnt vmcnt(0)` in every wave, then a workgroup
+  barrier) before they publish; `gl.barrier()` alone waits for no store.
+  Consumers read with `.cv` loads, which bypass non-coherent L2 lines.
+  Nothing invalidates or writes back L2.
+- The join is a two-level top-bit toggle: the 32 workgroups of an XCD add to
+  their XCD's line (the designated one adds `1 + 2**31 - 32`), so the 32nd
+  arrival flips bit 31; that arrival adds to the grid line the same way.
+  Both levels flip once per join from the same start, so a waiter knows the
+  bit to wait for from its own XCD arrival, and no join needs a reset.
+  Consecutive joins alternate two line sets; a set is reused only after
+  every workgroup passed the join in between, so the grid line holds exactly
+  0 or `-2**31` while anyone waits on it.
+- `wait_word` polls from one lane with relaxed device-scope loads
+  (`gl.atomic_poll`, no barrier in its loop); its closing workgroup barrier
+  orders the loads after it. It checks the deadline and the abort word every
+  50 us of polling.
+
 ## GEMM
 
 ### gfx950 dense BF16 projections
@@ -77,6 +126,13 @@ Qwen3.8-Flash-Next decode batches.
   single rounding. It reuses the decode tile for `M` and accepts only buckets
   without split-K (Kimi K3 latent up-projection, `2 <= M <= 32`), replacing a
   separate add kernel.
+- `launch_gluon_mm_a16w16_column_shard_gfx950` runs the decode kernel over a
+  column shard `[shard_n, K]` of a replicated weight with full-K 16x16 tiles
+  (512-deep K, three buffers). Every output issues its 16x16x32 MFMAs over K
+  in order on one FP32 accumulator whatever the tile shape, so when the full
+  GEMM's measured config has no split-K
+  (`supports_gluon_mm_a16w16_column_shard_gfx950`) each column equals the
+  replicated GEMM's bitwise.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.
@@ -181,6 +237,58 @@ both operands along K into registers, issues every load before the first
 `V_MFMA_F32_16X16X4_F32`, and the waves' tiles are summed. Each program stores
 its partial and bumps the tile's arrival counter; the last to arrive sums the
 partials in split order, scales, writes the tile and resets the counter.
+
+### gfx950 FP32 router with a decode GEMM
+
+`gluon_fp32_router_gemv_mm_a16w16_gfx950` (`gemm/fp32/router_gemv.py`) runs
+the router's split-K GEMM and an independent BF16 decode GEMM
+(`gluon_mm_a16w16_medium_gfx950`) in one launch.
+`gemm.fp32_router_gemv_execute_with_mm` selects it.
+
+#### Contract
+
+- Router operands as for the router GEMV; `mm_a` `[M, K']` and `mm_b`
+  `[N', K']` contiguous BF16, `mm_out` an `[M, N']` BF16 destination.
+- `1 <= M <= 16`, `N` a multiple of 16, `K` a multiple of 512, and a measured
+  four-wave decode GEMM config for `(M, N', K')`.
+- `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
+  16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
+  rows and differ from the GEMV's in the last bits at 1-8 rows.
+
+#### Algorithm
+
+Programs `[0, P)` are the router's split-K programs and the rest the decode
+GEMM's, with its program ids offset by `P`. Neither half waits on the other.
+The split-K router reads 32 KB of activations per program, where a GEMV
+program reads all of them, so both weight streams finish together.
+
+### gfx950 K-split BF16 decode GEMV task bodies
+
+`gemm/fp16/gemv_splitk.py` holds the K-split GEMV as device functions that a
+persistent kernel calls with explicit task ids, plus a standalone launcher
+(`launch_gluon_gemv_a16w16_splitk_gfx950`) for tests and benchmarks.
+
+#### Contract
+
+- `x` `[M, K]` BF16 with `1 <= M <= 16`, `weight` `[N, K]` contiguous BF16,
+  `N` a multiple of 16 * 16 and `K` of 16 * 8 * 32. Task `t` owns weight rows
+  of group `t % GROUPS` and K slice `t // GROUPS` (16 x 16 tasks).
+- `gemv_a16w16_splitk_weights_gfx950` issues a task's weight loads;
+  `gemv_a16w16_splitk_finish_gfx950` multiplies and stores one 64-bit word
+  per (part, token, row): FP32 value bits low, the caller's `tag` high, one
+  store. Tags must change between uses of the partial buffer.
+- `gemv_a16w16_splitk_sum_gfx950` waits for the tagged words at the caller's
+  offsets (one vote per wave per retry, no barrier) and sums them in part
+  order, stopping at a `Launch` deadline through the caller's `on_expiry`.
+- Results are deterministic but not bit-equal to a full-K GEMV.
+
+#### Algorithm
+
+Weights and the task's x slice load straight into the 16x16x32 MFMA operand
+layouts, so nothing passes through LDS before the MFMAs. A task reads only
+its K slice of x, which keeps the GEMV flat in N at 8-16 rows where a full-K
+GEMV rereads all of x per program. The eight waves' accumulators meet in LDS
+behind one barrier.
 
 ### gfx950 dense BF16 decode GEMV
 

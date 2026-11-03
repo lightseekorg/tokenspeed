@@ -32,8 +32,11 @@ if not is_cdna4():
 from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     fp32_router_gemv_counters,
     fp32_router_gemv_execute,
+    fp32_router_gemv_execute_with_mm,
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
+    fp32_router_gemv_with_mm_supported,
+    mm,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (  # noqa: E402
     MAX_K,
@@ -220,3 +223,49 @@ def test_splitk_router_compiles_once_per_bucket() -> None:
     with assert_no_triton_compile(gluon_fp32_router_gemv_splitk_gfx950):
         for rows in range(min(SPLITK_ROWS), max(SPLITK_ROWS) + 1):
             _launch(x[:rows].contiguous(), prepared, MULTIPLIER)
+
+
+def _router_plan():
+    return fp32_router_gemv_plan(
+        hidden_size=8192,
+        output_size=256,
+        dtype=torch.float32,
+        solution=None,
+        batch_invariant=False,
+    )
+
+
+# 8 rows are below the split-K buckets, 16 rows inside the first one.
+@pytest.mark.parametrize("rows", [8, 16])
+def test_router_with_mm_matches_the_split_k_router_and_mm(rows: int) -> None:
+    """One launch writes mm's bits and the split-K router's logits."""
+    plan = _router_plan()
+    x, weight = _problem(16, 8192, 256, 20261103)
+    weight *= 0.02
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    mm_a = torch.randn(rows, 8192, device="cuda", generator=generator).bfloat16()
+    mm_b = (
+        torch.randn(512, 8192, device="cuda", generator=generator) * 0.02
+    ).bfloat16()
+    router_rows = x[:rows].contiguous()
+    assert fp32_router_gemv_with_mm_supported(plan, router_rows, mm_a, mm_b)
+    mm_out = torch.full((rows, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+    logits = fp32_router_gemv_execute_with_mm(
+        plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
+    )
+    assert torch.equal(mm_out, mm(mm_a, mm_b))
+    # A row's split-K logits do not depend on the other rows of its tile, so
+    # the standalone 16-row split-K launch gives the same bits.
+    assert torch.equal(logits, _launch(x, prepared, MULTIPLIER)[:rows])
+
+
+# One row has no decode GEMM config, mm sends 2-4 rows of this shape to the
+# rowcta GEMV, and 17 rows exceed the shared router tile.
+@pytest.mark.parametrize("rows", [1, 2, 17])
+def test_router_with_mm_declines_outside_its_contract(rows: int) -> None:
+    plan = _router_plan()
+    x = torch.randn(rows, 8192, device="cuda")
+    mm_a = torch.randn(rows, 8192, device="cuda").bfloat16()
+    mm_b = torch.randn(512, 8192, device="cuda").bfloat16()
+    assert not fp32_router_gemv_with_mm_supported(plan, x, mm_a, mm_b)
