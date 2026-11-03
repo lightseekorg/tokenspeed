@@ -138,6 +138,26 @@ def test_router_weights_at_entry_would_queue_the_owner_poll():
         check_plan(_edit(plan, (3, 0), router_at_entry))
 
 
+def test_tail_workgroups_push_every_h5_before_waiting_on_one():
+    """At 16 rows a tail workgroup completes two routes: both H5 pushes go
+    out before its first H5 wait, so the second push does not wait for the
+    first row's whole H5 hop."""
+    plan = muse_plan(PlanKey(2, "sliding", "sliding"))
+    for xcd in range(8):
+        steps = plan.programs[(xcd, 24)]
+        pushes = [
+            i
+            for i, x in enumerate(steps)
+            if isinstance(x, Publish) and x.keys[0].startswith("H5")
+        ]
+        waits = [
+            i for i, x in enumerate(steps) if isinstance(x, Wait) and x.role == "FIN"
+        ]
+        assert len(pushes) == 2 and len(waits) == 2
+        assert max(pushes) < min(waits)
+    assert check_plan(plan) > 0
+
+
 def test_a_wait_cycle_is_rejected():
     """Each owner waits for the next owner's AG words before publishing its
     own: a ring of waits that resident workgroups cannot leave."""

@@ -43,10 +43,11 @@ Per XCD, in launch order:
 - tail: the QKV task's weights at the MoE end (not when the next layer is
   regular; UNP workgroups issue the relay's weights, then the QKV task's
   first window, and the rest of it after UNP, before RED's scalar polls),
-  then OWN4 + FIN on slots 0 and 24-30 (tail index i, tokens i + 8 r), UNP
-  on 16-23 (slot 16 also RED), then the QKV task (part 2 xcd + slot % 2,
-  group slot // 2) on every workgroup, then HEAD i * 8 + xcd < 34 on tail
-  workgroups; or BND2 on tail workgroups when the next layer is regular.
+  then OWN4 of every row, then FIN, on slots 0 and 24-30 (tail index i,
+  tokens i + 8 r), UNP on 16-23 (slot 16 also RED), then the QKV task (part
+  2 xcd + slot % 2, group slot // 2) on every workgroup, then HEAD i * 8 +
+  xcd < 34 on tail workgroups; or BND2 on tail workgroups when the next
+  layer is regular.
 """
 
 from __future__ import annotations
@@ -251,15 +252,19 @@ def _tail(key: PlanKey, xcd: int, slot: int) -> list:
         steps.append(Load("QKV", _ALL))  # paced, at this workgroup's MoE end
     if tail:
         index = TAIL_SLOTS.index(slot)
-        for r in range(requests):
-            token = index + 8 * r
-            h5 = tuple(f"H5[{token}][{k}]" for k in range(XCDS))
+        tokens = [index + 8 * r for r in range(requests)]
+        # Every row's OWN4 push before any FIN wait; one S publish.
+        for token in tokens:
             steps += [
                 Wait("OWN4", _ALL, all_h4, "vector", _LANDED),
                 Publish("OWN4", _ALL, (f"H5[{token}][{xcd}]",)),
-                Wait("FIN", _ALL, h5, "vector", _LANDED),
-                Publish("FIN", _ALL, (f"S[{xcd}][{token}]",)),
             ]
+        for token in tokens:
+            h5 = tuple(f"H5[{token}][{k}]" for k in range(XCDS))
+            steps.append(Wait("FIN", _ALL, h5, "vector", _LANDED))
+        steps.append(
+            Publish("FIN", _ALL, tuple(f"S[{xcd}][{token}]" for token in tokens))
+        )
     elif unp:
         sender = xcd * 8 + slot - 16
         s_lines = tuple(f"S[{p}][{t}]" for p in range(XCDS) for t in range(rows))

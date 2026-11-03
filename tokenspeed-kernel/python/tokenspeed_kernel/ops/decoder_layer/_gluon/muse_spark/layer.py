@@ -1088,24 +1088,34 @@ def _publish_hprime(launch, part, exchange_ptr):
 
 
 @gluon.jit
-def _publish_s(launch, s, token, part, rows, s_rows_ptr, exchange_ptr):
-    """FIN's routed sum of (token, part) as BF16 (the post-expert
-    projection's input) to ``s_rows [MAX_ROWS, 4096]`` written through,
-    then its tag in the S tags ``[part][row]`` (also row ``token + 8`` when
-    the launch has at most 8 rows: UNP polls 16-row lines)."""
+def _store_s(s, token, part, s_rows_ptr):
+    """FIN's routed sum of (token, part), FP32 [512], as BF16 (the
+    post-expert projection's input) to ``s_rows [MAX_ROWS, 4096]``, written
+    through. :func:`_publish_s` then publishes it."""
     columns = gl.arange(0, 512, layout=s.type.layout)
     gl.amd.cdna4.buffer_store(
         s.to(gl.bfloat16), s_rows_ptr, token * _POOLED + part * 512 + columns,
         cache=".wt",
     )  # fmt: skip
+
+
+@gluon.jit
+def _publish_s(launch, first_token, ROWS: gl.constexpr, part, rows, exchange_ptr):
+    """After this workgroup's :func:`_store_s` of tokens ``first_token + 8 r``
+    (r < ROWS): one drain for them all, then their tags in the S tags
+    ``[part][row]`` (also row ``token + 8`` when the launch has at most 8
+    rows: UNP polls 16-row lines)."""
     release_drain()
     gl.barrier()
     lanes_l: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     lane = gl.arange(0, 64 * gl.num_warps(), lanes_l)
     tag = gl.full([64 * gl.num_warps()], 0, gl.int32, lanes_l) + launch.tag
-    tags = exchange_ptr + _EX_S_TAGS + part * _MAX_ROWS + token
-    gl.amd.cdna4.buffer_store(tag, tags, lane * 0, mask=lane == 0)
-    gl.amd.cdna4.buffer_store(tag, tags, lane * 0 + 8, mask=(lane == 0) & (rows <= 8))
+    for r in gl.static_range(ROWS):
+        tags = exchange_ptr + _EX_S_TAGS + part * _MAX_ROWS + first_token + 8 * r
+        gl.amd.cdna4.buffer_store(tag, tags, lane * 0, mask=lane == 0)
+        gl.amd.cdna4.buffer_store(
+            tag, tags, lane * 0 + 8, mask=(lane == 0) & (rows <= 8)
+        )
 
 
 @gluon.jit
@@ -1800,22 +1810,25 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
                 _QKV_TASK_ROWS // 16,
             )  # fmt: skip
-        # OWN4 then FIN of pick / part xcd.
+        # OWN4 of every row's pick xcd first, so the second row's H5 push
+        # does not wait for the first row's FIN; then FIN of part xcd per
+        # row, and one drain and tag publish for all the rows' S.
         for r in gl.static_range(REQUESTS):
-            token = index + 8 * r
             own4_complete(
-                view, launch, token * _TOPK + xcd, route_norm_ptr, iris_fail_stop,
-                RANK, ROUTE_OFFSET, PEER_CACHE,
+                view, launch, (index + 8 * r) * _TOPK + xcd, route_norm_ptr,
+                iris_fail_stop, RANK, ROUTE_OFFSET, PEER_CACHE,
             )  # fmt: skip
             _stamp(stamps_ptr, launch.cta, _STAMP_OWN4, STAMPS)
+        for r in gl.static_range(REQUESTS):
             s = fin(
-                view, launch, token, xcd,
+                view, launch, index + 8 * r, xcd,
                 (exchange + _EX_WEIGHTS).to(gl.pointer_type(gl.float32), bitcast=True),
                 route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
             )  # fmt: skip
             _stamp(stamps_ptr, launch.cta, _STAMP_FIN, STAMPS)
-            _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
-            _stamp(stamps_ptr, launch.cta, _STAMP_S, STAMPS)
+            _store_s(s, index + 8 * r, xcd, s_rows)
+        _publish_s(launch, index, REQUESTS, xcd, rows, exchange)
+        _stamp(stamps_ptr, launch.cta, _STAMP_S, STAMPS)
     else:
         if NEXT_KIND != 2:
             # The other workgroups stream their task while the tail's
