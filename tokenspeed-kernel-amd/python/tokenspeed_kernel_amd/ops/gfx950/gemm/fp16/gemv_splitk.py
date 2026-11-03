@@ -84,7 +84,9 @@ def gemv_a16w16_splitk_weights_gfx950(
     K = 8192 in 16 parts). Loads are ``.cg`` (streamed once).
     """
     TILES: gl.constexpr = ROWS_PER_TASK // 16
-    base, group = _weight_tile_base(task, K, ROWS_PER_TASK, PARTS, GROUPS)
+    base, group = _weight_tile_base(
+        task, K, ROWS_PER_TASK, PARTS, GROUPS, K // PARTS // gl.num_warps()
+    )
     tiles = ()
     for t in gl.static_range(TILES):
         tiles += (
@@ -119,7 +121,9 @@ def gemv_a16w16_splitk_weights_paced_gfx950(
     gl.static_assert(
         1 <= WINDOW and (WINDOW >= TILES or (WINDOW - 1) * LOADS <= _MAX_VMCNT_WAIT)
     )
-    base, group = _weight_tile_base(task, K, ROWS_PER_TASK, PARTS, GROUPS)
+    base, group = _weight_tile_base(
+        task, K, ROWS_PER_TASK, PARTS, GROUPS, K // PARTS // gl.num_warps()
+    )
     tiles = ()
     for t in gl.static_range(TILES):
         if t >= WINDOW:
@@ -137,10 +141,11 @@ def _weight_tile_base(
     ROWS_PER_TASK: gl.constexpr,
     PARTS: gl.constexpr,
     GROUPS: gl.constexpr,
+    KSPAN: gl.constexpr,
 ):
-    """Element offsets of a task's weight rows in the MFMA A layout, without
-    the row group, and the group: tile ``t`` is ``(group * TILES + t) * 16 *
-    K`` past them."""
+    """Element offsets of a task's weight rows in the MFMA A layout, the
+    first ``KSPAN`` of each wave's K range, without the row group, and the
+    group: tile ``t`` is ``(group * TILES + t) * 16 * K`` past them."""
     WAVES: gl.constexpr = gl.num_warps()
     KP: gl.constexpr = K // PARTS
     KW: gl.constexpr = KP // WAVES
@@ -150,7 +155,7 @@ def _weight_tile_base(
     )
     wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, a_l)))
     row = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, a_l)))
-    k = gl.arange(0, KW, gl.SliceLayout(0, gl.SliceLayout(1, a_l)))
+    k = gl.arange(0, KSPAN, gl.SliceLayout(0, gl.SliceLayout(1, a_l)))
     group = task % GROUPS
     part = task // GROUPS
     base = (
@@ -231,6 +236,36 @@ def gemv_a16w16_splitk_finish_gfx950(
 
 
 @gluon.jit
+def _store_partials(
+    bufs, part_ptr, tag, group, part, M, N: gl.constexpr, PART_CACHE: gl.constexpr
+):
+    """After one barrier, sum each tile's ``[waves, 16, 16]`` accumulators in
+    ``bufs`` over the waves and store them as the finish's tagged words."""
+    WAVES: gl.constexpr = gl.num_warps()
+    TILES: gl.constexpr = len(bufs)
+    gl.barrier()
+    sum_l: gl.constexpr = gl.BlockedLayout(
+        [WAVES, 1, 1], [1, 4, 16], [1, WAVES // 2, 2], [2, 1, 0]
+    )
+    out_l: gl.constexpr = gl.SliceLayout(0, sum_l)
+    r = gl.arange(0, 16, gl.SliceLayout(1, out_l))
+    c = gl.arange(0, _BLOCK_T, gl.SliceLayout(0, out_l))
+    for t in gl.static_range(TILES):
+        value = gl.sum(bufs[t].load(sum_l), axis=0)
+        rows = (group * TILES + t) * 16 + r
+        word = (tag.to(gl.int64) << 32) | (
+            value.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF
+        )
+        cdna4.buffer_store(
+            word,
+            part_ptr,
+            (part * M + c[None, :]) * N + rows[:, None],
+            mask=(c < M)[None, :] & (rows < N)[:, None],
+            cache=PART_CACHE,
+        )
+
+
+@gluon.jit
 def gemv_a16w16_splitk_finish_x_gfx950(
     tiles,
     x,
@@ -263,26 +298,7 @@ def gemv_a16w16_splitk_finish_x_gfx950(
             cdna4.mfma(tiles[t], x, gl.zeros((WAVES, 16, _BLOCK_T), gl.float32, mfma))
         )
         bufs += (buf,)
-    gl.barrier()
-    sum_l: gl.constexpr = gl.BlockedLayout(
-        [WAVES, 1, 1], [1, 4, 16], [1, WAVES // 2, 2], [2, 1, 0]
-    )
-    out_l: gl.constexpr = gl.SliceLayout(0, sum_l)
-    r = gl.arange(0, 16, gl.SliceLayout(1, out_l))
-    c = gl.arange(0, _BLOCK_T, gl.SliceLayout(0, out_l))
-    for t in gl.static_range(TILES):
-        value = gl.sum(bufs[t].load(sum_l), axis=0)
-        rows = (group * TILES + t) * 16 + r
-        word = (tag.to(gl.int64) << 32) | (
-            value.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF
-        )
-        cdna4.buffer_store(
-            word,
-            part_ptr,
-            (part * M + c[None, :]) * N + rows[:, None],
-            mask=(c < M)[None, :] & (rows < N)[:, None],
-            cache=PART_CACHE,
-        )
+    _store_partials(bufs, part_ptr, tag, group, part, M, N, PART_CACHE)
 
 
 @gluon.jit
@@ -348,6 +364,244 @@ def gemv_a16w16_splitk_hi_lo_sums_gfx950(hi, lo, x, OUT_LAYOUT: gl.constexpr):
         acc = cdna4.mfma(lo[t], xh, acc)
         accs += (cdna4.mfma(hi[t], xl, acc),)
     return gemv_a16w16_splitk_exchange_gfx950(accs, OUT_LAYOUT)
+
+
+# A 32-deep K step: one 16x16x32 MFMA per tile.
+_STEP_K = gl.constexpr(32)
+
+
+@gluon.constexpr_function
+def gemv_a16w16_splitk_step_layout(waves: int):
+    """The MFMA B operand layout of one 32-deep K step, ``[waves, 32, 16]``."""
+    return gl.DotOperandLayout(operand_index=1, parent=_mfma(waves), k_width=8)
+
+
+@gluon.jit
+def gemv_a16w16_splitk_weight_steps_gfx950(
+    w_ptr,
+    task,
+    K: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    WINDOW: gl.constexpr,
+):
+    """:func:`gemv_a16w16_splitk_weights_paced_gfx950` by K step:
+    ``tiles[t][s]`` is tile ``t``'s ``[waves, 16, 32]`` BF16 A operand of the
+    wave's K step ``s``. The same loads in the same order (one 16-byte load
+    per lane per tile and step) and the same pacing (``WINDOW`` at least the
+    tile count: no wait), for a caller that builds x one step at a time."""
+    TILES: gl.constexpr = ROWS_PER_TASK // 16
+    STEPS: gl.constexpr = K // PARTS // gl.num_warps() // _STEP_K
+    gl.static_assert(
+        1 <= WINDOW and (WINDOW >= TILES or (WINDOW - 1) * STEPS <= _MAX_VMCNT_WAIT)
+    )
+    base, group = _weight_tile_base(task, K, ROWS_PER_TASK, PARTS, GROUPS, _STEP_K)
+    tiles = ()
+    for t in gl.static_range(TILES):
+        if t >= WINDOW:
+            wait_vmcnt((WINDOW - 1) * STEPS)
+        steps = ()
+        for step in gl.static_range(STEPS):
+            steps += (
+                cdna4.buffer_load(
+                    w_ptr,
+                    base + (group * TILES + t) * 16 * K + step * _STEP_K,
+                    cache=".cg",
+                ),
+            )
+        tiles += (steps,)
+    return tiles
+
+
+@gluon.jit
+def gemv_a16w16_splitk_x_steps_gfx950(
+    x_ptr,
+    x_stride,
+    task,
+    M,
+    K: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    X_CACHE: gl.constexpr,
+):
+    """:func:`gemv_a16w16_splitk_x_gfx950` by K step: a tuple of the wave's
+    ``[waves, 32, 16]`` B operands, step ``s`` its K ``[32 s, 32 s + 32)``."""
+    WAVES: gl.constexpr = gl.num_warps()
+    KP: gl.constexpr = K // PARTS
+    KW: gl.constexpr = KP // WAVES
+    b_l: gl.constexpr = gemv_a16w16_splitk_step_layout(WAVES)
+    part = task // GROUPS
+    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, b_l)))
+    k = gl.arange(0, _STEP_K, gl.SliceLayout(0, gl.SliceLayout(2, b_l)))
+    token = gl.minimum(
+        gl.arange(0, _BLOCK_T, gl.SliceLayout(0, gl.SliceLayout(1, b_l))), M - 1
+    )
+    base = (
+        token[None, None, :] * x_stride
+        + (part * KP + wave * KW)[:, None, None]
+        + k[None, :, None]
+    )
+    steps = ()
+    for step in gl.static_range(KW // _STEP_K):
+        steps += (cdna4.buffer_load(x_ptr, base + step * _STEP_K, cache=X_CACHE),)
+    return steps
+
+
+@gluon.constexpr_function
+def _k_vector_layout(waves: int, kw: int, bits: int):
+    # 16 bytes per lane, a wave's 64 lanes over consecutive waves' K ranges, so
+    # each wave's LDS-direct copy writes one contiguous run; waves past the
+    # rows repeat a copy, which the compiler leaves to one of them.
+    vector = 128 // bits
+    lanes_k = kw // vector
+    return gl.BlockedLayout([1, vector], [64 // lanes_k, lanes_k], [waves, 1], [1, 0])
+
+
+@gluon.jit
+def gemv_a16w16_splitk_k_vector_to_shared_gfx950(
+    smem, v_ptr, task, K: gl.constexpr, PARTS: gl.constexpr, GROUPS: gl.constexpr
+):
+    """Copy task ``task``'s K slice of the per-K vector ``v_ptr`` (FP32 or
+    BF16) into ``smem`` ``[waves, K / PARTS / waves]`` (unswizzled), wave
+    w's K range in row w, with LDS-direct loads (no registers). The caller
+    commits the group and waits for it (``async_copy``) before reading."""
+    WAVES: gl.constexpr = gl.num_warps()
+    KP: gl.constexpr = K // PARTS
+    KW: gl.constexpr = KP // WAVES
+    layout: gl.constexpr = _k_vector_layout(
+        WAVES, KW, v_ptr.dtype.element_ty.primitive_bitwidth
+    )
+    wave = gl.arange(0, WAVES, gl.SliceLayout(1, layout))
+    k = gl.arange(0, KW, gl.SliceLayout(0, layout))
+    cdna4.async_copy.buffer_load_to_shared(
+        smem, v_ptr, (task // GROUPS * KP + wave * KW)[:, None] + k[None, :]
+    )
+
+
+@gluon.jit
+def gemv_a16w16_splitk_k_vector_step_gfx950(smem, step):
+    """K step ``step`` (constexpr) of a vector copied by
+    :func:`gemv_a16w16_splitk_k_vector_to_shared_gfx950`, as ``[waves, 32, 1]``
+    in the step's B operand layout (broadcast over the tokens)."""
+    b_l: gl.constexpr = gemv_a16w16_splitk_step_layout(gl.num_warps())
+    chunk = smem.slice(step * _STEP_K, _STEP_K, 1)
+    return chunk.load(gl.SliceLayout(2, b_l))[:, :, None]
+
+
+@gluon.jit
+def gemv_a16w16_splitk_b_step_gfx950(smem, step):
+    """K step ``step`` (constexpr) of a B operand stored in ``smem``
+    ``[waves, K / PARTS / waves, 16]``: ``[waves, 32, 16]`` in the step's
+    layout."""
+    b_l: gl.constexpr = gemv_a16w16_splitk_step_layout(gl.num_warps())
+    return smem.slice(step * _STEP_K, _STEP_K, 1).load(b_l)
+
+
+@gluon.jit
+def gemv_a16w16_splitk_wave_sums_steps_gfx950(
+    tiles, X_STEP: gl.constexpr, x_args, OUT_LAYOUT: gl.constexpr
+):
+    """:func:`gemv_a16w16_splitk_wave_sums_gfx950` with x built one K step at
+    a time: ``X_STEP(x_args, s)`` (constexpr ``s``) returns step ``s``'s
+    ``[waves, 32, 16]`` BF16 B operand, used by every tile's MFMA before the
+    next step's is built, so one step of x and its inputs is live.
+    ``tiles`` from :func:`gemv_a16w16_splitk_weight_steps_gfx950`. Each
+    tile's MFMAs run in K order on one accumulator, as the full-K dot does,
+    so the sums are bitwise the same."""
+    mfma: gl.constexpr = _mfma(gl.num_warps())
+    accs = ()
+    for t in gl.static_range(len(tiles)):
+        accs += (gl.zeros((gl.num_warps(), 16, _BLOCK_T), gl.float32, mfma),)
+    for step in gl.static_range(len(tiles[0])):
+        x = X_STEP(x_args, step)
+        next_accs = ()
+        for t in gl.static_range(len(tiles)):
+            next_accs += (cdna4.mfma(tiles[t][step], x, accs[t]),)
+        accs = next_accs
+    return gemv_a16w16_splitk_exchange_gfx950(accs, OUT_LAYOUT)
+
+
+@gluon.jit
+def gemv_a16w16_splitk_hi_lo_sums_steps_gfx950(
+    hi, lo, X_STEP: gl.constexpr, x_args, OUT_LAYOUT: gl.constexpr
+):
+    """:func:`gemv_a16w16_splitk_hi_lo_sums_gfx950` with x built one K step
+    at a time (``X_STEP`` returns FP32, as in
+    :func:`gemv_a16w16_splitk_wave_sums_steps_gfx950`). Only the steps' BF16
+    ``xh`` and ``xl`` stay live; each tile still runs ``hi xh`` over all K,
+    then ``lo xh``, then ``hi xl`` on one accumulator, so the sums are
+    bitwise the same."""
+    mfma: gl.constexpr = _mfma(gl.num_warps())
+    STEPS: gl.constexpr = len(hi[0])
+    accs = ()
+    for t in gl.static_range(len(hi)):
+        accs += (gl.zeros((gl.num_warps(), 16, _BLOCK_T), gl.float32, mfma),)
+    xhs = ()
+    xls = ()
+    for step in gl.static_range(STEPS):
+        x = X_STEP(x_args, step)
+        xh = x.to(gl.bfloat16)
+        xhs += (xh,)
+        xls += ((x - xh.to(gl.float32)).to(gl.bfloat16),)
+        next_accs = ()
+        for t in gl.static_range(len(hi)):
+            next_accs += (cdna4.mfma(hi[t][step], xh, accs[t]),)
+        accs = next_accs
+    for step in gl.static_range(STEPS):
+        next_accs = ()
+        for t in gl.static_range(len(hi)):
+            next_accs += (cdna4.mfma(lo[t][step], xhs[step], accs[t]),)
+        accs = next_accs
+    for step in gl.static_range(STEPS):
+        next_accs = ()
+        for t in gl.static_range(len(hi)):
+            next_accs += (cdna4.mfma(hi[t][step], xls[step], accs[t]),)
+        accs = next_accs
+    return gemv_a16w16_splitk_exchange_gfx950(accs, OUT_LAYOUT)
+
+
+@gluon.jit
+def gemv_a16w16_splitk_finish_steps_gfx950(
+    tiles,
+    X_STEP: gl.constexpr,
+    x_args,
+    part_ptr,
+    tag,
+    task,
+    M,
+    N: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    GROUPS: gl.constexpr,
+    PART_CACHE: gl.constexpr,
+):
+    """:func:`gemv_a16w16_splitk_finish_x_gfx950` with x built one K step at
+    a time, as in :func:`gemv_a16w16_splitk_wave_sums_steps_gfx950`: the
+    same MFMA order per tile, so the partial words are bitwise the same."""
+    WAVES: gl.constexpr = gl.num_warps()
+    TILES: gl.constexpr = ROWS_PER_TASK // 16
+    mfma: gl.constexpr = _mfma(WAVES)
+    group = task % GROUPS
+    part = task // GROUPS
+    accs = ()
+    for t in gl.static_range(TILES):
+        accs += (gl.zeros((WAVES, 16, _BLOCK_T), gl.float32, mfma),)
+    for step in gl.static_range(len(tiles[0])):
+        x = X_STEP(x_args, step)
+        next_accs = ()
+        for t in gl.static_range(TILES):
+            next_accs += (cdna4.mfma(tiles[t][step], x, accs[t]),)
+        accs = next_accs
+    bufs = ()
+    for t in gl.static_range(TILES):
+        buf = gl.allocate_shared_memory(
+            gl.float32,
+            [WAVES, 16, _BLOCK_T],
+            gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0]),
+        )
+        buf.store(accs[t])
+        bufs += (buf,)
+    _store_partials(bufs, part_ptr, tag, group, part, M, N, PART_CACHE)
 
 
 @gluon.jit
