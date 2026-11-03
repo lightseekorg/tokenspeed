@@ -50,11 +50,20 @@ _is_blackwell = current_platform().is_blackwell
 
 
 class GatedMLPFusion(enum.Enum):
-    """A kernel that applies SwiGLU inside the gate/up GEMM."""
+    """A kernel that applies SwiGLU inside the gate/up GEMM, or ``NONE``."""
 
+    NONE = "none"
     # NVFP4 GEMM whose epilogue also quantizes for an NVFP4 down_proj.
     NVFP4_GEMM_SWIGLU_QUANT = "nvfp4_gemm_swiglu_quant"
     MXFP4_GEMM_SWIGLU = "mxfp4_gemm_swiglu"
+
+    @property
+    def is_nvfp4_gemm_swiglu_quant(self) -> bool:
+        return self is GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT
+
+    @property
+    def is_mxfp4_gemm_swiglu(self) -> bool:
+        return self is GatedMLPFusion.MXFP4_GEMM_SWIGLU
 
 
 def _supports(
@@ -63,18 +72,18 @@ def _supports(
     """Whether both projections' quantization can run ``fusion``."""
     gate_up_method = gate_up_proj.quant_method
     down_method = down_proj.quant_method
-    if fusion is GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT:
+    if fusion.is_nvfp4_gemm_swiglu_quant:
         return (
             envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
             and _is_blackwell
             and isinstance(gate_up_method, Nvfp4LinearMethod)
             and isinstance(down_method, Nvfp4LinearMethod)
         )
-    if fusion is GatedMLPFusion.MXFP4_GEMM_SWIGLU:
+    if fusion.is_mxfp4_gemm_swiglu:
         return isinstance(gate_up_method, Mxfp4LinearMethod) and isinstance(
             down_method, Mxfp4LinearMethod
         )
-    raise ValueError(f"Unhandled gated MLP fusion: {fusion}")
+    raise ValueError(f"Not a fused gated MLP kernel: {fusion}")
 
 
 def gated_activation(hidden_act: str) -> nn.Module:
@@ -113,14 +122,13 @@ class GatedMLP(nn.Module):
         self.gate_up_proj = gate_up_proj
         self.down_proj = down_proj
         self.act_fn = activation
-        self.fusion: GatedMLPFusion | None = next(
-            (f for f in fusions if _supports(f, gate_up_proj, down_proj)), None
+        self.fusion = next(
+            (f for f in fusions if _supports(f, gate_up_proj, down_proj)),
+            GatedMLPFusion.NONE,
         )
         # Both fused GEMMs need their weight layout chosen before loading.
-        gate_up_proj.interleave_linear_and_gate = (
-            self.fusion is GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT
-        )
-        if self.fusion is GatedMLPFusion.MXFP4_GEMM_SWIGLU:
+        gate_up_proj.interleave_linear_and_gate = self.fusion.is_nvfp4_gemm_swiglu_quant
+        if self.fusion.is_mxfp4_gemm_swiglu:
             gate_up_proj.quant_method.enable_swiglu(gate_up_proj)
 
     @classmethod
@@ -173,7 +181,7 @@ class GatedMLP(nn.Module):
         """Run the MLP; ``x_nvfp4`` is gate_up_proj's input when its producer quantized ``x``."""
         if x.shape[0] == 0:
             return x
-        if self.fusion is GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT:
+        if self.fusion.is_nvfp4_gemm_swiglu_quant:
             if x_nvfp4 is None:
                 x_nvfp4 = fp4_quantize(x, self.gate_up_proj.input_scale_inv)
             activated = nvfp4_gemm_swiglu_nvfp4_quant(
@@ -184,13 +192,12 @@ class GatedMLP(nn.Module):
                 self.down_proj.input_scale_inv,
             )
             output, _ = self.down_proj(activated)
-            return output
-        if self.fusion is GatedMLPFusion.MXFP4_GEMM_SWIGLU:
+        elif self.fusion.is_mxfp4_gemm_swiglu:
             activated = self.gate_up_proj.quant_method.apply_swiglu(
                 self.gate_up_proj, x
             )
             output, _ = self.down_proj(activated)
-            return output
-        gate_up, _ = self.gate_up_proj(x if x_nvfp4 is None else x_nvfp4)
-        output, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
+        else:
+            gate_up, _ = self.gate_up_proj(x if x_nvfp4 is None else x_nvfp4)
+            output, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
         return output
