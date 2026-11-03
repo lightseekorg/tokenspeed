@@ -433,7 +433,9 @@ _SLICE_WORDS = gl.constexpr(256)
 @gluon.jit
 def _iris_column_routes_offsets():
     """Lane l's four 32-bit words (BF16 columns 8l + [0, 8)) of a 512-column slice."""
-    layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [1, 1], [1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
     lane = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
     return lane[:, None] * 4 + word[None, :]
@@ -583,6 +585,9 @@ def iris_column_routes_complete(
     computes. With CLEAR, restores the consumed markers afterwards; a
     two-copy caller clears its areas at entry instead.
     """
+    # With several waves every wave polls the same words (replicated
+    # layouts), so a wave's clear could race another's poll.
+    gl.static_assert(not CLEAR or gl.num_warps() == 1)
     PEERS: gl.constexpr = WORLD_SIZE - 1
     P1_WORDS: gl.constexpr = PEERS * MAX_ROWS * _ROUTE_WORDS
     P2_WORDS: gl.constexpr = WORLD_SIZE * MAX_ROWS * _ROUTE_WORDS
@@ -628,7 +633,7 @@ def iris_column_routes_complete(
         gl.reshape(gl.join(sum_even, sum_odd), [_SLICE_FEATURES]).to(gl.bfloat16)
     )
     # The inverse-RMS kernel's subgroup layout: lane l holds columns 8l + [0, 8).
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [1], [0])
+    layout: gl.constexpr = gl.BlockedLayout([8], [64], [gl.num_warps()], [0])
     columns = gl.arange(0, _SLICE_FEATURES, layout=layout)
     values = gl.convert_layout(completed, layout).to(gl.float32)
     gain = gl.load(norm_weight + RANK * _SLICE_FEATURES + columns).to(gl.float32)
@@ -639,7 +644,7 @@ def iris_column_routes_complete(
     # included (write-through: its readers may run on another XCD).
     published = gl.convert_layout(
         gl.reshape(completed, [64, 8]),
-        gl.BlockedLayout([1, 8], [64, 1], [1, 1], [1, 0]),
+        gl.BlockedLayout([1, 8], [64, 1], [gl.num_warps(), 1], [1, 0]),
     )
     p_lane = gl.arange(0, 64, layout=gl.SliceLayout(1, published.type.layout))
     p_elem = gl.arange(0, 8, layout=gl.SliceLayout(0, published.type.layout))
@@ -648,7 +653,9 @@ def iris_column_routes_complete(
     ) + (p_lane[:, None] * 8 + p_elem[None, :])
     # Every rank's eight column owners each get a copy of the sum of squares:
     # words [token][source][route][owner].
-    owners = gl.arange(0, WORLD_SIZE, layout=gl.BlockedLayout([1], [64], [1], [0]))
+    owners = gl.arange(
+        0, WORLD_SIZE, layout=gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    )
     squares = gl.full(owners.shape, 0, gl.float32, owners.type.layout) + partial
     s_offsets = (
         base
@@ -751,13 +758,16 @@ def iris_column_routes_wait(
     restores their markers (only this caller reads them); a two-copy caller
     clears its areas at entry instead.
     """
+    gl.static_assert(not CLEAR or gl.num_warps() == 1)
     PEERS: gl.constexpr = WORLD_SIZE - 1
     P1_WORDS: gl.constexpr = PEERS * MAX_ROWS * _ROUTE_WORDS
     P2_WORDS: gl.constexpr = WORLD_SIZE * MAX_ROWS * _ROUTE_WORDS
     base = (stage * STAGE_WORDS).to(gl.int32)
     words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
     # Every lane holds all eight routes of its four words.
-    poll: gl.constexpr = gl.BlockedLayout([8, 1, 4], [1, 64, 1], [1, 1, 1], [2, 1, 0])
+    poll: gl.constexpr = gl.BlockedLayout(
+        [8, 1, 4], [1, 64, 1], [1, gl.num_warps(), 1], [2, 1, 0]
+    )
     route = gl.arange(0, 8, layout=gl.SliceLayout(1, gl.SliceLayout(2, poll)))
     lane = gl.arange(0, 64, layout=gl.SliceLayout(0, gl.SliceLayout(2, poll)))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, poll)))
@@ -769,7 +779,7 @@ def iris_column_routes_wait(
         + (lane[None, :, None] * 4 + word[None, None, :])
     )
     # Lane l reads the sum of squares of source l // 8, route l % 8.
-    square_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    square_layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     index = gl.arange(0, 64, layout=square_layout)
     sums = base + P1_WORDS + P2_WORDS + (token * 64 + index) * WORLD_SIZE + owner
     loaded = gl.amd.cdna4.buffer_load(words_ptr, slices, cache=".cv")
@@ -815,7 +825,9 @@ def iris_column_routes_combine(
     # ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7)).
     partials = gl.convert_layout(
         gl.reshape(squares.to(gl.float32, bitcast=True), [2, 2, 2, 8]),
-        gl.BlockedLayout([2, 2, 2, 8], [1, 1, 1, 64], [1, 1, 1, 1], [3, 2, 1, 0]),
+        gl.BlockedLayout(
+            [2, 2, 2, 8], [1, 1, 1, 64], [1, 1, 1, gl.num_warps()], [3, 2, 1, 0]
+        ),
     )
     a0, a1 = gl.split(gl.permute(partials, (1, 2, 3, 0)))
     b0, b1 = gl.split(gl.permute(a0 + a1, (1, 2, 0)))
