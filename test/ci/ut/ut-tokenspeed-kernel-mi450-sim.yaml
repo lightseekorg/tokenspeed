@@ -152,7 +152,7 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_add3_auto_fuses_matches_composed_and_captures[16]
     tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_output_contract
     tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_inputs_use_torch
-    tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_latent_in_shape_matches
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
     tokenspeed-kernel/test/ops/gemm/test_decode_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
     tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_largem_gfx1250.py::test_largem_warp_pipeline_matches_torch[4097-3072-512]
     # Kimi K3 dense BF16 and AttnRes: split-K reduce, short TDM tails, batch
