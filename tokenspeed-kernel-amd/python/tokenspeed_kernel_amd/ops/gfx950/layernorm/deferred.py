@@ -33,8 +33,7 @@ consumer waits for a second exchange:
     h'   = fma(beta, b * post * inv1, alpha * h)
     x    = h' * inv2 * pre
 
-These are the attention boundary finisher's operations
-(``muse_attntail_finish``), in its order.
+These are the attention tail finisher's operations, in its order.
 """
 
 from tokenspeed_kernel_amd._triton import gl, gluon

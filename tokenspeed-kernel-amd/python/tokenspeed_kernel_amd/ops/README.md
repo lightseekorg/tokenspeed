@@ -281,6 +281,14 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   offsets (one vote per wave per retry, no barrier) and sums them in part
   order, stopping at a `Launch` deadline through the caller's `on_expiry`.
 - Results are deterministic but not bit-equal to a full-K GEMV.
+- For roles that build or hold their own operands:
+  `gemv_a16w16_splitk_x_gfx950` loads a task's x slice as the B operand;
+  `gemv_a16w16_splitk_wave_sums_gfx950` (one MFMA per tile) and
+  `gemv_a16w16_splitk_hi_lo_sums_gfx950` (an FP32 weight and x as BF16
+  hi + lo, three MFMAs per tile, the lo x lo term dropped) return the
+  wave-summed `[16, rows]` FP32 in the caller's layout;
+  `gemv_a16w16_splitk_publish_gfx950` stores such sums as the finish's
+  tagged words.
 
 #### Algorithm
 
@@ -288,7 +296,52 @@ Weights and the task's x slice load straight into the 16x16x32 MFMA operand
 layouts, so nothing passes through LDS before the MFMAs. A task reads only
 its K slice of x, which keeps the GEMV flat in N at 8-16 rows where a full-K
 GEMV rereads all of x per program. The eight waves' accumulators meet in LDS
-behind one barrier.
+behind one barrier. In `gemv_a16w16_splitk_exchange_gfx950` they are stored
+rows fastest, so each thread reads its contiguous rows of every wave with
+wide LDS reads (a 64-row sender: 4 `ds_read2st64_b64`, not 32 4-byte reads)
+and adds the waves in wave order in registers.
+
+### gfx950 deferred residual norms
+
+`layernorm/deferred.py` folds a residual boundary's post-norm and the next
+pre-norm into their consumers.
+
+#### Contract
+
+- Producers publish four FP32 sums per row and column block: `sum b^2`,
+  `B = sum (alpha h)(beta b)`, `A = sum (alpha h)^2`, `C = sum (beta b)^2`.
+- `deferred_norm_scales_gfx950` takes them as `[rows, producers, 4]` with the
+  producers across one wave's lanes and returns `inv1`, `inv2` per row.
+- `deferred_norm_rows_gfx950` returns `h' = fma(beta, b post inv1, alpha h)`
+  and `x = h' inv2 pre` elementwise; `post` / `pre` are weight plus offset
+  rounded to BF16, as FP32 or BF16 operands.
+
+#### Algorithm
+
+`inv1 = rsqrt(sum b^2 / W + eps_post)` and `inv2 = rsqrt((A + 2 inv1 B +
+inv1^2 C) / W + eps_pre)`, the attention tail finisher's operations in its
+order, so a consumer builds its own columns of x without waiting for the
+normalized row.
+
+### gfx950 sigmoid-bias routing top-k
+
+`moe/mxfp4/routing.py` selects each row's top-k experts by
+`sigmoid(logit) + bias`, with weights normalized and scaled.
+
+#### Contract
+
+- `sigmoid_bias_topk_row_gfx950` routes one row per call (its kernel,
+  `gluon_sigmoid_bias_topk_gfx950`, one row per program).
+- `sigmoid_bias_topk_keys_gfx950` routes several rows of a `[rows, EP]` FP32
+  tensor, one wave per row, and returns ids and weights `[rows, TKP]` bitwise
+  equal to the row function's.
+
+#### Algorithm
+
+The row function takes three reductions per pick (the maximum, the lowest
+expert at it, its weight). The keyed form takes two: one 64-bit maximum of
+the score's order-preserving integer bits (high) and `EP - 1 - expert` (low),
+which is the largest score with ties to the lowest expert, then the weight.
 
 ### gfx950 dense BF16 decode GEMV
 
@@ -1420,6 +1473,22 @@ masked to the rows' windows.
 
 Every split stores its partial and LSE (-inf for rows without keys in it), so
 the reduce does not read cache lengths.
+
+#### Split bodies for persistent kernels
+
+`mha_decode_sliding_split_gfx950(program, ...)` streams one sliding split of
+an `AttentionProgram` built from caller-chosen (request, head block, split),
+and stores its partial. Two merges follow it:
+
+- `finalize_splits`: the last arriver on an acq_rel counter merges (the
+  standalone kernel).
+- `publish_split_record` / `merge_split_records`: each wave waits for its own
+  partial stores (`release_drain`), then stores an int32 tag record; a
+  designated merger waits for all `NUM_KV_SPLITS * NUM_WARPS` records through
+  a caller-supplied poll (the scalar `poll_tags16` in a persistent layer) and
+  merges with `.cg` partial loads, all splits' loads issued before the fold.
+  Same split boundaries and fold order, so the rows are bitwise the
+  last arriver's.
 
 #### Balanced split schedule
 
