@@ -47,6 +47,7 @@ from native_body_helpers import (  # noqa: E402
     kpart_router_steps_kernel,
     qkv_task_kernel,
     qkv_task_steps_kernel,
+    router_weights_paced_kernel,
     sender_kernel,
     sender_sums_kernel,
     split_records_kernel,
@@ -105,7 +106,7 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
             "tag": "i32",
             "deadline_ticks": "i64",
         },
-        _MUSE_SLIDING,
+        dict(_MUSE_SLIDING, MERGE="designated"),
         num_warps=_MUSE_SLIDING["NUM_WARPS"],
         **persistent_compile_options(),
     )
@@ -150,6 +151,52 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
     assert (
         sum(1 for i in loads if i < first_wait) >= 16
     ), "every split's partial load is issued before the first wait"
+
+
+def test_spread_merge_issues_its_rows_partials_before_the_fold():
+    """In the spread merge each split reads only its share of the rows: after
+    the record poll, every split's partial and LSE loads for those rows
+    (``sc0 nt``) issue back to back before the first wait, with no full drain
+    among them and no L2 writeback or invalidate."""
+    kernel = compile_gfx950(
+        split_records_kernel,
+        {
+            "q_ptr": "*fp8e4nv",
+            "k_cache_ptr": "*fp8e4nv",
+            "v_cache_ptr": "*fp8e4nv",
+            "page_table_ptr": "*i32",
+            "cache_seqlens_ptr": "*i32",
+            "mid_o_ptr": "*fp32",
+            "mid_lse_ptr": "*fp32",
+            "out_ptr": "*bf16",
+            "record_ptr": "*i32",
+            "error_ptr": "*i32",
+            "tag": "i32",
+            "deadline_ticks": "i64",
+        },
+        dict(_MUSE_SLIDING, MERGE="spread"),
+        num_warps=_MUSE_SLIDING["NUM_WARPS"],
+        **persistent_compile_options(),
+    )
+    code = instruction_lines(kernel.asm["amdgcn"])
+    assert not [line for line in code if re.match(r"buffer_(wbl2|inv)", line)]
+    poll = max(i for i, line in enumerate(code) if line.startswith("s_load_dwordx16"))
+    loads = [
+        i for i, line in enumerate(code) if i > poll and line.startswith("buffer_load")
+    ]
+    assert loads and all(code[i].endswith("sc0 nt") for i in loads), [
+        code[i] for i in loads
+    ]
+    assert not [
+        line
+        for line in code[loads[0] : loads[-1]]
+        if line.startswith("s_waitcnt") and "vmcnt(0)" in line
+    ]
+    first_wait = next(
+        i for i in range(loads[0], len(code)) if code[i].startswith("s_waitcnt vmcnt")
+    )
+    issued = sum(1 for i in loads if i < first_wait)
+    assert issued >= 2 * _MUSE_SLIDING["NUM_KV_SPLITS"], issued
 
 
 def _metadata(assembly: str, key: str) -> int:
@@ -476,3 +523,30 @@ def test_full_records_wait_only_for_the_partial_and_merge_issue_first():
     run = reads[: 2 * (16 + 16)]
     assert sum(code[i].startswith("buffer_load_dwordx4") for i in run) == 32
     assert not [line for line in code[run[0] : run[-1]] if "vmcnt" in line]
+
+
+@pytest.mark.parametrize("loads", [1, 4])
+def test_router_weights_pace_by_k_step(loads: int):
+    """The router task's 8 step loads per wave (hi then lo, one stream) keep
+    at most ``loads`` in flight: before each load past the first ``loads``
+    the wave waits until ``loads - 1`` remain (a window of one: none)."""
+    assembly = compile_gfx950(
+        router_weights_paced_kernel,
+        {"hi_ptr": "*bf16", "lo_ptr": "*bf16", "out_ptr": "*fp32"},
+        dict(LOADS=loads),
+        num_warps=8,
+        **persistent_compile_options(),
+    ).asm["amdgcn"]
+    code = instruction_lines(assembly)
+    weights = [
+        i
+        for i, line in enumerate(code)
+        if line.startswith("buffer_load_dwordx4") and line.endswith("sc0 nt")
+    ]
+    assert len(weights) == 8
+    waits = [
+        code[i]
+        for i in range(weights[0], weights[-1])
+        if code[i].startswith("s_waitcnt") and "vmcnt" in code[i]
+    ]
+    assert waits == [f"s_waitcnt vmcnt({loads - 1})"] * (8 - loads), waits

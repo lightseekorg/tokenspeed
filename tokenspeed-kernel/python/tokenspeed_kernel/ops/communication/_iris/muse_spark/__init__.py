@@ -1908,6 +1908,36 @@ class MuseIrisState:
         """
         return 0 < rows <= self.column_routes_max_rows
 
+    def column_routes_push_args(
+        self, routes: torch.Tensor
+    ) -> tuple[tuple, tuple[int, int, int, int, str]]:
+        """Arguments of iris_column_routes_dn_sink for a producer writing ``routes``.
+
+        Returns (SINK_ARGS, SINK_CONSTS): the producer passes them to its
+        epilogue sink, then the reduction runs with ``pushed=True``. Every row
+        the reduction will read must be pushed, padding rows included.
+        """
+        assert self.column_routes_max_rows
+        world = self.world_size
+        stage_words = self.column_routes_max_rows * (
+            (2 * world - 1) * (_MUSE_ROUTE_WIDTH // 2) + world * world * _MUSE_TOPK
+        )
+        return (
+            (
+                routes,
+                routes.stride(0),
+                self.column_routes_epochs,
+                self.column_routes_peer_addresses,
+            ),
+            (
+                self.all_reduce.rank_in_group,
+                world,
+                self.column_routes_max_rows,
+                stage_words,
+                self._arch.peer_signal_store,
+            ),
+        )
+
     def reduce_column_routed_rmsnorm_sum(
         self,
         routes: torch.Tensor,
@@ -1915,6 +1945,7 @@ class MuseIrisState:
         norm_weight: torch.Tensor,
         eps: float,
         weight_offset: float,
+        pushed: bool,
     ) -> torch.Tensor:
         """Sum expert TP8 partial routes, normalize, weight and sum them, in one launch.
 
@@ -1925,7 +1956,9 @@ class MuseIrisState:
         applies the routed RMSNorm (gain first; inverse RMS bitwise equal to
         the portable kernel's) and the weighted route sum (within one BF16 ULP
         of the portable kernel's). Returns independent BF16 ``[rows, 4096]``,
-        equal on every rank.
+        equal on every rank. With ``pushed`` the producer already pushed the
+        other owners' partials (column_routes_push_args) and wrote only this
+        rank's slices of ``routes``.
         """
         rows = route_weights.shape[0]
         assert self.can_reduce_column_routed_rmsnorm_sum(rows)
@@ -1942,9 +1975,11 @@ class MuseIrisState:
         output = torch.empty(
             (rows, _MUSE_ROUTE_WIDTH), dtype=torch.bfloat16, device=routes.device
         )
-        # Per token: a sender per (route, peer), a completer per route and a
-        # finisher per column owner.
-        programs = _MUSE_TOPK * (self.world_size - 1) + _MUSE_TOPK + self.world_size
+        # Per token: a sender per (route, peer) unless pushed, a completer per
+        # route and a finisher per column owner.
+        programs = (0 if pushed else _MUSE_TOPK * (self.world_size - 1)) + (
+            _MUSE_TOPK + self.world_size
+        )
         iris_fused_lamport_column_routed_rmsnorm_sum[(rows * programs,)](
             routes,
             route_weights,
@@ -1959,6 +1994,7 @@ class MuseIrisState:
             EPS=eps,
             WEIGHT_OFFSET=weight_offset,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            PUSHED=pushed,
             num_warps=1,
         )
         return output

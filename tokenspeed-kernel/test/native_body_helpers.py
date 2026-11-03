@@ -59,6 +59,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
     gemv_a16w16_splitk_wave_sums_gfx950,
     gemv_a16w16_splitk_wave_sums_steps_gfx950,
     gemv_a16w16_splitk_weight_steps_gfx950,
+    gemv_a16w16_splitk_weight_steps_windowed_gfx950,
     gemv_a16w16_splitk_weights_gfx950,
     gemv_a16w16_splitk_weights_paced_gfx950,
     gemv_a16w16_splitk_x_gfx950,
@@ -178,10 +179,13 @@ def split_records_kernel(
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    MERGE: gl.constexpr,
 ):
     """The sliding split decode with records: every program streams its split
-    and publishes its record; split 0 merges once all records carry ``tag``.
-    The grid is ``_mha_decode_sliding_split_atomic``'s; all programs must be
+    and publishes its record; once all records carry ``tag``, split 0 merges
+    the block (``MERGE`` ``"designated"``) or every split merges its share of
+    the rows, one row per wave (``"spread"``). The grid is
+    ``_mha_decode_sliding_split_atomic``'s; all programs must be
     co-resident."""
     cfg = AttentionConfig(
         SM_SCALE,
@@ -219,7 +223,27 @@ def split_records_kernel(
         program, q_ptr, k_cache_ptr, v_cache_ptr, NUM_STAGES
     )
     program.publish_split_record(record_ptr, launch.tag)
-    if program.split_id == 0:
+    if MERGE == "spread":
+        SHARE: gl.constexpr = cfg.ROWS // cfg.NUM_KV_SPLITS
+        rows_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [cfg.NUM_WARPS, 1], [1, 0]
+        )
+        m = program.split_id * SHARE + gl.arange(
+            0, SHARE, layout=gl.SliceLayout(1, rows_layout)
+        )
+        d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, rows_layout))
+        merged = program.merge_split_records_rows(
+            record_ptr, launch.tag, m, d, wait_records_tags16, launch
+        )
+        gl.amd.cdna4.buffer_store(
+            merged.to(out_ptr.dtype.element_ty),
+            out_ptr,
+            (program.row_tokens(m) * cfg.NUM_Q_HEADS + program.row_heads(m))[:, None]
+            * cfg.HEAD_DIM
+            + d[None, :],
+            mask=program.row_valid(m)[:, None] & (d >= 0)[None, :],
+        )
+    elif program.split_id == 0:
         merged = program.merge_split_records(
             record_ptr, launch.tag, q_ptr, False, wait_records_tags16, launch
         )
@@ -708,6 +732,26 @@ def kpart_pooler_steps_kernel(
     gemv_a16w16_splitk_publish_gfx950(
         pooled, part_ptr, tag, (task % GROUPS) * ROWS, task // GROUPS, M, OUTPUTS, ".wt"
     )
+
+
+@gluon.jit
+def router_weights_paced_kernel(hi_ptr, lo_ptr, out_ptr, LOADS: gl.constexpr):
+    """The router task's hi / lo weights issued as one stream with at most
+    ``LOADS`` step loads in flight (K 8192 in 8 parts, 16 experts per task);
+    the tiles are summed so the loads stay live."""
+    task = gl.program_id(0)
+    STEPS: gl.constexpr = 8192 // 8 // gl.num_warps() // 32
+    hi = gemv_a16w16_splitk_weight_steps_windowed_gfx950(
+        hi_ptr, task, 8192, 16, 8, 16, LOADS, 0
+    )
+    lo = gemv_a16w16_splitk_weight_steps_windowed_gfx950(
+        lo_ptr, task, 8192, 16, 8, 16, LOADS, STEPS
+    )
+    total = 0.0
+    for step in gl.static_range(STEPS):
+        total += gl.sum(gl.sum(gl.sum(hi[0][step].to(gl.float32), 2), 1), 0)
+        total += gl.sum(gl.sum(gl.sum(lo[0][step].to(gl.float32), 2), 1), 0)
+    gl.store(out_ptr + task, total)
 
 
 @gluon.jit

@@ -46,6 +46,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     MAX_VMCNT_WAIT,
     poll_expired,
     poll_stop_site,
+    release_drain,
     wait_vmcnt,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
@@ -66,6 +67,16 @@ def _mfma(waves: int):
         transposed=True,
         warps_per_cta=[waves, 1, 1],
     )
+
+
+@gluon.jit
+def _pace_wait(OUTSTANDING: gl.constexpr):
+    """Wait until at most ``OUTSTANDING`` of this wave's vector memory
+    operations are in flight (a window of one: until none are)."""
+    if OUTSTANDING == 0:
+        release_drain()
+    else:
+        wait_vmcnt(OUTSTANDING)
 
 
 @gluon.jit
@@ -127,7 +138,7 @@ def gemv_a16w16_splitk_weights_paced_gfx950(
     tiles = ()
     for t in gl.static_range(TILES):
         if t >= WINDOW:
-            wait_vmcnt((WINDOW - 1) * LOADS)
+            _pace_wait((WINDOW - 1) * LOADS)
         tiles += (
             cdna4.buffer_load(w_ptr, base + (group * TILES + t) * 16 * K, cache=".cg"),
         )
@@ -423,9 +434,47 @@ def gemv_a16w16_splitk_weight_step_tiles_gfx950(
     tiles = ()
     for t in gl.static_range(FIRST, FIRST + COUNT):
         if t >= WINDOW:
-            wait_vmcnt((WINDOW - 1) * STEPS)
+            _pace_wait((WINDOW - 1) * STEPS)
         steps = ()
         for step in gl.static_range(STEPS):
+            steps += (
+                cdna4.buffer_load(
+                    w_ptr,
+                    base + (group * TILES + t) * 16 * K + step * _STEP_K,
+                    cache=".cg",
+                ),
+            )
+        tiles += (steps,)
+    return tiles
+
+
+@gluon.jit
+def gemv_a16w16_splitk_weight_steps_windowed_gfx950(
+    w_ptr,
+    task,
+    K: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    LOADS: gl.constexpr,
+    ISSUED: gl.constexpr,
+):
+    """:func:`gemv_a16w16_splitk_weight_steps_gfx950` paced by K step: at
+    most ``LOADS`` of the stream's step loads (one 16-byte load per lane,
+    ``16 * 32 * 2 * waves`` bytes per workgroup) in flight, for streams
+    finer than one tile per window (a 16-row router task is one tile).
+    ``ISSUED`` is how many of the same stream's loads the wave issued just
+    before (a previous call), so two calls pace as one stream."""
+    TILES: gl.constexpr = ROWS_PER_TASK // 16
+    STEPS: gl.constexpr = K // PARTS // gl.num_warps() // _STEP_K
+    gl.static_assert(1 <= LOADS and LOADS - 1 <= _MAX_VMCNT_WAIT)
+    base, group = _weight_tile_base(task, K, ROWS_PER_TASK, PARTS, GROUPS, _STEP_K)
+    tiles = ()
+    for t in gl.static_range(TILES):
+        steps = ()
+        for step in gl.static_range(STEPS):
+            if ISSUED + t * STEPS + step >= LOADS:
+                _pace_wait(LOADS - 1)
             steps += (
                 cdna4.buffer_load(
                     w_ptr,

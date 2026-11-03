@@ -62,6 +62,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     muse_attntail_gated_rows,
     muse_attntail_publish_attention,
+    muse_attntail_publish_rows,
     muse_attntail_read_box,
     muse_attntail_read_box_rows,
 )
@@ -72,6 +73,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
     H6_SLOT,
     H6_WORDS,
     MAX_ROWS,
+    H4SinkArgs,
     MuseNativeView,
     clear_next_copies,
     fin,
@@ -118,7 +120,9 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
     gemv_a16w16_splitk_wave_sums_steps_gfx950,
     gemv_a16w16_splitk_weight_step_tiles_gfx950,
     gemv_a16w16_splitk_weight_steps_gfx950,
+    gemv_a16w16_splitk_weight_steps_windowed_gfx950,
     gemv_a16w16_splitk_weights_gfx950,
+    gemv_a16w16_splitk_weights_paced_gfx950,
     gemv_a16w16_splitk_x_steps_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
@@ -428,9 +432,15 @@ def _attention_split(
     cfg: gl.constexpr,
     GATE_EPS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    ATT_MERGE: gl.constexpr,
 ):
-    """One sliding split of block ``block`` = (request, KV head); split 0 is
-    the block's merger.
+    """One sliding split of block ``block`` = (request, KV head).
+
+    ``ATT_MERGE`` picks who merges: ``"designated"`` (split 0 merges the
+    block's rows) or ``"spread"`` (split ``s`` merges block rows ``[s R, (s +
+    1) R)``, ``R = ROWS / NUM_KV_SPLITS``, one row per wave; every split
+    then reads 1/NUM_KV_SPLITS of the partials). Either way the rows are
+    bitwise the same.
 
     The split streams its pages and stores its partial (plain, read on
     this XCD); each wave drains its stores, then stores its record
@@ -455,7 +465,30 @@ def _attention_split(
         program, q_ptr, k_cache_ptr, v_cache_ptr, NUM_STAGES
     )
     program.publish_split_record(record_ptr, launch.tag)
-    if split == 0:
+    box = view.box + launch.copy * _BOX_WORDS
+    if ATT_MERGE == "spread":
+        SHARE: gl.constexpr = cfg.ROWS // cfg.NUM_KV_SPLITS
+        gl.static_assert(SHARE * cfg.NUM_KV_SPLITS == cfg.ROWS)
+        gl.static_assert(cfg.NUM_ROW_BLOCKS == 1)
+        rows_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [cfg.NUM_WARPS, 1], [1, 0]
+        )
+        m = split * SHARE + gl.arange(0, SHARE, layout=gl.SliceLayout(1, rows_layout))
+        d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, rows_layout))
+        gate = gl.amd.cdna4.buffer_load(
+            gate_ptr,
+            (program.row_tokens(m) * gate_stride + program.row_heads(m) * cfg.HEAD_DIM)[
+                :, None
+            ]
+            + d[None, :],
+            mask=program.row_valid(m)[:, None] & (d >= 0)[None, :],
+        )
+        merged = program.merge_split_records_rows(
+            record_ptr, launch.tag, m, d, _wait_records, launch
+        )
+        muse_attntail_publish_rows(program, m, merged, gate, box, GATE_EPS)
+    elif split == 0:
+        gl.static_assert(ATT_MERGE == "designated")
         m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
         gate = gl.amd.cdna4.buffer_load(
@@ -469,9 +502,7 @@ def _attention_split(
         merged = program.merge_split_records(
             record_ptr, launch.tag, q_ptr, False, _wait_records, launch
         )
-        muse_attntail_publish_attention(
-            program, merged, gate, view.box + launch.copy * _BOX_WORDS, GATE_EPS
-        )
+        muse_attntail_publish_attention(program, merged, gate, box, GATE_EPS)
 
 
 # ---------------------------------------------------------------------------
@@ -503,33 +534,74 @@ def _no_weights(args):
     return gl.to_tensor(0)
 
 
+# Front weight pacing. Each stream that overlaps a latency-bound chain keeps
+# few enough bytes in flight per CU that the GPU's total stays below ~4.5
+# TB/s (polls stay flat up to ~4.9 TB/s of other traffic and double above
+# ~6), at ~1.27 us per round trip:
+# - o_proj at a sliding layer's entry, one 32 KB tile per CU in flight: 128
+#   CUs ~3.3 TB/s, landed ~5 us after entry, well before the box;
+# - the pooler, two 8 KB steps per CU: 64 CUs ~0.8 TB/s, landed ~10 us
+#   after entry (sliding) or ~5 us after the items (full: four steps), before
+#   the all-gather;
+# - the router after the sender's push (slot 0: after OWN1), four steps per
+#   CU: 128 CUs ~3.3 TB/s, landed ~2.5 us later, before the all-gather.
+# A full layer's o_proj stays unpaced at the issue hook: the sender waits
+# for it, so it takes the whole fabric.
+_O_PROJ_WINDOW = gl.constexpr(1)
+_POOLER_LOADS_SLIDING = gl.constexpr(2)
+_POOLER_LOADS_FULL = gl.constexpr(4)
+_ROUTER_LOADS = gl.constexpr(4)
+
+
 @gluon.jit
 def _sender_weights(args):
-    """SND's resident weights: the o_proj rows of ``sender``."""
+    """SND's resident weights at a full layer's issue hook (unpaced): the
+    o_proj rows of ``sender``."""
     o_proj_ptr, sender = args
     return gemv_a16w16_splitk_weights_gfx950(o_proj_ptr, sender, _Q_WIDTH, 64, 1, 128)
 
 
 @gluon.jit
+def _sender_weights_paced(o_proj_ptr, sender):
+    """SND's resident weights at a sliding layer's entry, one tile in
+    flight per CU."""
+    return gemv_a16w16_splitk_weights_paced_gfx950(
+        o_proj_ptr, sender, _Q_WIDTH, 64, 1, 128, _O_PROJ_WINDOW
+    )
+
+
+@gluon.jit
 def _router_weights(router_hi_ptr, router_lo_ptr, task):
     """RTR's resident weights: the router's hi / lo tiles of its K-part
-    task."""
-    hi = gemv_a16w16_splitk_weight_steps_gfx950(
-        router_hi_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS, 1
+    task, paced as one stream of K steps."""
+    STEPS: gl.constexpr = _HIDDEN // _KPARTS // _NUM_WARPS // 32
+    hi = gemv_a16w16_splitk_weight_steps_windowed_gfx950(
+        router_hi_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS, _ROUTER_LOADS, 0
     )
-    lo = gemv_a16w16_splitk_weight_steps_gfx950(
-        router_lo_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS, 1
-    )
+    lo = gemv_a16w16_splitk_weight_steps_windowed_gfx950(
+        router_lo_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS, _ROUTER_LOADS,
+        STEPS,
+    )  # fmt: skip
     return hi, lo
 
 
 @gluon.jit
+def _pooler_weights_sliding(pooler_ptr, task):
+    """POOL's resident weights at a sliding layer's entry (paced)."""
+    return gemv_a16w16_splitk_weight_steps_windowed_gfx950(
+        pooler_ptr, task, _HIDDEN, _POOL_TILE, _KPARTS, _POOL_TILES,
+        _POOLER_LOADS_SLIDING, 0,
+    )  # fmt: skip
+
+
+@gluon.jit
 def _pooler_weights(args):
-    """POOL's resident weights: its K-part task's pooler tiles."""
+    """POOL's resident weights at a full layer's issue hook (paced)."""
     pooler_ptr, task = args
-    return gemv_a16w16_splitk_weight_steps_gfx950(
-        pooler_ptr, task, _HIDDEN, _POOL_TILE, _KPARTS, _POOL_TILES, _POOL_TILE // 16
-    )
+    return gemv_a16w16_splitk_weight_steps_windowed_gfx950(
+        pooler_ptr, task, _HIDDEN, _POOL_TILE, _KPARTS, _POOL_TILES,
+        _POOLER_LOADS_FULL, 0,
+    )  # fmt: skip
 
 
 @gluon.jit
@@ -1449,6 +1521,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     KV_SCALED: gl.constexpr,
     NEXT_ROTARY: gl.constexpr,
     QKV_WINDOW: gl.constexpr,
+    ATT_MERGE: gl.constexpr,
     STAMPS: gl.constexpr,
     # MoE plan fields (native_stream.run_moe).
     N_PHYS1: gl.constexpr,
@@ -1489,10 +1562,9 @@ def gluon_decoder_layer_muse_spark_gfx950(
         sender = xcd * 16 + slot
         task = xcd * _ROUTER_GROUPS + slot
         if SLIDING:
-            # The weights go out before the entry check (no attention here)
-            # and land long before the box: o_proj and the router's tiles.
-            o_tiles = _sender_weights((o_proj_ptr, sender))
-            hi, lo = _router_weights(router_hi_ptr, router_lo_ptr, task)
+            # o_proj goes out before the entry check (no attention here),
+            # paced, and lands long before the box.
+            o_tiles = _sender_weights_paced(o_proj_ptr, sender)
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
@@ -1506,8 +1578,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         else:
             # Full layers: o_proj after this workgroup's attention items; the
             # box arrives soon after, and its read queues behind whatever
-            # this workgroup has in flight, so the router's tiles wait for
-            # the push and OWN1 (they are needed only after the all-gather).
+            # this workgroup has in flight.
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
@@ -1523,8 +1594,9 @@ def gluon_decoder_layer_muse_spark_gfx950(
                     alpha_ptr, beta_ptr, iris_fail_stop, RANK, POST_ATTN_OFFSET,
                     POST_ATTN_HAS_WEIGHT, PEER_CACHE,
                 )  # fmt: skip
-            # After OWN1's reduce-scatter wait, which they would hold up.
-            hi, lo = _router_weights(router_hi_ptr, router_lo_ptr, task)
+        # The router's tiles after the push and OWN1's reduce-scatter wait,
+        # which they would hold up; needed only after the all-gather.
+        hi, lo = _router_weights(router_hi_ptr, router_lo_ptr, task)
         router_x = _kpart_state(
             launch, view, xcd, task, rows, residual_ptr, alpha_ptr, beta_ptr,
             post_attn_bf16_ptr, pre_ffn_bf16_ptr, hprime, slot == 1, _ROUTER_GROUPS,
@@ -1551,7 +1623,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         tile = slot - 16
         task = xcd * _POOL_TILES + tile
         if SLIDING:
-            p_tiles = _pooler_weights((pooler_ptr, task))
+            p_tiles = _pooler_weights_sliding(pooler_ptr, task)
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
@@ -1604,7 +1676,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                     launch, xcd, slot - _ATT_FIRST_SLOT, view, q_ptr, gate_ptr,
                     gate_stride, k_cache_ptr, v_cache_ptr, page_table_ptr,
                     cache_seqlens_ptr, mid_o_ptr, mid_lse_ptr, records, cfg,
-                    GATE_EPS, NUM_STAGES,
+                    GATE_EPS, NUM_STAGES, ATT_MERGE,
                 )  # fmt: skip
         else:
             _full_items(
@@ -1651,7 +1723,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         iris_fail_stop(launch, _SITE_XQ, 0)
     _stamp(stamps_ptr, launch.cta, _STAMP_XQ, STAMPS)
     run_moe(
-        launch, handles, bufs, h4_sink, (view, launch), ROWS, _TOPK, N_PHYS1,
+        launch, handles, bufs, h4_sink, H4SinkArgs(view, launch, RANK), ROWS, _TOPK, N_PHYS1,
         N_PHYS2, RING, QUAD_MAP, DN_ORDER, ADDR_SOFFSET, True, SCALE_LANES,
         SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
     )  # fmt: skip
@@ -1894,6 +1966,7 @@ def kernel_constexprs(
     kv_scaled: bool,
     next_rotary: bool,
     qkv_window: int,
+    att_merge: str,
     stamps: bool,
 ) -> dict:
     """The kernel's constexprs for one plan variant on one rank."""
@@ -1925,6 +1998,7 @@ def kernel_constexprs(
         KV_SCALED=kv_scaled,
         NEXT_ROTARY=next_rotary,
         QKV_WINDOW=qkv_window,
+        ATT_MERGE=att_merge,
         STAMPS=stamps,
         N_PHYS1=n_phys1,
         N_PHYS2=n_phys2,
@@ -2031,10 +2105,11 @@ def offline_compile_args(key: PlanKey, rank: int):
     """
     fn = gluon_decoder_layer_muse_spark_gfx950
     constexprs = kernel_constexprs(
-        key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=8, quad_map=0,
+        key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=16, quad_map=0,
         dn_order=0, addr_soffset=0, scale_lanes=0, tail_num=1, tail_den=2,
         n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False,
-        next_rotary=key.next_kind == "sliding", qkv_window=4, stamps=False,
+        next_rotary=key.next_kind == "sliding", qkv_window=2, att_merge="designated",
+        stamps=False,
     )  # fmt: skip
     signature = offline_signature(constexprs)
     options = {"num_warps": NUM_WARPS, **persistent_compile_options()}

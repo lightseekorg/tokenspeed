@@ -859,11 +859,13 @@ def test_balanced_schedule_buffer_at_capacity_ignores_its_stale_tail() -> None:
     )
 
 
+@pytest.mark.parametrize("merge", ["designated", "spread"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
-def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool) -> None:
-    """The designated merger polling per-wave split records (the native
-    layer's attention hand-off) merges the same partials in the same order as
-    the last-arriver merge, so the rows are bitwise equal."""
+def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool, merge: str) -> None:
+    """Merging after per-wave split records (the native layer's attention
+    hand-off), by the designated merger or spread over the splits (each its
+    share of the rows), folds the same partials in the same order as the
+    last-arriver merge, so the rows are bitwise equal."""
     from native_body_helpers import split_records_kernel
     from tokenspeed_kernel_amd.ops.gfx950.persistent import (
         ERROR_WORDS,
@@ -943,6 +945,7 @@ def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool) -> None:
             2047,
             q.dtype == torch.float8_e4m3fn,
             config.num_stages,
+            merge,
             num_warps=config.num_warps,
             **persistent_compile_options(),
         )
