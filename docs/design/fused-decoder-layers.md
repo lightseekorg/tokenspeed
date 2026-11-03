@@ -59,6 +59,10 @@ copies run as kernels, `HSA_ENABLE_SDMA=0`, CU masks, a model forward that
 forks a side stream, and the settings whose state the fused path cannot keep
 (the expert-load recorder, the memory saver). A change that adds kernels on
 another stream during decode must extend that list in the same change.
+Production declines on these known sources rather than inspecting each
+captured graph, which would need graphs kept for inspection on the serving
+path; a GPU runtime test checks that the captured graph is a chain around
+every fused node.
 
 ### Fail-stop
 
