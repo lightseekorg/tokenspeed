@@ -93,6 +93,9 @@ class DecodeKVView:
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     max_seqlen_k: int
+    # The forward's split schedule that full-attention decode reads (computed
+    # once per forward, in place), or None for a sliding layer.
+    split_schedule: torch.Tensor | None
 
 
 @dataclass

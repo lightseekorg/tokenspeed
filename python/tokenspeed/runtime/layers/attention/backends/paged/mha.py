@@ -204,24 +204,52 @@ class MHAAttnBackend(PagedAttentionBackend):
     def decode_kv_view(
         self, layer: PagedAttention, token_to_kv_pool
     ) -> DecodeKVView | None:
-        # A sliding window reads the cache through the page table alone; full
-        # layers' verify decode takes a split schedule, and scaled caches more.
+        # A sliding window reads the cache through the page table alone. A
+        # full layer's verify decode reads the forward's split schedule, which
+        # is computed here when the view is taken (as by the first full
+        # layer's decode call); without one (a draft, another shape) there is
+        # no view. Scaled caches need more than the view carries.
         metadata = self.forward_decode_metadata
         if (
             metadata is None
             or not self.is_fp8
             or layer.fp8_kv_scales is not None
-            or layer.sliding_window_size < 0
             or self.draft_block_decode
         ):
             return None
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        schedule = None
+        if layer.sliding_window_size < 0:
+            # The schedule reads only the query's shape: a meta tensor of the
+            # verify rows stands in for it.
+            query = torch.empty(
+                (
+                    metadata.seq_lens.shape[0] * self.verify_floor,
+                    layer.tp_q_head_num,
+                    layer.qk_head_dim,
+                ),
+                dtype=self.kv_cache_dtype,
+                device="meta",
+            )
+            schedule = self._decode_schedule(
+                layer,
+                query,
+                k_cache,
+                v_cache,
+                metadata.seq_lens,
+                self.verify_floor,
+                None,
+                {},
+            )
+            if schedule is None:
+                return None
         return DecodeKVView(
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=metadata.page_table,
             seq_lens=metadata.seq_lens,
             max_seqlen_k=self.max_context_len,
+            split_schedule=schedule,
         )
 
     def query_dtype(
