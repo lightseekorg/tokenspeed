@@ -20,17 +20,18 @@
 
 """Other operators remain importable without the optional TRT-LLM extension."""
 
-import importlib.util
-
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import deep_gemm  # noqa: F401
-from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
+from tokenspeed_kernel.ops.gemm.trtllm import (
+    _HAS_TRTLLM_KERNEL,
+    dsv3_fused_a_gemm,
+)
 from tokenspeed_kernel.ops.quantization.trtllm import _per_token_group_quant_8bit
 
 pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("trtllm_kernel") is not None,
-    reason="requires an environment without the optional TRT-LLM GPU extension",
+    _HAS_TRTLLM_KERNEL,
+    reason="requires an environment without a usable TRT-LLM GPU extension",
 )
 
 
