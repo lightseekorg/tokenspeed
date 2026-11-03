@@ -1490,37 +1490,47 @@ def gluon_decoder_layer_muse_spark_gfx950(
         part = 2 * xcd + slot % 2
         group = slot // 2
         task = part * _QKV_GROUPS + group
-        qkv_tiles = gemv_a16w16_splitk_weights_paced_gfx950(
-            qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
-            QKV_WINDOW,
-        )  # fmt: skip
-    if is_tail:
-        # OWN4 (S16-S17) then FIN (S18) of pick / part xcd.
-        for r in gl.static_range(REQUESTS):
-            token = index + 8 * r
-            own4_complete(
-                view, launch, token * _TOPK + xcd, route_norm_ptr, iris_fail_stop,
-                RANK, ROUTE_OFFSET, PEER_CACHE,
-            )  # fmt: skip
-            s = fin(
-                view, launch, token, xcd,
-                (exchange + _EX_WEIGHTS).to(gl.pointer_type(gl.float32), bitcast=True),
-                route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
-            )  # fmt: skip
-            _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
-    elif is_unp:
-        # UNP (S20), then this XCD's sum reducer (S21) on slot 16.
+    if is_unp:
+        # UNP (S20), then this XCD's sum reducer (S21) on slot 16. The relay
+        # weights go out first: the relay needs them before the QKV task.
         sender = xcd * 8 + slot - 16
         w = mm_a16w16_column_relay_weights_gfx950(
             post_expert_ptr, RANK * (_HIDDEN // _KPARTS) + sender * _UNP_COLUMNS,
             _POOLED,
         )  # fmt: skip
+        if NEXT_KIND != 2:
+            qkv_tiles = gemv_a16w16_splitk_weights_paced_gfx950(
+                qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
+                QKV_WINDOW,
+            )  # fmt: skip
         _unp(
             launch, view, sender, rows, w, s_rows, hprime, exchange, alpha2_ptr,
             beta2_ptr, post2_bf16_ptr, RANK, PEER_CACHE,
         )  # fmt: skip
         if slot == 16:
             red_sums(view, launch, rows, iris_fail_stop, RANK, PEER_CACHE)
+    else:
+        if NEXT_KIND != 2:
+            qkv_tiles = gemv_a16w16_splitk_weights_paced_gfx950(
+                qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
+                QKV_WINDOW,
+            )  # fmt: skip
+        if is_tail:
+            # OWN4 (S16-S17) then FIN (S18) of pick / part xcd.
+            for r in gl.static_range(REQUESTS):
+                token = index + 8 * r
+                own4_complete(
+                    view, launch, token * _TOPK + xcd, route_norm_ptr,
+                    iris_fail_stop, RANK, ROUTE_OFFSET, PEER_CACHE,
+                )  # fmt: skip
+                s = fin(
+                    view, launch, token, xcd,
+                    (exchange + _EX_WEIGHTS).to(
+                        gl.pointer_type(gl.float32), bitcast=True
+                    ),
+                    route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
+                )  # fmt: skip
+                _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
     if NEXT_KIND != 2:
         # QKV (S22-S23): x'' of K part ``part``; group 0 stores h'' for the
         # next layer (plain: the next launch reads it).
