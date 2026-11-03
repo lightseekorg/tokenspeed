@@ -16,7 +16,7 @@ head sums between warp-MMA decode and TMEM prefill; each independent score
 keeps its original left-to-right FP32 addition order.
 
 Long prefill shares K tiles across eight request-owned queries per CTA.
-TMA key copies, MMA accumulators and compacted score queues each have two
+TMA key copies, MMA accumulators, and compacted score queues each have two
 stages. Every row keeps two 1120-entry FP32 score buffers. Integer coarse
 and fine histograms can retain a bounded 528-candidate set, including the
 complete boundary bucket; exact FP32 refinement runs on overflow and final
@@ -40,13 +40,13 @@ reads the original FP32 scores. Large ties and clipped histogram boundaries
 also retain exact refinement. Scratch is bounded by the caller's existing
 budget, with the grouped kernel handling zero-budget calls.
 
-Owners, frontiers, row counts and tensor strides remain runtime inputs.
+Owners, frontiers, row counts, and tensor strides remain runtime inputs.
 Every CuTe streaming algorithm widens query-row and head indices before
 multiplying by runtime strides, including for strided query views. Key-page
 and partial-score row addressing retain 64-bit offsets for large cache pools
 and scratch buffers. Logical slots and TMA coordinates require fewer than
 `2**31` key slots.
-Only static geometry, explicit algorithm parameters and bucketed capacity
+Only static geometry, explicit algorithm parameters, and bucketed capacity
 specialize compilation. Graph replay refreshes the same input buffers as
 eager execution; no backend-private request state is introduced.
 
