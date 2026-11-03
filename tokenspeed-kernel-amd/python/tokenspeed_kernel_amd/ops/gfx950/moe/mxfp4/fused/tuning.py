@@ -171,6 +171,33 @@ assert all(
     for _, max_rows, config in entries
 )
 
+# Key: hidden width, intermediate width, local experts, global experts, top-k.
+# K tiles of loads the direct decode stage 1 (one program per route and
+# 64-column slice) keeps in flight ahead of its MFMA. Shapes without an entry
+# load one K tile at a time (0).
+_DIRECT_STAGE1_PREFETCH_TILES = {
+    # EP1 (TP8 intermediate shard), MI355X, both MoE stages in graph replay
+    # over four cold weight copies: 1 row 11.5 -> 10.2 us, 2 rows 16.2 ->
+    # 14.6, 8 verify rows (recorded routing) 36.0 -> 35.4 and 38.4 -> 37.5,
+    # 12 rows 58.3 -> 57.5. Depths 1-4 were slower than 8. EP8 (1-3 rows)
+    # showed no consistent gain at any depth.
+    (4096, 512, 256, 256, 8): 8,
+}
+
+
+def _select_direct_stage1_prefetch_tiles(
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int | None,
+    top_k: int,
+) -> int:
+    """Return the direct decode stage 1's ``PREFETCH_TILES`` for this shape."""
+    shape = (hidden_dim, inter_dim, num_local_experts, num_experts, top_k)
+    return _DIRECT_STAGE1_PREFETCH_TILES.get(shape, 0)
+
+
 # Largest row count any route-tile entry serves; callers that do not want
 # route tiles pass 0 instead.
 _ROUTE_TILE_MAX_M = max(
