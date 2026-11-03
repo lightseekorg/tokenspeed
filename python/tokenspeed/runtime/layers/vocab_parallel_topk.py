@@ -30,9 +30,8 @@ from tokenspeed_kernel.ops.sampling import (
     vocab_topk_merge_supports,
 )
 
-from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
-from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.layers.logits_processor import should_apply_lm_head_quant_method
+from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -244,32 +243,6 @@ class VocabParallelTopK:
             self._gather_buffers = buffers
         return buffers[0][:rows], buffers[1][: rows * self.tp_size]
 
-    def _gather_pairs(
-        self, staged: torch.Tensor, landing: torch.Tensor
-    ) -> torch.Tensor:
-        """Every rank's packed pairs, as an ``[R, rows, 2 * top_k]`` view.
-
-        A column gather the backend prepared for this group (Iris on gfx950)
-        moves the fp32 pairs as raw 16-bit words and lands rank r's pairs in
-        columns ``r * 2 * top_k`` onward of every row; otherwise the pairs
-        land rank-major in the resident pad.
-        """
-        rows, width = staged.shape
-        words = staged.view(torch.bfloat16)
-        gather = get_global_backend().get_prepared_all_gather(
-            self.tp_group, words.dtype
-        )
-        if gather is not None and gather.can_run(words):
-            # Borrowed collective storage: the caller's merge reads it next.
-            gathered = gather.run(words).view(torch.float32)
-            return gathered.as_strided(
-                (self.tp_size, rows, width),
-                (width, gathered.stride(0), 1),
-                gathered.storage_offset(),
-            )
-        all_gather_single(landing, staged, self.tp_group)
-        return landing.view(self.tp_size, rows, width)
-
     def _shard_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's slice of the logits row, however the head computes it.
 
@@ -329,7 +302,7 @@ class VocabParallelTopK:
             staged[:, :top_k].copy_(values)
             # Global ids in fp32, in one launch: both terms are exact below 2**24.
             torch.add(ids, float(vocab_start), out=staged[:, top_k:])
-        pairs = self._gather_pairs(staged, landing)
+        pairs = gather_topk_pairs(staged, landing, self.tp_size, self.tp_group)
         candidate_ids = torch.empty(
             (rows, top_k), dtype=torch.int64, device=logits.device
         )
