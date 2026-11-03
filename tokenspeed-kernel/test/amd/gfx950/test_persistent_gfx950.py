@@ -244,7 +244,9 @@ _TRAP_CHILD = textwrap.dedent("""
     sys.path.insert(0, sys.argv[1])
     import torch
     import test_persistent_gfx950 as t
+    from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
     state = t._State()
+    mirror = FailureMirror(state.errors, sys.argv[2])
     t._fail_stop_kernel[(t.GRID - 8,)](
         state.epochs, state.claims, state.joins, state.errors, 1_000_000,
         num_warps=8, **t.persistent_compile_options(),
@@ -261,11 +263,15 @@ def _fail_stop_kernel(epochs, claims, joins, errors, deadline_ticks):
     grid_join(joins, launch, fail_stop, 0, 0)
 
 
-def test_expired_wait_stops_the_queue():
-    """``fail_stop`` raises a queue error: the process ends, it never hangs."""
+def test_expired_wait_stops_the_queue(tmp_path):
+    """``fail_stop`` raises a queue error: the process ends, it never hangs,
+    and its record survives in the host mirror for the parent to read."""
+    from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
+
+    path = str(tmp_path / "failure-record")
     start = time.monotonic()
     child = subprocess.run(
-        [sys.executable, "-c", _TRAP_CHILD, os.path.dirname(__file__)],
+        [sys.executable, "-c", _TRAP_CHILD, os.path.dirname(__file__), path],
         capture_output=True,
         text=True,
         timeout=300,
@@ -273,3 +279,7 @@ def test_expired_wait_stops_the_queue():
     assert child.returncode != 0, child.stdout + child.stderr
     assert "NO TRAP" not in child.stdout
     assert time.monotonic() - start < 300
+    site, cta, _, epoch, label = FailureMirror.read(path)
+    # The 8 missing workgroups stall the join: a join failure in launch 1.
+    assert (site, epoch, label) == (SITE_JOIN, 1, 0)
+    assert 0 <= cta < GRID
