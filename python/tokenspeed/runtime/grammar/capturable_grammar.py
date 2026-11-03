@@ -236,7 +236,7 @@ class CapturableGrammarExecutor:
 
         ``advance_mask[i] == False`` disables matcher advance for slot
         i at this step — set it for intermediate chunked-prefill chunks
-        whose sampled tokens are discarded by output_processor.
+        whose sampled tokens the host's output processor discards.
         ``None`` defaults to all-True.
         """
         if advance_mask is None:

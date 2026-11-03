@@ -184,7 +184,6 @@ def _attn_config(layer_types, window) -> AttnConfig:
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=262144,
         max_bs=64,
@@ -312,12 +311,6 @@ def _resolve(path, caplog, platform_case=None, override_args="{}", **launch):
             "--kv-cache-dtype fp8_e4m3 is not BF16",
         ),
         (
-            {"prefix_granularity": 32},
-            None,
-            None,
-            "--prefix-granularity 32 is not a multiple of the leaf's 64-token pages",
-        ),
-        (
             {"numerics": "rl-bitwise"},
             None,
             None,
@@ -335,7 +328,6 @@ def _resolve(path, caplog, platform_case=None, override_args="{}", **launch):
         "default",
         "sm103",
         "fp8-kv",
-        "granularity-32",
         "rl-bitwise",
         "sm90",
         "mha-override",
@@ -345,9 +337,8 @@ def test_the_attention_default(
     checkpoints, caplog, monkeypatch, sm100, launch, platform_case, env, reason
 ):
     """An unset --attention-backend becomes the TRT-LLM leaf on NVIDIA SM100 to
-    SM103 for a BF16 KV cache of whole 64-token pages, --numerics auto and no
-    attention.mha_* override; elsewhere it stays unset, with one line naming
-    why."""
+    SM103 for a BF16 KV cache, --numerics auto and no attention.mha_* override;
+    elsewhere it stays unset, with one line naming why."""
     if env is not None:
         monkeypatch.setenv(kernel_override_env_key(*env), f"triton_{env[1]}")
     args = _resolve(checkpoints["beam"], caplog, platform_case, **launch)

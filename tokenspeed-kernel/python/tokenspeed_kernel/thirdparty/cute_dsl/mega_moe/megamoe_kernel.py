@@ -186,6 +186,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         max_tokens_per_rank: int,
         hidden: int,
         fc2_output_dtype: Type[cutlass.Numeric],
+        fuse_bf16_reduce: bool,
+        bf16_hidden_per_thread: int,
+        dense_routing: bool,
         combine_format: CombineFormat = CombineFormat.parse("bf16"),
         non_ubulk_fc2_store: bool = True,
         in_kernel_fc2_reduce: bool = False,
@@ -207,6 +210,43 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # only reject combinations the kernel cannot express
         # (in_kernel_fc2_reduce is bf16-only; FP4 needs non_ubulk_fc2_store).
         self.combine_format = combine_format
+        self.fuse_bf16_reduce = fuse_bf16_reduce
+        self.bf16_hidden_per_thread = bf16_hidden_per_thread
+        self.dense_routing = dense_routing
+        if not isinstance(dense_routing, bool):
+            raise ValueError("dense_routing must be bool")
+        if dense_routing and not (
+            world_size == 16
+            and num_topk == 16
+            and hidden == 3584
+            and static_expert_shape == (56, 6144, 3584)
+            and max_tokens_per_rank in (1, 2, 4)
+            and situ_beta == 4.0
+            and situ_linear_beta == 25.0
+            and token_back_mode == "epi_warps"
+            and not combine_format.is_quantized
+            and fc2_output_dtype is cutlass.BFloat16
+        ):
+            raise ValueError(
+                "dense_routing requires K3 EP16 capacity 1/2/4 BF16 epi_warps"
+            )
+        # Checked here as well because in_kernel_fc2_reduce kernels build no
+        # TopkReduce; the option list lives with the reducer.
+        if (
+            not isinstance(bf16_hidden_per_thread, int)
+            or bf16_hidden_per_thread not in TopkReduce.bf16_hidden_per_thread_options
+        ):
+            raise ValueError(
+                "bf16_hidden_per_thread must be one of "
+                f"{TopkReduce.bf16_hidden_per_thread_options}, got {bf16_hidden_per_thread}"
+            )
+        if fuse_bf16_reduce and (combine_format.is_quantized or in_kernel_fc2_reduce):
+            raise ValueError(
+                "fuse_bf16_reduce requires bf16 combine and "
+                "in_kernel_fc2_reduce=False."
+            )
+        if fuse_bf16_reduce and token_back_mode != "epi_warps":
+            raise ValueError("fuse_bf16_reduce requires token_back_mode='epi_warps'.")
         if in_kernel_fc2_reduce and combine_format.is_quantized:
             raise ValueError(
                 f"in_kernel_fc2_reduce requires a non-quantized (bf16) combine "
@@ -309,6 +349,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         self.num_topk = num_topk
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden = hidden
+        # The tail reducer serves both the standalone and the fused tail
+        # reduce; the in-kernel FC2 reduce never reduces, so it must not
+        # inherit the reducer's hidden-divisibility constraints.
+        self.tail_reducer: Optional[TopkReduce] = None
+        if not in_kernel_fc2_reduce:
+            self.tail_reducer = TopkReduce(
+                self.hidden,
+                self.num_topk,
+                self.combine_format,
+                bf16_hidden_per_thread=self.bf16_hidden_per_thread,
+            )
         self.flag_batch = flag_batch  # stored so name() can encode it
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
@@ -409,6 +460,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             dispatch_warp_start=self.dispatch_warp_id[0],
             num_other_warps=num_other_warps,
             flag_batch=flag_batch,
+            dense_routing=dense_routing,
             is_swap_ab=True,
             token_back_schedule_mode=self.token_back_schedule_mode,
         )
@@ -699,6 +751,16 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 )
             )
 
+        # Always reserve this data region, including maximum-capacity kernels.
+        # Fixed workspace offsets must also support later capacity-1/2/4 kernels.
+        specs.append(
+            _RegionSpec(
+                "routing_id_scratch",
+                cutlass.Int64,
+                (self.world_size, 4, self.num_topk),
+                16,
+            )
+        )
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -948,6 +1010,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
+            f"_fusebf16_{int(self.fuse_bf16_reduce)}"
+            f"_bf16hpt_{self.bf16_hidden_per_thread}"
+            f"_denserouting3_{int(self.dense_routing)}"
         )
 
     @cute.jit
@@ -956,7 +1021,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # User-domain inputs (peer-mapped on the symmetric heap).
         activation: cute.Tensor,  # (T, hidden) NVFP4
         activation_sf: cute.Tensor,  # (T, round_up(hidden, sf_atom_block_k)) FP8
-        topk_idx: cute.Tensor,  # (T, num_topk) Int64
+        topk_idx: cute.Tensor,  # (T, num_topk) Int32
         topk_weights: cute.Tensor,  # (T, num_topk) Float32
         # Per-rank model weights (local-only; not in workspace).
         fc1_weight: cute.Tensor,
@@ -989,8 +1054,12 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             (typically NVSHMEM symmetric heap).  Single-rank degenerate
             runs (``peer_rank_ptr_mapper.offsets[local_rank] == 0`` by NVSHMEM
             convention) are allowed.
-          * ``topk_idx`` is read on the local rank only; placement is
-            unconstrained (cuda local or sym heap).
+          * With ``dense_routing``, ``topk_idx`` MUST also be reachable via
+            the peer mapper and MUST be Int32 or Int64 (peers read it in
+            that width), with a unit column stride; its row stride is honored
+            and every row start MUST be 8-byte aligned (peers fetch 8-byte
+            words). Otherwise it is read on the local rank only and may use
+            ordinary device memory.
           * ``fc1_weight`` / ``fc1_weight_sf`` / ``fc2_weight`` /
             ``fc2_weight_sf`` are local-only.
           * ``output_activation`` is the 2D (T, hidden) result.  Under
@@ -1007,6 +1076,24 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         contract may be tightened later to have the kernel take
         ownership of the reset.
         """
+        # Dense routing reads peer ``topk_idx`` tables in their element width
+        # (``dispatch_dense_routing``) and widens the ids into Int64 scratch;
+        # only the two integer widths it is written for are accepted.
+        if cutlass.const_expr(
+            self.dense_routing
+            and topk_idx.element_type not in (cutlass.Int32, cutlass.Int64)
+        ):
+            raise TypeError(
+                "dense_routing requires Int32 or Int64 topk_idx, "
+                f"got {topk_idx.element_type}."
+            )
+        # Peers fetch two adjacent ids per 8-byte word, so columns must be
+        # contiguous; the row stride itself is read from the layout.
+        if cutlass.const_expr(self.dense_routing and topk_idx.stride[1] != 1):
+            raise TypeError(
+                "dense_routing requires a unit column stride for topk_idx, "
+                f"got stride {topk_idx.stride}."
+            )
         # ``max_active_clusters`` and ``cluster_size`` are both Python ints
         # at trace time, so the product folds to a Python int that flows
         # cleanly to every dispatch primitive's ``num_sms: Constexpr[int]``
@@ -1075,6 +1162,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         expert_send_count = self._view_local(
             local_workspace,
             "expert_send_count",
+        )
+        routing_id_scratch = self._view_local(
+            local_workspace,
+            "routing_id_scratch",
+            # Keep small rank strides identical to the capacity-1/2 kernel.
+            # The fixed region still reserves four rows for later buckets.
+            shape=(
+                self.world_size,
+                2 if self.max_tokens_per_rank <= 2 else 4,
+                self.num_topk,
+            ),
         )
         grid_sync_counter = self._view_local(
             local_workspace,
@@ -1269,6 +1367,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             input_token_buffer=activation,
             input_sf_buffer=activation_sf,
             topk_idx=topk_idx,
+            routing_id_scratch=routing_id_scratch,
             input_topk_weights_buffer=topk_weights,
             expert_send_count=expert_send_count,
             expert_recv_count=expert_recv_count,
@@ -1280,6 +1379,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             fc1_ready_counter=l1_arrival_count,
             token_src_metadata=token_src_metadata,
             combine_output=combine_output_u8,
+            reduced_output=output_activation,
             combine_sf=combine_sf,
             fc2_output_workspace=fc2_output_workspace_u8,
             fc2_output_sf=fc2_output_sf,
@@ -1346,20 +1446,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             token_comm_args=token_comm_args,
         )
 
-        # separate_kernel_reduce: collapse the per-topk ``combine_quant`` staging
-        # into the public 2D output via the shared TopkReduce launcher (sized from
-        # codegen-time hidden / num_topk / combine_format -- it dequantizes per
-        # format and reduces over topk). Same stream, so it is ordered strictly
-        # after the cross-rank combine writes landed (the mega kernel's nvlink
-        # barrier guarantees all peer combine STGs to this rank completed before it
-        # exits). Weighting follows the compute graph: deepgemm (apply_topk_in_fc1)
-        # folded the routing weight into fc1 -> plain K-sum; transformers applies
-        # topk_weights here.
-        if cutlass.const_expr(not self.in_kernel_fc2_reduce):
+        # Selected BF16 capacities reduce on the dispatch workers after the
+        # tail's NVLink barrier. Other capacities and quantized combine keep
+        # standalone reduce on the same stream. Scores are applied here only
+        # if FC1 did not absorb them before quantization.
+        if cutlass.const_expr(
+            not self.in_kernel_fc2_reduce and not self.fuse_bf16_reduce
+        ):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1) else None
             )
-            TopkReduce(self.hidden, self.num_topk, self.combine_format)(
+            self.tail_reducer(
                 combine_target,
                 combine_sf,
                 output_activation,
@@ -1429,23 +1526,6 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         )
 
     @cute.jit
-    def token_comm_hook_tail_reset_shared_counters(
-        self,
-        token_comm_args,
-        *,
-        cta_linear_id,
-        local_warp_idx,
-        lane_idx,
-    ):
-        self.token_comm.tail_reset_counters(
-            token_comm_args,
-            token_comm_args.shared_zero_prefix,
-            cta_linear_id=cta_linear_id,
-            local_warp_idx=local_warp_idx,
-            lane_idx=lane_idx,
-        )
-
-    @cute.jit
     def token_comm_hook_kernel_tail(
         self,
         token_comm_args,
@@ -1460,3 +1540,54 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             lane_idx=lane_idx,
             tidx=tidx,
         )
+        if cutlass.const_expr(self.fuse_bf16_reduce):
+            # Only dispatch workers passed the final NVLink acquire and grid
+            # barrier. Other warps can return from kernel_tail earlier and must
+            # not read the peer combine cells here.
+            if (warp_idx >= self.dispatch_warp_id[0]) and (
+                warp_idx < self.dispatch_warp_id[0] + self.token_comm.num_dispatch_warps
+            ):
+                bidx, bidy, bidz = cute.arch.block_idx()
+                cta_linear_id = (
+                    cutlass.Int32(bidx)
+                    + cutlass.Int32(self.cluster_shape_mn[1]) * cutlass.Int32(bidy)
+                    + cutlass.Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
+                    * cutlass.Int32(bidz)
+                )
+                local_warp_idx = cutlass.Int32(warp_idx) - cutlass.Int32(
+                    self.dispatch_warp_id[0]
+                )
+                local_worker = (
+                    local_warp_idx * cutlass.Int32(self.token_comm.warp_threads)
+                    + lane_idx
+                )
+                worker_idx = (
+                    cta_linear_id * cutlass.Int32(self.token_comm.num_dispatch_threads)
+                    + local_worker
+                )
+                worker_stride = cutlass.Int32(
+                    token_comm_args.sm_count * self.token_comm.num_dispatch_threads
+                )
+                total_workers = (
+                    token_comm_args.reduced_output.shape[0]
+                    * self.tail_reducer.hidden_tiles
+                )
+                # Dispatch token-back uses a byte view. Recover the BF16 view
+                # before sharing the exact standalone load/accumulate/store code.
+                combine = cute.recast_tensor(
+                    token_comm_args.combine_output, cutlass.BFloat16
+                )
+                score = (
+                    None
+                    if cutlass.const_expr(self.apply_topk_in_fc1)
+                    else token_comm_args.input_topk_weights_buffer
+                )
+                while worker_idx < total_workers:
+                    self.tail_reducer.reduce_bf16_worker(
+                        combine,
+                        score,
+                        token_comm_args.reduced_output,
+                        worker_idx,
+                        normalize_layout=True,
+                    )
+                    worker_idx += worker_stride

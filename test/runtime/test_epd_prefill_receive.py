@@ -280,6 +280,7 @@ def test_a_slot_returns_only_once_its_copy_finished():
 def _server_args(mode, *, first_stage=True):
     return SimpleNamespace(
         disaggregation_mode=mode,
+        enable_external_encoder=False,
         mapping=SimpleNamespace(is_first_pp_rank=first_stage),
     )
 
@@ -408,3 +409,27 @@ def test_assert_embeddings_received_ignores_items_an_earlier_chunk_prefilled():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize(
+    "mode, external, active, expected",
+    [
+        ("null", True, True, 2 << 20),
+        ("null", False, True, 0),
+        ("null", True, False, 0),
+        ("prefill", False, True, 2 << 20),
+        ("decode", False, True, 0),
+    ],
+)
+def test_external_encoder_receive_budget(monkeypatch, mode, external, active, expected):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    # The budget calculation needs no model loading or GPU initialization.
+    args = ServerArgs.__new__(ServerArgs)
+    args.disaggregation_mode = mode
+    args.enable_external_encoder = external
+    args.mapping = Mapping(rank=0, world_size=1)
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "2")
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", "1")
+    assert recv_pool.recv_pool_bytes(args, active) == expected

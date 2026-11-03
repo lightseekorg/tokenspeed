@@ -13,6 +13,9 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_cache_groups,
     scheduler_cache_geometry_from_pool,
 )
+from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+    CacheBatchMetadata,
+)
 
 
 def test_scheduler_uses_lcm_parents_and_per_group_child_counts() -> None:
@@ -48,4 +51,47 @@ def test_metadata_validates_each_groups_own_page_range() -> None:
             pool.arena.runtime_contract,
             {"linear_attention_0": np.array([[3]], dtype=np.int32)},
             "cpu",
+        )
+
+
+class _ForwardTables:
+    def __init__(self, arrays: dict[str, np.ndarray]) -> None:
+        self.arrays = arrays
+
+    def block_tables_arrays(self) -> dict[str, np.ndarray]:
+        return self.arrays
+
+
+def test_metadata_scans_page_ids_only_when_asked() -> None:
+    contract = make_kimi_pool("cpu", usable_pages=2).arena.runtime_contract
+    arrays = {group_id: np.array([[1]], dtype=np.int32) for group_id in KIMI_GROUP_IDS}
+    arrays["linear_attention_0"] = np.array([[3]], dtype=np.int32)
+    forward_op = _ForwardTables(arrays)
+
+    metadata = CacheBatchMetadata.from_forward_op(
+        forward_op,
+        device="cpu",
+        contract=contract,
+        num_requests=1,
+        validate_page_ids=False,
+    )
+    tables = metadata.tables(active_forward_op=forward_op)
+    assert tables["linear_attention_0"].item() == 3
+
+    with pytest.raises(ValueError, match="outside -1..2"):
+        CacheBatchMetadata.from_forward_op(
+            forward_op,
+            device="cpu",
+            contract=contract,
+            num_requests=1,
+            validate_page_ids=True,
+        )
+    # The structural checks run either way.
+    with pytest.raises(ValueError, match="rows"):
+        CacheBatchMetadata.from_forward_op(
+            forward_op,
+            device="cpu",
+            contract=contract,
+            num_requests=2,
+            validate_page_ids=False,
         )

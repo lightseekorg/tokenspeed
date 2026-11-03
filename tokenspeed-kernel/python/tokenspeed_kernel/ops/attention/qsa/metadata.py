@@ -50,8 +50,11 @@ class QSASparseMetadata:
     block IDs; unused entries follow that prefix. The incomplete causal tail
     is implicit. ``block_table`` maps [request, logical_page] to physical pages.
     ``token_to_request`` is int32 [tokens], and ``query_positions`` contains
-    zero-based causal positions. ``query_start_loc`` is the CPU cumulative
+    zero-based causal positions, consecutive within each request's prefill span.
+    ``query_start_loc`` is the CPU cumulative
     query length tuple, including both endpoints, so groups never cross requests.
+    ``seq_lens`` is the live int32 [requests] KV length, shared with the forward
+    layout. Each nonempty query span ends at its request's KV length.
     ``page_size`` is the physical cache page size; ``block_size`` is the
     indexer's compression ratio. Cache padding must contain finite values.
     ``workspace`` owns reusable plans for this KV pool. Direct CUDA Graph
@@ -66,6 +69,7 @@ class QSASparseMetadata:
     page_size: int
     block_size: int
     workspace: QSAWorkspace
+    seq_lens: torch.Tensor
 
     def validate(
         self, rows: int, selected_width: int, *, query_width: int | None
@@ -84,6 +88,8 @@ class QSASparseMetadata:
             )
         if self.block_table.ndim != 2:
             raise ValueError("QSA block table must have one row per request")
+        if self.seq_lens.shape != (self.block_table.shape[0],):
+            raise ValueError("QSA KV lengths must have one entry per request")
         if self.token_to_request.shape != (rows,) or self.query_positions.shape != (
             rows,
         ):

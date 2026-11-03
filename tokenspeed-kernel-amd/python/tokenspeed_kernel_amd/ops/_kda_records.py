@@ -163,9 +163,9 @@ def validate_kda_records_verify(
         state.ndim != 4
         or state.shape[1] < heads
         or state.shape[2:] != (dim, dim)
-        or state.dtype != torch.float32
+        or state.dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise ValueError("KDA checkpoint must be FP32 [page, head, value, key]")
+        raise ValueError("KDA checkpoint must be FP32 or BF16 [page, head, value, key]")
     if (
         correction.ndim != 4
         or correction.shape[1] != heads

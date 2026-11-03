@@ -334,7 +334,7 @@
     },
     {
       "id": "dsv41_flash.attention.dsv41_index_topk/cold-full-csa2-t8192-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 10,
       "definition": {
         "family": "attention",
@@ -346,7 +346,8 @@
           "compress_ratio": 2,
           "selection": "full",
           "table_pages": 64,
-          "query_chunk_size": 1024
+          "query_chunk_size": 1024,
+          "shared_table": true
         },
         "registration": "gluon_dsv41_index_topk_gfx950",
         "cold_cache": true,
@@ -359,7 +360,7 @@
     },
     {
       "id": "dsv41_flash.attention.dsv41_index_topk/cold-full-candidates-csa1-t8192-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 10,
       "definition": {
         "family": "attention",
@@ -371,7 +372,8 @@
           "compress_ratio": 1,
           "selection": "full_candidates",
           "table_pages": 128,
-          "query_chunk_size": 1024
+          "query_chunk_size": 1024,
+          "shared_table": true
         },
         "registration": "gluon_dsv41_index_topk_gfx950",
         "cold_cache": true,
@@ -384,7 +386,7 @@
     },
     {
       "id": "dsv41_flash.attention.dsv41_index_topk/extend-reindex-csa1-p8192-t8192-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 10,
       "definition": {
         "family": "attention",
@@ -396,7 +398,8 @@
           "compress_ratio": 1,
           "selection": "reindex",
           "table_pages": 256,
-          "query_chunk_size": 1024
+          "query_chunk_size": 1024,
+          "shared_table": true
         },
         "registration": "gluon_dsv41_index_topk_gfx950",
         "cold_cache": true,
@@ -409,7 +412,7 @@
     },
     {
       "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-csa2-p57344-t8192-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 10,
       "definition": {
         "family": "attention",
@@ -421,7 +424,8 @@
           "compress_ratio": 2,
           "selection": "full",
           "table_pages": 512,
-          "query_chunk_size": 1024
+          "query_chunk_size": 1024,
+          "shared_table": true
         },
         "registration": "gluon_dsv41_index_topk_gfx950",
         "cold_cache": true,
@@ -434,7 +438,7 @@
     },
     {
       "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-candidates-csa1-c65536-t128-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 20,
       "definition": {
         "family": "attention",
@@ -446,7 +450,8 @@
           "compress_ratio": 1,
           "selection": "full_candidates",
           "table_pages": 1024,
-          "query_chunk_size": 1024
+          "query_chunk_size": 1024,
+          "shared_table": true
         },
         "registration": "gluon_dsv41_index_topk_gfx950",
         "cold_cache": true,
@@ -459,7 +464,7 @@
     },
     {
       "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-candidates-csa1-c65536-t1-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 20,
       "definition": {
         "family": "attention",
@@ -471,7 +476,8 @@
           "compress_ratio": 1,
           "selection": "full_candidates",
           "table_pages": 1024,
-          "query_chunk_size": 1024
+          "query_chunk_size": 1024,
+          "shared_table": true
         },
         "registration": "gluon_dsv41_index_topk_gfx950",
         "cold_cache": true,

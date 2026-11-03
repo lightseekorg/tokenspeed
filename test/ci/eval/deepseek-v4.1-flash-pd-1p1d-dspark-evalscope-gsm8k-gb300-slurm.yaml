@@ -34,7 +34,7 @@ install:
 server:
   command: bash test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh
   ready:
-    url: http://127.0.0.1:8000/v1/models
+    url: http://127.0.0.1:8000/readiness
     timeout: 7200
     interval: 10
 eval:

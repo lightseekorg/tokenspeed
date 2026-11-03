@@ -27,6 +27,24 @@ from tokenspeed.runtime.utils.env import (
 from tokenspeed.runtime.utils.server_args import prepare_server_args
 
 
+def test_head_tp_exchange_max_rows_reaches_model_initialization():
+    original = global_server_args_dict.copy()
+    try:
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--head-tp-exchange-max-rows",
+                "128",
+            ]
+        )
+        global_server_args_dict_update(args)
+        assert global_server_args_dict["head_tp_exchange_max_rows"] == 128
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(original)
+
+
 @pytest.mark.parametrize(
     "roles", [("prefill", "decode", "null"), ("decode", "prefill", "null")]
 )

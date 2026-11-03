@@ -375,7 +375,6 @@ KERNEL_GROUPS = [
     (
         "dsv4_attention",
         [
-            CUDA_CSRC_DIR / "dsv4_attention.cu",
             CUDA_CSRC_DIR / "dsv4_topk.cu",
             CUDA_CSRC_DIR / "dsv4_attention_binding.cu",
         ],
@@ -1099,6 +1098,7 @@ setup(
         ],
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",
+            "csrc/kimi3_router.cu",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",

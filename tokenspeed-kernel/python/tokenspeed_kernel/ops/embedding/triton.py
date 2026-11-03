@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     dense_tensor_format,
@@ -494,6 +494,13 @@ def apply_rope_mla_set_kv_buffer_triton(
         MAX_FINITE=max_finite,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
+        # On AMD, keep the rotation scalar: LLVM then folds each FMA and its
+        # FP16 store conversion into one v_fma_mixlo_f16 with a single
+        # rounding, as embedding.rope compiles to. SLP-vectorized FMAs round
+        # to FP32 first and differ from it in rare ties.
+        **(
+            {"llvm_cl_opts": "vectorize-slp=false"} if current_platform().is_amd else {}
+        ),
     )
 
 

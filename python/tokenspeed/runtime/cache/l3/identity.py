@@ -75,26 +75,12 @@ _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 _SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")
 
 
-def resolve_l3_weight_version(requested: str | None) -> str | None:
-    """Normalize an explicit namespace without inventing a successor.
-
-    An explicit ``requested`` version always wins. ``None`` keeps the
-    current namespace. The request handler separately validates whether
-    the update may preserve or change that namespace.
-    """
-
-    if requested is not None:
-        return str(requested)
-    return None
-
-
-L3_FLUSH_REQUIRES_WEIGHT_VERSION = (
-    "L3 flushed updates require weight_version so independent replicas "
-    "cannot restore another checkpoint's objects"
-)
-
-
-def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
+def cache_layout_signature(
+    layout: Any,
+    *,
+    cache_dtype: str,
+    checkpoint_granularities: tuple[tuple[str, int], ...] = (),
+) -> str:
     """Return a stable fingerprint of the bytes stored in one L3 page.
 
     The signature is the packed Host CacheBlock: dtype, group packing, and
@@ -121,8 +107,11 @@ def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
                 "fields": fields,
             }
         )
+    identity = {"cache_dtype": str(cache_dtype), "groups": groups}
+    if checkpoint_granularities:
+        identity["checkpoint_granularities"] = sorted(checkpoint_granularities)
     payload = json.dumps(
-        {"cache_dtype": str(cache_dtype), "groups": groups},
+        identity,
         sort_keys=True,
         separators=(",", ":"),
     )

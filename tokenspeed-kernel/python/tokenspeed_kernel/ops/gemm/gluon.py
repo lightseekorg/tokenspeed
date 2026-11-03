@@ -73,6 +73,15 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        launch_gluon_gated_rowcta_bf16_gemv_gfx950 as _gated_rowcta_bf16_gemv_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        supports_gluon_gated_rowcta_bf16_gemv_gfx950 as _supports_gated_rowcta,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        supports_gluon_rowcta_bf16_gemv_gfx950 as _supports_rowcta_bf16_gemv,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
     )
@@ -142,9 +151,9 @@ if platform.is_amd:
         ),
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "m": frozenset({1}),
             "n_min": frozenset({128}),
             "k_min": frozenset({128}),
+            "mnk_problem_filter": frozenset({_supports_rowcta_bf16_gemv}),
         },
     )
     def gluon_rowcta_bf16_gemv_gfx950(
@@ -152,14 +161,51 @@ if platform.is_amd:
         weight: torch.Tensor,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Dispatch one-row BF16 GEMV to the gfx950 Gluon implementation."""
+        """Dispatch single rows, and measured few-row shapes, to the gfx950 GEMV."""
         if out is None:
             out = torch.empty(
-                (1, weight.shape[0]),
+                (x.shape[0], weight.shape[0]),
                 dtype=x.dtype,
                 device=x.device,
             )
         return _rowcta_bf16_gemv_impl(x, weight, out)
+
+    def _gated_rowcta_bf16_gemv_filter(m: int, n: int, k: int) -> bool:
+        # Heads are 64 wide, so K fixes the head count.
+        return _supports_gated_rowcta(n, k, k // 64, 64)
+
+    @register_kernel(
+        "gemm",
+        "mv_weightless_rmsnorm_gated_sigmoid",
+        name="gluon_gated_rowcta_bf16_gemv_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    gate=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "m": frozenset({1}),
+            "mnk_problem_filter": frozenset({_gated_rowcta_bf16_gemv_filter}),
+            "head_dim": frozenset({64}),
+        },
+    )
+    def gluon_gated_rowcta_bf16_gemv_gfx950(
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        num_heads: int,
+        eps: float,
+    ) -> torch.Tensor:
+        """Dispatch one gated row of the measured shapes to the gfx950 GEMV."""
+        return _gated_rowcta_bf16_gemv_impl(x, gate, weight, out, num_heads, eps)
 
     @register_kernel(
         "gemm",
@@ -879,6 +925,9 @@ if platform.is_cdna5:
         launch_gluon_mm_mxfp8_ue8m0_gfx1250 as _mm_mxfp8_ue8m0_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.mm import (
+        launch_gluon_mm_fp8_blockscale_largem_gfx1250 as _mm_fp8_blockscale_largem_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.mm import (
         launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250 as _mm_mxfp8_ue8m0_largem_gfx1250_impl,
     )
 
@@ -1040,6 +1089,62 @@ if platform.is_cdna5:
             out=out,
         )
 
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_fp8_blockscale_largem_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    a=tensor_format(
+                        "mxfp8",
+                        _FP8_DTYPE,
+                        scale=_FP8_BLOCK_SCALE,
+                    ),
+                    b=tensor_format(
+                        "mxfp8",
+                        _FP8_DTYPE,
+                        scale=_FP8_BLOCK_SCALE,
+                    ),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "m_min": frozenset({65}),
+            "n_align": frozenset({128}),
+            "k_align": frozenset({512}),
+            **_GFX1250_MXFP8_COMMON_TRAITS,
+        },
+    )
+    def gluon_mm_fp8_blockscale_largem_gfx1250(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _mm_fp8_blockscale_largem_gfx1250_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+        )
+
 else:
 
     def gluon_mm_mxfp8_ue8m0_gfx1250(*args, **kwargs):
@@ -1050,6 +1155,9 @@ else:
 
     def gluon_mm_fp8_blockscale_gfx1250(*args, **kwargs):
         raise RuntimeError("gluon_mm_fp8_blockscale_gfx1250 requires CDNA5")
+
+    def gluon_mm_fp8_blockscale_largem_gfx1250(*args, **kwargs):
+        raise RuntimeError("gluon_mm_fp8_blockscale_largem_gfx1250 requires CDNA5")
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1411,6 +1519,7 @@ __all__ = [
     "gluon_mm_fp8_blockscale_gfx950",
     "gluon_mm_mxfp8_decode_gfx950",
     "gluon_mm_fp8_blockscale_gfx1250",
+    "gluon_mm_fp8_blockscale_largem_gfx1250",
     "gluon_mm_mxfp8_ue8m0_gfx1250",
     "gluon_mm_mxfp8_ue8m0_largem_gfx1250",
     "gluon_dsv4_linear_fp32_gfx1250",

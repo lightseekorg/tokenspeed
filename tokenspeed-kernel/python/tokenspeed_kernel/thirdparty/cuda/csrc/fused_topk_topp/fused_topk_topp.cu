@@ -122,7 +122,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
         auto* tpc = topp_counters + b;
         tpc->in = probs + static_cast<size_t>(b) * vocab_size;
         tpc->oriLen = vocab_size;
-        tpc->len = topp_active ? vocab_size : 0;
+        // Apply uses threshold zero for P >= 1 and still renormalizes the row.
+        // Skip only the unused top-p radix work; retain the top-k skip routing.
+        tpc->len = (topp_active && p < 1.0f) ? vocab_size : 0;
         tpc->previousLen = vocab_size;
         tpc->p = topp_active ? p : 0.0f;
         tpc->totalSum = 0.0f;

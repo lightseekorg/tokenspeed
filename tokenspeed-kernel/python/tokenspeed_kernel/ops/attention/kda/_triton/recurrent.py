@@ -191,8 +191,8 @@ def fused_recurrent_kda_pool(
         q/k: ``[B, T, H, K]``; v: ``[B, T, HV, V]``; g: ``[B, T, HV, K]`` raw
             gate input; beta: ``[B, T, HV]`` raw logits.
         A_log: ``[HV]`` per-head log decay; dt_bias: ``[HV*K]`` or ``[HV, K]``.
-        h_pool: ``[num_pages, HV, V, K]`` full state pool (fp32), updated
-            in place at ``write_indices``.
+        h_pool: ``[num_pages, HV, V, K]`` full state pool (FP32 or BF16),
+            updated in place at ``write_indices``.
         read_indices / write_indices: ``[N]`` page ids; negative ids read
             zeros / skip the write (graph padding, page-boundary crossing).
         scale: attention scale; defaults to ``K ** -0.5``.
@@ -440,8 +440,9 @@ def fused_recurrent_kda_mtp(
         q/k: ``[B, T, H, K]``; v: ``[B, T, HV, V]``; g: ``[B, T, HV, K]``;
             beta: ``[B, T, HV]`` — dense request-major verify batch,
             ``T`` = draft_token_num.
-        h_pool: FP32 state pool (read side), physically ``[num_pages, HV, K, V]``
-            for ``k_major`` or ``[num_pages, HV, V, K]`` for ``v_major``.
+        h_pool: FP32 or BF16 state pool (read side), physically
+            ``[num_pages, HV, K, V]`` for ``k_major`` or
+            ``[num_pages, HV, V, K]`` for ``v_major``.
         read_indices: ``[B]`` initial-state page per request (< 0 reads zeros).
         write_indices: ``[B, T]`` per-position output rows (< 0 skips).
         h_pool_out: optional write-side pool (verify scratch); defaults to

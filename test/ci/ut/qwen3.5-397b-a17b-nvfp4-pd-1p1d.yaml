@@ -10,8 +10,21 @@ runner:
     - gb200-4gpu
 env:
   CI: "true"
+  MODEL: nvidia/Qwen3.5-397B-A17B-NVFP4
+  # P and D each take two GPUs of the four-GPU runner.
+  WORLD_SIZE: "2"
+  PREFILL_GPUS: "0,1"
+  DECODE_GPUS: "2,3"
+  PD_ENGINE_ARGS: >-
+    --moe-backend flashinfer_trtllm --attention-backend trtllm
+    --quantization nvfp4 --kv-cache-dtype fp8_e4m3
+    --comm-fusion-max-num-tokens 4096 --max-model-len 131072
+    --max-num-seqs 16 --disaggregation-layerwise-interval 0
+  CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+  MC_INTRANODE_NVLINK: "1"
+  MC_INTRA_NVLINK: "1"
 install:
   - bash test/ci_system/install_deps.sh
 ut:
   commands:
-    - python3 -m pytest test/runtime/distributed/test_qwen35_pd_1p1d.py -v -s
+    - python3 -m pytest test/runtime/distributed/test_pd_wire_1p1d.py -v -s

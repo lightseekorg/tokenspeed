@@ -74,6 +74,7 @@ class InputBuffers:
         self.ngram_hash_ids_buf: torch.Tensor | None = None
         self.ngram_padding_hash: torch.Tensor | None = None
         self.ngram_hash_params: NGramHashParams | None = None
+        self._ngram_vocab_size = 0
         self._ngram_active_tokens = 0
         # Per-modality in-vocab draft tokens; when set, fill rewrites the
         # drafter-only shift-1 buffer's media pad ids in place so drafters
@@ -197,6 +198,7 @@ class InputBuffers:
                 f"fewer than the vocabulary of {vocab_size}"
             )
         self.ngram_hash_params = hash_params
+        self._ngram_vocab_size = vocab_size
         self.ngram_previous_tokens_buf = torch.full(
             (self.max_num_tokens, context_len),
             -1,
@@ -736,13 +738,36 @@ class InputBuffers:
         """Prepare padded decode graph inputs for a rank with no real tokens."""
         if self.ngram_previous_tokens_buf is not None:
             assert self.ngram_token_mask_buf is not None
-            self.ngram_previous_tokens_buf[:total_tokens].fill_(-1)
-            self.ngram_token_mask_buf[:total_tokens].zero_()
             assert (
                 self.ngram_hash_ids_buf is not None
                 and self.ngram_padding_hash is not None
             )
-            self.ngram_hash_ids_buf[:total_tokens].copy_(self.ngram_padding_hash)
+            assert self.ngram_seed_buf is not None
+            assert self.ngram_prefix_buf is not None
+            assert self.ngram_hash_params is not None
+            # Empty requests prepare dummy and idle padding without reading
+            # accepted history; the executor controls the warmup scope.
+            empty = self.ngram_seed_buf[:0]
+            context_len = self.ngram_previous_tokens_buf.shape[1]
+            prepare_ngram_inputs(
+                snapshots=empty.view(0, context_len + 1),
+                positions=empty,
+                reset=empty,
+                slots=empty,
+                cache_lengths=self.seq_lens_buf[:0],
+                request_ends=empty,
+                tail=self.ngram_previous_tokens_buf[:0],
+                needs_seed=self.ngram_token_mask_buf[:0],
+                ids=self.input_ids_buf,
+                previous=self.ngram_previous_tokens_buf[:total_tokens],
+                token_mask=self.ngram_token_mask_buf[:total_tokens],
+                prefix=self.ngram_prefix_buf[:0],
+                hashes=self.ngram_hash_ids_buf[:total_tokens],
+                total=0,
+                vocab_size=self._ngram_vocab_size,
+                uniform_length=0,
+                hash_params=self.ngram_hash_params,
+            )
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
             self.positions_buf[:total_tokens].fill_(0)

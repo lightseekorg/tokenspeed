@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "glm53_flash_tp4",
+    "hc_mult": 4,
+    "hidden_size": 4096,
+    "dtype": "bfloat16",
+    "validation": {
+      "runs": 3,
+      "atol": 0.02,
+      "rtol": 0.02
+    }
+  },
+  "cases": [
+    {
+      "id": "glm53_flash.residual.mhc_pre/hc4-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "mhc_pre",
+        "parameters": {
+          "tokens": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            65,
+            256,
+            257,
+            848,
+            8192
+          ],
+          "sinkhorn_iters": 20,
+          "rms_eps": 1e-05,
+          "hc_eps": 1e-06,
+          "fused_norm": false
+        },
+        "cold_cache": true,
+        "seed": 5301
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "glm53_flash.residual.mhc_post/hc4-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "mhc_post",
+        "parameters": {
+          "tokens": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            65,
+            256,
+            257,
+            848,
+            8192
+          ]
+        },
+        "cold_cache": true,
+        "seed": 5302
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    }
+  ]
+}

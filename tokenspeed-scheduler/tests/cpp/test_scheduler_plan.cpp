@@ -27,6 +27,42 @@
 
 namespace tokenspeed::test {
 
+class AdmissionPromptHashSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 8;
+        cfg.cache_groups[0].total_pages = 8;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        return cfg;
+    }
+};
+
+TEST_F(AdmissionPromptHashSuite, AQueuedAdmissionSeesCachePublishedSinceItsPreviousPlan) {
+    Submit({MakeRequestSpec("owner", 3), MakeRequestSpec("queued", 5)});
+    const auto first = PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    for (const auto& operation : first.Operations()) {
+        if (const auto* batch = std::get_if<ForwardBatch>(&operation)) {
+            EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"owner"}));
+        }
+    }
+
+    SendForwardDone("owner", {42});
+    SendFinish("owner");
+    const auto retry = PlanOnce();
+    bool admitted = false;
+    for (const auto& operation : retry.Operations()) {
+        if (const auto* batch = std::get_if<ForwardBatch>(&operation)) {
+            ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"queued"}));
+            EXPECT_EQ(batch->extend_prefix_lens, (std::vector<std::int32_t>{6}));
+            admitted = true;
+        }
+    }
+    EXPECT_TRUE(admitted);
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+}
+
 class LoadBackViaCacheTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -34,6 +70,7 @@ protected:
         cfg.decode_input_tokens = 0;
         cfg.device_allocator.total_pages = 5;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.enable_l3_storage = false;
         return cfg;
     }
@@ -140,7 +177,7 @@ TEST_F(CopySourceRegrantSuite, ACopySourceEvictedInTheSameRoundIsBothCopiedAndZe
     const auto& copies = plan.pages_to_copy.at("full_attention");
     ASSERT_EQ(copies.size(), 1u);
     const auto [source, destination] = copies.front();
-    EXPECT_EQ(batch->block_tables.at("full_attention").at(0).at(1), destination);
+    EXPECT_EQ(batch->BlockTables().at("full_attention").at(0).at(1), destination);
     const auto& zeroed = plan.pages_to_zero.at("full_attention");
     EXPECT_NE(std::ranges::find(zeroed, source), zeroed.end()) << "r3 took the source once the copy left it cache-only";
     EXPECT_EQ(std::ranges::find(zeroed, destination), zeroed.end()) << "the copy fills the destination whole";
@@ -221,7 +258,7 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
         }
     }
 
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(MakeRequestSpec("r_ccc", 2, 300));
     Submit(MakeRequestSpec("r_aaa", 2, 100));
     Submit(MakeRequestSpec("r_bbb", 2, 200));
@@ -235,6 +272,25 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
 
     ASSERT_FALSE(ids_a.empty());
     EXPECT_EQ(ids_a, ids_b);
+}
+
+// A request hashes its full pages for KV events once each, every page chained
+// on the one before: asking for more pages extends the chain, asking for
+// fewer reads a prefix of it.
+TEST(RequestKvEventBlockHashes, ChainEachFullPageOnTheOneBefore) {
+    Request request(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 4, 5, 6, 7}}, /*prefix_granularity=*/2,
+                    Role::kFused);
+    const std::uint64_t first = HashKvBlock(std::vector<std::int32_t>{1, 2}, std::nullopt);
+    const std::uint64_t second = HashKvBlock(std::vector<std::int32_t>{3, 4}, first);
+    const std::uint64_t third = HashKvBlock(std::vector<std::int32_t>{5, 6}, second);
+    const auto hashes = [&request](std::size_t num_pages) {
+        const std::span<const std::uint64_t> span = request.KvEventBlockHashes(num_pages);
+        return std::vector<std::uint64_t>(span.begin(), span.end());
+    };
+    EXPECT_EQ(hashes(2), (std::vector<std::uint64_t>{first, second}));
+    EXPECT_EQ(hashes(3), (std::vector<std::uint64_t>{first, second, third}));
+    EXPECT_EQ(hashes(1), std::vector<std::uint64_t>{first});
+    EXPECT_THROW(request.KvEventBlockHashes(4), std::runtime_error) << "token 7 fills no fourth page";
 }
 
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
@@ -262,6 +318,31 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesStoredBlockAndDrainsItOnce) {
     ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
     EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, spec.tokens);
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+}
+
+TEST_F(SchedulerKvCacheEventTestSuite, PartialPrefillRetractionUsesItsActualTailParent) {
+    config_.device_allocator.total_pages = 16;
+    config_.cache_groups.front().total_pages = 16;
+    config_.max_scheduled_tokens = 3;
+    config_.debug_force_retraction_interval = -1;
+    SetTestSnapshotPool(config_);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit(RequestSpec{.request_id = "partial", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}});
+    const ExecutionPlan first = PlanOnce();
+    ASSERT_NE(FindForwardBatch(first), nullptr);
+    EXPECT_EQ(FindForwardBatch(first)->input_lengths, std::vector<std::int32_t>{3});
+    SendForwardDone("partial");
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(retraction), nullptr);
+    const std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[1]));
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_EQ(tail.token_ids, std::vector<std::int32_t>{3});
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front());
 }
 
 TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock) {
@@ -294,7 +375,7 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock)
 TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFinish) {
     config_.device_allocator.total_pages = 5;
     config_.cache_groups.front().total_pages = config_.device_allocator.total_pages;
-    scheduler_ = std::make_unique<Scheduler>(config_);
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     const RequestSpec spec{.request_id = "r1", .tokens = {1, 2, 3}};
     Submit(spec);
     PlanOnce();
@@ -718,7 +799,7 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
     EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
     for (std::int32_t i = 0; i < 3; ++i) {
-        const auto& row = reuse->block_tables.at("linear_attention_" + std::to_string(i)).at(0);
+        const auto row = reuse->BlockTables().at("linear_attention_" + std::to_string(i)).at(0);
         EXPECT_GT(row.at(0), 0) << "the junction checkpoint is the chunk's input";
     }
 }
@@ -737,7 +818,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     // with a negative usable count and assert before the config diagnostic.
     try {
         SetTestSnapshotPool(cfg);
-        Scheduler scheduler{cfg};
+        Scheduler scheduler{WithHostPackingFromDevice(cfg)};
         FAIL() << "a device cache without usable capacity was accepted";
     } catch (const std::invalid_argument& error) {
         EXPECT_NE(std::string{error.what()}.find("device cache"), std::string::npos) << error.what();

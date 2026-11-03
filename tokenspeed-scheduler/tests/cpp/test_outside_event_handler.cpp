@@ -57,6 +57,7 @@ protected:
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 8;
         cfg.host_allocator.total_pages = 8;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -79,6 +80,10 @@ TEST_F(FinishOnlyWriteBackTestSuite, PrefillStreamsMlaPagesDecodeDefersUntilFini
     EXPECT_EQ(prefill_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0}));
     SendWriteBackDone(prefill_write_back.op_ids.front());
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 2);
+    const HostCacheStats after_publication = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(after_publication.publication_stores.ops, 1u);
+    EXPECT_EQ(after_publication.publication_stores.blocks, (std::vector<std::uint64_t>{2}));
+    EXPECT_EQ(after_publication.finish_stores.ops, 0u);
 
     SendForwardDone("r0", {43});
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
@@ -98,6 +103,16 @@ TEST_F(FinishOnlyWriteBackTestSuite, PrefillStreamsMlaPagesDecodeDefersUntilFini
            "2 plus a one-token tail)";
     SendWriteBackDone(finish_write_back.op_ids.front());
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    // Finish requeues the whole chain: the two prompt pages are skipped as
+    // already on Host, the decode page and the tail are stored.
+    const HostCacheStats stats = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(stats.publication_stores.ops, 1u) << "decode publishes nothing to Host";
+    EXPECT_EQ(stats.finish_stores.ops, 1u);
+    EXPECT_EQ(stats.finish_stores.blocks, (std::vector<std::uint64_t>{2}));
+    EXPECT_EQ(stats.finish_stores.host_cached, 2u);
+    EXPECT_EQ(
+        stats.finish_stores.in_flight + stats.finish_stores.evicted_before_drain + stats.finish_stores.no_placement,
+        0u);
 }
 
 TEST_F(FinishOnlyWriteBackTestSuite, FinishStoresTheTailOfAOneTokenPrompt) {
@@ -124,6 +139,12 @@ TEST_F(FinishOnlyWriteBackTestSuite, AbortEmitsNoStore) {
     SendAbortEvent("r0");
 
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
+    const TierTransferManager::WriteBackStats finish_stores = scheduler_->GetHostCacheStats().finish_stores;
+    EXPECT_EQ(finish_stores.ops, 0u);
+    EXPECT_EQ(finish_stores.host_cached + finish_stores.in_flight + finish_stores.evicted_before_drain +
+                  finish_stores.no_placement + finish_stores.blocks[0],
+              0u)
+        << "an abort drains no finish candidate";
 }
 
 class FinishOnlyHybridWriteBackTestSuite : public FinishOnlyWriteBackTestSuite {
@@ -132,6 +153,7 @@ protected:
         SchedulerConfig cfg = FinishOnlyWriteBackTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;
         cfg.host_allocator.total_pages = 16;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         for (std::int32_t i = 0; i < 3; ++i) {
             CacheGroupConfig state = cfg.cache_groups.front();
@@ -185,13 +207,16 @@ protected:
         cfg.decode_input_tokens = 0;
         cfg.device_allocator.total_pages = 5;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.enable_l3_storage = false;
         return cfg;
     }
 
-    // Both seeds finish right after their prefill (a zero decode width plans
+    // The seeds finish right after their prefill (a zero decode width plans
     // no decode step): the quiescent finish publishes the prompt pages, whose
-    // stream to Host rides the next plan.
+    // stream to Host rides the next plan. Of the four usable Device pages,
+    // r_fill's three evict r1's last page and r_fill2's one evicts r1's first,
+    // the least recently used, so r1's prompt stays on Host alone.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
@@ -209,6 +234,13 @@ protected:
         SendFinish("r_fill");
         AckWriteBacks(PlanOnce());
         PlanOnce();
+
+        Submit(MakeRequestSpec("r_fill2", /*num_pages=*/1, /*start=*/300));
+        PlanOnce();
+        SendForwardDone("r_fill2", {201});
+        SendFinish("r_fill2");
+        AckWriteBacks(PlanOnce());
+        PlanOnce();
     }
 };
 
@@ -216,6 +248,10 @@ protected:
 // the host cache and be scheduled with reduced input_length (host pages already cached).
 TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     SetupHostCache();
+    // The fills' admissions evicted r1's two pages after they reached Host.
+    const CacheCoordinator::DeviceEvictionCounts seeded = scheduler_->GetHostCacheStats().device_evictions.admission;
+    EXPECT_EQ(seeded.blocks, 2u);
+    EXPECT_EQ(seeded.host_resident, 2u);
 
     Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/1));
     auto plan = PlanOnce();
@@ -233,6 +269,15 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
         EXPECT_EQ(fwd->extend_prefix_lens[idx], 1 * PrefixGranularity())
             << "extend_prefix_len should cover the 1 loadback page";
     }
+    // The Device holds none of r2's prompt, so the Host wins with the one page
+    // and loads it: all of it counts as a Host hit and as a Host gain.
+    const HostCacheStats stats = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(stats.prefix_hits.device_hit_tokens, 0u);
+    EXPECT_EQ(stats.prefix_hits.host_hit_tokens, 2u);
+    EXPECT_EQ(stats.prefix_hits.host_gain_tokens, 2u);
+    EXPECT_EQ(stats.prefix_hits.prompt_tokens, 4u + 6u + 2u + 4u);
+    EXPECT_EQ(stats.prefix_loads.ops, 1u) << "r2's load-back of the one page";
+    EXPECT_EQ(stats.prefix_loads.blocks, (std::vector<std::uint64_t>{1}));
 }
 
 class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {
@@ -243,6 +288,7 @@ protected:
         // Cache block 0 is the null page, leaving three usable pages.
         cfg.device_allocator.total_pages = 4;
         cfg.host_allocator.total_pages = 4;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 2;
         cfg.max_batch_size = 1;
         cfg.decode_input_tokens = 1;
@@ -284,8 +330,8 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     ASSERT_NE(prefill, nullptr);
     EXPECT_EQ(prefill->request_ids, (std::vector<std::string>{"r0"}));
     EXPECT_EQ(prefill->input_lengths, (std::vector<std::int32_t>{4}));
-    ASSERT_EQ(prefill->block_tables.count("full"), 1u);
-    EXPECT_EQ(prefill->block_tables.at("full").at(0).size(), 3u);
+    ASSERT_EQ(prefill->BlockTables().count("full"), 1u);
+    EXPECT_EQ(prefill->BlockTables().at("full").at(0).size(), 3u);
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 3u);
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
@@ -295,8 +341,8 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     const std::int32_t r0 = FindRequestIndex(decode, "r0");
     ASSERT_GE(r0, 0);
     EXPECT_EQ(decode->decode_input_ids[static_cast<std::size_t>(r0)], 42);
-    ASSERT_EQ(decode->block_tables.count("full"), 1u);
-    EXPECT_EQ(decode->block_tables.at("full")[static_cast<std::size_t>(r0)].size(), 3u);
+    ASSERT_EQ(decode->BlockTables().count("full"), 1u);
+    EXPECT_EQ(decode->BlockTables().at("full")[static_cast<std::size_t>(r0)].size(), 3u);
 }
 
 class DisaggDecodePriorityTestSuite : public DisaggDecodeAdmissionTestSuite {
@@ -349,6 +395,7 @@ protected:
         cfg.disable_prefix_cache = false;
         cfg.device_allocator.total_pages = 7;
         cfg.host_allocator.total_pages = 7;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 2;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
@@ -408,6 +455,7 @@ protected:
         SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 3;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
@@ -437,6 +485,28 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.host_allocator.total_pages = 0;
         SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// One usable Host L2 parent: of the victim's three published slots, the split
+// places one on the Host and sends two to the snapshot pool.
+class DecodeRetractionOneHostParentTestSuite : public DecodeRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 2;  // null parent + one
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        return cfg;
+    }
+};
+
+// And a one-page snapshot pool: the split's two pool slots are too many.
+class DecodeRetractionOneSnapshotPageTestSuite : public DecodeRetractionOneHostParentTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeRetractionOneHostParentTestSuite::MakeConfig();
+        cfg.snapshot_allocator.total_pages = 2;  // null parent + one
         return cfg;
     }
 };
@@ -534,6 +604,13 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     EXPECT_EQ(write_back.source_pinned, std::vector<bool>{false})
         << "the victim's pages are granted away this round; the runtime must order the copy ahead of reuse";
     EXPECT_EQ(write_back.src_pages.at(0).size(), 3u);
+    // Every published slot of the attempt took the L2 leg.
+    const HostCacheStats retracted = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(retracted.retraction_stores.ops, 1u);
+    EXPECT_EQ(retracted.retraction_stores.blocks, (std::vector<std::uint64_t>{3}));
+    EXPECT_EQ(retracted.retraction_stores.host_cached + retracted.retraction_stores.in_flight +
+                  retracted.retraction_stores.snapshot_fallback + retracted.retraction_stores.image_refused,
+              0u);
     const SnapshotStoreBatch* store = FindSnapshotStore(retract);
     ASSERT_NE(store, nullptr) << "the tail leg always rides the plan: it carries the slot-state blob";
     EXPECT_EQ(store->request_ids, (std::vector<std::string>{"running"}));
@@ -576,6 +653,10 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     }
     EXPECT_EQ(scheduler_->DecodingSize(), 0u) << "a retracted request returns to Decode only after the ACK";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    const HostCacheStats restoring = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(restoring.restore_loads.ops, 1u);
+    EXPECT_EQ(restoring.restore_loads.blocks, (std::vector<std::uint64_t>{3}));
+    EXPECT_EQ(restoring.prefix_loads.ops, 0u) << "a restore is no prefix-hit load";
     SendRestoreDone(restore->op_ids.front());
     SendRestoreDone(restore->op_ids.front());  // Duplicate ACK is ignored.
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
@@ -592,13 +673,72 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     EXPECT_EQ(resumed->NumExtends(), 0u) << "the D role runs no prefill of any kind";
     EXPECT_EQ(resumed->decode_input_ids.front(), 44)
         << "the first decode after a restore carries its input: the new slot holds no in-flight capture";
-    EXPECT_EQ(resumed->block_tables.at("full").at(0).size(), 4u) << "3 restored pages and the decode slot";
+    EXPECT_EQ(resumed->BlockTables().at("full").at(0).size(), 4u) << "3 restored pages and the decode slot";
     SendForwardDone("running", {45});
     const ExecutionPlan next = PlanOnce();
     const ForwardBatch* ordinary = FindForwardBatch(next.Operations());
     ASSERT_NE(ordinary, nullptr);
     ASSERT_EQ(ordinary->request_ids, (std::vector<std::string>{"running"}));
     EXPECT_EQ(ordinary->decode_input_ids.front(), -1) << "from the second step on the device has its own capture";
+}
+
+TEST_F(DecodeRetractionOneHostParentTestSuite, PublishedSlotsWithoutAHostBlockRideTheSnapshotPool) {
+    ExecutionPlan retract;
+    DriveRunningToRetraction(retract);
+    const TierTransferManager::WriteBackStats retraction_stores = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(retraction_stores.ops, 1u);
+    EXPECT_EQ(retraction_stores.blocks, (std::vector<std::uint64_t>{1}));
+    EXPECT_EQ(retraction_stores.snapshot_fallback, 2u);
+    EXPECT_EQ(retraction_stores.image_refused, 0u);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 6 - 2);
+    AckImageStores(retract);
+    FinishRemote("blocked", /*bootstrap_token=*/142);
+    FinishRemote("other", /*bootstrap_token=*/242);
+
+    const ExecutionPlan recovery = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(recovery);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->src_pages.at(0).size(), 3u);
+    const TierTransferManager::LoadBackStats restore_loads = scheduler_->GetHostCacheStats().restore_loads;
+    EXPECT_EQ(restore_loads.ops, 1u);
+    EXPECT_EQ(restore_loads.blocks, (std::vector<std::uint64_t>{1})) << "the snapshot-pool rows are no L2 traffic";
+    AckRestores(recovery);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+}
+
+TEST_F(DecodeRetractionOneSnapshotPageTestSuite, ARefusedImageAcquiresAndEvictsNothing) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1),
+            MakeRequestSpec("other", /*num_pages=*/2, /*start=*/201)});
+    SendBootstrapped("running");
+    SendBootstrapped("other");
+    PlanOnce();
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("blocked");
+    for (const std::int32_t token : {43, 44}) {
+        PlanOnce();
+        SendForwardDone("running", {token});
+    }
+
+    // running needs a page and is the only victim: its image would put two
+    // slots in a one-page pool, so the probe refuses it before a Host block
+    // is acquired for it -- no slot is counted -- and running is aborted for
+    // the Host's size.
+    const std::int32_t host_free = scheduler_->HostPoolFreeBlocks();
+    const ExecutionPlan refused = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(refused).empty());
+    const TierTransferManager::WriteBackStats retraction_stores = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(retraction_stores.ops, 0u);
+    EXPECT_EQ(retraction_stores.blocks, (std::vector<std::uint64_t>{0}));
+    EXPECT_EQ(retraction_stores.snapshot_fallback, 0u);
+    EXPECT_EQ(retraction_stores.image_refused, 0u);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), host_free);
+    ASSERT_EQ(refused.aborts.size(), 1u);
+    EXPECT_EQ(refused.aborts.front().request_id, "running");
+    EXPECT_NE(refused.aborts.front().detail.find("--kvstore-size"), std::string::npos) << refused.aborts.front().detail;
 }
 
 TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RestoreUsesItsOwnImageWithPrefixCachingDisabled) {
@@ -769,6 +909,7 @@ protected:
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 7;  // null parent + six usable LCM parents
         cfg.host_allocator.total_pages = 32;   // Keep retraction capacity outside these placement tests.
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 2;
         cfg.overlap_schedule_depth = 0;
         cfg.disable_prefix_cache = false;
@@ -815,6 +956,7 @@ protected:
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 65;
         cfg.host_allocator.total_pages = 65;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;
         cfg.max_batch_size = 4;
         cfg.disable_prefix_cache = false;
@@ -870,7 +1012,7 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
     ASSERT_NE(destination, nullptr);
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{11}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
-    const auto& swa = destination->block_tables.at("swa").at(0);
+    const auto swa = destination->BlockTables().at("swa").at(0);
     // Seven two-token blocks cover the 13-token prompt and the decode slot.
     ASSERT_EQ(swa.size(), 7u);
     for (std::size_t slot = 0; slot < 4; ++slot) {
@@ -885,7 +1027,7 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
         << "the block containing token 11 is a fresh page the peer fills whole";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(6)), 1) << "the landing's own block";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(4)), 0) << "a copy destination is never zeroed";
-    const auto& full = destination->block_tables.at("full").at(0);
+    const auto full = destination->BlockTables().at("full").at(0);
     ASSERT_GE(full.size(), 3u);  // the prompt, the decode slot and the D's admission headroom
     EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "the full group's only tail block is the partial one";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(2)), 1);
@@ -897,7 +1039,7 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
     // copied block [8, 10) has already slid out.
     std::vector<std::int32_t> after_landing = swa;
     after_landing.at(4) = 0;
-    EXPECT_EQ(decode->block_tables.at("swa").at(0), after_landing);
+    EXPECT_EQ(decode->BlockTables().at("swa").at(0), after_landing);
 }
 
 class PdDecodeCapacityTestSuite : public PdSparseDecodeAdmissionTestSuite {
@@ -946,6 +1088,76 @@ TEST_F(PdDecodeCapacityTestSuite, SingleRequestCapacityChargesTheLandingShapeOnl
     EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 24);
 }
 
+// The D role's State input is a Device tail checkpoint when its prompt
+// claims the prompt-end state an earlier request left there: r1 repeats the
+// nine tokens r0 computed and claims r0's state at 9. Once r1 decodes, its
+// finish publishes its state at 10, which supersedes that one: big's landing
+// evicts it first, as r1's reclaim, with its tail's KV block, and old's
+// checkpoint, the least recently used, with its own; the prompt ending at 10
+// still claims its state, the one ending at 9 no longer does. Had r1 left
+// before any decode, its end state would be the state at 9 itself,
+// superseding nothing: big's landing evicts only old's, and the prompt ending
+// at 9 still claims its state.
+TEST_F(PdSparseDecodeAdmissionTestSuite, AClaimedPromptEndStateIsSupersededOnlyByADecode) {
+    config_.device_allocator.total_pages = 10;  // null parent + nine usable parents
+    config_.cache_groups[0].total_pages = 19;
+    config_.cache_groups[1].total_pages = 10;
+    SetTestSnapshotPool(config_);
+    for (const bool r1_decodes : {false, true}) {
+        SCOPED_TRACE(r1_decodes);
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+        RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1);
+        r1.tokens.push_back(42);
+        // Each lands with the bootstrap token 42; old and r0 decode it and
+        // leave at nine tokens.
+        for (const auto& [id, start] : {std::pair{"old", 100}, std::pair{"r0", 1}, std::pair{"r1", 1}}) {
+            const std::string request_id = id;
+            Submit({request_id == "r1" ? r1 : MakeRequestSpec(request_id, /*num_pages=*/4, start)});
+            SendBootstrapped(request_id);
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* landing = FindRemoteAdmission(plan);
+            ASSERT_NE(landing, nullptr) << request_id;
+            EXPECT_EQ(landing->state_prefix_cached, std::vector<bool>{request_id == "r1"}) << request_id;
+            SendRemotePrefillDone(request_id, /*bootstrap_token=*/42);
+            if (request_id != "r1" || r1_decodes) {
+                ASSERT_NE(FindForwardBatch(PlanOnce().Operations()), nullptr) << request_id;
+                SendForwardDone(request_id, {43});
+            }
+            ExecutionEvent succeeded;
+            succeeded.With(pd::SucceededEvent{request_id});
+            scheduler_->Advance(succeeded);
+            AckWriteBacks(PlanOnce());
+        }
+
+        Submit({MakeRequestSpec("big", /*num_pages=*/2, /*start=*/500)});
+        SendBootstrapped("big");
+        ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
+        // Each state at 9 leaves with its tail's KV block: old's as an
+        // admission victim, r0's, once r1 decoded, as r1's reclaim.
+        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        EXPECT_EQ(evictions.admission.blocks, 2u);
+        EXPECT_EQ(evictions.request_reclaim.blocks, r1_decodes ? 2u : 0u);
+        SendAbortEvent("big");
+        PlanOnce();
+
+        for (const bool ends_at_10 : {false, true}) {
+            RequestSpec again = r1;
+            again.request_id = ends_at_10 ? "again-10" : "again-9";
+            if (ends_at_10) {
+                again.tokens.push_back(42);
+            }
+            Submit({again});
+            SendBootstrapped(again.request_id);
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* landing = FindRemoteAdmission(plan);
+            ASSERT_NE(landing, nullptr) << again.request_id;
+            EXPECT_EQ(landing->state_prefix_cached, std::vector<bool>{ends_at_10 == r1_decodes}) << again.request_id;
+            SendAbortEvent(again.request_id);
+            PlanOnce();
+        }
+    }
+}
+
 TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecodesInPlace) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");
@@ -954,13 +1166,13 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     const ForwardBatch* destination = FindRemoteAdmission(plan);
     ASSERT_NE(destination, nullptr);
     EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{false});
-    const auto& full = destination->block_tables.at("full").at(0);
+    const auto full = destination->BlockTables().at("full").at(0);
     ASSERT_EQ(full.size(), 5u);
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
     // The peer's final state lands in slot 1; slot 0 is the zero state, so
     // the first decode writes slot 1 in place.
-    const auto& state = destination->block_tables.at("state").at(0);
+    const auto state = destination->BlockTables().at("state").at(0);
     ASSERT_EQ(state.size(), 2u);
     EXPECT_EQ(state[0], 0);
     EXPECT_GT(state[1], 0);
@@ -975,7 +1187,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     const ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
     ASSERT_NE(decode, nullptr);
-    const auto& decode_state = decode->block_tables.at("state").at(0);
+    const auto decode_state = decode->BlockTables().at("state").at(0);
     ASSERT_EQ(decode_state.size(), 2u);
     EXPECT_EQ(decode_state[0], 0);
     EXPECT_EQ(decode_state[1], state[1]);
@@ -983,7 +1195,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     const ExecutionPlan later_plan = PlanOnce();
     const ForwardBatch* later = FindForwardBatch(later_plan.Operations());
     ASSERT_NE(later, nullptr);
-    EXPECT_EQ(later->block_tables.at("state").at(0), decode_state) << "every decode writes slot 1 in place";
+    EXPECT_EQ(later->BlockTables().at("state").at(0), decode_state) << "every decode writes slot 1 in place";
 
     SendForwardDone("r0", {44});  // the last decode lands: r0 leaves quiescent
     ExecutionEvent succeeded;
@@ -1023,7 +1235,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{1}));
     EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
-    const auto& state = destination->block_tables.at("state").at(0);
+    const auto state = destination->BlockTables().at("state").at(0);
     ASSERT_EQ(state.size(), 2u);
     EXPECT_GT(state[0], 0) << "the cached prompt-end state is slot 0";
     EXPECT_GT(state[1], 0) << "a fresh live slot for the first decode";
@@ -1031,7 +1243,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     const ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
     ASSERT_NE(decode, nullptr);
-    EXPECT_EQ(decode->block_tables.at("state").at(0), state) << "the first decode reads slot 0, writes slot 1";
+    EXPECT_EQ(decode->BlockTables().at("state").at(0), state) << "the first decode reads slot 0, writes slot 1";
     SendForwardDone("r1", {44});
     const ForwardBatch* later = FindForwardBatch(PlanOnce().Operations());
     ASSERT_NE(later, nullptr);
@@ -1056,9 +1268,9 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     EXPECT_EQ(destination2->extend_prefix_lens, (std::vector<std::int32_t>{9}));
     EXPECT_EQ(destination2->input_lengths, (std::vector<std::int32_t>{1}));
     EXPECT_EQ(destination2->state_prefix_cached, std::vector<bool>{false});
-    EXPECT_EQ(destination2->block_tables.at("state").at(0).at(0), 0);
+    EXPECT_EQ(destination2->BlockTables().at("state").at(0).at(0), 0);
     EXPECT_TRUE(plan2.pages_to_copy.at("full").empty()) << "the hit's only tail block is the partial one";
-    const auto& full2 = destination2->block_tables.at("full").at(0);
+    const auto full2 = destination2->BlockTables().at("full").at(0);
     ASSERT_EQ(full2.size(), 6u);  // five prompt pages and the decode reserve
     EXPECT_EQ(std::ranges::count(plan2.pages_to_zero.at("full"), full2.at(4)), 1)
         << "the block containing token 9 is a fresh page";
@@ -1077,7 +1289,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeFor
         const ForwardBatch* destination = FindRemoteAdmission(plan);
         ASSERT_NE(destination, nullptr);
         ASSERT_EQ(destination->state_prefix_cached, std::vector<bool>{attempt > 0});
-        const auto& state = destination->block_tables.at("state").at(0);
+        const auto state = destination->BlockTables().at("state").at(0);
         ASSERT_EQ(state.size(), 2u);
         if (attempt > 0) {
             ASSERT_GT(state[0], 0);
@@ -1123,11 +1335,11 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAligne
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
     EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
 
-    const auto& full = destination->block_tables.at("full").at(0);
+    const auto full = destination->BlockTables().at("full").at(0);
     ASSERT_EQ(full.size(), 5u);
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
-    const auto& state = destination->block_tables.at("state").at(0);
+    const auto state = destination->BlockTables().at("state").at(0);
     ASSERT_EQ(state.size(), 2u);
     EXPECT_GT(state[0], 0) << "the page-aligned prompt-end checkpoint";
     EXPECT_GT(state[1], 0);
@@ -1142,7 +1354,7 @@ TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMate
     const ExecutionPlan seed_admission = PlanOnce();
     const ForwardBatch* seed_destination = FindRemoteAdmission(seed_admission);
     ASSERT_NE(seed_destination, nullptr);
-    const auto seed_row = seed_destination->block_tables.at("sliding").at(0);
+    const auto seed_row = seed_destination->BlockTables().at("sliding").at(0);
     ASSERT_EQ(seed_row.size(), 5u);
     EXPECT_EQ(seed_row[0], 0);
     EXPECT_EQ(seed_row[1], 0);
@@ -1169,7 +1381,7 @@ TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMate
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{8}));
 
-    const auto& row = destination->block_tables.at("sliding").at(0);
+    const auto row = destination->BlockTables().at("sliding").at(0);
     ASSERT_EQ(row.size(), 9u);
     EXPECT_EQ(row[0], 0);
     EXPECT_EQ(row[1], 0);
@@ -1216,7 +1428,7 @@ TEST_F(PdSlidingPageBlockDecodeAdmissionTestSuite, ATailHitInsideThePromptsLastB
     ASSERT_NE(destination, nullptr);
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{5}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{1}));
-    const auto& row = destination->block_tables.at("sliding").at(0);
+    const auto row = destination->BlockTables().at("sliding").at(0);
     ASSERT_EQ(row.size(), 2u) << "blocks [0, 4) and [4, 8): nothing lands beyond the tail's block";
     EXPECT_GT(row[0], 0) << "the window [3, 6) keeps block 0";
     EXPECT_GT(row[1], 0);
@@ -1237,7 +1449,7 @@ TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, DecodeStepsWriteTheLandedStateInPla
         const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
         ASSERT_NE(decode, nullptr);
         ASSERT_EQ(decode->request_ids, (std::vector<std::string>{"r0"}));
-        const std::vector<std::int32_t> state = decode->block_tables.at("state").at(0);
+        const std::vector<std::int32_t> state = decode->BlockTables().at("state").at(0);
         ASSERT_EQ(state.size(), 2u);
         EXPECT_EQ(state[0], 0);
         EXPECT_GT(state[1], 0);

@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 def _compute_host_layout(
     layout: CacheTransferLayout,
-) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], int]:
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], int, tuple[int, ...]]:
     host_cache_block_bytes = []
     host_field_offsets = []
     host_lcm_block_bytes = 0
@@ -49,14 +49,18 @@ def _compute_host_layout(
             cursor += field.payload_bytes
         host_cache_block_bytes.append(cursor)
         host_field_offsets.append(tuple(offsets))
-        host_lcm_block_bytes = max(
-            host_lcm_block_bytes,
-            group.cache_blocks_per_lcm_block * cursor,
-        )
+        host_lcm_block_bytes = max(host_lcm_block_bytes, cursor)
+    # Device packing satisfies model/kernel strides. Host bytes have no such
+    # stride constraint: one shared parent fits the largest compact payload,
+    # and each group fills it with as many complete payloads as it can hold.
+    host_group_packing = tuple(
+        host_lcm_block_bytes // size for size in host_cache_block_bytes
+    )
     return (
         tuple(host_cache_block_bytes),
         tuple(host_field_offsets),
         host_lcm_block_bytes,
+        host_group_packing,
     )
 
 
@@ -64,6 +68,37 @@ def compute_host_lcm_block_bytes(layout: CacheTransferLayout) -> int:
     """Return compact Host bytes required by one LCMBlock."""
 
     return _compute_host_layout(layout)[2]
+
+
+def compute_host_group_packing(layout: CacheTransferLayout) -> tuple[int, ...]:
+    """Return physical children per shared Host parent in layout group order."""
+
+    return _compute_host_layout(layout)[3]
+
+
+def validate_host_group_packing(packing: tuple[int, ...], *, cpu_group) -> None:
+    """Require identical Host block IDs on every mirrored scheduler rank.
+
+    Args:
+        packing: Virtual Host children per parent in scheduler group order.
+        cpu_group: The ranks' Gloo group, or None for one rank.
+    """
+    if cpu_group is None:
+        return
+    import torch
+    import torch.distributed as dist
+
+    # Compare lengths first so every rank joins the same number of collectives.
+    for value in (len(packing), *packing):
+        minimum = torch.tensor(value, dtype=torch.int64)
+        negative_maximum = torch.tensor(-value, dtype=torch.int64)
+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=cpu_group)
+        dist.all_reduce(negative_maximum, op=dist.ReduceOp.MIN, group=cpu_group)
+        if minimum.item() != -negative_maximum.item():
+            raise ValueError(
+                "Host packing must match across scheduler ranks; their compact "
+                f"Host layouts differ (this rank's packing is {packing})"
+            )
 
 
 class HostCacheStorage:
@@ -82,13 +117,11 @@ class HostCacheStorage:
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
         self.group_ids = tuple(group.group_id for group in layout.groups)
-        self.group_packing = tuple(
-            group.cache_blocks_per_lcm_block for group in layout.groups
-        )
         (
             self.host_cache_block_bytes,
             self.host_field_offsets,
             self.host_lcm_block_bytes,
+            self.group_packing,
         ) = _compute_host_layout(layout)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
@@ -155,3 +188,4 @@ class HostCacheResources:
     memory_plan: CacheMemoryPlan
     attention_backend_name: str
     draft_attention_backend_name: str
+    checkpoint_granularities: tuple[tuple[str, int], ...] = ()

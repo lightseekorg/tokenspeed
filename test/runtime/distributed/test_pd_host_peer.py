@@ -60,6 +60,7 @@ from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
     HostPrefillPeer,
     PeerSettings,
     _prefill_settings,
+    kv_bootstrap_address,
 )
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 
@@ -146,6 +147,11 @@ def _server_args(bootstrap_port: int) -> SimpleNamespace:
         dist_init_addr="127.0.0.1:5000",
         disaggregation_bootstrap_port=bootstrap_port,
     )
+
+
+def test_the_kv_bootstrap_server_is_on_the_first_node():
+    # Where the prefill ranks register, and where a frontend sends decode.
+    assert kv_bootstrap_address(_server_args(8998)) == ("127.0.0.1", 8998)
 
 
 @pytest.mark.parametrize(

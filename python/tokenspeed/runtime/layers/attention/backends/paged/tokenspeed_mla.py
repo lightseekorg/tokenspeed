@@ -239,10 +239,14 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
+        self.min_kv_split = 1 if spec.min_kv_split is None else spec.min_kv_split
+        if not 1 <= self.min_kv_split <= 256:
+            raise ValueError("min_kv_split must be in [1, 256]")
+        self._decode_row_capacity = config.max_bs * self.block_decode_expansion
 
         # Decode scratch comes from the shared WorkspacePool: the kernel's own
         # get_workspace_size formula is B*H*q_len*split_kv*(D+1)*acc_bytes with
-        # B*split_kv <= num_SMs, giving the closed-form bound used in
+        # automatic B*split_kv <= num_SMs, plus any explicit split minimum in
         # _cutedsl_workspace. The content is partial decode accumulators,
         # consumed within each op and never zero-initialized, so sharing the
         # block is safe. Warm to the verify-path peak now: graph capture runs
@@ -322,6 +326,18 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             * (self.kv_lora_rank + 1)
             * 4
         )
+        if self.min_kv_split > 1:
+            head_rows = self._num_heads_per_tp * len(self.kvp_group) * q_len_capacity
+            # Packed FP8 queries pad the combined query/head axis to 128 rows.
+            head_rows = ((head_rows + 127) // 128) * 128
+            required = max(
+                required,
+                self._decode_row_capacity
+                * head_rows
+                * self.min_kv_split
+                * (self.kv_lora_rank + 1)
+                * 4,
+            )
         (buf,) = self._workspace_pool.allocate(((required,), torch.int8))
         return buf
 
@@ -760,6 +776,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             window_left=window_left,
             local_visible_lens=local_visible_lens,
             return_lse=metadata.dcp is not None,
+            min_split_kv=self.min_kv_split,
         )
         if metadata.dcp is not None:
             partial, lse_log2 = raw_out

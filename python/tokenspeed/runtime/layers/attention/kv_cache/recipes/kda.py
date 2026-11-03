@@ -18,13 +18,27 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KDA verify workspace shared by the Kimi-K3 and GLM cache recipes."""
+"""KDA state helpers shared by the Kimi-K3 and GLM cache recipes."""
+
+import torch
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
 )
+
+
+def kda_recurrent_state_dtype(server_args) -> torch.dtype:
+    """KDA recurrent-state dtype selected by ``--mamba-ssm-dtype``.
+
+    The scans accumulate in FP32 either way; BF16 only narrows what is stored
+    between steps, halving the state pages.
+    """
+    return {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }[server_args.mamba_ssm_dtype]
 
 
 def kda_replay_supported(config: AttnConfig) -> bool:

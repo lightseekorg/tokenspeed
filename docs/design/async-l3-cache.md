@@ -76,11 +76,14 @@ I/O and its memory references may outlive cancellation or a soft deadline;
 that lifetime stays in `StorageTransferManager`, independently of the FSM.
 
 `AdmissionResources` carries the input context, `storage_prepared` bit and
-optional Ready hold across these pre-admission transitions. The hold names
+optional Ready hold across these pre-admission transitions. The state that
+waits on a query or GET, and the Ready hold after it, own a `StorageLease` on
 the storage ticket; the actual Host references remain in
-`StorageTransferManager`. `storage_prepared` means the request has considered
-L3 once, not that a read succeeded. A Ready hold likewise does not promise
-a complete prefix hit.
+`StorageTransferManager`. Whatever ends the state — admission, a soft
+deadline, an abort — drops the lease with it, which detaches the request
+from the ticket: no path has to release L3 by hand. `storage_prepared` means
+the request has considered L3 once, not that a read succeeded. A Ready hold
+likewise does not promise a complete prefix hit.
 
 `plan.cache` contains both Device copies and four Host-only command types:
 `StorageQueryOp`, `StorageGetOp`, `StoragePutOp` and `StorageCancelOp`.
@@ -98,9 +101,11 @@ completion protocol; storage completion never substitutes for an H2D fence.
    full prefix boundaries and matching tails from the local `TailTable`, plus
    the exact reusable request bound. Query credits first cover the longest
    boundary whose complete missing dependencies fit: Full history, the SWA
-   window and each State checkpoint at that boundary. Shorter fallback
-   boundaries contribute their distinct missing keys only when the whole
-   additional set fits. Historical State checkpoints cannot crowd out the
+   window and each State checkpoint at that boundary that the Device's
+   prefix does not supply (the Host-suffix rule of
+   [cache concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)).
+   Shorter fallback boundaries contribute their distinct missing keys only
+   when the whole additional set fits. Historical State checkpoints cannot crowd out the
    prompt-end checkpoint needed for the longest restore.
 2. The storage subset of `plan.cache` carries a query with a monotonically
    increasing operation ID and immutable keys. Querying reserves no Device
@@ -137,12 +142,15 @@ request bound, but cannot discover an arbitrary older nonaligned checkpoint
 in a longer prompt without a local hint. There is no shared tail directory
 or scan of every token position. These misses use ordinary computation.
 
-Query planning uses the same matcher masks and key traversal as reservation,
-with temporary existence assumptions and no cache-block allocation. It may
-skip history below the aligned local Device/Host coverage, but considers only
-boundaries beyond the complete local hit. Reservation always matches again
-from the Device floor and pins the real Host dependencies before allocation;
-eviction between QUERY and GET can shorten the restore, never establish a hit.
+Query planning uses the same matcher masks and key traversal as reservation
+and admission, with temporary existence assumptions standing in for Host
+entries and no cache-block allocation. It considers only boundaries beyond the
+complete local hit, and at each one the Device's KV prefix and the Device's
+checkpoints count as they are: only the Host suffix's missing keys are asked
+for, never KV or a checkpoint the Device holds below the split. Reservation
+always matches again above the Device-only hit and pins the real Host
+dependencies before allocation; eviction between QUERY and GET can shorten
+the restore, never establish a hit.
 
 `max_host_blocks` counts logical references across all groups and outstanding
 storage operations, including recurrent-state checkpoints. It is neither a

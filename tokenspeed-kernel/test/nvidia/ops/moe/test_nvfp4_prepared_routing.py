@@ -255,27 +255,30 @@ def test_prepared_routing_reproduces_the_fused_launch_bitwise(
     assert torch.equal(split[1], fused_weights)
 
 
-def test_prepared_routing_replays_new_top_k_under_a_graph() -> None:
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_prepared_routing_replays_new_top_k_under_a_graph(enable_pdl: bool) -> None:
     tokens = 2
     generator = torch.Generator(device="cuda").manual_seed(7)
     w = _weights(generator)
     x_quantized = _quantized(generator, tokens)
     logits = _logits(generator, tokens)
     weights, ids = _routing(logits)
-    prepared = module.prepare_nvfp4_routing(w, x_quantized, ids, weights, None, False)
+    prepared = module.prepare_nvfp4_routing(
+        w, x_quantized, ids, weights, None, enable_pdl
+    )
     _populate(prepared, logits)
-    _apply(w, x_quantized, weights, ids, False, prepared)
+    _apply(w, x_quantized, weights, ids, enable_pdl, prepared)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         weights, ids = _populate(prepared, logits)
-        split = _apply(w, x_quantized, weights, ids, False, prepared)
+        split = _apply(w, x_quantized, weights, ids, enable_pdl, prepared)
     for seed in (11, 12):
         logits.copy_(_logits(torch.Generator(device="cuda").manual_seed(seed), tokens))
         graph.replay()
         replayed = _rows(split, tokens).clone()
         torch.cuda.synchronize()
-        fused = _apply(w, x_quantized, *_routing(logits), False, None)
+        fused = _apply(w, x_quantized, *_routing(logits), enable_pdl, None)
         assert torch.equal(replayed, _rows(fused, tokens))
 
 

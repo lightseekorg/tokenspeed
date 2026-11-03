@@ -52,8 +52,11 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   missing implementation fails at startup
 │                                   instead of silently falling back
 ├── collectives.deterministic       one association order per reduction
-│   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
-│   │                               kernels make no bitwise claim)
+│   ├── no fused AR+norm            enable_allreduce_fusion=False and
+│   │                               comm_fusion_max_num_tokens=-1, also set
+│   │                               by batch_invariant_collectives or
+│   │                               layer_boundary_norm=unfused alone (the
+│   │                               fused kernels make no bitwise claim)
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   ├── batch_invariant_collectives AutoBackend.route, one decision for every
@@ -145,19 +148,12 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               batch_invariant=True); the tuned top-k
 │   │                               kernels switch algorithm and CTA split
 │   │                               with the row count, which moves ties
-│   ├── position-order reduction    dsa_slot_order=sorted: a token's selected
-│   │                               KV rows are reduced in ascending POSITION
-│   │                               order, not in the top-k leaf's tie order
-│   │                               and never in physical slot order (a
-│   │                               request's pages are allocated in arbitrary
-│   │                               id order once pages recycle, so slot order
-│   │                               follows the page placement and differs
-│   │                               between runs and engines). The top-k leaf
-│   │                               emits that order (dsa_decode_topk /
-│   │                               dsa_prefill_topk slot_order trait) and the
-│   │                               sparse core keeps it (dsa_decode /
-│   │                               dsa_prefill slot_order trait); silent
-│   │                               kernels are refused rather than assumed
+│   ├── selection-order reduction   dsa_slot_order=selection: reduce selected
+│   │                               KV rows in the top-k leaf's emitted order,
+│   │                               matching the trainer. Both selection and
+│   │                               attention require batch-invariant leaves;
+│   │                               physical cache addresses never determine
+│   │                               the reduction order
 │   └── per-row GEMMs               fixed-order GEMM leaves (see plans below)
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
@@ -179,6 +175,11 @@ Every selection point that pins a batch-invariant leaf tests `numerics in
 BITWISE_ENVELOPES`, never the one name, so an envelope added above
 rl-bitwise would inherit every pin.
 
+Unquantized FP16/BF16 MoE on `flashinfer_cutlass` defaults to GEMM2 atomic
+expert combine. `--no-moe-cutlass-fused-finalize` selects a separate finalize
+reduction for both target and draft; `rl-bitwise` forces fusion off. The
+setting is fixed in each expert plan before warmup and CUDA graph capture.
+
 ## alignment.trainer
 
 The invariance layers make a deployment agree with itself. Trainer alignment
@@ -193,12 +194,25 @@ and only the reported log-probabilities change.
 | Switch | Trainer form | Changes |
 | --- | --- | --- |
 | `--sampling-stream per-request` | Non-greedy rows draw from a Philox stream keyed by `(request seed, position)` only (`sampling.deterministic` above); the trainer plays back the sampled ids, so this is an invariance switch rather than an alignment one — T>0 rollouts need it | tokens at T>0 (not logprobs) |
-| `--yarn-ramp-mask-device cpu` | The whole `inv_freq` table of `deepseek_yarn` RoPE — position frequencies, both divisions and the YaRN linear ramp mask — is computed on the host and copied to the device once, as the trainer builds its `inv_freq` on the host; CPU and CUDA division round differently at ulp level, and every rotated q/k inherits the difference | forward values |
+| `--yarn-ramp-mask-device cpu` | Compute the `deepseek_yarn` linear ramp on CPU; `rl-bitwise` pins this choice. The computed ramp is transferred to the frequency device before interpolation | forward values |
+| `--yarn-frequency-device cuda` | Compute YaRN powers, divisions and interpolation on CUDA after transferring the CPU-built ramp; `rl-bitwise` pins this choice, overriding an explicit `cpu`. CPU and CUDA arithmetic can round differently | forward values |
 | `--mla-lora-scale runtime` | The `sqrt(hidden / lora_rank)` norm scales of LongCat-style MLA stay out of the `q_a_layernorm` / `kv_a_layernorm` weights and multiply `q` after `q_b_proj` and the latent after `kv_a_layernorm` in bf16, as the trainer does; the DSA indexer reads the unscaled `q_lora` | forward values |
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
-| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
-| `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 and no DeepEP all-to-all (both refused by `resolve_numerics`) and a kernel declaring `combine_order` with `slot`. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
+| `--dsa-slot-order selection` | Keep the top-k leaf's emitted order when reducing sparse attention, as the trainer does. `rl-bitwise` fixes this choice, overriding an explicit `sorted`; both top-k and attention leaves still require batch invariance. Under `auto`, `sorted` remains available to reduce by token position, never physical cache address | forward values |
+| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = target - log(sum_exp)`, for output and prompt (input) logprobs alike | logprobs only |
+| `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 (refused by `resolve_numerics` otherwise) and a kernel declaring `combine_order` with `slot`; under `--all2all-backend deepep` that kernel must also own the exchange (`supports_all_to_all_ep`) and returns the complete output of the rows this rank owns. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
+
+`rl-bitwise` folds YaRN to a CPU ramp and CUDA frequencies. The same
+construction can be selected under `auto` with `--yarn-ramp-mask-device cpu
+--yarn-frequency-device cuda`. This replaces the previous all-CPU
+inverse-frequency construction under `rl-bitwise`. Under `auto`, both devices
+default independently to `cuda`; setting only the ramp device to `cpu` leaves
+frequency construction on CUDA. For the previous all-CPU construction, set
+both options to `cpu`. Both devices participate in the RoPE cache identity
+and the L3 KV deployment identity, preventing reuse across construction devices.
+The transfer and frequency construction run when the cos/sin cache is
+initialized; forward reuses that cache.
 
 These are the switches the host can mirror with no new vendor dependency.
 The rest of the trainer's form lives in kernel leaves and model code the host
@@ -429,6 +443,43 @@ Value projection stays separate to preserve its explicit rounding boundary.
 Provider registration owns dtype, head geometry and hardware constraints.
 The ordinary auto envelope retains its existing dynamic selection policy.
 
+### Explicit projection plans
+
+A model may bind an existing unquantized Linear or LM-head method to a dense
+GEMM plan without changing its weight owner or storage. The logits processor
+uses that method for a registered bitwise envelope, preserving its normal
+input dtype cast and vocabulary communication.
+
+Plugins may call `register_numerics_envelope` from the runtime registration
+surface. A policy supplies its name, bitwise classification, launch resolver
+and checkpoint validator. Plugin discovery precedes CLI choices and launch
+validation; registrations update shared containers and roll back together if
+plugin loading fails. Every policy still passes the model profile gate.
+Only `rl-bitwise` inherits the RL switches and unquantized/vocab-block limits;
+a plugin owns its own policy without changing individual execution entry points.
+
+The existing `gemm/mm` plan also accepts already quantized FP8 operands and
+canonical scales. Quantization stays in the caller's existing quantization
+hook; an online quantizer is not selected by a frozen GEMM plan. The ordinary
+FP8 linear method retains its original dynamic selection and has no new plan
+field or forwarding path.
+
+The original RMSNorm module may accept a preselected callable through `kernel`.
+The caller uses the existing registry selection during initialization; forward
+invokes that callable with the ordinary weight, epsilon, residual and output
+arguments. No plan or forward-scoped override is required. The default remains
+the original platform facade, and empty inputs keep the original early return.
+A custom callable rejects fused collective/norm entry points so its arithmetic
+cannot be bypassed. Kernel-specific input validation stays in the selected leaf.
+
+`MoELayer` retains the usual `moe/apply` selection and its existing scoped
+`kernel_override` mechanism; no model-specific solution or feature arguments
+are added. An optional input dtype describes the actual activation for that
+selection without changing the global default dtype. A live-row mask is
+forwarded only to a kernel declaring that capability; unsupported masks fail
+rather than being ignored. Weight allocation and checkpoint loading stay on
+the original MoE layer for both precomputed and in-kernel routing.
+
 ## Logprobs: one arithmetic for prompt and output
 
 A returned logprob is the launch's `--logprob-order` applied to the row --
@@ -623,6 +674,9 @@ equals the trainer's sharded sum bitwise when the in-block tree is pairwise
 over its tiles. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
 the vendor leaf registers above it (any higher band), so plain selection
 takes it wherever it is installed and no host code names the vendor.
+The final subtraction is `target - log(sum_exp)`, preserving positive zero
+for a token whose rounded probability is one. Negating the equivalent NLL
+would produce negative zero and fail a bit-pattern comparison with the trainer.
 
 The pins above cover only the paths a verified model takes, so the
 verification is recorded per model and enforced at startup

@@ -67,6 +67,16 @@ std::int32_t OccupiedSlotsByScan(const BlockPool& pool) {
     return occupied;
 }
 
+std::int32_t MinimumParentOccupancyByScan(const BlockPool& pool, std::uint32_t group_id, std::int32_t packing) {
+    std::int32_t minimum = packing;
+    for (std::int32_t parent_id = 1; parent_id <= pool.NumLcmBlocks(); ++parent_id) {
+        if (pool.BoundGroup(parent_id) == group_id) {
+            minimum = std::min(minimum, pool.OccupiedCount(parent_id));
+        }
+    }
+    return minimum;
+}
+
 // The placement order the removed full-pool scan produced: parents already
 // bound to the group, densest first with the lowest id breaking a tie, each
 // contributing its free slots in ascending slot order.
@@ -554,6 +564,8 @@ TEST(BlockPoolOccupancyIndexTest, AgreesWithAFullScanUnderRandomChurn) {
         for (std::uint32_t id = 0; id < kPackings.size(); ++id) {
             ASSERT_EQ(pool.NumFreeSlots(id), FreeSlotsInGroupByScan(pool, id, kPackings[id]))
                 << "step " << step << " group " << id;
+            ASSERT_EQ(pool.MinimumParentOccupancy(id), MinimumParentOccupancyByScan(pool, id, kPackings[id]))
+                << "step " << step << " group " << id;
         }
     }
     held.clear();
@@ -561,7 +573,24 @@ TEST(BlockPoolOccupancyIndexTest, AgreesWithAFullScanUnderRandomChurn) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), kPoolSize);
     for (std::uint32_t id = 0; id < kPackings.size(); ++id) {
         EXPECT_EQ(pool.NumFreeSlots(id), 0);
+        EXPECT_EQ(pool.MinimumParentOccupancy(id), kPackings[id]);
     }
+}
+
+TEST(BlockPoolOccupancyIndexTest, MinimumOccupancyIncludesParentsWithHolesInOnlyOneBucket) {
+    BlockPool pool(3, {4});
+    pool.RegisterGroup(0, 4, 2);
+    auto blocks = pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 6>{0, 0, 1, 1, 0, 0});
+    ASSERT_EQ(blocks.size(), 6u);
+    EXPECT_EQ(pool.MinimumParentOccupancy(0), 2);
+    blocks[0].reset();
+    EXPECT_EQ(pool.MinimumParentOccupancy(0), 2);
+    blocks[4].reset();
+    EXPECT_EQ(pool.MinimumParentOccupancy(0), 1);
+    blocks[5].reset();
+    EXPECT_EQ(pool.MinimumParentOccupancy(0), 3);
+    blocks.clear();
+    EXPECT_EQ(pool.MinimumParentOccupancy(0), 4);
 }
 
 TEST(BlockPoolOccupancyIndexTest, FreeSlotsAreScopedToTheOwningGroup) {

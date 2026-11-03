@@ -23,7 +23,8 @@
     python -m tokenspeed.runtime.execution.drafter.eagle_harness.measure_run \\
         --model <target> --draft-model <EAGLE-4 draft> --run-dir <dir> \\
         --tp-size 4 --compute-intensity chain_intensity --topk 1 \\
-        --num-steps 15 --num-draft-tokens 16 --max-bs 8 --mamba-ssm-dtype float32
+        --num-steps 15 --num-draft-tokens 16 --max-bs 8 --mamba-ssm-dtype float32 \\
+        --attention-backend trtllm
 
 For each sampled batch size the driver writes ``config/measure_config.json``,
 serves that many identical greedy requests on an exec-mode-2 engine (whose
@@ -47,6 +48,7 @@ import os
 import sys
 
 import torch
+from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache,
 )
@@ -85,6 +87,7 @@ _PROMPT = (
 
 def attention_samples(
     *,
+    attention_backend: str,
     batch_size: int,
     rows: int,
     window: int,
@@ -100,9 +103,11 @@ def attention_samples(
     category: str,
 ) -> list[MeasureRecord]:
     """One attention layer of the decode tree cascade over the context range:
-    ``rows`` query rows per request against its ``kv_len``-key prefix (the
-    trtllm-gen decode; a sliding window decodes each row alone over the
-    window ending there) plus its ``window``-key tree window.
+    ``rows`` query rows per request against its ``kv_len``-key prefix (a
+    sliding window decodes each row alone over the window ending there) plus
+    its ``window``-key tree window. The prefix half is the one
+    ``attention_backend`` serves with: ``trtllm`` the trtllm-gen decode,
+    ``mha`` the Triton extend (``MHAAttnBackend._tree_cascade``).
 
     Serving forwards all ``rows`` whatever the round's width, so one timing
     per context stands for every swept width.
@@ -125,8 +130,15 @@ def attention_samples(
     )
     v_rows = torch.randn_like(k_rows)
 
+    if attention_backend not in ("trtllm", "mha"):
+        raise ValueError(f"no tree cascade timing for {attention_backend!r}")
+    trtllm = attention_backend == "trtllm"
+
     def paged(rows_: torch.Tensor) -> torch.Tensor:
-        cache = rows_.view(-1, page, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+        cache = rows_.view(-1, page, num_kv_heads, head_dim)
+        if not trtllm:
+            return cache
+        cache = cache.permute(0, 2, 1, 3)
         return canonicalize_stride(cache) if num_kv_heads == 1 else cache
 
     k_cache, v_cache = paged(k_rows), paged(v_rows)
@@ -166,9 +178,34 @@ def attention_samples(
         else:
             tables = page_table.repeat_interleave(rows, dim=0)
             prefix_lens, q_len = prefix.repeat_interleave(rows), 1
+        cu_seqlens_q = torch.arange(
+            0, q.shape[0] + 1, q_len, dtype=torch.int32, device=device
+        )
 
-        def layer() -> torch.Tensor:
-            out, lse = trtllm_batch_decode_with_kv_cache(
+        def prefix_half() -> tuple[torch.Tensor, torch.Tensor]:
+            if not trtllm:
+                # Pinned to Triton as serving pins it (MHAAttnBackend._tree_cascade).
+                out, lse = mha_extend_with_kvcache(
+                    q=q,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=None,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    page_table=tables,
+                    cache_seqlens=prefix_lens,
+                    max_seqlen_q=q_len,
+                    max_seqlen_k=context_stop + window,
+                    is_causal=True,
+                    window_left=-1 if causal else sliding_window - 1,
+                    logit_cap=0.0,
+                    sinks=None,
+                    return_lse=True,
+                    softmax_scale=scale,
+                    solution="triton",
+                )
+                # The window kernel merges in base 2.
+                return out, lse * 1.4426950408889634
+            return trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=(k_cache, v_cache),
                 workspace_buffer=workspace,
@@ -182,6 +219,9 @@ def attention_samples(
                 window_left=-1 if causal else sliding_window - 1,
                 return_lse=True,
             )
+
+        def layer() -> torch.Tensor:
+            out, lse = prefix_half()
             return tree_window_attention(
                 q, k_rows, v_rows, page_table, seq_lens, mask, out, lse,
                 rows_per_req=rows, window=window, causal_prefix=causal,
@@ -233,6 +273,8 @@ def _full_attention_layers(config) -> int:
 
 def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) -> bool:
     """Measure one batch size; whether its averages converged."""
+    from tokenspeed.runtime.entrypoints.wire_driver import generate_request
+
     ci = args.compute_intensity
     # The verify window: the widest swept verify width.
     verify_num = max(verify_widths(batch_size, ci))
@@ -241,8 +283,12 @@ def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) ->
     with open(os.path.join(config_dir, "measure_config.json"), "w") as f:
         json.dump({"batch_size": batch_size}, f)
     engine.generate(
-        input_ids=[input_ids] * batch_size,
-        sampling_params={"temperature": 0.0, "max_new_tokens": _MAX_NEW_TOKENS},
+        [
+            generate_request(
+                input_ids, {"temperature": 0.0, "max_new_tokens": _MAX_NEW_TOKENS}
+            )
+            for _ in range(batch_size)
+        ]
     )
     test = os.path.join(args.run_dir, "test", f"bs_{batch_size}")
     cost = os.path.join(args.run_dir, "cost", f"bs_{batch_size}")
@@ -263,7 +309,7 @@ def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) ->
          (d_heads, d_kv_heads, d_head_dim), d_window),
     ):  # fmt: skip
         records = attention_samples(
-            batch_size=batch_size, rows=rows, window=window,
+            attention_backend=args.attention_backend, batch_size=batch_size, rows=rows, window=window,
             num_q_heads=shape[0] // tp, num_kv_heads=max(1, shape[1] // tp),
             head_dim=shape[2], sliding_window=sliding, context_step=args.context_step,
             context_stop=args.context_stop, fast=args.fast, repeat=repeat,
@@ -303,6 +349,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--draft-model", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--tp-size", type=int, required=True)
+    parser.add_argument(
+        "--attention-backend",
+        required=True,
+        choices=["trtllm", "mha"],
+        help="the target's and draft's attention backend, as serving runs it",
+    )
     parser.add_argument(
         "--compute-intensity",
         required=True,
@@ -351,7 +403,7 @@ def main(argv: list[str] | None = None) -> None:
     from transformers import AutoConfig, AutoTokenizer
 
     from tokenspeed.runtime.configs.model_config import get_hf_text_config
-    from tokenspeed.runtime.entrypoints.engine import Engine
+    from tokenspeed.runtime.entrypoints.wire_driver import WireDriver
     from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
     # Read as serving does: a multimodal checkpoint's config class may not load without remote code.
@@ -359,17 +411,28 @@ def main(argv: list[str] | None = None) -> None:
     draft_cfg = AutoConfig.from_pretrained(args.draft_model, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     input_ids = list(tokenizer(_PROMPT, add_special_tokens=False)["input_ids"])
-    engine = Engine(
-        model=args.model, attn_tp_size=args.tp_size, dtype="bfloat16",
-        max_model_len=max(4096, len(input_ids) + _MAX_NEW_TOKENS + 2 * args.num_draft_tokens),
-        max_num_seqs=args.max_bs, attention_backend="trtllm", sampling_backend="greedy",
-        disable_kvstore=True, speculative_algorithm="EAGLE4",
-        speculative_draft_model_path=args.draft_model, speculative_eagle_topk=args.topk,
-        speculative_num_steps=args.num_steps, speculative_num_draft_tokens=args.num_draft_tokens,
-        speculative_exec_mode=2, speculative_data_path=args.run_dir,
-        speculative_compute_intensity=args.compute_intensity, log_level="warning",
-        mamba_ssm_dtype=args.mamba_ssm_dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+    max_model_len = max(
+        4096, len(input_ids) + _MAX_NEW_TOKENS + 2 * args.num_draft_tokens
+    )
+    engine = WireDriver(
+        [
+            "--model", args.model, "--attn-tp-size", str(args.tp_size),
+            "--dtype", "bfloat16", "--max-model-len", str(max_model_len),
+            "--max-num-seqs", str(args.max_bs), "--attention-backend", args.attention_backend,
+            "--sampling-backend", "greedy", "--disable-kvstore",
+            "--speculative-algorithm", "EAGLE4",
+            "--speculative-draft-model-path", args.draft_model,
+            "--speculative-eagle-topk", str(args.topk),
+            "--speculative-num-steps", str(args.num_steps),
+            "--speculative-num-draft-tokens", str(args.num_draft_tokens),
+            "--speculative-exec-mode", "2", "--speculative-data-path", args.run_dir,
+            "--speculative-compute-intensity", args.compute_intensity,
+            "--log-level", "warning", "--mamba-ssm-dtype", args.mamba_ssm_dtype,
+            "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        ],
+        num_engines=1,
+        routing="round_robin",
+        startup_timeout_s=3600,
     )  # fmt: skip
     try:
         for batch_size in COST_BATCH_SIZES:

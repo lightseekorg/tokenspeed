@@ -512,6 +512,7 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(
             record_metadata=metadata,
             record_stamps=stamps,
             lower_bound=-5.0,
+            state_dtype=states.dtype,
         )
 
     launch()
@@ -1129,6 +1130,7 @@ def _check_gate_recovery(
         record_metadata=None,
         record_stamps=None,
         lower_bound=lower_bound,
+        state_dtype=state.dtype,
     )
     torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-5)
 

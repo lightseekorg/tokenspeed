@@ -25,15 +25,11 @@
 
 import torch
 from tokenspeed_kernel.ops.gemm import (
-    dsv4_grouped_output_projection_preprocessor as kernel_dsv4_grouped_output_projection_preprocessor,
-)
-from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_deepgemm_fp8_weight,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import pdl_enabled
-from tokenspeed_kernel.weights import get_weight_broker
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -185,20 +181,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                 )
                 layer.input_scale = None
-            grouped_output_projection_plan = getattr(
-                layer, "_dsv4_grouped_output_projection_plan", None
-            )
-            if grouped_output_projection_plan is not None:
-                preprocessor = kernel_dsv4_grouped_output_projection_preprocessor(
-                    grouped_output_projection_plan
-                )
-                broker = get_weight_broker()
-                if preprocessor is None:
-                    broker.enroll(layer.weight, None)
-                    broker.enroll(layer.weight_scale_inv, None)
-                else:
-                    broker.preprocess(preprocessor, layer)
-                return
             if global_server_args_dict["dense_gemm_backend"] == "deepgemm" and tuple(
                 self.quant_config.weight_block_size
             ) == (128, 128):

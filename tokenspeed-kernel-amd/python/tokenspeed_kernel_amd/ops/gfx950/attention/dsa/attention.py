@@ -1430,13 +1430,10 @@ def _run_dense_kv(
         BLOCK_H=16,
         TILE_K=64 if qk_rope_head_dim == 0 else 32,
         num_warps=4,
-        # Retain iterative-ilp for BF16; native FP8 and mixed conversion
-        # keep the default scheduler.
-        llvm_fn_attrs=(
-            (("amdgpu-sched-strategy", "iterative-ilp"),)
-            if q.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
-            else ()
-        ),
+        # Bound how far the SLP vectorizer moves instructions. Unbounded, it
+        # splits the in-loop KV prefetch around an LDS wait; with the bound,
+        # the default machine scheduler beats iterative-ilp for BF16 too.
+        llvm_cl_opts="slp-schedule-budget=100",
     )
     if num_kv_splits > 1:
         _dsa_dense_mfma_reduce_kernel[(q.shape[0], q.shape[1])](

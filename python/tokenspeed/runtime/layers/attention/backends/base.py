@@ -30,7 +30,7 @@ call and answers the model's ``forward``. Three kinds of node implement it:
 * composites that wrap a router next to a state consumer (hybrid GDN/KDA,
   Inkling's conv columns, MSA's sparse layers);
 * block consumers that read raw tables of their own state groups (Mamba /
-  KDA state paging, DeepSeek-V4's bespoke multi-group backend).
+  KDA state paging, DeepSeek V4.1's bespoke multi-group backend).
 
 ``block_tables`` is always a complete mapping — the runner synthesizes
 placeholder tables for capture, idle and warmup — so no implementation

@@ -254,10 +254,11 @@ def test_general_triton_mix_projection_storage(
     dtype: torch.dtype,
     strided: bool,
     monkeypatch,
+    set_matmul_precision,
 ) -> None:
     if dtype is torch.float32:
         monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
-        monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+        set_matmul_precision("ieee")
     generator = torch.Generator(device="cuda").manual_seed(19)
     wide = hc_count * hidden_size
     normalized = torch.randn(17, wide, dtype=dtype, device="cuda", generator=generator)

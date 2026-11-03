@@ -247,16 +247,21 @@ def deepep_scatter(
 
     # Block starts double as the write cursors the scatter kernel bumps. The
     # counts are host-side already, so the prefix sum costs one small H2D copy
-    # rather than a device scan plus sync.
+    # rather than a device scan plus sync. The starts and counts share one
+    # pinned, non-blocking upload: a copy from pageable memory would wait for
+    # the work already queued on the stream.
     starts = [0] * num_local_experts
     running = 0
     for expert, count in enumerate(num_recv_tokens_per_expert):
         starts[expert] = running
         running += count
-    cursor = torch.tensor(starts, dtype=torch.int32, device=device)
+    starts_and_counts = torch.tensor(
+        [*starts, *num_recv_tokens_per_expert], dtype=torch.int32, pin_memory=True
+    ).to(device, non_blocking=True)
+    cursor = starts_and_counts[:num_local_experts]
     m_indices = torch.repeat_interleave(
         torch.arange(num_local_experts, dtype=torch.int32, device=device),
-        torch.tensor(num_recv_tokens_per_expert, dtype=torch.int32, device=device),
+        starts_and_counts[num_local_experts:],
         output_size=total_rows,
     )
 

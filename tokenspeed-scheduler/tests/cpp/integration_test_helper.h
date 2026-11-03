@@ -62,6 +62,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -76,7 +77,7 @@ protected:
     }
 
     void SetUp() override {
-        config_ = MakeConfig();
+        config_ = WithHostPackingFromDevice(MakeConfig());
         scheduler_ = std::make_unique<Scheduler>(config_);
     }
 

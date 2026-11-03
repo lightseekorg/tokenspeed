@@ -85,11 +85,11 @@ def prepare_deepgemm_fp8_weight(
     traits={
         "n_align": frozenset({64}),
         "k_align": frozenset({128}),
-        "a_inner_stride_one": frozenset({True}),
-        "b_inner_stride_one": frozenset({True}),
+        "a_contiguous": frozenset({True}),
+        "b_contiguous": frozenset({True}),
         "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+        "out_contiguous": frozenset({True}),
         "out_dtype": frozenset({torch.bfloat16}),
-        "out_inner_stride_one": frozenset({True}),
     },
     # Below the existing Triton block-FP8 leaf: auto keeps its current choice.
     priority=Priority.PERFORMANT,

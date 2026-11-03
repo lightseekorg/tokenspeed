@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_plan,
     mha_prefill,
 )
+from tokenspeed_kernel.ops.attention.tree import tree_window_attention
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -41,6 +42,10 @@ from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeCascadeRows,
+)
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
@@ -290,6 +295,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             torch.clamp_min(
                 seq_lens[:bs], self.verify_floor, out=self.seq_lens_buf[:bs]
             )
+            self._refresh_tree_prefix(bs, self.seq_lens_buf)
             self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
 
@@ -308,6 +314,8 @@ class MHAAttnBackend(PagedAttentionBackend):
         self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
     ) -> None:
         del seq_lens, num_extends
+        # The router filled seq_lens_buf (floored) through decode_buffer_targets.
+        self._refresh_tree_prefix(bs, self.seq_lens_buf)
         self.forward_decode_metadata = self._decode_views(bs)
 
     # ------------------------------------------------------------------
@@ -329,6 +337,15 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         metadata = self.forward_decode_metadata
+        max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
+
+        tree = self._tree_lane_rows(bs) or self._tree_verify_rows(
+            bs, max_seqlen_q, metadata.page_table, metadata.seq_lens
+        )
+        if tree is not None:
+            return self._tree_cascade(
+                q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
+            )
 
         scale_kwargs = {}
         if self.is_mxfp8:
@@ -340,7 +357,6 @@ class MHAAttnBackend(PagedAttentionBackend):
             scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
         output = mha_decode_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -356,6 +372,91 @@ class MHAAttnBackend(PagedAttentionBackend):
             **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def tree_support(self) -> TreeSupport:
+        if self.kv_cache_dtype == self.qkv_dtype:
+            return TreeSupport(verify_blocker=None, draft_blocker=None)
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} reads the verify window K/V in the model dtype; "
+            f"kv_cache_dtype {self.kv_cache_dtype} is not supported",
+            draft_blocker=f"{name} reads the lane window K/V in the model dtype; "
+            f"kv_cache_dtype {self.kv_cache_dtype} is not supported",
+        )
+
+    def _tree_cascade(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        tree: TreeCascadeRows,
+        *,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Draft-tree attention (verify nodes or drafting lanes): a causal
+        ``rows``-token extend over the committed prefix with its log-sum-exp,
+        then the tree window and the prefix tail merged into it
+        (``tree_window_attention``); the trtllm leaf's cascade with a portable
+        prefix half.
+
+        A sliding-window draft layer sees the window frozen at the round's
+        prefix end: each lane row extends the prefix alone (its query placed at
+        the prefix's last key), so no prefix tail remains for the window kernel.
+        """
+        causal_prefix = layer.sliding_window_size < 0
+        # Only lane rows (their own tables) decode a sliding window.
+        if sinks is not None or (not causal_prefix and tree.row_page_table is None):
+            raise NotImplementedError(
+                "draft trees have no sliding-window or attention-sink path yet"
+            )
+        if layer.logit_cap:
+            raise NotImplementedError("draft trees have no logit-cap path yet")
+        q_len = tree.rows if causal_prefix else 1
+        num_reqs = q.shape[0] // q_len
+        k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        # Pinned to Triton, bypassing selection: its causal mask keeps row r at
+        # key P - R + r even when the prefix P is shorter than the R rows (the
+        # partial then covers fewer keys, or none), which the window kernel's
+        # merge assumes.
+        prefix_out, prefix_lse = mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=torch.arange(
+                0, (num_reqs + 1) * q_len, q_len, dtype=torch.int32, device=q.device
+            ),
+            # Unread by the Triton extend: it takes the keys from cache_seqlens.
+            cu_seqlens_kv=None,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=tree.page_table if causal_prefix else tree.row_page_table,
+            cache_seqlens=tree.prefix_lens if causal_prefix else tree.row_prefix_lens,
+            max_seqlen_q=q_len,
+            max_seqlen_k=self.max_context_len,
+            is_causal=True,
+            window_left=layer.sliding_window_size,
+            logit_cap=0.0,
+            sinks=None,
+            return_lse=True,
+            softmax_scale=layer.scaling,
+            solution="triton",
+        )
+        dim = layer.qk_head_dim
+        out = tree_window_attention(
+            q,
+            k_cache.view(-1, layer.tp_k_head_num, dim),
+            v_cache.view(-1, layer.tp_v_head_num, dim),
+            tree.page_table,
+            tree.seq_lens,
+            tree.mask,
+            prefix_out,
+            # The window kernel merges in base 2.
+            prefix_lse * 1.4426950408889634,
+            rows_per_req=tree.rows,
+            window=tree.window,
+            causal_prefix=causal_prefix,
+            page_size=self.kernel_page_size,
+            sm_scale=layer.scaling,
+        )
+        return out.view(-1, layer.tp_q_head_num * dim)
 
     def forward_extend(
         self,

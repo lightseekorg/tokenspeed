@@ -82,8 +82,11 @@ if platform.is_hopper_plus:
 def is_available() -> bool:
     """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    # FlashInfer provides separate SM90 and Blackwell prefill kernels.
-    return (platform.is_hopper or platform.is_blackwell) and cuda_major >= 13
+    # Older FlashInfer wheels lack the separate Rubin implementation.
+    supported_arch = platform.is_hopper or platform.is_blackwell
+    if platform.arch_version == ArchVersion(10, 7):
+        supported_arch = _flashinfer_gdn.is_rubin_prefill_available()
+    return supported_arch and cuda_major >= 13
 
 
 def is_supported(
@@ -119,7 +122,7 @@ if is_available():
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
@@ -148,7 +151,7 @@ if is_available():
         output_h: bool = False,
         state_checkpoints: GdnStateCheckpoints | None = None,
     ):
-        """Run one chunked GDN prefill on Hopper or Blackwell.
+        """Run one chunked GDN prefill on Hopper, Blackwell or Rubin.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
         g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the
@@ -304,6 +307,9 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            # Automatic selection must preserve the arena's null state. The
+            # legacy BF16 implementation redirects negative indices to row 0.
+            "state_dtype": frozenset({torch.float32}),
             "strided_qkv": frozenset({False}),
         },
     )
@@ -374,6 +380,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "state_dtype": frozenset({torch.float32}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False}),
         },
@@ -497,3 +504,96 @@ if is_decode_available():
             use_qk_l2norm=use_qk_l2norm,
         )
         return out.to(q.dtype)
+
+
+_rubin = None
+if current_platform().arch_version == ArchVersion(10, 7):
+    from tokenspeed_kernel.thirdparty.flashinfer import gdn_rubin as _rubin
+
+
+def is_rubin_decode_available() -> bool:
+    """Whether PR6604 is installed on an SM107 GPU."""
+    return _rubin is not None and _rubin.is_available()
+
+
+flashinfer_rubin_gdn_decode_step = error_fn
+
+if is_rubin_decode_available():
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_step",
+        name="flashinfer_rubin_gdn_decode_step",
+        solution="flashinfer_rubin",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({128}),
+            "value_head_dim": frozenset({128}),
+            "state_dtype": frozenset({torch.bfloat16}),
+            "strided_qkv": frozenset({False, True}),
+        },
+    )
+    def flashinfer_rubin_gdn_decode_step(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        dt_bias: torch.Tensor,
+        b: torch.Tensor,
+        initial_state: torch.Tensor,
+        initial_state_indices: torch.Tensor,
+        scale: float | None,
+        output_state_indices: torch.Tensor | None,
+        use_qk_l2norm: bool,
+    ) -> torch.Tensor:
+        """Update a K-last BF16 state pool and return ``[B, 1, HV, 128]``.
+
+        Q/K are ``[B, 1, H, 128]``; V is ``[B, 1, HV, 128]``. Gates a/b are
+        ``[B, 1, HV]`` and A_log/dt_bias are ``[HV]``. Strided projection rows
+        and page-strided pools are supported. Negative read or write indices
+        skip the row entirely, preserving the cache arena's null page.
+        ``output_state_indices=None`` writes to the read rows. ``scale=None``
+        means ``128**-0.5``; ``use_qk_l2norm`` selects normalization in kernel.
+        """
+        if q.shape[1] != 1 or q.shape[-1] != 128 or v.shape[-1] != 128:
+            raise ValueError("FlashInfer Rubin GDN requires T=1 and K=V=128")
+        if initial_state.dtype != torch.bfloat16 or q.dtype != torch.bfloat16:
+            raise ValueError("FlashInfer Rubin GDN requires BF16 inputs and state")
+        if v.shape[2] < q.shape[2] or v.shape[2] % q.shape[2]:
+            raise ValueError("FlashInfer Rubin GDN requires HV to be a multiple of H")
+        A_log, dt_bias = A_log.detach().float(), dt_bias.detach().float()
+        # Upstream's DLPack boundary requires 32-byte base alignment, including
+        # scalar gates. TP shards with 12 value heads can start a/b at +24 bytes.
+        # Keep aligned strided views; contiguous() alone cannot fix an unaligned
+        # view that PyTorch already considers contiguous (notably B=1).
+        q, k, v, a, b, A_log, dt_bias = (
+            (
+                tensor
+                if tensor.data_ptr() % 32 == 0
+                else tensor.clone(memory_format=torch.contiguous_format)
+            )
+            for tensor in (q, k, v, a, b, A_log, dt_bias)
+        )
+        return _rubin.gated_delta_rule_t1_rubin(
+            enable_pdl=pdl_enabled(),
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state_source=initial_state,
+            initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            scale=scale,
+        )

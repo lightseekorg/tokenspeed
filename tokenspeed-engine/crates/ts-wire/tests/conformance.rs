@@ -193,6 +193,7 @@ fn generate_text() {
             multimodal_inputs: None,
             validation_error: Some(s("rejected")),
             data_parallel_rank: Some(1),
+            cache_session_id: Some(s("cache-session")),
         },
     );
 }
@@ -437,6 +438,7 @@ fn output_slim() {
         num_waiting: 2,
         kv_active_pages: 1000,
         kv_total_pages: 4096,
+        kv_used_pages: 1500,
         ..no_tail()
     };
     let frames = fixture("output_slim");
@@ -456,6 +458,7 @@ fn output_slim() {
         ("a", &[1, 2][..], None)
     );
     assert_eq!(rows[0].output_token_logprobs, [-0.5, -1.25]);
+    assert!(rows[0].output_token_cumulative_probs.is_empty());
     assert_eq!(
         (rows[1].finish_reason, rows[1].completion_tokens),
         (Some("stop"), 9)
@@ -501,12 +504,14 @@ fn no_tail() -> BatchTokenIDOutSlim {
         cached_tokens: vec![],
         output_token_logprobs_val: vec![],
         output_token_logprobs_idx: vec![],
+        output_token_cumulative_probs_val: vec![],
         engine_index: 0,
         num_running: 0,
         num_waiting: 0,
         kv_active_pages: 0,
         kv_total_pages: 0,
         finish_reason_details: vec![],
+        kv_used_pages: 0,
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],
         input_token_logprobs_val: vec![],
@@ -560,6 +565,7 @@ fn output_slim_tail() {
         input_top_logprobs_idx: vec![vec![None, Some(vec![9, 2]), Some(vec![4, 3])], vec![]],
         output_top_logprobs_val: vec![vec![vec![-0.25, -3.0]], vec![]],
         output_top_logprobs_idx: vec![vec![vec![7, 1]], vec![]],
+        output_token_cumulative_probs_val: vec![vec![0.75], vec![]],
         ..no_tail()
     };
     let frames = fixture("output_slim_tail");
@@ -574,6 +580,8 @@ fn output_slim_tail() {
     let rows: Vec<_> = expected.requests().unwrap().collect();
     assert_eq!(rows[0].spec_verify_ct, Some(2));
     assert_eq!(rows[0].accept_draft_tokens, Some(1.5));
+    assert_eq!(rows[0].output_token_cumulative_probs, [0.75]);
+    assert!(rows[1].output_token_cumulative_probs.is_empty());
     assert_eq!(
         rows[0].input_token_logprobs,
         Some((&[None, Some(-1.0), Some(-2.5)][..], &[1, 2, 3][..]))
@@ -591,6 +599,16 @@ fn ragged_output_columns_are_rejected() {
     batch.cached_tokens.pop();
     let error = batch.requests().err().unwrap();
     assert!(error.to_string().contains("cached_tokens"), "{error}");
+}
+
+#[test]
+fn cumulative_probabilities_reject_ragged_request_and_token_rows() {
+    let mut batch: BatchTokenIDOutSlim = decode_frames(&fixture("output_slim_tail")).unwrap();
+    batch.output_token_cumulative_probs_val.pop();
+    assert!(batch.requests().is_err());
+    batch.output_token_cumulative_probs_val.push(vec![]);
+    batch.output_token_cumulative_probs_val[0].push(1.0);
+    assert!(batch.requests().is_err());
 }
 
 #[test]
@@ -612,6 +630,7 @@ fn handshake_hello() {
             local: Some(true),
             headless: Some(false),
             parallel_config_hash: Some(s("abc")),
+            engine_count: Some(2),
         },
     );
 }
@@ -666,6 +685,20 @@ fn handshake_ready_response() {
                 ("publisher".into(), "zmq".into()),
                 ("topic".into(), "".into()),
             ])),
+            request_types: vec![s("add"), s("abort"), s("control")],
+            positional_layouts: Dict(vec![(
+                s("ControlReplySlim"),
+                vec![s("call_id"), s("success")],
+            )]),
+            disaggregation_mode: Some(s("prefill")),
+            bootstrap_host: Some(s("10.0.0.7")),
+            bootstrap_port: Some(8998),
+            model_type: Some(s("qwen3_5")),
+            architectures: vec![s("Qwen3_5ForConditionalGeneration")],
+            mrope_positions: Some(true),
+            spatial_merge_size: Some(2),
+            image_token_id: Some(248056),
+            video_token_id: Some(248057),
         },
     );
 }

@@ -20,8 +20,8 @@
 
 """DeepSeek V4 decode context parallelism kernels.
 
-Virtual block translation, the LSE merge of per-shard attention partials, the
-sink applied once after merging, and the owner-only compressed cache stores.
+Virtual block translation, the LSE merge of per-shard attention partials, and
+the sink applied once after merging.
 """
 
 from __future__ import annotations
@@ -30,43 +30,24 @@ import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.dsv4 import (
     torch_dsv4_merge_partials,
-    torch_dsv4_selected_attention,
 )
 from tokenspeed_kernel.numerics.torch.kvcache import (
     torch_virtual_slots_to_local,
 )
 from tokenspeed_kernel.ops.attention.dsa._triton import candidate_exchange as exchange
 from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates as candidates
-from tokenspeed_kernel.ops.attention.dsv4 import (
-    dsv4_decode,
-    dsv4_decode_supports_partials,
-)
 from tokenspeed_kernel.ops.attention.dsv4._triton import dcp
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dcp_apply_sink,
     dcp_weight_for_reduce_scatter,
     normalize_dcp_partials,
 )
-from tokenspeed_kernel.ops.attention.dsv4.triton import (
-    dsv4_fused_sparse_compress_cache_insert,
-)
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from utils import assert_no_triton_compile
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
 )
-
-HEAD_DIM = 512
-PAGE_ROWS = 64
-SWA_TOKEN_STRIDE = 576  # 448 FP8 nope + 64 BF16 rope per row (fp8_swa_page_planar).
-SWA_ROW_BYTES = SWA_TOKEN_STRIDE + 8  # plus one FP8 scale per 64-wide nope block.
-# The arena aligns every page's stride to the token stride; SM100 FlashMLA
-# requires that alignment for its TMA loads.
-SWA_PAGE_BYTES = -(-PAGE_ROWS * SWA_ROW_BYTES // SWA_TOKEN_STRIDE) * SWA_TOKEN_STRIDE
-
 
 # ---------------------------------------------------------------------------
 # Virtual block translation
@@ -303,264 +284,6 @@ def test_weight_and_sink_reject_inconsistent_shapes():
             torch.zeros(2, device="cuda"),
             dtype=torch.bfloat16,
         )
-
-
-# ---------------------------------------------------------------------------
-# Kernel capability and the no-sink LSE contract
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "traits,expected",
-    [
-        pytest.param({}, False, id="undeclared"),
-        pytest.param({"sinks": frozenset({True})}, False, id="sink-only"),
-        pytest.param({"sinks": frozenset({False})}, False, id="missing-lse"),
-        pytest.param({"return_lse": frozenset({True})}, False, id="missing-sinks"),
-        pytest.param(
-            {"return_lse": frozenset({True}), "sinks": frozenset({True})},
-            False,
-            id="lse-includes-sink",
-        ),
-        pytest.param(
-            {"return_lse": frozenset({False}), "sinks": frozenset({False})},
-            False,
-            id="no-lse",
-        ),
-        pytest.param(
-            {"return_lse": frozenset({True}), "sinks": frozenset({False})},
-            True,
-            id="no-sink-lse",
-        ),
-        pytest.param(
-            {"return_lse": frozenset({False, True}), "sinks": frozenset({False, True})},
-            True,
-            id="optional-sink-and-lse",
-        ),
-    ],
-)
-def test_decode_partials_require_explicit_no_sink_lse_support(
-    fresh_registry, h100_platform, traits, expected
-):
-    KernelRegistry.get().register(
-        KernelSpec(
-            name="test_dsv4_decode",
-            family="attention",
-            mode="dsv4_decode",
-            traits=traits,
-        ),
-        lambda: None,
-    )
-
-    assert dsv4_decode_supports_partials(h100_platform) is expected
-
-
-def test_decode_partials_need_a_kernel_registered_for_the_platform(
-    a100_platform, mi350_platform, h100_platform
-):
-    # No portable kernel returns a no-sink LSE yet; only FlashMLA does, and
-    # it is registered for NVIDIA SM90+ hosts only.
-    assert not dsv4_decode_supports_partials(a100_platform)
-    assert not dsv4_decode_supports_partials(mi350_platform)
-    platform = current_platform()
-    assert dsv4_decode_supports_partials(h100_platform) == (
-        platform.is_nvidia and platform.is_hopper_plus
-    )
-
-
-def test_decode_refuses_a_sink_together_with_lse():
-    q = torch.empty(1, 64, HEAD_DIM, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="no-sink LSE"):
-        dsv4_decode(
-            q=q,
-            swa_kv_cache=torch.empty(1, SWA_PAGE_BYTES, dtype=torch.uint8),
-            swa_slots=torch.zeros(1, 8, dtype=torch.int32),
-            swa_lens=torch.zeros(1, dtype=torch.int32),
-            swa_page_size=PAGE_ROWS,
-            attn_sink=torch.zeros(64),
-            softmax_scale=HEAD_DIM**-0.5,
-            return_lse=True,
-        )
-
-
-def _page_planar_cache(pages, page_size):
-    """A random FP8 SWA-layout cache plus its BF16 row reference [pages*page_size, 512]."""
-    assert page_size == PAGE_ROWS
-    nope = torch.randn(pages, page_size, 448, device="cuda").to(torch.float8_e4m3fn)
-    rope = torch.randn(pages, page_size, 64, device="cuda", dtype=torch.bfloat16)
-    # 127 is the UE8M0 scale for 1.0, so every quant block dequantizes as-is.
-    cache = torch.full((pages, SWA_PAGE_BYTES), 127, device="cuda", dtype=torch.uint8)
-    payload = torch.cat((nope.view(torch.uint8), rope.view(torch.uint8)), dim=-1)
-    cache[:, : page_size * SWA_TOKEN_STRIDE] = payload.reshape(pages, -1)
-    reference = torch.cat((nope.to(torch.bfloat16), rope), dim=-1).reshape(-1, HEAD_DIM)
-    return cache, reference
-
-
-def _selected_attention_reference(q, kv, slots, lens, sink):
-    """Softmax over each token's selected rows with the sink, plus the no-sink LSE."""
-    return torch_dsv4_selected_attention(q, kv, slots, lens, sink, HEAD_DIM**-0.5)
-
-
-@requires_cuda
-@pytest.mark.parametrize("heads,degree", [(64, 2), (64, 4), (128, 2), (128, 8)])
-def test_flashmla_partials_merge_to_the_full_softmax_with_empty_shards(
-    require, heads, degree
-):
-    require("attention", "dsv4_decode", "flashmla", torch.bfloat16, "q")
-    from tokenspeed_kernel.ops.attention.dsv4.cuda import reset_dsv4_tile_metadata
-
-    torch.manual_seed(74)
-    tokens = 5
-    swa_cache, swa_kv = _page_planar_cache(3, PAGE_ROWS)
-    extra_cache, extra_kv = _page_planar_cache(4, PAGE_ROWS)
-    q = torch.randn(tokens, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
-    swa_slots = torch.arange(128, device="cuda", dtype=torch.int32).repeat(tokens, 1)
-    swa_slots[0, 10] = -1
-    swa_lens = torch.tensor([91, 1, 40, 0, 0], device="cuda", dtype=torch.int32)
-    extra_width = 128
-    extra_slots = torch.arange(extra_width, device="cuda", dtype=torch.int32).repeat(
-        tokens, 1
-    )
-    extra_slots[1, 5] = -1
-    # Token 1 selects three compressed rows, so some shards own none of them;
-    # token 4 attends to nothing at all.
-    extra_lens = torch.tensor([120, 3, 0, 64, 0], device="cuda", dtype=torch.int32)
-
-    swa_selected = swa_slots.masked_fill(
-        torch.arange(128, device="cuda")[None] >= swa_lens[:, None], -1
-    )
-    extra_selected = (extra_slots + swa_kv.shape[0]).masked_fill(
-        torch.arange(extra_width, device="cuda")[None] >= extra_lens[:, None], -1
-    )
-    selected = torch.cat((swa_selected, extra_selected), dim=1)
-    expected, expected_lse = _selected_attention_reference(
-        q,
-        torch.cat((swa_kv, extra_kv), dim=0),
-        selected,
-        torch.full((tokens,), selected.shape[1], device="cuda", dtype=torch.int32),
-        sink,
-    )
-
-    # Shard compressed pages cyclically and keep the scan length, as the
-    # runtime does; only rank 0 counts the replicated SWA cache.
-    partials, lses = [], []
-    for rank in range(degree):
-        owned = ((extra_slots // PAGE_ROWS) % degree == rank) & (extra_slots >= 0)
-        shard_slots = torch.where(owned, extra_slots, torch.full_like(extra_slots, -1))
-        in_prefix = torch.arange(extra_width, device="cuda")[None] < extra_lens[:, None]
-        valid_lens = (owned & in_prefix).sum(dim=1, dtype=torch.int32)
-        rank_swa_lens = swa_lens if rank == 0 else torch.zeros_like(swa_lens)
-        reset_dsv4_tile_metadata()
-        out, lse = dsv4_decode(
-            q=q,
-            swa_kv_cache=swa_cache,
-            swa_slots=swa_slots,
-            swa_lens=rank_swa_lens,
-            swa_page_size=PAGE_ROWS,
-            attn_sink=None,
-            softmax_scale=HEAD_DIM**-0.5,
-            extra_kv_cache=extra_cache,
-            extra_slots=shard_slots,
-            extra_lens=extra_lens,
-            extra_page_size=PAGE_ROWS,
-            solution="flashmla",
-            return_lse=True,
-        )
-        out, lse = normalize_dcp_partials(
-            out, lse.squeeze(-1), rank_swa_lens, valid_lens
-        )
-        partials.append(out)
-        lses.append(lse)
-
-    all_lse = torch.stack(lses, dim=0)
-    local_heads = heads // degree
-    summed = None
-    global_lses = []
-    for rank in range(degree):
-        weighted, global_lse = dcp_weight_for_reduce_scatter(
-            partials[rank], all_lse, rank
-        )
-        summed = weighted if summed is None else summed + weighted
-        global_lses.append(global_lse)
-    actual = torch.cat(
-        [
-            dcp_apply_sink(
-                summed[rank * local_heads : (rank + 1) * local_heads].movedim(0, 1),
-                global_lses[rank],
-                sink[rank * local_heads : (rank + 1) * local_heads].contiguous(),
-                dtype=q.dtype,
-            )
-            for rank in range(degree)
-        ],
-        dim=1,
-    )
-    global_lse = torch.cat(global_lses, dim=1)
-
-    assert not actual.isnan().any() and not global_lse.isnan().any()
-    assert torch.equal(torch.isinf(global_lse), torch.isinf(expected_lse))
-    finite = torch.isfinite(expected_lse)
-    torch.testing.assert_close(
-        global_lse[finite], expected_lse[finite], atol=1e-5, rtol=1e-5
-    )
-    torch.testing.assert_close(actual, expected, atol=8e-3, rtol=8e-3)
-
-
-# ---------------------------------------------------------------------------
-# Owner-only compressed cache stores
-# ---------------------------------------------------------------------------
-
-
-@requires_cuda
-@pytest.mark.parametrize("compress_ratio", [4, 128])
-def test_masked_compress_stores_leave_every_other_byte_untouched(compress_ratio):
-    torch.manual_seed(compress_ratio)
-    tokens = 8
-    positions = torch.arange(
-        tokens, device="cuda", dtype=torch.int32
-    ) * compress_ratio + (compress_ratio - 1)
-    token_to_req = torch.zeros(tokens, device="cuda", dtype=torch.int32)
-    state_rows = compress_ratio
-    state_cache = torch.randn(
-        tokens * 2, state_rows, HEAD_DIM * 2, device="cuda", dtype=torch.float32
-    )
-    kv_cache = torch.randint(
-        0, 255, (tokens + 2, SWA_PAGE_BYTES), device="cuda", dtype=torch.uint8
-    )
-    before = kv_cache.clone()
-    kv_slots = (torch.arange(tokens, device="cuda", dtype=torch.int64) + 1) * PAGE_ROWS
-    mask = torch.tensor([True, False] * (tokens // 2), device="cuda")
-    dsv4_fused_sparse_compress_cache_insert(
-        state_cache=state_cache,
-        token_to_req_indices=token_to_req,
-        positions=positions,
-        compressor_slot_mapping=torch.arange(tokens, device="cuda", dtype=torch.int32),
-        block_table=torch.arange(tokens, device="cuda", dtype=torch.int32).view(
-            1, tokens
-        ),
-        compressor_block_size=1,
-        rms_norm_weight=torch.ones(HEAD_DIM, device="cuda", dtype=torch.float32),
-        rms_norm_eps=1e-6,
-        cos_sin_cache=torch.randn(
-            positions.max().item() + 1, 64, device="cuda", dtype=torch.float32
-        ),
-        kv_cache_2d=kv_cache,
-        kv_slot_mapping=kv_slots,
-        kv_cache_block_size=PAGE_ROWS,
-        compress_ratio=compress_ratio,
-        overlap=compress_ratio == 4,
-        block_table_base_offsets=None,
-        kv_write_mask=mask,
-    )
-    torch.cuda.synchronize()
-    changed_pages = (kv_cache != before).any(dim=1)
-    written_pages = (kv_slots // PAGE_ROWS)[mask]
-    unwritten_pages = (kv_slots // PAGE_ROWS)[~mask]
-    assert changed_pages[written_pages].all()
-    assert not changed_pages[unwritten_pages].any()
-    # Masked tokens park on slot 0; the null page must stay untouched too.
-    assert not changed_pages[0]
-    assert not changed_pages[tokens + 1]
 
 
 # Candidate transport and head-owner merging share the DCP graph contract.

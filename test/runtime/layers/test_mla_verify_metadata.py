@@ -318,6 +318,7 @@ def _run_cutedsl_decode(
     )
     backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
     backend._dcp = None
+    backend.min_kv_split = 1
     spec = block_size if draft_block_decode else 1
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
     backend.forward_decode_metadata = cutedsl_backend.CuteDSLMLADecodeMetadata(

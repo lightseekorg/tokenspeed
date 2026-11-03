@@ -42,6 +42,7 @@ import json
 import threading
 from contextlib import nullcontext
 from dataclasses import replace
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest import mock
 
@@ -77,6 +78,8 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-2gpu")
 
 
 def _execute(handle, plan, planned):
@@ -203,6 +206,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         disable_cudagraph_memory_reserve=not reserve,
         enforce_eager=False,
         enable_memory_saver=False,
+        enable_external_encoder=False,
         device="cuda",
         speculative_algorithm=algorithm,
     )
@@ -631,7 +635,7 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
     # A plan with no pairs runs no copy at all.
     trace.clear()
     _execute(handle, _plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
-    assert trace == [("zero", {"kv": (2,)})]
+    assert trace == [("zero", {"kv": (2,)}), ("load_backs", ())]
 
 
 def test_a_failed_page_copy_fails_the_plan(wire_ops):
@@ -764,13 +768,24 @@ def test_page_zeroing_without_l2_runs_only_zeroing():
     assert trace == [("zero", {"kv": (3, 4)})]
 
 
-def test_a_plan_with_no_device_work_touches_nothing():
+def test_a_plan_with_no_device_work_only_points_the_load_waits_at_no_load():
+    """A plan with no device work enqueues nothing, and it settles no pending
+    draft round; it still reaches the Host cache's load-back submission,
+    which points the layerwise load waits at the plan's (absent) load."""
     trace: list = []
-    handle = _handle(trace, host_cache_executor=SimpleNamespace())
+    handle = _handle(
+        trace,
+        host_cache_executor=SimpleNamespace(
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                ("load_backs", ops, prerequisite_stream)
+            ),
+        ),
+    )
+    handle._executor.complete_pending_drafting = lambda: trace.append("settle")
 
     _execute(handle, _plan(), None)
 
-    assert trace == []
+    assert trace == [("load_backs", (), "default-stream")]
 
 
 def test_a_failed_cache_submission_fails_the_plan(wire_ops):

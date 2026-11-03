@@ -22,24 +22,22 @@
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import functools
-import io
 import json
 import logging
+import logging.config
 import os
-import pickle
 import random
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from functools import lru_cache
-from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -50,11 +48,9 @@ from typing import (
 
 import numpy as np
 import psutil
-import pybase64
 import torch
 import torch.distributed
 import torch.distributed as dist
-import zmq
 from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
@@ -288,12 +284,22 @@ def configure_logger(server_args, prefix: str = ""):
     global LOG_LEVEL
     LOG_LEVEL = server_args.log_level.upper()
 
-    from tokenspeed._logging import suppress_noisy_third_party_logs
+    from tokenspeed._logging import (
+        configure_root_logger,
+        stop_async_logging,
+        suppress_noisy_third_party_logs,
+    )
     from tokenspeed.runtime.utils.env import envs
 
     suppress_noisy_third_party_logs()
 
     if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
+        if server_args.enable_async_logging:
+            raise ValueError(
+                "--enable-async-logging cannot be combined with "
+                "TOKENSPEED_LOGGING_CONFIG_PATH; configure async handlers in "
+                "the custom file or use the default logging configuration"
+            )
         if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
             raise FileNotFoundError(
                 "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
@@ -301,16 +307,18 @@ def configure_logger(server_args, prefix: str = ""):
             )
         with open(TOKENSPEED_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
+        stop_async_logging()
         logging.config.dictConfig(custom_config)
         suppress_noisy_third_party_logs()
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
     log_level = getattr(logging, server_args.log_level.upper())
-    logging.basicConfig(
+    configure_root_logger(
         level=log_level,
-        format=format,
+        log_format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
+        stream=sys.stderr,
+        enable_async_logging=server_args.enable_async_logging,
     )
 
     # Only set specified log level for tokenspeed-related loggers
@@ -344,97 +352,6 @@ def set_weight_attrs(
         if hasattr(weight, key):
             raise ValueError(f"Overwriting existing tensor attribute: {key}")
         setattr(weight, key, value)
-
-
-def broadcast_pyobj(
-    data: list[Any],
-    rank: int,
-    dist_group: torch.distributed.ProcessGroup | None = None,
-    src: int = 0,
-    force_cpu_device: bool = True,
-):
-    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
-    The `rank` here refer to the source rank on global process group (regardless
-    of dist_group argument).
-    """
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
-    )
-
-    if rank == src:
-        if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-        else:
-            serialized_data = pickle.dumps(data)
-            size = len(serialized_data)
-
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(device)
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
-
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-            dist.broadcast(tensor_data, src=src, group=dist_group)
-        return data
-    else:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
-        size = tensor_size.item()
-
-        if size == 0:
-            return []
-
-        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
-
-        serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
-        return data
-
-
-step_counter = 0
-
-
-def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-) -> zmq.Socket:
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type == zmq.DEALER:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-    if bind:
-        socket.bind(endpoint)
-    else:
-        socket.connect(endpoint)
-
-    return socket
 
 
 # Temporary directory for prometheus multiprocess mode
@@ -616,96 +533,10 @@ def dataclass_to_string_truncated(
         return str(data)
 
 
-class MultiprocessingSerializer:
-    @staticmethod
-    def serialize(obj, output_str: bool = False):
-        """
-        Serialize a Python object using ForkingPickler.
-
-        Args:
-            obj: The object to serialize.
-            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
-
-        Returns:
-            bytes or str: The serialized object.
-        """
-        buf = io.BytesIO()
-        ForkingPickler(buf).dump(obj)
-        buf.seek(0)
-        output = buf.read()
-
-        if output_str:
-            # Convert bytes to base64-encoded string
-            output = pybase64.b64encode(output).decode("utf-8")
-
-        return output
-
-    @staticmethod
-    def deserialize(data):
-        """
-        Deserialize a previously serialized object.
-
-        Args:
-            data (bytes or str): The serialized data, optionally base64-encoded.
-
-        Returns:
-            The deserialized Python object.
-        """
-        if isinstance(data, str):
-            # Decode base64 string to bytes
-            data = pybase64.b64decode(data, validate=True)
-
-        return ForkingPickler.loads(data)
-
-
 def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
-
-
-def launch_dummy_health_check_server(host, port, enable_metrics):
-
-    import uvicorn
-    from fastapi import FastAPI, Response
-
-    app = FastAPI()
-
-    @app.get("/health")
-    async def health():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    @app.get("/health_generate")
-    async def health_generate():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    # Add prometheus middleware
-    if enable_metrics:
-        add_prometheus_middleware(app)
-
-    config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        timeout_keep_alive=5,
-        loop="auto",
-        log_config=None,
-        log_level="warning",
-    )
-    server = uvicorn.Server(config=config)
-
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
-        )
-        loop.create_task(server.serve())
-
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
-        server.run()
 
 
 def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
@@ -713,8 +544,8 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
 
     With --enable-metrics every engine process on this node writes to the
     shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
-    engine's main process, which otherwise has no HTTP surface (the gRPC
-    servicer speaks gRPC only). The daemon thread keeps the synchronous
+    engine's main process, which otherwise has no HTTP surface (its frontend
+    speaks the msgpack wire only). The daemon thread keeps the synchronous
     launch path free of event-loop assumptions. The socket is bound eagerly
     on the calling thread, so a bind failure degrades to an error log and
     None — metrics must never take down serving — and the
@@ -785,8 +616,6 @@ def add_prefix(name: str, prefix: str) -> str:
 
 
 def log_info_on_rank0(logger, msg):
-    import torch.distributed as dist
-
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(msg)
 

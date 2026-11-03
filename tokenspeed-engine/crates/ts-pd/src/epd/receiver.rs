@@ -45,7 +45,7 @@ use crate::{
     control::{EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest},
     http, net,
     status::TransferPoll,
-    StartError, Transport,
+    PeerConfig, StartError, Transport,
 };
 
 /// How long a bootstrap-server lookup may take.
@@ -296,6 +296,13 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    /// Receive encoder embeddings without a P/D KV-transfer peer.
+    pub fn start_standalone(config: ReceiverConfig, peer: PeerConfig) -> Result<Self, StartError> {
+        let (incoming, _unused) = mpsc::channel();
+        let transport = Transport::start(&peer, incoming)?;
+        Self::start(config, transport)
+    }
+
     /// Register the pools with `transport`'s engine, open the status socket
     /// and start the threads.
     pub(crate) fn start(

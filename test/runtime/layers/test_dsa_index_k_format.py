@@ -76,7 +76,6 @@ def _attn_config(spec: DSAConfig) -> AttnConfig:
         kv_cache_dtype=torch.bfloat16,
         context_len=256,
         max_bs=1,
-        prefix_granularity=PREFIX,
         kernel_page_size=PREFIX,
         kv_cache_quant_method="",
         pd_disaggregation_enabled=False,
@@ -105,7 +104,7 @@ def test_formats_map_to_one_plane_dtype_and_row_width_each():
 )
 def test_recipe_plans_the_declared_plane(index_k_format, dtype_name, width):
     spec = _dsa_spec(index_k_format)
-    field = _index_k_field(_attn_config(spec), layer_id=3)
+    field = _index_k_field(_attn_config(spec), PREFIX, layer_id=3)
     assert field.field_id == "layer.3.index_k"
     assert field.shape == (PREFIX, width)
     assert field.dtype == dtype_name
@@ -171,7 +170,6 @@ def _qcp_attn_config(spec: DSAConfig) -> AttnConfig:
         kv_cache_dtype=torch.bfloat16,
         context_len=256,
         max_bs=1,
-        prefix_granularity=PREFIX,
         kernel_page_size=PREFIX,
         kv_cache_quant_method="none",
         pd_disaggregation_enabled=False,

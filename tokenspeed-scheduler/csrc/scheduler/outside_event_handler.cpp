@@ -49,7 +49,6 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    releaseStorage(*request);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -65,7 +64,6 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     // frontier is final here, so it finishes like any request -- the P's
     // prompt-end state and partial page, the D's final state and tail are
     // published when it settles.
-    releaseStorage(*request);
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -93,7 +91,6 @@ void Scheduler::handleEvent(const forward::Finish& event) {
         if (pdTransferInFlight(*request)) {
             throw std::logic_error("PD Finish received while transfer pages are pinned");
         }
-        releaseStorage(*request);
         request->Apply(fsm::FinishEvent{&coordinator_});
     }
 }
@@ -118,7 +115,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     RequestProgress completed =
         AdvanceRequestProgress(request, progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
+                                   (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()));
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
@@ -126,7 +125,18 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         if (completed.completed_pages->tail) {
             store_hashes.push_back(completed.completed_pages->tail->hash);
         }
+        // This end state supersedes the checkpoint the turn resumed from
+        // (MarkSupersededStateInput). Marked at the finish only: a request
+        // that fails earlier (a failed PD transfer) publishes and marks
+        // nothing, and an end state that is the input itself (a D request
+        // that claimed its prompt-end checkpoint and leaves before any
+        // decode) supersedes nothing.
+        if (progress.resumed_tail_hash && !(completed.completed_pages->tail &&
+                                            completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
+            coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
+        }
     }
+    coordinator_.RefreshRetainedCheckpoint(progress.retained_input_checkpoint, progress.access_epoch);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
@@ -135,7 +145,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     coordinator_.QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
-    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
@@ -156,22 +166,23 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
-        releaseStorage(*request);
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
+    // Completing the op lands it for every image waiting on it: their waits
+    // expire with its record.
     const std::vector<HostPublication> published = tier_transfers_.CompleteWriteBack(event.op_id);
-    // A retraction image's L2 leg: every suspended request waiting for this
-    // store (its own, or an earlier one carrying one of its keys) notes it
-    // and follows the Host entries as published, which may differ from the
+    // A retraction image's L2 leg: every suspended request that waited for
+    // this store (its own, or an earlier one carrying one of its keys)
+    // follows the Host entries as published, which may differ from the
     // ticket's blocks it pinned when the index redirected a key to an entry
     // an L3 prefetch landed first.
     for (const std::unique_ptr<Request>& request : requests_) {
-        const auto* retracted = request->GetIf<fsm::Retracted>();
+        fsm::Retracted* retracted = request->GetIf<fsm::Retracted>();
         if (retracted != nullptr && retracted->WaitsForStore(event.op_id)) {
-            request->Apply(fsm::StoreLandedEvent{event.op_id, published});
+            retracted->image.FollowPublished(published);
         }
     }
     if (storage_transfers_ && storage_allowed_) {
@@ -187,14 +198,8 @@ void Scheduler::handleEvent(const cache::LoadBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::SnapshotDone& event) {
-    const std::optional<std::string> request_id = tier_transfers_.CompleteSnapshotStore(event.op_id);
-    if (!request_id) {
-        return;  // unknown or duplicate ACK
-    }
-    Request* request = findRequest(*request_id);
-    if (request != nullptr && request->Is<fsm::Retracted>()) {
-        request->Apply(fsm::StoreLandedEvent{event.op_id, /*published=*/{}});
-    }
+    // The image's tail leg landed: its wait expires with the op's record.
+    tier_transfers_.CompleteSnapshotStore(event.op_id);
 }
 
 void Scheduler::handleEvent(const cache::RestoreDone& event) {

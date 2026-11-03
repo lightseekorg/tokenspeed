@@ -36,6 +36,7 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 # after startup (a per-batch constexpr) fails the run instead of stalling it.
 SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
 JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
+DATA_PLANE_SYNC_DEBUG_ENV = "TOKENSPEED_DATA_PLANE_SYNC_DEBUG"
 SUPPORTED_TRIGGERS = {
     "per-commit",
     "post-submit",
@@ -48,6 +49,7 @@ SUPPORTED_TRIGGERS = {
 # requests and on pushes to main; `post-submit` tasks run only on pushes.
 SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
 WORKFLOW_STAGE_TYPES = {
+    "import-check": {"ut"},
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
     "model-test": {"eval", "perf"},
@@ -82,7 +84,9 @@ STALE_PROCESS_PATTERNS = [
     # setproctitle, so the python pattern above stops matching once
     # the router is fully up.
     r"smg::",
-    r"smg_grpc_servicer\.tokenspeed",
+    # ts serve's engine: the headless launcher, whose ranks run as
+    # ``tokenspeed::`` processes.
+    r"tokenspeed\.runtime\.entrypoints\.engine",
     r"run_ci_suite",
 ]
 JIT_CACHE_ENV_SUBDIRS = {
@@ -224,6 +228,12 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         or not all(isinstance(label, str) and label for label in labels)
     ):
         raise ValueError(f"{path}: runner.labels must be a non-empty string list")
+    if workflow_stage == "import-check" and not all(
+        is_amd_runner(label) for label in labels
+    ):
+        raise ValueError(
+            f"{path}: workflow_stage 'import-check' requires AMD runner labels"
+        )
     runner_env = runner.get("env", {})
     if runner_env:
         if not isinstance(runner_env, dict):
@@ -241,6 +251,16 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 raise ValueError(
                     f"{path}: runner.env[{label!r}] must be a string mapping"
                 )
+    # CI serves with the data-plane sync check raising (execute_task), and no
+    # task may relax it.
+    for where, env in [("env", data.get("env") or {})] + [
+        (f"runner.env[{label!r}]", env) for label, env in (runner_env or {}).items()
+    ]:
+        if DATA_PLANE_SYNC_DEBUG_ENV in env:
+            raise ValueError(
+                f"{path}: {where} sets {DATA_PLANE_SYNC_DEBUG_ENV}; CI serves "
+                "with it set to error and a task cannot change it"
+            )
     if "priority" in data:
         priority = data["priority"]
         if isinstance(priority, str):
@@ -1900,6 +1920,9 @@ def execute_task(
         env[JIT_COMPILE_CHECK_ENV] = str(
             task.get("env", {}).get(JIT_COMPILE_CHECK_ENV, "error")
         )
+        # Not even the task may relax this one (validate_task), and a value
+        # inherited from the runner's environment is overridden too.
+        env[DATA_PLANE_SYNC_DEBUG_ENV] = "error"
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)

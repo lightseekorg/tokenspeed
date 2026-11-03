@@ -1,8 +1,8 @@
 """Native accumulator-to-LDS layouts; pointers index scalar float words."""
 
-import triton.experimental.gluon as g
 from lib.moe.rocm.memory_ops import _store_vector4
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 @g.jit

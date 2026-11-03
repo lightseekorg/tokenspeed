@@ -191,5 +191,13 @@ def chunk_fwd_o(
         num_stages=2,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
+        # On AMD, unbounded SLP vectorizer scheduling hoists all gate loads
+        # ahead of their exp math, exceeding 256 registers and cutting occupancy
+        # from 3 to 1.
+        **(
+            {"llvm_cl_opts": "slp-schedule-budget=100"}
+            if current_platform().is_amd
+            else {}
+        ),
     )
     return o

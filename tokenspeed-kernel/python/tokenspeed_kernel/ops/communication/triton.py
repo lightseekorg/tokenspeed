@@ -439,7 +439,8 @@ def send_signal_to_peers(
     for peer in tl.static_range(0, world_size):
         remote_signal = tl.load(signal_ptrs + peer).to(tl.pointer_type(tl.uint32))
         send_addr = remote_signal + block_id * world_size + rank
-        send_old = tl.full((), 1, tl.int32)
+        # The CAS returns the signal's own type, uint32.
+        send_old = tl.full((), 1, tl.uint32)
         while send_old != 0:
             send_old = tl.atomic_cas(send_addr, 0, 1, sem="release", scope="sys")
 
@@ -452,7 +453,7 @@ def wait_signal_from_peers(
 ):
     for peer in tl.static_range(0, world_size):
         wait_addr = local_signal + block_id * world_size + peer
-        wait_old = tl.full((), 0, tl.int32)
+        wait_old = tl.full((), 0, tl.uint32)
         while wait_old != 1:
             wait_old = tl.atomic_cas(wait_addr, 1, 0, sem="acquire", scope="sys")
 
@@ -1085,7 +1086,8 @@ def nvidia_create_rsag_state(
     # we never shrink one another module enlarged. Must precede symm_mem.empty()
     # below, which bakes the pad size into the allocation.
     pad_bytes = _RSAG_MAX_BLOCKS * group.size() * 4
-    symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
+    if hasattr(symm_mem, "set_signal_pad_size"):
+        symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
     free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
     # Allocate outside inference_mode so the persistent comm buffer is not
     # an inference tensor; this class is often lazily constructed during
@@ -1099,7 +1101,14 @@ def nvidia_create_rsag_state(
     logger.info(
         f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
-    symm_mem.rendezvous(comm_buff, group=group)
+    handle = symm_mem.rendezvous(comm_buff, group=group)
+    # Torch 2.9 has a fixed signal pad. Verify its actual capacity before
+    # launching the same kernels; never silently run past the allocation.
+    if handle.signal_pad_size < pad_bytes:
+        raise RuntimeError(
+            f"RSAG requires {pad_bytes} signal-pad bytes, "
+            f"but Torch allocated {handle.signal_pad_size}"
+        )
     return TritonRSAGState(
         group=group,
         rank_in_group=rank_in_group,

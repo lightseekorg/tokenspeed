@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
@@ -70,7 +71,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
-    prepare_cache_setup,
+    cache_recipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
@@ -642,6 +643,39 @@ def create_paged_router(
     )
 
 
+def _pin_fixed_kernel_page(
+    config: AttnConfig,
+    model_config: ModelConfig,
+    backend_name: str | None,
+) -> AttnConfig:
+    """Pin a fixed-page leaf's kernel page on an ordinary side's config.
+
+    The ordinary recipe makes one block span its prefix granularity and sizes
+    that span to hold whole kernel pages (``OrdinaryRecipe.prefix_granularity``),
+    so the page a leaf fixes must be visible before the plan. The leaf then
+    resolves the same page from the pinned value. A flexible leaf runs at the
+    block span and pins nothing; MSA builds a dense and a sparse leaf, and its
+    recipe adds the sparse page itself.
+    """
+    from tokenspeed.runtime.layers.attention.backends.paged.base import (
+        PagedAttentionBackend,
+    )
+
+    if config.kernel_page_size is not None or isinstance(
+        config.component(SoftmaxAttnConfig), MSAConfig
+    ):
+        return config
+    leaf_cls = _get_backend_cls(backend_name, model_config.attention_arch)
+    if (
+        not issubclass(leaf_cls, PagedAttentionBackend)
+        or leaf_cls.default_kernel_page_size is None
+    ):
+        return config
+    return dataclasses.replace(
+        config, kernel_page_size=int(leaf_cls.default_kernel_page_size)
+    )
+
+
 def _validate_lcm_page_size(
     config: AttnConfig,
     *,
@@ -1115,7 +1149,9 @@ def _prepare_fixed_workspaces(
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
         allocated = True
-    if config.qcp_size > 1:
+    # V4.1 allocates its gathered projections and per-request packed history
+    # per forward; it has no DSA history gather workspace to reserve.
+    if config.qcp_size > 1 and config.component(DeepseekV41Config) is None:
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
         if draft_backend is not None:
@@ -1306,8 +1342,16 @@ def create_attn_components(
             world_group=server_args.mapping.world_group,
         )
     cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)
-    cache_setup = prepare_cache_setup(
-        family=cache_family,
+    if cache_family in _ORDINARY_CACHE_FAMILIES:
+        config = _pin_fixed_kernel_page(
+            config, model_config, target_full_attn_backend_name
+        )
+        if draft_attn_config is not None:
+            draft_attn_config = _pin_fixed_kernel_page(
+                draft_attn_config, draft_model_config, draft_full_attn_backend_name
+            )
+    recipe = cache_recipe(
+        cache_family,
         server_args=server_args,
         model_config=model_config,
         attn_config=config,
@@ -1318,44 +1362,43 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
         probe_batch_rows=probe_batch_rows,
     )
+    num_draft_cache_layers = recipe.num_draft_layers
+    num_target_cache_layers = len(recipe.layer_types) - num_draft_cache_layers
+    from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
+
+    owners = pipeline_cache_ownership(
+        num_target_cache_layers,
+        num_draft_cache_layers,
+        pp_target_cache_windows(
+            server_args.mapping, model_config, num_target_cache_layers
+        ),
+    )
+    layer_ownership = owners[server_args.mapping.pp_rank]
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
+        agree_cache_capacity,
+    )
+
+    capacity_group = (
+        pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+        if server_args.mapping.world_size > 1
+        else None
+    )
+    cache_setup = recipe.setup_for_layers(
+        resident_cache_window=layer_ownership.resident_cache_window,
+        synchronize_capacity=partial(
+            agree_cache_capacity,
+            cpu_group=capacity_group,
+            probe=probe_batch_rows is not None,
+        ),
+    )
     if probe_batch_rows is not None:
         check_probe_cache_fits(cache_setup.cache_budget_bytes, profiled_cache_bytes)
     spec = cache_setup.spec
     if config.kvp_size > 1 and target.is_hybrid_linear:
         _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)
-    num_target_cache_layers = cache_setup.num_target_layers
-    num_draft_cache_layers = cache_setup.num_draft_layers
-    if server_args.mapping.has_pp:
-        from tokenspeed.runtime.distributed.pp_stage import (
-            pp_stage_cache_windows,
-            pp_stage_windows,
-        )
-
-        # Stage windows partition execution blocks; cache ownership speaks
-        # cache-layer IDs, one per attention instance. A model's profile says
-        # how many instances each block owns (LongCat's paired layout: two);
-        # the in-tree PP targets K3 and V4 declare no profile and own one.
-        # Cache ownership itself does not partition execution blocks.
-        profile = model_config.model_profile
-        target_cache_windows = pp_stage_cache_windows(
-            pp_stage_windows(
-                model_config.num_hidden_layers,
-                server_args.mapping.pp_size,
-                server_args.mapping.pp_layer_partition,
-            ),
-            cache_layers_per_execution_layer=(
-                profile.attention_instances_per_layer if profile is not None else 1
-            ),
-            num_target_cache_layers=num_target_cache_layers,
-        )
-    else:
-        target_cache_windows = [(0, num_target_cache_layers)]
-    owners = pipeline_cache_ownership(
-        num_target_cache_layers,
-        num_draft_cache_layers,
-        target_cache_windows,
-    )
-    layer_ownership = owners[server_args.mapping.pp_rank]
     cache_fields_by_stage, stage_schedules = cache_field_placement(
         spec.memory_plan, owners
     )
@@ -1407,6 +1450,18 @@ def create_attn_components(
             draft_view_spec = dataclasses.replace(
                 draft_view_spec, memory_plan=spec.memory_plan
             )
+    logger.log(
+        logging.DEBUG if probe_batch_rows is not None else logging.INFO,
+        f"Cache resident: pp_rank={server_args.mapping.pp_rank}, "
+        f"window={layer_ownership.resident_cache_window}, "
+        f"parent_bytes={spec.memory_plan.arena_bytes // (spec.memory_plan.num_lcm_blocks + 1)}, "
+        f"parents={spec.memory_plan.num_lcm_blocks}, "
+        f"local_limit={cache_setup.local_parent_limit}, "
+        f"agreed_limit={cache_setup.agreed_parent_limit}, "
+        f"arena_bytes={spec.memory_plan.arena_bytes}, "
+        f"fixed_workspace_bytes={fixed_workspace_bytes}, "
+        f"budget_bytes={cache_budget_bytes}",
+    )
     arena = create_cache_arena(
         spec,
         device=config.device,

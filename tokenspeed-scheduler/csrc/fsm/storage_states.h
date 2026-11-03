@@ -27,6 +27,7 @@
 #include <variant>
 #include <vector>
 
+#include "cache/tier/storage_lease.h"
 #include "fsm/forward_states.h"
 #include "fsm/pd_states.h"
 
@@ -38,7 +39,10 @@ namespace tokenspeed::fsm {
 struct Prefetching {
     using Continuation = std::variant<Bootstrapping, Submitted>;
     Continuation continuation;
-    std::uint64_t operation_id;
+    // The query, then the GET, this request waits for. Leaving the state
+    // detaches it, unless a completed GET's lease moves on as the Ready hold
+    // (FinishPrefetchEvent).
+    StorageLease lease;
     std::int64_t deadline_us;
     std::vector<std::string> hashes;
     std::int32_t max_tokens;

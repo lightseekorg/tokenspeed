@@ -12,8 +12,8 @@ Core components:
 - **Kernels**: pluggable, layered kernel system with a portable public API and
   a centralized registry including one of the fastest **MLA**
   (Multi-head Latent Attention) implementations on Blackwell for agentic workloads.
-- **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
-  handling.
+- **Entrypoint**: SMG and Dynamo drive the engine from Rust over its msgpack
+  wire, with no Python on the request path.
 
 ## Differentiation
 

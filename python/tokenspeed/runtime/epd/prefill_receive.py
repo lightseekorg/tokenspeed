@@ -49,12 +49,19 @@ import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.epd.recv_pool import (
-    is_epd_prefill_node,
+    is_epd_receive_node,
     recv_pool_geometry,
     split_slot,
 )
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+from tokenspeed.runtime.pd.host_peer import (
+    PeerSettings,
+    enable_mooncake_ipv6_for_host,
+    mooncake_library,
+    mooncake_protocol,
+)
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +124,8 @@ class EpdReceiveSettings:
     element_size: int
     shard: bool
     timeout_s: float
+    # Aggregated receivers own transport; PD receivers share the KV peer.
+    transport: PeerSettings | None = None
 
 
 class ReceivePools:
@@ -328,7 +337,7 @@ def build_epd_receive(
     (a later pipeline stage receives nothing and follows the first's
     decisions). Allocates the receive pools, which the cache budget left out
     (``recv_pool_bytes``)."""
-    if not is_epd_prefill_node(server_args, model_config.is_multimodal_active):
+    if not is_epd_receive_node(server_args, model_config.is_multimodal_active):
         return None
     # Resolved only past the gate: reading the vision tower's dtype raises on
     # a text-only model, and every text-only PD node calls this.
@@ -359,7 +368,20 @@ def build_epd_receive(
             f"EPD receive pool: {slots} slots x {slot_mb} MB "
             f"({pools.slot_bytes} B rows, {pools.deepstack_slot_bytes} B deepstack)"
         )
+    transport = None
+    if server_args.disaggregation_mode == "null":
+        local_ip = get_local_ip_by_remote()
+        enable_mooncake_ipv6_for_host(local_ip)
+        transport = PeerSettings(
+            library=mooncake_library(),
+            protocol=mooncake_protocol(),
+            local_ip=local_ip,
+            ib_device=server_args.disaggregation_ib_device or "",
+            engine_rank=mapping.rank,
+            regions=(),
+        )
     settings = EpdReceiveSettings(
+        transport=transport,
         slots=slots,
         slot_bytes=pools.slot_bytes if pools is not None else 0,
         pool_base=pools.base if pools is not None else 0,

@@ -90,6 +90,7 @@ if platform.is_nvidia:
         ep_size: int,
         ep_rank: int,
         device: torch.device,
+        use_fused_finalize: bool,
     ) -> torch.Tensor:
         """The device's persistent workspace, grown (and re-zeroed) on demand.
 
@@ -107,6 +108,8 @@ if platform.is_nvidia:
             ep_size: Expert-parallel width.
             ep_rank: This rank's expert-parallel coordinate.
             device: CUDA device the call runs on.
+            use_fused_finalize: Whether GEMM2 atomically reduces expert outputs
+                in its epilogue. Must match the actual MoE call.
 
         Returns:
             A 1-D ``uint8`` CUDA tensor of at least the bytes
@@ -128,6 +131,7 @@ if platform.is_nvidia:
             ep_size=ep_size,
             ep_rank=ep_rank,
             device=device,
+            use_fused_finalize=use_fused_finalize,
         )
         workspace = _workspaces.get(device)
         if workspace is None or workspace.numel() < needed:
@@ -190,6 +194,7 @@ if platform.is_nvidia:
         ep_rank = getattr(w, "ep_rank", 0)
         tp_size = getattr(w, "tp_size", 1)
         tp_rank = getattr(w, "tp_rank", 0)
+        use_fused_finalize = plan["cutlass_fused_finalize"]
         workspace = cutlass_unquant_moe_workspace(
             num_tokens=x.shape[0],
             hidden_size=w.w2_weight.shape[1],
@@ -203,6 +208,7 @@ if platform.is_nvidia:
             ep_size=ep_size,
             ep_rank=ep_rank,
             device=x.device,
+            use_fused_finalize=use_fused_finalize,
         )
         return cutlass_fused_moe(
             input=x,
@@ -223,6 +229,9 @@ if platform.is_nvidia:
             # identical call is clean). Keep the chain fully serialized until
             # the flashinfer kernels are fixed.
             enable_pdl=False,
+            # Fused GEMM2 finalize uses floating-point atomics; changing their
+            # arrival order changes the reduction's rounding across calls.
+            use_fused_finalize=use_fused_finalize,
             workspace_buffer=workspace,
         )[0]
 
@@ -3251,6 +3260,7 @@ if platform.is_nvidia:
     )
     from flashinfer.fused_moe.da_moe import DABody
     from flashinfer.tllm_enums import ActivationType
+    from flashinfer.utils import device_support_pdl
     from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
         trtllm_fp4_block_scale_moe as tokenspeed_trtllm_fp4_block_scale_moe,
     )
@@ -3557,8 +3567,7 @@ if platform.is_nvidia:
             local_expert_offset=spec.ep_rank * spec.num_local_experts,
             routed_scaling_factor=None,
             routing_method_type=0,
-            enable_pdl=enable_pdl
-            and _fi_core._device_support_moe_pdl(w.g1_alphas.device),
+            enable_pdl=enable_pdl and device_support_pdl(w.g1_alphas.device),
             do_finalize=False,
             activation_type=activation_type,
             num_fused_shared_experts=0,

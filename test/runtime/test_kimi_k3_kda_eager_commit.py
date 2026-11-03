@@ -82,7 +82,6 @@ class _Harness:
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.float8_e4m3fn,
             kv_cache_quant_method=None,
-            prefix_granularity=128,
             context_len=4096,
             is_draft=False,
             speculative_num_draft_tokens=draft_tokens,

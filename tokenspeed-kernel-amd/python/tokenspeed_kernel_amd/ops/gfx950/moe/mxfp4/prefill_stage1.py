@@ -2527,5 +2527,13 @@ def invoke_gluon_mxfp4_moe_stage1(
         OUTPUT_FP8=output_format == "e4m3",
         INPUT_SORTED=bool(input_sorted),
         num_warps=NUM_WARPS,
+        # Interleaving the MFMAs with the next K tile's loads makes the 128-row
+        # E2M1 tile faster. Narrower tiles lose occupancy to the extra registers
+        # and do not gain.
+        **(
+            {"schedule_hint": "mfma-schedule"}
+            if BLOCK_M == 128 and NUM_WARPS == 4 and a_format == "e2m1"
+            else {}
+        ),
     )
     return out

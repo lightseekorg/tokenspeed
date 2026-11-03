@@ -3,9 +3,9 @@
 
 """Raw TMA ops and descriptor builders.
 
-`tma_utils.py` is the canonical owner for raw TMA inline-asm helpers and TMA
-descriptor construction. Non-TMA store/layout helpers are re-exported from
-`copy_utils.py` for backward compatibility.
+MSA keeps its descriptor builders and raw TMA interfaces here. Cached gather4
+uses the shared CuTe instruction helper. Non-TMA store/layout helpers are
+re-exported from `copy_utils.py` for backward compatibility.
 """
 
 import ctypes
@@ -16,6 +16,10 @@ from cutlass import Int32, Int64
 from cutlass._mlir.dialects import _cute_nvgpu_ops_gen as cute_nvgpu_gen
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+from tokenspeed_kernel.thirdparty.cute_dsl.tma import (
+    tma_cache_hint,
+)
+from tokenspeed_kernel.thirdparty.cute_dsl.tma import tma_gather4 as _tma_gather4
 
 # Raw TMA Ops
 
@@ -253,33 +257,18 @@ def tma_gather4_cached(
     ip=None,
 ):
     """cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4 with cache hint."""
-    llvm.inline_asm(
-        None,
-        [
-            smem_ptr.toint().ir_value(loc=loc, ip=ip),
-            Int32(smem_byte_offset).ir_value(loc=loc, ip=ip),
-            tma_desc_ptr.toint().ir_value(loc=loc, ip=ip),
-            Int32(col_idx).ir_value(loc=loc, ip=ip),
-            Int32(row0).ir_value(loc=loc, ip=ip),
-            Int32(row1).ir_value(loc=loc, ip=ip),
-            Int32(row2).ir_value(loc=loc, ip=ip),
-            Int32(row3).ir_value(loc=loc, ip=ip),
-            mbar_ptr.toint().ir_value(loc=loc, ip=ip),
-            Int64(cache_hint).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n"
-        ".reg .u32 sa, ma;\n"
-        "cvt.u32.u64 sa, $0;\n"
-        "add.u32 sa, sa, $1;\n"
-        "cvt.u32.u64 ma, $8;\n"
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
-        ".mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint "
-        "[sa], [$2, {$3, $4, $5, $6, $7}], [ma], $9;\n"
-        "}\n",
-        "l,r,l,r,r,r,r,r,l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
+    if isinstance(cache_hint, int):
+        cache_hint = tma_cache_hint(cache_hint)
+    _tma_gather4(
+        Int32(smem_ptr.toint(loc=loc, ip=ip)) + Int32(smem_byte_offset),
+        tma_desc_ptr.toint(loc=loc, ip=ip),
+        Int32(mbar_ptr.toint(loc=loc, ip=ip)),
+        col_idx,
+        row0,
+        row1,
+        row2,
+        row3,
+        cache_hint=cache_hint,
         loc=loc,
         ip=ip,
     )

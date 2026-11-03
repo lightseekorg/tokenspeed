@@ -22,6 +22,5 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --disable-kvstore \
-    --block-size 128 \
     --host 127.0.0.1 \
     --port 8000

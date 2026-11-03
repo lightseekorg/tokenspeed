@@ -21,11 +21,12 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
 import torch_npu  # noqa: F401
+from tokenspeed_kernel.ops import moe as moe_kernels
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_npu.ops.moe import ascend_softmax_bias_topk
 
 
 class _Weights(torch.nn.Module):
@@ -69,17 +70,25 @@ def _requires_npu():
 
 
 def _plan(weights: _Weights, *, num_zero_experts: int = 0) -> dict:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = moe_kernels.moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="silu",
         routing_mode="precomputed_topk",
+        a2a_backend="none",
         ep_size=weights.ep_size,
-        num_zero_experts=num_zero_experts,
         ispp=weights.intermediate_size,
+        hidden=weights.hidden_size,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=num_zero_experts > 0,
+        fast_math=False,
+        combine_order="rank",
+        solution="torch_npu",
     )
+    plan["num_zero_experts"] = num_zero_experts
     assert plan["apply_kernel_name"] == "ascend_bf16_precomputed_moe_apply"
-    tokenspeed_kernel.moe_process_weights(plan, weights)
+    moe_kernels.moe_process_weights(plan, weights)
     return plan
 
 
@@ -90,7 +99,7 @@ def _apply(
     route_weights: torch.Tensor,
     route_ids: torch.Tensor,
 ) -> torch.Tensor:
-    return tokenspeed_kernel.moe_apply(
+    return moe_kernels.moe_apply(
         plan,
         hidden,
         weights,
@@ -141,10 +150,10 @@ def test_ascend_softmax_bias_topk_matches_torch(tokens: int):
     torch.manual_seed(6100 + tokens)
     logits = torch.randn(tokens, 416, device="npu:0", dtype=torch.float32)
     bias = torch.randn(416, device="npu:0", dtype=torch.float32) * 0.01
-    weights, ids = tokenspeed_kernel.moe_softmax_bias_topk(
-        logits,
-        bias,
-        12,
+    weights, ids = ascend_softmax_bias_topk(
+        router_logits=logits,
+        correction_bias=bias,
+        topk=12,
         routed_scaling_factor=6.0,
     )
     probabilities = logits.softmax(-1)
@@ -202,6 +211,47 @@ def test_ascend_flattened_192_local_experts():
     actual = _apply(plan, weights, hidden, route_weights, route_ids)
     expected = _oracle(weights, hidden, route_weights, route_ids)
     _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("tokens", [1, 33])
+def test_ascend_local_expert_preserves_fp32_route_weights(tokens: int):
+    weights = _Weights(4, 4)
+    with torch.no_grad():
+        weights.w13_weight.zero_()
+        weights.w2_weight.zero_()
+        # Exact expert outputs isolate routing precision from GEMM rounding.
+        weights.w13_weight[:, 0, 0] = 128
+        weights.w13_weight[:, weights.intermediate_size, 0] = 1
+        for expert, output in enumerate([1, -1, 2, -2]):
+            weights.w2_weight[expert, :, 0] = output / 128
+    plan = _plan(weights)
+    hidden = torch.zeros(
+        tokens, weights.hidden_size, device="npu:0", dtype=torch.bfloat16
+    )
+    hidden[:, 0] = 1
+    route_ids = torch.arange(4, dtype=torch.int32).expand(tokens, -1).contiguous()
+    # The first two values lie on opposite sides of one BF16 midpoint.
+    route_weights = (
+        torch.tensor(
+            [1.1445316076278687, 1.144531011581421, 0.6, 0.6], dtype=torch.float32
+        )
+        .expand(tokens, -1)
+        .contiguous()
+    )
+    expert_outputs = torch.tensor([1, -1, 2, -2], dtype=torch.float32)
+    expected = torch.zeros(tokens, 1, dtype=torch.float32)
+    rounded_control = torch.zeros_like(expected)
+    for slot in range(4):
+        expected += expert_outputs[slot] * route_weights[:, slot, None]
+        rounded_control += (
+            expert_outputs[slot] * route_weights[:, slot, None].bfloat16().float()
+        )
+    expected = expected.bfloat16().expand(-1, weights.hidden_size)
+    assert not torch.equal(expected, rounded_control.bfloat16().expand_as(expected))
+
+    actual = _apply(plan, weights, hidden, route_weights.npu(), route_ids.npu())
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
 
 def test_ascend_ep1_zeros_model_side_special_routes():

@@ -324,6 +324,7 @@ def batched_recoverssm_commit(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
     lower_bound: float | None,
+    state_dtype: torch.dtype,
 ) -> None:
     """Recover all layers from request-major raw records and commit conv.
 
@@ -340,7 +341,8 @@ def batched_recoverssm_commit(
     The shared state-page planner must clamp accepted_length to [0, draft_token_num] before this
     call. A zero count copies the source endpoint without reading records.
 
-    State pages use contiguous [head, value, key] FP32 values. U is FP32;
+    State pages use contiguous [head, value, key] values of state_dtype (FP32
+    or BF16); recovery accumulates in FP32 either way. U is FP32;
     activation_dtype gives the storage type of raw QKV and K/raw_g records.
     conv_state_dtype gives the history storage type, independently of the
     activation dtype, with conv layout [channel, conv_width - 1]. Accepted
@@ -417,11 +419,16 @@ def batched_recoverssm_commit(
             raise ValueError(
                 "record metadata must be contiguous INT64 on the descriptor device"
             )
+    if state_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(f"batched KDA replay does not support {state_dtype} state")
     grid = lambda meta: (triton.cdiv(head_dim, meta["BV"]), batch, layers * num_heads)
     typed = torch.empty(0, dtype=torch.float32, device=descriptors.device)
+    # The kernel types each described state page from this reference; it loads
+    # into FP32 and its final store narrows to the pool dtype.
+    state_typed = torch.empty(0, dtype=state_dtype, device=descriptors.device)
     activation_typed = torch.empty(0, dtype=activation_dtype, device=descriptors.device)
     _commit_kda_state_kernel[grid](
-        typed,
+        state_typed,
         descriptors[:, 8],
         state_stride,
         typed,

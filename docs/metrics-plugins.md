@@ -119,8 +119,8 @@ collector never measured.
 Events are observations before reporter aggregation, not cumulative Prometheus
 snapshots, request summaries, or request payload logs. Labels and collection
 ranks retain their existing meanings; a plugin must not independently discard
-every nonzero global rank. A headless engine has no frontend and therefore does
-not generate frontend request metrics. See
+every nonzero global rank. Request metrics from the client's side (time to
+first token, end-to-end latency) are the frontend's, not the engine's. See
 [server observability](configuration/server.md#observability) for metric
 definitions and engine roles.
 

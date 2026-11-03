@@ -244,6 +244,7 @@ def _load_builtin_generators() -> None:
         prepare_mhc_apply_pre,
         prepare_mhc_mixes,
         prepare_mhc_post,
+        prepare_mhc_pre,
         prepare_post_norm_residual_pre_norm,
     )
 
@@ -332,6 +333,7 @@ def _load_builtin_generators() -> None:
     )
     _BENCHMARK_GENERATORS.setdefault(("residual", "mhc_mixes"), prepare_mhc_mixes)
     _BENCHMARK_GENERATORS.setdefault(("residual", "mhc_post"), prepare_mhc_post)
+    _BENCHMARK_GENERATORS.setdefault(("residual", "mhc_pre"), prepare_mhc_pre)
     _BENCHMARK_GENERATORS.setdefault(
         ("residual", "post_norm_residual_pre_norm"),
         prepare_post_norm_residual_pre_norm,

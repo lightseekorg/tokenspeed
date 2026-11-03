@@ -41,7 +41,6 @@ from tokenspeed.runtime.cache.l3.identity import (
     cache_layout_signature,
     l3_cache_quantization_id,
     l3_checkpoint_id,
-    resolve_l3_weight_version,
     share_l3_checkpoint_ids,
     storage_deployment_id,
 )
@@ -1330,11 +1329,6 @@ class TestStorageKeyTest:
                 )
             )
 
-    def test_resolve_l3_weight_version_preserves_requested_identity(self):
-        assert resolve_l3_weight_version(None) is None
-        assert resolve_l3_weight_version("explicit") == "explicit"
-        assert resolve_l3_weight_version(12) == "12"
-
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(
             field_id="k0",
@@ -1351,6 +1345,16 @@ class TestStorageKeyTest:
             )
         )
         fp16 = cache_layout_signature(layout, cache_dtype="float16")
+        aligned = cache_layout_signature(
+            layout, cache_dtype="float16", checkpoint_granularities=(("state", 4096),)
+        )
+        assert aligned != fp16
+        assert aligned != cache_layout_signature(
+            layout, cache_dtype="float16", checkpoint_granularities=(("state", 8192),)
+        )
+        assert fp16 == cache_layout_signature(
+            layout, cache_dtype="float16", checkpoint_granularities=()
+        )
         assert (fp16) == (cache_layout_signature(layout, cache_dtype="float16"))
         assert (fp16) != (cache_layout_signature(layout, cache_dtype="bfloat16"))
         changed = SimpleNamespace(

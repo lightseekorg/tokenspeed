@@ -304,6 +304,106 @@ def test_a_query_shard_gathers_the_rotated_latent_before_the_masked_store(
         )
 
 
+def test_a_query_shard_gather_can_carry_extra_rows(monkeypatch):
+    """The combined prologue puts the caller's extra rows in front of the
+    rotated latent, gathers both in one collective, stores the latent half
+    and returns the extra half: the index-K write and the KV write share one
+    gather instead of paying two."""
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    handed = {}
+    rotated = torch.arange(3 * 576, dtype=torch.bfloat16).reshape(3, 576)
+    extra = torch.arange(3 * 128, dtype=torch.bfloat16).reshape(3, 128)
+
+    monkeypatch.setattr(
+        paged_attention,
+        "mla_prologue",
+        lambda query, q_pe, latent, **kw: SimpleNamespace(
+            query=query, key=None, value=None, latent=rotated
+        ),
+    )
+
+    def fake_gather_rows(rows, group, scattered_num_tokens):
+        handed["gather"] = (rows.clone(), group, scattered_num_tokens)
+        return torch.cat([rows, rows[:2]])  # the other rank's two rows
+
+    monkeypatch.setattr(paged_attention, "token_all_gather_rows", fake_gather_rows)
+    monkeypatch.setattr(
+        paged_attention,
+        "latent_store",
+        lambda latent, *, kv_lora_rank, cache: handed.update(
+            store=(latent.clone(), kv_lora_rank, cache)
+        ),
+    )
+    layer = paged_attention.PagedAttention(
+        4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=None, qk_norm=None
+    )
+    ctx = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        token_to_kv_pool=SimpleNamespace(
+            kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
+        ),
+    )
+    plan = QueryShardPlan.from_forward(
+        total_tokens=5, input_lengths=[5], size=2, rank=0
+    )  # rows [3, 2]
+    q = torch.zeros(3, 4, 576, dtype=torch.bfloat16)
+    out, gathered = layer.latent_prologue_with_rows(
+        q,
+        q[..., 512:],
+        torch.zeros(3, 576, dtype=torch.bfloat16),
+        torch.arange(3),
+        ctx,
+        slots=torch.tensor([4, 9, 8, 0, 5]),
+        key_rows=paged_attention.QueryShardGather(plan, (0, 1)),
+        extra_rows=extra,
+    )
+    assert out.latent is rotated
+    payload, group, counts = handed["gather"]
+    assert payload.shape == (3, 128 + 576)
+    assert torch.equal(payload[:, :128], extra)
+    assert torch.equal(payload[:, 128:], rotated)
+    assert group == (0, 1) and counts == [3, 2]
+    stored, kv_lora_rank, cache = handed["store"]
+    assert stored.shape == (5, 576) and kv_lora_rank == 512
+    assert torch.equal(stored[:3], rotated)
+    assert cache.slots.tolist() == [4, 9, 8, 0, 5]
+    assert gathered.shape == (5, 128)
+    assert torch.equal(gathered[:3], extra)
+
+
+def test_extra_rows_must_keep_the_latent_half_16_byte_aligned():
+    """The gathered payload is stored through a column slice, so an extra
+    width that does not end on 16 bytes misaligns every latent row."""
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    layer = paged_attention.PagedAttention(
+        4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=None, qk_norm=None
+    )
+    ctx = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        token_to_kv_pool=SimpleNamespace(
+            kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
+        ),
+    )
+    plan = QueryShardPlan.from_forward(
+        total_tokens=5, input_lengths=[5], size=2, rank=0
+    )  # rows [3, 2]
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        layer.latent_prologue_with_rows(
+            torch.zeros(3, 4, 576, dtype=torch.bfloat16),
+            torch.zeros(3, 4, 64, dtype=torch.bfloat16),
+            torch.zeros(3, 576, dtype=torch.bfloat16),
+            torch.arange(3),
+            ctx,
+            slots=torch.tensor([4, 9, 8, 0, 5]),
+            key_rows=paged_attention.QueryShardGather(plan, (0, 1)),
+            extra_rows=torch.zeros(3, 116, dtype=torch.bfloat16),
+        )
+
+
 def test_an_empty_shard_still_joins_the_gather_and_stores_its_pages(monkeypatch):
     """A rank whose shard has no rows rotates nothing (the prologue kernel is
     not run on zero rows) but joins the latent all-gather with an empty

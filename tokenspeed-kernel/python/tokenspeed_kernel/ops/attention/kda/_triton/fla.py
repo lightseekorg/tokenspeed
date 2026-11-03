@@ -124,7 +124,7 @@ def kda_recurrent_decode_pool(
     Same math as :func:`kda_recurrent_decode`, but reads ``h_pool[read_indices]``
     and writes ``h_pool[write_indices]`` inside the kernel (negative write ids
     skip the store), eliminating the python-side gather/scatter round-trip.
-    ``h_pool`` is ``[num_pages, HV, V, K]`` fp32 and is updated in place.
+    ``h_pool`` is ``[num_pages, HV, V, K]`` FP32 or BF16 and is updated in place.
     Returns ``o [B, T, HV, V]``.
     """
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (

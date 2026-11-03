@@ -1,0 +1,1041 @@
+{
+  "manifest_sha256": "ec3b8d4a2d5a0ebb86a2888f270a8675c11b0bfd16038e8791350d69cf091aae",
+  "operators": {
+    "scatter": {
+      "accuracy": [
+        {
+          "case": {
+            "cap": 20,
+            "locations": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              0,
+              -1,
+              20,
+              33
+            ],
+            "name": "width64",
+            "page": 1,
+            "width": 64
+          },
+          "metadata": {
+            "dtype": "bfloat16"
+          }
+        },
+        {
+          "case": {
+            "cap": 32,
+            "locations": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              0,
+              -1,
+              -9,
+              32,
+              47
+            ],
+            "name": "width128",
+            "page": 1,
+            "width": 128
+          },
+          "metadata": {
+            "dtype": "bfloat16"
+          }
+        },
+        {
+          "case": {
+            "cap": 24,
+            "locations": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              0,
+              -2,
+              24,
+              50
+            ],
+            "name": "width192",
+            "page": 1,
+            "width": 192
+          },
+          "metadata": {
+            "dtype": "bfloat16"
+          }
+        },
+        {
+          "case": {
+            "cap": 16,
+            "locations": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              0,
+              -3,
+              16,
+              99
+            ],
+            "name": "width576",
+            "page": 1,
+            "width": 576
+          },
+          "metadata": {
+            "dtype": "bfloat16"
+          }
+        },
+        {
+          "case": {
+            "cap": 96,
+            "locations": [
+              64,
+              65,
+              66,
+              67,
+              68,
+              69,
+              70,
+              71,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              0,
+              -1,
+              63,
+              96,
+              130
+            ],
+            "name": "width128_page64",
+            "page": 64,
+            "width": 128
+          },
+          "metadata": {
+            "dtype": "bfloat16"
+          }
+        }
+      ],
+      "performance": [
+        {
+          "config": {
+            "cap": 16384,
+            "name": "width64",
+            "rows": 8192,
+            "width": 64
+          },
+          "metadata": {
+            "dtype": "bfloat16",
+            "page": 1
+          }
+        },
+        {
+          "config": {
+            "cap": 8192,
+            "name": "width128_r4096",
+            "rows": 4096,
+            "width": 128
+          },
+          "metadata": {
+            "dtype": "bfloat16",
+            "page": 1
+          }
+        },
+        {
+          "config": {
+            "cap": 32768,
+            "name": "width128_r16384",
+            "rows": 16384,
+            "width": 128
+          },
+          "metadata": {
+            "dtype": "bfloat16",
+            "page": 1
+          }
+        },
+        {
+          "config": {
+            "cap": 16384,
+            "name": "width192",
+            "rows": 8192,
+            "width": 192
+          },
+          "metadata": {
+            "dtype": "bfloat16",
+            "page": 1
+          }
+        },
+        {
+          "config": {
+            "cap": 4096,
+            "name": "width576_r2048",
+            "rows": 2048,
+            "width": 576
+          },
+          "metadata": {
+            "dtype": "bfloat16",
+            "page": 1
+          }
+        },
+        {
+          "config": {
+            "cap": 16384,
+            "name": "width576_r8192",
+            "rows": 8192,
+            "width": 576
+          },
+          "metadata": {
+            "dtype": "bfloat16",
+            "page": 1
+          }
+        }
+      ],
+      "timing": {
+        "iterations": 50,
+        "sample_count": 5,
+        "warmup": 10
+      }
+    },
+    "virtual_slots_to_local": {
+      "accuracy": [
+        {
+          "case": {
+            "degree": 1,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg1_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 2,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg2_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 2,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg2_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg4_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg4_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg4_rank2_int64_prealloc0",
+            "prealloc": false,
+            "rank": 2,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg4_rank3_int64_prealloc0",
+            "prealloc": false,
+            "rank": 3,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank2_int64_prealloc0",
+            "prealloc": false,
+            "rank": 2,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank3_int64_prealloc0",
+            "prealloc": false,
+            "rank": 3,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank4_int64_prealloc0",
+            "prealloc": false,
+            "rank": 4,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank5_int64_prealloc0",
+            "prealloc": false,
+            "rank": 5,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank6_int64_prealloc0",
+            "prealloc": false,
+            "rank": 6,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows1_deg8_rank7_int64_prealloc0",
+            "prealloc": false,
+            "rank": 7,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 1,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg1_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 2,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg2_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 2,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg2_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg4_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg4_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg4_rank2_int64_prealloc0",
+            "prealloc": false,
+            "rank": 2,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg4_rank3_int64_prealloc0",
+            "prealloc": false,
+            "rank": 3,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank2_int64_prealloc0",
+            "prealloc": false,
+            "rank": 2,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank3_int64_prealloc0",
+            "prealloc": false,
+            "rank": 3,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank4_int64_prealloc0",
+            "prealloc": false,
+            "rank": 4,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank5_int64_prealloc0",
+            "prealloc": false,
+            "rank": 5,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank6_int64_prealloc0",
+            "prealloc": false,
+            "rank": 6,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank7_int64_prealloc0",
+            "prealloc": false,
+            "rank": 7,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 1,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg1_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 2,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg2_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 2,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg2_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg4_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg4_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg4_rank2_int64_prealloc0",
+            "prealloc": false,
+            "rank": 2,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg4_rank3_int64_prealloc0",
+            "prealloc": false,
+            "rank": 3,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank0_int64_prealloc0",
+            "prealloc": false,
+            "rank": 0,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank1_int64_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank2_int64_prealloc0",
+            "prealloc": false,
+            "rank": 2,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank3_int64_prealloc0",
+            "prealloc": false,
+            "rank": 3,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank4_int64_prealloc0",
+            "prealloc": false,
+            "rank": 4,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank5_int64_prealloc0",
+            "prealloc": false,
+            "rank": 5,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank6_int64_prealloc0",
+            "prealloc": false,
+            "rank": 6,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows128_deg8_rank7_int64_prealloc0",
+            "prealloc": false,
+            "rank": 7,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        },
+        {
+          "case": {
+            "degree": 2,
+            "dtype": "int32",
+            "geometry": "int32",
+            "name": "rows1_deg2_rank1_int32_prealloc0",
+            "prealloc": false,
+            "rank": 1,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int32"
+          }
+        },
+        {
+          "case": {
+            "degree": 4,
+            "dtype": "int32",
+            "geometry": "int32",
+            "name": "rows64_deg4_rank3_int32_prealloc1",
+            "prealloc": true,
+            "rank": 3,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int32"
+          }
+        },
+        {
+          "case": {
+            "degree": 8,
+            "dtype": "int64",
+            "geometry": "int64",
+            "name": "rows64_deg8_rank7_int64_prealloc1",
+            "prealloc": true,
+            "rank": 7,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64"
+          }
+        }
+      ],
+      "performance": [
+        {
+          "config": {
+            "degree": 1,
+            "n": 32768,
+            "name": "rows1_deg1",
+            "rank": 0,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 32770
+          }
+        },
+        {
+          "config": {
+            "degree": 8,
+            "n": 65536,
+            "name": "rows1_deg8",
+            "rank": 3,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 65538
+          }
+        },
+        {
+          "config": {
+            "degree": 8,
+            "n": 131072,
+            "name": "rows1_deg8_large",
+            "rank": 3,
+            "rows": 1
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 131074
+          }
+        },
+        {
+          "config": {
+            "degree": 8,
+            "n": 65536,
+            "name": "rows64_deg8",
+            "rank": 3,
+            "rows": 64
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 1026
+          }
+        },
+        {
+          "config": {
+            "degree": 8,
+            "n": 65536,
+            "name": "rows128_deg8",
+            "rank": 3,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 514
+          }
+        },
+        {
+          "config": {
+            "degree": 4,
+            "n": 131072,
+            "name": "rows128_deg4",
+            "rank": 2,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 1026
+          }
+        },
+        {
+          "config": {
+            "degree": 8,
+            "n": 262144,
+            "name": "rows128_deg8_large",
+            "rank": 7,
+            "rows": 128
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 2050
+          }
+        },
+        {
+          "config": {
+            "degree": 16,
+            "n": 131072,
+            "name": "rows256_deg16",
+            "rank": 5,
+            "rows": 256
+          },
+          "metadata": {
+            "dtype": "int64",
+            "prealloc": true,
+            "virtual_block_count": 514
+          }
+        }
+      ],
+      "timing": {
+        "iterations": 50,
+        "sample_count": 5,
+        "warmup": 10
+      }
+    }
+  },
+  "schema_version": 2,
+  "source_sha256": {
+    "test/ci/npu/tests/scatter-test.py": "0e6f760f185dbfe5380cfa55fe55828bdef94984e7bd1cb585a201ed9ed3e19a",
+    "test/ci/npu/tests/virtual_slots_to_local-test.py": "5b3065251e71235afa046de3cba8a30ff23a677c904dea0f632b730583cea4ed"
+  }
+}

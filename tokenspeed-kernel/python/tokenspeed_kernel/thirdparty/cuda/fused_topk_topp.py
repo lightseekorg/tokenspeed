@@ -115,6 +115,8 @@ def fused_topk_topp_renorm(
             ``probs``), neither reading nor writing greedy rows (top-k 1) and
             rows that cut nothing (top-k off, top-p >= 1); False writes every
             row to ``out``: greedy rows one-hot, uncut rows renormalized.
+            Uncut rows skip radix selection in both modes; False retains
+            the apply stage's FP32 reduction and normalization rounding.
 
     Returns:
         ``[bs, V]`` float32. Non-kept positions are 0; kept positions are

@@ -142,7 +142,6 @@ def test_checkpoint_reaches_two_group_cache(checkpoint):
     spec = config.component(Dots3NoteAttentionConfig)
     assert model.attention_arch == AttentionArch.DSA
     assert config.kv_cache_dtype == torch.float8_e4m3fn
-    assert args.prefix_granularity == 128
     assert args.attention_backend == "dsa"
     assert spec.num_attention_heads // spec.attn_tp_size == 16
     assert spec.swa.num_attention_heads // spec.swa.attn_tp_size == 8
@@ -164,9 +163,10 @@ def test_checkpoint_reaches_two_group_cache(checkpoint):
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
+    assert recipe.prefix_granularity == 128
     plan = pack(
         recipe.groups(),
-        prefix_granularity=config.prefix_granularity,
+        prefix_granularity=recipe.prefix_granularity,
         cache_blocks_per_lcm_block=recipe.packing(recipe.groups()),
         alignment=recipe.alignment,
         max_padding_fraction=recipe.max_padding_fraction,
@@ -207,7 +207,6 @@ def test_mtp_uses_one_swa_layer_in_the_shared_cache(checkpoint):
     assert draft.attention_arch == AttentionArch.MLA
     assert args.attention_backend == "dsa"
     assert args.drafter_attention_backend == "mla"
-    assert args.prefix_granularity == 128
     assert (draft.num_attention_heads, draft.kv_lora_rank) == (64, 1024)
 
     target_config = _create_attn_config(args, model)
@@ -246,7 +245,7 @@ def test_mtp_uses_one_swa_layer_in_the_shared_cache(checkpoint):
     groups = recipe.groups()
     layout = pack(
         groups,
-        prefix_granularity=target_config.prefix_granularity,
+        prefix_granularity=recipe.prefix_granularity,
         cache_blocks_per_lcm_block=recipe.packing(groups),
         alignment=recipe.alignment,
         max_padding_fraction=recipe.max_padding_fraction,
@@ -259,11 +258,10 @@ def test_mtp_uses_one_swa_layer_in_the_shared_cache(checkpoint):
 
 
 @pytest.mark.parametrize("draft_backend", ["mla", "dsa"])
-def test_mtp_preserves_explicit_backend_and_prefix(checkpoint, draft_backend):
+def test_mtp_preserves_explicit_backend(checkpoint, draft_backend):
     args, _ = _load(checkpoint)
     args.speculative_algorithm = "MTP"
     args.drafter_attention_backend = draft_backend
-    args.prefix_granularity = 256
     draft = ModelConfig(
         model_path=args.model,
         trust_remote_code=False,
@@ -275,9 +273,8 @@ def test_mtp_preserves_explicit_backend_and_prefix(checkpoint, draft_backend):
     )
     assert args.attention_backend == "dsa"
     assert args.drafter_attention_backend == draft_backend
-    assert args.prefix_granularity == 256
     if draft_backend == "dsa":
         with pytest.raises(ValueError, match="dots3-note MTP requires the mla backend"):
             _create_attn_config(args, draft, is_draft=True)
     else:
-        assert _create_attn_config(args, draft, is_draft=True).prefix_granularity == 256
+        assert _create_attn_config(args, draft, is_draft=True).kernel_page_size == 32

@@ -1110,7 +1110,7 @@ class PrefillGraph:
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot; per-group table widths come from
         :meth:`_dummy_group_tables`. Backends with extra cache groups
-        (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every group
+        (DeepSeek V4.1: SWA + compressor + indexer state) need every group
         table, or their extend metadata is incomplete.
 
         On a query-sharding engine (``config.query_shard_size > 1``) the
@@ -1194,7 +1194,9 @@ class PrefillGraph:
             # Route the dummy tables through the same bridge packer live
             # batches use: one packed device storage, contract order and
             # bounds validated (the router's packed unpack and V4's
-            # packed-storage checks both key on that layout).
+            # packed-storage checks both key on that layout). These tables
+            # are built here, not by the scheduler, so their page IDs are
+            # always scanned; capture runs once, at startup.
             arrays = {
                 group_id: table.cpu().numpy()
                 for group_id, table in group_tables.items()
@@ -1205,6 +1207,7 @@ class PrefillGraph:
                 device=self.config.device,
                 contract=self.token_to_kv_pool.arena.runtime_contract,
                 num_requests=bs,
+                validate_page_ids=True,
             )
             group_tables = dict(
                 cache_metadata.tables(active_forward_op=dummy_forward_op)
@@ -1290,6 +1293,19 @@ class PrefillGraph:
             if ctx.global_num_tokens is not None
             else [num_tokens] * self.config.world_size
         )
+        # The layerwise Host-load waits are made eagerly, and a captured
+        # segment holds none: a prologue writes latent rows into a page a
+        # tail hit loads, and an inline KDA layer reads the State checkpoint
+        # a hit loads, both inside segments. So a replay waits for the
+        # plan's whole Host load (its last layer's event, which the load
+        # stream records after every earlier layer's copy) before its first
+        # segment.
+        tracker = self.token_to_kv_pool.layerwise_load_tracker
+        if tracker is not None:
+            for index in tracker.consumer_indices:
+                torch.cuda.current_stream().wait_event(
+                    tracker.event_sets[index].last_layer_done_event
+                )
         if self._narrowing is not None:
             hidden_states, aux_hidden_states = self._replay_narrowed(
                 bucket, ctx, num_tokens

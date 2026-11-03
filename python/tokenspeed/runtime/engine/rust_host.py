@@ -119,6 +119,10 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
     resolve_grammar_completion,
 )
 from tokenspeed.runtime.grammar.host_grammar import HostGrammar, HostGrammarEntries
+from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    ReasoningGrammar,
+    reasoning_grammar,
+)
 from tokenspeed.runtime.metrics.config import metrics_enabled
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.multimodal.inputs import (
@@ -126,7 +130,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
-from tokenspeed.runtime.pd.host_peer import build_host_peer
+from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
@@ -187,8 +191,8 @@ def rust_host_refusals(server_args: ServerArgs) -> list[str]:
     """What in ``server_args`` the Rust host cannot serve yet, empty when
     it can serve all of it."""
     refusals = []
-    # An EPD encode server starts its ranks itself (``_launch_encode_server``):
-    # they take encode requests, not the engine wire.
+    # An EPD encode server starts its ranks itself (``_start_encode_ranks``):
+    # they run no scheduler.
     if server_args.disaggregation_mode not in ("null", "prefill", "decode"):
         refusals.append(f"--disaggregation-mode {server_args.disaggregation_mode}")
     if kv_events_enabled(server_args.kv_events_config):
@@ -286,6 +290,8 @@ def start_rust_host(
                 sys.executable,
                 "--control-fd",
                 str(child.fileno()),
+                "--enable-async-logging",
+                str(server_args.enable_async_logging).lower(),
             ],
             executable=binary,
             pass_fds=[child.fileno(), held_until_exit],
@@ -313,12 +319,16 @@ class GrammarSettings:
         any_whitespace: JSON schemas allow any whitespace.
         compile_timeout_s: How long a request may wait for its grammar.
         max_retries: Timeouts a grammar is retried after.
+        reasoning: How a JSON schema waits for the reasoning block of the
+            ``--reasoning-parser``; None without one, or when xgrammar has
+            no template for it.
     """
 
     tokenizer_info: str
     any_whitespace: bool
     compile_timeout_s: float
     max_retries: int
+    reasoning: ReasoningGrammar | None
 
 
 def grammar_tokenizer_info(tokenizer, vocab_size: int, eos_token_ids) -> str:
@@ -436,7 +446,7 @@ class HostConfig:
         attn_tp_rank: This rank's attention-TP rank, an L3 metrics label.
         engine_role: ``--disaggregation-mode``, an L3 metrics label.
         eplb: With ``--enable-eplb``, the rebalance's settings; else None.
-        epd_prefill: An EPD prefill node: requests whose images an encode
+        epd_receive_enabled: An EPD prefill node: requests whose images an encode
             node embeds wait for the embeddings before they are scheduled;
             its first stage receives them (``HostBootstrap.epd_receive``).
         grammar: Grammar-constrained decoding's settings; None with
@@ -490,7 +500,7 @@ class HostConfig:
     attn_tp_rank: int
     engine_role: str
     eplb: EplbSettings | None
-    epd_prefill: bool
+    epd_receive_enabled: bool
     grammar: GrammarSettings | None
     eager_grammar: bool
 
@@ -769,6 +779,7 @@ class HostDataPlane:
         tuple[int, float] | None,
         list[int] | None,
         tuple | None,
+        list[float] | None,
     ]:
         """Wait for a forward's host copies to land (the control thread: the
         event wait releases the interpreter lock), and return its sampled
@@ -809,6 +820,11 @@ class HostDataPlane:
             ),
             resolve_grammar_completion(results),
             _logprob_lists(results),
+            (
+                results.output_token_cumulative_probs.tolist()
+                if results.output_token_cumulative_probs is not None
+                else None
+            ),
         )
 
     def note_committed(self, dispatched: _Dispatched) -> None:
@@ -881,6 +897,14 @@ class HostDataPlane:
             )
         )
 
+    def check_weight_update(self, payload: bytes) -> tuple[bool, str]:
+        """Check a weight load's local prerequisites (a msgpack control
+        struct) for the replica-wide admission before any rank loads."""
+        ok, message = self._device.check_weight_update(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
+
     def update_weights(self, payload: bytes) -> tuple[bool, str]:
         """Apply one weight operation (a msgpack control struct), ordered
         behind the forwards dispatched before it."""
@@ -888,6 +912,10 @@ class HostDataPlane:
             zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
         )
         return bool(ok), str(message)
+
+    def commit_weight_update(self, success: bool) -> None:
+        """Publish a weight load only after the Rust rank agreement."""
+        self._device.commit_weight_update(success)
 
     def profile(self, payload: bytes) -> tuple[bool, str]:
         """Start or stop the profiler (a msgpack ``ProfileReq``)."""
@@ -1119,6 +1147,12 @@ class HostBootstrap:
                 context_len=model_config.context_len,
                 max_single_request_tokens=self._max_single_request_tokens,
                 decode_input_tokens=decode_input_tokens,
+                max_kv_page_num=(
+                    0
+                    if server_args.chunk_prefill_kv_size is None
+                    else scheduler_config.max_kv_page_num
+                ),
+                prefix_granularity=geometry.prefix_granularity,
             )
             self._max_total_num_tokens = geometry.token_capacity
             self._max_model_len = max_model_len
@@ -1136,6 +1170,11 @@ class HostBootstrap:
                 attn_tp_size=server_args.attn_tp_size or mapping.attn.tp_size,
                 dp_rank=dp_rank,
                 kv_cache_size_tokens=geometry.token_capacity,
+                bootstrap=(
+                    kv_bootstrap_address(server_args)
+                    if server_args.disaggregation_mode == "prefill"
+                    else None
+                ),
             )
             if (specs.expert_rebalance is None) == server_args.enable_eplb:
                 raise RuntimeError(
@@ -1251,8 +1290,11 @@ class HostBootstrap:
                     and kv_events_config.publisher in (None, "zmq")
                     else None
                 ),
-                epd_prefill=(
-                    server_args.disaggregation_mode == "prefill"
+                epd_receive_enabled=(
+                    (
+                        server_args.disaggregation_mode == "prefill"
+                        or server_args.enable_external_encoder
+                    )
                     and model_config.is_multimodal_active
                 ),
                 grammar=(
@@ -1267,6 +1309,11 @@ class HostBootstrap:
                             server_args.grammar_compile_timeout_secs
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
+                        reasoning=(
+                            reasoning_grammar(server_args.reasoning_parser, tokenizer)
+                            if server_args.reasoning_parser
+                            else None
+                        ),
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None
@@ -1377,13 +1424,25 @@ class HostBootstrap:
         self._device.shutdown_cache()
 
 
-def bootstrap(control_fd: int, pd_outbox) -> HostBootstrap | EncodeBootstrap:
+def bootstrap(
+    control_fd: int, pd_outbox, weight_update_commit_protocol: int = 0
+) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
     host's encode mode instead (``epd/encode_host.py``)."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
+    # Reject an older host binary before constructing a model or process
+    # group. Protocol 1 publishes the replica-wide decision that makes locally
+    # loaded weights usable; protocol 2 also agrees the load prerequisites
+    # before any rank starts loading. A binary without protocol 1 calls
+    # bootstrap with two arguments.
+    if server_args.enable_memory_saver and weight_update_commit_protocol < 2:
+        raise RuntimeError(
+            "Memory saver requires a ts-host binary with weight-update commit "
+            "protocol 2; rebuild tokenspeed-engine together with this runtime"
+        )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(

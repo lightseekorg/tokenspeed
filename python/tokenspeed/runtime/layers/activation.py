@@ -57,6 +57,8 @@ class SiluAndMul(torch.nn.Module):
         if not x.is_cuda:
             if fp8_out:
                 raise NotImplementedError("CPU fp8_out silu_and_mul is not implemented")
+            if x.device.type == "npu" and self.swiglu_limit is None:
+                return silu_and_mul(x)
             return self.forward_native(x)
 
         if not _is_amd:

@@ -36,6 +36,9 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_step,
     gdn_tree_verify_needs_node_states,
 )
+from tokenspeed_kernel.ops.attention.gdn.flashinfer import (
+    is_rubin_decode_available as is_rubin_available,
+)
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     fused_qkv_split_gdn_prefill,
     pack_gdn_projection,
@@ -157,7 +160,7 @@ def forbid_cake_backend(request, monkeypatch):
 
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("steps", [1, 4])
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "flashinfer_rubin"])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("heads,value_heads", [(4, 12), (4, 8)])
 def test_gdn_chain_pdl_toggle(
@@ -170,6 +173,10 @@ def test_gdn_chain_pdl_toggle(
     restore_pdl,
     forbid_cake_backend,
 ):
+    if solution == "flashinfer_rubin" and (
+        not is_rubin_available() or steps != 1 or state_dtype != torch.bfloat16
+    ):
+        pytest.skip("Rubin GDN requires SM107, PR6604, T=1 and BF16 state")
     if solution == "flashinfer" and not flashinfer_gdn.is_decode_available():
         pytest.skip("FlashInfer GDN unavailable")
     torch.manual_seed(31)

@@ -65,6 +65,8 @@ Non-goals:
    plane sits behind a temporary launch switch during development, and the
    cut-over change deletes the Python control plane and the switch together.
 3. **The Python `Engine` API stays**, as a PyO3 binding over the Rust client.
+   Not kept: the cut-over deleted it with `AsyncLLM` (see the deviations
+   under Phase 4).
 4. **Grammar engine: xgrammar's C++ core** (see Grammar).
 5. **Mooncake: the Rust control plane owns the transfer engine through
    Mooncake's C API**; the L3 store client stays on the data plane (see
@@ -490,20 +492,25 @@ overrides the binary the `tokenspeed-engine` wheel installs); the Python event
 loop, its hooks, the request handler, the output processor, the data-parallel
 controller, the engine core client and pickle IPC, the Python headless
 transport, the Python PD transfer executors, the EPD prefill hooks and the
-Python encode loop are deleted, and `docs/design/event-loop.md` describes the Rust loop. `ts-py`
-(`tokenspeed_engine._native`) is the Python frontend's connection to the ranks.
-Four deviations from the plan above:
+Python encode loop are deleted, and `docs/design/event-loop.md` describes the Rust loop. `AsyncLLM`
+and the gRPC servicer path are deleted as well: SMG and Dynamo reach the
+ranks over the wire only. Four deviations from the plan above:
 
-* `AsyncLLM` stays, as the in-process frontend over `ts-py`: tokenization,
-  detokenization, stop strings, `n > 1` fan-out and the `Engine` API stay in
-  Python, and so does the Python encoding of requests onto the wire
-  (`zmq_wire`), which `ts-py` sends as it is.
-* `ts serve` keeps the gRPC servicer, now over that `AsyncLLM`. SMG's
-  msgpack backend does not yet carry what the CI model jobs need: MRoPE
-  multimodal inputs, EPD encode handshakes, shared-memory features and
-  top-k/prompt logprobs. `ts serve --headless` serves SMG's msgpack mode as
-  before. Moving `ts serve` onto it, and deleting the servicer, waits for
-  SMG.
+* The Python `Engine` API is deleted with `AsyncLLM` rather than wrapped
+  over `ts-py`, so Python has no serving frontend. `ts-py`
+  (`tokenspeed_engine._native`) connects tests and tools to the ranks
+  (`entrypoints/wire_driver.py`), on token ids and with the Python encoding
+  of requests (`zmq_wire`); tokenization, detokenization, stop strings and
+  `n > 1` fan-out are the frontends'.
+* `ts serve` runs on SMG's direct msgpack lane, which carries what the
+  servicer did through the wire revision the ranks declare at the handshake:
+  prefill/decode and encode roles (`smg launch` in disaggregated mode over
+  headless engines; `ts serve` fronts one regular engine), MRoPE positions
+  the gateway computes from the model facts the engines declare, top-k and
+  prompt logprobs, engines on other hosts over a `tcp://` worker, and the
+  control and RL operations as control calls. Not carried: shared-memory
+  features (tensors travel inline) and the frontend-held weight version
+  (`get_weight_version`).
 * The control thread calls into Python for the data plane's completion
   queries, and only for those: it waits on a launched forward's copy event
   through the torch event the data plane records (vendor-neutral, as the

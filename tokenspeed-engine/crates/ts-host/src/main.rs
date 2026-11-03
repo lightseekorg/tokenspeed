@@ -24,7 +24,7 @@
 //! half; `TOKENSPEED_HOST_BINARY` overrides the installed binary):
 //!
 //! ```text
-//! ts-host --python <the launcher's sys.executable> --control-fd <fd>
+//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>
 //! ```
 //!
 //! The rank's arguments arrive on `--control-fd`, and readiness goes back
@@ -37,6 +37,7 @@
 mod data_plane;
 mod encode;
 mod interpreter;
+mod logging;
 mod pd;
 
 use std::{
@@ -50,14 +51,13 @@ use std::{
 };
 
 use pyo3::{prelude::*, types::PyBytes};
-use tracing_subscriber::EnvFilter;
 use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     batch_log::BatchLogConfig,
     control::ControlConfig,
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, COMMIT_DELAY_FORWARDS},
     event_loop::{EventLoop, LoopConfig, LoopError, Ranks, Subsystems},
-    grammar::{GrammarConfig, Grammars},
+    grammar::{GrammarConfig, Grammars, ReasoningGrammar},
     ingress::{IngressLimits, LogprobServability},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
@@ -70,6 +70,17 @@ use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
 
 use crate::data_plane::PythonDataPlane;
+
+/// Rust's allocations go to mimalloc. The control thread allocates for every
+/// row of every round (scheduler events, outputs, the batches' columns); with
+/// glibc's allocator those allocations also contend with the forward thread's
+/// frees of the C++ plans the control thread built, as glibc returns a chunk
+/// to the arena that allocated it under that arena's lock. mimalloc frees
+/// across threads without one, and allocates small objects faster. Python,
+/// the C++ scheduler and the kernels keep the system allocator; nothing
+/// allocated on one side is freed on the other, as every boundary copies.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// How long the host waits for the frontend's INIT and for the other ranks
 /// to connect.
@@ -84,7 +95,9 @@ const EP_GROUP: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 enum HostError {
-    #[error("usage: ts-host --python <executable> --control-fd <fd>: {0}")]
+    #[error(
+        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>: {0}"
+    )]
     Usage(String),
     #[error("{0}")]
     Interpreter(String),
@@ -121,12 +134,13 @@ fn python_error(py: Python<'_>, error: PyErr) -> HostError {
 struct Args {
     python: String,
     control_fd: i32,
+    enable_async_logging: bool,
 }
 
-fn parse_args() -> Result<Args, HostError> {
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
     let mut python = None;
     let mut control_fd = None;
-    let mut args = std::env::args().skip(1);
+    let mut enable_async_logging = None;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -140,6 +154,13 @@ fn parse_args() -> Result<Args, HostError> {
                         .map_err(|_| HostError::Usage(format!("bad --control-fd {value}")))?,
                 )
             }
+            "--enable-async-logging" => {
+                enable_async_logging = Some(value.parse().map_err(|_| {
+                    HostError::Usage(format!(
+                        "bad --enable-async-logging {value}: use true or false"
+                    ))
+                })?);
+            }
             _ => return Err(HostError::Usage(format!("unknown argument {flag}"))),
         }
     }
@@ -147,6 +168,8 @@ fn parse_args() -> Result<Args, HostError> {
         python: python.ok_or_else(|| HostError::Usage("--python is required".to_owned()))?,
         control_fd: control_fd
             .ok_or_else(|| HostError::Usage("--control-fd is required".to_owned()))?,
+        enable_async_logging: enable_async_logging
+            .ok_or_else(|| HostError::Usage("--enable-async-logging is required".to_owned()))?,
     })
 }
 
@@ -182,7 +205,7 @@ struct HostConfig {
     eplb: Option<Eplb>,
     /// An EPD prefill node: it receives image embeddings from encode
     /// workers.
-    epd_prefill: bool,
+    epd_receive_enabled: bool,
     /// Grammar-constrained decoding's settings, if it is on.
     grammar: Option<GrammarConfig>,
     /// The data plane fills bitmasks from the matchers' committed state.
@@ -232,6 +255,24 @@ impl Eplb {
             ep_ranks: (ep_ranks.len() > 1).then_some(ep_ranks),
         }))
     }
+}
+
+/// The grammar settings' `reasoning` (`rust_host.GrammarSettings`), if
+/// grammars are on and it is set.
+fn reasoning_grammar(grammar: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGrammar>> {
+    if grammar.is_none() {
+        return Ok(None);
+    }
+    let reasoning = grammar.getattr("reasoning")?;
+    if reasoning.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ReasoningGrammar {
+        continues: reasoning.getattr("continues")?.extract()?,
+        may_open: reasoning.getattr("may_open")?.extract()?,
+        schema_slot: reasoning.getattr("schema_slot")?.extract()?,
+        markers: reasoning.getattr("markers")?.extract()?,
+    }))
 }
 
 /// Which metrics this rank exports, and where (`rust_host.HostConfig`'s
@@ -337,6 +378,7 @@ impl HostConfig {
                 requires_bootstrap,
                 multimodal: config.getattr("multimodal")?.extract()?,
                 grammar: !config.getattr("grammar")?.is_none(),
+                reasoning: reasoning_grammar(&config.getattr("grammar")?)?,
                 logprobs: {
                     let servability = config.getattr("logprob_servability")?;
                     LogprobServability {
@@ -371,7 +413,7 @@ impl HostConfig {
             },
             l3,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
-            epd_prefill: config.getattr("epd_prefill")?.extract()?,
+            epd_receive_enabled: config.getattr("epd_receive_enabled")?.extract()?,
             grammar: {
                 let grammar = config.getattr("grammar")?;
                 if grammar.is_none() {
@@ -461,7 +503,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1("bootstrap", (args.control_fd, outbox.clone()))?;
+                .call_method1("bootstrap", (args.control_fd, outbox.clone(), 2_u32))?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
             Ok((bootstrap.unbind(), outbox.unbind(), mode))
         })();
@@ -548,7 +590,8 @@ fn serve(args: &Args) -> Result<(), HostError> {
 
     // The replica's first member speaks for it.
     let transport = if ranks.replica.index() == 0 {
-        let ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+        let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+        ready.declare_scheduler();
         Some(EngineTransport::connect(
             &config.handshake_address,
             config.engine_index,
@@ -597,7 +640,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         controls: config.controls.clone(),
         batch_log: config.batch_log.clone(),
         kv_events: config.kv_events,
-        epd_prefill: config.epd_prefill,
+        epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
     };
     tracing::info!(
@@ -658,15 +701,22 @@ fn serve(args: &Args) -> Result<(), HostError> {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("TS_HOST_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    let served = parse_args().and_then(|args| {
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _log_guard = logging::init(args.enable_async_logging);
+    let served = (|| {
         interpreter::start(&args.python).map_err(HostError::Interpreter)?;
-        let served = serve(&args);
+        let served = {
+            // The host does not finalize Python. Drain its logger on success,
+            // error and unwind, before failure notification can kill the rank.
+            let _python_logs = logging::PythonLogGuard;
+            serve(&args)
+        };
         if served.is_err() {
             // As `run_event_loop` does: the launcher then stops the other
             // ranks.
@@ -680,12 +730,37 @@ fn main() -> ExitCode {
             }
         }
         served
-    });
+    })();
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("{error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    #[test]
+    fn logging_mode_is_explicit_and_validated() {
+        let args = |mode: &str| {
+            [
+                "--python",
+                "python3",
+                "--control-fd",
+                "3",
+                "--enable-async-logging",
+                mode,
+            ]
+            .map(str::to_owned)
+            .into_iter()
+        };
+        assert!(parse_args(args("true")).unwrap().enable_async_logging);
+        assert!(!parse_args(args("false")).unwrap().enable_async_logging);
+        assert!(parse_args(args("yes")).is_err());
+        assert!(parse_args(args("true").take(4)).is_err());
     }
 }

@@ -343,6 +343,12 @@ macro_rules! wire_struct {
         wire_struct!(@$layout $name $(($tag))? { $( $field: $fty $(= $fdefault)? ),* });
     };
     (@array $name:ident $(($tag:expr))? { $( $field:ident: $fty:ty $(= $fdefault:expr)? ),* }) => {
+        impl $name {
+            /// The fields in wire order, the tag not counted: what an
+            /// engine declares in its ready response's `positional_layouts`.
+            pub const FIELDS: &'static [&'static str] = &[$( stringify!($field) ),*];
+        }
+
         impl $crate::codec::Wire for $name {
             fn encode(&self, encoder: &mut $crate::msgpack::Encoder) {
                 let tag_len: usize = 0 $( + { let _ = $tag; 1 } )?;
@@ -439,6 +445,11 @@ mod tests {
         let mut encoder = Encoder::new();
         write(&mut encoder);
         encoder.into_single_frame()
+    }
+
+    #[test]
+    fn a_positional_struct_lists_its_fields_without_its_tag() {
+        assert_eq!(Tagged::FIELDS, ["name", "count"]);
     }
 
     #[test]

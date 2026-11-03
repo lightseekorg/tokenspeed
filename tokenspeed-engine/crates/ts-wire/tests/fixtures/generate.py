@@ -73,6 +73,7 @@ class WireReadyMessage(msgspec.Struct):
     local: bool | None = None
     headless: bool | None = None
     parallel_config_hash: str | None = None
+    engine_count: int | None = None
 
 
 class WireHandshakeAddresses(msgspec.Struct):
@@ -167,6 +168,7 @@ def _generate_text() -> list[bytes]:
             input_ids_unpadded=[151644, 872, 198],
             validation_error="rejected",
             data_parallel_rank=1,
+            cache_session_id="cache-session",
         )
     )
 
@@ -323,6 +325,7 @@ def _output_slim() -> list[bytes]:
         num_waiting=2,
         kv_active_pages=1000,
         kv_total_pages=4096,
+        kv_used_pages=1500,
     )
     return [bytes(f) for f in _ENCODER.encode(batch)]
 
@@ -356,6 +359,7 @@ def _output_slim_tail() -> list[bytes]:
         input_top_logprobs_idx=[[None, [9, 2], [4, 3]], []],
         output_top_logprobs_val=[[[-0.25, -3.0]], []],
         output_top_logprobs_idx=[[[7, 1]], []],
+        output_token_cumulative_probs_val=[[0.75], []],
     )
     return [bytes(f) for f in _ENCODER.encode(batch)]
 
@@ -384,7 +388,11 @@ def _handshake_hello() -> list[bytes]:
     return [
         zmq_wire.encode(
             WireReadyMessage(
-                status="HELLO", local=True, headless=False, parallel_config_hash="abc"
+                status="HELLO",
+                local=True,
+                headless=False,
+                parallel_config_hash="abc",
+                engine_count=2,
             )
         )
     ]
@@ -430,6 +438,17 @@ def _handshake_ready_response() -> list[bytes]:
                 kv_cache_size_tokens=790080,
                 kv_cache_max_concurrency=24.1,
                 kv_events_config={"publisher": "zmq", "topic": ""},
+                request_types=["add", "abort", "control"],
+                positional_layouts={"ControlReplySlim": ["call_id", "success"]},
+                disaggregation_mode="prefill",
+                bootstrap_host="10.0.0.7",
+                bootstrap_port=8998,
+                model_type="qwen3_5",
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                mrope_positions=True,
+                spatial_merge_size=2,
+                image_token_id=248056,
+                video_token_id=248057,
             )
         )
     ]

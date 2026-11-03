@@ -696,8 +696,9 @@ class CacheGroupRouter(AttentionBackend):
         expands the device tables), so a leaf that gathers history by page
         owner can split the gather without a device sync. A page-sharded
         group's leaf gets the mirror for an extend with a prefix too, to split
-        its prefix-chunk gathers the same way; any other forward reads nothing
-        from the mirror.
+        its prefix-chunk gathers the same way. Bounded native prefill also uses
+        it for cold batches to keep the receive pages within the scheduler's
+        budget; other forwards read nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
@@ -744,6 +745,7 @@ class CacheGroupRouter(AttentionBackend):
                     self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
                     if sharded
                     or (extend_with_prefix and gid in self._page_sharded_groups)
+                    or (num_extends > 0 and leaf.prefill_needs_host_page_table)
                     else None
                 ),
             )

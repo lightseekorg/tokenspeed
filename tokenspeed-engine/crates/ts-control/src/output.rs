@@ -53,6 +53,9 @@ pub struct ForwardResult {
     /// The tokens' logprobs in the same layout; `None` when the forward
     /// computed none.
     pub output_logprobs: Option<Vec<f64>>,
+    /// Selected tokens' cumulative probability mass in the same layout;
+    /// `None` when the diagnostic is disabled.
+    pub output_token_cumulative_probs: Option<Vec<f64>>,
     /// Per-row NaN-guard flags; `None` with the guard off.
     pub nan_flags: Option<Vec<i32>>,
     /// P role: each row's sampled token and the drafter's candidates, the
@@ -109,7 +112,8 @@ pub struct LogprobPlan {
 impl ForwardResult {
     /// The result as a pipeline's last stage shares it. The top-k
     /// alternatives are not shared: the ingress refuses them under pipeline
-    /// parallelism.
+    /// parallelism. Nor are the cumulative probabilities: the engine refuses
+    /// that diagnostic under pipeline parallelism.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Writer::new();
         out.i32s(&self.output_tokens);
@@ -145,6 +149,8 @@ impl ForwardResult {
             output_tokens,
             output_lengths,
             output_logprobs,
+            // Not shared: the engine refuses the diagnostic under a pipeline.
+            output_token_cumulative_probs: None,
             nan_flags,
             next_input_ids,
             serving_compiles: None,
@@ -259,6 +265,9 @@ pub struct StreamedOutput {
     pub cached_tokens: i64,
     /// Logprobs of `output_ids`; empty when not requested.
     pub output_logprobs: Vec<f64>,
+    /// Cumulative probability mass of `output_ids`; empty without diagnostics
+    /// or when the request did not ask for logprobs.
+    pub output_token_cumulative_probs: Vec<f64>,
     /// The finish reason in full once the request ended.
     pub finish_details: Option<FinishDetails>,
     /// With speculative decoding: verify rounds so far, and once finished
@@ -324,6 +333,16 @@ pub enum CommitError {
     Shape {
         /// Rows in the batch.
         rows: usize,
+        /// The mismatched column.
+        column: &'static str,
+        /// Its length.
+        found: usize,
+    },
+    /// A per-token diagnostic column does not match the sampled tokens.
+    #[error("forward result has {tokens} tokens but {found} {column}")]
+    TokenColumn {
+        /// Tokens in the result.
+        tokens: usize,
         /// The mismatched column.
         column: &'static str,
         /// Its length.
@@ -578,7 +597,10 @@ impl OutputProcessor {
         }
         state.finished_output = false;
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         self.log_end(rid, &state);
         committed.released.push(rid.to_owned());
@@ -634,7 +656,10 @@ impl OutputProcessor {
         }
         let mut state = self.states.remove(rid).expect("present above");
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         let kind = if state.to_abort {
             ForwardEventKind::Abort
@@ -665,10 +690,16 @@ impl OutputProcessor {
         if !state.finished() {
             state.abort("PD/EPD remote transfer failed or timed out", false, None);
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         } else if state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         committed.released.push(rid.to_owned());
         committed
@@ -711,7 +742,9 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
         }
         state.finished_output = false;
-        self.stream(&mut [(rid.to_owned(), &mut state)])
+        Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+            .into_iter()
+            .collect()
     }
 
     /// The ids of the requests registered and not ended.
@@ -729,7 +762,10 @@ impl OutputProcessor {
         };
         if state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         committed.released.push(rid.to_owned());
         committed
@@ -752,7 +788,10 @@ impl OutputProcessor {
         }
         if !state.to_abort || state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs = self.stream(&mut [(rid.to_owned(), &mut state)]);
+            committed.outputs =
+                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
+                    .into_iter()
+                    .collect();
         }
         self.log_end(rid, &state);
         committed.released.push(rid.to_owned());
@@ -773,13 +812,19 @@ impl OutputProcessor {
                     status_code: None,
                 });
                 committed.stats.capacity_aborts += 1;
-                committed
-                    .outputs
-                    .extend(self.stream(&mut [(abort.request_id.clone(), &mut state)]));
+                committed.outputs.extend(Self::stream_state(
+                    abort.request_id.as_str(),
+                    &mut state,
+                    self.stream_interval,
+                    self.spec_num_tokens,
+                ));
             } else if state.abort_notify_client {
-                committed
-                    .outputs
-                    .extend(self.stream(&mut [(abort.request_id.clone(), &mut state)]));
+                committed.outputs.extend(Self::stream_state(
+                    abort.request_id.as_str(),
+                    &mut state,
+                    self.stream_interval,
+                    self.spec_num_tokens,
+                ));
             }
             self.log_end(&abort.request_id, &state);
             committed.released.push(abort.request_id.clone());
@@ -954,6 +999,15 @@ impl OutputProcessor {
         if let Some(flags) = &result.nan_flags {
             check("nan_flags", flags.len())?;
         }
+        if let Some(probs) = &result.output_token_cumulative_probs {
+            if probs.len() != result.output_tokens.len() {
+                return Err(CommitError::TokenColumn {
+                    tokens: result.output_tokens.len(),
+                    column: "output_token_cumulative_probs",
+                    found: probs.len(),
+                });
+            }
+        }
 
         // The request stats' clock: a decode step lasts from the previous
         // commit, and a round with prefill rows interrupts the decodes in it.
@@ -983,8 +1037,12 @@ impl OutputProcessor {
             }
         }
 
-        let mut committed = Committed::default();
-        let mut streamed: Vec<String> = Vec::new();
+        // Most rows push one scheduler event and one streamed output.
+        let mut committed = Committed {
+            events: Vec::with_capacity(rows),
+            ..Committed::default()
+        };
+        let mut streamed: Vec<&str> = Vec::with_capacity(rows);
         let mut pt = 0usize;
         for i in 0..rows {
             let rid = &batch.request_ids[i];
@@ -994,6 +1052,10 @@ impl OutputProcessor {
                 .output_logprobs
                 .as_ref()
                 .map(|lps| window(lps, pt, output_length));
+            let mut model_cumulative_probs = result
+                .output_token_cumulative_probs
+                .as_ref()
+                .map(|probs| window(probs, pt, output_length));
             let is_decode = i >= batch.num_extends;
             // The prefill rows' sampled-token alternatives, in prefill output
             // order.
@@ -1079,6 +1141,9 @@ impl OutputProcessor {
                 if let Some(lps) = model_logprobs.as_mut() {
                     lps.truncate(1);
                 }
+                if let Some(probs) = model_cumulative_probs.as_mut() {
+                    probs.truncate(1);
+                }
                 tracing::warn!(rid, "request terminated: NaN detected in logits");
             }
             if is_decode && self.spec_num_tokens.is_some() {
@@ -1119,6 +1184,20 @@ impl OutputProcessor {
                 if state.return_logprob {
                     if let Some(lp) = model_logprobs.as_ref().and_then(|lps| lps.get(j)) {
                         state.output_logprobs.push(*lp);
+                    }
+                    if let Some(prob) = model_cumulative_probs
+                        .as_ref()
+                        .and_then(|probs| probs.get(j))
+                    {
+                        // The column stays indexed like `output_ids`: an
+                        // earlier token that came without a value (a remote
+                        // prefill's bootstrap token) keeps its place as NaN.
+                        let before = state.output_ids.len() - 1;
+                        state.output_token_cumulative_probs.resize(
+                            before.max(state.output_token_cumulative_probs.len()),
+                            f64::NAN,
+                        );
+                        state.output_token_cumulative_probs.push(*prob);
                     }
                 }
                 let finished_before = state.finished();
@@ -1205,16 +1284,20 @@ impl OutputProcessor {
             if state.to_abort && state.finished() {
                 committed.events.push(finish(rid, nan_detected));
                 if state.abort_notify_client {
-                    streamed.push(rid.clone());
+                    streamed.push(rid);
                 } else {
                     self.release(rid, &mut committed);
                 }
                 continue;
             }
-            streamed.push(rid.clone());
+            streamed.push(rid);
             if state.finished() {
                 committed.events.push(finish(rid, nan_detected));
-            } else if is_decode {
+            } else if is_decode && state.decode_reserve != Some(output_length as i32) {
+                // The scheduler keeps a request's decode reservation until it
+                // is sent another (a retraction's image carries it too), so
+                // only a change goes out, not an event per row every round.
+                state.decode_reserve = Some(output_length as i32);
                 committed.events.push(event(
                     ForwardEventKind::UpdateReserveNumTokens,
                     rid,
@@ -1224,23 +1307,7 @@ impl OutputProcessor {
             }
         }
 
-        let mut states: Vec<(String, RequestState)> = streamed
-            .iter()
-            .filter_map(|rid| self.states.remove_entry(rid))
-            .collect();
-        let mut refs: Vec<(String, &mut RequestState)> = states
-            .iter_mut()
-            .map(|(rid, state)| (rid.clone(), state))
-            .collect();
-        committed.outputs = self.stream(&mut refs);
-        for (rid, state) in states {
-            if state.finished() {
-                self.log_end(&rid, &state);
-                committed.released.push(rid);
-            } else {
-                self.states.insert(rid, state);
-            }
-        }
+        committed.outputs = self.stream(&streamed, &mut committed.released);
         Ok(committed)
     }
 
@@ -1251,55 +1318,95 @@ impl OutputProcessor {
         }
     }
 
-    /// The outputs due for `states` this step (`stream_output`).
-    fn stream(&self, states: &mut [(String, &mut RequestState)]) -> Vec<StreamedOutput> {
-        let mut outputs = Vec::new();
-        for (rid, state) in states.iter_mut() {
-            if !state.output_due(self.stream_interval) {
-                continue;
-            }
-            if state.finished() {
-                state.finished_output = true;
-            }
-            let sent = state.send_token_offset;
-            let output_ids = state.output_ids[sent..].to_vec();
-            state.send_token_offset = state.output_ids.len();
-            let n_new = output_ids.len();
-            let output_logprobs = if state.return_logprob {
-                let start = state.output_logprobs.len().saturating_sub(n_new);
-                state.output_logprobs[start..].to_vec()
+    /// The output due from one request this step, at its stream interval,
+    /// if any is. A free function so the commit streams states in place
+    /// without lifting them out of the map.
+    fn stream_state(
+        rid: &str,
+        state: &mut RequestState,
+        stream_interval: i64,
+        spec_num_tokens: Option<usize>,
+    ) -> Option<StreamedOutput> {
+        if !state.output_due(stream_interval) {
+            return None;
+        }
+        if state.finished() {
+            state.finished_output = true;
+        }
+        let sent = state.send_token_offset;
+        let output_ids = state.output_ids[sent..].to_vec();
+        state.send_token_offset = state.output_ids.len();
+        let n_new = output_ids.len();
+        let output_logprobs = if state.return_logprob {
+            let start = state.output_logprobs.len().saturating_sub(n_new);
+            state.output_logprobs[start..].to_vec()
+        } else {
+            Vec::new()
+        };
+        // Indexed like `output_ids` (see the commit), so the new tokens'
+        // values start where theirs do. Once the request has any value,
+        // every output carries one per token, NaN where none arrived, so
+        // the column never misaligns with the tokens.
+        let output_token_cumulative_probs =
+            if state.return_logprob && !state.output_token_cumulative_probs.is_empty() {
+                let mut values = state
+                    .output_token_cumulative_probs
+                    .get(sent..)
+                    .map_or_else(Vec::new, <[f64]>::to_vec);
+                values.resize(n_new, f64::NAN);
+                values
             } else {
                 Vec::new()
             };
-            // Prompt logprobs ship once, in the first output after the
-            // prompt's final chunk committed.
-            let input_logprobs = if state.input_logprobs_sent {
-                None
-            } else {
-                state.input_logprobs.clone()
+        // Prompt logprobs ship once, in the first output after the
+        // prompt's final chunk committed.
+        let input_logprobs = if state.input_logprobs_sent {
+            None
+        } else {
+            state.input_logprobs.clone()
+        };
+        state.input_logprobs_sent |= input_logprobs.is_some();
+        let output_top_logprobs = state.output_top_logprobs.as_ref().map(|(values, ids)| {
+            (
+                values[values.len().saturating_sub(n_new)..].to_vec(),
+                ids[ids.len().saturating_sub(n_new)..].to_vec(),
+            )
+        });
+        Some(StreamedOutput {
+            rid: rid.to_owned(),
+            output_ids,
+            finish_reason: state.finished_reason.as_ref().map(FinishReason::wire_type),
+            prompt_tokens: state.prompt_len,
+            completion_tokens: state.output_ids.len() as i64,
+            cached_tokens: state.cached_tokens,
+            output_logprobs,
+            output_token_cumulative_probs,
+            finish_details: state.finished_reason.as_ref().map(FinishReason::details),
+            spec: spec_num_tokens.map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
+            input_logprobs,
+            output_top_logprobs,
+        })
+    }
+
+    /// The outputs due from `rids` this step, each request's at its stream
+    /// interval; a finished request leaves the processor, into `released`,
+    /// whether or not an output was due.
+    fn stream(&mut self, rids: &[&str], released: &mut Vec<String>) -> Vec<StreamedOutput> {
+        let interval = self.stream_interval;
+        let spec = self.spec_num_tokens;
+        let mut outputs = Vec::with_capacity(rids.len());
+        for &rid in rids {
+            let Some(state) = self.states.get_mut(rid) else {
+                continue;
             };
-            state.input_logprobs_sent |= input_logprobs.is_some();
-            let output_top_logprobs = state.output_top_logprobs.as_ref().map(|(values, ids)| {
-                (
-                    values[values.len().saturating_sub(n_new)..].to_vec(),
-                    ids[ids.len().saturating_sub(n_new)..].to_vec(),
-                )
-            });
-            outputs.push(StreamedOutput {
-                rid: rid.clone(),
-                output_ids,
-                finish_reason: state.finished_reason.as_ref().map(FinishReason::wire_type),
-                prompt_tokens: state.prompt_len,
-                completion_tokens: state.output_ids.len() as i64,
-                cached_tokens: state.cached_tokens,
-                output_logprobs,
-                finish_details: state.finished_reason.as_ref().map(FinishReason::details),
-                spec: self
-                    .spec_num_tokens
-                    .map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
-                input_logprobs,
-                output_top_logprobs,
-            });
+            if let Some(output) = Self::stream_state(rid, state, interval, spec) {
+                outputs.push(output);
+            }
+            if state.finished() {
+                let (_, state) = self.states.remove_entry(rid).expect("present above");
+                self.log_end(rid, &state);
+                released.push(rid.to_owned());
+            }
         }
         outputs
     }
@@ -1329,6 +1436,7 @@ mod tests {
             output_tokens: tokens.to_vec(),
             output_lengths: lengths.to_vec(),
             output_logprobs: None,
+            output_token_cumulative_probs: None,
             nan_flags: None,
             next_input_ids: None,
             serving_compiles: None,
@@ -1657,6 +1765,45 @@ mod tests {
     }
 
     #[test]
+    fn a_bootstrap_token_without_a_cumulative_probability_keeps_the_column_aligned() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG);
+        register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
+        // The prefill node sends the first token's logprob, but no cumulative
+        // probability.
+        p.remote_prefill_done("r", 9, 0, Some(-0.25));
+        let decode = ForwardResult {
+            output_logprobs: Some(vec![-0.5]),
+            output_token_cumulative_probs: Some(vec![0.375]),
+            ..result(&[10], &[1])
+        };
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 3)], 0), None, &decode)
+            .unwrap();
+        let output = &c.outputs[0];
+        assert_eq!(output.output_ids, [9, 10]);
+        assert_eq!(output.output_logprobs, [-0.25, -0.5]);
+        // One value per token: the bootstrap token's place holds NaN.
+        let probs = &output.output_token_cumulative_probs;
+        assert_eq!(probs.len(), 2);
+        assert!(probs[0].is_nan());
+        assert_eq!(probs[1], 0.375);
+        // The next output starts at the next token.
+        let c = p
+            .commit(
+                &batch(&[("r", 1, 0, 3)], 0),
+                None,
+                &ForwardResult {
+                    output_logprobs: Some(vec![-0.75]),
+                    output_token_cumulative_probs: Some(vec![0.625]),
+                    ..result(&[11], &[1])
+                },
+            )
+            .unwrap();
+        assert_eq!(c.outputs[0].output_ids, [11]);
+        assert_eq!(c.outputs[0].output_token_cumulative_probs, [0.625]);
+    }
+
+    #[test]
     fn the_prefill_role_ships_its_prompt_logprobs_with_its_final_output() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG);
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, true);
@@ -1721,6 +1868,37 @@ mod tests {
             assert_eq!(ForwardResult::from_bytes(&bytes).as_ref(), Some(&result));
             assert_eq!(ForwardResult::from_bytes(&bytes[..bytes.len() - 1]), None);
         }
+    }
+
+    #[test]
+    fn a_decode_reservation_reaches_the_scheduler_only_when_it_changes() {
+        // Verify width 3: each decode row stores three tokens and keeps some.
+        let mut p = processor(Some(3));
+        register(&mut p, "r", 4, 100, &[]);
+        p.commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        let reserves: Vec<Vec<i32>> = [2, 2, 3, 3, 3, 1]
+            .into_iter()
+            .map(|kept| {
+                let committed = p
+                    .commit(
+                        &batch(&[("r", 3, 0, 4)], 0),
+                        None,
+                        &result(&[8, 9, 10], &[kept]),
+                    )
+                    .unwrap();
+                committed
+                    .events
+                    .iter()
+                    .filter(|event| event.kind == ForwardEventKind::UpdateReserveNumTokens)
+                    .map(|event| event.reserve_num_tokens)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            reserves,
+            [vec![2], vec![], vec![3], vec![], vec![], vec![1]]
+        );
     }
 
     #[test]
@@ -1809,6 +1987,25 @@ mod tests {
         assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
         assert!(c.outputs.is_empty(), "the client tore down already");
         assert_eq!(c.released, ["r"]);
+    }
+
+    #[test]
+    fn a_finished_request_leaves_even_when_no_output_is_due() {
+        // Release follows the finish, not the output: with its final output
+        // already marked sent, the finishing commit streams nothing and still
+        // releases the request.
+        let mut p = processor(None);
+        register(&mut p, "r", 2, 2, &[]);
+        p.commit(&batch(&[("r", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        p.states.get_mut("r").unwrap().finished_output = true;
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 2)], 0), None, &result(&[4], &[1]))
+            .unwrap();
+        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+        assert!(c.outputs.is_empty());
+        assert_eq!(c.released, ["r"]);
+        assert_eq!(p.num_running(), 0);
     }
 
     #[test]
@@ -1969,5 +2166,102 @@ mod tests {
             .commit(&batch(&[("r", 1, 0, 1)], 1), None, &first)
             .unwrap();
         assert_eq!(c.outputs[0].output_logprobs, [-0.25]);
+    }
+
+    #[test]
+    fn cumulative_probabilities_follow_streamed_tokens_and_logprob_requests() {
+        let mut p = processor(None);
+        for (rid, logprobs) in [("scored", true), ("plain", false)] {
+            p.register(
+                rid.to_owned(),
+                RequestState::new(vec![0], 4, BTreeSet::new(), true, Some(2), logprobs),
+            );
+        }
+        for (step, token) in [5, 6, 7, 8].into_iter().enumerate() {
+            let mut forward = result(&[token, token + 10], &[1, 1]);
+            forward.output_logprobs = Some(vec![-(token as f64), -10.0]);
+            forward.output_token_cumulative_probs = Some(vec![token as f64 / 10.0, 0.9]);
+            let c = p
+                .commit(
+                    &batch(
+                        &[("scored", 1, 0, 1), ("plain", 1, 0, 1)],
+                        if step == 0 { 2 } else { 0 },
+                    ),
+                    None,
+                    &forward,
+                )
+                .unwrap();
+            if step == 1 {
+                assert!(c.outputs.is_empty());
+                continue;
+            }
+            let scored = c
+                .outputs
+                .iter()
+                .find(|output| output.rid == "scored")
+                .unwrap();
+            let expected = match step {
+                0 => vec![5],
+                2 => vec![6, 7],
+                _ => vec![8],
+            };
+            assert_eq!(scored.output_ids, expected);
+            assert_eq!(
+                scored.output_logprobs,
+                expected.iter().map(|&id| -(id as f64)).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                scored.output_token_cumulative_probs,
+                expected
+                    .iter()
+                    .map(|&id| id as f64 / 10.0)
+                    .collect::<Vec<_>>()
+            );
+            let plain = c
+                .outputs
+                .iter()
+                .find(|output| output.rid == "plain")
+                .unwrap();
+            assert!(plain.output_logprobs.is_empty());
+            assert!(plain.output_token_cumulative_probs.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_stop_token_cuts_cumulative_probabilities_with_its_verify_window() {
+        let mut p = processor(Some(3));
+        p.register(
+            "r".to_owned(),
+            RequestState::new(vec![0], 10, BTreeSet::from([7]), true, None, true),
+        );
+        let mut first = result(&[5], &[1]);
+        first.output_logprobs = Some(vec![-0.5]);
+        first.output_token_cumulative_probs = Some(vec![0.1]);
+        p.commit(&batch(&[("r", 1, 0, 1)], 1), None, &first)
+            .unwrap();
+        let mut verify = result(&[6, 7, 8], &[3]);
+        verify.output_logprobs = Some(vec![-0.6, -0.7, -0.8]);
+        verify.output_token_cumulative_probs = Some(vec![0.2, 0.3, 0.4]);
+        let c = p
+            .commit(&batch(&[("r", 3, 0, 1)], 0), None, &verify)
+            .unwrap();
+        assert_eq!(c.outputs[0].output_ids, [6, 7]);
+        assert_eq!(c.outputs[0].output_logprobs, [-0.6, -0.7]);
+        assert_eq!(c.outputs[0].output_token_cumulative_probs, [0.2, 0.3]);
+    }
+
+    #[test]
+    fn cumulative_probabilities_must_cover_the_result_tokens() {
+        let mut p = processor(None);
+        register(&mut p, "r", 1, 2, &[]);
+        let mut forward = result(&[5], &[1]);
+        forward.output_token_cumulative_probs = Some(vec![]);
+        assert!(matches!(
+            p.commit(&batch(&[("r", 1, 0, 1)], 1), None, &forward),
+            Err(CommitError::TokenColumn {
+                column: "output_token_cumulative_probs",
+                ..
+            })
+        ));
     }
 }

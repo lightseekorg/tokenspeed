@@ -36,6 +36,7 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.prefix_granularity = 2
     cfg.num_device_pages = 32
     cfg.num_host_pages = 32
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
@@ -130,6 +131,23 @@ def test_forward_batch_uses_per_group_block_tables_as_the_only_page_table():
     assert not hasattr(op, "occupied_pages")
     assert not hasattr(op, "begins")
     assert not hasattr(op, "sizes")
+
+
+def test_block_table_arrays_keep_their_snapshot_alive():
+    import gc
+
+    scheduler = ts.Scheduler(_make_config())
+    scheduler.submit_requests([_make_spec("r1", num_pages=2)])
+    plan = scheduler.next_execution_plan()
+    op = _find_forward_op(plan)
+    arrays = op.block_tables_arrays()
+    expected = dict(op.block_tables)
+    assert all(not array.flags.writeable for array in arrays.values())
+
+    del op, plan, scheduler
+    gc.collect()
+    for group_id, array in arrays.items():
+        assert array.tolist() == expected[group_id]
 
 
 def test_pages_to_zero_arrays_view_the_plan_without_python_ints():
@@ -476,6 +494,31 @@ def _drive_k3_to_retract(scheduler) -> tuple[object, dict[str, list[int]]]:
     return snapshot, a_rows
 
 
+@pytest.mark.parametrize("host_pool", ["l2", "snapshot"])
+def test_host_pools_require_explicit_packing_for_every_group(host_pool: str) -> None:
+    cfg = _make_k3_config()
+    if host_pool == "l2":
+        cfg.num_host_pages = 33
+        cfg.disable_l2_cache = False
+        cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
+    else:
+        cfg.num_snapshot_pages = 33
+        cfg.max_retracted_requests = 4
+
+    with pytest.raises(ValueError, match="Host pools require explicit packing"):
+        ts.Scheduler(cfg)
+
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
+    scheduler = ts.Scheduler(cfg)
+    scheduler.submit_requests([_spec("request", [1, 2, 3, 4])])
+    batch = _find_forward_op(scheduler.next_execution_plan())
+    assert batch is not None
+    assert tuple(batch.request_ids) == ("request",)
+    assert list(batch.input_lengths) == [4]
+
+
 def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     """Without L2 the whole image lives in the snapshot pool; the restore
     copies it back into fresh pages and decode resumes where it stopped."""
@@ -484,6 +527,9 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     assert cfg.disable_l2_cache
     cfg.num_snapshot_pages = 33
     cfg.max_retracted_requests = 4
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
     scheduler = ts.Scheduler(cfg)
     before = scheduler.available_lcm_blocks()
     assert scheduler.snapshot_pool_free_blocks() == 32
@@ -602,6 +648,9 @@ def test_k3_finish_while_retracted_returns_the_image() -> None:
     cfg = _make_k3_config()
     cfg.num_snapshot_pages = 33
     cfg.max_retracted_requests = 4
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
     scheduler = ts.Scheduler(cfg)
     snapshot, _ = _drive_k3_to_retract(scheduler)
     assert scheduler.snapshot_pool_free_blocks() == 32 - 8
@@ -623,6 +672,7 @@ def _make_replay_config() -> ts.SchedulerConfig:
     cfg.prefix_granularity = 8
     cfg.num_device_pages = 256
     cfg.num_host_pages = 256
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8

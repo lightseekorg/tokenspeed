@@ -509,7 +509,6 @@ def _qsa_config(*, kernel_page_size: int | None, max_bs: int, spec: int) -> Attn
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=256,
         kernel_page_size=kernel_page_size,
         context_len=1024,
         max_bs=max_bs,
@@ -1823,7 +1822,6 @@ def test_qsa_passes_logical_selection_to_kernel(query_width: int | None) -> None
     config = replace(
         _qsa_config(kernel_page_size=64, max_bs=2, spec=4),
         device="cuda",
-        prefix_granularity=64,
         context_len=512,
         components=(spec,),
     )
@@ -2121,7 +2119,6 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         kv_cache_mxfp8=False,
         context_len=1024,
         max_bs=2,
-        prefix_granularity=64,
         kernel_page_size=64,
         kv_cache_quant_method="none",
         components=(softmax, linear),
@@ -2131,6 +2128,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
         kv_offload_config=None,
+        mamba_ssm_dtype="float32",
     )
 
     setup = prepare_cache_setup(
@@ -2233,6 +2231,94 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert (
         short_counts[QWEN4_EXP_QSA_CACHE_GROUP] < long_counts[QWEN4_EXP_QSA_CACHE_GROUP]
     )
+
+
+def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
+    """A Qwen4-Exp cache plan whose PLE state outgrows one FP8 K page.
+
+    The recurrent state (8 x 32 x 32 fp32, 32 KiB) is far wider than an FP8 K
+    page (the recipe's 128-token grain x 1 head x 32 dims, 4 KiB), and the PLE
+    state (512 x 9 bf16 plus its context, about 9 KiB) falls between them, as
+    on the real model with FP8 KV.
+    """
+    text_config = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        mamba2_cache_params=(
+            (64, 3),
+            (8, 32, 32),
+            torch.bfloat16,
+            torch.float32,
+            (0,),
+        ),
+        ple_layer_ids=[1] if with_ple else [],
+        ngram_context_len=2,
+        short_conv_state_shape=(512, 9),
+        short_conv_layer_ids=[0],
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=text_config),
+        hf_text_config=text_config,
+        num_attention_layers=2,
+    )
+    softmax = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=2,
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        num_kv_heads=1,
+        attn_tp_size=1,
+        head_dim=32,
+    )
+    linear = LinearAttnConfig(
+        num_k_heads=1,
+        num_v_heads=8,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_kernel_size=4,
+        layer_ids=(0,),
+        tp_size=1,
+    )
+    attn_config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_mxfp8=False,
+        context_len=1024,
+        max_bs=2,
+        kernel_page_size=64,
+        kv_cache_quant_method="none",
+        components=(softmax, linear),
+    )
+    server_args = SimpleNamespace(
+        block_size=64,
+        max_total_tokens=None,
+        speculative_num_draft_tokens=0,
+        kv_offload_config=None,
+        mamba_ssm_dtype="float32",
+        mapping=Mapping(rank=0, world_size=1),
+    )
+    return prepare_cache_setup(
+        family="qwen4_exp",
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=attn_config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=8 << 20,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+
+def test_qwen4_exp_ple_state_wider_than_an_fp8_k_page_adds_no_parent_bytes() -> None:
+    with_ple = _fp8_kv_qwen4_exp_cache_setup(with_ple=True).spec.memory_plan
+    without_ple = _fp8_kv_qwen4_exp_cache_setup(with_ple=False).spec.memory_plan
+
+    assert with_ple.group(QWEN4_EXP_PLE_CACHE_GROUP).cache_blocks_per_lcm_block >= 1
+    # A parent belongs to one group at a time: the PLE state fits the planes
+    # the recurrent state already reserves, so every K and state parent keeps
+    # its size instead of carrying a PLE-only plane.
+    assert with_ple.lcm_block_bytes == without_ple.lcm_block_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -2388,6 +2474,26 @@ def test_ple_batch_indices_uniform_matches_general_path() -> None:
     assert torch.equal(fast[0], general[0][: fast[5]])
     assert torch.equal(fast[1], general[1][: fast[5]])
     assert torch.equal(fast[3], general[3][: len(lengths)])
+
+
+@_requires_cuda
+def test_ple_ragged_batch_indices_do_not_synchronize() -> None:
+    # Prefill builds them on the forward thread, behind the step in flight.
+    lengths = [3, 1, 4]
+    device = torch.device("cuda")
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        req, col, lengths_t, starts, *_ = Qwen4ExpPLELayer._batch_indices(
+            lengths, device
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert req.tolist() == [0, 0, 0, 1, 2, 2, 2, 2]
+    assert col.tolist() == [0, 1, 2, 0, 0, 1, 2, 3]
+    assert lengths_t.tolist() == lengths
+    assert starts.tolist() == [0, 3, 4]
 
 
 @_requires_cuda

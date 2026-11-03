@@ -23,7 +23,7 @@
 Each request owns ``R`` query rows over its committed prefix and a ``W``-key
 tree window at the end of its keys; row ``r`` sees window key ``j`` when bit
 ``j % 64`` of its mask word ``j // 64`` is set. A causal ``q_len = R`` decode
-over the prefix (trtllm-gen, with its log-sum-exp) covers keys
+over the prefix (trtllm-gen, or the Triton MHA extend, with its log-sum-exp) covers keys
 ``[0, P - R + 1 + r)`` of row ``r``; ``triton_tree_window_attention`` attends
 the rest (the prefix tail and the window) and merges both in one kernel.
 Target verify (``R == W == N``) and draft lanes (``R == K``,
@@ -228,8 +228,8 @@ def _tree_window_merge_kernel(
     "tree_window",
     name="triton_tree_window_attention",
     solution="triton",
-    # Its prefix partial comes from trtllm-gen, so trees run it on NVIDIA only.
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    # Its prefix partial comes from trtllm-gen on NVIDIA and the Triton MHA extend on AMD.
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     # An FP8 KV cache is unscaled (every factor 1.0): its K/V widen to the query dtype.
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}

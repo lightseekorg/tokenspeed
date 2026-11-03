@@ -20,12 +20,13 @@
 
 from __future__ import annotations
 
-import sys
-from types import SimpleNamespace
-
 import pytest
+import torch
 
-from tokenspeed.runtime.cache.host_storage import HostCacheStorage
+from tokenspeed.runtime.cache.host_storage import (
+    HostCacheStorage,
+    validate_host_group_packing,
+)
 from tokenspeed.runtime.cache.transfer.layout import (
     CacheField,
     CacheGroupLayout,
@@ -34,19 +35,17 @@ from tokenspeed.runtime.cache.transfer.layout import (
 
 
 @pytest.fixture(autouse=True)
-def _fake_torch(monkeypatch):
-    uint8 = object()
+def _cpu_pinned_allocation(monkeypatch):
+    allocate = torch.empty
 
-    def empty(num_bytes, *, dtype, pin_memory):
-        assert dtype is uint8
-        assert pin_memory is True
-        return bytearray(num_bytes)
+    def empty(*args, **kwargs):
+        # Pinned allocation needs a CUDA device; storage behavior uses real
+        # CPU tensors so these tests do not acquire a serving GPU.
+        if kwargs.get("pin_memory", False):
+            kwargs["pin_memory"] = False
+        return allocate(*args, **kwargs)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "torch",
-        SimpleNamespace(empty=empty, uint8=uint8),
-    )
+    monkeypatch.setattr(torch, "empty", empty)
 
 
 def _layout():
@@ -67,13 +66,13 @@ def test_block_offsets_follow_group_packing_without_overlap():
     storage = HostCacheStorage(layout, num_host_lcm_blocks=2)
 
     assert storage.host_block_offset(0, 1) == 0
-    assert storage.host_block_offset(0, 4) == 3 * storage.host_cache_block_bytes[0]
-    assert storage.host_block_offset(0, 5) == storage.host_lcm_block_bytes
+    assert storage.host_block_offset(0, 2) == storage.host_cache_block_bytes[0]
+    assert storage.host_block_offset(0, 3) == storage.host_lcm_block_bytes
     assert storage.host_block_offset(1, 1) == 0
     assert storage.host_block_offset(1, 2) == storage.host_lcm_block_bytes
 
 
-@pytest.mark.parametrize("group_index,block_id", [(0, 0), (0, 9), (1, 3)])
+@pytest.mark.parametrize("group_index,block_id", [(0, 0), (0, 5), (1, 3)])
 def test_null_and_out_of_range_blocks_are_rejected(group_index, block_id):
     layout = _layout()
     storage = HostCacheStorage(layout, num_host_lcm_blocks=2)
@@ -112,7 +111,7 @@ def test_host_fields_are_packed_without_padding():
 
     assert storage.host_cache_block_bytes == (80, 1200)
     assert storage.host_field_offsets == ((0, 40), (0, 1000))
-    assert storage.host_lcm_block_bytes == 1280
+    assert storage.host_lcm_block_bytes == 1200
 
 
 def test_host_storage_does_not_retain_device_buffers():
@@ -131,4 +130,65 @@ def test_host_storage_does_not_retain_device_buffers():
     gc.collect()
     assert reference() is None
     assert storage.host_block_range(0, 1) == (0, 32)
-    assert len(storage.host_buffer) == 256
+    assert len(storage.host_buffer) == 160
+
+
+def test_shared_host_storage_packs_payloads_independently_of_device_strides():
+    layout = CacheTransferLayout(
+        num_lcm_blocks=2,
+        groups=(
+            CacheGroupLayout("full", 4, (CacheField("kv", 0, 0, 32, 32),)),
+            CacheGroupLayout("state", 1, (CacheField("ssm", 0, 0, 80, 80),)),
+            CacheGroupLayout("aux", 2, (CacheField("aux", 0, 0, 40, 5),)),
+        ),
+        buffers=(object(),),
+        consumers=(("kv",), ("ssm",), ("aux",)),
+    )
+    storage = HostCacheStorage(layout, num_host_lcm_blocks=2)
+
+    assert storage.host_buffer.numel() == 160
+    assert storage.host_block_range(0, 2) == (32, 32)
+    assert storage.host_block_range(2, 16) == (75, 5)
+    assert storage.host_block_range(2, 17) == (80, 5)
+    assert storage.host_block_range(1, 2) == (80, 80)
+    # One shared parent can hold history or State. These two occupants use
+    # different parents and retain their bytes across the compact boundary.
+    storage.host_buffer[32:64].fill_(17)
+    storage.host_buffer[80:160].fill_(29)
+    assert torch.all(storage.host_buffer[32:64] == 17)
+    assert torch.all(storage.host_buffer[80:160] == 29)
+
+
+def _check_host_packing_agreement(rank, rendezvous, peer_packing):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        packing = (2, 1) if rank == 0 else peer_packing
+        if peer_packing == (2, 1):
+            validate_host_group_packing(packing, cpu_group=dist.group.WORLD)
+        else:
+            with pytest.raises(ValueError, match="Host packing must match"):
+                validate_host_group_packing(packing, cpu_group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("peer_packing", [(2, 1), (3, 1), (2, 1, 1)])
+def test_mirrored_ranks_accept_only_identical_host_packing(tmp_path, peer_packing):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _check_host_packing_agreement,
+        args=(f"file://{tmp_path}/gloo", peer_packing),
+        nprocs=2,
+        join=True,
+    )

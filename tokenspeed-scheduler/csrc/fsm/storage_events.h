@@ -31,9 +31,9 @@ namespace tokenspeed::fsm {
 struct StartPrefetchEvent : InvalidTransitionHandler<StartPrefetchEvent> {
     using InvalidTransitionHandler<StartPrefetchEvent>::operator();
 
-    StartPrefetchEvent(std::uint64_t operation_id, std::int64_t deadline_us, std::vector<std::string> hashes,
+    StartPrefetchEvent(StorageLease lease, std::int64_t deadline_us, std::vector<std::string> hashes,
                        std::int32_t max_tokens, std::optional<TailPublication> tail)
-        : operation_id_{operation_id},
+        : lease_{std::move(lease)},
           deadline_us_{deadline_us},
           hashes_{std::move(hashes)},
           max_tokens_{max_tokens},
@@ -46,27 +46,34 @@ private:
     template <typename State>
     Prefetching start(State&& state) {
         state.admission.storage_prepared = true;
-        return Prefetching{std::move(state),   operation_id_, deadline_us_,
-                           std::move(hashes_), max_tokens_,   std::move(tail_)};
+        return Prefetching{std::move(state),   std::move(lease_), deadline_us_,
+                           std::move(hashes_), max_tokens_,       std::move(tail_)};
     }
-    std::uint64_t operation_id_;
+    StorageLease lease_;
     std::int64_t deadline_us_;
     std::vector<std::string> hashes_;
     std::int32_t max_tokens_;
     std::optional<TailPublication> tail_;
 };
 
+// Ends the L3 wait. With a deadline the completed GET's lease moves to the
+// admission resources as the Ready hold, expiring then; without one it dies
+// with the state and the request gives the operation up.
 struct FinishPrefetchEvent : InvalidTransitionHandler<FinishPrefetchEvent> {
     using InvalidTransitionHandler<FinishPrefetchEvent>::operator();
-    explicit FinishPrefetchEvent(std::optional<StorageReadyHold> hold) : hold_{std::move(hold)} {}
+    explicit FinishPrefetchEvent(std::optional<std::int64_t> ready_deadline_us)
+        : ready_deadline_us_{ready_deadline_us} {}
 
     Prefetching::Continuation operator()(Prefetching&& state) {
-        state.Admission().storage_hold = std::move(hold_);
+        if (ready_deadline_us_) {
+            state.Admission().storage_hold =
+                StorageReadyHold{.lease = std::move(state.lease), .deadline_us = *ready_deadline_us_};
+        }
         return std::move(state.continuation);
     }
 
 private:
-    std::optional<StorageReadyHold> hold_;
+    std::optional<std::int64_t> ready_deadline_us_;
 };
 
 }  // namespace tokenspeed::fsm

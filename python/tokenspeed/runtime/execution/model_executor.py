@@ -122,11 +122,15 @@ from tokenspeed.runtime.layers.paged_attention import (
     check_block_drafter_storage,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+from tokenspeed.runtime.sampling.diagnostics import sample_with_diagnostics
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
     setup_dp_sampling,
 )
-from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+from tokenspeed.runtime.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+    request_vocab_mask,
+)
 from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
@@ -157,10 +161,10 @@ def _sampling_info_for_requests(
     """Select original request parameters and their token-indexed masks."""
     info = sampling_info[requests]
     if mask_width is not None and sampling_info.vocab_mask is not None:
-        mask = sampling_info.vocab_mask[
-            requests.start * mask_width : requests.stop * mask_width
-        ]
-        info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
+        mask = request_vocab_mask(
+            sampling_info.vocab_mask, requests, mask_width=mask_width, prefill=prefill
+        )
+        info.vocab_mask = mask.contiguous() if prefill else mask
     return info
 
 
@@ -417,6 +421,7 @@ class ModelExecutorConfig:
 
     # ====== DP =========
     data_parallel_size: int = 1
+    attention_tp_size: int = 1
     world_size: int = 1
     world_group: list[int] | None = None
 
@@ -527,6 +532,7 @@ class ModelExecutorConfig:
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
+            attention_tp_size=server_args.mapping.attn.tp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
             pp_size=server_args.mapping.pp_size,
@@ -592,6 +598,8 @@ class ModelExecutor:
                 attn_backend=attn_backend, kv_pool=token_to_kv_pool
             )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
+        # Read once: scanning every page ID of every forward is a diagnostic.
+        self._validate_page_ids: bool = envs.TOKENSPEED_VALIDATE_PAGE_IDS.get()
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_model_runner = draft_model_runner
@@ -1146,10 +1154,11 @@ class ModelExecutor:
                         # Prefill-only roles do not allocate decode/verify scratch.
                         # The draft model is reached through the shared speculative
                         # forward, not model_runner.forward above. One request
-                        # exposes its operators; FI still owns their bucket
-                        # enumeration.
+                        # per attention TP rank keeps sequence-parallel router
+                        # GEMMs nonempty on every peer during distributed tuning.
                         self.forward_step.warmup_decode_path(
-                            batch_sizes=(1,), graph_phase=False
+                            batch_sizes=(self.config.attention_tp_size,),
+                            graph_phase=False,
                         )
         finally:
             set_autotune_process_group(None)
@@ -1513,12 +1522,26 @@ class ModelExecutor:
         ends it: an accepted width is cut at the request's stop token or
         token limit before anything reads it (the state commit, the accepted
         frontier, the drafter, the reported tokens)."""
-        output_tokens, accept_lengths = self._sample_and_verify(
-            logits_output, sampling_info, ctx, candidates
+        drafter = self.drafter
+        output_tokens, accept_lengths = sample_with_diagnostics(
+            logits_output,
+            sampling_info,
+            ctx.output_layout,
+            lambda: self._sample_and_verify(
+                logits_output, sampling_info, ctx, candidates
+            ),
+            enabled=self.sampling_backend.config.enable_output_cumulative_probs,
+            # The drafter rewrites its verify outputs before anything reads
+            # them, the diagnostic included; the stop conditions below cut
+            # what the drafter has the round commit.
+            finalize=(
+                None
+                if drafter is None
+                else lambda tokens, lengths: drafter.rewrite_verify_outputs(
+                    ctx, tokens, lengths
+                )
+            ),
         )
-        if self.drafter is not None:
-            # The stop conditions cut what the drafter has the round commit.
-            self.drafter.rewrite_verify_outputs(ctx, output_tokens, accept_lengths)
         ib = self.input_buffers
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
@@ -1815,11 +1838,11 @@ class ModelExecutor:
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
 
-        output_logprobs = logits_output.next_token_logprobs
         return (
             output_tokens,
             accept_lengths,
-            output_logprobs,
+            logits_output.next_token_logprobs,
+            logits_output.next_token_cumulative_probs,
             ForwardLogprobs.of(logits_output),
         )
 
@@ -2289,12 +2312,14 @@ class ModelExecutor:
             block_tables = {}
             block_tables_cpu = {}
             if bs > 0:
-                # Validate and pack the per-group tables once for this batch.
+                # Check the per-group tables' structure and pack them once for
+                # this batch; the page IDs only under the diagnostic.
                 cache_metadata = CacheBatchMetadata.from_forward_op(
                     forward_op,
                     device=self.device,
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
+                    validate_page_ids=self._validate_page_ids,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
                 block_tables_cpu = dict(
@@ -2401,6 +2426,7 @@ class ModelExecutor:
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
+                output_cumulative_probs = None
                 if input_logprob_plan is not None:
                     raise RuntimeError(
                         "prompt logprobs planned for a forward without input rows"
@@ -2547,6 +2573,7 @@ class ModelExecutor:
                         output_tokens,
                         output_lengths,
                         output_logprobs,
+                        output_cumulative_probs,
                         forward_logprobs,
                     ) = self.forward_step(
                         bs=bs,
@@ -2621,9 +2648,8 @@ class ModelExecutor:
                 # Defensive clamp into the valid vocab range (kept from the
                 # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
                 # value surfaced by the intermittent spec-decode decode-state race
-                # -- would otherwise reach the detokenizer, whose HF
-                # tokenizer.decode raises a fatal OverflowError on ids outside
-                # [0, vocab) and tears down the whole server process tree.
+                # -- would otherwise reach the frontend's detokenizer as a
+                # token outside the vocabulary.
                 # It must run on-GPU *before* the non_blocking D2H: clamping the
                 # CPU result afterwards would race the in-flight copy. In-place
                 # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
@@ -2647,6 +2673,10 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                if output_cumulative_probs is not None:
+                    output_cumulative_probs = output_cumulative_probs.to(
+                        "cpu", non_blocking=True
+                    )
                 if forward_logprobs is not None:
                     forward_logprobs = forward_logprobs.to_host()
                 else:
@@ -2701,6 +2731,7 @@ class ModelExecutor:
             input_top_logprobs_idx=forward_logprobs.input_top_logprobs_idx,
             output_top_logprobs_val=forward_logprobs.output_top_logprobs_val,
             output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
+            output_token_cumulative_probs=output_cumulative_probs,
         )
 
     def _input_logprob_rows(

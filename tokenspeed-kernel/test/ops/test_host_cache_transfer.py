@@ -124,6 +124,7 @@ def _sample_geometry(
         ),
         layer_slices=((0, 2), (2, 0), (2, 1)),
         group_packing=(4, 1),
+        host_group_packing=(4, 1),
         host_lcm_block_bytes=1280,
         num_host_lcm_blocks=num_host_lcm_blocks,
         num_device_lcm_blocks=num_device_lcm_blocks,
@@ -156,6 +157,27 @@ def test_geometry_layer_slices_preserve_empty_layers(host_transfer_contract):
     assert geometry.num_field_rows == 3
 
 
+def test_transfer_bounds_follow_the_packing_of_each_tier():
+    module = _load_host_transfer_contract_module()
+    geometry = module.build_host_transfer_geometry(
+        rows=((0, 0, 0, 16, 8, 0, 3, 8), (1, 0, 0, 24, 24, 0, 1, 24)),
+        layer_slices=((0, 2),),
+        group_packing=(2, 4),
+        host_group_packing=(3, 1),
+        host_lcm_block_bytes=24,
+        num_host_lcm_blocks=2,
+        num_device_lcm_blocks=2,
+        num_device_buffers=1,
+    )
+    workspace = module.HostTransferWorkspace()
+    count, _ = workspace.load_block_transfers([(0, 4, 6), (1, 8, 2)], geometry=geometry)
+    assert count == 2
+    with pytest.raises(IndexError, match="device_block_id"):
+        workspace.load_block_transfers([(0, 5, 6)], geometry=geometry)
+    with pytest.raises(IndexError, match="host_block_id"):
+        workspace.load_block_transfers([(1, 8, 3)], geometry=geometry)
+
+
 def test_geometry_bind_uploads_device_rows_once(host_transfer_contract):
     geometry = _sample_geometry(host_transfer_contract)
     device = torch.device("cpu")
@@ -180,6 +202,7 @@ def test_build_geometry_validates_row_shape_and_fields(host_transfer_contract):
         rows=((0, 0, 100, 96, 80, 0, 4, 40),),
         layer_slices=((0, 1),),
         group_packing=(4,),
+        host_group_packing=(4,),
         host_lcm_block_bytes=320,
         num_host_lcm_blocks=2,
         num_device_lcm_blocks=16,
@@ -240,6 +263,7 @@ def test_per_group_device_block_id_bounds_with_unequal_packing(host_transfer_con
         ),
         layer_slices=((0, 2),),
         group_packing=(4, 8),
+        host_group_packing=(4, 8),
         host_lcm_block_bytes=512,
         num_host_lcm_blocks=2,
         num_device_lcm_blocks=8,
@@ -729,6 +753,7 @@ def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
         ),
         layer_slices=((0, 2),),
         group_packing=(1, 1),
+        host_group_packing=(1, 1),
         host_lcm_block_bytes=6000,
         num_host_lcm_blocks=8,
         num_device_lcm_blocks=8,
@@ -1174,6 +1199,72 @@ def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
 
 
 @requires_cuda
+@pytest.mark.parametrize("backend", ["dma", "triton"])
+def test_round_trip_with_distinct_device_and_shared_host_packing(backend):
+    module = _load_host_transfer_contract_module()
+    geometry = module.build_host_transfer_geometry(
+        rows=(
+            (0, 0, 0, 40, 32, 0, 2, 32),
+            (1, 1, 0, 96, 80, 0, 1, 80),
+        ),
+        layer_slices=((0, 2),),
+        group_packing=(4, 1),
+        host_group_packing=(2, 1),
+        host_lcm_block_bytes=80,
+        num_host_lcm_blocks=2,
+        num_device_lcm_blocks=2,
+        num_device_buffers=2,
+    )
+    # History occupies parent 1 and State parent 2 in one shared Host buffer.
+    # The last history Device ID exceeds the Host ID bound for that group.
+    transfers = ((0, 1, 1), (0, 8, 2), (1, 2, 2))
+    initial = tuple(
+        torch.arange(size, dtype=torch.int64).remainder(251).to(torch.uint8)
+        for size in (360, 288)
+    )
+    buffers = tuple(value.cuda() for value in initial)
+    host = torch.zeros(160, dtype=torch.uint8, pin_memory=True)
+    workspace = module.HostTransferWorkspace()
+    count, _ = workspace.load_block_transfers(transfers, geometry=geometry)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        bound = geometry.bind(buffers[0].device, non_blocking=True)
+        workspace.commit_block_transfers(count, buffers[0].device, non_blocking=True)
+    for direction in ("d2h", "h2d"):
+        module.transfer_cache_blocks(
+            direction,
+            buffers,
+            host,
+            bound,
+            workspace,
+            stream,
+            num_blocks=count,
+            geometry_offset=0,
+            num_geometry_rows=2,
+            backend=backend,
+            grid_cap=2,
+            layer_ready_flags=None,
+        )
+        stream.synchronize()
+        if direction == "d2h":
+            expected_host = torch.zeros(160, dtype=torch.uint8)
+            expected_host[:32] = initial[0][40:72]
+            expected_host[32:64] = initial[0][320:352]
+            expected_host[80:160] = initial[1][192:272]
+            assert torch.equal(host, expected_host)
+            with torch.cuda.stream(stream):
+                for buffer in buffers:
+                    buffer.zero_()
+    expected = tuple(torch.zeros_like(value) for value in initial)
+    expected[0][40:72] = initial[0][40:72]
+    expected[0][320:352] = initial[0][320:352]
+    expected[1][192:272] = initial[1][192:272]
+    for actual, wanted in zip(buffers, expected, strict=True):
+        assert torch.equal(actual.cpu(), wanted)
+
+
+@requires_cuda
 def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
     module = _load_host_transfer_contract_module()
     geometry = module.build_host_transfer_geometry(
@@ -1185,6 +1276,7 @@ def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
         ),
         layer_slices=((0, 4),),
         group_packing=(2, 3),
+        host_group_packing=(2, 3),
         host_lcm_block_bytes=10028,
         num_host_lcm_blocks=2,
         num_device_lcm_blocks=4,
@@ -1320,6 +1412,7 @@ def test_layered_h2d_reuses_workspaces_after_delayed_flag_reset():
         ),
         layer_slices=((0, 1), (1, 0), (1, 1)),
         group_packing=(1,),
+        host_group_packing=(1,),
         host_lcm_block_bytes=16,
         num_host_lcm_blocks=8,
         num_device_lcm_blocks=4,

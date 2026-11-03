@@ -794,6 +794,9 @@ def gluon_mhc_pre_reduce_apply_gfx950(
 # ===-----------------------------------------------------------------------===#
 
 _POST_BLOCK_H = 512
+# Above 2048 tokens, post uses non-temporal (streaming) accesses for data it never reuses.
+# Smaller calls keep normal caching so the next pre-mapping reads the new streams from cache.
+_POST_STREAM_TOKENS = 2048
 
 
 def _mhc_post_metadata(grid, kernel, args):
@@ -818,13 +821,23 @@ def gluon_mhc_post_gfx950(
     HIDDEN_SIZE: gl.constexpr,
     BLOCK_H: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    STREAM: gl.constexpr,
 ):
     # One token per CTA keeps the 20 coefficients scalar (SMEM) loads, which
     # do not queue behind the vector stores; each lane moves eight contiguous
     # BF16 values (16-byte accesses).
-    token = gl.program_id(0)
+    if STREAM:
+        # Consecutive CTAs cover adjacent hidden blocks of one token,
+        # keeping active memory accesses contiguous.
+        hidden_blocks: gl.constexpr = (HIDDEN_SIZE + BLOCK_H - 1) // BLOCK_H
+        token = gl.program_id(0) // hidden_blocks
+        hidden_block = gl.program_id(0) % hidden_blocks
+    else:
+        token = gl.program_id(0)
+        hidden_block = gl.program_id(1)
+    cache: gl.constexpr = ".cs" if STREAM else ""
     layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
-    hidden = gl.program_id(1) * BLOCK_H + gl.arange(0, BLOCK_H, layout=layout)
+    hidden = hidden_block * BLOCK_H + gl.arange(0, BLOCK_H, layout=layout)
     mask = hidden < HIDDEN_SIZE
     p0 = gl.load(post + token * 4)
     p1 = gl.load(post + token * 4 + 1)
@@ -846,14 +859,20 @@ def gluon_mhc_post_gfx950(
     c13 = gl.load(comb + token * 16 + 13)
     c14 = gl.load(comb + token * 16 + 14)
     c15 = gl.load(comb + token * 16 + 15)
-    x = cdna4.buffer_load(hidden_states, token * HIDDEN_SIZE + hidden, mask=mask).to(
+    x = cdna4.buffer_load(
+        hidden_states, token * HIDDEN_SIZE + hidden, mask=mask, cache=cache
+    ).to(gl.float32)
+    base = token * (4 * HIDDEN_SIZE) + hidden
+    r0 = cdna4.buffer_load(residual, base, mask=mask, cache=cache).to(gl.float32)
+    r1 = cdna4.buffer_load(residual, base + HIDDEN_SIZE, mask=mask, cache=cache).to(
         gl.float32
     )
-    base = token * (4 * HIDDEN_SIZE) + hidden
-    r0 = cdna4.buffer_load(residual, base, mask=mask).to(gl.float32)
-    r1 = cdna4.buffer_load(residual, base + HIDDEN_SIZE, mask=mask).to(gl.float32)
-    r2 = cdna4.buffer_load(residual, base + 2 * HIDDEN_SIZE, mask=mask).to(gl.float32)
-    r3 = cdna4.buffer_load(residual, base + 3 * HIDDEN_SIZE, mask=mask).to(gl.float32)
+    r2 = cdna4.buffer_load(residual, base + 2 * HIDDEN_SIZE, mask=mask, cache=cache).to(
+        gl.float32
+    )
+    r3 = cdna4.buffer_load(residual, base + 3 * HIDDEN_SIZE, mask=mask, cache=cache).to(
+        gl.float32
+    )
     # Match portable FP32 rounding: post * x, then FMA for input streams 0..3.
     # comb is indexed [input stream, output stream].
     out0 = p0 * x
@@ -861,25 +880,31 @@ def gluon_mhc_post_gfx950(
     out0 = gl.fma(c4, r1, out0)
     out0 = gl.fma(c8, r2, out0)
     out0 = gl.fma(c12, r3, out0)
-    cdna4.buffer_store(out0.to(gl.bfloat16), out, base, mask=mask)
+    cdna4.buffer_store(out0.to(gl.bfloat16), out, base, mask=mask, cache=cache)
     out1 = p1 * x
     out1 = gl.fma(c1, r0, out1)
     out1 = gl.fma(c5, r1, out1)
     out1 = gl.fma(c9, r2, out1)
     out1 = gl.fma(c13, r3, out1)
-    cdna4.buffer_store(out1.to(gl.bfloat16), out, base + HIDDEN_SIZE, mask=mask)
+    cdna4.buffer_store(
+        out1.to(gl.bfloat16), out, base + HIDDEN_SIZE, mask=mask, cache=cache
+    )
     out2 = p2 * x
     out2 = gl.fma(c2, r0, out2)
     out2 = gl.fma(c6, r1, out2)
     out2 = gl.fma(c10, r2, out2)
     out2 = gl.fma(c14, r3, out2)
-    cdna4.buffer_store(out2.to(gl.bfloat16), out, base + 2 * HIDDEN_SIZE, mask=mask)
+    cdna4.buffer_store(
+        out2.to(gl.bfloat16), out, base + 2 * HIDDEN_SIZE, mask=mask, cache=cache
+    )
     out3 = p3 * x
     out3 = gl.fma(c3, r0, out3)
     out3 = gl.fma(c7, r1, out3)
     out3 = gl.fma(c11, r2, out3)
     out3 = gl.fma(c15, r3, out3)
-    cdna4.buffer_store(out3.to(gl.bfloat16), out, base + 3 * HIDDEN_SIZE, mask=mask)
+    cdna4.buffer_store(
+        out3.to(gl.bfloat16), out, base + 3 * HIDDEN_SIZE, mask=mask, cache=cache
+    )
 
 
 def launch_gluon_mhc_post_gfx950(
@@ -910,7 +935,12 @@ def launch_gluon_mhc_post_gfx950(
     out = torch.empty_like(residual)
     num_tokens = residual.numel() // (4 * hidden_size)
     if num_tokens:
-        gluon_mhc_post_gfx950[(num_tokens, triton.cdiv(hidden_size, _POST_BLOCK_H))](
+        hidden_blocks = triton.cdiv(hidden_size, _POST_BLOCK_H)
+        stream = num_tokens > _POST_STREAM_TOKENS
+        # The streaming grid is flat, so the token count is not bounded by
+        # the 65535 limit of the second grid dimension.
+        grid = (num_tokens * hidden_blocks,) if stream else (num_tokens, hidden_blocks)
+        gluon_mhc_post_gfx950[grid](
             hidden_states,
             residual,
             post,
@@ -920,6 +950,7 @@ def launch_gluon_mhc_post_gfx950(
             HIDDEN_SIZE=hidden_size,
             BLOCK_H=_POST_BLOCK_H,
             NUM_WARPS=_POST_BLOCK_H // 512,
+            STREAM=stream,
             num_warps=_POST_BLOCK_H // 512,
         )
     return out
@@ -1429,6 +1460,9 @@ def launch_gluon_mhc_mixes_gfx950(
         BLOCK_K=_MIXES_BLOCK_K,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
+        # Interleaving the four-wave tile's MFMAs with the next K tile's loads
+        # makes it faster from 65 to 1024 tokens.
+        **({"schedule_hint": "mfma-schedule"} if num_warps == 4 else {}),
     )
     # Splits sit in registers for prefill, and also spread over lanes (and
     # waves when there are few tokens) as the split count grows.

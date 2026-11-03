@@ -127,6 +127,15 @@ def select_qsa_sparse_attention_kernel(
     """
 
     query_width = 1 if max_seqlen_q is None else max_seqlen_q
+    supported_tma_gather_layout = False
+    if max_seqlen_q is None and sparse_metadata is not None:
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+            can_use_cute_dsl_tma_gather_qsa,
+        )
+
+        supported_tma_gather_layout = can_use_cute_dsl_tma_gather_qsa(
+            q, k_cache, v_cache, sparse_metadata
+        )
     traits = {
         "batch_size": q.shape[0] // query_width,
         "q_len": query_width,
@@ -152,6 +161,8 @@ def select_qsa_sparse_attention_kernel(
         "page_size": None if sparse_metadata is None else sparse_metadata.page_size,
         "scalar_scales": not isinstance(k_scale, torch.Tensor)
         and not isinstance(v_scale, torch.Tensor),
+        "unscaled_kv": k_scale is None and v_scale is None,
+        "supported_tma_gather_layout": supported_tma_gather_layout,
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     return select_kernel(
@@ -212,9 +223,10 @@ def qsa_sparse_attention(
         Attention output shaped
         ``[tokens, query_heads, value_head_dim]`` with the query dtype.
 
-    The SM100/SM103 CuTe DSL implementation is preferred when its specialization
-    matches a uniform decode. Other supported Blackwell BF16 inputs with logical
-    metadata use FlashInfer PrimTS QSA. Other supported NVIDIA inputs retain FA2.
+    The CuTe DSL implementation is preferred for supported uniform decode on
+    SM100/SM103/SM107. SM107 BF16 prefill with compatible logical metadata uses
+    TMA gather; SM100/SM103 use FlashInfer PrimTS QSA for supported BF16 inputs
+    with logical metadata. Other supported NVIDIA inputs retain FA2.
     GFX950 uses the Gluon kernel and other AMD GPUs the portable Triton kernel.
     Selection preserves prefill versus decode before adapting ragged inputs to
     independent one-token query rows.

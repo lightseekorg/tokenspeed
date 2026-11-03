@@ -80,7 +80,9 @@ def _scheduler(ts, make_config):
             enable_l3_storage=False,
             role="fused",
             num_snapshot_pages=1,
+            host_group_packing=(),
             max_retracted_requests=0,
+            host_write_policy="write_through",
             storage_config=None,
             cache_groups=groups,
         )
@@ -261,14 +263,11 @@ class TestGdnTokenLevelHitResumeTest:
 
     def test_the_repeat_resumes_from_the_published_prefill_state(self):
         mamba = self.mamba
-        decode_path = mamba._prepare_gdn_decode_state_path
+        from tokenspeed_kernel.selection import kernel_override
+
         with (
             patch.object(mamba, "gdn_chunk_prefill", self.triton_prefill),
-            patch.object(
-                mamba,
-                "_prepare_gdn_decode_state_path",
-                lambda *args: (*decode_path(*args)[:2], "triton"),
-            ),
+            kernel_override("attention", "gdn_decode_step", "triton"),
         ):
             self._computed = {}
             scheduler = _scheduler(self.ts, self.make_config)

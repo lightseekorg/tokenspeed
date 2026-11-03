@@ -10,7 +10,7 @@ runner:
     - tokenspeed-npu-arm64
 ut:
   commands:
-    - bash ci/npu_ops_test/run_step.sh accuracy "$NPU_CI_WORK"
-    - bash ci/npu_ops_test/run_step.sh performance "$NPU_CI_WORK"
+    - bash test/ci_system/npu/run_step.sh accuracy "$NPU_CI_WORK"
+    - bash test/ci_system/npu/run_step.sh performance "$NPU_CI_WORK"
 report:
   github_step_summary: true

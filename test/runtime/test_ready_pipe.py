@@ -97,39 +97,49 @@ def _fail_with_lingering_cleanup(finish_cleanup, writer):
     writer.close()
 
 
-def _engine_owns_failed_startup_cleanup(writer):
-    from tokenspeed.runtime.entrypoints.engine import Engine
+def _launcher_owns_failed_startup_cleanup(writer):
+    from tokenspeed.runtime.entrypoints import engine as engine_module
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
     finish_cleanup = mp.Event()
-    started = [
-        start_process_with_ready_pipe(_never_ready, (), contextlib.nullcontext()),
-        start_process_with_ready_pipe(
-            _fail_with_lingering_cleanup,
-            (finish_cleanup,),
-            contextlib.nullcontext(),
-        ),
-    ]
-    # The constructor's existing failure handler calls shutdown before its
-    # frontend has been installed. Bypass only model/network construction.
-    engine = Engine.__new__(Engine)
-    engine.llm = None
-    engine.tokenizer_manager = None
+    started = []
+
+    def start_without_model(server_args, port_args, metrics_relay, parent_death_signal):
+        # Replace GPU/model loading only: the launcher's ready wait and
+        # process-tree shutdown are the real implementation.
+        started.extend(
+            [
+                start_process_with_ready_pipe(
+                    _never_ready, (), contextlib.nullcontext()
+                ),
+                start_process_with_ready_pipe(
+                    _fail_with_lingering_cleanup,
+                    (finish_cleanup,),
+                    contextlib.nullcontext(),
+                ),
+            ]
+        )
+        return [proc for proc, _ in started], [reader for _, reader in started]
+
     try:
-        try:
-            receive_ready_messages(
-                [reader for _, reader in started], [proc for proc, _ in started]
-            )
-        except RuntimeError as exc:
-            engine.shutdown()
-            for proc, _ in started:
-                proc.join(_TIMEOUT_S)
-            writer.send(
-                {
-                    "error": str(exc),
-                    "alive": [proc.is_alive() for proc, _ in started],
-                    "exitcodes": [proc.exitcode for proc, _ in started],
-                }
-            )
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(engine_module, "_start_ranks", start_without_model)
+            try:
+                engine_module.launch_scheduler_headless(
+                    ServerArgs(
+                        model="unused", device="cpu", world_size=1, nprocs_per_node=1
+                    )
+                )
+            except RuntimeError as exc:
+                for proc, _ in started:
+                    proc.join(_TIMEOUT_S)
+                writer.send(
+                    {
+                        "error": str(exc),
+                        "alive": [proc.is_alive() for proc, _ in started],
+                        "exitcodes": [proc.exitcode for proc, _ in started],
+                    }
+                )
     finally:
         for proc, reader in started:
             if proc.is_alive():
@@ -237,13 +247,14 @@ class TestReadyPipe:
         assert not failed.is_alive()
         assert failed.exitcode == 0
 
-    def test_engine_failure_cleanup_reaps_workers(self, start_process) -> None:
-        supervisor, reader = start_process(_engine_owns_failed_startup_cleanup)
+    def test_launcher_failure_cleanup_reaps_workers(self, start_process) -> None:
+        supervisor, reader = start_process(_launcher_owns_failed_startup_cleanup)
         assert reader.poll(_TIMEOUT_S), "launcher failed to unwind startup"
         result = reader.recv()
         assert "Scheduler process 1" in result["error"]
         assert result["alive"] == [False, False]
-        assert result["exitcodes"] == [-signal.SIGKILL, -signal.SIGKILL]
+        # The launcher terminates its ranks before it kills what is left.
+        assert result["exitcodes"] == [-signal.SIGTERM, -signal.SIGTERM]
         supervisor.join(_TIMEOUT_S)
         assert supervisor.exitcode == 0
 

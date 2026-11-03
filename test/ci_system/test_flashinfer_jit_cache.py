@@ -25,13 +25,14 @@ def test_read_exact_pin_requires_exact_pin(tmp_path: Path):
         read_exact_pin(requirements, "flashinfer-python")
 
 
-def test_jit_cache_url_tracks_flashinfer_and_cuda_versions():
-    assert expected_jit_cache_version("0.6.18", "130") == "0.6.18+cu130"
+@pytest.mark.parametrize("version", ["0.6.18", "0.7.2.post1"])
+def test_jit_cache_url_tracks_flashinfer_and_cuda_versions(version):
+    assert expected_jit_cache_version(version, "130") == f"{version}+cu130"
     assert jit_cache_wheel_url(
-        "0.6.18", "130", platform_tag="manylinux_2_28_aarch64"
+        version, "130", platform_tag="manylinux_2_28_aarch64"
     ) == (
         "https://github.com/flashinfer-ai/flashinfer/releases/download/"
-        "v0.6.18/flashinfer_jit_cache-0.6.18+cu130-cp39-abi3-"
+        f"v{version}/flashinfer_jit_cache-{version}+cu130-cp39-abi3-"
         "manylinux_2_28_aarch64.whl"
     )
 

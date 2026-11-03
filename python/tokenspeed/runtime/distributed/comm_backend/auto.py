@@ -22,7 +22,8 @@
 
 Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
 backends are only selected for node-local groups; groups spanning nodes fall
-back to NCCL. ``AutoBackend.route`` is the one place that decides which
+back to NCCL, except for the Iris all-reduce on gfx1250, which maps a world in
+one fabric domain. ``AutoBackend.route`` is the one place that decides which
 implementation serves a collective; every public method asks it first.
 """
 
@@ -49,6 +50,9 @@ from tokenspeed.runtime.distributed.comm_backend.triton_rsag import TritonRSAGBa
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     MAX_ONESHOT_BYTES,
     TrtllmAllReduceBackend,
+)
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -121,6 +125,9 @@ class AutoBackend(CommBackend):
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
         # Projection fallbacks retain Auto's ordinary routing and numerics.
         self._projection = ProjectionBackend(fallback=self)
+        # Lamport token/channel-shard exchanges prepared by layers at build
+        # time (prepare_shard_exchange), keyed by (group, full channel width).
+        self._shard_exchanges: dict[tuple[Group, int], object] = {}
 
     @property
     def nccl(self) -> NcclBackend:
@@ -237,6 +244,31 @@ class AutoBackend(CommBackend):
             return False
         nprocs_per_node = mapping.nprocs_per_node
         return len({rank // nprocs_per_node for rank in group}) > 1
+
+    @staticmethod
+    def _iris_maps_world() -> bool | None:
+        """Whether the Iris heap, which spans the world, can map every rank.
+
+        Distributed initialization decides this on AMD; None before it does,
+        or off AMD, where the Iris module is never loaded.
+        """
+        if not current_platform().is_amd:
+            return None
+        from tokenspeed_kernel.ops.communication.iris import iris_maps_world
+
+        return iris_maps_world()
+
+    def _iris_reaches(self, group: Group) -> bool:
+        """Whether Iris may run over ``group``.
+
+        A world the heap cannot map keeps every group on NCCL. Groups spanning
+        nodes also need gfx1250 and a world known to be mapped; before that is
+        decided, only node-local groups qualify.
+        """
+        maps_world = self._iris_maps_world()
+        if not self._group_spans_nodes(group):
+            return maps_world is not False
+        return current_platform().is_cdna5 and maps_world is True
 
     @staticmethod
     def _multicast_reachable(group: Group) -> bool:
@@ -364,9 +396,7 @@ class AutoBackend(CommBackend):
             tensors = tensor
             if len(tensors) == 0:
                 raise ValueError("all-reduce requires at least one tensor")
-            use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
-                group
-            )
+            use_nccl = self._force_deterministic_rsag() or not self._iris_reaches(group)
             if (
                 not use_nccl
                 and current_platform().is_amd
@@ -407,10 +437,9 @@ class AutoBackend(CommBackend):
         # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by pattern, payload
         # bytes and the IPC kernel's strategy) inside _ar_fusion_workspace.
         #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
-        #   2. group spans nodes ................... NCCL
+        #   2. group Iris cannot map ............... NCCL
         #   3. producer-owned memory or Iris can run Iris
         #   4. otherwise ........................... NCCL
-        spans_nodes = self._group_spans_nodes(group)
         # trtllm_ar carries an mnnvl workspace that spans nodes; it is only
         # armed for a group when that succeeded, so has_trtllm_ar() is itself
         # the "usable here" test. Checking it before the cross-node NCCL
@@ -418,7 +447,7 @@ class AutoBackend(CommBackend):
         # the workspace is armed and never called.
         if self._trtllm_ar.has_trtllm_ar(group):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
-        if spans_nodes:
+        if not self._iris_reaches(group):
             return self._nccl.all_reduce(tensor, group, op=op)
         if self._iris.can_reduce_outputs((tensor,), group, op=op):
             # The producer wrote into acquired Iris symmetric memory, so the
@@ -456,12 +485,15 @@ class AutoBackend(CommBackend):
 
         Return None unless AMD uses a node-local tiered route without trtllm.
         """
-        # Same eligibility as the producer-direct all-reduce in _all_reduce_one.
+        # The fused mHC kernel runs only on gfx950, which keeps groups spanning
+        # nodes on NCCL. Like the producer-direct and gather paths below, it
+        # stays node-local even where the Iris all-reduce spans trays.
         if (
             not current_platform().is_amd
             or self.route(Collective.ALL_REDUCE, tensor, group) is not Route.TIERED
             or self._trtllm_ar.has_trtllm_ar(group)
             or self._group_spans_nodes(group)
+            or not self._iris_reaches(group)
         ):
             return None
         return self._iris.all_reduce_mhc_post(tensor, residual, post, comb, group)
@@ -477,7 +509,7 @@ class AutoBackend(CommBackend):
             or dtype != torch.bfloat16
             or self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or not self._iris_reaches(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         )
 
@@ -515,6 +547,7 @@ class AutoBackend(CommBackend):
             self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
             or self._group_spans_nodes(group)
+            or not self._iris_reaches(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return False
@@ -536,6 +569,7 @@ class AutoBackend(CommBackend):
             self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
             or self._group_spans_nodes(group)
+            or not self._iris_reaches(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
@@ -564,6 +598,7 @@ class AutoBackend(CommBackend):
             if (
                 current_platform().is_cdna4
                 and not self._group_spans_nodes(group)
+                and self._iris_reaches(group)
                 and not self._trtllm_ar.has_trtllm_ar(group)
             ):
                 return self._iris.all_gather(tensor, group, dim)
@@ -588,6 +623,62 @@ class AutoBackend(CommBackend):
         if self.route(Collective.REDUCE_SCATTER, tensor, group) is Route.ORDERED_FOLD:
             return self._ordered_fold_reduce_scatter(tensor, group)
         return self._nccl.reduce_scatter(tensor, group)
+
+    def prepare_shard_exchange(
+        self, group: Group, channels: int, max_rows: int, dtype: torch.dtype
+    ) -> bool:
+        # The Lamport exchange (tokenspeed_a2a_lamport): one NVLink hop per
+        # packet instead of NCCL's send/recv kernel, for the small decode
+        # exchanges of head / tensor parallel layouts. Pure data movement,
+        # every bit preserved, so no numerics envelope vetoes it.
+        world_size = len(group)
+        if (
+            not current_platform().is_nvidia
+            or dtype != torch.bfloat16
+            or world_size not in (2, 4, 8)
+            or channels % (2 * world_size)
+            or max_rows < 1
+            or 3 * max_rows * channels // 2 > 2**31 - 1
+            or self._group_spans_nodes(group)
+        ):
+            return False
+        prepared = self._shard_exchanges.get((group, channels))
+        if prepared is not None:
+            # Growing would move scratch that captured graphs hold.
+            return prepared.max_rows >= max_rows
+        from tokenspeed_kernel.ops.communication.cuda import TokenSpeedA2ALamportState
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self._shard_exchanges[(group, channels)] = TokenSpeedA2ALamportState(
+            pg_manager.get_device_process_group(group),
+            max_rows,
+            channels,
+            device,
+            min(128, sms),
+        )
+        return True
+
+    def try_shard_exchange(
+        self, tensor: torch.Tensor, group: Group, inverse: bool
+    ) -> torch.Tensor | None:
+        world_size = len(group)
+        rows = tensor.shape[0] // world_size if inverse else tensor.shape[0]
+        channels = tensor.shape[1] * world_size if inverse else tensor.shape[1]
+        state = self._shard_exchanges.get((group, channels))
+        # Only group-wide facts decide (preparation, rows, dtype): every rank
+        # takes the same path. Layout is fixed up locally.
+        if state is None or rows > state.max_rows or tensor.dtype != torch.bfloat16:
+            return None
+        from tokenspeed_kernel.ops.communication.cuda import tokenspeed_a2a_lamport
+
+        sent = tensor.contiguous()
+        if sent.data_ptr() % 16:
+            sent = sent.clone()
+        out = sent.new_empty(
+            (rows, channels) if inverse else (world_size * rows, channels // world_size)
+        )
+        return tokenspeed_a2a_lamport(state, sent, inverse=inverse, out=out)
 
     def all_to_all_single(
         self,

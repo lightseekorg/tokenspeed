@@ -28,6 +28,57 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 class TestNumericsMode:
+    def test_moe_cutlass_fused_finalize_defaults_on(self):
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        assert ServerArgs(model="x").moe_cutlass_fused_finalize
+        assert prepare_server_args(["--model", "x"]).moe_cutlass_fused_finalize
+        assert prepare_server_args(
+            ["--model", "x", "--moe-cutlass-fused-finalize"]
+        ).moe_cutlass_fused_finalize
+        assert not prepare_server_args(
+            ["--model", "x", "--no-moe-cutlass-fused-finalize"]
+        ).moe_cutlass_fused_finalize
+        assert ServerArgs(
+            model="x", moe_cutlass_fused_finalize=True
+        ).moe_cutlass_fused_finalize
+        assert not ServerArgs(
+            model="x", moe_cutlass_fused_finalize=False
+        ).moe_cutlass_fused_finalize
+
+    @pytest.mark.parametrize("fused_finalize", [False, True])
+    def test_moe_cutlass_fused_finalize_reaches_global_server_args(
+        self, fused_finalize
+    ):
+        from tokenspeed_kernel.platform import pdl_enabled
+
+        from tokenspeed.runtime.utils.env import (
+            global_server_args_dict,
+            global_server_args_dict_update,
+        )
+
+        original = global_server_args_dict.copy()
+        original_pdl = pdl_enabled()
+        try:
+            args = ServerArgs(model="x", moe_cutlass_fused_finalize=fused_finalize)
+            global_server_args_dict_update(args)
+            assert (
+                global_server_args_dict["moe_cutlass_fused_finalize"] is fused_finalize
+            )
+        finally:
+            pdl_enabled(original_pdl)
+            global_server_args_dict.clear()
+            global_server_args_dict.update(original)
+
+    @pytest.mark.parametrize("fused_finalize", [False, True])
+    def test_rl_bitwise_disables_moe_cutlass_fused_finalize(self, fused_finalize):
+        args = ServerArgs(
+            model="x",
+            numerics="rl-bitwise",
+            moe_cutlass_fused_finalize=fused_finalize,
+        )
+        assert not args.moe_cutlass_fused_finalize
+
     def test_auto_keeps_performance_defaults(self):
         args = ServerArgs(model="x")
         assert (args.numerics) == ("auto")
@@ -37,6 +88,7 @@ class TestNumericsMode:
 
     def test_rl_bitwise_tightens_every_switch(self):
         args = ServerArgs(model="x", numerics="rl-bitwise")
+        assert not args.moe_cutlass_fused_finalize
         # The envelope routes reductions itself (batch_invariant_collectives);
         # the NCCL-only knob stays the user's.
         assert not (args.force_deterministic_rsag)
@@ -84,6 +136,16 @@ class TestNumericsMode:
         args = ServerArgs(model="x", numerics="rl-bitwise", world_size=1)
         assert not (args.enable_allreduce_fusion)
 
+    def test_batch_invariant_collectives_vetoes_the_fused_all_reduce_norm(self):
+        args = ServerArgs(model="x", enable_allreduce_fusion=True)
+        assert args.enable_allreduce_fusion and args.comm_fusion_max_num_tokens > 0
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
+        args = ServerArgs(
+            model="x", batch_invariant_collectives=True, enable_allreduce_fusion=True
+        )
+        assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
+
     def test_unknown_mode_is_rejected(self):
         with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="bitwise")
@@ -105,6 +167,82 @@ class TestNumericsMode:
         with pytest.raises((ValueError), match=("--yarn-ramp-mask-device")):
             ServerArgs(model="x", yarn_ramp_mask_device="npu")
 
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    @pytest.mark.parametrize("ramp_device", [None, "cpu", "cuda"])
+    @pytest.mark.parametrize("frequency_device", [None, "cpu", "cuda"])
+    def test_yarn_devices_default_independently_and_fold_with_the_envelope(
+        self, numerics, ramp_device, frequency_device
+    ):
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        argv = [
+            "--model",
+            "x",
+            "--numerics",
+            numerics,
+        ]
+        devices = {}
+        if ramp_device is not None:
+            argv.extend(["--yarn-ramp-mask-device", ramp_device])
+            devices["yarn_ramp_mask_device"] = ramp_device
+        if frequency_device is not None:
+            argv.extend(["--yarn-frequency-device", frequency_device])
+            devices["yarn_frequency_device"] = frequency_device
+        cli_args = prepare_server_args(argv)
+        direct_args = ServerArgs(
+            model="x",
+            numerics=numerics,
+            **devices,
+        )
+        expected_ramp = "cpu" if numerics == "rl-bitwise" else ramp_device or "cuda"
+        expected_frequency = (
+            "cuda" if numerics == "rl-bitwise" else frequency_device or "cuda"
+        )
+        for args in (cli_args, direct_args):
+            assert args.yarn_ramp_mask_device == expected_ramp
+            assert args.yarn_frequency_device == expected_frequency
+
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    @pytest.mark.parametrize("device", [None, "npu"])
+    @pytest.mark.parametrize(
+        "field", ["yarn_ramp_mask_device", "yarn_frequency_device"]
+    )
+    def test_yarn_devices_reject_invalid_values(self, numerics, field, device):
+        with pytest.raises(ValueError, match="--" + field.replace("_", "-")):
+            ServerArgs(model="x", numerics=numerics, **{field: device})
+
+    def test_yarn_devices_reach_rope_launch_state(self):
+        from tokenspeed_kernel.platform import pdl_enabled
+
+        from tokenspeed.runtime.utils.env import (
+            global_server_args_dict,
+            global_server_args_dict_update,
+        )
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--numerics",
+                "rl-bitwise",
+                "--yarn-ramp-mask-device",
+                "cpu",
+                "--yarn-frequency-device",
+                "cpu",
+            ]
+        )
+        original = global_server_args_dict.copy()
+        original_pdl = pdl_enabled()
+        try:
+            global_server_args_dict_update(args)
+            assert global_server_args_dict["yarn_ramp_mask_device"] == "cpu"
+            assert global_server_args_dict["yarn_frequency_device"] == "cuda"
+        finally:
+            pdl_enabled(original_pdl)
+            global_server_args_dict.clear()
+            global_server_args_dict.update(original)
+
     def test_rl_bitwise_applies_the_mla_lora_scale_at_runtime(self):
         assert (ServerArgs(model="x").mla_lora_scale) == ("folded")
         assert (ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale) == (
@@ -118,11 +256,12 @@ class TestNumericsMode:
         assert (ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm) == (
             "unfused"
         )
-        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
         args = ServerArgs(
             model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
         )
         assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
         with pytest.raises((ValueError), match=("--layer-boundary-norm")):
             ServerArgs(model="x", layer_boundary_norm="half")
 
@@ -140,13 +279,26 @@ class TestNumericsMode:
         with pytest.raises((ValueError), match=("--logprob-order")):
             ServerArgs(model="x", logprob_order="apex")
 
-    def test_rl_bitwise_reduces_dsa_slots_sorted(self):
-        assert (ServerArgs(model="x").dsa_slot_order) == ("selection")
-        assert (ServerArgs(model="x", numerics="rl-bitwise").dsa_slot_order) == (
-            "sorted"
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    @pytest.mark.parametrize("order", [None, "selection", "sorted"])
+    def test_dsa_slot_order_resolution(self, numerics, order):
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        kwargs = {} if order is None else {"dsa_slot_order": order}
+        argv = ["--model", "x", "--numerics", numerics]
+        if order is not None:
+            argv.extend(["--dsa-slot-order", order])
+        expected = "selection" if numerics == "rl-bitwise" else order or "selection"
+        assert (
+            ServerArgs(model="x", numerics=numerics, **kwargs).dsa_slot_order
+            == expected
         )
-        with pytest.raises((ValueError), match=("--dsa-slot-order")):
-            ServerArgs(model="x", dsa_slot_order="shuffled")
+        assert prepare_server_args(argv).dsa_slot_order == expected
+
+    @pytest.mark.parametrize("numerics", ["auto", "rl-bitwise"])
+    def test_invalid_dsa_slot_order_is_rejected(self, numerics):
+        with pytest.raises(ValueError, match="--dsa-slot-order"):
+            ServerArgs(model="x", numerics=numerics, dsa_slot_order="shuffled")
 
     def test_rl_bitwise_combines_moe_slots_in_the_leaf(self):
         assert (ServerArgs(model="x").moe_combine_order) == ("rank")
@@ -164,29 +316,52 @@ class TestNumericsMode:
 
     def test_slot_combine_is_validated_against_the_launch_at_startup(self):
         # The slot fold runs over the EP group inside the leaf: a K-split down
-        # projection would need a second fold, and DeepEP owns the exchange.
+        # projection would need a second fold.
         ServerArgs(model="x", moe_combine_order="slot", world_size=2, ep_size=2)
         # MoE TP defaults to the stage world over EP, so world_size=2 alone
         # is MoE TP 2.
         with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", moe_combine_order="slot", world_size=2)
-        with pytest.raises((ValueError), match=("--all2all-backend deepep")):
-            ServerArgs(
-                model="x",
-                moe_combine_order="slot",
-                world_size=2,
-                ep_size=2,
-                all2all_backend="deepep",
-            )
+        # Under DeepEP the leaf owns the exchange; whether one declares both
+        # traits is the MoE plan's question, not the launch's.
+        args = ServerArgs(
+            model="x",
+            moe_combine_order="slot",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="auto",
+        )
+        assert not args.enforce_eager
         # The envelope inherits both refusals: rl-bitwise needs MoE TP 1.
         with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", numerics="rl-bitwise", world_size=2)
         ServerArgs(model="x", numerics="rl-bitwise", world_size=2, ep_size=2)
 
+    def test_deepep_normal_mode_runs_eager(self):
+        # The normal dispatch reads its receive counts on the host, so no
+        # decode graph can capture it; the low-latency legs keep the graphs.
+        normal = ServerArgs(
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="normal",
+        )
+        assert normal.enforce_eager
+        low_latency = ServerArgs(
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="low_latency",
+        )
+        assert not low_latency.enforce_eager
+
     def test_rl_bitwise_is_the_one_bitwise_envelope(self):
         from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
 
-        assert (NUMERICS_ENVELOPES) == (("auto", "rl-bitwise"))
+        assert {"auto", "rl-bitwise"} <= set(NUMERICS_ENVELOPES)
         with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="trainer-aligned")
 
@@ -196,7 +371,9 @@ class TestNumericsMode:
             NUMERICS_ENVELOPES,
         )
 
-        assert (BITWISE_ENVELOPES) == (set(NUMERICS_ENVELOPES) - {"auto"})
+        assert "rl-bitwise" in BITWISE_ENVELOPES
+        assert "auto" not in BITWISE_ENVELOPES
+        assert BITWISE_ENVELOPES <= set(NUMERICS_ENVELOPES)
 
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
@@ -270,7 +447,6 @@ class TestModelVerificationGate:
             cache_family="fixture_family",
             linear_attention=None,
             default_attention_backend=None,
-            default_prefix_granularity=None,
             request_token_history=False,
             is_multimodal=False,
             tokenizer_kwargs={},
@@ -434,6 +610,112 @@ class TestCanonicalGreedyTies:
         # Every slot is gathered for logprobs, accepted or not.
         assert bool((predict < vocab).all())
         assert torch.equal(predict.view(bs, n), logits.argmax(-1).view(bs, n).int())
+
+
+@pytest.fixture
+def registered_envelope():
+    from tokenspeed.runtime.plugins import ensure_loaded
+    from tokenspeed.runtime.plugins.registry import (
+        recording,
+        register_numerics_envelope,
+    )
+
+    ensure_loaded()
+
+    def resolve(args):
+        args.disable_tf32 = True
+
+    def validate(*, quantization, vocab_size):
+        if quantization != "fp8":
+            raise ValueError("fixture policy requires FP8")
+
+    class Rollback(Exception):
+        pass
+
+    try:
+        with recording():
+            register_numerics_envelope(
+                "fixture-bitwise", bitwise=True, resolve=resolve, validate=validate
+            )
+            yield "fixture-bitwise"
+            raise Rollback
+    except Rollback:
+        pass
+
+
+def test_registered_policy_uses_cli_and_its_own_resolver(registered_envelope):
+    import argparse
+
+    from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    args = ServerArgs.from_cli_args(
+        parser.parse_args(["--model", "x", "--numerics", registered_envelope])
+    )
+    assert args.numerics in BITWISE_ENVELOPES
+    assert args.disable_tf32
+    assert args.dsa_slot_order == "selection"
+    assert args.logprob_order == "torch"
+    assert not args.batch_invariant_collectives
+
+
+def test_registered_policy_keeps_profile_gate_and_owns_storage_checks(
+    registered_envelope,
+):
+    from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+    arguments = dict(architecture="Fixture", quantization="fp8", vocab_size=32000)
+    with pytest.raises(ValueError, match="has not been verified"):
+        require_verified_numerics(registered_envelope, model_profile=None, **arguments)
+    profile = TestModelVerificationGate()._profile({"auto", registered_envelope})
+    require_verified_numerics(registered_envelope, model_profile=profile, **arguments)
+    with pytest.raises(ValueError, match="requires FP8"):
+        require_verified_numerics(
+            registered_envelope,
+            model_profile=profile,
+            **{**arguments, "quantization": None},
+        )
+
+
+def test_failed_policy_registration_restores_imported_views():
+    from tokenspeed.runtime.configs.numerics import (
+        BITWISE_ENVELOPES,
+        NUMERICS_ENVELOPES,
+    )
+    from tokenspeed.runtime.plugins import ensure_loaded
+    from tokenspeed.runtime.plugins.registry import (
+        recording,
+        register_numerics_envelope,
+    )
+
+    ensure_loaded()
+    before_names = list(NUMERICS_ENVELOPES)
+    before_bitwise = set(BITWISE_ENVELOPES)
+
+    def resolve(args):
+        args.disable_tf32 = True
+
+    def validate(*, quantization, vocab_size):
+        if quantization != "fp8":
+            raise ValueError("requires FP8")
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        with recording():
+            register_numerics_envelope(
+                "fixture-rollback", bitwise=True, resolve=resolve, validate=validate
+            )
+            assert "fixture-rollback" in NUMERICS_ENVELOPES
+            assert "fixture-rollback" in BITWISE_ENVELOPES
+            with pytest.raises(ValueError, match="already registered"):
+                register_numerics_envelope(
+                    "fixture-rollback", bitwise=True, resolve=resolve, validate=validate
+                )
+            raise RuntimeError("registration failed")
+    assert NUMERICS_ENVELOPES == before_names
+    assert BITWISE_ENVELOPES == before_bitwise
+    with pytest.raises(ValueError, match="--numerics"):
+        ServerArgs(model="x", numerics="fixture-rollback")
 
 
 if __name__ == "__main__":

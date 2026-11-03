@@ -164,6 +164,7 @@ from tokenspeed.runtime.execution.types import (
     ModelExecutionResult,
     PlannedForward,
 )
+from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLoadSnapshot,
     get_global_expert_location_metadata,
@@ -276,6 +277,8 @@ class DeviceSpecs:
             (``cache/l2/sizing.py``); 1 (the null page alone) without a
             pool, when nothing can be imaged and a capacity-blocked round
             aborts a resident instead.
+        host_group_packing: Virtual children per compact Host parent, for
+            both Host tiers; independent of Device kernel strides.
         max_retracted_requests: Slot-state image rows of the snapshot pool,
             i.e. how many requests may be retracted at once; 0 without a
             pool.
@@ -297,6 +300,7 @@ class DeviceSpecs:
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
     num_snapshot_pages: int
+    host_group_packing: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
 
@@ -388,9 +392,11 @@ class DeviceHandle:
         *,
         host_cache_executor=None,
         kv_transfer=None,
+        weight_memory: WeightMemoryState | None = None,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
+        self._weight_memory = weight_memory
         # Resolved here, on the building thread, whose current device the
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
@@ -437,15 +443,17 @@ class DeviceHandle:
 
         The whole plan, explicitly ordered streams, in an order
         that IS the correctness argument for same-round page reuse: the
-        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: a
-        retraction image's two legs -- the stream-ordered L2 write-back of
-        the victim's hash-complete pages and the snapshot store of its tail
-        pages and slot state -- read pages this plan re-grants, so they ride
-        the write stream consecutively and ONE completion event fences the
-        forward thread's default stream before anything else of the plan is
-        enqueued; a pinned write-back -- an ordinary publication, whose
-        sources the scheduler holds until the ACK -- rides the write stream
-        and fences nothing), then the Device-to-Device block copies
+        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: the
+        stream-ordered ones -- a retraction image's two legs (the L2
+        write-back of the victim's hash-complete pages, the snapshot store of
+        its tail pages and slot state) and, under ``--kvstore-write-policy
+        write_back``, the L2 write-back of what the plan's admissions and
+        restores evicted -- read pages this plan re-grants, so they ride the
+        write stream consecutively and ONE completion event fences the forward
+        thread's default stream before anything else of the plan is enqueued;
+        a pinned write-back -- an ordinary publication under write-through,
+        whose sources the scheduler holds until the ACK -- rides the write
+        stream and fences nothing), then the Device-to-Device block copies
         (``pages_to_copy``: a prefix hit's private copy of the block holding
         its boundary, an owner's move off the block it just published; the
         source may be re-granted by this very plan, so the copy precedes the
@@ -485,6 +493,8 @@ class DeviceHandle:
             copy event, or None on rounds that run no batch — DP-idle, an
             empty plan, or a D-role round whose only work was the peer's.
         """
+        if planned is not None and self._weight_memory is not None:
+            self._weight_memory.require_usable()
         cache_ops = tuple(cache_ops)
         for operation in cache_ops:
             if not is_device_cache_op(operation):
@@ -519,8 +529,8 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
-        l2 = self._l2 if cache_ops else None
-        if l2 is not None:
+        l2 = self._l2
+        if l2 is not None and cache_ops:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
             # default stream the zeroing runs on, before the zeroing is
@@ -541,6 +551,12 @@ class DeviceHandle:
         if l2 is not None:
             # Behind the zeroing: the loads' destinations were zeroed on the
             # default stream, so that is the prerequisite they order after.
+            # Every plan makes the call, with a load or not: it points the
+            # layerwise load waits at this plan's load or at none, so neither
+            # an eager layer nor a prefill graph replay of this plan waits on
+            # an earlier plan's load. Without cache ops it enqueues nothing,
+            # and a draft round still pending from the previous forward began
+            # in that forward, behind the waits for that plan's load.
             l2.submit_load_backs(cache_ops, prerequisite_stream=executor.default_stream)
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,
@@ -672,6 +688,8 @@ class DeviceHandle:
         Args:
             dp_metadata: The round's CPU-gathered DP metadata.
         """
+        if self._weight_memory is not None:
+            self._weight_memory.require_usable()
         self.settle()
         self._executor.execute_idle_forward(dp_metadata)
 
@@ -729,6 +747,30 @@ class DeviceHandle:
         self._executor.device_module.synchronize()
         if self._kv_transfer is not None:
             self._kv_transfer.release_cache_registration()
+        if self._weight_memory is not None:
+            self._weight_memory.mark_kv_released()
+
+    def before_kv_resume(self) -> None:
+        """Keep KV unmapped while discarded or partially updated weights are invalid."""
+        if self._weight_memory is not None:
+            self._weight_memory.before_kv_resume()
+
+    def release_weights(self, adapter) -> None:
+        """Discard or back up weights only after device and KV work drained."""
+        self.synchronize()
+        operation = lambda: adapter.pause(tag="weights")
+        if self._weight_memory is None:
+            operation()
+        else:
+            self._weight_memory.release(operation)
+
+    def resume_weights(self, adapter) -> None:
+        """Remap storage and restore constants; discarded parameters stay invalid."""
+        operation = lambda: adapter.resume(tag="weights")
+        if self._weight_memory is None:
+            operation()
+        else:
+            self._weight_memory.resume(operation)
 
     def finish_kv_resume(self) -> None:
         """Repair the KV arena after a memory-saver wake re-maps its storage.
@@ -743,6 +785,8 @@ class DeviceHandle:
         self._executor.token_to_kv_pool.clear_kv_buffers()
         if self._kv_transfer is not None:
             self._kv_transfer.restore_cache_registration()
+        if self._weight_memory is not None:
+            self._weight_memory.mark_kv_resumed()
 
     def suspend_nccl(self) -> None:
         """Free the NCCL communicators' buffers; they stay usable after resume."""
@@ -876,6 +920,49 @@ class DeviceHandle:
             with allow_host_sync("expert placement chunk"):
                 executor.execution_stream.synchronize()
 
+    def check_weight_update(self, req) -> tuple[bool, str]:
+        """Check a weight load's local prerequisites without changing anything.
+
+        The control plane MIN-reduces this result over the replica before any
+        rank runs a loader, so a rank that would refuse never strands a ready
+        peer inside a loading collective, and a refusal leaves every rank's
+        weights untouched.
+
+        Args:
+            req: A weight-load request (disk, distributed or Mooncake).
+
+        Returns:
+            ``(ready, message)``; the message explains a refusal.
+
+        Raises:
+            TypeError: Not a weight-load request.
+        """
+        from tokenspeed.runtime.engine.io_struct import (
+            UpdateWeightFromDiskReqInput,
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        )
+
+        if type(req) not in (
+            UpdateWeightFromDiskReqInput,
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        ):
+            raise TypeError(f"unsupported weight-load request {type(req).__name__}")
+        state = self._weight_memory
+        if state is None:
+            return True, "ready for weight update"
+        if (
+            state.policy == "discard"
+            and type(req) is not UpdateWeightsFromMooncakeReqInput
+        ):
+            return False, "Discard policy requires a complete Model Updater SDK update"
+        try:
+            state.check_update()
+        except RuntimeError as exc:
+            return False, str(exc)
+        return True, "ready for weight update"
+
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
@@ -912,7 +999,9 @@ class DeviceHandle:
             ),
             UpdateWeightsFromMooncakeReqInput: (
                 lambda req: runner.update_weights_from_mooncake(
-                    req.version, self._mooncake_update_models()
+                    req.version,
+                    self._mooncake_update_models(),
+                    require_complete=require_complete,
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
@@ -927,10 +1016,35 @@ class DeviceHandle:
             UpdateWeightFromDiskReqInput,
         )
 
-        result = handler(req)
-        if loads_weights and result[0] and self._executor.drafter is not None:
-            self._executor.drafter.on_target_weights_updated()
-        return result
+        state = self._weight_memory
+        require_complete = False
+        if loads_weights:
+            # The control plane already agreed these prerequisites across the
+            # replica; re-checking keeps a direct caller from loading unchecked.
+            ready, message = self.check_weight_update(req)
+            if not ready:
+                return False, message
+            if state is not None:
+                require_complete = state.begin_update()
+        try:
+            result = handler(req)
+            if loads_weights and result[0] and self._executor.drafter is not None:
+                self._executor.drafter.on_target_weights_updated()
+            if loads_weights and state is not None:
+                state.finish_update(success=bool(result[0]))
+            return result
+        except Exception as exc:
+            # The reply carries only the message; keep the traceback that
+            # explains a failed (and, under the memory saver, poisoning) load.
+            logger.exception(f"weight operation {type(req).__name__} failed")
+            if loads_weights and state is not None and state.updating:
+                state.finish_update(success=False)
+            return False, str(exc)
+
+    def commit_weight_update(self, success: bool) -> None:
+        """Apply the replica-wide result before KV wake or another forward."""
+        if self._weight_memory is not None:
+            self._weight_memory.commit_update(success)
 
     def _mooncake_update_models(self) -> list:
         """The modules a Mooncake update streams into, target first.
@@ -978,7 +1092,7 @@ def start_expert_load_window(executor) -> None:
 
 
 def arm_data_plane_sync_debug(device: str) -> None:
-    """Arm torch's sync-debug mode for the serving phase when asked to.
+    """Arm torch's sync-debug mode for the serving phase; it cannot be off.
 
     Startup synchronizes on purpose -- weight loading, tuning, graph capture,
     the PD transfer and L2 executor builders, the EPD receive's NCCL
@@ -989,18 +1103,19 @@ def arm_data_plane_sync_debug(device: str) -> None:
     synchronization that serializes the data plane against the step in
     flight -- ``.cpu()``, ``.item()``, ``.tolist()``, ``bool(tensor)``,
     ``nonzero``, pageable host<->device copies, ``stream.synchronize()``.
+    ``TOKENSPEED_DATA_PLANE_SYNC_DEBUG`` picks whether a report warns or
+    raises.
     """
     mode = envs.TOKENSPEED_DATA_PLANE_SYNC_DEBUG.get()
-    if mode == "default":
-        return
     if mode not in ("warn", "error"):
         raise ValueError(
-            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be default, warn or error, got {mode!r}"
+            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be warn or error, got {mode!r}; "
+            "the data-plane sync check cannot be disabled"
         )
     if torch.device(device).type != "cuda":
-        logger.warning(
-            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG={mode!s} ignored on {device!s}: "
-            "sync-debug mode is a CUDA facility"
+        logger.info(
+            f"Data-plane sync check unavailable on {device!s}: sync-debug mode "
+            "is a CUDA facility"
         )
         return
     torch.cuda.set_sync_debug_mode(mode)
@@ -1133,6 +1248,7 @@ def _retraction_pool_request(
     server_args,
     contract,
     *,
+    host_group_packing,
     max_batch_size: int,
     max_context_len: int,
     decode_input_tokens: int,
@@ -1161,7 +1277,7 @@ def _retraction_pool_request(
         model = capacity_model(
             contract.group_specs,
             prefix_granularity=contract.prefix_granularity,
-            virtual_packing=contract.virtual_packing,
+            virtual_packing=host_group_packing,
             limits=SchedulerLimits(
                 role=scheduler_role(server_args.disaggregation_mode),
                 max_live_requests=max_batch_size,
@@ -1435,9 +1551,34 @@ def build_device_side(
     # executor lists, so it is built after it.
     host_cache_executor = None
     host_cache = None
+    host_tail_packing = {}
+    if server_args.enable_kvstore:
+        from tokenspeed.runtime.cache.host_storage import compute_host_group_packing
+        from tokenspeed.runtime.cache.transfer.layout import (
+            combine_cache_transfer_layouts,
+        )
+
+        contract = views.token_to_kv_pool.arena.runtime_contract
+        layout = combine_cache_transfer_layouts(
+            views.token_to_kv_pool.cache_transfer_layout(),
+            (
+                views.draft_token_to_kv_pool.cache_transfer_layout()
+                if views.draft_token_to_kv_pool is not None
+                else None
+            ),
+            group_ids=tuple(spec.group_id for spec in contract.group_specs),
+        )
+        shards = {spec.group_id: spec.shard_count for spec in contract.group_specs}
+        host_tail_packing = {
+            group.group_id: packing * shards[group.group_id]
+            for group, packing in zip(
+                layout.groups, compute_host_group_packing(layout), strict=True
+            )
+        }
     snapshot_pool = _retraction_pool_request(
         server_args,
         views.token_to_kv_pool.arena.runtime_contract,
+        host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
         max_context_len=model_config.context_len + server_args.spec_context_pad,
         decode_input_tokens=decode_input_tokens,
@@ -1483,6 +1624,12 @@ def build_device_side(
             memory_plan=views.token_to_kv_pool.arena.plan,
             attention_backend_name=attention.attention_backend_name,
             draft_attention_backend_name=attention.draft_attention_backend_name,
+            checkpoint_granularities=tuple(
+                (spec.group_id, spec.checkpoint_granularity)
+                for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
+                if spec.checkpoint_granularity is not None
+                and spec.checkpoint_granularity > 1
+            ),
         )
 
     kv_transfer = kv_transfer_builder(
@@ -1532,6 +1679,11 @@ def build_device_side(
             if host_cache_executor is not None
             else 1
         ),
+        host_group_packing=(
+            host_cache_executor.host_group_packing
+            if host_cache_executor is not None
+            else ()
+        ),
         max_retracted_requests=(
             host_cache_executor.max_retracted_requests
             if host_cache_executor is not None
@@ -1547,6 +1699,18 @@ def build_device_side(
     def encoder_model_facts() -> EncoderModelFacts:
         return EncoderModelFacts.from_model(target.model, device=executor.device)
 
+    weight_memory = None
+    if server_args.enable_memory_saver:
+        update_models = [target.model]
+        if (
+            server_args.model_update_draft_weights == "refresh"
+            and executor.draft_model_runner is not None
+        ):
+            update_models.append(executor.draft_model_runner.model)
+        weight_memory = WeightMemoryState(
+            policy=server_args.weight_memory_policy, models=update_models
+        )
+
     return DeviceBuild(
         host_cache=host_cache,
         specs=specs,
@@ -1556,6 +1720,7 @@ def build_device_side(
             executor,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
+            weight_memory=weight_memory,
         ),
     )
 

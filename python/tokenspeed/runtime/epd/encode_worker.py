@@ -21,11 +21,10 @@
 """The request an EPD encode server's ranks take: one multimodal item to
 embed and ship to the prefill ranks that wait for it.
 
-The encode server's frontend (``AsyncLLM.submit_encode``, driven by the
-gateway's encode servicer) pushes it to the encode ranks, whose host
-(``ts-host`` in encode mode, ``epd/encode_host.py``) relays, batches and
-ships it; this module only defines the wire struct, which the servicer
-imports by this path.
+The encode server's frontend sends it to the first encode rank over the
+connection that rank dialed; the ranks' host (``ts-host`` in encode mode,
+``epd/encode_host.py``) relays, batches and ships it. This module only
+defines the wire struct.
 """
 
 from __future__ import annotations

@@ -28,7 +28,6 @@ server:
     --moe-backend flashinfer_trtllm
     --enable-prefix-caching
     --disable-kvstore
-    --block-size 128
     --speculative-algorithm MTP
     --speculative-num-steps 3
     --speculative-eagle-topk 1

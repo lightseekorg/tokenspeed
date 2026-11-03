@@ -457,11 +457,102 @@ def test_dsv41_index_topk_table_width():
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("with_candidates", [False, True])
+@pytest.mark.parametrize("sort_positions", [False, True])
+def test_dsv41_finish_selection_width(with_candidates, sort_positions):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    scores = torch.ones((2, 128), device=DEVICE)
+    scores[:, 3] = -torch.inf
+    lengths = torch.tensor([64, 128], dtype=torch.int32, device=DEVICE)
+    candidates = torch.arange(15, -1, -1, dtype=torch.int32, device=DEVICE)
+    candidates = candidates.repeat(2, 1)
+    candidates[:, 2] = -1
+
+    def run(k):
+        indices = torch.arange(k - 1, -1, -1, dtype=torch.int32, device=DEVICE)
+        indices = indices.repeat(2, 1)
+        valid = (indices < lengths[:, None]) & (indices != 3)
+        positions = indices
+        if with_candidates:
+            blocks = candidates.gather(1, (indices // 8).long())
+            positions = blocks * 8 + indices % 8
+            valid &= (blocks >= 0) & (positions < 121)
+        expected = torch.where(valid, positions, torch.iinfo(torch.int32).max)
+        if sort_positions:
+            expected = expected.sort(dim=1).values
+        expected = torch.where(expected == torch.iinfo(torch.int32).max, -1, expected)
+        actual = implementation.finish_selection(
+            indices,
+            scores,
+            lengths,
+            candidates if with_candidates else None,
+            121,
+            8,
+            sort_positions,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    run(65)
+    with assert_no_triton_compile(implementation._finish_selection):
+        for k in (72, 80, 96, 104, 112, 127):
+            run(k)
+
+
+@pytest.mark.parametrize("with_candidates", [False, True])
+def test_dsv41_write_selection_width(with_candidates):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    def run(k, c):
+        selected = torch.arange(k, dtype=torch.int32, device=DEVICE).repeat(2, 1)
+        selected[0, ::2] = -1
+        selected[1, 1::3] = -1
+        candidates = None
+        if with_candidates:
+            candidates = torch.arange(c, dtype=torch.int32, device=DEVICE)
+            candidates = candidates.repeat(2, 1)
+            candidates[0, ::3] = -1
+            candidates[1, 1::4] = -1
+        rows = torch.full((2, k), -2, dtype=torch.int32, device=DEVICE)
+        lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        blocks = torch.full((2, c), -2, dtype=torch.int32, device=DEVICE)
+        block_lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        implementation.write_selection(
+            selected, candidates, (rows, lengths, blocks, block_lengths)
+        )
+        torch.testing.assert_close(rows, selected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            lengths, (selected >= 0).sum(1).to(torch.int32), rtol=0, atol=0
+        )
+        if with_candidates:
+            sentinel = torch.iinfo(torch.int32).max
+            expected = torch.where(candidates >= 0, candidates, sentinel)
+            expected = expected.sort(dim=1).values
+            expected = torch.where(expected == sentinel, -1, expected)
+            torch.testing.assert_close(blocks, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                block_lengths,
+                (candidates >= 0).sum(1).to(torch.int32),
+                rtol=0,
+                atol=0,
+            )
+        else:
+            torch.testing.assert_close(
+                block_lengths, torch.zeros_like(block_lengths), rtol=0, atol=0
+            )
+
+    run(65, 65 if with_candidates else 0)
+    with assert_no_triton_compile(implementation._write_selection):
+        for k in (72, 80, 96, 104, 112, 127):
+            run(k, k if with_candidates else 0)
+
+
 def test_dsv41_page_table_geometry():
-    """The dsv41 address kernels take the page table's rows, columns and
-    strides as runtime scalars. Rows follow the batch and columns the longest
-    request, so a lone request (one row, which Triton otherwise folds into a
-    constant) or a width crossing a multiple of 16 must not recompile."""
+    """The dsv41 address kernels take the page table's rows, columns,
+    strides and pool capacity as runtime scalars. Rows follow the batch and
+    columns the longest request, so a lone request (one row, which Triton
+    otherwise folds into a constant) or a width crossing a multiple of 16
+    must not recompile."""
     from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41
     from tokenspeed_kernel.ops.attention.mla._triton import page_table
 
@@ -472,7 +563,7 @@ def test_dsv41_page_table_geometry():
     selected = (torch.arange(48, device=DEVICE, dtype=torch.int32) * 7 % 70).view(8, 6)
     n = positions.numel()
 
-    def run(rows, cols, col_stride):
+    def run(rows, cols, col_stride, pages):
         table = torch.full(
             (rows, cols * col_stride), -1, dtype=torch.int32, device=DEVICE
         )
@@ -483,7 +574,7 @@ def test_dsv41_page_table_geometry():
             torch.empty((n, 128), dtype=torch.int32, device=DEVICE),
             torch.empty(n, dtype=torch.int32, device=DEVICE),
         )
-        dsv41.decode_window(positions, requests, *window, table, 8)
+        dsv41.decode_window(positions, requests, *window, table, pages)
         compressor = tuple(
             torch.empty(n, dtype=dtype, device=DEVICE)
             for dtype in (
@@ -495,19 +586,19 @@ def test_dsv41_page_table_geometry():
                 torch.int64,
             )
         )
-        dsv41.compressor_metadata(positions, requests, table, 8, *compressor)
+        dsv41.compressor_metadata(positions, requests, table, pages, *compressor)
         selection, lengths = dsv41.selection_table(positions, requests, table, 4)
         assert (selection[:, 4:] == -1).all()
         return (
-            page_table.bounded_group_slots(positions, requests, table, 64, 1, 1, 8),
-            dsv41.global_slots(selected, positions, requests, table, 4, 8),
+            page_table.bounded_group_slots(positions, requests, table, 64, 1, 1, pages),
+            dsv41.global_slots(selected, positions, requests, table, 4, pages),
             selection[:, :4],
             lengths,
             *window,
             *compressor,
         )
 
-    expected = run(3, 8, 1)
+    expected = run(3, 8, 1, 8)
     # Pages 3, 1, 7 hold columns 0-2; column 4 is padding and resolves to -1.
     assert expected[0][[1, 3, 4, 6]].tolist() == [197, 64, 450, -1]
     with assert_no_triton_compile(
@@ -517,15 +608,17 @@ def test_dsv41_page_table_geometry():
         dsv41._decode_window_kernel,
         dsv41._compressor_metadata,
     ):
-        for rows, cols, col_stride in (
-            (1, 4, 1),
-            (1, 16, 1),
-            (2, 33, 1),
-            (16, 1024, 1),
-            (17, 129, 2),
-            (1, 6, 2),
+        for rows, cols, col_stride, pages in (
+            (1, 4, 1, 9),
+            (1, 16, 1, 16),
+            (2, 33, 1, 17),
+            (16, 1024, 1, 32),
+            (17, 129, 2, 33),
+            (1, 6, 2, 1024),
         ):
-            for got, want in zip(run(rows, cols, col_stride), expected, strict=True):
+            for got, want in zip(
+                run(rows, cols, col_stride, pages), expected, strict=True
+            ):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
@@ -1191,6 +1284,53 @@ def test_qrita_top_k_top_p_row_count():
     with assert_no_triton_compile(topk_topp._top_k_top_p_qrita_gumbel_kernel):
         for rows in (5, 6, 7, 9, 12, 130, 131):
             run(rows)
+
+
+def test_top_k_top_p_gumbel_request_count_and_top_k():
+    from tokenspeed_kernel.ops.sampling.triton import topk_topp
+
+    # The serving verify layout: four rows per request, 1024-token blocks and
+    # the CUDA-graph pad of 128. Each row's top_k is read from the pool.
+    vocab, n, block_size, top_k_pad, pools = 5000, 4, 1024, 128, 8
+    num_candidates = -(-vocab // block_size) * top_k_pad
+    greedy = torch.ones(pools, dtype=torch.int32, device=DEVICE)
+    mixed = torch.tensor([1, 20, 128, 1, 7, 1, 64, 1], dtype=torch.int32, device=DEVICE)
+
+    def run(requests, top_k_pool):
+        rows = requests * n
+        logits = torch.randn(rows, vocab, device=DEVICE) * 2.0
+        req_pool_indices = torch.arange(requests, dtype=torch.int32, device=DEVICE)
+        req_pool_indices %= pools
+        got = topk_topp.gumbel_sample_top_k_top_p_from_pools(
+            logits,
+            req_pool_indices,
+            torch.ones(pools, device=DEVICE),
+            top_k_pool,
+            torch.ones(pools, device=DEVICE),
+            torch.arange(pools, dtype=torch.int64, device=DEVICE),
+            torch.zeros(pools, dtype=torch.int64, device=DEVICE),
+            torch.empty(rows, num_candidates, dtype=torch.int32, device=DEVICE),
+            torch.empty(rows, num_candidates, dtype=torch.float32, device=DEVICE),
+            torch.empty(rows, dtype=torch.int32, device=DEVICE),
+            block_size=block_size,
+            top_k_pad=top_k_pad,
+            num_tokens_per_req=n,
+        )
+        # Top-k of one leaves only the argmax to sample.
+        greedy_rows = (top_k_pool[req_pool_indices.long()] == 1).repeat_interleave(n)
+        torch.testing.assert_close(
+            got[greedy_rows], logits.argmax(-1).int()[greedy_rows], rtol=0, atol=0
+        )
+
+    for requests in (1, 16, 3):
+        run(requests, greedy)
+    with assert_no_triton_compile(
+        topk_topp._top_k_top_p_candidates_stage1_kernel,
+        topk_topp._top_k_top_p_gumbel_stage2_kernel,
+    ):
+        for requests in (2, 5, 8, 9, 16, 33):
+            for top_k_pool in (greedy, mixed):
+                run(requests, top_k_pool)
 
 
 def test_marlin_deepep_pack_global_token_count():

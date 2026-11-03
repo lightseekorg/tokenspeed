@@ -41,6 +41,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
                 setattr(self, name, kwargs[name])
         self.rope_parameters = kwargs.get("rope_scaling", {})
         super().__init__(**kwargs)
+        self.expert_dtype: str | None = kwargs.get("expert_dtype")
         # These are architectural facts, not V4 defaults: V4.1 has learned,
         # ungrouped routing in every layer and no hash-routed MoE layers.
         self.num_hash_layers = 0

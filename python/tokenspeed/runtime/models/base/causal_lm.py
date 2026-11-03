@@ -47,26 +47,54 @@ from tokenspeed.runtime.utils import add_prefix
 
 
 def _record_loaded_names(load_weights: Callable) -> Callable:
-    """Record the parameter names a ``load_weights`` override returns and,
-    inside a session, screen the stream for KV-cache scales other than one."""
+    """Track physical parameter writes and the canonical source stream.
+
+    A delegating override and its ``super()`` loader share one stream. Only
+    the outermost wrapper checks source names; inner loaders may rename them
+    to fused or rank-local parameter names before loading.
+    """
 
     @functools.wraps(load_weights)
     def wrapper(self: BaseCausalLM, *args: Any, **kwargs: Any) -> Any:
-        rejected = self._weight_update_non_unit_kv_scales
-        if rejected is not None:
-            # The session owns the stream contract whoever drives the calls
-            # (the trainer's NCCL receive loop, the Model Updater SDK), so the
-            # check lives here rather than at each caller.
-            if args:
-                args = (record_non_unit_kv_scales(args[0], rejected), *args[1:])
-            else:
-                kwargs["weights"] = record_non_unit_kv_scales(
-                    kwargs["weights"], rejected
-                )
-        loaded = load_weights(self, *args, **kwargs)
-        if isinstance(loaded, set):
-            self.record_loaded_weights(loaded)
-        return loaded
+        depth = self._weight_update_load_depth
+        self._weight_update_load_depth = depth + 1
+        checked_stream = None
+        try:
+            if depth == 0:
+                rejected = self._weight_update_non_unit_kv_scales
+                complete = self._weight_update_required_names is not None
+                if rejected is not None or complete:
+                    weights = args[0] if args else kwargs["weights"]
+                    if complete:
+                        weights = self._record_weight_update_sources(weights)
+                    if rejected is not None:
+                        weights = record_non_unit_kv_scales(weights, rejected)
+                    weights = iter(weights)
+                    if complete:
+                        checked_stream = weights
+                    if args:
+                        args = (weights, *args[1:])
+                    else:
+                        kwargs["weights"] = weights
+            loaded = load_weights(self, *args, **kwargs)
+            if checked_stream is not None:
+                # Receiving every required name is not sufficient if a loader
+                # returned early and left part of its input unconsumed.
+                sentinel = object()
+                if next(checked_stream, sentinel) is not sentinel:
+                    raise ValueError(
+                        f"{type(self).__name__}: load_weights did not consume "
+                        "the complete checkpoint stream"
+                    )
+            if isinstance(loaded, set):
+                self.record_loaded_weights(loaded)
+            return loaded
+        except BaseException:
+            if self._weight_update_required_names is not None:
+                self._weight_update_load_failed = True
+            raise
+        finally:
+            self._weight_update_load_depth = depth
 
     return wrapper
 
@@ -115,6 +143,13 @@ class BaseCausalLM(nn.Module):
     its end (``end_weight_update``), the check the initial load applies to
     the checkpoint, whoever drives the ``load_weights`` calls.
 
+    A complete session also checks the canonical source names consumed by
+    the outermost loader against ``required_weight_update_names``. Every
+    required source must arrive exactly once; the session validates all
+    models before any post-load derivation. The model declares discard
+    support separately and lists its non-checkpoint preserved tensors in
+    ``weight_discard_preserved_tensors``.
+
     The session fields are class-level defaults so a subclass that builds
     itself without ``BaseCausalLM.__init__`` (the speculative drafts) still
     takes part in sessions.
@@ -127,6 +162,11 @@ class BaseCausalLM(nn.Module):
     # refuses the placement flags for a model that does not, so a placement
     # is never installed only to be ignored.
     supports_expert_placement: ClassVar[bool] = False
+    # Opt in only when complete checkpoint loading and non-parameter state
+    # restoration are both defined for this model.
+    supports_weight_discard: ClassVar[bool] = False
+    # Opt in only when ``self.model`` returns the taps ``layers_to_capture`` names (EAGLE3, DFLASH).
+    supports_aux_capture: ClassVar[bool] = False
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
@@ -159,6 +199,12 @@ class BaseCausalLM(nn.Module):
     # calls (KV caches are written and read at unit scale); None outside a
     # session, where the loader screens the checkpoint itself.
     _weight_update_non_unit_kv_scales: list[str] | None = None
+    # Canonical checkpoint names, distinct from the physical parameter names
+    # above. Complete sessions require each source exactly once.
+    _weight_update_required_names: set[str] | None = None
+    _weight_update_source_names: set[str] | None = None
+    _weight_update_load_failed: bool = False
+    _weight_update_load_depth: int = 0
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -187,6 +233,10 @@ class BaseCausalLM(nn.Module):
         self._weight_update_loaded_names = None
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = None
+        self._weight_update_required_names = None
+        self._weight_update_source_names = None
+        self._weight_update_load_failed = False
+        self._weight_update_load_depth = 0
 
         self.encoder_only = encoder_only
         if encoder_only:
@@ -268,8 +318,17 @@ class BaseCausalLM(nn.Module):
     def post_init(self) -> None:
         """Hook for subclasses that need derived state after shared modules exist."""
 
+    def require_aux_capture(self) -> None:
+        """Refuse a capture request this model's forward would silently ignore."""
+        if not self.supports_aux_capture:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not return aux hidden states, so "
+                "EAGLE3 and DFLASH drafts cannot attach to it"
+            )
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
 
+        self.require_aux_capture()
         self.capture_aux_hidden_states = True
 
         if layer_ids is None:
@@ -292,6 +351,7 @@ class BaseCausalLM(nn.Module):
         a ``ctx.target_capture_sink``; otherwise they are only collected.
         """
 
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
@@ -437,6 +497,61 @@ class BaseCausalLM(nn.Module):
 
     # Live weight updates (see the class docstring).
 
+    def required_weight_update_names(self) -> set[str]:
+        """Canonical checkpoint names required for a complete model update.
+
+        Models that support discarding weights return their rank-local source
+        contract, excluding aliases loaded by another model in the session.
+        These names precede any loader renaming or fused-parameter mapping.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support complete weight updates"
+        )
+
+    def weight_discard_preserved_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Non-checkpoint tensors that must survive discarded weight storage.
+
+        An opted-in model lists only immutable state that cannot be rebuilt
+        from the new weights. Model parameters and reconstructible derived
+        tensors must not be retained as a CPU weight backup.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support weight discard"
+        )
+
+    def _record_weight_update_sources(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        required = self._weight_update_required_names
+        received = self._weight_update_source_names
+        assert required is not None and received is not None
+        for name, tensor in weights:
+            if name not in required:
+                raise ValueError(
+                    f"{type(self).__name__}: unexpected checkpoint weight {name!r}"
+                )
+            if name in received:
+                raise ValueError(
+                    f"{type(self).__name__}: duplicate checkpoint weight {name!r}"
+                )
+            received.add(name)
+            yield name, tensor
+
+    def _validate_weight_update_complete(self) -> None:
+        required = self._weight_update_required_names
+        if required is None:
+            return
+        if self._weight_update_load_failed:
+            raise ValueError(
+                f"{type(self).__name__}: a complete weight update failed while loading"
+            )
+        assert self._weight_update_source_names is not None
+        missing = required - self._weight_update_source_names
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__}: missing checkpoint weights: {sorted(missing)}"
+            )
+
     def begin_weight_update(self) -> None:
         """Enter a live weight-update session.
 
@@ -451,6 +566,10 @@ class BaseCausalLM(nn.Module):
         self._weight_update_loaded_names = set()
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = []
+        self._weight_update_required_names = None
+        self._weight_update_source_names = None
+        self._weight_update_load_failed = False
+        self._weight_update_load_depth = 0
 
     def end_weight_update(self) -> None:
         """Leave the session and run the deferred derivation once.
@@ -471,6 +590,11 @@ class BaseCausalLM(nn.Module):
             raise RuntimeError(
                 f"{type(self).__name__}: no weight-update session is active"
             )
+        try:
+            self._validate_weight_update_complete()
+        except BaseException:
+            self.abort_weight_update()
+            raise
         # Leave the session first: the ``post_load_weights`` wrapper defers
         # only while one is active.
         self._weight_update_active = False
@@ -494,6 +618,10 @@ class BaseCausalLM(nn.Module):
         self._weight_update_loaded_names = None
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = None
+        self._weight_update_required_names = None
+        self._weight_update_source_names = None
+        self._weight_update_load_failed = False
+        self._weight_update_load_depth = 0
 
     def record_loaded_weights(self, names: Iterable[str]) -> None:
         """Remember which parameters this session's ``load_weights`` touched.

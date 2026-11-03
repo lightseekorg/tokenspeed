@@ -31,6 +31,7 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed.runtime.layers.attention import backends
 from tokenspeed.runtime.layers.attention.backends.paged import ascend_dsa
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
+from tokenspeed.runtime.layers.attention.dcp import ascend as ascend_dcp
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
@@ -99,7 +100,7 @@ def cpu_metadata_operator(monkeypatch):
             local, owned = resolve_cache_slots(k["slots"], placement)
             k["local_slots"].copy_(torch.where(owned, local, -1))
 
-    monkeypatch.setattr(ascend_dsa, "ascend_dsa_cp_metadata", reference)
+    monkeypatch.setattr(ascend_dcp, "ascend_dsa_cp_metadata", reference)
 
 
 def test_ascend_backend_reuses_the_common_dsa_base():
@@ -113,13 +114,37 @@ def test_both_dsa_modules_are_imported():
     assert _BACKEND_REGISTRY["dsa"][1] is expected
 
 
+@pytest.mark.skipif(not current_platform().is_npu, reason="Ascend RMSNorm kernel")
+@pytest.mark.parametrize("epsilon", [1e-5, 3e-4])
+def test_index_key_normalization_uses_checkpoint_epsilon(epsilon):
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAIndexer
+
+    config = PretrainedConfig(
+        index_n_heads=8,
+        index_head_dim=128,
+        index_use_rope=False,
+        rms_norm_eps=epsilon,
+    )
+    indexer = AscendDSAIndexer(config, hidden_size=64, q_lora_rank=32)
+    norm = indexer.k_norm.to(device="npu", dtype=torch.bfloat16)
+    # Small keys make epsilon material, so a hardcoded default cannot pass.
+    key = torch.linspace(-0.003, 0.003, 4 * 128).reshape(4, 128).bfloat16()
+    expected = torch.nn.functional.rms_norm(
+        key.float(), (128,), torch.ones(128), eps=epsilon
+    ).bfloat16()
+    actual = norm(key.npu()).cpu()
+    torch.testing.assert_close(actual, expected, rtol=2**-7, atol=2**-14)
+
+
 def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     spec = KernelRegistry.get().get_by_name("ascend_composite_mla_prologue")
     assert spec is not None
     assert spec.capability.vendors == frozenset({"ascend"})
     assert spec.traits["expanded"] == frozenset({False, True})
     assert spec.traits["kv_format"] == frozenset({"native"})
-    assert spec.traits["store"] == frozenset({True})
+    assert spec.traits["store"] == frozenset({False, True})
 
 
 @pytest.mark.parametrize(
@@ -185,7 +210,7 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missin
 
 
 def test_dsa_slots_share_the_metadata_refresh():
-    dcp = ascend_dsa._AscendDSAContextParallel(
+    dcp = ascend_dcp.AscendDCPMetadata(
         degree=8,
         rank=1,
         ranks=tuple(range(8)),
@@ -277,7 +302,7 @@ def test_indexer_writes_only_its_own_cache_after_mla_prologue():
 
 def test_each_candidate_keeps_its_own_local_page_prefix():
     table = torch.tensor([[1, 2, 3]] * 4, dtype=torch.int32)
-    dcp = ascend_dsa._AscendDSAContextParallel(
+    dcp = ascend_dcp.AscendDCPMetadata(
         virtual_block_count=8,
         degree=8,
         rank=1,
@@ -300,7 +325,7 @@ def test_each_candidate_keeps_its_own_local_page_prefix():
 
 
 def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
-    dcp = ascend_dsa._AscendDSAContextParallel(
+    dcp = ascend_dcp.AscendDCPMetadata(
         virtual_block_count=17,
         degree=8,
         rank=1,
@@ -356,7 +381,7 @@ def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
 
 
 def test_decode_metadata_storage_is_stable_across_batch_sizes():
-    dcp = ascend_dsa._AscendDSAContextParallel(
+    dcp = ascend_dcp.AscendDCPMetadata(
         degree=1,
         rank=0,
         ranks=(0,),
@@ -375,7 +400,7 @@ def test_decode_metadata_storage_is_stable_across_batch_sizes():
 def test_large_prefill_does_not_replace_decode_metadata_buffers(
     prefill_rows, prefill_columns
 ):
-    dcp = ascend_dsa._AscendDSAContextParallel(
+    dcp = ascend_dcp.AscendDCPMetadata(
         degree=8,
         rank=0,
         ranks=tuple(range(8)),
@@ -434,7 +459,7 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             block_size, virtual_count, tuple(range(degree)), rank
         )
         cache = torch.full((3 * block_size, 1, 8), -99.0)
-        dcp = ascend_dsa._AscendDSAContextParallel(
+        dcp = ascend_dcp.AscendDCPMetadata(
             degree=degree,
             rank=rank,
             ranks=tuple(range(degree)),
@@ -532,42 +557,6 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             torch.testing.assert_close(
                 cache[addresses, 0, 0], torch.tensor(expected, dtype=torch.float32)
             )
-
-
-@pytest.mark.parametrize("degree", [1, 8])
-def test_prefill_uses_global_query_visibility_before_dcp_compaction(degree):
-    records = []
-    backend = SimpleNamespace(
-        _validate_logit_cap=lambda cap: None,
-        _dcp=SimpleNamespace(degree=degree),
-        forward_prefill_metadata=SimpleNamespace(
-            cum_extend_seq_lens=torch.tensor([0, 3, 5]),
-            seq_lens=torch.tensor([130, 257]),
-            page_table=torch.tensor([[9, 2, 0], [8, 1, 10]], dtype=torch.int32),
-        ),
-        _select_indexed=lambda *args, **kw: records.append((args, kw)),
-        _run_indexed_sparse_attention=lambda *args, **kw: None,
-    )
-    ascend_dsa.AscendDSABackend.forward_extend(
-        backend,
-        torch.zeros(5, 1, 8),
-        None,
-        None,
-        SimpleNamespace(logit_cap=0),
-        torch.arange(5),
-        None,
-        2,
-        fused=False,
-    )
-    args, options = records[0]
-    assert options["context_parallel"] == (degree > 1)
-    if degree > 1:
-        assert args[5].tolist() == [1, 2, 3, 4, 5]
-        assert args[6].tolist() == [128, 129, 130, 256, 257]
-        assert args[7].tolist() == [[9, 2, 0]] * 3 + [[8, 1, 10]] * 2
-    else:
-        assert args[5].tolist() == [3, 5]
-        assert args[6].tolist() == [130, 257]
 
 
 @pytest.mark.parametrize("width", [2, 4, 8])
@@ -696,7 +685,7 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
     initial, local = 130, 129
     records = []
 
-    class Dcp(ascend_dsa._AscendDSAContextParallel):
+    class Dcp(ascend_dcp.AscendDCPMetadata):
         def refresh_metadata(
             self,
             *,
@@ -1344,3 +1333,57 @@ def test_ordinary_selection_rejects_fused_prolog_query(monkeypatch):
             context_parallel=True,
             query_width=8,
         )
+
+
+@pytest.mark.parametrize("width", [1, 8, 9])
+@pytest.mark.parametrize("page,block", [(64, 128), (128, 128), (128, 256)])
+def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(width, page, block):
+    owner = ascend_dcp.AscendDCPMetadata(
+        degree=8, rank=1, ranks=tuple(range(8)), virtual_block_count=19
+    )
+    owner.allocate_decode_buffers(3 * width, 4, "cpu")
+    table = torch.tensor([[1, 2, 3, 4], [2, 3, 4, 5], [0, 0, 0, 0]], dtype=torch.int32)
+    lengths = torch.tensor([page + 3, 3 * page - 1, width], dtype=torch.int32)
+    placement = CachePlacement(block, 19, tuple(range(8)), 1)
+    # Authoritative router slots include null, foreign, owned and invalid IDs.
+    locations = torch.tensor(
+        [0, block, 2 * block + 3, 19 * block, -1] * width, dtype=torch.int64
+    )
+
+    def prepare():
+        owner.prepare_metadata(
+            seq_lens=lengths,
+            page_table=table,
+            page_size=page,
+            block_granularity=block,
+            init_tokens=0,
+            local_tokens=0,
+            query_width=width,
+            query_group_size=width,
+            slots=None,
+        )
+
+    prepare()
+    reference, live = resolve_cache_slots(locations, placement)
+    expected = torch.where(live, reference, -1)
+    local = owner.metadata(start=0, end=3 * width)
+    address = local.page_table.data_ptr()
+    assert torch.count_nonzero(local.seq_lens[-width:]) == 0
+    slots = owner.prepare_write_slots(locations, placement)
+    torch.testing.assert_close(slots, expected, atol=0, rtol=0)
+    for _ in range(4):
+        assert owner.prepare_write_slots(locations.view(-1), placement) is slots
+        assert owner.metadata(start=0, end=3 * width).page_table.data_ptr() == address
+    # Next step overwrites the same router/input storage; no stale metadata or
+    # ownership mask can escape the step invalidation.
+    owner.clear_forward_metadata()
+    table.zero_()
+    locations.fill_(2 * block + 7)
+    lengths.fill_(width)
+    prepare()
+    assert owner.page_table.data_ptr() == address
+    assert torch.count_nonzero(owner.seq_lens) == 0
+    slots = owner.prepare_write_slots(locations, placement)
+    torch.testing.assert_close(
+        slots, torch.full_like(locations, block + 7), atol=0, rtol=0
+    )

@@ -25,16 +25,22 @@ from itertools import accumulate
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.kda import kda_delta_rule, kda_gate
-from utils import is_cdna4, is_cdna5
+from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda import prefill as _prefill
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
         launch_gluon_kda_paged_prefill_gfx950 as launch_kda_prefill,
     )
+
+    _ARCH = "gfx950"
 elif is_cdna5():
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda import prefill as _prefill
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.prefill import (
         launch_gluon_kda_paged_prefill_gfx1250 as launch_kda_prefill,
     )
+
+    _ARCH = "gfx1250"
 else:
     pytest.skip(
         "AMD CDNA4 or CDNA5 is required for Gluon KDA tests", allow_module_level=True
@@ -67,28 +73,48 @@ def _reference_sequence(
     )
 
 
-@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize(
+    ("time_split", "lower_bound", "dtype"),
+    [
+        (False, -5.0, torch.bfloat16),
+        (False, None, torch.bfloat16),
+        (False, -5.0, torch.float16),
+        (True, -5.0, torch.bfloat16),
+    ],
+    ids=["chunk_edges", "chunk_edges_unbounded", "chunk_edges_float16", "time_split"],
+)
 def test_kda_prefill_matches_packed_recurrent_reference(
+    time_split: bool,
     lower_bound: float | None,
+    dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Few long sequences are split in time. Their gates decay slowly so that
+    # the state handed between time groups stays visible in the output.
     torch.manual_seed(31)
-    lengths = [0, 1, 15, 16, 17, 63, 64, 65]
+    lengths = [1700, 1600] if time_split else [0, 1, 15, 16, 17, 63, 64, 65]
     total_tokens = sum(lengths)
     heads = 2
     dim = 128
-    q = torch.randn(1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, total_tokens, heads, dim, device="cuda", dtype=dtype)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     raw_g = torch.randn_like(q)
-    beta = torch.randn(1, total_tokens, heads, device="cuda", dtype=torch.bfloat16)
+    beta = torch.randn(1, total_tokens, heads, device="cuda", dtype=dtype)
     initial_state = torch.randn(
         len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
     )
-    a_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0
-    dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+    if time_split:
+        a_log = torch.full((heads,), 0.5, device="cuda", dtype=torch.float32)
+        dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+        dt_bias = dt_bias * 2.0 - 7.0
+    else:
+        a_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0
+        dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
     cu_seqlens = torch.tensor(
         [0, *accumulate(lengths)], device="cuda", dtype=torch.int32
     )
+    cu_seqlens_cpu = cu_seqlens.cpu().long() if time_split else None
 
     expected_outputs = []
     expected_states = []
@@ -109,6 +135,14 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         expected_outputs.append(output)
         expected_states.append(state)
 
+    planned_groups = []
+    scan_groups = _prefill._scan_groups
+
+    def record_groups(*args: int) -> int:
+        planned_groups.append(scan_groups(*args))
+        return planned_groups[-1]
+
+    monkeypatch.setattr(_prefill, "_scan_groups", record_groups)
     actual_output, actual_state = launch_kda_prefill(
         q,
         k,
@@ -120,7 +154,9 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
+    assert (planned_groups[-1] > 1) == time_split, planned_groups
 
     torch.testing.assert_close(
         actual_output[0].float(),
@@ -128,12 +164,56 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         atol=2e-3,
         rtol=2e-2,
     )
+    # A slowly decaying state grows larger, and so does its bf16 rounding.
     torch.testing.assert_close(
         actual_state,
         torch.stack(expected_states),
-        atol=4e-3,
+        atol=1.5e-2 if time_split else 4e-3,
         rtol=2e-2,
     )
     assert actual_state.dtype == torch.float32
     assert actual_state.shape == (len(lengths), heads, dim, dim)
     assert actual_state.stride()[-2:] == (dim, 1)
+
+
+def test_kda_prefill_new_batches_reuse_compiled_kernels() -> None:
+    torch.manual_seed(41)
+    heads = 2
+    dim = 128
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0
+    dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+
+    def run(lengths: list[int]) -> None:
+        total_tokens = sum(lengths)
+        q = torch.randn(
+            1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16
+        )
+        cu_seqlens_cpu = torch.tensor([0, *accumulate(lengths)], dtype=torch.int64)
+        launch_kda_prefill(
+            q,
+            torch.randn_like(q),
+            torch.randn_like(q),
+            torch.randn_like(q),
+            torch.randn(1, total_tokens, heads, device="cuda", dtype=torch.bfloat16),
+            a_log,
+            dt_bias,
+            initial_state=torch.zeros(
+                len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
+            ),
+            cu_seqlens=cu_seqlens_cpu.cuda(),
+            lower_bound=-5.0,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+        )
+
+    kernels = [
+        getattr(_prefill, f"gluon_kda_paged_prefill_{stage}_{_ARCH}")
+        for stage in ("prepare", "state_walk", "group_summary", "chain_groups")
+    ]
+    run([0, 1, 15, 16, 17, 63, 64, 65])
+    run([1700, 1600])
+    # New token, chunk, sequence and time-group counts in the same block
+    # buckets. The last batch takes 16 time groups, a multiple of 16, which
+    # Triton would otherwise compile separately.
+    with assert_no_triton_compile(*kernels):
+        for lengths in ([5, 70, 200], [2100, 2000], [4200, 4100]):
+            run(lengths)

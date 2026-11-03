@@ -105,6 +105,26 @@ fn single(payload: Vec<Bytes>) -> ZmqMessage {
 /// Start an engine that dials `handshake_address` as engine `index`,
 /// reporting attention-DP rank `dp_rank` of `dp_size`.
 pub fn start(handshake_address: &str, index: u16, dp_rank: i64, dp_size: i64) -> FakeEngine {
+    start_as(handshake_address, index, dp_rank, dp_size, Role::Scheduler)
+}
+
+/// What a fake engine registers as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// A scheduler, which takes add, abort and control requests.
+    Scheduler,
+    /// An EPD encode server, which takes encode requests only.
+    Encoder,
+}
+
+/// [`start`] as `role`.
+pub fn start_as(
+    handshake_address: &str,
+    index: u16,
+    dp_rank: i64,
+    dp_size: i64,
+    role: Role,
+) -> FakeEngine {
     let (received_tx, received) = mpsc::unbounded_channel();
     let (kill, kill_rx) = mpsc::unbounded_channel();
     let handshake_address = handshake_address.to_owned();
@@ -114,6 +134,7 @@ pub fn start(handshake_address: &str, index: u16, dp_rank: i64, dp_size: i64) ->
             index,
             dp_rank,
             dp_size,
+            role,
             received_tx,
             kill_rx,
         )
@@ -131,6 +152,7 @@ async fn run(
     index: u16,
     dp_rank: i64,
     dp_size: i64,
+    role: Role,
     received: mpsc::UnboundedSender<EngineRequest>,
     mut kill: mpsc::UnboundedReceiver<()>,
 ) {
@@ -141,6 +163,7 @@ async fn run(
         local: Some(true),
         headless: Some(true),
         parallel_config_hash: None,
+        engine_count: None,
     };
     handshake.send(single(encode_frames(&hello))).await.unwrap();
     let init = handshake.recv().await.unwrap().into_vec();
@@ -153,12 +176,16 @@ async fn run(
 
     let mut input = DealerSocket::with_options(options(index));
     input.connect(&init.addresses.inputs[0]).await.unwrap();
-    let registration = EngineCoreReadyResponse {
+    let mut registration = EngineCoreReadyResponse {
         max_model_len: 4096,
         data_parallel_size: dp_size,
         data_parallel_rank: dp_rank,
         ..Default::default()
     };
+    match role {
+        Role::Scheduler => registration.declare_scheduler(),
+        Role::Encoder => registration.declare_encoder(),
+    }
     input
         .send(single(encode_frames(&registration)))
         .await
@@ -197,6 +224,7 @@ async fn run(
                         finished.then_some("length"),
                         prompt,
                         &running,
+                        request.return_logprob,
                     );
                     output.send(single(batch)).await.unwrap();
                 }
@@ -204,7 +232,7 @@ async fn run(
             EngineRequest::Abort(rids) => {
                 for rid in rids {
                     if running.remove(&rid) {
-                        let batch = step(index, &rid, 2, Some("abort"), 0, &running);
+                        let batch = step(index, &rid, 2, Some("abort"), 0, &running, false);
                         output.send(single(batch)).await.unwrap();
                     }
                 }
@@ -233,6 +261,8 @@ async fn run(
                     .await
                     .unwrap();
             }
+            // Recorded above; nothing answers them.
+            EngineRequest::Call(_) | EngineRequest::Encode(_) => {}
         }
     }
 }
@@ -244,6 +274,7 @@ fn step(
     finish: Option<&str>,
     prompt: i64,
     running: &HashSet<String>,
+    return_logprob: bool,
 ) -> Vec<Bytes> {
     let token = 1000 * i32::from(index) + k as i32;
     EngineOutput::Batch(Box::new(BatchTokenIDOutSlim {
@@ -257,13 +288,23 @@ fn step(
         prompt_tokens: vec![prompt],
         completion_tokens: vec![k],
         cached_tokens: vec![0],
-        output_token_logprobs_val: vec![vec![]],
-        output_token_logprobs_idx: vec![vec![]],
+        output_token_logprobs_val: vec![if return_logprob {
+            vec![-(k as f64) / 10.0]
+        } else {
+            vec![]
+        }],
+        output_token_logprobs_idx: vec![if return_logprob { vec![token] } else { vec![] }],
+        output_token_cumulative_probs_val: if return_logprob {
+            vec![vec![k as f64 / 10.0]]
+        } else {
+            vec![]
+        },
         engine_index: i64::from(index),
         num_running: running.len() as i64,
         num_waiting: 0,
         kv_active_pages: 0,
         kv_total_pages: 100,
+        kv_used_pages: 7,
         finish_reason_details: vec![None],
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],

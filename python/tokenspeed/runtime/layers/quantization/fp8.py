@@ -43,12 +43,10 @@ class Fp8Config(QuantizationConfig):
     weight_scale_dtype = torch.float32
 
     # Keep GDN BA (including fused QKVZBA), conv and Mamba projections floating.
-    # Grouped wo_a preprocessing requires serialized weights/scales.
     ONLINE_IGNORED_LAYERS = [
         "re:.*conv1d.*",
         r"re:.*\.in_proj_(a|b|ba|qkvzba)$",
         r"re:.*\.mixer\.(in_proj|out_proj).*",
-        "re:.*wo_a.*",
     ]
 
     def __init__(

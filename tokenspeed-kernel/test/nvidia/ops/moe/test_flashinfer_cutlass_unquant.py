@@ -74,7 +74,7 @@ def test_wrapper_never_enables_pdl(monkeypatch) -> None:
     monkeypatch.setattr(cutlass_unquant, "cutlass_fused_moe", fake_cutlass_fused_moe)
     x = torch.zeros(2, 8, dtype=torch.bfloat16, device="cuda")
     cutlass_unquant.flashinfer_cutlass_unquant_moe_apply(
-        {},
+        {"cutlass_fused_finalize": False},
         x,
         SimpleNamespace(
             w13_weight=torch.zeros(4, 16, 8, dtype=torch.bfloat16, device="cuda"),
@@ -121,7 +121,7 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
 
     def apply(tokens: int) -> None:
         cutlass_unquant.flashinfer_cutlass_unquant_moe_apply(
-            {},
+            {"cutlass_fused_finalize": False},
             torch.zeros(tokens, hidden, dtype=torch.bfloat16, device=device),
             layer,
             None,
@@ -141,6 +141,7 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
             ep_size=ep_size,
             ep_rank=1,
             device=device,
+            use_fused_finalize=False,
         )
 
     apply(16)
@@ -181,6 +182,17 @@ def _reference(x, ids, weights, w13, w2, first_expert):
     )
 
 
+class _MoEWeights(torch.nn.Module):
+    def __init__(self, w13, w2, ep_size: int, ep_rank: int) -> None:
+        super().__init__()
+        self.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.tp_size = 1
+        self.tp_rank = 0
+
+
 @pytest.mark.parametrize("ep_rank", [0, 1])
 def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
     _requires_flashinfer_hopper()
@@ -218,6 +230,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         features=frozenset(),
         solution="flashinfer_cutlass",
     )
+    assert plan["cutlass_fused_finalize"] is True
     reference_w13 = w13.clone()
     layer = SimpleNamespace(
         w13_weight=torch.nn.Parameter(w13, requires_grad=False),
@@ -249,3 +262,82 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         )
         assert torch.isfinite(out).all()
         torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("fused_finalize", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ep_partial_finalize_matches_reference(
+    use_cuda_graph: bool, fused_finalize: bool, dtype: torch.dtype
+) -> None:
+    _requires_flashinfer_hopper()
+
+    torch.manual_seed(123)
+    device = "cuda"
+    num_experts, ep_size, ep_rank = 64, 8, 1
+    hidden, inter, top_k, tokens = 512, 512, 18, 13
+    local = num_experts // ep_size
+    w13 = (torch.randn(local, 2 * inter, hidden, device=device) * 0.02).to(dtype)
+    w2 = (torch.randn(local, hidden, inter, device=device) * 0.02).to(dtype)
+    x = torch.randn(tokens, hidden, device=device).to(dtype)
+    ids = torch.arange(top_k, device=device, dtype=torch.int32).expand(tokens, -1)
+    ids = (ids + ep_rank * local) % num_experts
+    weights = torch.rand(tokens, top_k, device=device)
+    weights /= weights.sum(dim=-1, keepdim=True)
+
+    plan = kernel_moe_plan(
+        "unquant",
+        input_dtype=dtype,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=ep_size,
+        ispp=inter,
+        hidden=hidden,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        internal_activation_dtype="input",
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+        solution="flashinfer_cutlass",
+    )
+    if not fused_finalize:
+        plan["cutlass_fused_finalize"] = False
+    reference_w13 = w13.clone()
+    layer = _MoEWeights(w13, w2, ep_size, ep_rank)
+    kernel_moe_process_weights(plan, layer)
+    expected = _reference(
+        x, ids, weights, reference_w13, w2, first_expert=ep_rank * local
+    )
+
+    def apply():
+        return kernel_moe_apply(
+            plan,
+            x,
+            layer,
+            None,
+            topk_weights=weights,
+            topk_ids=ids,
+            num_tokens_global=tokens,
+            max_num_tokens_per_gpu=tokens,
+        )
+
+    if use_cuda_graph:
+        apply()  # Allocate the persistent workspace before graph capture.
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_out = apply()
+        outputs = []
+        for _ in range(10):
+            graph.replay()
+            outputs.append(captured_out.clone())
+    else:
+        outputs = [apply().clone() for _ in range(10)]
+
+    for out in outputs:
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out.float(), expected, atol=1e-3, rtol=1e-2)
+    if not fused_finalize:
+        assert all(torch.equal(outputs[0], out) for out in outputs[1:])

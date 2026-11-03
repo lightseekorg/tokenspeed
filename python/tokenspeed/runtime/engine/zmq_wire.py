@@ -75,6 +75,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from tokenspeed.runtime.multimodal.mrope_facts import mrope_facts
 
 # Single-byte request-type frame: sent as a raw ZMQ frame ahead of the msgpack
 # payload so the receiver can dispatch without decoding first.
@@ -162,6 +163,24 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_events_config: dict | None = None
+    # The request types the engine takes and the field order of the
+    # positional structs it decodes and emits; the host fills both
+    # (``ts-wire``'s ``declare_scheduler`` / ``declare_encoder``).
+    request_types: list[str] = msgspec.field(default_factory=list)
+    positional_layouts: dict[str, list[str]] = msgspec.field(default_factory=dict)
+    # The engine's role, and where a prefill or encode engine's bootstrap
+    # server listens: the rendezvous a frontend puts on its requests.
+    disaggregation_mode: str | None = None
+    bootstrap_host: str | None = None
+    bootstrap_port: int | None = None
+    # Checkpoint facts a frontend computes multimodal items' MRoPE positions
+    # from (``multimodal/mrope_facts.py``'s ``mrope_facts``).
+    model_type: str | None = None
+    architectures: list[str] = msgspec.field(default_factory=list)
+    mrope_positions: bool | None = None
+    spatial_merge_size: int | None = None
+    image_token_id: int | None = None
+    video_token_id: int | None = None
 
 
 _ENC = msgspec.msgpack.Encoder()
@@ -292,6 +311,16 @@ def _tokenspeed_version() -> str:
         return "unknown"
 
 
+def _model_facts(hf_config) -> dict:
+    """The ready response's checkpoint facts: what a frontend reads to
+    compute multimodal items' MRoPE positions."""
+    return {
+        "model_type": getattr(hf_config, "model_type", None),
+        "architectures": list(getattr(hf_config, "architectures", None) or []),
+        **mrope_facts(hf_config),
+    }
+
+
 def engine_ready_response(
     *,
     server_args,
@@ -303,8 +332,10 @@ def engine_ready_response(
     attn_tp_size: int,
     dp_rank: int,
     kv_cache_size_tokens: int,
+    bootstrap: tuple[str, int] | None,
 ) -> WireEngineCoreReadyResponse:
-    """The ready response an engine rank registers with.
+    """The ready response an engine rank registers with. The host declares
+    the request types and positional layouts on top.
 
     Args:
         server_args: The resolved server arguments.
@@ -316,7 +347,10 @@ def engine_ready_response(
         attn_tp_size: Attention-TP ranks.
         dp_rank: This rank's attention-DP rank.
         kv_cache_size_tokens: The tokens the cache admits.
+        bootstrap: A prefill engine's KV bootstrap server, ``(host, port)``;
+            None for the other roles.
     """
+    host, port = bootstrap if bootstrap is not None else (None, None)
     return WireEngineCoreReadyResponse(
         max_model_len=model_config.context_len,
         num_gpu_blocks=geometry.num_device_pages,
@@ -335,4 +369,34 @@ def engine_ready_response(
         max_num_batched_tokens=max(0, server_args.chunked_prefill_size),
         instance_id=server_args.served_model_name or server_args.model,
         kv_cache_size_tokens=kv_cache_size_tokens,
+        disaggregation_mode=server_args.disaggregation_mode,
+        bootstrap_host=host,
+        bootstrap_port=port,
+        **_model_facts(model_config.hf_config),
+    )
+
+
+def encode_ready_response(
+    *, server_args, hf_config, dtype, bootstrap: tuple[str, int]
+) -> WireEngineCoreReadyResponse:
+    """The ready response an EPD encode server's first rank registers with:
+    no scheduler, no KV cache. The host declares it an encoder.
+
+    Args:
+        server_args: The resolved server arguments.
+        hf_config: The checkpoint's config.
+        dtype: The vision tower's dtype.
+        bootstrap: The encode server's bootstrap server, ``(host, port)``,
+            which the prefill ranks ask for their embeddings.
+    """
+    host, port = bootstrap
+    return WireEngineCoreReadyResponse(
+        dtype=wire_dtype(dtype),
+        multimodal_encoder_dtype=wire_dtype(dtype),
+        vllm_version=f"tokenspeed-{_tokenspeed_version()}",
+        instance_id=server_args.served_model_name or server_args.model,
+        disaggregation_mode="encode",
+        bootstrap_host=host,
+        bootstrap_port=port,
+        **_model_facts(hf_config),
     )

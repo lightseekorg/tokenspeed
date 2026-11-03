@@ -145,6 +145,12 @@ class DFlash(BaseDrafter):
 
         self.device = torch.device(draft_model_runner.device)
         self.model = draft_model_runner.model
+        # Bound by wire_target.
+        self.target_model: torch.nn.Module | None = None
+        self.target_language_model: torch.nn.Module | None = None
+        self.embed_tokens: torch.nn.Module | None = None
+        self.lm_head: torch.nn.Module | None = None
+        self.logits_processor: torch.nn.Module | None = None
         self.attention_kind = getattr(self.model, "attention_kind", "qwen_mha")
 
         cfg = self.model.config
@@ -1258,7 +1264,7 @@ class DFlash(BaseDrafter):
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
-        if not hasattr(self, "target_model"):
+        if self.target_model is None:
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
         # The same gate prepare_target_forward armed the incremental

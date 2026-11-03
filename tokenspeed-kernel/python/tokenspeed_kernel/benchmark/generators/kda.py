@@ -1248,6 +1248,7 @@ def prepare_kda_replay_commit(
             state_stride=first_state.stride(0),
             conv_width=common["conv_kernel_size"],
             lower_bound=common["lower_bound"],
+            state_dtype=first_state.dtype,
             **payload_args,
         )
 

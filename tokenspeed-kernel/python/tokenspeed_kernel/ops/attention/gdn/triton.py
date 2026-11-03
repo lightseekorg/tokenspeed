@@ -52,6 +52,10 @@ from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     build_causal_conv1d_prefill_metadata,
     refresh_causal_conv1d_capacity_metadata,
 )
+from tokenspeed_kernel.ops.attention.gdn._triton.chain_verify import (
+    gdn_chain_verify_warm_batch_sizes,
+    launch_gdn_chain_verify,
+)
 from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
     chunk_gated_delta_rule,
 )
@@ -956,6 +960,48 @@ def triton_gdn_decode_mtp(
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
         tree_ancestors=tree_ancestors,
+    )
+
+
+@register_kernel(
+    "attention",
+    "gdn_chain_verify",
+    name="triton_gdn_chain_verify",
+    solution="triton",
+    # Validated (and selected) on NVIDIA only; its small 16-bit dots are untested on AMD.
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_gdn_chain_verify(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None,
+    use_qk_l2norm: bool,
+) -> torch.Tensor:
+    """Read-only chain verify in the chunked form (see ``gdn_chain_verify``)."""
+    return launch_gdn_chain_verify(
+        q,
+        k,
+        v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm,
     )
 
 

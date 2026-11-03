@@ -262,17 +262,14 @@ class TestCLIConfigCompat:
                 "1",
                 "2",
                 "4",
-                "--block-size",
-                "128",
                 "--moe-backend",
                 "deep_gemm_mega_moe",
                 "--sampling-backend",
                 "triton_full",
                 "--tokenizer-mode",
-                "deepseek_v4",
+                "slow",
                 "--hf-overrides",
                 '{"rope_scaling": null}',
-                "--no-enable-log-requests",
                 "--no-trust-remote-code",
                 "--disable-prefix-caching",
                 "--quantization",
@@ -297,12 +294,10 @@ class TestCLIConfigCompat:
             "enforce_eager": True,
             "max_cudagraph_capture_size": 32,
             "cudagraph_capture_sizes": [1, 2, 4],
-            "prefix_granularity": 128,
             "moe_backend": "deep_gemm_mega_moe",
             "sampling_backend": "triton_full",
-            "tokenizer_mode": "deepseek_v4",
+            "tokenizer_mode": "slow",
             "hf_overrides": '{"rope_scaling": null}',
-            "enable_log_requests": False,
             "trust_remote_code": False,
             "enable_prefix_caching": False,
             "quantization": "mxfp4",
@@ -375,11 +370,6 @@ class TestCLIConfigCompat:
         sa = self._from_cli_args_no_init(args)
         sa.resolve_basic_defaults()
         assert (sa.kv_cache_dtype) == ("fp8_e4m3")
-
-    def test_log_requests_default_on(self):
-        args = self._parse_args(["--model", "test/model"])
-        assert args.enable_log_requests
-        assert (args.log_requests_level) == (0)
 
     def test_kv_events_config_arg(self):
         config = (
