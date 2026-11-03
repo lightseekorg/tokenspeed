@@ -42,7 +42,6 @@ layer's gated attention rows, across ranks, across repeated launches, and
 between replay and eager.
 """
 
-import os
 import socket
 import traceback
 
@@ -73,6 +72,7 @@ from muse_layer_reference import (  # noqa: E402
     RoutingTie,
     assert_matches,
     attention_reference,
+    failure_records,
     regular_reference,
     run_fused,
 )
@@ -202,16 +202,5 @@ def test_fused_layer_matches_the_regular_layer(tmp_path):
         mp.spawn(_worker, args=(port, str(tmp_path), errors), nprocs=WORLD, join=True)
     except Exception as error:
         # A kernel's fail_stop traps; its record survives in the host files.
-        raise AssertionError(_failure_records(tmp_path)) from error
+        raise AssertionError(failure_records(tmp_path, WORLD)) from error
     assert not errors, "\n".join(f"rank {r}: {e}" for r, e in errors.items())
-
-
-def _failure_records(record_dir):
-    """Every rank's mirrored failure record: (site, logical workgroup,
-    detail, epoch, label), all zero if that rank recorded none."""
-    lines = []
-    for rank in range(WORLD):
-        path = os.path.join(record_dir, f"rank{rank}.bin")
-        record = FailureMirror.read(path) if os.path.exists(path) else "no file"
-        lines.append(f"rank {rank}: {record}")
-    return "\n".join(lines)

@@ -56,6 +56,7 @@ from muse_layer_reference import (  # noqa: E402
     SEEDS,
     RoutingTie,
     assert_matches,
+    failure_records,
     regular_reference,
     run_fused,
 )
@@ -289,9 +290,13 @@ def _free_port() -> int:
 
 def test_one_state_serves_alternation_replays_wrap_and_a_late_rank(tmp_path):
     errors = mp.Manager().dict()
-    mp.spawn(
-        _worker, args=(_free_port(), str(tmp_path), errors), nprocs=WORLD, join=True
-    )
+    try:
+        mp.spawn(
+            _worker, args=(_free_port(), str(tmp_path), errors), nprocs=WORLD,
+            join=True,
+        )  # fmt: skip
+    except Exception as error:
+        raise AssertionError(failure_records(tmp_path, WORLD)) from error
     assert not errors, "\n".join(f"rank {r}: {e}" for r, e in errors.items())
 
 
@@ -343,7 +348,9 @@ def test_a_withheld_launch_stops_every_peer_with_the_origin(tmp_path):
     ]
     for rank, (child, output) in enumerate(zip(children, outputs)):
         if rank == withheld:
-            assert child.returncode == 0 and "WITHHELD" in output, output[-2000:]
+            assert child.returncode == 0 and "WITHHELD" in output, (
+                output[-2000:] + "\n" + failure_records(tmp_path, WORLD)
+            )
             assert not any(records[rank]), records[rank]
         else:
             assert child.returncode != 0 and "NO TRAP" not in output, output[-2000:]

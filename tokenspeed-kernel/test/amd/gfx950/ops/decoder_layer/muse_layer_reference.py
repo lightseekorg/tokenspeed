@@ -31,6 +31,8 @@ FFN boundary, and the next layer's QKV projection and ``gqa_prologue``.
 Collectives run over the default process group.
 """
 
+import os
+
 import torch
 import torch.distributed as dist
 from muse_layer_builder import (
@@ -75,6 +77,20 @@ SWIGLU = dict(swiglu_alpha=1.0, swiglu_limit=0.0, swiglu_beta=0.0)
 ROUTING_GAP = 1e-3
 # Seeds a test tries, in order, until the inputs have no routing tie.
 SEEDS = range(16)
+
+
+def failure_records(record_dir, world):
+    """Every rank's mirrored failure record (site, logical workgroup, detail,
+    epoch, label), one line per rank: a fail_stop trap ends the ranks with a
+    queue error, and the record names the wait that failed."""
+    from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
+
+    lines = []
+    for rank in range(world):
+        path = os.path.join(record_dir, f"rank{rank}.bin")
+        record = FailureMirror.read(path) if os.path.exists(path) else "no file"
+        lines.append(f"rank {rank}: {record}")
+    return "\n".join(lines)
 
 
 class RoutingTie(AssertionError):
