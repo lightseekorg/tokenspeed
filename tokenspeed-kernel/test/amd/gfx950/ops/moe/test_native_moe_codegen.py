@@ -216,7 +216,7 @@ def test_item_loops_keep_the_ring(fields):
             len(chunks) == mfma
         ), f"{mfma}-MFMA loop issues {len(chunks)} weight chunks"
         if mfma == 32:
-            # S-MOE2: each wave's group tag follows a wait covering its mids stores.
+            # Each wave's group tag follows a wait covering its mids stores.
             assert tags and all(tags), tags
             # Gate/up scales: two lane-major dwordx4 per strip, or one
             # swizzled dword per two steps.

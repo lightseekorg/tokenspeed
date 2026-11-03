@@ -1112,8 +1112,7 @@ def run_moe(
     pend_word = rank * 0 - 1
     pend_left = left
     for k in range(plan.n_ug):
-        # S-MOE1 (ug strip -> quant exchange, LDS class); next strip's plan
-        # from LDS only.
+        # The next strip's plan, from LDS only.
         nexpert, nrank, ngroup, nleft = _group_of(plan, k + 1, rank_smem)
         nlive = k + 1 < plan.n_ug
         nw, nw_pair, nw_odd, ns, ns_pair = _strip_offsets(
@@ -1168,8 +1167,9 @@ def run_moe(
                     + sring[(kt // 2) % (RING // 2) + 1 :]
                 )
             if kt == RING:
-                # The previous strip's tag (S-MOE2, ordered retirement): this
-                # step's chunk was issued after that strip's mids stores.
+                # The previous strip's tag: this step's chunk was issued after
+                # that strip's mids stores, and the wave's memory operations
+                # complete in issue order, so waiting for it covers them.
                 _publish_tags(tags_d, pend_word, tag, pend_word >= 0, pend_left, acc)
             gl.amd.hint.sched_barrier()
         pend_word = rank * 0 - 1
@@ -1242,7 +1242,7 @@ def run_moe(
     # back edge. Its readiness wait therefore precedes its weights, once per
     # wave, right after the gate/up drain.
     if dlive:
-        # S-MOE3 (mids ready: scalar-polled group tags)
+        # Mids ready: the expert's group tags, polled with scalar loads.
         _wait_ready(ctx, bufs.tags, drank, TAG_GLC)
     route_a, route_s = _unit_routes(ids_t, dexpert, TOPK)
     sdw = ()
@@ -1343,7 +1343,7 @@ def run_moe(
                 )
             ring2 = ring2[: c % RING] + (nb,) + ring2[c % RING + 1 :]
             gl.amd.hint.sched_barrier()
-        # S-MOE4 (down unit -> sink: the H4 push in the layer). Handed over in
+        # Down unit -> sink (the layer's H4 push). Handed over in
         # MOE_SINK_LAYOUT, which is the MFMA result's own layout: no data
         # moves, and each wave owns its 16 columns.
         rows = gl.arange(0, 16, layout=gl.SliceLayout(1, rowl))

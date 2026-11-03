@@ -94,8 +94,8 @@ through memory instead of kernel boundaries.
   (`gl.atomic_poll`, no barrier in its loop); its closing workgroup barrier
   orders the loads after it. It checks the deadline and the abort word every
   50 us of polling.
-- `wave.py` holds the per-wave facts Gluon cannot state (inline asm, each in
-  the compiler TODO): per-wave SGPR values, an opaque index that keeps LDS
+- `wave.py` holds the per-wave facts Gluon cannot state yet (inline asm):
+  per-wave SGPR values, an opaque index that keeps LDS
   reads in a loop, a value ordered after a load (to publish after the wave's
   stores retire), and an LDS exchange among the waves of a workgroup without
   a barrier (its spin has no deadline: only same-workgroup waves that never
