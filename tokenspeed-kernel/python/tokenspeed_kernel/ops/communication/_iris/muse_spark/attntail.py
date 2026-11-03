@@ -706,6 +706,29 @@ def muse_attntail_read_box(
     waves, 16 tokens]``. With ``on_expiry`` (not None) the waits stop at
     ``launch``'s deadline or abort (``muse_attntail_wait_box``)."""
     WAVES: gl.constexpr = gl.num_warps()
+    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[WAVES, 1, 1],
+    )
+    b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma, k_width=8
+    )
+    return gl.convert_layout(
+        muse_attntail_read_box_rows(att_box, rows, K, launch, on_expiry, SITE),
+        b_layout,
+    )
+
+
+@gluon.jit
+def muse_attntail_read_box_rows(
+    att_box, rows, K: gl.constexpr, launch, on_expiry: gl.constexpr, SITE: gl.constexpr
+):
+    """:func:`muse_attntail_read_box` before its layout change: ``[waves, K /
+    waves, 16 tokens]`` in the layout the words arrive in (each thread a
+    contiguous K run of one token), for a caller that stores it to LDS."""
+    WAVES: gl.constexpr = gl.num_warps()
     KW: gl.constexpr = K // WAVES
     # The 16 x K box as 256 packs (one per lane of 4 waves), one-source Lamport wait.
     PACK: gl.constexpr = 16 * K // 256
@@ -736,20 +759,8 @@ def muse_attntail_read_box(
     box = muse_attntail_wait_box(
         box_ptr, offsets, valid, launch, on_expiry, SITE, packs
     )
-    # [16 tokens, K] -> the MFMA B operand [waves, K / waves, 16 tokens].
-    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 32],
-        transposed=True,
-        warps_per_cta=[WAVES, 1, 1],
-    )
-    b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma, k_width=8
-    )
-    x = gl.convert_layout(
-        gl.permute(gl.reshape(box, [16, WAVES, KW]), [1, 2, 0]), b_layout
-    )
-    return x
+    # [16 tokens, K] -> [waves, K / waves, 16 tokens].
+    return gl.permute(gl.reshape(box, [16, WAVES, KW]), [1, 2, 0])
 
 
 @gluon.jit

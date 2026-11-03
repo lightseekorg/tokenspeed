@@ -335,6 +335,17 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   most `WINDOW` tiles in flight per wave (counted `vmcnt` waits), so a weight
   stream overlapping a latency-bound chain stays below the fabric's knee;
   `gemv_a16w16_splitk_finish_x_gfx950` finishes on a caller-built x.
+- K-step forms for a caller that builds x itself (a deferred norm), so one
+  32-deep step of x and its inputs is live instead of the whole K range:
+  `gemv_a16w16_splitk_weight_steps_gfx950` returns `tiles[t][s]` (the same
+  loads and pacing); `gemv_a16w16_splitk_wave_sums_steps_gfx950`,
+  `gemv_a16w16_splitk_hi_lo_sums_steps_gfx950` and
+  `gemv_a16w16_splitk_finish_steps_gfx950` call an `X_STEP(args, s)` per
+  step and run each tile's MFMAs in K order (hi/lo: all `hi xh`, then
+  `lo xh`, then `hi xl`), bitwise the full-x forms. Inputs can wait in LDS:
+  `gemv_a16w16_splitk_k_vector_to_shared_gfx950` copies a per-K vector's
+  task slice LDS-direct, and `..._k_vector_step_gfx950` /
+  `..._b_step_gfx950` read one step back in the B operand layout.
 
 #### Algorithm
 

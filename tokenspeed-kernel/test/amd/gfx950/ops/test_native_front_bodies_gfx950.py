@@ -34,7 +34,11 @@ if not is_cdna4():
 
 from native_body_helpers import (  # noqa: E402
     kpart_pooler_kernel,
+    kpart_pooler_steps_kernel,
     kpart_router_kernel,
+    kpart_router_steps_kernel,
+    qkv_task_kernel,
+    qkv_task_steps_kernel,
     sender_kernel,
     topk_keys_kernel,
 )
@@ -145,6 +149,63 @@ def test_kpart_router_matches_fp32_reference(rows: int) -> None:
     # the error stays under ~1e-5 absolute; FP32 accumulation adds ~1e-6.
     expected = (inputs["x"].double() @ router.double().T).float()
     torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("rows", [8, 16])
+@pytest.mark.parametrize("role", ["router", "pooler", "qkv"])
+def test_kpart_steps_are_bitwise_the_full_x_build(role: str, rows: int) -> None:
+    """Building x one K step at a time (norm vectors and b from LDS) runs the
+    same elementwise operations and each tile's MFMAs in the same K order as
+    the full-x build, so the partial words are bitwise equal."""
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+        persistent_compile_options,
+    )
+
+    inputs = _boundary_inputs(rows, 50 + rows)
+    common = dict(
+        WIDTH=WIDTH, PRODUCERS=PRODUCERS, PARTS=PARTS, POST_EPS=POST_EPS,
+        PRE_EPS=PRE_EPS, num_warps=8,
+    )  # fmt: skip
+    if role == "qkv":
+        # 144-row tasks over 16 K parts, weights paced 3 tiles ahead.
+        common.pop("PARTS")
+        weights = (
+            torch.randn(2304, WIDTH, device="cuda", dtype=torch.bfloat16) * 0.02,
+        )
+        kernels, grid, outputs = (qkv_task_kernel, qkv_task_steps_kernel), 256, 2304
+        extra = dict(N=outputs, WINDOW=3)
+        parts_count = 16
+    elif role == "router":
+        router = torch.randn(256, WIDTH, device="cuda") * 0.02
+        hi = router.to(torch.bfloat16)
+        weights = (hi, (router - hi.float()).to(torch.bfloat16))
+        kernels, grid, outputs = (
+            (kpart_router_kernel, kpart_router_steps_kernel),
+            16 * PARTS,
+            256,
+        )
+        extra = dict(EXPERTS=outputs)
+        parts_count = PARTS
+    else:
+        weights = (torch.randn(512, WIDTH, device="cuda", dtype=torch.bfloat16) * 0.02,)
+        kernels, grid, outputs = (
+            (kpart_pooler_kernel, kpart_pooler_steps_kernel),
+            8 * PARTS,
+            512,
+        )
+        extra = dict(OUTPUTS=outputs, ROWS=64)
+        parts_count = PARTS
+    words = []
+    for kernel in kernels:
+        parts = torch.zeros(
+            parts_count * rows * outputs, device="cuda", dtype=torch.int64
+        )
+        kernel[(grid,)](
+            *inputs["args"], *weights, parts, 5, rows, **extra, **common,
+            **persistent_compile_options(),
+        )  # fmt: skip
+        words.append(parts)
+    assert torch.equal(words[1], words[0])
 
 
 @pytest.mark.parametrize("rows", [8, 16])
