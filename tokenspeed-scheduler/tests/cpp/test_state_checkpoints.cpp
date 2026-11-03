@@ -155,6 +155,7 @@ protected:
         }
         AckWriteBacks(plan);
         SendAbortEvent(id);
+        SendTransferStopped(id);
         PlanOnce();
         return resume;
     }
@@ -2859,6 +2860,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AWrittenBackSessionResumesFromHost)
     AckWriteBacks(PlanOnce());
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
 
     tokens.push_back(77);
@@ -2902,6 +2904,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASharedPromptStaysOnDeviceWhileItsS
     }
     AckWriteBacks(plan);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
 
     a.push_back(77);
@@ -2938,6 +2941,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TailHintSurvivesTheWriteBackWindow)
     AckWriteBacks(plan);
     EXPECT_EQ(scheduler_->TailEntries(), 1u);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
     tokens.push_back(77);
     EXPECT_EQ(Probe("s1-next", tokens).prefix_tokens, 22);
@@ -3072,6 +3076,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputIsTheFirstVictim)
         }
         AckWriteBacks(plan);
         SendAbortEvent("f1");
+        SendTransferStopped("f1");
         AckWriteBacks(PlanOnce());
 
         o.push_back(77);
@@ -3116,6 +3121,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheHostDropsACheckpointALaterTurnEx
     EXPECT_EQ(stats.device_evictions.admission.blocks, 0u);
     AckWriteBacks(plan);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
 
     o.push_back(77);
@@ -3168,6 +3174,7 @@ TEST_F(StateCheckpointPrefillHostSuite, TheEndStateOutlivesTheInputItSupersedesU
         EXPECT_EQ(evictions.admission.blocks, 0u);
         AckWriteBacks(plan);
         SendAbortEvent("f1");
+        SendTransferStopped("f1");
         AckWriteBacks(PlanOnce());
 
         tokens.push_back(77);
@@ -3388,6 +3395,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputStaysWhenTheNextV
     EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
     AckWriteBacks(plan);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
 
     const Resume resent = Probe("resent", tokens);
@@ -3437,6 +3445,7 @@ TEST_F(StateCheckpointPrefillHostSuite, TheSupersededInputOfASingleChunkTurnIsDr
     AckWriteBacks(plan);
     EXPECT_EQ(scheduler_->TailEntries(), 1u) << "only h's tail at 27";
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
 
     tokens.push_back(77);
@@ -3483,6 +3492,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputOfATwoChunkTurnIs
     EXPECT_EQ(scheduler_->TailEntries(), 1u) << "only h's tail at 38";
     AckWriteBacks(plan);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
     std::vector<std::int32_t> other = s1;
     other.push_back(77);
@@ -3554,6 +3564,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AHitUnmarksTheSupersededInputUntilTheHit
         }
         AckWriteBacks(plan);
         SendAbortEvent("f1");
+        SendTransferStopped("f1");
         AckWriteBacks(PlanOnce());
         const Resume again = Probe("again", tokens);
         EXPECT_EQ(again.prefix_tokens, resend_finishes ? 24 : 22);
@@ -3584,6 +3595,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
     AckWriteBacks(handoff);
     ExecutionEvent failed;
     failed.With(pd::FailedEvent{"h"});
+    failed.With(pd::TransferStoppedEvent{"h"});
     scheduler_->Advance(std::move(failed));
 
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
@@ -3599,6 +3611,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
     EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, 0u);
     AckWriteBacks(plan);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
     const Resume again = Probe("h-again", tokens);
     EXPECT_EQ(again.prefix_tokens, 22);
@@ -3655,6 +3668,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersI
             } else {
                 ExecutionEvent failed;
                 failed.With(pd::FailedEvent{"g"});
+                failed.With(pd::TransferStoppedEvent{"g"});
                 scheduler_->Advance(std::move(failed));
             }
             // Under write-through the finishes' stores land first: each pins
@@ -3678,6 +3692,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersI
             }
             AckWriteBacks(plan);
             SendAbortEvent("f1");
+            SendTransferStopped("f1");
             AckWriteBacks(PlanOnce());
             EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
             const Resume again = Probe("g-again", g);
@@ -3738,6 +3753,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         SendPdSucceeded("h");
         ExecutionEvent failed;
         failed.With(pd::FailedEvent{"g"});
+        failed.With(pd::TransferStoppedEvent{"g"});
         scheduler_->Advance(std::move(failed));
         AckWriteBacks(PlanOnce());
 
@@ -3751,6 +3767,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
         AckWriteBacks(PlanOnce());
         SendAbortEvent("f1");
+        SendTransferStopped("f1");
         AckWriteBacks(PlanOnce());
         const Resume again = Probe("g-again", g);
         EXPECT_EQ(again.prefix_tokens, 22);
@@ -3882,6 +3899,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AJunctionCheckpointOutlivesTheHandO
     EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, 0u);
     AckWriteBacks(plan);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
     const Resume after = Probe("after-f1", sharing(1300));
     EXPECT_EQ(after.prefix_tokens, 8);
@@ -3903,6 +3921,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASegmentHostCannotPlaceIsDroppedWho
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
     ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
     CompleteSession("s2", MakeTokens(22, 2000));
     ASSERT_EQ(scheduler_->TailEntries(), 2u);
@@ -3942,6 +3961,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASessionResumedFromHostIsNotCopiedA
     SendBootstrapped("f1");
     AckWriteBacks(PlanOnce());
     SendAbortEvent("f1");
+    SendTransferStopped("f1");
     AckWriteBacks(PlanOnce());
 
     for (std::int32_t i = 0; i < 4; ++i) {
@@ -4244,6 +4264,10 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
     failed.With(pd::FailedEvent{"a"});
     scheduler_->Advance(std::move(failed));
     SendAbortEvent("b");
+    EXPECT_EQ(scheduler_->PdTransferSize(), 2u) << "both ended, their transfers still stopping";
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 4) << "the pages wait for the transport";
+    SendTransferStopped("a");
+    SendTransferStopped("b");
     EXPECT_EQ(scheduler_->PdTransferSize(), 0u);
     EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 10) << "each frees its three State parents";
 

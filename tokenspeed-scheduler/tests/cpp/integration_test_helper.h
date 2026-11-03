@@ -173,6 +173,15 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    // The PD transport's report that a failed or cancelled transfer stopped:
+    // a request an abort or a failure parked in PdTransferring returns its
+    // pages. Ignored for any other request.
+    void SendTransferStopped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::TransferStoppedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
     void SendSnapshotDone(std::uint32_t op_id) {
         ExecutionEvent event;
         event.With(cache::SnapshotDone{.op_id = op_id});

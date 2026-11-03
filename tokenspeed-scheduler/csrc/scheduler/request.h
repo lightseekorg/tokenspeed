@@ -327,6 +327,7 @@ public:
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Restoring&) -> std::string { return "Restoring"; },
                               [](const fsm::Finishing&) -> std::string { return "Finishing"; },

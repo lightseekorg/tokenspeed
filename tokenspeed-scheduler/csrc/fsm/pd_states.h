@@ -82,5 +82,18 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
+// The request ended on this engine -- aborted, or its transfer failed --
+// while a PD transfer may still read or write its pages: the peer's decode
+// reading a P request's sources, the peer's prefill writing a D request's
+// destinations. The transport was told to stop; the bundle stays whole,
+// pages and all, until it reports that every reader and writer on every rank
+// stopped (TransferStoppedEvent). Nothing is scheduled or published here, and
+// it is no retraction victim.
+struct PdTransferring {
+    explicit PdTransferring(ForwardResources resources) : resources{std::move(resources)} {}
+
+    ForwardResources resources;
+};
+
 }  // namespace fsm
 }  // namespace tokenspeed

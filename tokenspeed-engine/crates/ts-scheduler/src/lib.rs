@@ -69,7 +69,8 @@ mod ffi {
         UpdateReserveNumTokens,
         /// PD: the request's peers are connected (`pd::BootstrappedEvent`).
         PdBootstrapped,
-        /// PD: the request's transfer failed (`pd::FailedEvent`).
+        /// PD: the request's transfer failed; it may still be stopping
+        /// (`pd::FailedEvent`).
         PdFailed,
         /// PD, P role: the request's KV reached the decode node
         /// (`pd::SucceededEvent`).
@@ -77,6 +78,9 @@ mod ffi {
         /// PD, D role: the request's KV landed, with the prefill node's
         /// first token (`pd::RemotePrefillDoneEvent`).
         PdRemotePrefillDone,
+        /// PD: a failed or cancelled transfer stopped on every rank; the
+        /// request's pages may return (`pd::TransferStoppedEvent`).
+        PdTransferStopped,
     }
 
     /// A forward event fed back to the scheduler. Fields other kinds do not
