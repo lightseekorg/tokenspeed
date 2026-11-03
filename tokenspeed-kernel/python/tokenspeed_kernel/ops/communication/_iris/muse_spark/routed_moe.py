@@ -36,6 +36,11 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_wait_lamport_peers,
     _iris_wait_lamport_slots,
 )
+from tokenspeed_kernel.platform import current_platform
+
+if current_platform().is_cdna4:
+    # Deadline and abort checks of the waits a persistent layer runs.
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import poll_check, poll_stop_site
 
 
 @gluon.jit
@@ -556,7 +561,26 @@ def _iris_column_routes_complete(
         WEIGHT_OFFSET,
         PEER_SIGNAL_STORE_CACHE,
         True,
+        None,
+        None,
+        0,
     )
+
+
+@gluon.jit
+def _iris_column_routes_poll(
+    words_ptr, slices, PEERS: gl.constexpr, MAX_ROWS: gl.constexpr
+):
+    """One read of every peer's slot of a route slice: (words, missing)."""
+    received = ()
+    missing = gl.zeros_like(slices)
+    for slot in gl.static_range(PEERS):
+        loaded = gl.amd.cdna4.buffer_load(
+            words_ptr, slices + slot * (MAX_ROWS * _ROUTE_WORDS), cache=".cv"
+        )
+        received += (loaded,)
+        missing |= ((loaded >> 16) == 0x8000).to(gl.int32)
+    return received, missing
 
 
 @gluon.jit
@@ -574,6 +598,9 @@ def iris_column_routes_complete(
     WEIGHT_OFFSET: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     CLEAR: gl.constexpr,
+    launch,
+    on_expiry: gl.constexpr,
+    SITE: gl.constexpr,
 ):
     """Complete this rank's 512 columns of one route and publish them to every rank.
 
@@ -583,7 +610,9 @@ def iris_column_routes_complete(
     and publishes the BF16 columns and the partial sum of squares of the
     gained route that the portable inverse-RMS kernel's subgroup RANK
     computes. With CLEAR, restores the consumed markers afterwards; a
-    two-copy caller clears its areas at entry instead.
+    two-copy caller clears its areas at entry instead. With ``on_expiry``
+    (not None) the wait stops at ``launch``'s deadline or abort and calls
+    ``on_expiry(launch, site, 0)``.
     """
     # With several waves every wave polls the same words (replicated
     # layouts), so a wave's clear could race another's poll.
@@ -597,24 +626,26 @@ def iris_column_routes_complete(
     words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
     words = _iris_column_routes_offsets()
     slices = base + row * _SLICE_WORDS + words
-    received = ()
-    missing = gl.zeros_like(slices)
-    for slot in gl.static_range(PEERS):
-        loaded = gl.amd.cdna4.buffer_load(
-            words_ptr, slices + slot * (MAX_ROWS * _ROUTE_WORDS), cache=".cv"
-        )
-        received += (loaded,)
-        missing |= ((loaded >> 16) == 0x8000).to(gl.int32)
-    while _iris_subgroup_any(gl.max(missing, 1)):
-        # Arrived words stay unchanged until cleared; reread them all.
-        received = ()
-        missing = gl.zeros_like(slices)
-        for slot in gl.static_range(PEERS):
-            loaded = gl.amd.cdna4.buffer_load(
-                words_ptr, slices + slot * (MAX_ROWS * _ROUTE_WORDS), cache=".cv"
+    received, missing = _iris_column_routes_poll(words_ptr, slices, PEERS, MAX_ROWS)
+    if on_expiry is None:
+        while _iris_subgroup_any(gl.max(missing, 1)):
+            # Arrived words stay unchanged until cleared; reread them all.
+            received, missing = _iris_column_routes_poll(
+                words_ptr, slices, PEERS, MAX_ROWS
             )
-            received += (loaded,)
-            missing |= ((loaded >> 16) == 0x8000).to(gl.int32)
+    else:
+        start = gl.to_tensor(0).to(gl.int64)
+        retries = 0
+        stop = retries < 0
+        while _iris_subgroup_any(gl.max(missing, 1)) & (not stop):
+            received, missing = _iris_column_routes_poll(
+                words_ptr, slices, PEERS, MAX_ROWS
+            )
+            retries += 1
+            if retries % 64 == 0:
+                stop, start = poll_check(launch, start, retries, False)
+        if stop:
+            on_expiry(launch, poll_stop_site(launch, SITE), 0)
     for source in gl.static_range(WORLD_SIZE):
         if source == RANK:
             loaded = own
@@ -725,8 +756,9 @@ def _iris_column_routes_finish(
     counter = epochs + token * WORLD_SIZE + owner
     stage = gl.load(counter).to(gl.uint32) % 3
     loaded, squares = iris_column_routes_wait(
-        region, stage, token, owner, WORLD_SIZE, MAX_ROWS, STAGE_WORDS, True
-    )
+        region, stage, token, owner, WORLD_SIZE, MAX_ROWS, STAGE_WORDS, True, None,
+        None, 0,
+    )  # fmt: skip
     # Only a later launch reads the restored markers or this stage, so the
     # advance need not wait for the clears.
     gl.store(counter, ((stage + 1) % 3).to(gl.int32))
@@ -741,6 +773,21 @@ def _iris_column_routes_finish(
 
 
 @gluon.jit
+def _iris_column_routes_finish_poll(words_ptr, slices, sums):
+    """One read of the completed columns and the sums of squares:
+    (loaded, squares, missing)."""
+    loaded = gl.amd.cdna4.buffer_load(words_ptr, slices, cache=".cv")
+    squares = gl.amd.cdna4.buffer_load(words_ptr, sums, cache=".cv")
+    # Payloads never hold negative zero (sums of squares are never negative),
+    # so a word is empty exactly when its high half is 0x8000.
+    missing = gl.max(gl.max(((loaded >> 16) == 0x8000).to(gl.int32), 2), 0)
+    missing |= gl.convert_layout(
+        ((squares >> 16) == 0x8000).to(gl.int32), missing.type.layout
+    )
+    return loaded, squares, missing
+
+
+@gluon.jit
 def iris_column_routes_wait(
     region,
     stage,
@@ -750,13 +797,18 @@ def iris_column_routes_wait(
     MAX_ROWS: gl.constexpr,
     STAGE_WORDS: gl.constexpr,
     CLEAR: gl.constexpr,
+    launch,
+    on_expiry: gl.constexpr,
+    SITE: gl.constexpr,
 ):
     """Wait for owner's completed columns of the token's eight routes and
     every rank's partial sums of squares in mailbox copy ``stage``.
 
     Returns ``(loaded, squares)`` for iris_column_routes_combine. With CLEAR,
     restores their markers (only this caller reads them); a two-copy caller
-    clears its areas at entry instead.
+    clears its areas at entry instead. With ``on_expiry`` (not None) the
+    wait stops at ``launch``'s deadline or abort and calls
+    ``on_expiry(launch, site, 0)``.
     """
     gl.static_assert(not CLEAR or gl.num_warps() == 1)
     PEERS: gl.constexpr = WORLD_SIZE - 1
@@ -782,21 +834,25 @@ def iris_column_routes_wait(
     square_layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     index = gl.arange(0, 64, layout=square_layout)
     sums = base + P1_WORDS + P2_WORDS + (token * 64 + index) * WORLD_SIZE + owner
-    loaded = gl.amd.cdna4.buffer_load(words_ptr, slices, cache=".cv")
-    squares = gl.amd.cdna4.buffer_load(words_ptr, sums, cache=".cv")
-    # Payloads never hold negative zero (sums of squares are never negative),
-    # so a word is empty exactly when its high half is 0x8000.
-    missing = gl.max(gl.max(((loaded >> 16) == 0x8000).to(gl.int32), 2), 0)
-    missing |= gl.convert_layout(
-        ((squares >> 16) == 0x8000).to(gl.int32), missing.type.layout
-    )
-    while _iris_subgroup_any(missing):
-        loaded = gl.amd.cdna4.buffer_load(words_ptr, slices, cache=".cv")
-        squares = gl.amd.cdna4.buffer_load(words_ptr, sums, cache=".cv")
-        missing = gl.max(gl.max(((loaded >> 16) == 0x8000).to(gl.int32), 2), 0)
-        missing |= gl.convert_layout(
-            ((squares >> 16) == 0x8000).to(gl.int32), missing.type.layout
-        )
+    loaded, squares, missing = _iris_column_routes_finish_poll(words_ptr, slices, sums)
+    if on_expiry is None:
+        while _iris_subgroup_any(missing):
+            loaded, squares, missing = _iris_column_routes_finish_poll(
+                words_ptr, slices, sums
+            )
+    else:
+        start = gl.to_tensor(0).to(gl.int64)
+        retries = 0
+        stop = retries < 0
+        while _iris_subgroup_any(missing) & (not stop):
+            loaded, squares, missing = _iris_column_routes_finish_poll(
+                words_ptr, slices, sums
+            )
+            retries += 1
+            if retries % 64 == 0:
+                stop, start = poll_check(launch, start, retries, False)
+        if stop:
+            on_expiry(launch, poll_stop_site(launch, SITE), 0)
     if CLEAR:
         gl.amd.cdna4.buffer_store(
             gl.full_like(loaded, 0x80000000), words_ptr, slices, cache=".wt"

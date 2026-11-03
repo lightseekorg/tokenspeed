@@ -60,8 +60,42 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_column_routes_complete,
     iris_column_routes_wait,
 )
+from tokenspeed_kernel.platform import current_platform
+
+if current_platform().is_cdna4:
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+        ERROR_ABORT,
+        ERROR_CALLER,
+        ERROR_WORDS,
+        FIRST_KERNEL_SITE,
+        fail_stop,
+        poll_check,
+        poll_pairs,
+        poll_stop_site,
+        store_pairs,
+        vote,
+    )
+else:  # host-side sizes only
+    ERROR_ABORT, ERROR_CALLER, ERROR_WORDS, FIRST_KERNEL_SITE = 32, 64, 128, 16
 
 WORLD_SIZE = 8
+# Failure sites of the hop waits (fail_stop records them).
+SITE_OWN1 = FIRST_KERNEL_SITE + 16
+SITE_XN = SITE_OWN1 + 1
+SITE_OWN4_OWN = SITE_OWN1 + 2
+SITE_OWN4 = SITE_OWN1 + 3
+SITE_FIN = SITE_OWN1 + 4
+SITE_RED = SITE_OWN1 + 5
+SITE_H6_SUMS = SITE_OWN1 + 6
+_SITE_OWN1 = gl.constexpr(SITE_OWN1)
+_SITE_XN = gl.constexpr(SITE_XN)
+_SITE_OWN4_OWN = gl.constexpr(SITE_OWN4_OWN)
+_SITE_OWN4 = gl.constexpr(SITE_OWN4)
+_SITE_FIN = gl.constexpr(SITE_FIN)
+_SITE_RED = gl.constexpr(SITE_RED)
+_SITE_H6_SUMS = gl.constexpr(SITE_H6_SUMS)
+_ERROR_ABORT = gl.constexpr(ERROR_ABORT)
+_ERROR_CALLER = gl.constexpr(ERROR_CALLER)
 # Rows every area is sized for, whatever a launch's rows (8 or 16 today), so
 # an area's rows never shrink between launches (stale rows of a wider launch
 # would read as data).
@@ -96,6 +130,12 @@ H4_OWN_WORDS = MAX_ROWS * TOPK * _SLICE_WORDS
 H6_LOCAL = HIDDEN // WORLD_SIZE
 H6_SLOT = MAX_ROWS * H6_LOCAL
 H6_WORDS = WORLD_SIZE * H6_SLOT // 2
+# The FFN boundary's per-row norm sums: UNP (b, x) -> RED x (local pairs),
+# RED x -> every rank (tagged int64 words), like the H1 sums.
+SUMS = 4
+RED_SENDERS = 8
+RED_IN_WORDS = WORLD_SIZE * RED_SENDERS * MAX_ROWS * SUMS  # int64, local
+H6_SUM_WORDS = WORLD_SIZE * WORLD_SIZE * MAX_ROWS * SUMS  # int64, symmetric
 
 _WORLD = gl.constexpr(WORLD_SIZE)
 _MAX_ROWS = gl.constexpr(MAX_ROWS)
@@ -111,6 +151,7 @@ _ROUTES_WORDS = gl.constexpr(ROUTES_WORDS)
 _H4_OWN_WORDS = gl.constexpr(H4_OWN_WORDS)
 _H6_WORDS = gl.constexpr(H6_WORDS)
 _H6_SLOT = gl.constexpr(H6_SLOT)
+_SUMS = gl.constexpr(SUMS)
 HIDDEN_LOCAL = gl.constexpr(H6_LOCAL)
 _SLICE = gl.constexpr(_SLICE_WORDS)
 _LAMPORT_EMPTY = gl.constexpr(LAMPORT_EMPTY_WORD)
@@ -165,6 +206,10 @@ class MuseNativeView:
             (local).
         routes: H4 / H5 [copy][column-route stage words], uint32 (symmetric).
         h6: H6 [copy][source][row * 1024], BF16 (symmetric).
+        red_in: UNP's norm-sum partials [xcd][sender][row][4], int64 pairs
+            (local, epoch-tagged).
+        h6_sums: RED's norm sums [rank][xcd][row][4], int64 tagged words
+            (symmetric, epoch-tagged).
     """
 
     heaps: gl.tuple
@@ -176,9 +221,13 @@ class MuseNativeView:
     h4_own: gl.tensor
     routes: gl.tensor
     h6: gl.tensor
+    red_in: gl.tensor
+    h6_sums: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6):
+    def __init__(
+        self, heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+    ):
         self.heaps = heaps
         self.rank = rank
         self.box = box
@@ -188,6 +237,8 @@ class MuseNativeView:
         self.h4_own = h4_own
         self.routes = routes
         self.h6 = h6
+        self.red_in = red_in
+        self.h6_sums = h6_sums
 
 
 @gluon.jit
@@ -245,8 +296,12 @@ def clear_next_copies(view, launch, sender):
     iris_clear_share(box + nxt * _BOX_WORDS, sender, _BOX_WORDS, _BOX_EMPTY)
     iris_clear_share(h1 + nxt * _H1_WORDS, sender, _H1_WORDS, _LAMPORT_EMPTY)
     iris_clear_share(h3 + nxt * _H3_WORDS, sender, _H3_WORDS, _LAMPORT_EMPTY)
-    iris_clear_share(h4_own + nxt * _H4_OWN_WORDS, sender, _H4_OWN_WORDS, _LAMPORT_EMPTY)
-    iris_clear_share(routes + nxt * _ROUTES_WORDS, sender, _ROUTES_WORDS, _LAMPORT_EMPTY)
+    iris_clear_share(
+        h4_own + nxt * _H4_OWN_WORDS, sender, _H4_OWN_WORDS, _LAMPORT_EMPTY
+    )
+    iris_clear_share(
+        routes + nxt * _ROUTES_WORDS, sender, _ROUTES_WORDS, _LAMPORT_EMPTY
+    )
     iris_clear_share(h6 + nxt * _H6_WORDS, sender, _H6_WORDS, _LAMPORT_EMPTY)
 
 
@@ -272,6 +327,7 @@ def own1(
     post_weight_ptr,
     alpha_ptr,
     beta_ptr,
+    on_expiry: gl.constexpr,
     RANK: gl.constexpr,
     POST_WEIGHT_OFFSET: gl.constexpr,
     POST_HAS_WEIGHT: gl.constexpr,
@@ -279,14 +335,29 @@ def own1(
 ):
     """OWN1 ``owner`` (0-7): wait for the 16 sources of its 128 columns, sum
     in rank order, push the AG words and the four norm sums (tagged with
-    launch.tag) to every rank."""
+    launch.tag) to every rank. Then zero its sums of rows [rows, MAX_ROWS)
+    on every rank: 32-bit tags repeat after 2**32 - 1 launches, so a row a
+    later, wider launch reads must not keep a tag that old (TAG-LIVE)."""
+    sums_peers = _peer_addresses(view.h1_sums, view.heaps, RANK)
     muse_attntail_own(
         owner, launch.cta, view.h1, _peer_addresses(view.h1, view.heaps, RANK),
-        _peer_addresses(view.h1_sums, view.heaps, RANK), launch.tag, launch.copy,
-        rows, stream_ptr, post_weight_ptr, alpha_ptr, beta_ptr, _HIDDEN, RANK,
-        _WORLD, _H1_SHARD, _MAX_ROWS, _OWNER_COLUMNS, POST_WEIGHT_OFFSET,
-        POST_HAS_WEIGHT, PEER_CACHE, False,
+        sums_peers, launch.tag, launch.copy, rows, stream_ptr, post_weight_ptr,
+        alpha_ptr, beta_ptr, _HIDDEN, RANK, _WORLD, _H1_SHARD, _MAX_ROWS,
+        _OWNER_COLUMNS, POST_WEIGHT_OFFSET, POST_HAS_WEIGHT, PEER_CACHE, False,
+        launch, on_expiry, _SITE_OWN1,
     )  # fmt: skip
+    OWNERS: gl.constexpr = _HIDDEN // _WORLD // _OWNER_COLUMNS
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [32, 2], [gl.num_warps(), 1], [1, 0]
+    )
+    row = gl.arange(0, _MAX_ROWS, layout=gl.SliceLayout(1, layout))
+    which = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
+    slot = ((RANK * OWNERS + owner) * _MAX_ROWS + row[:, None]) * 4 + which[None, :]
+    stale = (row >= rows)[:, None] & (which >= 0)[None, :]
+    zero = gl.zeros([_MAX_ROWS, 4], gl.int64, layout)
+    for peer in gl.static_range(_WORLD):
+        destination = gl.multiple_of(sums_peers[peer].to(gl.pointer_type(gl.int64)), 16)
+        gl.amd.cdna4.buffer_store(zero, destination, slot, mask=stale, cache=".wt")
 
 
 @gluon.jit
@@ -319,20 +390,22 @@ def h3_sink(
     published = ()
     for _ in gl.static_range(1, _WORLD):
         published += (v,)
-    _iris_lamport_push(published, peers, 0, offsets, valid, tile, RANK, _WORLD, PEER_CACHE)
+    _iris_lamport_push(
+        published, peers, 0, offsets, valid, tile, RANK, _WORLD, PEER_CACHE
+    )
     own = gl.multiple_of(view.h3.to(gl.pointer_type(gl.bfloat16), bitcast=True), 16)
     gl.amd.cdna4.buffer_store(v, own, offsets, mask=valid, cache=".wt")
 
 
 @gluon.jit
-def xn_wait(view, launch, row, RANK: gl.constexpr):
+def xn_wait(view, launch, row, on_expiry: gl.constexpr, RANK: gl.constexpr):
     """XN of ``row``: wait for every rank's 512 pooled columns (the own slot
     polled too); returns iris_lamport_allgather_wait's words for
     iris_rmsnorm_mxfp4_row."""
     words = view.h3.to(gl.pointer_type(gl.uint32), bitcast=True)
     return iris_lamport_allgather_wait(
         view.h3, words, row * 256, (launch.copy.to(gl.uint32),), RANK, _WORLD, 512,
-        4096, _H3_WORDS, _H3_SLOT // 2, False, True,
+        4096, _H3_WORDS, _H3_SLOT // 2, False, True, launch, on_expiry, _SITE_XN,
     )  # fmt: skip
 
 
@@ -386,11 +459,16 @@ def h4_sink(args, y, route, cols):
     offset = view.routes.to(gl.int64, bitcast=True) - _iris_group_heap_base(
         rank, view.heaps
     )
-    target = _iris_group_heap_base(owner, view.heaps) + offset + 4 * (
-        launch.copy * _ROUTES_WORDS
-        + (_WORLD - 1 - distance) * (_MAX_ROWS * 2 * 1024)
-        + within
-    ).to(gl.int64)
+    target = (
+        _iris_group_heap_base(owner, view.heaps)
+        + offset
+        + 4
+        * (
+            launch.copy * _ROUTES_WORDS
+            + (_WORLD - 1 - distance) * (_MAX_ROWS * 2 * 1024)
+            + within
+        ).to(gl.int64)
+    )
     gl.atomic_store(
         target.to(gl.pointer_type(gl.uint32)),
         words,
@@ -406,6 +484,7 @@ def own4_complete(
     launch,
     route_row,
     norm_weight,
+    on_expiry: gl.constexpr,
     RANK: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
     PEER_CACHE: gl.constexpr,
@@ -413,18 +492,38 @@ def own4_complete(
     """OWN4 of ``route_row``: wait for this rank's own 512-column slice (the
     local dn units' share), then complete it with the peers' partials and
     push the completed columns and sum of squares to every rank (H5)."""
-    layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [gl.num_warps(), 1], [1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
     lane = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
-    offsets = launch.copy * _H4_OWN_WORDS + route_row * _SLICE + lane[:, None] * 4 + word[None, :]
-    own_ptr = gl.multiple_of(view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
+    offsets = (
+        launch.copy * _H4_OWN_WORDS
+        + route_row * _SLICE
+        + lane[:, None] * 4
+        + word[None, :]
+    )
+    own_ptr = gl.multiple_of(
+        view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16
+    )
     own = gl.amd.cdna4.buffer_load(own_ptr, offsets, cache=".cv")
-    while _iris_subgroup_any(gl.max(((own >> 16) == 0x8000).to(gl.int32), 1)):
+    start = gl.to_tensor(0).to(gl.int64)
+    retries = 0
+    stop = retries < 0
+    while _iris_subgroup_any(gl.max(((own >> 16) == 0x8000).to(gl.int32), 1)) & (
+        not stop
+    ):
         own = gl.amd.cdna4.buffer_load(own_ptr, offsets, cache=".cv")
+        retries += 1
+        if retries % 64 == 0:
+            stop, start = poll_check(launch, start, retries, False)
+    if stop:
+        on_expiry(launch, poll_stop_site(launch, _SITE_OWN4_OWN), route_row)
     iris_column_routes_complete(
         own, launch.copy, norm_weight, view.routes,
         _peer_addresses(view.routes, view.heaps, RANK), route_row, RANK, _WORLD,
-        _MAX_ROWS, _ROUTES_WORDS, WEIGHT_OFFSET, PEER_CACHE, False,
+        _MAX_ROWS, _ROUTES_WORDS, WEIGHT_OFFSET, PEER_CACHE, False, launch,
+        on_expiry, _SITE_OWN4,
     )  # fmt: skip
 
 
@@ -436,6 +535,7 @@ def fin(
     owner,
     route_weights,
     norm_weight,
+    on_expiry: gl.constexpr,
     EPS: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
 ):
@@ -443,8 +543,9 @@ def fin(
     token's 8 routes and every rank's sums of squares (H5), then the routed
     RMSNorm and weighted route sum over those 512 columns (FP32 [512])."""
     loaded, squares = iris_column_routes_wait(
-        view.routes, launch.copy, token, owner, _WORLD, _MAX_ROWS, _ROUTES_WORDS, False
-    )
+        view.routes, launch.copy, token, owner, _WORLD, _MAX_ROWS, _ROUTES_WORDS, False,
+        launch, on_expiry, _SITE_FIN,
+    )  # fmt: skip
     return iris_column_routes_combine(
         loaded, squares, route_weights, norm_weight, token, owner, EPS, WEIGHT_OFFSET
     )
@@ -470,6 +571,129 @@ def h6_sink(
         _WORLD, HIDDEN_LOCAL, _H6_SLOT, BLOCK_M, OUTPUTS, gl.num_warps(), PEER_CACHE,
         ".wt",
     )  # fmt: skip
+
+
+@gluon.jit
+def unp_sums_publish(view, launch, sums, sender, rows):
+    """UNP ``sender`` (0-7) of this XCD publishes its FP32 [16, SUMS] norm-sum
+    partials (rows < rows) to its XCD's RED: one (value, tag) pair each; the
+    pairs of rows [rows, 16) are zeroed."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]
+    )
+    values = gl.convert_layout(sums, layout).to(gl.int32, bitcast=True)
+    row = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+    which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, layout))
+    slot = ((launch.xcd * 8 + sender) * _MAX_ROWS + row[:, None]) * _SUMS + which[
+        None, :
+    ]
+    valid = (row < rows)[:, None] & (which >= 0)[None, :]
+    store_pairs(view.red_in + slot, values, launch, valid, "gpu")
+    # Rows past ``rows`` get tag 0, which never matches (TAG-LIVE).
+    gl.atomic_store(
+        view.red_in + slot,
+        gl.zeros_like(slot).to(gl.int64),
+        mask=(row >= rows)[:, None] & (which >= 0)[None, :],
+        sem="relaxed",
+        scope="gpu",
+    )
+
+
+@gluon.jit
+def red_sums(view, launch, rows, on_expiry: gl.constexpr, RANK: gl.constexpr, PEER_CACHE: gl.constexpr,):  # fmt: skip
+    """RED of this XCD: wait for its 8 senders' partials of rows < rows (at
+    most 16), add them in FP32 (the same reduction on every rank), and push
+    the [row][SUMS] totals as tagged int64 words to slot (RANK, xcd) of every
+    rank's h6_sums; rows [rows, MAX_ROWS) of the slot are zeroed (TAG-LIVE).
+    Needs 8 waves (one pair per lane)."""
+    gl.static_assert(gl.num_warps() == 8)
+    poll: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [8, 1], [1, 0])
+    sender = gl.arange(0, 8, layout=gl.SliceLayout(1, poll))
+    entry = gl.arange(0, 16 * _SUMS, layout=gl.SliceLayout(0, poll))
+    slot = ((launch.xcd * 8 + sender[:, None]) * _MAX_ROWS) * _SUMS + entry[None, :]
+    valid = (sender >= 0)[:, None] & (entry // _SUMS < rows)[None, :]
+    values, seen = poll_pairs(view.red_in + slot, valid, launch, "gpu")
+    if not seen:
+        on_expiry(launch, poll_stop_site(launch, _SITE_RED), 0)
+    totals = gl.sum(values.to(gl.float32, bitcast=True), 0)  # [16 * SUMS]
+    push: gl.constexpr = gl.BlockedLayout([1, 4], [32, 2], [gl.num_warps(), 1], [1, 0])
+    row = gl.arange(0, _MAX_ROWS, layout=gl.SliceLayout(1, push))
+    which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, push))
+    flat = row[:, None] * _SUMS + which[None, :]
+    total = gl.convert_layout(
+        gl.reshape(totals, [16, _SUMS]),
+        gl.BlockedLayout([1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]),
+    )
+    # Rows 16-31 of a [32, SUMS] slot hold zeros (and tag 0): never current.
+    padded = gl.join(total, gl.zeros_like(total))
+    padded = gl.convert_layout(
+        gl.reshape(gl.permute(padded, [2, 0, 1]), [_MAX_ROWS, _SUMS]), push
+    )
+    live = (row < rows)[:, None] & (which >= 0)[None, :]
+    words = gl.where(
+        live,
+        (launch.tag.to(gl.int64) << 32)
+        | (padded.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF),
+        0,
+    )
+    destination_slot = (RANK * 8 + launch.xcd) * (_MAX_ROWS * _SUMS) + flat
+    peers = _peer_addresses(view.h6_sums, view.heaps, RANK)
+    for peer in gl.static_range(_WORLD):
+        destination = gl.multiple_of(peers[peer].to(gl.pointer_type(gl.int64)), 16)
+        if peer == RANK:
+            gl.amd.cdna4.buffer_store(words, destination, destination_slot, cache=".wt")
+        else:
+            gl.amd.cdna4.buffer_store(
+                words, destination, destination_slot, cache=PEER_CACHE
+            )
+
+
+@gluon.jit
+def h6_sums_wait(view, launch, row, on_expiry: gl.constexpr):
+    """The FFN boundary's norm sums of ``row`` from every rank's 8 REDs:
+    FP32 [64 sources (rank, xcd), SUMS], polled on their tags (one pair per
+    lane), returned with the sources over a wave's lanes and the SUMS sums
+    of a source in one lane (deferred_norm_scales_gfx950's layout)."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [16, 4], [gl.num_warps(), 1], [1, 0]
+    )
+    source = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
+    which = gl.arange(0, _SUMS, layout=gl.SliceLayout(0, layout))
+    slot = (source[:, None] * _MAX_ROWS + row) * _SUMS + which[None, :]
+    valid = (source >= 0)[:, None] & (which >= 0)[None, :]
+    values, seen = poll_pairs(view.h6_sums + slot, valid, launch, "sys")
+    if not seen:
+        on_expiry(launch, poll_stop_site(launch, _SITE_H6_SUMS), row)
+    sums_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
+    return gl.convert_layout(values.to(gl.float32, bitcast=True), sums_layout)
+
+
+@gluon.jit
+def iris_fail_stop(launch, site, detail):
+    """The fused layer's ``on_expiry``: stop every rank's waits, then record
+    the failure and trap (fail_stop); never returns.
+
+    Callable from any subset of waves. Each calling wave stores the abort
+    marker ``(rank + 1) << 16 | site`` (the origin, for every rank's record)
+    into every rank's abort word, system scope; the addresses come from the
+    error words' caller lines that MuseNativeIrisState fills.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    lane = gl.arange(0, 64 * gl.num_warps(), layout) % 64
+    table = launch.error_ptr.to(gl.pointer_type(gl.int64), bitcast=True)
+    peer = gl.load(table + _ERROR_CALLER // 2 + lane, mask=lane < 8, other=0)
+    rank = gl.load(launch.error_ptr + _ERROR_CALLER + 16 + lane * 0)
+    marker = ((rank + 1) << 16) | site
+    gl.atomic_store(
+        (peer + 4 * _ERROR_ABORT).to(gl.pointer_type(gl.int32)),
+        marker,
+        mask=lane < 8,
+        sem="relaxed",
+        scope="sys",
+    )
+    fail_stop(launch, site, detail)
 
 
 class MuseNativeIrisState:
@@ -498,6 +722,10 @@ class MuseNativeIrisState:
         self.h6 = peers.ctx.empty((2 * H6_WORDS,), dtype=torch.int32)
         for area in (self.h1, self.h3, self.routes, self.h6):
             area.fill_(empty)
+        self.h6_sums = peers.ctx.zeros((H6_SUM_WORDS,), dtype=torch.int64)
+        self.red_in = torch.zeros(
+            (RED_IN_WORDS,), dtype=torch.int64, device=peers.device
+        )
         self.box = torch.full(
             (2 * BOX_WORDS,), BOX_EMPTY_WORD - (1 << 32), dtype=torch.int32,
             device=peers.device,
@@ -506,6 +734,16 @@ class MuseNativeIrisState:
             (2 * H4_OWN_WORDS,), empty, dtype=torch.int32, device=peers.device
         )
         self.heaps = tuple(int(address) for address in peers.addresses[:WORLD_SIZE])
+        # The launch's error words, on the heap so that iris_fail_stop can
+        # store every rank's abort word; their caller lines hold the peers'
+        # addresses of them (int64) and this rank.
+        self.errors = peers.ctx.zeros((ERROR_WORDS,), dtype=torch.int32)
+        offset = self.errors.data_ptr() - self.heaps[peers.rank]
+        caller = self.errors[ERROR_CALLER:]
+        caller[:16].view(torch.int64).copy_(
+            torch.tensor([base + offset for base in self.heaps], dtype=torch.int64)
+        )
+        caller[16] = peers.rank
 
     @staticmethod
     def heap_bytes() -> int:
@@ -516,13 +754,15 @@ class MuseNativeIrisState:
             + allocation_bytes((2 * H3_WORDS,), torch.int32)
             + allocation_bytes((2 * ROUTES_WORDS,), torch.int32)
             + allocation_bytes((2 * H6_WORDS,), torch.int32)
+            + allocation_bytes((ERROR_WORDS,), torch.int32)
+            + allocation_bytes((H6_SUM_WORDS,), torch.int64)
         )
 
     def view_args(self) -> tuple:
         """Kernel arguments that build :class:`MuseNativeView` in order:
         ``heaps`` (a tuple of 8 int64), rank, then box, h1, h1_sums, h3,
-        h4_own, routes, h6."""
+        h4_own, routes, h6, red_in, h6_sums."""
         return (
             self.heaps, self.peers.rank, self.box, self.h1, self.h1_sums, self.h3,
-            self.h4_own, self.routes, self.h6,
+            self.h4_own, self.routes, self.h6, self.red_in, self.h6_sums,
         )  # fmt: skip

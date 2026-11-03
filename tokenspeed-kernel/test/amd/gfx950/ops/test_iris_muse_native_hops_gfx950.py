@@ -51,6 +51,9 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (  #
     iris_column_routes_push,
     iris_column_routes_wait,
 )
+from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+    persistent_compile_options,
+)
 
 _WORLD = 8
 _STAGE = gl.constexpr(32 * ((2 * _WORLD - 1) * 2048 + _WORLD * _WORLD * 8))
@@ -74,7 +77,7 @@ def _compile(fn, signature, constexprs, num_warps=8):
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": num_warps},
+        options={"num_warps": num_warps, **persistent_compile_options()},
     ).asm["amdgcn"]
 
 
@@ -91,7 +94,7 @@ def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.const
     iris_column_routes_push(partial, row, 1, copy, regions, RANK, 8, 32, _STAGE, ".wt")
     iris_column_routes_complete(
         partial, copy, norm_weight, region, regions, row, RANK, 8, 32,
-        _STAGE, 0.0, ".wt", False,
+        _STAGE, 0.0, ".wt", False, None, None, 0,
     )  # fmt: skip
 
 
@@ -99,7 +102,7 @@ def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.const
 def _fin_kernel(route_weights, norm_weight, region, out, token, owner, copy):
     """FIN for (token, owner): wait + routed norm + weighted sum."""
     loaded, squares = iris_column_routes_wait(
-        region, copy, token, owner, 8, 32, _STAGE, False
+        region, copy, token, owner, 8, 32, _STAGE, False, None, None, 0
     )
     combined = iris_column_routes_combine(
         loaded, squares, route_weights, norm_weight, token, owner, 1e-6, 0.0
@@ -159,7 +162,7 @@ def _xn_kernel(local_input, weight, packed, scales, region, regions, row, copy,R
     )
     words = iris_lamport_allgather_wait(
         region, local_words, row * 256, stages, RANK, 8, 512, 4096, STAGE_WORDS, 8192,
-        False, True,
+        False, True, None, None, 0,
     )  # fmt: skip
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 16], [1, 64], [gl.num_warps(), 1], [1, 0]
@@ -226,25 +229,29 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  
     h3_sink,
     h4_sink,
     h6_sink,
+    h6_sums_wait,
+    iris_fail_stop,
     own1,
     own4_complete,
+    red_sums,
+    unp_sums_publish,
     xn_wait,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
-    Launch,
-    persistent_compile_options,
-)
+from tokenspeed_kernel_amd.ops.gfx950.persistent import Launch  # noqa: E402
 
 _VIEW = {
     "heaps": ("i64",) * 8, "rank": "i32", "box": "*i32", "h1": "*bf16", "h1_sums": "*i64",
     "h3": "*bf16", "h4_own": "*i32", "routes": "*i32", "h6": "*bf16",
+    "red_in": "*i64", "h6_sums": "*i64",
 }  # fmt: skip
 
 
 @gluon.jit
-def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
+def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
     """Each fused-layer hop end on the view, at 8 waves, by ROLE."""
-    view = MuseNativeView(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6)
+    view = MuseNativeView(
+        heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+    )
     zero = gl.program_id(0) * 0
     launch = Launch(
         gl.program_id(0), zero, zero, copy.to(gl.int64) + 2, zero + 7, copy, zero,
@@ -260,14 +267,14 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, er
         h1_rs_sink(view, launch, out, 5, rows, 3, ".wt")
     elif ROLE == "own1":
         own1(view, launch, 2, rows, floats, words.to(gl.pointer_type(gl.bfloat16),
-             bitcast=True), floats, floats, 3, 0.0, True, ".wt")  # fmt: skip
+             bitcast=True), floats, floats, iris_fail_stop, 3, 0.0, True, ".wt")  # fmt: skip
     elif ROLE == "h3":
         layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [8, 1], [1, 0])
         r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
         c = gl.arange(0, 64, layout=gl.SliceLayout(0, layout))
         h3_sink(view, launch, gl.load(floats + r[:, None] * 64 + c[None, :]), 4, rows,
                 16, 3, ".wt")  # fmt: skip
-        got = xn_wait(view, launch, 1, 3)
+        got = xn_wait(view, launch, 1, iris_fail_stop, 3)
         gl.store(
             words
             + gl.arange(0, 64, gl.SliceLayout(0, gl.SliceLayout(2, got.type.layout))),
@@ -282,11 +289,22 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, er
         h4_sink((view, launch), y, route, (1024 + c)[None, :])
     elif ROLE == "own4":
         own4_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
-                      bitcast=True), 3, 0.0, ".wt")  # fmt: skip
+                      bitcast=True), iris_fail_stop, 3, 0.0, ".wt")  # fmt: skip
     elif ROLE == "fin":
         combined = fin(view, launch, 1, 2, floats, words.to(gl.pointer_type(gl.bfloat16),
-                       bitcast=True), 1e-6, 0.0)  # fmt: skip
+                       bitcast=True), iris_fail_stop, 1e-6, 0.0)  # fmt: skip
         gl.store(floats + gl.arange(0, 512, layout=combined.type.layout), combined)
+    elif ROLE == "red":
+        layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [8, 1], [1, 0])
+        r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+        c = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
+        unp_sums_publish(
+            view, launch, gl.load(floats + r[:, None] * 4 + c[None, :]), 3, rows
+        )
+        red_sums(view, launch, rows, iris_fail_stop, 3, ".wt")
+        sums = h6_sums_wait(view, launch, 1, iris_fail_stop)
+        s4 = gl.arange(0, 4, layout=gl.SliceLayout(0, sums.type.layout))
+        gl.store(floats + s4, gl.sum(sums, 0))
     else:
         layout: gl.constexpr = gl.BlockedLayout([1, 16], [64, 1], [8, 1], [1, 0])
         r = gl.arange(0, 8, layout=gl.SliceLayout(1, layout))
@@ -296,7 +314,7 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, er
 
 
 @pytest.mark.parametrize(
-    "role", ["clear", "h1", "own1", "h3", "h4", "own4", "fin", "h6"]
+    "role", ["clear", "h1", "own1", "h3", "h4", "own4", "fin", "h6", "red"]
 )
 def test_fused_layer_hop_compiles_at_8_waves(role):
     """Every hop end of the fused layer compiles at 8 waves, with no L2
@@ -307,7 +325,20 @@ def test_fused_layer_hop_compiles_at_8_waves(role):
     assembly = _compile(_layer_hops_kernel, signature, {"ROLE": role})
     assert "buffer_inv" not in assembly and "buffer_wbl2" not in assembly
     assert re.search(r"\.private_segment_fixed_size:\s+0|ScratchSize: 0", assembly)
-    if role in ("h1", "own1", "h3", "h4", "own4", "h6"):
+    if role in ("own1", "h3", "own4", "fin", "red"):
+        # Every poll loop reads the clock (deadline) on its retry path, and
+        # the failure path traps after storing the peers' abort words.
+        from asm_checks import _clock_on_retry_path, _innermost_loop_lines
+
+        raw = assembly.splitlines()
+        polls = [
+            set(lines)
+            for lines in _innermost_loop_lines(assembly).values()
+            if any(re.search(r"_load_dword\w* .*sc1", raw[i]) for i in lines)
+        ]
+        assert polls and all(_clock_on_retry_path(raw, loop) for loop in polls)
+        assert "s_trap 2" in assembly
+    if role in ("h1", "own1", "h3", "h4", "own4", "h6", "red"):
         assert re.search(r"(buffer|global)_(store|atomic)\w* .*sc0 sc1", assembly)
     if role == "clear":
         lines = instruction_lines(assembly)
