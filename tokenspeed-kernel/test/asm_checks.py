@@ -21,7 +21,9 @@
 """Text checks on gfx950 assembly that kernel codegen tests share.
 
 Pure functions of the assembly text: no device, no Triton import, so the
-offline compile tests can use them on hosts without a GPU.
+offline compile tests can use them on hosts without a GPU. The source
+attribution (:func:`source_lines`, :func:`frame_functions`) also reads the
+Python files the ``.file`` directives name.
 """
 
 from __future__ import annotations
@@ -674,3 +676,48 @@ def source_lines(assembly: str) -> list[SourceLine]:
         ):
             result.append(SourceLine(index, line.split(";", 1)[0].strip(), frames))
     return result
+
+
+def call_site(line: SourceLine, file_name: str, first: int, last: int) -> int | None:
+    """The outermost frame of ``line`` in ``file_name`` within source lines
+    ``first..last`` (for example a kernel function's body): the call site
+    inside that function the instruction belongs to."""
+    sites = [n for f, n in line.frames if f == file_name and first <= n <= last]
+    return sites[-1] if sites else None
+
+
+def frame_functions(assembly: str):
+    """Return ``names(frames) -> list[str]``: the Python function names of a
+    line's frames, innermost first, from the source files the ``.file``
+    directives name (functions found with :mod:`ast`)."""
+    import ast
+    from pathlib import Path
+
+    spans: dict[str, list[tuple[int, int, str]]] = {}
+    for directory, name in re.findall(
+        r'^\s*\.file\s+\d+\s+"([^"]*)"\s+"([^"]*)"', assembly, re.M
+    ):
+        if name in spans or not name.endswith(".py"):
+            continue
+        path = Path(directory) / name
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text())
+        spans[name] = [
+            (node.lineno, node.end_lineno, node.name)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+
+    def function(name: str, line: int) -> str:
+        # The innermost (latest-starting) definition that spans the line.
+        best = max(
+            (span for span in spans.get(name, ()) if span[0] <= line <= span[1]),
+            default=None,
+        )
+        return best[2] if best else "?"
+
+    def names(frames: list[tuple[str, int]]) -> list[str]:
+        return [function(name, line) for name, line in frames]
+
+    return names
