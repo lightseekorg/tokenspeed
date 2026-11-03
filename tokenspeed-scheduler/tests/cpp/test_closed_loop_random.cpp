@@ -46,10 +46,11 @@
 // everything is acknowledged, no Host entry is pinned and nothing is in
 // flight.
 //
-// The demotion runs turn superseded checkpoint demotion on and draw
-// conversations: most prompts are the next turn of a finished one, which
-// renders its last tokens anew, so a turn resumes at the in-forward
-// checkpoint the turn before wrote and chains of them form.
+// The demotion runs turn superseded checkpoint demotion on, with the
+// in-forward checkpoints it requires (so the dead prompt ends and finishes
+// they skip as well), and draw conversations: most prompts are the next turn
+// of a finished one, which renders its last tokens anew, so a turn resumes at
+// the in-forward checkpoint the turn before wrote and chains of them form.
 //
 // The random runs acknowledge op by op, out of order and now and then twice.
 // The mirrored runs drive two schedulers of one seed, as two ranks of a

@@ -928,12 +928,13 @@ protected:
 TEST_F(CheckpointDemotionSuite, TheCheckpointTwoTurnsBackLeavesTheHostBeforeAnIdleConversation) {
     for (const bool demote : {false, true}) {
         SCOPED_TRACE(demote);
-        Rebuild(demote, /*device_pages=*/257, /*host_pages=*/26);
+        Rebuild(demote, /*device_pages=*/257, /*host_pages=*/18);
         ASSERT_EQ(Turn("x", XTurnOne()), 0);
         ThreeTurns();
-        // X: five pages, its tail and two checkpoints (20 and its prompt end);
-        // A: as many for turn 1, then a page, a tail and two checkpoints a turn.
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 24);
+        // X: five pages and its checkpoint at 20, its prompt end being dead
+        // (the in-forward checkpoint covers it); A: as many for turn 1, then a
+        // page and a checkpoint a turn.
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 16);
         ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 1);
         EXPECT_EQ(scheduler_->DemotedCheckpointEntries(), demote ? 2u : 0u) << "C(20)'s State on both tiers";
         Turn("filler", MakeTokens(4, 9000));
@@ -959,15 +960,17 @@ TEST_F(CheckpointDemotionSuite, TheCheckpointTwoTurnsBackLeavesTheHostBeforeAnId
 
 // The same pressure on the Device alone: X and A's three turns leave four
 // parents free, and a contender needs five. Without demotion its victims are
-// X's prompt end, its KV tail and the state there, so a prompt extending X's
-// resumes earlier; with demotion the one victim is C(20)'s State entry.
+// X's oldest entries, its checkpoint at 20 among them (its prompt end is dead,
+// never published), so a prompt extending X's resumes at nothing; with
+// demotion the one victim is C(20)'s State entry, and that prompt resumes at
+// X's checkpoint.
 TEST_F(CheckpointDemotionSuite, TheCheckpointTwoTurnsBackLeavesTheDeviceBeforeAnIdleConversation) {
     for (const bool demote : {false, true}) {
         for (const char* probe : {"a-next", "a-diverging", "a-fork", "x-extended"}) {
             SCOPED_TRACE(testing::Message() << "demote=" << demote << " probe=" << probe);
             // Each probe runs on a fresh copy of the state: in a pool this
             // small a probe's own admission evicts.
-            Rebuild(demote, /*device_pages=*/29, /*host_pages=*/0);
+            Rebuild(demote, /*device_pages=*/21, /*host_pages=*/0);
             ASSERT_EQ(Turn("x", XTurnOne()), 0);
             ThreeTurns();
             ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 4);
@@ -981,7 +984,7 @@ TEST_F(CheckpointDemotionSuite, TheCheckpointTwoTurnsBackLeavesTheDeviceBeforeAn
             } else if (name == "a-fork") {
                 EXPECT_EQ(ProbeResume(probe, AFork()), demote ? 0 : 20);
             } else {
-                EXPECT_EQ(ProbeResume(probe, Extend(XTurnOne(), 960, 4)), demote ? 22 : 20);
+                EXPECT_EQ(ProbeResume(probe, Extend(XTurnOne(), 960, 4)), demote ? 20 : 0);
             }
         }
     }
@@ -989,13 +992,15 @@ TEST_F(CheckpointDemotionSuite, TheCheckpointTwoTurnsBackLeavesTheDeviceBeforeAn
 
 // The same Device pressure under the write-back policy, the Host large: the
 // contender's admission writes back what it evicts. Without demotion that is
-// X's prompt end, its tail block and its state; with demotion C(20)'s State
-// entry, dropped instead of written back, so nothing reaches the Host.
+// X's whole chain, a victim set that leaves whole: its five pages and its
+// checkpoint at 20 (its prompt end is dead, never published); with demotion
+// C(20)'s State entry, dropped instead of written back, so nothing reaches the
+// Host.
 TEST_F(CheckpointDemotionSuite, UnderWriteBackTheDemotedCheckpointIsDroppedNotWrittenBack) {
     write_policy_ = SchedulerConfig::HostWritePolicy::kWriteBack;
     for (const bool demote : {false, true}) {
         SCOPED_TRACE(demote);
-        Rebuild(demote, /*device_pages=*/29, /*host_pages=*/65);
+        Rebuild(demote, /*device_pages=*/21, /*host_pages=*/65);
         ASSERT_EQ(Turn("x", XTurnOne()), 0);
         ThreeTurns();
         ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 4);
@@ -1003,10 +1008,10 @@ TEST_F(CheckpointDemotionSuite, UnderWriteBackTheDemotedCheckpointIsDroppedNotWr
         EXPECT_EQ(scheduler_->DemotedCheckpointEntries(), demote ? 1u : 0u);
         Turn("contender", MakeTokens(8, 9000));
         const HostCacheStats stats = scheduler_->GetHostCacheStats();
-        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), demote ? 0 : 2);
-        EXPECT_EQ(stats.eviction_stores.blocks[1], demote ? 0u : 1u) << "X's prompt-end state, or no State block";
+        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), demote ? 0 : 6);
+        EXPECT_EQ(stats.eviction_stores.blocks[1], demote ? 0u : 1u) << "X's checkpoint at 20, or no State block";
         EXPECT_EQ(stats.demoted_entries_not_written_back, demote ? 1u : 0u) << "C(20)'s State block";
-        EXPECT_EQ(stats.device_evictions.admission.blocks, demote ? 1u : 2u) << "counted as the admission's";
+        EXPECT_EQ(stats.device_evictions.admission.blocks, demote ? 1u : 6u) << "counted as the admission's";
         EXPECT_EQ(ProbeResume("x-next", XNext()), 20);
     }
 }
@@ -1020,7 +1025,7 @@ TEST_F(CheckpointDemotionSuite, UnderWriteBackTheHostGetsAllButTheDemotedCheckpo
     write_policy_ = SchedulerConfig::HostWritePolicy::kWriteBack;
     for (const bool demote : {false, true}) {
         SCOPED_TRACE(demote);
-        Rebuild(demote, /*device_pages=*/21, /*host_pages=*/129);
+        Rebuild(demote, /*device_pages=*/15, /*host_pages=*/129);
         ThreeTurns();
         ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 4);
         for (const std::int32_t contender : {1, 2, 3}) {
@@ -1045,19 +1050,17 @@ TEST_F(CheckpointDemotionSuite, UnderWriteBackTheHostGetsAllButTheDemotedCheckpo
 }
 
 // Under the write-back policy, turn 3's own admission evicts C(20) and the
-// test holds that copy's ACK past turn 3's finish. (Two probes extending turns
-// 1 and 2 touch every other entry first, so C(20) is the oldest one turn 3
-// does not hold.) The demotion then finds C(20) on neither tier but on its way
-// to the Host, and dates it back there: it lands demoted, still resumable.
+// test holds that copy's ACK past turn 3's finish. (The prompt ends being
+// dead, C(20) is the one cached entry turn 3 does not hold.) The demotion then
+// finds C(20) on neither tier but on its way to the Host, and dates it back
+// there: it lands demoted, still resumable.
 TEST_F(CheckpointDemotionSuite, ACheckpointOnItsWayToTheHostIsDemotedThere) {
     write_policy_ = SchedulerConfig::HostWritePolicy::kWriteBack;
     for (const bool demote : {false, true}) {
         SCOPED_TRACE(demote);
-        Rebuild(demote, /*device_pages=*/16, /*host_pages=*/65);
+        Rebuild(demote, /*device_pages=*/12, /*host_pages=*/65);
         ASSERT_EQ(Turn("a1", MakeTokens(22)), 0);
         ASSERT_EQ(Turn("a2", TurnTwo()), 20);
-        ASSERT_EQ(ProbeResume("a1-extended", Extend(MakeTokens(22), 970, 4)), 22);
-        ASSERT_EQ(ProbeResume("a2-extended", Extend(TurnTwo(), 980, 4)), 25);
         ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 3);
         std::vector<std::uint32_t> held;
         ASSERT_EQ(Prefill("a3", TurnThree(), &held), 24);
