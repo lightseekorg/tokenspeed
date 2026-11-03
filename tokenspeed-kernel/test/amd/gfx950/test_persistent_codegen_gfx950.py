@@ -50,6 +50,11 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     store_pairs,
     wait_vmcnt,
 )
+from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (  # noqa: E402
+    scalar_load_glc,
+    scalar_load_glc_i64,
+    wave_index,
+)
 
 _LOADS = 4
 # The serving entry form (vector counters), for tests of what follows it.
@@ -424,3 +429,38 @@ def test_launch_tag_is_a_scalar():
         # vector compare on every retry.
         assert re.search(r"s_cmp_(eq|lg)_u32 s\d+, s\d+", loop), loop
         assert "v_readfirstlane" not in loop
+
+
+@gluon.jit
+def _scalar_loads_kernel(words, pairs, out):
+    """Per-wave scalar loads whose addresses die at the load (the case where
+    the result could reuse the address registers)."""
+    wave = wave_index()
+    a = scalar_load_glc(words + gl.program_id(0) * 32 + wave * 2)
+    b = scalar_load_glc_i64(pairs + gl.program_id(0) * 16 + wave)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [8], [0])
+    lane = gl.arange(0, 512, lanes)
+    gl.store(out + lane, gl.zeros([512], gl.int64, lanes) + a + b)
+
+
+def _sgprs(operand):
+    """The SGPR numbers of ``s7`` or ``s[4:5]``."""
+    m = re.fullmatch(r"s(\d+)|s\[(\d+):(\d+)\]", operand)
+    first = int(m.group(1) or m.group(2))
+    return set(range(first, int(m.group(3) or first) + 1))
+
+
+def test_scalar_load_results_never_share_the_address_registers():
+    """The scalar load helpers' results are early-clobber outputs: a load
+    never writes the registers holding its own address."""
+    assembly = _compile(
+        _scalar_loads_kernel, {"words": "*i32", "pairs": "*i64", "out": "*i64"}
+    )
+    loads = [
+        l.split(None, 1)[1].split(", ")[:2]
+        for l in instruction_lines(assembly)
+        if re.match(r"s_load_dword\w* .* glc", l)
+    ]
+    assert len(loads) == 2
+    for dst, base in loads:
+        assert not _sgprs(dst) & _sgprs(base), (dst, base)
