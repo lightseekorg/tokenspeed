@@ -583,14 +583,14 @@ the attention has no attention-side parallel communication, no FP8 o-projection
 input, and an output gate on MLA; `attention_supports()` in
 `_cute_dsl/k3_decode_support.py` checks the projections the kernels serve
 (BF16, this model's TP8 KDA and MLA input projections, and a 1536-wide
-o-projection shard). Each layer then:
+o-projection shard). Each layer then does the following:
 
-1. Adds the previous feed-forward output to the residual prefix and mixes it
+1. Add the previous feed-forward output to the residual prefix and mix it
    with the block snapshots (AttnRes), reading a MoE layer's output row
    straight from the tail's ring.
-2. Runs the packed input projection as a split-K GEMM with per-batch tactics.
-3. Runs the attention core as usual.
-4. Multiplies by this rank's o-projection shard and multicasts the partial;
+2. Run the packed input projection as a split-K GEMM with per-batch tactics.
+3. Run the attention core as usual.
+4. Multiply by this rank's o-projection shard and multicast the partial;
    a consumer kernel sums the partials, updates the prefix, and applies the
    post-attention AttnRes. Above 32 rows each rank sums its column share and
    multicasts it back (two-shot) instead of reading every rank's partial.
