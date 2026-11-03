@@ -37,7 +37,8 @@ state them itself.
   issued only after the wave waited for the other's load.
 - :func:`issue_order`: a point vector memory operations do not cross, so a
   wave issues the ones before it first (the queue then completes them first).
-- :func:`lds_store_count` and :func:`lds_spin_until`: an LDS exchange among
+- :func:`lds_store_count`, :func:`lds_spin_until` and
+  :func:`lds_spin_bounded`: an LDS exchange among
   the waves of a workgroup that the compiler does not model, so it adds no
   barrier. The waves share LDS and one wave's LDS operations complete in
   issue order: a wave that sees a counter value also sees every store its
@@ -163,3 +164,32 @@ def lds_spin_until(count, counter, target):
         [counter.type, counter.type],
         is_pure=False,
     )
+
+
+# LDS reads per call of lds_spin_bounded: the caller checks its deadline
+# between calls, as often as poll_check expects (every 64 retries).
+LDS_SPIN_TRIES = 64
+_SPIN_BOUNDED_ASM = gl.constexpr(
+    f"v_add_u32 $1, $3, $4\n\ts_mov_b32 $2, {LDS_SPIN_TRIES}\n1:\n\t"
+    "ds_read_b32 $0, $1\n\ts_waitcnt lgkmcnt(0)\n\t"
+    "v_cmp_lt_u32 vcc, $0, $5\n\ts_cbranch_vccz 2f\n\t"
+    "s_add_i32 $2, $2, -1\n\ts_cmp_lg_u32 $2, 0\n\ts_cbranch_scc1 1b\n2:"
+)
+
+
+@gluon.jit
+def lds_spin_bounded(count, counter, target):
+    """:func:`lds_spin_until` for at most ``LDS_SPIN_TRIES`` reads; returns
+    the last value read (one per lane, the same in every lane). The caller
+    loops until it reaches ``target``, checking its deadline between calls
+    (``poll_check``), so a writer that never arrives fails the launch instead
+    of hanging it.
+    """
+    old, _addr, _left = gl.inline_asm(
+        _SPIN_BOUNDED_ASM,
+        "=&v,=&v,=&s,s,v,v,~{vcc},~{scc},~{memory}",
+        [count, counter, target],
+        [counter.type, counter.type, counter.type],
+        is_pure=False,
+    )
+    return old

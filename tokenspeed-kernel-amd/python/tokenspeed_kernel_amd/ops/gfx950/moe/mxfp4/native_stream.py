@@ -89,13 +89,15 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     enter_issue,
     fail_stop,
     persistent_compile_options,
+    poll_check,
     poll_tags16,
     release_drain,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.arena import UncachedBuffer
 from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import (
+    LDS_SPIN_TRIES,
     after,
-    lds_spin_until,
+    lds_spin_bounded,
     lds_store_count,
     opaque_zero,
     wave_scalar,
@@ -149,6 +151,11 @@ UNIT_BYTES = UNIT_COLUMNS * INTER // 2 + UNIT_COLUMNS * INTER // 32
 # Failure site of a down unit's readiness wait (detail: the expert's rank).
 SITE_MOE_READY = FIRST_KERNEL_SITE + 8
 _SITE_MOE_READY = gl.constexpr(SITE_MOE_READY)
+# Failure site of a quad's mids exchange wait (detail: ``(rank * 16 + group)
+# * 2 + quad`` of the group being exchanged).
+SITE_MOE_QUAD = FIRST_KERNEL_SITE + 9
+_SITE_MOE_QUAD = gl.constexpr(SITE_MOE_QUAD)
+_LDS_SPIN_TRIES = gl.constexpr(LDS_SPIN_TRIES)
 _XCDS = gl.constexpr(XCDS)
 _HIDDEN = gl.constexpr(HIDDEN)
 _TAIL_FIRST = gl.constexpr(TAIL_FIRST)
@@ -1032,6 +1039,27 @@ def _load_a_scale(mids_sd, route_s, kt: gl.constexpr, live):
 
 
 @gluon.jit
+def _wait_quad(ctx, ex_count, counter, target, detail):
+    """Wait until the quad's exchange counter (byte ``counter`` into the
+    shared ``ex_count``) reaches ``target``: all 4 waves stored the group's
+    SwiGLU values. LDS reads only; the deadline is checked between bounded
+    spins and fails the launch with ``SITE_MOE_QUAD``."""
+    lane: gl.constexpr = _layouts()[6]
+    offsets = counter + gl.zeros([64 * gl.num_warps()], gl.int32, lane)
+    goal = target + gl.zeros([64 * gl.num_warps()], gl.int32, lane)
+    seen = wave_scalar(lds_spin_bounded(ex_count, offsets, goal))
+    start = gl.to_tensor(0).to(gl.int64)
+    retries = 0
+    stop = retries < 0
+    while (seen < target) & (not stop):
+        retries += _LDS_SPIN_TRIES
+        stop, start = poll_check(ctx, start, retries, True)
+        seen = wave_scalar(lds_spin_bounded(ex_count, offsets, goal))
+    if stop:
+        fail_stop(ctx, _SITE_MOE_QUAD, detail)
+
+
+@gluon.jit
 def _wait_ready(ctx, tags, rank, TAG_GLC: gl.constexpr):
     """Wait until every group tag of the expert at ``rank`` carries this
     launch's tag (64 words: 16 groups x 4 strips, each published by its
@@ -1279,7 +1307,13 @@ def run_moe(
         )
         counter = (par * 2 + plan.quad) * 4
         lds_store_count(ex, offs, mid, ex_count, counter + offs * 0)
-        lds_spin_until(ex_count, counter + lanes * 0, 256 * (k // 2 + 1) + lanes * 0)
+        _wait_quad(
+            ctx,
+            ex_count,
+            counter,
+            256 * (k // 2 + 1),
+            (rank * 16 + group) * 2 + plan.quad,
+        )
         packed, sbyte = _mxfp4_quantize_tile_in_layout(ex.index(par).load(quant))
         PL: gl.constexpr = packed.type.layout
         rho = gl.arange(0, 32, layout=gl.SliceLayout(1, PL))

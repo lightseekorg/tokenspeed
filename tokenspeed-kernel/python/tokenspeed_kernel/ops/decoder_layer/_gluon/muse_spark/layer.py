@@ -262,7 +262,7 @@ assert all(
 assert MAX_ROWS % 16 == 0
 
 # Failure sites of the layer's own waits (fused_layer's hop ends use
-# FIRST_KERNEL_SITE + 16 .. + 22, the MoE stream + 8).
+# FIRST_KERNEL_SITE + 16 .. + 22, the MoE stream + 8 and + 9).
 SITE_RECORDS = FIRST_KERNEL_SITE + 32
 SITE_BOX = SITE_RECORDS + 1
 SITE_SUMS = SITE_RECORDS + 2
