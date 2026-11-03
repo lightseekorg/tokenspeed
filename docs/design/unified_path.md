@@ -443,8 +443,7 @@ pointer-stable: a captured graph holds their addresses forever.
 
 Kernel page tables and router write-slot buffers retain int32. Cache binding
 bounds local and virtual token slots to the int32 range, including sharded
-groups. Kernel address offsets cast the index to int64 before multiplying
-by a tensor stride. Ascend adapters accept int32 router slots and prepare
+groups. Ascend adapters accept int32 router slots and prepare
 int64 buffers only for native consumers that require them.
 
 Helpers that memoize tensors created inside capture must not return those

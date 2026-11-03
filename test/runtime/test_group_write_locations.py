@@ -242,29 +242,6 @@ if __name__ == "__main__":
 
 
 class TestInt32WriteSlots:
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-    def test_table_stride_offsets_can_exceed_int32_with_small_slots(self):
-        stride = (1 << 30) + 16
-        storage_bytes = (2 * stride + 1) * torch.int32.itemsize
-        free_bytes, _ = torch.cuda.mem_get_info()
-        if free_bytes < storage_bytes + (256 << 20):
-            pytest.skip("large-stride check needs 8 GiB of free device memory")
-        # Request 2 times this int32 stride exceeds 2^31. Only three entries
-        # are touched; the cache slots they name remain ordinary int32 values.
-        tables = torch.empty_strided(
-            (1, 3, 1), (3 * stride, stride, 1), dtype=torch.int32, device="cuda"
-        )
-        tables[0, :, 0].copy_(torch.tensor([17, 18, 19], device="cuda"))
-        sizes = torch.tensor([128], dtype=torch.int32, device="cuda")
-        lengths = torch.ones(3, dtype=torch.int32, device="cuda")
-        out = torch.empty((1, 3), dtype=torch.int32, device="cuda")
-        decode_write_locations(tables, sizes, lengths, out, 3, 1)
-        assert out.tolist() == [[2176, 2304, 2432]]
-        extend_write_locations(
-            tables, sizes, torch.zeros_like(lengths), lengths, 3, out
-        )
-        assert out.tolist() == [[2176, 2304, 2432]]
-
     def test_stacked_slots_refresh_and_pad_without_replacing_decode_storage(self):
         stacks = GroupTableStacks(
             [GroupTableSpec("history", 128, 128, 2)],

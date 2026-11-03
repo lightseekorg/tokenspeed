@@ -88,7 +88,7 @@ def compute_out_cache_loc_kernel(
         output_offset = tl.where(req_idx > 0, output_offset, 0)
     else:
         input_length = uniform_input_length
-        output_offset = req_idx.to(tl.int64) * uniform_input_length
+        output_offset = req_idx * uniform_input_length
 
     # Process tokens in blocks
     num_blocks = tl.cdiv(input_length, BLOCK_SIZE)
@@ -110,7 +110,7 @@ def compute_out_cache_loc_kernel(
         offsets_in_page = positions % page_size
 
         # Load page IDs from the batch-ordered page table.
-        page_ptrs = page_table_ptr + req_idx.to(tl.int64) * max_pages + page_indices
+        page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
         page_ids = tl.load(page_ptrs, mask=mask, other=0)
 
         # Compute physical cache locations

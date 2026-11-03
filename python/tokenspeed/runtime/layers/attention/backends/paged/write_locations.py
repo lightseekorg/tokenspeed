@@ -70,13 +70,11 @@ def _decode_locs_kernel(
     overflow = page_idx >= max_num_pages
     page_idx = tl.minimum(page_idx, max_num_pages - 1)
     page = tl.load(
-        tables_ptr + g.to(tl.int64) * stride_g + req.to(tl.int64) * stride_b + page_idx,
-        mask=mask,
-        other=0,
+        tables_ptr + g * stride_g + req * stride_b + page_idx, mask=mask, other=0
     ).to(tl.int64)
     loc = page * page_size + pos % page_size
     loc = tl.where(overflow | (page <= 0), 0, loc)
-    tl.store(out_ptr + g.to(tl.int64) * out_stride_g + tok, loc.to(tl.int32), mask=mask)
+    tl.store(out_ptr + g * out_stride_g + tok, loc.to(tl.int32), mask=mask)
 
 
 @triton.jit(do_not_specialize=["max_num_pages", "out_stride_g"])
@@ -107,19 +105,14 @@ def _extend_locs_kernel(
         overflow = page_idx >= max_num_pages
         page_idx = tl.minimum(page_idx, max_num_pages - 1)
         page = tl.load(
-            tables_ptr
-            + g.to(tl.int64) * stride_g
-            + req.to(tl.int64) * stride_b
-            + page_idx,
+            tables_ptr + g * stride_g + req * stride_b + page_idx,
             mask=mask,
             other=0,
         ).to(tl.int64)
         loc = page * page_size + pos % page_size
         loc = tl.where(overflow | (page <= 0), 0, loc)
         tl.store(
-            out_ptr + g.to(tl.int64) * out_stride_g + out_base + offs,
-            loc.to(tl.int32),
-            mask=mask,
+            out_ptr + g * out_stride_g + out_base + offs, loc.to(tl.int32), mask=mask
         )
 
 
