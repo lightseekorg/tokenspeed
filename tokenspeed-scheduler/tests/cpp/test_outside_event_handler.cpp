@@ -280,6 +280,84 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     EXPECT_EQ(stats.prefix_loads.blocks, (std::vector<std::uint64_t>{1}));
 }
 
+// The Host holds three pages here, so r_fill's store evicts r1's two (its
+// least recently used) while the Device keeps r1's first. r2 continues r1's
+// prompt: its hit stops after that page, at a page the Host evicted
+// recently, so r2's prompt past the hit counts under lru. A cold prompt
+// counts nothing.
+class EvictedThenNeededTestSuite : public LoadBackDoneTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = LoadBackDoneTestSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 4;
+        return cfg;
+    }
+
+    // Prefills, finishes and stores `spec`'s prompt.
+    void RunToStore(const RequestSpec& spec) {
+        Submit(spec);
+        PlanOnce();
+        SendForwardDone(spec.request_id, {7});
+        SendFinish(spec.request_id);
+        AckWriteBacks(PlanOnce());
+        PlanOnce();
+    }
+};
+
+TEST_F(EvictedThenNeededTestSuite, AFirstAdmissionStoppedAtAPageTheHostEvictedCountsItsMiss) {
+    RunToStore(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
+    RunToStore(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
+    const auto needed = [&] { return scheduler_->GetHostCacheStats().host_evictions.lru.evicted_then_needed_tokens; };
+    ASSERT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 2u) << "r1's two pages left the Host";
+
+    Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/1));
+    ASSERT_GE(FindRequestIndex(FindForwardBatch(PlanOnce().Operations()), "r2"), 0);
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.device_hit_tokens, 2u) << "r1's first page";
+    decltype(needed()) expected{};
+    expected.counts[0] = 1;
+    expected.sums[0] = 6 - 2;
+    EXPECT_EQ(needed().counts, expected.counts);
+    EXPECT_EQ(needed().sums, expected.sums);
+    SendForwardDone("r2", {7});
+    SendFinish("r2");
+    AckWriteBacks(PlanOnce());
+
+    Submit(MakeRequestSpec("r3", /*num_pages=*/3, /*start=*/500));
+    ASSERT_GE(FindRequestIndex(FindForwardBatch(PlanOnce().Operations()), "r3"), 0);
+    EXPECT_EQ(needed().counts, expected.counts);
+    EXPECT_EQ(needed().sums, expected.sums);
+}
+
+// An admission is counted once it succeeds, not per attempt: r_hold's
+// prefill keeps the Device's pages while it is out, so r2's first
+// admissions fail; once r_hold is aborted, r2's retry takes its pages and
+// counts. r_hold's admission took r1's first page off the Device too, so
+// r2's hit is 0.
+TEST_F(EvictedThenNeededTestSuite, AnAdmissionCountsOnceItSucceeds) {
+    RunToStore(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
+    RunToStore(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
+    Submit(MakeRequestSpec("r_hold", /*num_pages=*/3, /*start=*/500));
+    ASSERT_GE(FindRequestIndex(FindForwardBatch(PlanOnce().Operations()), "r_hold"), 0);
+    const auto needed = [&] { return scheduler_->GetHostCacheStats().host_evictions.lru.evicted_then_needed_tokens; };
+    decltype(needed()) expected{};
+
+    Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/1));
+    for (std::int32_t round = 0; round < 2; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        ASSERT_LT(FindRequestIndex(FindForwardBatch(plan.Operations()), "r2"), 0) << "r_hold holds the Device";
+        AckWriteBacks(plan);
+    }
+    EXPECT_EQ(needed().counts, expected.counts);
+    SendForwardDone("r_hold", {7});
+    SendAbortEvent("r_hold");
+    ASSERT_GE(FindRequestIndex(FindForwardBatch(PlanOnce().Operations()), "r2"), 0);
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.prompt_tokens, 2u * 2 + 3 * 2 + 3 * 2 + 3 * 2);
+    expected.counts[0] = 1;
+    expected.sums[0] = 6;
+    EXPECT_EQ(needed().counts, expected.counts);
+    EXPECT_EQ(needed().sums, expected.sums);
+}
+
 class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -588,6 +666,50 @@ TEST_F(DecodeRetractionL2TestSuite, AnAbortedVictimStopsQualifyingForReadmission
     FinishRemote("other", /*bootstrap_token=*/242);
     const ExecutionPlan after_abort = PlanOnce();
     EXPECT_EQ(FindRestore(after_abort), nullptr) << "an aborted victim must not be restored";
+}
+
+// The decode role's prompt is the prefill peer's to compute, so its
+// admissions count nothing, though its Host, which holds retraction images
+// only, evicts what they stop at. On a Host of three blocks, running's image
+// stays cached once running is aborted, until other's, when other gives way
+// to waiter in turn, evicts it. again then continues running's prompt: its
+// hit stops at running's first page, which neither tier holds.
+class DecodeEvictedThenNeededTestSuite : public DecodeRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 4;
+        return cfg;
+    }
+};
+
+TEST_F(DecodeEvictedThenNeededTestSuite, ADecodeAdmissionCountsNothing) {
+    ExecutionPlan retract;
+    DriveRunningToRetraction(retract);
+    AckImageStores(retract);
+    SendAbortEvent("running");
+    SendRemotePrefillDone("other", /*bootstrap_token=*/242);
+    Submit({MakeRequestSpec("waiter", /*num_pages=*/2, /*start=*/301)});
+    SendBootstrapped("waiter");
+    for (const std::int32_t token : {243, 244}) {
+        ASSERT_GE(FindRequestIndex(FindForwardBatch(PlanOnce().Operations()), "other"), 0);
+        SendForwardDone("other", {token});
+    }
+    const ExecutionPlan retract_other = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u) << "other gave way";
+    AckImageStores(retract_other);
+    ASSERT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 3u) << "running's image left the Host";
+
+    SendAbortEvent("other");
+    FinishRemote("blocked", /*bootstrap_token=*/142);
+    FinishRemote("waiter", /*bootstrap_token=*/342);
+    Submit({MakeRequestSpec("again", /*num_pages=*/3, /*start=*/1)});
+    SendBootstrapped("again");
+    const ExecutionPlan admission = PlanOnce();
+    ASSERT_NE(FindRemoteAdmission(admission), nullptr);
+    ASSERT_EQ(FindRemoteAdmission(admission)->request_ids, (std::vector<std::string>{"again"}));
+    EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.evicted_then_needed_tokens.counts,
+              (std::array<std::uint64_t, CacheCoordinator::kEvictedThenNeededTokenBounds.size() + 1>{}));
 }
 
 TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestoresTheVictimLater) {

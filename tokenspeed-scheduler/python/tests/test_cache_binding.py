@@ -506,6 +506,20 @@ def test_host_cache_stats_count_eviction_write_backs():
         host.dead_entry.device_resident,
         host.tail_cap.blocks,
     ) == (1, 0, 0, 0, 1, 0, 0)
+    # Each of them is observed once in its reason's idle times, KV blocks and
+    # State checkpoints apart: the scheduler samples the clock they read.
+    for counts in (
+        host.lru,
+        host.duplicate,
+        host.superseded,
+        host.dead_entry,
+        host.tail_cap,
+        host.duplicate_kv,
+    ):
+        assert (
+            sum(counts.kv_idle_ms.counts) + sum(counts.state_idle_ms.counts)
+            == counts.blocks
+        )
     # Every block an admission evicted for the cache was stored or dropped:
     # a's tail and second page, then a's first page and b's tail.
     device = stats.device_evictions

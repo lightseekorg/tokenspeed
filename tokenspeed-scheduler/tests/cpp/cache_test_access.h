@@ -84,6 +84,17 @@ struct CacheCoordinatorTestAccess {
     static auto NodeEntries(const CacheCoordinator& coordinator, const BlockPool& pool, const ContentHash& hash) {
         return coordinator.NodeEntries(pool, *coordinator.boundary_tree_.Find(hash));
     }
+
+    static std::size_t NumAccessClockSamples(const CacheCoordinator& coordinator) {
+        return coordinator.access_clock_samples_.size();
+    }
+
+    // How many Host evictions after a block's EvictedThenNeeded still counts
+    // it, and the record's buckets (CacheKeyHash modulo their number) and
+    // slots per bucket.
+    static constexpr std::uint64_t kRecentHostEvictions{CacheCoordinator::kRecentHostEvictions};
+    static constexpr std::size_t kRecentHostEvictionBuckets{CacheCoordinator::kRecentHostEvictionBuckets};
+    static constexpr std::size_t kRecentHostEvictionWays{CacheCoordinator::kRecentHostEvictionWays};
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
