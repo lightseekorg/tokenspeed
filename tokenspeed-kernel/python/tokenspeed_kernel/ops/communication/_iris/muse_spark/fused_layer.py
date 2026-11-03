@@ -441,9 +441,9 @@ def _whole_pairs(layout):
 
 
 @gluon.jit
-def h4_sink(args, y, route, cols):
+def h4_sink(args, y, route, cols, col0):
     """The MoE down unit's output pushed to its route's column owner (H4):
-    the MoE stream's ``sink(args, y, route, cols)`` with ``args`` an
+    the MoE stream's ``sink(args, y, route, cols, col0)`` with ``args`` an
     H4SinkArgs. Called from per-wave code, so it moves no data between
     lanes (no layout conversion, LDS or barrier).
 
