@@ -485,4 +485,8 @@ def iris_fused_lamport_allreduce_muse_attntail(
             NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE,
         )
+    # A wave that loads the stage after this store would push into the next
+    # stage's slot. Every wave has used its stage before the barrier, so no
+    # memory wait is needed.
+    gl.barrier()
     gl.store(epoch, (stage + 1) % 3)
