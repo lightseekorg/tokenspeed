@@ -140,6 +140,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     poll_tags16,
     poll_until_all,
     release_drain,
+    trace_stamp,
 )
 
 __all__ = [
@@ -194,6 +195,19 @@ HEAD_TASKS = Q_HEADS + KV_HEADS + Q_HEADS
 UNP_COLUMNS = 16
 # Tail-role slots per XCD: OWN4 -> FIN -> HEAD (or BND2).
 TAIL_SLOTS = (0, 24, 25, 26, 27, 28, 29, 30)
+
+# Stamps (``STAMPS``): per workgroup, the clock at these points of its
+# flow (int64, ``STAMP_STRIDE`` per workgroup, logical id order).
+STAMP_ENTRY = 0
+STAMP_CHECKED = 1
+STAMP_FRONT = 2
+STAMP_IDS = 3
+STAMP_XQ = 4
+STAMP_MOE = 5
+STAMP_TAIL = 6
+STAMP_QKV = 7
+STAMP_END = 8
+STAMP_STRIDE = 16
 
 # The uncached exchange (int32 words): routed ids, route weights, the ids
 # and xq row tags (one 64 B line per 16 rows), the xq rows and scales, the
@@ -271,6 +285,16 @@ _QKV_PARTS = gl.constexpr(QKV_PARTS)
 _QKV_TASK_ROWS = gl.constexpr(QKV_TASK_ROWS)
 _HEAD_TASKS = gl.constexpr(HEAD_TASKS)
 _UNP_COLUMNS = gl.constexpr(UNP_COLUMNS)
+_STAMP_STRIDE = gl.constexpr(STAMP_STRIDE)
+_STAMP_ENTRY = gl.constexpr(STAMP_ENTRY)
+_STAMP_CHECKED = gl.constexpr(STAMP_CHECKED)
+_STAMP_FRONT = gl.constexpr(STAMP_FRONT)
+_STAMP_IDS = gl.constexpr(STAMP_IDS)
+_STAMP_XQ = gl.constexpr(STAMP_XQ)
+_STAMP_MOE = gl.constexpr(STAMP_MOE)
+_STAMP_TAIL = gl.constexpr(STAMP_TAIL)
+_STAMP_QKV = gl.constexpr(STAMP_QKV)
+_STAMP_END = gl.constexpr(STAMP_END)
 _SITE_HPRIME = gl.constexpr(SITE_HPRIME)
 _SITE_S = gl.constexpr(SITE_S)
 _SITE_H6 = gl.constexpr(SITE_H6)
@@ -308,6 +332,14 @@ def _norm_sums_layout():
     return gl.BlockedLayout(
         [16 // NUM_WARPS, 1, 4], [1, 64, 1], [NUM_WARPS, 1, 1], [2, 1, 0]
     )
+
+
+@gluon.jit
+def _stamp(stamps_ptr, cta, point: gl.constexpr, STAMPS: gl.constexpr):
+    """With ``STAMPS``, store the clock for this workgroup's ``point`` (one
+    plain store; compiled out otherwise)."""
+    if STAMPS:
+        trace_stamp(stamps_ptr + cta * _STAMP_STRIDE, point)
 
 
 @gluon.jit
@@ -1284,6 +1316,8 @@ def gluon_decoder_layer_muse_spark_gfx950(
     v_inv_scale,
     # The last fused layer's boundary output (next layer regular).
     normed_out_ptr,
+    # Clock stamps per workgroup (``STAMPS``).
+    stamps_ptr,
     # Plan key.
     REQUESTS: gl.constexpr,
     SLIDING: gl.constexpr,
@@ -1313,6 +1347,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     QK_OFFSET: gl.constexpr,
     KV_SCALED: gl.constexpr,
     QKV_WINDOW: gl.constexpr,
+    STAMPS: gl.constexpr,
     # MoE plan fields (native_stream.run_moe).
     N_PHYS1: gl.constexpr,
     N_PHYS2: gl.constexpr,
@@ -1346,6 +1381,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     entry = enter_issue(epochs, claims)
     xcd = entry.xcd
     slot = entry.slot
+    _stamp(stamps_ptr, entry.cta, _STAMP_ENTRY, STAMPS)
     if slot < 16:
         # SND (S4-S5) -> OWN1 on slot 0 (S6-S7) -> RTR (S8-S9).
         sender = xcd * 16 + slot
@@ -1355,8 +1391,10 @@ def gluon_decoder_layer_muse_spark_gfx950(
             # The weights go out before the entry check (no attention here).
             o_tiles, hi, lo = _sender_weights(weights)
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+            _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
         else:
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+            _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             o_tiles, hi, lo = _full_items(
                 launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
                 k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
@@ -1387,8 +1425,10 @@ def gluon_decoder_layer_muse_spark_gfx950(
         if SLIDING:
             p_tiles = _pooler_weights((pooler_ptr, task))
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+            _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
         else:
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+            _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             p_tiles = _full_items(
                 launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
                 k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
@@ -1425,6 +1465,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             )  # fmt: skip
     else:
         launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+        _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
         if SLIDING:
             if xcd < 2 * REQUESTS:
                 # S1-S3: split (slot - 24) of block xcd.
@@ -1458,9 +1499,11 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 xq_ptr, xs_ptr, RANK, POOLED_EPS, POOLED_OFFSET,
             )  # fmt: skip
 
+    _stamp(stamps_ptr, launch.cta, _STAMP_FRONT, STAMPS)
     # MoE (S12-S15): every workgroup, once the ids and then the xq rows land.
     if not poll_tags16(exchange + _EX_IDS_TAGS, launch.tag, launch, True, True):
         iris_fail_stop(launch, _SITE_IDS, 0)
+    _stamp(stamps_ptr, launch.cta, _STAMP_IDS, STAMPS)
     bufs = MoeBuffers(
         xq_ptr,
         xs_ptr,
@@ -1475,12 +1518,14 @@ def gluon_decoder_layer_muse_spark_gfx950(
     )  # fmt: skip
     if not poll_tags16(exchange + _EX_XQ_TAGS, launch.tag, launch, True, True):
         iris_fail_stop(launch, _SITE_XQ, 0)
+    _stamp(stamps_ptr, launch.cta, _STAMP_XQ, STAMPS)
     run_moe(
         launch, handles, bufs, h4_sink, (view, launch), ROWS, _TOPK, N_PHYS1,
         N_PHYS2, RING, QUAD_MAP, DN_ORDER, ADDR_SOFFSET, True, SCALE_LANES,
         SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
     )  # fmt: skip
 
+    _stamp(stamps_ptr, launch.cta, _STAMP_MOE, STAMPS)
     # Tail. Weights first, at this workgroup's MoE end: the post-expert
     # relay's (UNP) and the next layer's QKV task (paced, P-PACE).
     is_tail = (slot == 0) | ((slot >= 24) & (slot < 31))
@@ -1531,6 +1576,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                     route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
                 )  # fmt: skip
                 _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
+    _stamp(stamps_ptr, launch.cta, _STAMP_TAIL, STAMPS)
     if NEXT_KIND != 2:
         # QKV (S22-S23): x'' of K part ``part``; group 0 stores h'' for the
         # next layer (plain: the next launch reads it).
@@ -1544,6 +1590,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             qkv_tiles, x2.to(gl.bfloat16), qkv_parts, launch.tag, task, rows,
             _QKV_WIDTH, _QKV_TASK_ROWS, _QKV_GROUPS, ".wt",
         )  # fmt: skip
+        _stamp(stamps_ptr, launch.cta, _STAMP_QKV, STAMPS)
         head = index * 8 + xcd
         if is_tail & (head < _HEAD_TASKS):
             _head(
@@ -1560,6 +1607,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 residual_ptr, normed_out_ptr, alpha2_ptr, beta2_ptr, post2_bf16_ptr,
                 pre2_bf16_ptr, POST2_EPS, PRE2_EPS,
             )  # fmt: skip
+    _stamp(stamps_ptr, launch.cta, _STAMP_END, STAMPS)
 
 
 # ---------------------------------------------------------------------------
@@ -1649,6 +1697,7 @@ _POINTER_TYPES = dict(
     k_inv_scale="fp32",
     v_inv_scale="fp32",
     normed_out_ptr="*bf16",
+    stamps_ptr="*i64",
 )
 
 
@@ -1698,6 +1747,7 @@ def kernel_constexprs(
     num_stages: int,
     kv_scaled: bool,
     qkv_window: int,
+    stamps: bool,
 ) -> dict:
     """The kernel's constexprs for one plan variant on one rank."""
     return dict(
@@ -1727,6 +1777,7 @@ def kernel_constexprs(
         QK_OFFSET=model.qk_offset,
         KV_SCALED=kv_scaled,
         QKV_WINDOW=qkv_window,
+        STAMPS=stamps,
         N_PHYS1=n_phys1,
         N_PHYS2=n_phys2,
         RING=ring,
@@ -1816,6 +1867,7 @@ def offline_compile_args(key: PlanKey, rank: int):
         key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=8, quad_map=0,
         dn_order=0, addr_soffset=0, scale_lanes=0, tail_num=1, tail_den=2,
         n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False, qkv_window=4,
+        stamps=False,
     )  # fmt: skip
     signature = offline_signature(constexprs)
     options = {"num_warps": NUM_WARPS, **persistent_compile_options()}

@@ -60,6 +60,7 @@ from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (
     QKV_PARTS,
     QKV_WIDTH,
     SLIDING_SPLITS,
+    STAMP_STRIDE,
     WORLD_SIZE,
     XQ_ROW_BYTES,
     XS_MBLOCK_STRIDE,
@@ -92,7 +93,7 @@ _MAX_VGPRS = 256
 # Clock ticks (10 ns) a wait may last before the launch fail-stops: 2 s.
 _DEADLINE_TICKS = 200_000_000
 # Plan fields of the default variant (NATIVE-DESIGN §12 sweeps them).
-_PLAN_FIELDS = dict(
+DEFAULT_PLAN_FIELDS = dict(
     ring=8,
     quad_map=0,
     dn_order=0,
@@ -195,6 +196,8 @@ class MuseSparkDecoderLayerState:
         self.hprime = torch.zeros(
             (MAX_ROWS, HIDDEN), dtype=torch.float32, device=device
         )
+        # Clock stamps of the last launch made with stamps (benchmarks).
+        self.stamps = torch.zeros(GRID * STAMP_STRIDE, dtype=torch.int64, device=device)
         peers.finish_prepare()
 
     @staticmethod
@@ -323,6 +326,23 @@ class MuseSparkFusedDecoderLayer:
     heap_bytes = staticmethod(MuseSparkDecoderLayerState.heap_bytes)
 
     def __init__(self, *, plan_keys, weights: dict, state: MuseSparkDecoderLayerState):
+        self._setup(plan_keys, weights, state, DEFAULT_PLAN_FIELDS, False)
+
+    @classmethod
+    def for_benchmark(
+        cls, *, plan_keys, weights: dict, state, plan_fields: dict, stamps: bool
+    ) -> MuseSparkFusedDecoderLayer:
+        """A layer with explicit plan fields (``DEFAULT_PLAN_FIELDS``' keys) and
+        clock stamps into ``state.stamps``, for NATIVE-DESIGN §12's runs."""
+        layer = cls.__new__(cls)
+        layer._setup(plan_keys, weights, state, plan_fields, stamps)
+        return layer
+
+    def _setup(self, plan_keys, weights, state, plan_fields: dict, stamps: bool):
+        if set(plan_fields) != set(DEFAULT_PLAN_FIELDS):
+            raise ValueError(f"plan fields must be {sorted(DEFAULT_PLAN_FIELDS)}")
+        self.plan_fields = dict(plan_fields)
+        self.stamps = stamps
         self.state = state
         self.plan_keys = tuple(plan_keys)
         kinds = {(key.layer_kind, key.next_kind) for key in self.plan_keys}
@@ -433,7 +453,8 @@ class MuseSparkFusedDecoderLayer:
         return kernel_constexprs(
             key, model, rank=self.state.rank, peer_cache=".wt",
             scale_lanes=int(self.moe.s13_lanes is not None), n_phys1=self.moe.n_phys1,
-            n_phys2=self.moe.n_phys2, kv_scaled=kv_scaled, **_PLAN_FIELDS,
+            n_phys2=self.moe.n_phys2, kv_scaled=kv_scaled, stamps=self.stamps,
+            **self.plan_fields,
         )  # fmt: skip
 
     def _compile(self, key: PlanKey) -> list[str]:
@@ -541,6 +562,7 @@ class MuseSparkFusedDecoderLayer:
             t.route_norm, state.s_rows, state.hprime, t.post_expert, t.alpha2,
             t.beta2, t.post2_bf16, t.next_pre_bf16,
             *next_args,
+            state.stamps,
             **constexprs,
             num_warps=NUM_WARPS,
             **persistent_compile_options(),
