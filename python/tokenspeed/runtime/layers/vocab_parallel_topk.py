@@ -312,7 +312,16 @@ class VocabParallelTopK:
         if self._radix_topk is None and vocab_shard_topk_supports(
             logits.dtype, columns, top_k
         ):
-            vocab_shard_topk(logits, top_k, self.logit_scale, vocab_start, staged)
+            # The draft caps the kept values after the merge, in fp32.
+            vocab_shard_topk(
+                logits,
+                top_k,
+                self.logit_scale,
+                vocab_start,
+                staged,
+                softcap=None,
+                vocab_mask=None,
+            )
         else:
             if self.logit_scale is not None:
                 logits.mul_(self.logit_scale)
