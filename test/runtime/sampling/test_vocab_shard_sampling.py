@@ -219,7 +219,9 @@ def _candidates(q: DraftTreeQ, req_pool_indices: torch.Tensor) -> torch.Tensor:
 @requires_cuda
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("with_q", [False, True])
-@pytest.mark.parametrize("top_k,top_p", [([64, 64, 64], [1.0] * 3), ([1, 30, 128], [1.0, 0.9, 0.8])])
+@pytest.mark.parametrize(
+    "top_k,top_p", [([64, 64, 64], [1.0] * 3), ([1, 30, 128], [1.0, 0.9, 0.8])]
+)
 def test_verify_on_shards_matches_whole_rows(
     monkeypatch, masked, with_q, top_k, top_p
 ) -> None:
