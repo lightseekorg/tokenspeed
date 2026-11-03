@@ -106,6 +106,9 @@ DEFAULT_PLAN_FIELDS = dict(
     tail_den=2,
     num_stages=2,
     qkv_window=4,
+    # Who merges a sliding block's splits: split 0 ("designated") or every
+    # split its share of the rows ("spread").
+    att_merge="designated",
 )
 
 

@@ -1477,6 +1477,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     KV_SCALED: gl.constexpr,
     NEXT_ROTARY: gl.constexpr,
     QKV_WINDOW: gl.constexpr,
+    ATT_MERGE: gl.constexpr,
     STAMPS: gl.constexpr,
     # MoE plan fields (native_stream.run_moe).
     N_PHYS1: gl.constexpr,
@@ -1632,7 +1633,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                     launch, xcd, slot - _ATT_FIRST_SLOT, view, q_ptr, gate_ptr,
                     gate_stride, k_cache_ptr, v_cache_ptr, page_table_ptr,
                     cache_seqlens_ptr, mid_o_ptr, mid_lse_ptr, records, cfg,
-                    GATE_EPS, NUM_STAGES, "designated",
+                    GATE_EPS, NUM_STAGES, ATT_MERGE,
                 )  # fmt: skip
         else:
             _full_items(
@@ -1922,6 +1923,7 @@ def kernel_constexprs(
     kv_scaled: bool,
     next_rotary: bool,
     qkv_window: int,
+    att_merge: str,
     stamps: bool,
 ) -> dict:
     """The kernel's constexprs for one plan variant on one rank."""
@@ -1953,6 +1955,7 @@ def kernel_constexprs(
         KV_SCALED=kv_scaled,
         NEXT_ROTARY=next_rotary,
         QKV_WINDOW=qkv_window,
+        ATT_MERGE=att_merge,
         STAMPS=stamps,
         N_PHYS1=n_phys1,
         N_PHYS2=n_phys2,
@@ -2062,7 +2065,8 @@ def offline_compile_args(key: PlanKey, rank: int):
         key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=8, quad_map=0,
         dn_order=0, addr_soffset=0, scale_lanes=0, tail_num=1, tail_den=2,
         n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False,
-        next_rotary=key.next_kind == "sliding", qkv_window=4, stamps=False,
+        next_rotary=key.next_kind == "sliding", qkv_window=4, att_merge="designated",
+        stamps=False,
     )  # fmt: skip
     signature = offline_signature(constexprs)
     options = {"num_warps": NUM_WARPS, **persistent_compile_options()}
