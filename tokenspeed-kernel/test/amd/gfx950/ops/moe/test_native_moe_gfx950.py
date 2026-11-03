@@ -46,6 +46,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _quantize_mxfp4_activation,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (  # noqa: E402
+    TAG_COPY_WORDS,
     NativeMoeState,
     launch_gluon_mxfp4_moe_native_stream_gfx950,
     native_moe_weights,
@@ -158,3 +159,45 @@ def test_native_stream_is_bitwise_direct_decode(experts, variant, rows):
                 step,
                 variant,
             )
+
+
+def test_stale_tags_matching_the_launch_tag_are_never_seen(experts):
+    """Launch tags repeat after 2**32 - 1 launches. Plant the next launch's
+    tag in every slot of the copy it will poll (as a rank untouched for that
+    long would hold it) and poison the mids. The first launch touches 30
+    experts, the second 41, so ranks 30-40 are polled for the first time:
+    each launch zeroes the copy the next one polls, so the second launch
+    still waits for its producers."""
+    rows = 8
+    weights = native_moe_weights(experts, scale_lanes=False)
+    w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
+    w13_scale = _extract_gluon_raw_s(experts.w13_precision_config.b_mx_scale)
+    w2 = _extract_gluon_raw_w(experts.w2_weight_triton_tensor)
+    w2_scale = _extract_gluon_raw_s(experts.w2_precision_config.b_mx_scale)
+    state = NativeMoeState("cuda", rows, TOPK)
+    first = torch.tensor(RECORDED_ROUTINGS[rows][3], dtype=torch.int32, device="cuda")
+    ids = torch.tensor(RECORDED_ROUTINGS[rows][1], dtype=torch.int32, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    x = (torch.randn((rows, HIDDEN), device="cuda", generator=generator) * 2).bfloat16()
+    xq, xs = _quantize_mxfp4_activation(x)
+    expected = _direct_decode(xq, xs, w13, w13_scale, w2, w2_scale, ids)
+    out = torch.full_like(expected, float("nan"))
+
+    def run(routes):
+        launch_gluon_mxfp4_moe_native_stream_gfx950(
+            xq, xs, weights, routes, out, state, ring=8, quad_map=0, dn_order=0,
+            addr_soffset=0, tag_glc=1, tail_num=1, tail_den=2,
+            deadline_ticks=DEADLINE_TICKS, **SWIGLU
+        )  # fmt: skip
+
+    # Every workgroup's entry counter advances once per launch from 0, so the
+    # second launch has epoch 2: tag 3 (launch_tag), tag copy 0.
+    state.tags[:TAG_COPY_WORDS] = 3
+    run(first)
+    state.mids.fill_(0xFF)
+    state.mids_scale.fill_(-1)
+    out.fill_(float("nan"))
+    run(ids)
+    torch.cuda.synchronize()
+    assert int(state.errors[0]) == 0, state.errors[:8].tolist()
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))

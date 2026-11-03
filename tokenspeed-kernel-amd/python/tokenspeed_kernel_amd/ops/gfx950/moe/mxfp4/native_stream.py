@@ -102,6 +102,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import (
 
 __all__ = [
     "GROUPS_PER_EXPERT",
+    "TAG_WORDS",
     "TAG_WORDS_PER_EXPERT",
     "UNITS_PER_EXPERT",
     "MOE_SINK_LAYOUT",
@@ -131,6 +132,15 @@ UNIT_COLUMNS = 64
 UNITS_PER_EXPERT = HIDDEN // UNIT_COLUMNS  # 64
 # Group tags: one word per (group, strip) — each wave publishes its own rows.
 TAG_WORDS_PER_EXPERT = GROUPS_PER_EXPERT * 4
+# Distinct experts of one launch: at most 16 rows x top 8.
+MAX_RANKS = 128
+# Group tags live in two copies, indexed by expert rank. A launch polls and
+# publishes copy (epoch & 1) and zeroes the other one for the next launch.
+# Launch tags repeat after 2**32 - 1 launches, and a rank no launch touches
+# for that long would otherwise still hold a matching tag; zeroed slots never
+# match (tags are never 0).
+TAG_COPY_WORDS = MAX_RANKS * TAG_WORDS_PER_EXPERT
+TAG_WORDS = 2 * TAG_COPY_WORDS
 # Bytes of one group (64 gate/up columns x K, plus scales) and one unit.
 GROUP_BYTES = GROUP_COLUMNS * HIDDEN // 2 + GROUP_COLUMNS * HIDDEN // 32
 UNIT_BYTES = UNIT_COLUMNS * INTER // 2 + UNIT_COLUMNS * INTER // 32
@@ -145,6 +155,8 @@ _TAIL_LAST = gl.constexpr(TAIL_LAST)
 _GROUPS = gl.constexpr(GROUPS_PER_EXPERT)
 _UNITS = gl.constexpr(UNITS_PER_EXPERT)
 _TAGS = gl.constexpr(TAG_WORDS_PER_EXPERT)
+_TAG_COPY_WORDS = gl.constexpr(TAG_COPY_WORDS)
+_MAX_RANKS = gl.constexpr(MAX_RANKS)
 _K_STEPS = gl.constexpr(HIDDEN // 128)  # 32 gate/up steps
 _DN_STEPS = gl.constexpr(INTER // 128)  # 4 down steps
 _DN_CHUNKS = gl.constexpr(4 * (INTER // 128))  # 16
@@ -1013,7 +1025,9 @@ def run_moe(
 
     ``ctx`` is the launch (``persistent.Launch``); its ``tag`` marks this
     launch's mids. ``bufs.xq`` and ``bufs.xs`` must be published before the
-    call.
+    call. ``bufs.tags`` holds ``TAG_WORDS`` int32 words, zeroed once; every
+    launch that advances the epoch must run the stream, since it zeroes the
+    tag copy the next launch polls.
 
     Every down unit's output goes to ``sink(sink_args, y, route, cols)``,
     once per 16-column strip: ``y`` the fp32 ``[16, 128]`` result in
@@ -1096,6 +1110,18 @@ def run_moe(
     mids_sd = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.mids_s, 0x7FFFFFF0)
     tags_d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.tags, 0x7FFFFFF0)
     lanes = gl.arange(0, 64 * 8, layout=lane)
+    # This launch's tag copy; zero this workgroup's share of the other one
+    # (32 words, one line) for the next launch.
+    gl.static_assert(ROWS * TOPK <= _MAX_RANKS)
+    gl.static_assert(_TAG_COPY_WORDS == 32 * 256)
+    tag_base = ctx.copy * _TAG_COPY_WORDS
+    gl.amd.cdna3.buffer.store(
+        gl.zeros_like(lanes),
+        tags_d,
+        (1 - ctx.copy) * _TAG_COPY_WORDS + ctx.cta * 32 + lanes,
+        mask=lanes < 32,
+        scope="gpu",
+    )
 
     # ---- gate/up strips
     expert, rank, group, left = _group_of(plan, 0, rank_smem)
@@ -1170,7 +1196,9 @@ def run_moe(
                 # The previous strip's tag: this step's chunk was issued after
                 # that strip's mids stores, and the wave's memory operations
                 # complete in issue order, so waiting for it covers them.
-                _publish_tags(tags_d, pend_word, tag, pend_word >= 0, pend_left, acc)
+                _publish_tags(
+                    tags_d, tag_base + pend_word, tag, pend_word >= 0, pend_left, acc
+                )
             gl.amd.hint.sched_barrier()
         pend_word = rank * 0 - 1
 
@@ -1222,7 +1250,7 @@ def run_moe(
         release_drain()
         _publish_tags(
             tags_d,
-            pend_word,
+            tag_base + pend_word,
             tag,
             pend_word >= 0,
             pend_left,
@@ -1243,7 +1271,7 @@ def run_moe(
     # wave, right after the gate/up drain.
     if dlive:
         # Mids ready: the expert's group tags, polled with scalar loads.
-        _wait_ready(ctx, bufs.tags, drank, TAG_GLC)
+        _wait_ready(ctx, bufs.tags + tag_base, drank, TAG_GLC)
     route_a, route_s = _unit_routes(ids_t, dexpert, TOPK)
     sdw = ()
     for i in gl.static_range(4):
@@ -1296,7 +1324,7 @@ def run_moe(
             if c == POLL_AT:
                 # The next unit's readiness: scalar loads only.
                 if nlive:
-                    _wait_ready(ctx, bufs.tags, nrank, TAG_GLC)
+                    _wait_ready(ctx, bufs.tags + tag_base, nrank, TAG_GLC)
                 nroute_a, nroute_s = _unit_routes(ids_t, nexpert, TOPK)
             for kt in gl.static_range(_DN_STEPS):
                 if c == _a_release(kt, DN_ORDER, POLL_AT):
@@ -1490,9 +1518,7 @@ class NativeMoeState:
         self.mids_scale = torch.zeros(
             routes * INTER // 32 // 4, dtype=torch.int32, device=device
         )
-        self.tags = torch.zeros(
-            routes * TAG_WORDS_PER_EXPERT, dtype=torch.int32, device=device
-        )
+        self.tags = torch.zeros(TAG_WORDS, dtype=torch.int32, device=device)
 
 
 def _int32_words(scale):

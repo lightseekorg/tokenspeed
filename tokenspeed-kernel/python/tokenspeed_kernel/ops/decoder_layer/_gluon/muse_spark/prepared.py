@@ -71,7 +71,7 @@ from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
     INTER,
-    TAG_WORDS_PER_EXPERT,
+    TAG_WORDS,
     native_moe_weights,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
@@ -187,9 +187,7 @@ class MuseSparkDecoderLayerState:
         self.mids_scale = torch.zeros(
             routes * INTER // 32 // 4, dtype=torch.int32, device=device
         )
-        self.moe_tags = torch.zeros(
-            routes * TAG_WORDS_PER_EXPERT, dtype=torch.int32, device=device
-        )
+        self.moe_tags = torch.zeros(TAG_WORDS, dtype=torch.int32, device=device)
         self.s_rows = torch.zeros(
             (MAX_ROWS, POOLED), dtype=torch.bfloat16, device=device
         )
