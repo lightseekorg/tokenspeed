@@ -283,9 +283,14 @@ def fail_stop(launch, site, detail):
     Args:
         launch: The failing workgroup's :class:`Launch`.
         site: What failed: a ``SITE_*`` value, or a kernel's own site.
-        detail: Site-specific detail, such as a mask of missing peers.
+        detail: Site-specific detail, such as a mask of missing peers. For
+            ``SITE_ABORTED`` (a peer stopped this wait) the record holds the
+            abort word instead, the marker that names the origin.
     """
     lane = _lanes()
+    # One load, on the failure path only.
+    abort = gl.load(launch.abort_ptr + lane * 0, cache_modifier=".cv")
+    detail = gl.where(site == _SITE_ABORTED, abort, detail)
     record = launch.error_ptr + _ERROR_RECORD + lane * 0
     # The first claim owns the record (sites are never zero), so failing
     # waves and workgroups cannot interleave their fields. (A scalar atomic
