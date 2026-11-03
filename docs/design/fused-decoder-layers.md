@@ -26,8 +26,10 @@ both true without a second execution path.
   model's existing per-forward layout. The model loop is unchanged: the layer
   calls its prepared kernel, and the value passed to the next fused layer is
   that layer's prepared query (its K/V rows already in the cache).
-* The choice depends only on the forward's padded row shape and on the served
-  set agreed at startup. Capture records it, eager decode makes the same
+* The choice depends only on the forward's padded row shape, (requests,
+  tokens per request), and on the served set agreed at startup. Row count
+  alone is not a shape: a one-request verify of 8 tokens and a plain decode
+  of 8 requests differ. Capture records it, eager decode makes the same
   choice for the same shape, and every rank decides alike.
 * Everything else runs the regular layer, unchanged: prefill, extend, MIXED
   and IDLE forwards, row shapes outside the served set, and layers the kernel
@@ -42,7 +44,7 @@ both true without a second execution path.
   checks inside a captured graph.
 * Each rank's refusals (deployment settings, a variant that does not fit one
   workgroup per compute unit, state the kernel cannot allocate) go through
-  `agree_served_rows` (`runtime/layers/fused_decoder_layer.py`) over the
+  `agree_served_shapes` (`runtime/layers/fused_decoder_layer.py`) over the
   group's CPU group. A refusal on one rank removes the row shape on every
   rank. The startup report lists every declined shape with its rank and
   reason.

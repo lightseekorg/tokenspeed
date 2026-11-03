@@ -29,7 +29,7 @@ import torch.multiprocessing as mp
 
 from tokenspeed.runtime.layers.fused_decoder_layer import (
     FusedLayerDeployment,
-    agree_served_rows,
+    agree_served_shapes,
     deployment_decline_reasons,
 )
 
@@ -78,26 +78,24 @@ def _agree(rank, path, results):
         timeout=timedelta(seconds=30),
     )
     try:
-        # Rank 1 alone cannot serve 16 rows; no rank may serve them then.
-        local = {16: ["spills at 16 rows"]} if rank == 1 else {}
-        served = agree_served_rows([8, 16], local, dist.group.WORLD)
-        results[rank] = (served.rows, dict(served.declined))
-        if rank == 0:
-            with pytest.raises(RuntimeError, match="different row counts"):
-                agree_served_rows([8], {}, dist.group.WORLD)
-        else:
-            with pytest.raises(RuntimeError, match="different row counts"):
-                agree_served_rows([8, 16], {}, dist.group.WORLD)
+        # Rank 1 alone cannot serve two requests; no rank may serve them then.
+        local = {(2, 8): ["spills at 16 rows"]} if rank == 1 else {}
+        served = agree_served_shapes([(1, 8), (2, 8)], local, dist.group.WORLD)
+        results[rank] = (served.shapes, dict(served.declined))
+        with pytest.raises(RuntimeError, match="different shapes"):
+            agree_served_shapes(
+                [(1, 8)] if rank == 0 else [(8, 1)], {}, dist.group.WORLD
+            )
     finally:
         dist.destroy_process_group()
 
 
-def test_a_decline_on_one_rank_declines_the_rows_on_every_rank(tmp_path):
+def test_a_decline_on_one_rank_declines_the_shape_on_every_rank(tmp_path):
     with mp.Manager() as manager:
         results = manager.dict()
         mp.spawn(
             _agree, args=(str(tmp_path / "rendezvous"), results), nprocs=2, join=True
         )
         results = dict(results)
-    expected = (frozenset({8}), {16: ("rank 1: spills at 16 rows",)})
+    expected = (frozenset({(1, 8)}), {(2, 8): ("rank 1: spills at 16 rows",)})
     assert results == {0: expected, 1: expected}

@@ -29,7 +29,7 @@ holds the model-independent half of that decision:
 
 * ``deployment_decline_reasons`` lists the server settings under which some
   other kernel can run beside a fused launch;
-* ``agree_served_rows`` turns each rank's row shapes and local refusals into
+* ``agree_served_shapes`` turns each rank's row shapes and local refusals into
   one served set that every rank of the group holds, so a decline on one rank
   declines the shape everywhere.
 
@@ -128,46 +128,60 @@ def deployment_decline_reasons(deployment: FusedLayerDeployment) -> list[str]:
     return reasons
 
 
+# A decode forward's row shape: (requests, tokens per request). Plain decode of
+# 8 requests and a verify of one request with 8 tokens both carry 8 rows, but
+# they are different shapes to a fused layer.
+Shape = tuple[int, int]
+
+
 @dataclass(frozen=True)
-class ServedRows:
-    """The row counts every rank of a group serves with a fused layer.
+class ServedShapes:
+    """The decode row shapes every rank of a group serves with a fused layer.
 
     Attributes:
-        rows: Row counts served on every rank.
-        declined: For each declined row count, ``"rank <r>: <reason>"`` lines,
+        shapes: ``(requests, tokens per request)`` shapes served on every rank.
+        declined: For each declined shape, ``"rank <r>: <reason>"`` lines,
             ``r`` being the rank in the agreeing group.
     """
 
-    rows: frozenset[int]
-    declined: Mapping[int, tuple[str, ...]]
+    shapes: frozenset[Shape]
+    declined: Mapping[Shape, tuple[str, ...]]
 
     def report(self, what: str) -> str:
-        """One startup line per row count: served, or why not."""
-        lines = [f"{what}: serves rows {sorted(self.rows) or 'none'}"]
-        for rows in sorted(self.declined):
-            lines.append(f"  rows {rows} declined: {'; '.join(self.declined[rows])}")
+        """The startup report: the served shapes, and why each other one is not."""
+
+        def name(shape: Shape) -> str:
+            return f"{shape[0]} x {shape[1]} rows"
+
+        served = ", ".join(name(shape) for shape in sorted(self.shapes)) or "none"
+        lines = [f"{what}: serves {served}"]
+        for shape in sorted(self.declined):
+            reasons = "; ".join(self.declined[shape])
+            lines.append(f"  {name(shape)} declined: {reasons}")
         return "\n".join(lines)
 
 
-def agree_served_rows(
-    candidates: Sequence[int],
-    local_reasons: Mapping[int, Sequence[str]],
+def agree_served_shapes(
+    candidates: Sequence[Shape],
+    local_reasons: Mapping[Shape, Sequence[str]],
     group: dist.ProcessGroup | None,
-) -> ServedRows:
-    """Agree on the row counts a group serves with a fused layer.
+) -> ServedShapes:
+    """Agree on the decode row shapes a group serves with a fused layer.
 
     Args:
-        candidates: Row counts the model can run fused, the same on every rank.
-        local_reasons: This rank's reasons to decline a row count (missing or
+        candidates: ``(requests, tokens per request)`` shapes the model can run
+            fused, the same on every rank.
+        local_reasons: This rank's reasons to decline a shape (missing or
             empty: this rank can serve it).
         group: The CPU (gloo) group of the ranks that run each fused launch
             together, or None for a single process.
 
     Returns:
-        The row counts no rank declined, and the reasons for the others.
+        The shapes no rank declined, and the reasons for the others.
     """
     local = {
-        int(rows): tuple(local_reasons.get(rows, ())) for rows in sorted(candidates)
+        (int(requests), int(width)): tuple(local_reasons.get((requests, width), ()))
+        for requests, width in sorted(candidates)
     }
     if group is None:
         gathered = [local]
@@ -176,16 +190,16 @@ def agree_served_rows(
         dist.all_gather_object(gathered, local, group=group)
     if any(set(other) != set(local) for other in gathered):
         raise RuntimeError(
-            f"fused decoder layers: ranks propose different row counts: "
+            f"fused decoder layers: ranks propose different shapes: "
             f"{[sorted(other) for other in gathered]}"
         )
     declined = {}
-    for rows in local:
+    for shape in local:
         lines = tuple(
             f"rank {rank}: {reason}"
             for rank, other in enumerate(gathered)
-            for reason in other[rows]
+            for reason in other[shape]
         )
         if lines:
-            declined[rows] = lines
-    return ServedRows(frozenset(set(local) - set(declined)), declined)
+            declined[shape] = lines
+    return ServedShapes(frozenset(set(local) - set(declined)), declined)
