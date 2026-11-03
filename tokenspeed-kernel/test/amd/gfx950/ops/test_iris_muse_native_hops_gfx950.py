@@ -216,3 +216,118 @@ def test_h6_push_compiles_at_8_waves():
     assert len(pushes) >= 8  # 7 peers + the own copy
     first, last = lines.index(pushes[0]), lines.index(pushes[-1])
     assert not any("vmcnt" in l for l in lines[first:last])
+
+
+from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
+    MuseNativeView,
+    clear_next_copies,
+    fin,
+    h1_rs_sink,
+    h3_sink,
+    h4_sink,
+    h6_sink,
+    own1,
+    own4_complete,
+    xn_wait,
+)
+from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+    Launch,
+    persistent_compile_options,
+)
+
+_VIEW = {
+    "heaps": ("i64",) * 8, "rank": "i32", "box": "*i32", "h1": "*bf16", "h1_sums": "*i64",
+    "h3": "*bf16", "h4_own": "*i32", "routes": "*i32", "h6": "*bf16",
+}  # fmt: skip
+
+
+@gluon.jit
+def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, errors,floats, words, copy, rows, ROLE: gl.constexpr):  # fmt: skip
+    """Each fused-layer hop end on the view, at 8 waves, by ROLE."""
+    view = MuseNativeView(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6)
+    zero = gl.program_id(0) * 0
+    launch = Launch(
+        gl.program_id(0), zero, zero, copy.to(gl.int64) + 2, zero + 7, copy, zero,
+        errors, errors + 32, zero.to(gl.int64) + 1000, errors,
+    )  # fmt: skip
+    if ROLE == "clear":
+        clear_next_copies(view, launch, gl.program_id(0))
+    elif ROLE == "h1":
+        layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [8, 1], [1, 0])
+        r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+        c = gl.arange(0, 64, layout=gl.SliceLayout(0, layout))
+        out = gl.load(floats + r[:, None] * 64 + c[None, :])
+        h1_rs_sink(view, launch, out, 5, rows, 3, ".wt")
+    elif ROLE == "own1":
+        own1(view, launch, 2, rows, floats, words.to(gl.pointer_type(gl.bfloat16),
+             bitcast=True), floats, floats, 3, 0.0, True, ".wt")  # fmt: skip
+    elif ROLE == "h3":
+        layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [8, 1], [1, 0])
+        r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+        c = gl.arange(0, 64, layout=gl.SliceLayout(0, layout))
+        h3_sink(view, launch, gl.load(floats + r[:, None] * 64 + c[None, :]), 4, rows,
+                16, 3, ".wt")  # fmt: skip
+        got = xn_wait(view, launch, 1, 3)
+        gl.store(
+            words
+            + gl.arange(0, 64, gl.SliceLayout(0, gl.SliceLayout(2, got.type.layout))),
+            gl.sum(gl.sum(got, 2), 0),
+        )
+    elif ROLE == "h4":
+        layout: gl.constexpr = gl.BlockedLayout([1, 16], [16, 4], [1, 8], [1, 0])
+        r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+        c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+        y = gl.load(floats + r[:, None] * 128 + c[None, :])
+        route = gl.load(words + r)[:, None]
+        h4_sink((view, launch), y, route, (1024 + c)[None, :])
+    elif ROLE == "own4":
+        own4_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
+                      bitcast=True), 3, 0.0, ".wt")  # fmt: skip
+    elif ROLE == "fin":
+        combined = fin(view, launch, 1, 2, floats, words.to(gl.pointer_type(gl.bfloat16),
+                       bitcast=True), 1e-6, 0.0)  # fmt: skip
+        gl.store(floats + gl.arange(0, 512, layout=combined.type.layout), combined)
+    else:
+        layout: gl.constexpr = gl.BlockedLayout([1, 16], [64, 1], [8, 1], [1, 0])
+        r = gl.arange(0, 8, layout=gl.SliceLayout(1, layout))
+        c = gl.arange(0, 16, layout=gl.SliceLayout(0, layout))
+        values = gl.load(floats + r[:, None] * 16 + c[None, :]).to(gl.bfloat16)
+        h6_sink(view, launch, values, 32, rows, 8, 16, 3, ".wt")
+
+
+@pytest.mark.parametrize(
+    "role", ["clear", "h1", "own1", "h3", "h4", "own4", "fin", "h6"]
+)
+def test_fused_layer_hop_compiles_at_8_waves(role):
+    """Every hop end of the fused layer compiles at 8 waves, with no L2
+    invalidate or write-back, no scratch, and system-scope peer stores."""
+    signature = dict(
+        _VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32", rows="i32"
+    )
+    assembly = _compile(_layer_hops_kernel, signature, {"ROLE": role})
+    assert "buffer_inv" not in assembly and "buffer_wbl2" not in assembly
+    assert re.search(r"\.private_segment_fixed_size:\s+0|ScratchSize: 0", assembly)
+    if role in ("h1", "own1", "h3", "h4", "own4", "h6"):
+        assert re.search(r"(buffer|global)_(store|atomic)\w* .*sc0 sc1", assembly)
+    if role == "clear":
+        lines = instruction_lines(assembly)
+        stores = [l for l in lines if l.startswith("buffer_store")]
+        assert stores and all(
+            l.startswith("buffer_store_dwordx4") and l.endswith("sc0 sc1")
+            for l in stores
+        )
+        assert not any("vmcnt" in l for l in lines[lines.index(stores[0]) :])
+
+
+def test_every_cleared_area_splits_into_whole_sender_shares():
+    """128 senders clear equal 16-byte-multiple shares of every area copy, and
+    the area sizes follow the 32-row geometry the hop bodies index."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import fused_layer as f
+
+    for area in f.CLEARED_AREAS:
+        assert area.copy_words % (f.SENDERS * 4) == 0, area
+    # Column-route mailbox: peers' slices, completed slices, sums of squares.
+    assert f.ROUTES_WORDS == 32 * (15 * 2048 + 8 * 8 * 8)
+    # About 5.6 MB per copy in all, ~44 KB cleared per sender per launch.
+    total = sum(4 * area.copy_words for area in f.CLEARED_AREAS)
+    assert 5 << 20 < total < 6 << 20
