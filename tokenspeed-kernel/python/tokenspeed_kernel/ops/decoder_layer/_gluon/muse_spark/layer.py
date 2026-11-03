@@ -149,6 +149,7 @@ __all__ = [
     "PLAN_VARIANTS",
     "gluon_decoder_layer_muse_spark_gfx950",
     "DIVISIBLE_ARGS",
+    "offline_attrs",
     "offline_compile_args",
     "offline_signature",
 ]
@@ -197,6 +198,16 @@ UNP_COLUMNS = 16
 # Tail-role slots per XCD: OWN4 -> FIN -> HEAD (or BND2).
 TAIL_SLOTS = (0, 24, 25, 26, 27, 28, 29, 30)
 
+# Tagged K-part partials (router, pooler, QKV) keep 16 token slots per part
+# whatever the launch's rows: every slot is rewritten with the launch's tag
+# each launch (rows past the launch's carry unused values), so no slot keeps
+# a tag old enough to repeat (tags repeat after 2**32 - 1 launches).
+PART_ROWS = 16
+# Attention records (int32, one per wave): two copies by launch parity; each
+# launch zeroes the other copy, so no record keeps an old tag either.
+RECORD_WORDS = max(2 * KV_HEADS * SLIDING_SPLITS, FULL_PROGRAMS) * NUM_WARPS
+assert RECORD_WORDS % GRID == 0
+
 # Stamps (``STAMPS``): per workgroup, the clock at these points of its
 # flow (int64, ``STAMP_STRIDE`` per workgroup, logical id order).
 STAMP_ENTRY = 0
@@ -211,23 +222,26 @@ STAMP_END = 8
 STAMP_STRIDE = 16
 
 # The uncached exchange (int32 words): routed ids, route weights, the ids
-# and xq row tags (one 64 B line per 16 rows), the xq rows and scales, the
-# h' part flags (one line per 1024-column part) and the S part tags
-# ([part][row]).
+# and xq row tags (one 64 B line per 16 rows), the h' part flags (one line
+# per 1024-column part) and the S part tags ([part][row]). The xq rows and
+# scales are uncached buffers of their own.
 XQ_ROW_BYTES = POOLED // 2
 XS_ROW_BYTES = POOLED // 32
 EX_IDS = 0
 EX_WEIGHTS = EX_IDS + MAX_ROWS * TOPK
 EX_IDS_TAGS = EX_WEIGHTS + MAX_ROWS * TOPK
 EX_XQ_TAGS = EX_IDS_TAGS + MAX_ROWS
-EX_XQ = EX_XQ_TAGS + MAX_ROWS
-EX_XS = EX_XQ + MAX_ROWS * XQ_ROW_BYTES // 4
-EX_HP_TAGS = EX_XS + MAX_ROWS * XS_ROW_BYTES // 4
+EX_HP_TAGS = EX_XQ_TAGS + MAX_ROWS
 EX_S_TAGS = EX_HP_TAGS + KPARTS * 16
 # The xq scales are CDNA4-swizzled (``empty_swizzled_cdna4_mxfp4_scale``):
 # one 32-row block, stride 1 within it.
 XS_MBLOCK_STRIDE = MAX_ROWS * XS_ROW_BYTES
 EXCHANGE_WORDS = EX_S_TAGS + KPARTS * MAX_ROWS
+# Every polled tag line starts on a 64 B line (16 words).
+assert all(
+    offset % 16 == 0 for offset in (EX_IDS_TAGS, EX_XQ_TAGS, EX_HP_TAGS, EX_S_TAGS)
+)
+assert MAX_ROWS % 16 == 0
 
 # Failure sites of the layer's own waits (fused_layer's hop ends use
 # FIRST_KERNEL_SITE + 16 .. + 22, the MoE stream + 8).
@@ -270,8 +284,6 @@ _EX_IDS = gl.constexpr(EX_IDS)
 _EX_WEIGHTS = gl.constexpr(EX_WEIGHTS)
 _EX_IDS_TAGS = gl.constexpr(EX_IDS_TAGS)
 _EX_XQ_TAGS = gl.constexpr(EX_XQ_TAGS)
-_EX_XQ = gl.constexpr(EX_XQ)
-_EX_XS = gl.constexpr(EX_XS)
 _XS_MBLOCK_STRIDE = gl.constexpr(XS_MBLOCK_STRIDE)
 _EX_HP_TAGS = gl.constexpr(EX_HP_TAGS)
 _EX_S_TAGS = gl.constexpr(EX_S_TAGS)
@@ -287,6 +299,8 @@ _QKV_TASK_ROWS = gl.constexpr(QKV_TASK_ROWS)
 _HEAD_TASKS = gl.constexpr(HEAD_TASKS)
 _UNP_COLUMNS = gl.constexpr(UNP_COLUMNS)
 _STAMP_STRIDE = gl.constexpr(STAMP_STRIDE)
+_PART_ROWS = gl.constexpr(PART_ROWS)
+_RECORD_WORDS = gl.constexpr(RECORD_WORDS)
 _STAMP_ENTRY = gl.constexpr(STAMP_ENTRY)
 _STAMP_CHECKED = gl.constexpr(STAMP_CHECKED)
 _STAMP_FRONT = gl.constexpr(STAMP_FRONT)
@@ -341,6 +355,23 @@ def _stamp(stamps_ptr, cta, point: gl.constexpr, STAMPS: gl.constexpr):
     plain store; compiled out otherwise)."""
     if STAMPS:
         trace_stamp(stamps_ptr + cta * _STAMP_STRIDE, point)
+
+
+@gluon.jit
+def _launch_records(att_records, launch):
+    """This launch's copy of the attention records; zero this workgroup's
+    share of the other copy, which the next launch uses (nothing reads it in
+    this one)."""
+    lanes_l: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    lane = gl.arange(0, 64 * gl.num_warps(), lanes_l)
+    SHARE: gl.constexpr = _RECORD_WORDS // _GRID
+    gl.amd.cdna4.buffer_store(
+        gl.zeros([64 * gl.num_warps()], gl.int32, lanes_l),
+        att_records + (1 - launch.copy) * _RECORD_WORDS,
+        launch.cta * SHARE + lane,
+        mask=lane < SHARE,
+    )
+    return att_records + launch.copy * _RECORD_WORDS
 
 
 @gluon.jit
@@ -463,7 +494,8 @@ def _wait_records_gpu(record_ptr, first, count, tag, launch):
 
 @gluon.jit
 def _no_weights(args):
-    return ()
+    """No resident weights (a value, since the issue point sits in a branch)."""
+    return gl.to_tensor(0)
 
 
 @gluon.jit
@@ -513,8 +545,9 @@ def _full_items(
     """A full layer's splits: this workgroup's balanced decode items
     (program indices ``cta`` and ``cta + GRID``). Each partial is written
     through; its record (device scope) waits only for the partial's stores.
-    The role's weights (``ISSUE(issue_args)``) issue after the first item's
-    partial store, so they hold up neither its stores nor its record.
+    The role's weights (``ISSUE(issue_args)``) issue after the last item's
+    partial store, so they hold up neither the pages, the stores nor the
+    records.
 
     Returns:
         ``ISSUE``'s weights.
@@ -533,25 +566,33 @@ def _full_items(
         token = store_balanced_partial_gfx950(
             program, acc, l_i, m_i, block_item, splits, record_ptr
         )
-    issued = ISSUE(issue_args)
-    if live:
-        publish_balanced_record_gfx950(
-            program, record_ptr, block_item, launch.tag, token
-        )
-    program, live, block_item, splits = mha_decode_balanced_item_gfx950(
+    second, live2, block_item2, splits2 = mha_decode_balanced_item_gfx950(
         cfg, q_ptr, cache_seqlens_ptr, REQUESTS, schedule_ptr, page_table_ptr,
         k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, launch.cta + _GRID,
     )  # fmt: skip
-    if live:
+    if live2:
+        # Two items: the first's record goes out now, the weights after the
+        # second's partial, so neither item's pages queue behind them.
+        if live:
+            publish_balanced_record_gfx950(
+                program, record_ptr, block_item, launch.tag, token
+            )
         m_i, l_i, acc = mha_decode_balanced_split_gfx950(
-            program, k_cache_ptr, v_cache_ptr, NUM_STAGES
+            second, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
-        token = store_balanced_partial_gfx950(
-            program, acc, l_i, m_i, block_item, splits, record_ptr
+        token2 = store_balanced_partial_gfx950(
+            second, acc, l_i, m_i, block_item2, splits2, record_ptr
         )
+        issued = ISSUE(issue_args)
         publish_balanced_record_gfx950(
-            program, record_ptr, block_item, launch.tag, token
+            second, record_ptr, block_item2, launch.tag, token2
         )
+    else:
+        issued = ISSUE(issue_args)
+        if live:
+            publish_balanced_record_gfx950(
+                program, record_ptr, block_item, launch.tag, token
+            )
     return issued
 
 
@@ -730,7 +771,7 @@ def _topk(
         launch.tag,
         gl.reshape(offsets, [WAVES * _EXPERTS]),
         gl.reshape(live, [WAVES * _EXPERTS]),
-        rows,
+        _PART_ROWS,
         _EXPERTS,
         _KPARTS,
         launch,
@@ -800,7 +841,9 @@ def _xn(
         words, row, norm_weights, xq_ptr, xs_ptr, _POOLED, EPS, WEIGHT_OFFSET, 1,
         _XS_MBLOCK_STRIDE,
     )  # fmt: skip
+    # Every wave's xq stores land before the tag: drain, then a barrier.
     release_drain()
+    gl.barrier()
     lanes_l: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     lane = gl.arange(0, 64 * gl.num_warps(), lanes_l)
     tag = gl.full([64 * gl.num_warps()], 0, gl.int32, lanes_l) + launch.tag
@@ -1085,7 +1128,8 @@ def _head_rows(launch, qkv_parts, column0, rows):
     token = index // _HEAD_DIM
     sums = gemv_a16w16_splitk_sum_gfx950(
         qkv_parts, launch.tag, token * _QKV_WIDTH + column0 + index % _HEAD_DIM,
-        token < rows, rows, _QKV_WIDTH, _QKV_PARTS, launch, iris_fail_stop, _SITE_QKV,
+        token < rows, _PART_ROWS, _QKV_WIDTH, _QKV_PARTS, launch, iris_fail_stop,
+        _SITE_QKV,
     )  # fmt: skip
     return gl.convert_layout(
         gl.reshape(sums.to(gl.bfloat16).to(gl.float32), [16, _HEAD_DIM]), rows_l
@@ -1217,7 +1261,9 @@ def _bnd2(
 # ---------------------------------------------------------------------------
 
 
-@gluon.jit(do_not_specialize=("deadline_ticks", "label", "gate_stride", "num_slots"))
+@gluon.jit(
+    do_not_specialize=("deadline_ticks", "label", "rank", "gate_stride", "num_slots")
+)
 def gluon_decoder_layer_muse_spark_gfx950(
     # Launch state.
     epochs,
@@ -1346,6 +1392,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     QK_EPS: gl.constexpr,
     QK_OFFSET: gl.constexpr,
     KV_SCALED: gl.constexpr,
+    NEXT_ROTARY: gl.constexpr,
     QKV_WINDOW: gl.constexpr,
     STAMPS: gl.constexpr,
     # MoE plan fields (native_stream.run_moe).
@@ -1392,12 +1439,14 @@ def gluon_decoder_layer_muse_spark_gfx950(
             o_tiles, hi, lo = _sender_weights(weights)
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
+            records = _launch_records(att_records, launch)
         else:
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
+            records = _launch_records(att_records, launch)
             o_tiles, hi, lo = _full_items(
                 launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
-                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
+                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records,
                 REQUESTS, NUM_STAGES, _sender_weights, weights,
             )  # fmt: skip
         _send(launch, view, sender, o_tiles, rows, RANK, PEER_CACHE)
@@ -1416,7 +1465,14 @@ def gluon_decoder_layer_muse_spark_gfx950(
             _publish_hprime(launch, hp, xcd, rows, hprime, exchange)
         logits = gemv_a16w16_splitk_hi_lo_sums_gfx950(hi, lo, x, _sums_layout(16, 2))
         gemv_a16w16_splitk_publish_gfx950(
-            logits, logits_parts, launch.tag, slot * 16, xcd, rows, _EXPERTS, ".wt"
+            logits,
+            logits_parts,
+            launch.tag,
+            slot * 16,
+            xcd,
+            _PART_ROWS,
+            _EXPERTS,
+            ".wt",
         )
     elif slot < 24:
         # POOL; slot 16 + T on XCD T reduces tile T and pushes H3.
@@ -1426,12 +1482,14 @@ def gluon_decoder_layer_muse_spark_gfx950(
             p_tiles = _pooler_weights((pooler_ptr, task))
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
+            records = _launch_records(att_records, launch)
         else:
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
+            records = _launch_records(att_records, launch)
             p_tiles = _full_items(
                 launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
-                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
+                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records,
                 REQUESTS, NUM_STAGES, _pooler_weights, (pooler_ptr, task),
             )  # fmt: skip
         _, x = _kpart_x(
@@ -1443,7 +1501,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             p_tiles, x.to(gl.bfloat16), _sums_layout(_POOL_TILE, 2)
         )
         gemv_a16w16_splitk_publish_gfx950(
-            pooled, pooled_parts, launch.tag, tile * _POOL_TILE, xcd, rows,
+            pooled, pooled_parts, launch.tag, tile * _POOL_TILE, xcd, _PART_ROWS,
             _POOLED_LOCAL, ".wt",
         )  # fmt: skip
         if xcd == tile:
@@ -1456,7 +1514,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             live = (t < rows)[:, None] & (c >= 0)[None, :]
             reduced = gemv_a16w16_splitk_sum_gfx950(
                 pooled_parts, launch.tag, gl.reshape(offsets, [16 * _POOL_TILE]),
-                gl.reshape(live, [16 * _POOL_TILE]), rows, _POOLED_LOCAL, _KPARTS,
+                gl.reshape(live, [16 * _POOL_TILE]), _PART_ROWS, _POOLED_LOCAL, _KPARTS,
                 launch, iris_fail_stop, _SITE_POOL,
             )  # fmt: skip
             h3_sink(
@@ -1466,19 +1524,20 @@ def gluon_decoder_layer_muse_spark_gfx950(
     else:
         launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
         _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
+        records = _launch_records(att_records, launch)
         if SLIDING:
             if xcd < 2 * REQUESTS:
                 # Split (slot - 24) of block xcd.
                 _attention_split(
                     launch, xcd, slot - _ATT_FIRST_SLOT, view, q_ptr, gate_ptr,
                     gate_stride, k_cache_ptr, v_cache_ptr, page_table_ptr,
-                    cache_seqlens_ptr, mid_o_ptr, mid_lse_ptr, att_records, cfg,
+                    cache_seqlens_ptr, mid_o_ptr, mid_lse_ptr, records, cfg,
                     GATE_EPS, NUM_STAGES,
                 )  # fmt: skip
         else:
             _full_items(
                 launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
-                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
+                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records,
                 REQUESTS, NUM_STAGES, _no_weights, (),
             )  # fmt: skip
             # Merge tasks on slots 24.. (no weights in flight), 8 per XCD row.
@@ -1486,7 +1545,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             if merge < REQUESTS * 2 * _FULL_MERGE_TASKS:
                 _full_merge(
                     launch, merge, view, cfg, schedule_ptr, mid_o_ptr, mid_lse_ptr,
-                    att_records, q_ptr, gate_ptr, gate_stride, GATE_EPS,
+                    records, q_ptr, gate_ptr, gate_stride, GATE_EPS,
                 )  # fmt: skip
         if (slot == _ATT_FIRST_SLOT) & (xcd >= 8 - REQUESTS):
             _topk(
@@ -1545,38 +1604,43 @@ def gluon_decoder_layer_muse_spark_gfx950(
             _POOLED,
         )  # fmt: skip
         if NEXT_KIND != 2:
-            qkv_tiles = gemv_a16w16_splitk_weights_paced_gfx950(
-                qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
-                QKV_WINDOW,
-            )  # fmt: skip
+            # Tail-role workgroups finish their MoE share early, inside the
+            # MoE's full-rate window: their task goes out unpaced.
+            qkv_tiles = gemv_a16w16_splitk_weights_gfx950(
+                qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS
+            )
         _unp(
             launch, view, sender, rows, w, s_rows, hprime, exchange, alpha2_ptr,
             beta2_ptr, post2_bf16_ptr, RANK, PEER_CACHE,
         )  # fmt: skip
         if slot == 16:
             red_sums(view, launch, rows, iris_fail_stop, RANK, PEER_CACHE)
+    elif is_tail:
+        if NEXT_KIND != 2:
+            qkv_tiles = gemv_a16w16_splitk_weights_gfx950(
+                qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS
+            )
+        # OWN4 then FIN of pick / part xcd.
+        for r in gl.static_range(REQUESTS):
+            token = index + 8 * r
+            own4_complete(
+                view, launch, token * _TOPK + xcd, route_norm_ptr, iris_fail_stop,
+                RANK, ROUTE_OFFSET, PEER_CACHE,
+            )  # fmt: skip
+            s = fin(
+                view, launch, token, xcd,
+                (exchange + _EX_WEIGHTS).to(gl.pointer_type(gl.float32), bitcast=True),
+                route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
+            )  # fmt: skip
+            _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
     else:
         if NEXT_KIND != 2:
+            # The other workgroups stream their task while the tail's
+            # latency-bound exchanges run: paced below the fabric's knee.
             qkv_tiles = gemv_a16w16_splitk_weights_paced_gfx950(
                 qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
                 QKV_WINDOW,
             )  # fmt: skip
-        if is_tail:
-            # OWN4 then FIN of pick / part xcd.
-            for r in gl.static_range(REQUESTS):
-                token = index + 8 * r
-                own4_complete(
-                    view, launch, token * _TOPK + xcd, route_norm_ptr,
-                    iris_fail_stop, RANK, ROUTE_OFFSET, PEER_CACHE,
-                )  # fmt: skip
-                s = fin(
-                    view, launch, token, xcd,
-                    (exchange + _EX_WEIGHTS).to(
-                        gl.pointer_type(gl.float32), bitcast=True
-                    ),
-                    route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
-                )  # fmt: skip
-                _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
     _stamp(stamps_ptr, launch.cta, _STAMP_TAIL, STAMPS)
     if NEXT_KIND != 2:
         # QKV: x'' of K part ``part``; group 0 stores h'' for the
@@ -1588,7 +1652,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         if group == 0:
             _store_rows_b(h2, residual_ptr, part, rows, _HIDDEN // _QKV_PARTS)
         gemv_a16w16_splitk_finish_x_gfx950(
-            qkv_tiles, x2.to(gl.bfloat16), qkv_parts, launch.tag, task, rows,
+            qkv_tiles, x2.to(gl.bfloat16), qkv_parts, launch.tag, task, _PART_ROWS,
             _QKV_WIDTH, _QKV_TASK_ROWS, _QKV_GROUPS, ".wt",
         )  # fmt: skip
         _stamp(stamps_ptr, launch.cta, _STAMP_QKV, STAMPS)
@@ -1598,7 +1662,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 launch, head, rows, qkv_parts, q_out_ptr, gate_out_ptr, q_norm_ptr,
                 k_norm_ptr, cos_sin_ptr, cos_sin_stride, positions_ptr,
                 next_k_cache_ptr, next_v_cache_ptr, slots_ptr, num_slots, k_inv_scale,
-                v_inv_scale, NEXT_KIND == 0, QK_EPS, QK_OFFSET, KV_SCALED,
+                v_inv_scale, NEXT_ROTARY, QK_EPS, QK_OFFSET, KV_SCALED,
             )  # fmt: skip
     elif is_tail:
         # BND2: the regular boundary of (token, part xcd).
@@ -1699,6 +1763,7 @@ _POINTER_TYPES = dict(
     v_inv_scale="fp32",
     normed_out_ptr="*bf16",
     stamps_ptr="*i64",
+    deadline_ticks="i64",
 )
 
 
@@ -1747,6 +1812,7 @@ def kernel_constexprs(
     n_phys2: int,
     num_stages: int,
     kv_scaled: bool,
+    next_rotary: bool,
     qkv_window: int,
     stamps: bool,
 ) -> dict:
@@ -1777,6 +1843,7 @@ def kernel_constexprs(
         QK_EPS=model.qk_eps,
         QK_OFFSET=model.qk_offset,
         KV_SCALED=kv_scaled,
+        NEXT_ROTARY=next_rotary,
         QKV_WINDOW=qkv_window,
         STAMPS=stamps,
         N_PHYS1=n_phys1,
@@ -1836,9 +1903,10 @@ def offline_signature(constexprs: dict) -> dict:
 
 
 # Integer arguments a launch passes as multiples of 16, which Triton then
-# specializes as such (weight and scale strides).
+# specializes as such (weight and scale strides, the rotary table's stride).
 DIVISIBLE_ARGS = frozenset(
     {
+        "cos_sin_stride",
         "stride_w13",
         "stride_s13",
         "stride_s13lin",
@@ -1851,6 +1919,24 @@ DIVISIBLE_ARGS = frozenset(
 )
 
 
+def offline_attrs(signature: dict) -> dict:
+    """The argument attributes a launch's specialization gives the kernel:
+    16-byte divisible pointers within a 32-bit range (buffer operations),
+    and the 16-divisible integers of :data:`DIVISIBLE_ARGS`."""
+    attrs = {}
+    for index, name in enumerate(gluon_decoder_layer_muse_spark_gfx950.arg_names):
+        kind = signature.get(name)
+        if isinstance(kind, tuple):
+            attrs.update(
+                {(index, p): [["tt.divisibility", 16]] for p in range(len(kind))}
+            )
+        elif isinstance(kind, str) and kind.startswith("*"):
+            attrs[(index,)] = [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+        elif name in DIVISIBLE_ARGS:
+            attrs[(index,)] = [["tt.divisibility", 16]]
+    return attrs
+
+
 def offline_compile_args(key: PlanKey, rank: int):
     """Everything to compile plan variant ``key`` of rank ``rank`` (0-7) for
     gfx950 without a GPU, with Muse Spark's constants and the default plan
@@ -1859,16 +1945,16 @@ def offline_compile_args(key: PlanKey, rank: int):
     Returns:
         ``(fn, signature, constexprs, options)``: the kernel, its argument
         types (``heaps`` a tuple of 8 int64), the constexprs, and the compile
-        options (``num_warps`` and the persistent kernel options). Declare
-        every pointer and every :data:`DIVISIBLE_ARGS` argument 16-divisible,
-        as a launch specializes them.
+        options (``num_warps`` and the persistent kernel options). Pass
+        :func:`offline_attrs` of the signature as the source's attributes, as
+        a launch specializes them.
     """
     fn = gluon_decoder_layer_muse_spark_gfx950
     constexprs = kernel_constexprs(
         key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=8, quad_map=0,
         dn_order=0, addr_soffset=0, scale_lanes=0, tail_num=1, tail_den=2,
-        n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False, qkv_window=4,
-        stamps=False,
+        n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False,
+        next_rotary=key.next_kind == "sliding", qkv_window=4, stamps=False,
     )  # fmt: skip
     signature = offline_signature(constexprs)
     options = {"num_warps": NUM_WARPS, **persistent_compile_options()}
