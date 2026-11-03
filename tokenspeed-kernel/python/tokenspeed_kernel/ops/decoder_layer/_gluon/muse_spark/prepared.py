@@ -116,6 +116,11 @@ DEFAULT_PLAN_FIELDS = dict(
     # Who merges a sliding block's splits: split 0 ("designated") or every
     # split its share of the rows ("spread").
     att_merge="designated",
+    # The launch entry's counters (``enter_check``): "vector" (a scalar
+    # epoch load, a relaxed epoch store, a returning claim exchange) or
+    # "scalar" (returning scalar atomics, which do not wait for the role's
+    # first loads).
+    entry="vector",
 )
 
 

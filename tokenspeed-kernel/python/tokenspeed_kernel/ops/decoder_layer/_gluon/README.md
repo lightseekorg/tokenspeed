@@ -44,8 +44,9 @@ The rules in the design doc apply; on gfx950:
 `DEFAULT_PLAN_FIELDS` (prepared.py) are compile-time choices the benchmark
 varies one at a time: the MoE ring depth, its wave and down-unit orders and
 address form, the tail-role share of the expert bytes, the attention
-pipeline depth, the QKV weight window, and who merges a sliding block
-(`att_merge`). Serving uses the defaults.
+pipeline depth, the QKV weight window, who merges a sliding block
+(`att_merge`), and the launch entry's form (`entry`). Serving uses the
+defaults.
 
 ## Checks
 

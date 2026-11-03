@@ -279,15 +279,18 @@ def _counted_loop(loop: str) -> bool:
     return False
 
 
-def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
+def persistent_codegen_problems(assembly: str, *, entry: str | None) -> list[str]:
     """Return the ordering rules a persistent kernel's assembly breaks.
 
     - Nothing invalidates or writes back L2.
-    - With ``entry`` (a kernel that runs the launch entry): the two
-      counters are returning scalar atomics waited for with lgkmcnt (one
-      pair per inlined copy of the entry), and no store, vector atomic or
-      vmcnt wait precedes the first pair (the role's loads issued before
-      the entry stay in flight).
+    - With ``entry`` (a kernel that runs the launch entry, in the form
+      ``enter_check`` was given; None for a kernel without it), one check
+      per inlined copy of the entry, and nothing waits for the role's
+      loads issued before the entry until the form's first access:
+      - ``"scalar"``: the two counters are returning scalar atomics waited
+        for with lgkmcnt, and no store or vector atomic precedes them;
+      - ``"vector"``: the epoch store (``global_store_dwordx2``) is the
+        first store, and the returning claim exchange the next one.
     - A store to the address of an earlier global load with a scalar base
       (a per-workgroup word such as the epoch) follows a full drain and a
       workgroup barrier after that load.
@@ -315,7 +318,7 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
         for index, line in enumerate(lines)
         if re.search(r"\b(global|buffer)_(store|atomic)\w*", line)
     ]
-    if entry:
+    if entry == "scalar":
         # The entry: two returning scalar atomics (the counters) with an
         # lgkmcnt wait, before any vector store or atomic; no vmcnt wait
         # from the kernel start to the counters, so loads issued before the
@@ -341,6 +344,30 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
                 after = "\n".join(lines[second : second + 3])
                 if "s_waitcnt lgkmcnt(0)" not in after:
                     problems.append("the entry does not wait for its counters")
+    elif entry == "vector":
+        # The entry: the epoch store, then the returning claim exchange, as
+        # the first two writes of each inlined copy; no vmcnt wait before
+        # the first epoch store (the exchange's own wait is the first).
+        swaps = [
+            position
+            for position, index in enumerate(writes)
+            if re.match(r"\s*global_atomic_swap_x2 v\[", lines[index])
+            and " sc0" in lines[index]
+        ]
+        if not swaps or swaps[0] != 1:
+            problems.append("the claim exchange is not the entry's second write")
+        else:
+            for position in swaps:
+                if not re.match(
+                    r"\s*global_store_dwordx2 ", lines[writes[position - 1]]
+                ):
+                    problems.append(
+                        "the claim exchange does not follow the epoch store"
+                    )
+            if any("vmcnt" in line for line in lines[: writes[0]]):
+                problems.append("a vmcnt wait precedes the epoch store")
+    else:
+        assert entry is None, entry
     problems += _unordered_read_then_write(lines)
     for position, index in enumerate(writes):
         if re.search(r"global_atomic_add\s", lines[index]) and " sc0" in lines[index]:

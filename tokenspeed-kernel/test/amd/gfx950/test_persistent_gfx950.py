@@ -53,6 +53,34 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
 
 _DEADLINE_TICKS = 200_000_000  # 2 s
 _GRID = gl.constexpr(GRID)
+_WORDS = LINE_WORDS // 2
+# The two entry forms (``enter_check``'s ``SCALAR_COUNTERS``).
+_FORMS = pytest.mark.parametrize("scalar", [False, True], ids=["vector", "scalar"])
+
+
+def _claim_mark(epoch, pid):
+    """The vector entry's claim word for ``pid`` in launch ``epoch``: its
+    tag (``launch_tag(epoch, 32)``) high, the program id low."""
+    return ((epoch % (2**32 - 1) + 1) << 32) | pid
+
+
+def _check_counters(state, launches, scalar):
+    """After ``launches`` launches from zeroed counters: every word the form
+    uses advanced once per launch, and no other word was touched."""
+    epochs = state.epochs.view(GRID, _WORDS).cpu()
+    claims = state.claims.view(GRID, _WORDS).cpu()
+    if scalar:
+        # One word per wave in each line.
+        for counters in (epochs, claims):
+            assert bool((counters[:, :8] == launches).all())
+            assert bool((counters[:, 8:] == 0).all())
+    else:
+        assert bool((epochs[:, 0] == launches).all())
+        assert bool((epochs[:, 1:] == 0).all())
+        assert bool((claims[:, 0] >> 32 == _claim_mark(launches, 0) >> 32).all())
+        # Each role was claimed by one program id.
+        assert sorted((claims[:, 0] & 0xFFFFFFFF).tolist()) == list(range(GRID))
+        assert bool((claims[:, 1:] == 0).all())
 
 
 @gluon.jit
@@ -77,13 +105,16 @@ def _join_rounds_kernel(
     deadline_ticks,
     ROUNDS: gl.constexpr,
     LAUNCHES: gl.constexpr,
+    SCALAR_COUNTERS: gl.constexpr,
 ):
     """Every round each workgroup writes its value, joins, and reads its
     neighbor's; the next round overwrites the same words after another join.
     ``placement[epoch % LAUNCHES, pid]`` records ``cta << 8 | xcd`` and
     ``tags[epoch % LAUNCHES, pid]`` the launch's ``tag << 1 | copy``."""
     entry = enter_issue(epochs, claims)
-    launch = enter_check(entry, errors, errors, deadline_ticks, 0, _record_and_return)
+    launch = enter_check(
+        entry, errors, errors, deadline_ticks, 0, _record_and_return, SCALAR_COUNTERS
+    )
     row = (launch.epoch % LAUNCHES).to(gl.int32)
     gl.store(placement + row * _GRID + gl.program_id(0), (launch.cta << 8) | launch.xcd)
     gl.store(tags + row * _GRID + gl.program_id(0), (launch.tag << 1) | launch.copy)
@@ -107,9 +138,7 @@ class _State:
         self.errors = torch.zeros(ERROR_WORDS, dtype=torch.int32, device="cuda")
 
 
-def _launch_rounds(
-    state, values, seen, placement, rounds, grid=GRID, deadline=None, tags=None
-):
+def _launch_rounds(state, values, seen, placement, rounds, scalar, grid=GRID, deadline=None, tags=None,):  # fmt: skip
     if tags is None:
         tags = torch.zeros_like(placement)
     _join_rounds_kernel[(grid,)](
@@ -124,6 +153,7 @@ def _launch_rounds(
         _DEADLINE_TICKS if deadline is None else deadline,
         ROUNDS=rounds,
         LAUNCHES=placement.shape[0],
+        SCALAR_COUNTERS=scalar,
         num_warps=8,
         **persistent_compile_options(),
     )
@@ -139,7 +169,8 @@ def _rotate_dispatch(scratch, workgroups):
     _small_grid_kernel[(workgroups,)](scratch)
 
 
-def test_joins_order_writes_across_launches_and_graph_replays():
+@_FORMS
+def test_joins_order_writes_across_launches_and_graph_replays(scalar):
     state = _State()
     rounds, replays = 4, 500
     # Each replay runs two launches; placement keeps one row per launch.
@@ -148,16 +179,16 @@ def test_joins_order_writes_across_launches_and_graph_replays():
     seen = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     placement = torch.full((launches + 1, GRID), -1, dtype=torch.int32, device="cuda")
     scratch = torch.zeros(64, dtype=torch.int32, device="cuda")
-    _launch_rounds(state, values, seen, placement, rounds)
+    _launch_rounds(state, values, seen, placement, rounds, scalar)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         # Odd grids before and between the persistent launches rotate the
         # XCD that their first workgroup lands on.
         _rotate_dispatch(scratch, 13)
-        _launch_rounds(state, values, seen, placement, rounds)
+        _launch_rounds(state, values, seen, placement, rounds, scalar)
         _rotate_dispatch(scratch, 5)
-        _launch_rounds(state, values, seen, placement, rounds)
+        _launch_rounds(state, values, seen, placement, rounds, scalar)
     for _ in range(replays):
         graph.replay()
     torch.cuda.synchronize()
@@ -166,13 +197,7 @@ def test_joins_order_writes_across_launches_and_graph_replays():
     assert torch.equal(
         seen.cpu(), torch.full((GRID,), rounds * launches, dtype=torch.int32)
     )
-    # Each wave of each program id advanced its own epoch once per launch,
-    # and each wave of each role claimed it once per launch.
-    for counters in (state.epochs, state.claims):
-        assert torch.equal(
-            counters.view(GRID, LINE_WORDS // 2)[:, :8].cpu(),
-            torch.full((GRID, 8), launches, dtype=torch.int64),
-        )
+    _check_counters(state, launches, scalar)
     rows = placement[1 : launches + 1].cpu()
     pid = torch.arange(GRID, dtype=torch.int32)
     xcd, cta = rows & 0xFF, rows >> 8
@@ -188,48 +213,57 @@ def test_joins_order_writes_across_launches_and_graph_replays():
     assert state.joins.count_nonzero().item() == 0
 
 
-def test_join_waits_for_a_missing_workgroup_until_its_deadline():
+@_FORMS
+def test_join_waits_for_a_missing_workgroup_until_its_deadline(scalar):
     state = _State()
     values = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     seen = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     placement = torch.zeros((2, GRID), dtype=torch.int32, device="cuda")
     # Eight workgroups short: no XCD completes its join. 10 ms deadline.
-    _launch_rounds(state, values, seen, placement, 1, grid=GRID - 8, deadline=1_000_000)
+    _launch_rounds(
+        state, values, seen, placement, 1, scalar, grid=GRID - 8, deadline=1_000_000
+    )
     torch.cuda.synchronize()
     assert state.errors[0].item() == SITE_JOIN
     assert state.errors[3].item() == 1  # epoch of the failing launch
 
 
-def test_duplicate_claim_is_reported():
+@_FORMS
+def test_duplicate_claim_is_reported(scalar):
     state = _State()
     values = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     seen = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     placement = torch.zeros((2, GRID), dtype=torch.int32, device="cuda")
-    # Advance the counter of role (xcd 3, slot 5) once, as a second
-    # workgroup taking that role in this launch would have.
-    claims = state.claims.view(GRID, LINE_WORDS // 2)
-    claims[3 * 32 + 5, 0] = 1
-    _launch_rounds(state, values, seen, placement, 1)
+    # Claim role (xcd 3, slot 5) for launch 1 as a second workgroup taking
+    # it would have: its counter advanced once, or program id 77's mark.
+    claims = state.claims.view(GRID, _WORDS)
+    claims[3 * 32 + 5, 0] = 1 if scalar else _claim_mark(1, 77)
+    _launch_rounds(state, values, seen, placement, 1, scalar)
     torch.cuda.synchronize()
     assert state.errors[0].item() == SITE_CLAIM
     assert state.errors[1].item() == 5 * 8 + 3  # the role's logical id
-    assert state.errors[2].item() == 5  # its slot
+    # The scalar form records the slot, the vector form the other claimer.
+    assert state.errors[2].item() == (5 if scalar else 77)
 
 
-def test_launches_cross_the_32_bit_epoch_boundary():
+@_FORMS
+def test_launches_cross_the_32_bit_epoch_boundary(scalar):
     """64-bit counters: tags stay nonzero and distinct, copies alternate and
     no claim trips across 2**32."""
     state = _State()
     start = 2**32 - 3
-    # Every wave's counters (one int64 per wave in each line).
-    state.epochs.view(GRID, LINE_WORDS // 2)[:, :8] = start
-    state.claims.view(GRID, LINE_WORDS // 2)[:, :8] = start
+    if scalar:
+        # Every wave's counters (one int64 per wave in each line).
+        state.epochs.view(GRID, _WORDS)[:, :8] = start
+        state.claims.view(GRID, _WORDS)[:, :8] = start
+    else:
+        state.epochs.view(GRID, _WORDS)[:, 0] = start
     values = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     seen = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     placement = torch.zeros((8, GRID), dtype=torch.int32, device="cuda")
     tags = torch.zeros_like(placement)
     for _ in range(6):
-        _launch_rounds(state, values, seen, placement, 1, tags=tags)
+        _launch_rounds(state, values, seen, placement, 1, scalar, tags=tags)
     torch.cuda.synchronize()
     assert state.errors.count_nonzero().item() == 0
     rows = [(start + n) % 8 for n in range(1, 7)]
@@ -240,13 +274,13 @@ def test_launches_cross_the_32_bit_epoch_boundary():
 
 
 @gluon.jit(do_not_specialize=["deadline_ticks"])
-def _wave_epochs_kernel(
-    epochs, claims, errors, seen, deadline_ticks, LAUNCHES: gl.constexpr
-):
+def _wave_epochs_kernel(epochs, claims, errors, seen, deadline_ticks, LAUNCHES: gl.constexpr, SCALAR_COUNTERS: gl.constexpr,):  # fmt: skip
     """Each wave of each workgroup records the epoch it entered with in
     ``seen[epoch % LAUNCHES, pid, wave]`` (one lane per wave stores)."""
     entry = enter_issue(epochs, claims)
-    launch = enter_check(entry, errors, errors, deadline_ticks, 0, _record_and_return)
+    launch = enter_check(
+        entry, errors, errors, deadline_ticks, 0, _record_and_return, SCALAR_COUNTERS
+    )
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     lane = gl.arange(0, 64 * gl.num_warps(), lanes)
     row = (launch.epoch % LAUNCHES).to(gl.int32)
@@ -255,12 +289,12 @@ def _wave_epochs_kernel(
     gl.store(seen + slot, value, mask=lane % 64 == 0)
 
 
-def test_every_wave_enters_with_the_same_epoch_advancing_by_one():
-    """Each wave keeps its own epoch and claim counter words (no wave waits
-    for another at entry), so the counters must stay in step: in every
-    launch all 8 waves of all workgroups see the same epoch, it grows by
-    exactly 1 per launch, eager or replayed, wherever dispatch starts, and
-    afterwards every wave's word of every line holds the same count."""
+@_FORMS
+def test_every_wave_enters_with_the_same_epoch_advancing_by_one(scalar):
+    """In every launch all 8 waves of all workgroups see the same epoch
+    (the scalar form keeps a counter word per wave, which must stay in
+    step), it grows by exactly 1 per launch, eager or replayed, wherever
+    dispatch starts, and afterwards the counters hold the launch count."""
     state = _State()
     launches = 6
     seen = torch.zeros((launches, GRID, 8), dtype=torch.int64, device="cuda")
@@ -269,7 +303,8 @@ def test_every_wave_enters_with_the_same_epoch_advancing_by_one():
     def launch():
         _wave_epochs_kernel[(GRID,)](
             state.epochs, state.claims, state.errors, seen, _DEADLINE_TICKS,
-            LAUNCHES=launches, num_warps=8, **persistent_compile_options(),
+            LAUNCHES=launches, SCALAR_COUNTERS=scalar, num_warps=8,
+            **persistent_compile_options(),
         )  # fmt: skip
 
     for n in range(3):
@@ -287,11 +322,7 @@ def test_every_wave_enters_with_the_same_epoch_advancing_by_one():
     by_launch = seen.cpu()
     for epoch in range(1, launches + 1):
         assert bool((by_launch[epoch % launches] == epoch).all()), epoch
-    words = LINE_WORDS // 2
-    for counters in (state.epochs, state.claims):
-        waves = counters.view(GRID, words)[:, :8].cpu()
-        assert bool((waves == launches).all())
-        assert bool((counters.view(GRID, words)[:, 8:] == 0).all())
+    _check_counters(state, launches, scalar)
 
 
 _TRAP_CHILD = textwrap.dedent("""
@@ -319,7 +350,8 @@ _TRAP_CHILD = textwrap.dedent("""
 @gluon.jit(do_not_specialize=["deadline_ticks"])
 def _fail_stop_kernel(epochs, claims, joins, errors, deadline_ticks):
     entry = enter_issue(epochs, claims)
-    launch = enter_check(entry, errors, errors, deadline_ticks, 0, fail_stop)
+    # The serving entry form.
+    launch = enter_check(entry, errors, errors, deadline_ticks, 0, fail_stop, False)
     grid_join(joins, launch, fail_stop, 0, 0)
 
 

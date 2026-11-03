@@ -150,7 +150,7 @@ def test_entry_and_poll_rules(key):
     # abort read on its retry path, no barrier or LDS exchange in it, and a
     # barrier after each vector flag poll.
     assembly, _ = _compile(key)
-    assert persistent_codegen_problems(assembly, entry=True) == []
+    assert persistent_codegen_problems(assembly, entry="vector") == []
     assert split_poll_problems(assembly) == []
 
 

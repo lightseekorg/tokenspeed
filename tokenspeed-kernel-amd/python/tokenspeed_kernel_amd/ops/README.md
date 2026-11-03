@@ -60,15 +60,14 @@ through memory instead of kernel boundaries. They carry no model knowledge.
 - Entry is two calls. `enter_issue(epochs, claims)` names the workgroup's
   role, `cta = (pid // 8) * 8 + xcd` from the hardware XCD id, with no
   memory access; the role may then issue its first weight or KV loads.
-  `enter_check(entry, errors, arena, deadline_ticks, label, on_expiry)`
-  returns this wave's `Launch` (`cta`, `xcd`, `slot`, 64-bit `epoch`,
+  `enter_check(entry, errors, arena, deadline_ticks, label, on_expiry,
+  SCALAR_COUNTERS)` returns this wave's `Launch` (`cta`, `xcd`, `slot`, 64-bit `epoch`,
   never-zero 32-bit `tag`, `copy = epoch & 1` for two-copy areas). Roles use
   `cta`, never the program id: dispatch starts on an XCD that depends on the
   kernels before.
-- Each wave owns one int64 word in its workgroup's epoch line and one in
-  its role's claim line (`ENTRY_WORDS` each, zeroed together once). Every
-  launch adds exactly one to each, so a wave whose two old values differ
-  found a second workgroup on its role and stops with `SITE_CLAIM`.
+- Every launch advances the workgroup's epoch line (one per program id) and
+  claims its role's line (`ENTRY_WORDS` each, zeroed together once); a
+  second workgroup on a role stops with `SITE_CLAIM`.
 - Every wait is an equality on the launch tag and returns whether it was
   seen, per wave; the caller then runs `on_expiry(launch, site, detail)`,
   which must not return. A wait gives up at `deadline_ticks` (10 ns ticks)
@@ -108,9 +107,16 @@ through memory instead of kernel boundaries. They carry no model knowledge.
   poll waits behind every load the wave issued before it. Scalar loads and
   atomics count separately (`lgkmcnt`): entry and the `smem` polls never
   wait behind the role's weight loads.
-- Entry: each wave adds 1 to its two counters with returning scalar atomics
-  (`s_atomic_add_x2 … glc`) and waits on `lgkmcnt` only. `epoch` is the old
-  epoch value plus one, kept in scalar registers.
+- Entry, two forms (`SCALAR_COUNTERS`); `epoch` stays in scalar registers:
+  - vector: every wave reads the epoch word with a scalar `glc` load, the
+    waves join at a barrier, and a relaxed atomic store writes epoch + 1
+    without waiting for the role's loads. The workgroup then exchanges
+    `tag << 32 | pid` into its claim word; an old value with this launch's
+    tag is a duplicate. The exchange's result returns after the role's
+    loads issued before it.
+  - scalar: each wave adds 1 to its own word of both lines with returning
+    scalar atomics (`s_atomic_add_x2 … glc`) and waits on `lgkmcnt` only;
+    old values that differ are a duplicate.
 - Polls run per wave: one owner lane and a one-instruction vote, or scalar
   loads. Every 64 retries a poll reads the clock (the first check starts the
   deadline, so a wait met sooner reads no clock) and the abort word, with a

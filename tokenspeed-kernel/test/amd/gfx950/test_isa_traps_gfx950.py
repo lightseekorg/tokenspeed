@@ -403,6 +403,6 @@ def test_only_vector_flag_polls_need_a_barrier():
             target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
             options={"num_warps": 1, **persistent_compile_options()},
         ).asm["amdgcn"]
-        problems[scalar] = persistent_codegen_problems(assembly, entry=False)
+        problems[scalar] = persistent_codegen_problems(assembly, entry=None)
     assert "a load follows a flag poll before a barrier" in problems[False]
     assert problems[True] == []

@@ -52,6 +52,8 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
 )
 
 _LOADS = 4
+# The serving entry form (vector counters), for tests of what follows it.
+_SERVING = gl.constexpr(False)
 
 
 def _compile(fn, signature, constexprs=None, num_warps=8):
@@ -90,10 +92,12 @@ def _weights(w_ptr, LOADS: gl.constexpr):
 
 
 @gluon.jit(do_not_specialize=["deadline_ticks"])
-def _entry_kernel(epochs, claims, errors, arena, w_ptr, out, deadline_ticks,LOADS: gl.constexpr):  # fmt: skip
+def _entry_kernel(epochs, claims, errors, arena, w_ptr, out, deadline_ticks,LOADS: gl.constexpr, SCALAR_COUNTERS: gl.constexpr):  # fmt: skip
     entry = enter_issue(epochs, claims)
     total, offs = _weights(w_ptr, LOADS)
-    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    launch = enter_check(
+        entry, errors, arena, deadline_ticks, 0, fail_stop, SCALAR_COUNTERS
+    )
     gl.amd.cdna4.buffer_store(total + launch.tag.to(gl.float32), out, offs)
 
 
@@ -108,12 +112,14 @@ _ENTRY_SIGNATURE = {
 }
 
 
-def test_entry_never_waits_for_the_roles_loads():
+def test_scalar_entry_never_waits_for_the_roles_loads():
     """The role's first loads go out with nothing vector outstanding, and
-    the entry's counters are scalar atomics waited for with lgkmcnt: the
-    loads stay in flight until the role uses them."""
-    assembly = _compile(_entry_kernel, _ENTRY_SIGNATURE, {"LOADS": _LOADS})
-    assert persistent_codegen_problems(assembly, entry=True) == []
+    the scalar form's counters are scalar atomics waited for with lgkmcnt:
+    the loads stay in flight until the role uses them."""
+    assembly = _compile(
+        _entry_kernel, _ENTRY_SIGNATURE, {"LOADS": _LOADS, "SCALAR_COUNTERS": True}
+    )
+    assert persistent_codegen_problems(assembly, entry="scalar") == []
     lines = instruction_lines(assembly)
     first_load = next(i for i, l in enumerate(lines) if l.startswith("buffer_load"))
     assert not any("vmcnt" in l for l in lines[:first_load])
@@ -124,6 +130,26 @@ def test_entry_never_waits_for_the_roles_loads():
         i for i in range(counters[1], len(lines)) if lines[i].startswith("s_cmp")
     )
     assert not any("vmcnt" in l for l in lines[first_load:check])
+
+
+def test_vector_entry_waits_for_the_roles_loads_only_at_the_claim():
+    """The vector form reads the epoch with a scalar load and stores it
+    without waiting for the role's loads; only the claim exchange's result
+    waits for them."""
+    assembly = _compile(
+        _entry_kernel, _ENTRY_SIGNATURE, {"LOADS": _LOADS, "SCALAR_COUNTERS": False}
+    )
+    assert persistent_codegen_problems(assembly, entry="vector") == []
+    lines = instruction_lines(assembly)
+    loads = [i for i, l in enumerate(lines) if l.startswith("buffer_load")]
+    epoch = next(
+        i
+        for i, l in enumerate(lines)
+        if l.startswith("s_load_dwordx2") and l.endswith(" glc")
+    )
+    swap = next(i for i, l in enumerate(lines) if l.startswith("global_atomic_swap_x2"))
+    assert len(loads) == _LOADS and loads[-1] < epoch < swap
+    assert not any("vmcnt" in l for l in lines[:swap])
 
 
 @gluon.jit
@@ -142,7 +168,7 @@ def _raw_weights(w_ptr):
 
 
 @gluon.jit(do_not_specialize=["deadline_ticks"])
-def _roles_kernel(epochs, claims, errors, arena, w_ptr, kv_ptr, out, deadline_ticks):
+def _roles_kernel(epochs, claims, errors, arena, w_ptr, kv_ptr, out, deadline_ticks,SCALAR_COUNTERS: gl.constexpr):  # fmt: skip
     """A composed layer's shape: role branches by slot, each issuing its own
     weights (or attention pages) before the entry check, used after it."""
     entry = enter_issue(epochs, claims)
@@ -152,17 +178,20 @@ def _roles_kernel(epochs, claims, errors, arena, w_ptr, kv_ptr, out, deadline_ti
         loads, offs = _raw_weights(w_ptr + 8 * 65536)
     else:
         loads, offs = _raw_weights(kv_ptr)
-    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    launch = enter_check(
+        entry, errors, arena, deadline_ticks, 0, fail_stop, SCALAR_COUNTERS
+    )
     total = loads[0] + loads[1] + loads[2] + loads[3]
     gl.amd.cdna4.buffer_store(total + launch.tag.to(gl.float32), out, offs)
 
 
-def test_composed_role_loads_issue_with_nothing_outstanding():
+@pytest.mark.parametrize("form", ["vector", "scalar"])
+def test_composed_role_loads_issue_with_nothing_outstanding(form):
     """In every role branch the first load follows no vmcnt wait: the entry
     leaves nothing vector in flight for a register reuse to wait on."""
     signature = dict(_ENTRY_SIGNATURE, kv_ptr="*fp32")
-    assembly = _compile(_roles_kernel, signature)
-    assert persistent_codegen_problems(assembly, entry=True) == []
+    assembly = _compile(_roles_kernel, signature, {"SCALAR_COUNTERS": form == "scalar"})
+    assert persistent_codegen_problems(assembly, entry=form) == []
     lines = instruction_lines(assembly)
     last_load = max(i for i, l in enumerate(lines) if l.startswith("buffer_load"))
     assert not any("vmcnt" in l for l in lines[:last_load])
@@ -198,7 +227,7 @@ def test_release_drain_orders_plain_payload_before_the_flag():
 def _poll_kernel(epochs, claims, errors, arena, word, w_ptr, out, expected,deadline_ticks, LOAD: gl.constexpr):  # fmt: skip
     entry = enter_issue(epochs, claims)
     total, offs = _weights(w_ptr, 2)
-    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop, _SERVING)
     if not poll_until(word, expected, launch, LOAD):
         fail_stop(launch, 16, 0)
     gl.amd.cdna4.buffer_store(total, out, offs)
@@ -212,7 +241,7 @@ _POLL_SIGNATURE = dict(_ENTRY_SIGNATURE, word="*i32", expected="i32")
 )
 def test_poll_until_codegen(load, bits):
     assembly = _compile(_poll_kernel, _POLL_SIGNATURE, {"LOAD": load})
-    assert persistent_codegen_problems(assembly, entry=True) == []
+    assert persistent_codegen_problems(assembly, entry="vector") == []
     assert re.search(rf"(global_load_dword|s_load_dword) .*{bits}\s*$", assembly, re.M)
 
 
@@ -226,7 +255,7 @@ def test_scalar_poll_never_waits_for_vector_loads():
 @gluon.jit(do_not_specialize=["deadline_ticks"])
 def _pairs_kernel(epochs, claims, errors, arena, box, src, out, deadline_ticks,SCOPE: gl.constexpr, PRODUCER: gl.constexpr):  # fmt: skip
     entry = enter_issue(epochs, claims)
-    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop, _SERVING)
     lane = gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0]))
     if PRODUCER:
         store_pairs(box + lane, gl.load(src + lane), launch, lane >= 0, SCOPE)
@@ -264,7 +293,7 @@ def test_pair_poll_reads_value_and_tag_in_one_load(scope):
     assembly = _compile(
         _pairs_kernel, _PAIRS_SIGNATURE, {"SCOPE": scope, "PRODUCER": False}
     )
-    assert persistent_codegen_problems(assembly, entry=True) == []
+    assert persistent_codegen_problems(assembly, entry="vector") == []
     bits = " sc1" if scope == "gpu" else " sc0 sc1"
     assert re.search(rf"global_load_dwordx2 .*{bits}\s*$", assembly, re.M)
 
@@ -273,7 +302,7 @@ def test_pair_poll_reads_value_and_tag_in_one_load(scope):
 def _tags16_kernel(epochs, claims, errors, arena, tags, w_ptr, out, tag,deadline_ticks, GLC: gl.constexpr, BARRIER: gl.constexpr):  # fmt: skip
     entry = enter_issue(epochs, claims)
     total, offs = _weights(w_ptr, 2)
-    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop, _SERVING)
     if not poll_tags16(tags, tag, launch, GLC, BARRIER):
         fail_stop(launch, 16, 0)
     # What the tags guard, read after the poll.
@@ -287,7 +316,7 @@ def test_poll_tags16_is_scalar_only(glc, barrier):
     signature = dict(_ENTRY_SIGNATURE, tags="*i32", tag="i32")
     assembly = _compile(_tags16_kernel, signature, {"GLC": glc, "BARRIER": barrier})
     if barrier:
-        assert persistent_codegen_problems(assembly, entry=True) == []
+        assert persistent_codegen_problems(assembly, entry="vector") == []
     assert scalar_poll_vector_waits(assembly) == []
     # The guarded load stays after the poll loop, barrier or not.
     lines = instruction_lines(assembly)
@@ -335,7 +364,7 @@ def test_paced_issue_keeps_w_loads_in_flight():
 @gluon.jit(do_not_specialize=["deadline_ticks"])
 def _join_kernel(epochs, claims, errors, arena, joins, values, deadline_ticks):
     entry = enter_issue(epochs, claims)
-    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop, _SERVING)
     gl.store(values + launch.cta, launch.tag)
     grid_join(joins, launch, fail_stop, 0, 0)
     gl.store(
@@ -348,11 +377,13 @@ def test_grid_join_drains_before_arriving():
     signature = {k: v for k, v in _ENTRY_SIGNATURE.items() if k not in ("w_ptr", "out")}
     signature.update(joins="*i32", values="*i32")
     assembly = _compile(_join_kernel, signature)
-    assert persistent_codegen_problems(assembly, entry=True) == []
+    assert persistent_codegen_problems(assembly, entry="vector") == []
 
 
 def test_fail_stop_mirrors_the_record_before_the_trap():
-    assembly = _compile(_entry_kernel, _ENTRY_SIGNATURE, {"LOADS": 1})
+    assembly = _compile(
+        _entry_kernel, _ENTRY_SIGNATURE, {"LOADS": 1, "SCALAR_COUNTERS": False}
+    )
     lines = instruction_lines(assembly)
     trap = next(i for i, l in enumerate(lines) if l.startswith("s_trap"))
     before = lines[:trap]
@@ -368,7 +399,7 @@ def test_fail_stop_mirrors_the_record_before_the_trap():
 @gluon.jit(do_not_specialize=["deadline_ticks"])
 def _tag_poll_kernel(epochs, claims, errors, arena, word, deadline_ticks):
     entry = enter_issue(epochs, claims)
-    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop, _SERVING)
     if not poll_until(word, launch.tag, launch, "smem"):
         fail_stop(launch, 16, 0)
 

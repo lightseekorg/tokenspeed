@@ -172,6 +172,17 @@ def scalar_load_glc(word_ptr):
     )  # fmt: skip
 
 
+@gluon.jit
+def scalar_load_glc_i64(word_ptr):
+    """Load an int64 with a scalar load past the scalar cache (``glc``).
+
+    Counts in ``lgkmcnt``, like :func:`scalar_load_glc`."""
+    return gl.inline_asm(
+        "s_load_dwordx2 $0, $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)", "=s,s,~{memory}",
+        [word_ptr], gl.int64, is_pure=False,
+    )  # fmt: skip
+
+
 # Eight lines of four tagged pairs (value low, tag high): loads into s16..s79,
 # the OR of (tag ^ $5) into $4 (s80 scratch), and the four sums in line order
 # into $0..$3. Line k holds pair i's value in s(16 + 8k + 2i), its tag in the
