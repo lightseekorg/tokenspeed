@@ -205,10 +205,10 @@ enum class OwnerTail {
     // place.
     kFinal,
     // The owner keeps writing past the point (a prompt end followed by
-    // decode): its blocks are registered without taking another request's
-    // canonical block into the table, and the admission moves off every one
-    // it registered into the copy-in block the request holds for its slot,
-    // copying the published bytes into it.
+    // decode): its blocks are registered, and the admission moves off every
+    // one the index took into the copy-in block the request holds for its
+    // slot, copying the published bytes into it. A block whose key another
+    // request published first stays the owner's to write.
     kCopiedIn,
     // The owner keeps writing past a point whose KV is cached already (a
     // chunk end cut at a junction): its blocks stay unpublished, and only the
@@ -250,7 +250,7 @@ struct CompletedPages {
     // behind that boundary is an endpoint's regardless of boundary_kind. Zero
     // pages means none.
     std::int32_t state_checkpoint_pages{0};
-    std::span<CacheBlockRef> state_checkpoint_blocks{};
+    std::span<const CacheBlockRef> state_checkpoint_blocks{};
     // Which kind of boundary the publication ends on (eviction provenance).
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefill streams newly published history and state to Host. Decode

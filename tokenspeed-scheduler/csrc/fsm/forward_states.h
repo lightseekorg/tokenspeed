@@ -67,8 +67,10 @@ struct CacheProgress {
     std::vector<CacheBlockRef> state_checkpoint_blocks;
     // The blocks of the checkpoint the latest publication point published,
     // held until the next one so the publication's spans stay valid; the
-    // index keeps them cached. A retraction drops them once its publication
-    // is applied (a Retracted request holds no Device block).
+    // index keeps them cached, unless another request published the
+    // checkpoint first and these are the request's private copies. A
+    // retraction drops them once its publication is applied (a Retracted
+    // request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
     // The boundary of the in-forward State checkpoint the request published
     // -- from its block, or from the live slot of a chunk that ended there --

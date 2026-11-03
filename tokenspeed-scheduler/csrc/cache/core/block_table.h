@@ -76,39 +76,10 @@ public:
         return take(static_cast<std::size_t>(index));
     }
 
-    // The window a prefix index registers (GroupAllocator::BlocksToPublish).
-    // The index replaces a block it dedupes against the key's canonical block
-    // in place, so the window resolves its page ids again when it closes; it
-    // lives no longer than the scope that publishes.
-    class PublishWindow {
-    public:
-        PublishWindow(const PublishWindow&) = delete;
-        PublishWindow& operator=(const PublishWindow&) = delete;
-        PublishWindow(PublishWindow&&) = delete;
-        PublishWindow& operator=(PublishWindow&&) = delete;
-        ~PublishWindow() { table_.refresh(group_id_, first_, count_); }
-
-        std::span<CacheBlockRef> Blocks() noexcept {
-            return std::span<CacheBlockRef>{table_.blocks_}.subspan(first_, count_);
-        }
-
-    private:
-        friend class GroupAllocator;
-
-        PublishWindow(std::uint32_t group_id, BlockTable& table, std::size_t first, std::size_t count) noexcept
-            : group_id_{group_id}, table_{table}, first_{first}, count_{count} {}
-
-        std::uint32_t group_id_;
-        BlockTable& table_;
-        std::size_t first_;
-        std::size_t count_;
-    };
-
 private:
-    // The allocator is the only component that changes a table; anything
-    // else that needs to write blocks (publishing them to a prefix index)
-    // receives a window from it. Every write goes through the members below,
-    // which keep page_ids_ in step with blocks_.
+    // The allocator is the only component that changes a table; publishing
+    // its blocks to a prefix index reads a window from it. Every write goes
+    // through the members below, which keep page_ids_ in step with blocks_.
     friend class GroupAllocator;
 
     void assign(std::uint32_t group_id, std::size_t slot, CacheBlockRef block) {
@@ -161,12 +132,6 @@ private:
         blocks_.clear();
         page_ids_.clear();
     }
-    void refresh(std::uint32_t group_id, std::size_t first, std::size_t count) {
-        for (std::size_t slot = first; slot < first + count; ++slot) {
-            page_ids_[slot] = ResolvedPageId(group_id, blocks_[slot]);
-        }
-    }
-
     std::vector<CacheBlockRef> blocks_{};
     // page_ids_[i] is blocks_[i]'s kernel page id, 0 for a null slot.
     std::vector<std::int32_t> page_ids_{};

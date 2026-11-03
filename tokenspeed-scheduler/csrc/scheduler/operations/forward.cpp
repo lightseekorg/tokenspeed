@@ -1135,10 +1135,8 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
     // tail it drops under the per-prior cap takes its Host entries along;
     // under the write-back policy the segment step ranks Host victims by
     // what the Device holds, which the publication adds to
-    // (NumHostBoundariesThatFit); and under KV parallelism a slot it
-    // re-points to the Device entry already holding its key rides the pool
-    // in that entry's bucket, not the one counted here. The split
-    // retractVictim makes after the publication can then refuse the image.
+    // (NumHostBoundariesThatFit). The split retractVictim makes after the
+    // publication can then refuse the image.
     // Nothing is mutated: a candidate that does not fit is left as it was,
     // and so is the Host.
     fsm::CacheProgress cache_progress = request.CacheProgress();
