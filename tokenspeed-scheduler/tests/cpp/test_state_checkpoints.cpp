@@ -632,7 +632,7 @@ protected:
                         .tokens = batch->input_lengths.at(0),
                         .checkpoint_len = batch->extend_state_checkpoint_lens.at(0),
                         .zeroed_state0 = plan.pages_to_zero.at("state0"),
-                        .full_row = batch->block_tables.at("full").at(0)};
+                        .full_row = batch->BlockTables().at("full").at(0)};
             for (const std::string& group : {"state0", "state1", "state2"}) {
                 chunk.state_rows.push_back(StateRow(*batch, group, id));
             }
@@ -1150,7 +1150,7 @@ TEST_F(DropDeadCheckpointsSuite, NoTailOrStateIsCachedAtACoveredPromptEndOrAtThe
         const ForwardBatch* batch = FindForwardBatch(first);
         ASSERT_NE(batch, nullptr);
         const std::vector<std::int32_t> state_row = StateRow(*batch, "state0", "seed");
-        const std::int32_t decode_partial = batch->block_tables.at("full").at(0).at(5);
+        const std::int32_t decode_partial = batch->BlockTables().at("full").at(0).at(5);
         if (in_forward) {
             EXPECT_EQ(state_row, (std::vector<std::int32_t>{0, live})) << "slot 0 released, the live slot kept";
             EXPECT_EQ(decode_partial, partial) << "the partial page stays the owner's";
