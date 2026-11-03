@@ -335,6 +335,13 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   most `WINDOW` tiles in flight per wave (counted `vmcnt` waits), so a weight
   stream overlapping a latency-bound chain stays below the fabric's knee;
   `gemv_a16w16_splitk_finish_x_gfx950` finishes on a caller-built x.
+- Pacing: the paced loaders keep a window of tiles in flight per wave (a
+  window of one waits for every earlier load), and
+  `gemv_a16w16_splitk_weight_steps_windowed_gfx950` paces by 32-deep K step
+  for tasks of one or two tiles; its `ISSUED` lets two calls (the router's
+  hi and lo) pace as one stream. Rate is about CUs x window bytes per load
+  latency (~1.3 us), so a stream overlapping latency-bound exchanges can be
+  held below the ~4.5 TB/s where polls slow down.
 - K-step forms for a caller that builds x itself (a deferred norm), so one
   32-deep step of x and its inputs is live instead of the whole K range:
   `gemv_a16w16_splitk_weight_steps_gfx950` returns `tiles[t][s]` (the same
