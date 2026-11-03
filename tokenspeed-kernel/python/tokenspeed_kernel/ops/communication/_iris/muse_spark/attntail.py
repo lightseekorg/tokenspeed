@@ -748,6 +748,31 @@ def muse_attntail_send(
         columns += (gl.permute(gl.sum(partials[t].load(sums_layout), axis=0), [1, 0]),)
     out = gl.join(gl.join(columns[0], columns[1]), gl.join(columns[2], columns[3]))
     out = gl.reshape(gl.permute(out, [0, 3, 2, 1]), [16, OUTPUTS])
+    muse_attntail_rs_push(
+        out, block, rs_peers, stage, rows, OUTPUTS, WIDTH, RANK, WORLD_SIZE,
+        MAX_SHARD_ELEMENTS, PEER_SIGNAL_STORE_CACHE,
+    )  # fmt: skip
+
+
+@gluon.jit
+def muse_attntail_rs_push(
+    out,
+    block,
+    rs_peers,
+    stage,
+    rows,
+    OUTPUTS: gl.constexpr,
+    WIDTH: gl.constexpr,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Push a sender's FP32 [16 tokens, OUTPUTS] o_proj partial (columns
+    [block * OUTPUTS, ...)) as BF16 to reduce-scatter slot RANK of the rank
+    owning those columns, in mailbox copy ``stage``; rows past ``rows`` are
+    not stored. The H1 reduce-scatter push of muse_attntail_send."""
+    WAVES: gl.constexpr = gl.num_warps()
     # Each wave stores whole token rows (OUTPUTS BF16 = one 128 B line), so
     # no line crosses the link in partial writes.
     PUSH_VECTOR: gl.constexpr = 16 * OUTPUTS // (64 * WAVES)
