@@ -60,10 +60,11 @@ SWIGLU = dict(swiglu_alpha=1.0, swiglu_limit=0.0, swiglu_beta=0.0)
 DEADLINE_TICKS = 200_000_000  # 2 s
 
 VARIANTS = [
-    dict(ring=8, quad_map=0, dn_order=0, addr_soffset=0, lanes=False),
-    dict(ring=8, quad_map=0, dn_order=0, addr_soffset=0, lanes=True),
-    dict(ring=8, quad_map=1, dn_order=1, addr_soffset=1, lanes=False),
-    dict(ring=16, quad_map=0, dn_order=0, addr_soffset=0, lanes=True),
+    dict(ring=8, quad_map=0, dn_order=0, dn_lines=0, addr_soffset=0, lanes=False),
+    dict(ring=8, quad_map=0, dn_order=0, dn_lines=0, addr_soffset=0, lanes=True),
+    dict(ring=8, quad_map=1, dn_order=1, dn_lines=1, addr_soffset=1, lanes=False),
+    dict(ring=16, quad_map=0, dn_order=0, dn_lines=0, addr_soffset=0, lanes=True),
+    dict(ring=16, quad_map=0, dn_order=0, dn_lines=1, addr_soffset=0, lanes=False),
 ]
 
 
@@ -186,7 +187,7 @@ def test_stale_tags_matching_the_launch_tag_are_never_seen(experts):
     def run(routes):
         launch_gluon_mxfp4_moe_native_stream_gfx950(
             xq, xs, weights, routes, out, state, ring=8, quad_map=0, dn_order=0,
-            addr_soffset=0, tag_glc=1, tail_num=1, tail_den=2,
+            dn_lines=0, addr_soffset=0, tag_glc=1, tail_num=1, tail_den=2,
             deadline_ticks=DEADLINE_TICKS, **SWIGLU
         )  # fmt: skip
 

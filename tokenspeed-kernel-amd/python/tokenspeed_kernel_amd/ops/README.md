@@ -2291,11 +2291,12 @@ store each.
   of the gate/up scales, 32 MiB per layer.
 - Every down unit's fp32 `[16, 128]` result goes to a sink function with
   its per-token routes and columns; the layer passes its H4 push, the
-  standalone launch stores `out[route, :]` in bf16.
+  standalone launch stores `out[route, :]` in bf16. The sink gets one
+  16-column strip per call, or with `DN_LINES` the unit's 4 strips at once.
 - Bitwise equal to the direct decode: the same per-column MFMA chain,
   SwiGLU, 32-value MXFP4 mids and down chain.
-- Plan fields (constexpr): `RING`, `QUAD_MAP`, `DN_ORDER`, `ADDR_SOFFSET`,
-  `TAG_GLC`, `SCALE_LANES`, `TAIL_NUM` / `TAIL_DEN`.
+- Plan fields (constexpr): `RING`, `QUAD_MAP`, `DN_ORDER`, `DN_LINES`,
+  `ADDR_SOFFSET`, `TAG_GLC`, `SCALE_LANES`, `TAIL_NUM` / `TAIL_DEN`.
 
 #### Algorithm
 
@@ -2311,6 +2312,11 @@ store each.
 - The quad exchanges its SwiGLU values through LDS (no barrier), each wave
   quantizes 4 rows of the group, stores them per route, and publishes its
   tag after a later load of its own has been waited for.
+- `DN_LINES` changes which output column each MFMA column of a down unit
+  computes, so that a lane's results across the unit's 4 strips are two
+  whole 16-byte bf16 lines (8 adjacent columns each) instead of 4 runs of 4.
+  The sink then writes 2 wide stores per lane. Strips 16 columns apart still
+  share their scale dwords, and each column's sum is unchanged.
 - The plan is closed-form from the ids in every workgroup: whole experts per
   XCD, the `E % 8` leftovers split by group; the 16 tail-role workgroups of
   an XCD (slots 0, 16-30) take half a full share of gate/up only, the others

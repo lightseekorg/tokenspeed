@@ -441,10 +441,10 @@ def _whole_pairs(layout):
 
 
 @gluon.jit
-def h4_sink(args, y, route, cols, col0):
+def h4_sink(args, ys, route, cols, col0):
     """The MoE down unit's output pushed to its route's column owner (H4):
-    the MoE stream's ``sink(args, y, route, cols, col0)`` with ``args`` an
-    H4SinkArgs. Called from per-wave code, so it moves no data between
+    the MoE stream's ``sink(args, ys, route, cols, col0)`` with ``args`` an
+    H4SinkArgs, one strip per call (``ys = (y,)``, ``cols = (cols,)``). Called from per-wave code, so it moves no data between
     lanes (no layout conversion, LDS or barrier).
 
     ``y``: FP32 partial [R, C] in a BlockedLayout whose lanes each hold
@@ -457,6 +457,9 @@ def h4_sink(args, y, route, cols, col0):
     local own slices (read by own4_complete), the rest to the owner's
     mailbox (iris_column_routes_push_words, copy ``launch.copy``), no
     wait."""
+    gl.static_assert(len(ys) == 1, "h4_sink: one strip per call")
+    y = ys[0]
+    cols = cols[0]
     gl.static_assert(
         _whole_pairs(y.type.layout), "h4_sink: lanes must hold whole pairs"
     )

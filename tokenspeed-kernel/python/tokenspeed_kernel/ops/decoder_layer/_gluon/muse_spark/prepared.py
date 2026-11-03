@@ -104,6 +104,7 @@ DEFAULT_PLAN_FIELDS = dict(
     ring=16,
     quad_map=0,
     dn_order=0,
+    dn_lines=0,
     addr_soffset=0,
     tail_num=1,
     tail_den=2,
