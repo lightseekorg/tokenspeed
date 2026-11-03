@@ -293,6 +293,54 @@ def test_iris_column_all_gather(world_size):
     )
 
 
+def _lamport_gather_rmsnorm_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.layernorm import affine_rmsnorm
+
+    state = _muse_state(rank, device, 64, True)
+    width = 4096
+    local_width = width // world_size
+    weight = torch.linspace(-0.5, 0.5, width, device=device).to(torch.bfloat16)
+    for rows in (1, 8, 16, 64):
+        gen = torch.Generator(device=device).manual_seed(rows)
+        full = torch.randn(rows, width, generator=gen, device=device).to(torch.bfloat16)
+        local = torch.empty(rows, local_width, dtype=torch.bfloat16, device=device)
+
+        def run():
+            # The MXFP4 sibling shares the mailboxes and stage counters.
+            state.all_gather_rmsnorm_mxfp4_quant(local, weight, 1e-5, 1.0)
+            return state.all_gather_rmsnorm(local, weight, 1e-5, 1.0)
+
+        assert state.can_all_gather_rmsnorm(local, weight)
+        local.copy_(full[:, rank * local_width : (rank + 1) * local_width])
+        run()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+        # Four replays cycle every mailbox stage with changed inputs.
+        for scale in (2.0, -1.0, 0.5, 3.0):
+            scaled = (full.float() * scale).to(torch.bfloat16)
+            local.copy_(scaled[:, rank * local_width : (rank + 1) * local_width])
+            graph.replay()
+            reference = affine_rmsnorm(scaled, weight, 1e-5, 1.0, torch.bfloat16)
+            # Another in-thread addition order: at most one BF16 ulp (2**-7
+            # relative), on a rare element (0-2 of 64 x 4096 measured).
+            torch.testing.assert_close(output, reference, rtol=2**-7, atol=0)
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_iris_lamport_gather_rmsnorm_matches_affine_rmsnorm(world_size):
+    """The fused gather + RMSNorm is affine_rmsnorm of the gathered rows."""
+    _skip_if_unsupported(world_size, "Iris gather + RMSNorm tests")
+    port = _get_open_port()
+    _spawn_and_collect(
+        _communication_worker,
+        (world_size, port, _lamport_gather_rmsnorm_worker, "gloo"),
+        world_size,
+    )
+
+
 def _muse_state(rank, device, max_rows, enable_lamport):
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,

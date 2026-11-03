@@ -740,6 +740,18 @@ class ModelExecutor:
             # The sampler reads only each row's argmax, so the target head can
             # reduce it across vocabulary shards instead of gathering logits.
             self.model_runner.model.logits_processor.fuse_argmax()
+        shard_top_k = self.sampling_backend.vocab_shard_top_k()
+        if (
+            self._pp_is_last_stage
+            and shard_top_k is not None
+            and self.model_runner.model.logits_processor.keep_sampled_logits_vocab_sharded(
+                self.model_runner.model.lm_head, shard_top_k
+            )
+        ):
+            logger.info(
+                f"Sampled rows stay vocab-sharded: the top-k routes select "
+                f"{shard_top_k} candidates per shard instead of gathering logits"
+            )
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -1600,6 +1612,11 @@ class ModelExecutor:
         num_prefill_outputs = layout.num_prefill_outputs
         # Eager prefills only: 0 in every captured graph.
         sampled_top_k = ctx.sampled_top_k
+        if sampled_top_k and logits_output.vocab_shard is not None:
+            # The top logprobs read the masked whole rows the sampler draws
+            # from, so this eager forward samples from gathered rows.
+            logits_output.next_token_logits = logits_output.vocab_shard.full_logits()
+            logits_output.vocab_shard = None
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
             sampled = self.sampling_backend.sample(logits_output, sampling_info)
@@ -1638,13 +1655,15 @@ class ModelExecutor:
             else None
         )
         logits = logits_output.next_token_logits
+        shard = logits_output.vocab_shard
         token_ids = logits_output.next_token_ids
         token_parts, length_parts, logprob_parts = [], [], []
 
         if num_prefill_outputs:
             prefill_out = LogitsProcessorOutput(
-                next_token_logits=logits[prefill],
+                next_token_logits=None if logits is None else logits[prefill],
                 next_token_ids=None if token_ids is None else token_ids[prefill],
+                vocab_shard=None if shard is None else shard.rows(prefill),
             )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
@@ -1671,15 +1690,16 @@ class ModelExecutor:
                 torch.zeros(
                     num_extends - num_prefill_outputs,
                     dtype=torch.int32,
-                    device=logits.device,
+                    device=(logits if shard is None else shard.logits).device,
                 )
             )
         if num_decodes:
             decode_out = LogitsProcessorOutput(
-                next_token_logits=logits[decode_outputs],
+                next_token_logits=None if logits is None else logits[decode_outputs],
                 next_token_ids=(
                     None if token_ids is None else token_ids[decode_outputs]
                 ),
+                vocab_shard=None if shard is None else shard.rows(decode_outputs),
             )
             tokens, lengths = self.sampling_backend.verify(
                 decode_out,
@@ -1703,7 +1723,13 @@ class ModelExecutor:
                 else torch.cat(logprob_parts)
             )
         if not token_parts:
-            token_parts.append(torch.empty(0, dtype=torch.int32, device=logits.device))
+            token_parts.append(
+                torch.empty(
+                    0,
+                    dtype=torch.int32,
+                    device=(logits if shard is None else shard.logits).device,
+                )
+            )
         tokens = token_parts[0] if len(token_parts) == 1 else torch.cat(token_parts)
         lengths = length_parts[0] if len(length_parts) == 1 else torch.cat(length_parts)
         return tokens, lengths
