@@ -35,7 +35,12 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (  # noqa: E4
     gluon_gemv_a16w16_splitk_gfx950,
     launch_gluon_gemv_a16w16_splitk_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.persistent import Launch  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+    ERROR_ABORT,
+    Launch,
+)
+
+_ABORT = gl.constexpr(ERROR_ABORT)
 
 _SITE = gl.constexpr(77)
 
@@ -64,7 +69,10 @@ def _reader_kernel(
     token = gl.program_id(0)
     rows = gl.program_id(1) * BLOCK + gl.arange(0, BLOCK, layout)
     zero = gl.program_id(0) * 0
-    launch = Launch(gl.program_id(0), zero, zero, zero, zero, error_ptr, deadline_ticks)
+    launch = Launch(
+        gl.program_id(0), zero, zero, zero.to(gl.int64), zero, zero, zero, error_ptr,
+        error_ptr + _ABORT, deadline_ticks, error_ptr,
+    )  # fmt: skip
     total = gemv_a16w16_splitk_sum_gfx950(
         part_ptr,
         tag,
