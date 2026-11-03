@@ -2306,6 +2306,165 @@ def iris_lamport_bf16_allreduce(
     gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
 
 
+@gluon.jit
+def iris_lamport_twoshot_rs_push(
+    chunks,
+    regions,
+    stage,
+    offsets,
+    mask,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Push chunks[delta - 1] to peer (RANK + delta)'s reduce-scatter slot RANK.
+
+    chunks[delta - 1] is this rank's part of shard (RANK + delta) % WORLD_SIZE
+    at offsets within the shard, already sanitized (no negative zero).
+    regions are the peers' two-shot region addresses; stage selects one of
+    the region's [stage][reduce-scatter, all-gather][source][shard] mailboxes.
+    """
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    _iris_lamport_push(
+        chunks,
+        regions,
+        stage * (2 * PHASE) + RANK * MAX_SHARD_ELEMENTS,
+        offsets,
+        mask,
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
+    )
+
+
+@gluon.jit
+def iris_lamport_twoshot_rs_wait_reduce(
+    region_sym_ptr,
+    stage,
+    own,
+    offsets,
+    valid,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    """Wait for every peer's part of this rank's shard at offsets and reduce.
+
+    own is this rank's part. Returns the FP32 sum in rank order rounded once
+    to BF16 (the one-shot result), with negative zero sent as zero.
+    """
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    scattered = _iris_wait_lamport_slots(
+        region_sym_ptr + stage * (2 * PHASE),
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        LAYOUT,
+    )
+    # Match the one-shot result: FP32 sum in rank order, one BF16 rounding.
+    for source in gl.static_range(0, WORLD_SIZE):
+        if source == RANK:
+            term = own
+        else:
+            term = scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
+        if source == 0:
+            accumulator = term.to(gl.float32)
+        else:
+            accumulator += term.to(gl.float32)
+    return _iris_sanitize_lamport_bf16(accumulator.to(gl.bfloat16))
+
+
+@gluon.jit
+def iris_lamport_twoshot_ag_push(
+    reduced,
+    regions,
+    stage,
+    offsets,
+    mask,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Push this rank's reduced shard part to every peer's all-gather slot RANK."""
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    published = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        published += (reduced,)
+    _iris_lamport_push(
+        published,
+        regions,
+        stage * (2 * PHASE) + PHASE + RANK * MAX_SHARD_ELEMENTS,
+        offsets,
+        mask,
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
+    )
+
+
+@gluon.jit
+def iris_lamport_twoshot_ag_wait(
+    region_sym_ptr,
+    stage,
+    offsets,
+    valid,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    """Wait for every peer's reduced part at offsets; element delta - 1 is
+    shard (RANK + delta) % WORLD_SIZE's."""
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    return _iris_wait_lamport_slots(
+        region_sym_ptr + stage * (2 * PHASE) + PHASE,
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        LAYOUT,
+    )
+
+
+@gluon.jit
+def iris_lamport_twoshot_clear(
+    region_sym_ptr,
+    stage,
+    offsets,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+):
+    """Restore the empty markers in both phases' peer slots at offsets.
+
+    The caller consumed them in this stage; it orders the restores before
+    any stage advance (a workgroup barrier) and they reach memory before the
+    launch ends.
+    """
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    slots = stage * (2 * PHASE)
+    sentinel = (
+        gl.where(offsets % 2 == 0, 0, 0x8000)
+        .to(gl.uint16)
+        .to(gl.bfloat16, bitcast=True)
+    )
+    for phase in gl.static_range(2):
+        for delta in gl.static_range(1, WORLD_SIZE):
+            source = (RANK + delta) % WORLD_SIZE
+            gl.amd.cdna4.buffer_store(
+                sentinel,
+                region_sym_ptr + slots + phase * PHASE + source * MAX_SHARD_ELEMENTS,
+                offsets,
+                cache=".wt",
+            )
+
+
 @gluon.jit(do_not_specialize=["total_elements"])
 def iris_lamport_twoshot_bf16_allreduce(
     input_ptr,
@@ -2344,8 +2503,6 @@ def iris_lamport_twoshot_bf16_allreduce(
     total_elements = gl.multiple_of(total_elements, WORLD_SIZE * TILE)
     shard = gl.multiple_of(total_elements // WORLD_SIZE, TILE)
     stage = gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
-    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
-    slots = stage * (2 * PHASE)
     # chunks[delta] is this rank's tile of shard (RANK + delta) % WORLD_SIZE.
     chunks = ()
     for delta in gl.static_range(WORLD_SIZE):
@@ -2355,19 +2512,22 @@ def iris_lamport_twoshot_bf16_allreduce(
                 gl.amd.cdna4.buffer_load(input_ptr + owner * shard, offsets)
             ),
         )
-    _iris_lamport_push(
+    iris_lamport_twoshot_rs_push(
         chunks[1:],
         regions,
-        slots + RANK * MAX_SHARD_ELEMENTS,
+        stage,
         offsets,
         None,
         RANK,
         WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
         PEER_SIGNAL_STORE_CACHE,
     )
     valid = gl.full([64], True, gl.int1, gl.SliceLayout(1, layout))
-    scattered = _iris_wait_lamport_slots(
-        region_sym_ptr + slots,
+    reduced = iris_lamport_twoshot_rs_wait_reduce(
+        region_sym_ptr,
+        stage,
+        chunks[0],
         offsets,
         valid,
         RANK,
@@ -2375,33 +2535,21 @@ def iris_lamport_twoshot_bf16_allreduce(
         MAX_SHARD_ELEMENTS,
         layout,
     )
-    # Match the one-shot result: FP32 sum in rank order, one BF16 rounding.
-    for source in gl.static_range(0, WORLD_SIZE):
-        if source == RANK:
-            term = chunks[0]
-        else:
-            term = scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
-        if source == 0:
-            accumulator = term.to(gl.float32)
-        else:
-            accumulator += term.to(gl.float32)
-    reduced = _iris_sanitize_lamport_bf16(accumulator.to(gl.bfloat16))
-    published = ()
-    for _ in gl.static_range(1, WORLD_SIZE):
-        published += (reduced,)
-    _iris_lamport_push(
-        published,
+    iris_lamport_twoshot_ag_push(
+        reduced,
         regions,
-        slots + PHASE + RANK * MAX_SHARD_ELEMENTS,
+        stage,
         offsets,
         None,
         RANK,
         WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
         PEER_SIGNAL_STORE_CACHE,
     )
     gl.amd.cdna4.buffer_store(reduced, output_ptr + RANK * shard, offsets)
-    gathered = _iris_wait_lamport_slots(
-        region_sym_ptr + slots + PHASE,
+    gathered = iris_lamport_twoshot_ag_wait(
+        region_sym_ptr,
+        stage,
         offsets,
         valid,
         RANK,
@@ -2416,20 +2564,9 @@ def iris_lamport_twoshot_bf16_allreduce(
         )
 
     # Clear this program's consumed mailboxes before advancing its stage.
-    sentinel = (
-        gl.where(offsets % 2 == 0, 0, 0x8000)
-        .to(gl.uint16)
-        .to(gl.bfloat16, bitcast=True)
+    iris_lamport_twoshot_clear(
+        region_sym_ptr, stage, offsets, RANK, WORLD_SIZE, MAX_SHARD_ELEMENTS
     )
-    for phase in gl.static_range(2):
-        for delta in gl.static_range(1, WORLD_SIZE):
-            source = (RANK + delta) % WORLD_SIZE
-            gl.amd.cdna4.buffer_store(
-                sentinel,
-                region_sym_ptr + slots + phase * PHASE + source * MAX_SHARD_ELEMENTS,
-                offsets,
-                cache=".wt",
-            )
     # Order the sentinel restores before this program's stage advance.
     gl.barrier()
     gl.store(epochs + gl.program_id(0), ((stage + 1) % NUM_STAGES).to(gl.int32))
