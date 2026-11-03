@@ -43,6 +43,17 @@ friends).  The ``nn.ModuleList`` is preserved so the checkpoint's 24
 ``named_parameters()`` (embedder weights land in the CPU tables, post
 projection weights land in the NPU linears).
 
+**Device staging for ACL Graph decode (方案C L1).** The per-step
+host<->device transfers cannot run inside a captured decode graph (910B3
+rejects host memcpy under stream capture), so when the decode ACL Graph is
+enabled the executor preloads the current batch's table rows H2D into a
+fixed device ``staging`` buffer *outside* the graph (``preload_ngram_staging``
+called from ``ModelExecutor.settle()``) and the in-graph forward reads only
+the staging.  The preload reuses the same ``_compute_new_ids`` hash the
+in-graph partial computes, so the staging rows align with the in-graph reads
+bit-exactly (verified maxdiff=0 over ACL Graph replays).  ``staging`` stays
+None on the eager / no-graph baseline, which keeps the original host lookup.
+
 The module is an in-tree runtime plugin: importing it runs ``register()``,
 which calls :func:`tokenspeed.runtime.plugins.registry.register_model`. The
 model registry's ``import_model_classes`` imports the in-tree plugin modules
@@ -144,6 +155,7 @@ class NgramEmbedding(nn.Module):
         tp_rank: int = 0,
         tp_size: int = 1,
         tp_group=None,
+        max_num_seqs: int = 160,
     ):
         super().__init__()
         _ensure_ngram_config(config)
@@ -164,6 +176,16 @@ class NgramEmbedding(nn.Module):
 
         self._init_ngram_embeddings()
         self._vocab_mods_cache = None
+
+        # Device staging for 方案C L1 (ACL Graph decode): the ~63 GB host
+        # tables cannot be read from inside a captured graph (host<->device
+        # memcpy is rejected during capture on 910B3), so the executor
+        # preloads the current batch's rows H2D into this fixed staging
+        # buffer *outside* the graph and the in-graph lookup reads only the
+        # staging.  Allocated lazily by ``preload_staging`` (None keeps the
+        # eager / no-graph baseline on the original host-table lookup path).
+        self._max_num_seqs = max_num_seqs
+        self.register_buffer("staging", None, persistent=False)
 
     def _init_ngram_embeddings(self) -> None:
         """Initialize the per-slot embedder/projection pairs.
@@ -306,6 +328,98 @@ class NgramEmbedding(nn.Module):
         self._vocab_mods_cache = vocab_mods
         return vocab_mods
 
+    def _compute_new_ids(
+        self,
+        input_ids: torch.Tensor,
+        predecessor_window: torch.Tensor,
+        index: int,
+    ) -> torch.Tensor:
+        """Polynomial rolling-hash ids for embedder ``index`` (shared hash).
+
+        The single source of the per-slot hash used by both the in-graph
+        ``_ngram_local_partial`` and the graph-external ``preload_staging``:
+        identical ``input_ids`` / ``predecessor_window`` inputs must produce
+        bit-identical ``new_ids`` so the staging rows preloaded by hash
+        align with the in-graph reads.  ``index`` enumerates the
+        ``(neighbor, split)`` pairs row-major (``index = (i - 2) * k + j``).
+        """
+        i = 2 + index // self.k
+        j = index % self.k
+        emb_vocab_dim = int(self.m + index * 2 + 1)
+
+        # EOS reset, vectorized over the window columns (newest first): the
+        # predecessor at distance ``d`` contributes zero when any of the ``d``
+        # tokens immediately before the current token is EOS (or is dead).
+        eos = self.config.eos_token_id
+        crossed = (predecessor_window == eos).cumsum(-1) > 0
+        effective = predecessor_window.masked_fill(
+            (predecessor_window < 0) | crossed, 0
+        )
+
+        mods = self._precompute_vocab_mods()[(i, j)]
+        ngram_ids = input_ids.clone()
+        for k in range(2, i + 1):
+            ngram_ids = ngram_ids + effective[..., k - 2] * mods[k - 2]
+        return ngram_ids % emb_vocab_dim
+
+    def preload_staging(
+        self,
+        input_ids: torch.Tensor,
+        predecessor_window: torch.Tensor,
+    ) -> None:
+        """Graph-external preload of this batch's table rows into ``staging``.
+
+        Computed *outside* the captured decode graph (the executor calls it
+        in ``settle()`` right after ``load_round_inputs`` has filled the
+        packed ids and the per-token predecessor window).  For every
+        embedder the polynomial hash ids are computed on the device (same
+        ``_compute_new_ids`` the in-graph path uses, so the staging rows are
+        aligned by construction), the corresponding host-table rows are
+        gathered on the CPU and copied H2D into ``staging[t, index, :]``.
+
+        Args:
+            input_ids: Packed ``[T]`` (or ``[.., seq_len]``) token ids.
+            predecessor_window: ``[T, n-1]`` (or broadcastable) raw
+                predecessor ids, as ``_ngram_local_partial`` reads.
+        """
+        device = input_ids.device
+        num_tokens = input_ids.numel()
+        if num_tokens > self._max_num_seqs:
+            raise ValueError(
+                f"NgramEmbedding staging holds {self._max_num_seqs} rows; "
+                f"the batch needs {num_tokens}"
+            )
+        num_embedders = self.k * (self.n - 1)
+        if self.staging is None:
+            # Lazily allocated once: a captured graph pins the staging data
+            # pointer, so it must never be re-allocated after capture.  The
+            # dtype tracks the host tables (bf16 under the deployment dtype),
+            # which keeps the H2D copy bit-exact for the maxdiff=0 contract.
+            # Zero-fill so rows beyond the current batch are finite (benign
+            # padding) — capture warmup reads the staging before any live
+            # preload has filled it.
+            self.staging = torch.empty(
+                (self._max_num_seqs, num_embedders, self._feature_width),
+                dtype=self._host_embedders[0].dtype,
+                device=device,
+            ).zero_()
+        with torch.no_grad():
+            for index in range(num_embedders):
+                new_ids = self._compute_new_ids(
+                    input_ids, predecessor_window, index
+                )
+                host_weight = self._host_embedders[index]
+                rows = F.embedding(
+                    new_ids.to("cpu"),
+                    host_weight,
+                    padding_idx=self.config.pad_token_id,
+                ).reshape(-1, self._feature_width)
+                self.staging[:num_tokens, index, :].copy_(rows.to(device))
+        if device.type == "npu":
+            # Make sure the preload is visible to the graph replay that
+            # follows the settle() call on the same stream.
+            torch.npu.synchronize()
+
     def forward_from_window(
         self,
         input_ids: torch.Tensor,
@@ -361,46 +475,25 @@ class NgramEmbedding(nn.Module):
         """Sum of the n-gram table contribution branches (pre all-reduce).
 
         Computes the polynomial hash ids from the per-token predecessor
-        window, applies the EOS reset, and accumulates the 12 host-resident
-        table lookups projected onto the hidden size. Under TP feature-column
-        sharding this is the local partial; the caller all-reduces it.
+        window (via the shared ``_compute_new_ids``) and accumulates the 12
+        table lookups projected onto the hidden size.  Two lookup paths:
+
+        * ``staging`` is None (eager / no decode graph): the original
+          host-resident lookup — ids D2H, ``F.embedding`` on the CPU table,
+          rows H2D (W18 scheme 2).  Preserved as the baseline path.
+        * ``staging`` is allocated (decode ACL Graph, 方案C L1): the graph
+          -external ``preload_staging`` has already H2D-copied this batch's
+          rows into the device buffer; the in-graph path reads them directly
+          (no host/device transfer inside the captured graph).
+
+        Under TP feature-column sharding this is the local partial; the
+        caller all-reduces it.
         """
-        # EOS reset, vectorized over the window columns (newest first): the
-        # predecessor at distance ``d`` contributes zero when any of the ``d``
-        # tokens immediately before the current token is EOS (or is dead),
-        # which is ``_shift_right_ignore_eos`` on the concatenated context.
-        eos = self.config.eos_token_id
-        crossed = (predecessor_window == eos).cumsum(-1) > 0
-        effective = predecessor_window.masked_fill(
-            (predecessor_window < 0) | crossed, 0
-        )
-
-        vocab_mods = self._precompute_vocab_mods()
-
-        shifted = {}
-        for d in range(1, self.n):
-            shifted[d] = effective[..., d - 1]
-
         local_partial = None
-        for i in range(2, self.n + 1):
-            for j in range(self.k):
-                index = (i - 2) * self.k + j
-                emb_vocab_dim = int(self.m + index * 2 + 1)
-
-                ngram_ids = input_ids.clone()
-                mods = vocab_mods[(i, j)]
-                for k in range(2, i + 1):
-                    ngram_ids = ngram_ids + shifted[k - 1] * mods[k - 2]
-                new_ids = ngram_ids % emb_vocab_dim
-
-                # Host-resident lookup (W18 scheme 2): the ids were hashed on
-                # the NPU; move only this batch's rows to the CPU, gather the
-                # embedder rows there, and bring the small result back to the
-                # device for the (NPU-resident) post projection.  Numerically
-                # identical to an on-device ``embedder(new_ids)`` — same ids,
-                # same weights — and leaves the ~63 GB tables off the device.
-                # Under TP feature sharding each rank gathers only its table
-                # slice (~63 GB / tp_size) and reduces the partials above.
+        for index in range(self.k * (self.n - 1)):
+            new_ids = self._compute_new_ids(input_ids, predecessor_window, index)
+            if self.staging is None:
+                # Host-resident lookup (W18 scheme 2, eager baseline).
                 host_weight = self._host_embedders[index]
                 new_ids_cpu = new_ids.to("cpu")
                 x_ngram = F.embedding(
@@ -408,10 +501,17 @@ class NgramEmbedding(nn.Module):
                     host_weight,
                     padding_idx=self.config.pad_token_id,
                 ).to(input_ids.device)
-                x_proj = self.post_projs[index](x_ngram)
-                local_partial = (
-                    x_proj if local_partial is None else local_partial + x_proj
-                )
+            else:
+                # 方案C L1: in-graph read-only lookup of the preloaded
+                # device staging (token rows were aligned by the shared
+                # hash at preload time).
+                x_ngram = self.staging[: input_ids.numel(), index, :]
+                if input_ids.dim() > 1:
+                    x_ngram = x_ngram.reshape(*input_ids.shape, -1)
+            x_proj = self.post_projs[index](x_ngram)
+            local_partial = (
+                x_proj if local_partial is None else local_partial + x_proj
+            )
         return local_partial
 
     def forward(
@@ -471,7 +571,24 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            # 方案C L1 staging 行数：默认 160（NPU 部署 --max-num-seqs 默认），
+            # 超限在 preload_staging 内报错，不静默。
+            max_num_seqs=getattr(config, "max_num_seqs", 160),
         )
+
+    def preload_ngram_staging(
+        self,
+        input_ids: torch.Tensor,
+        predecessor_window: torch.Tensor,
+    ) -> None:
+        """Graph-external preload hook (方案C L1), called by the executor.
+
+        The ``ModelExecutor.settle()`` runs this *outside* the decode ACL
+        Graph, after ``load_round_inputs`` has filled the packed ids and the
+        per-token predecessor window; the captured graph then reads only the
+        preloaded device staging (never the host tables).
+        """
+        self.ngram_embeddings.preload_staging(input_ids, predecessor_window)
 
     def _history_pad(self, input_ids: torch.Tensor, view) -> torch.Tensor:
         """Per-row committed history, left-padded to width ``n - 1``.

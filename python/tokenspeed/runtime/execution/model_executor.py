@@ -1151,6 +1151,21 @@ class ModelExecutor:
         # Freeze once for all captures; prefill and drafter captures collect on entry.
         with freeze_gc(self.config.enable_cudagraph_gc):
             if not self.forward_step.disable:
+                # LongCat ngram（方案C L1）：解码图捕获前强制分配 device staging。
+                # 捕获会记录图内 forward 读 staging 的 data pointer——若 staging 尚未
+                # 分配（None），捕获记录到的将是原 host 查表分支（其 host↔device
+                # memcpy 在流捕获下被拒，即历史 decode 图失败根因）。用空批次触发
+                # 一次预载（只分配不搬运），此后 staging 地址固定、由 settle() 逐
+                # step 刷新内容。
+                if (
+                    self.config.enforce_eager is False
+                    and hasattr(self.model_runner.model, "preload_ngram_staging")
+                    and self.input_buffers.ngram_previous_tokens_buf is not None
+                ):
+                    self.model_runner.model.preload_ngram_staging(
+                        self.input_buffers.input_ids_buf[:0],
+                        self.input_buffers.ngram_previous_tokens_buf[:0],
+                    )
                 self.forward_step.capture(entries=entries, observer=observer)
             if not self.prefill_graph.disable:
                 self.prefill_graph.capture(
@@ -2816,6 +2831,32 @@ class ModelExecutor:
                     decode_input_ids,
                     ngram_inputs=ngram_inputs,
                 )
+                # LongCat ngram（方案C L1）：解码 ACL Graph 捕获外预载。
+                # load_round_inputs 刚把 packed ids + 每 token predecessor window
+                # 填好，这里把 host 表当前批行 H2D 预载到固定 device staging，
+                # 图内 forward 只读 staging（ACL Graph 捕获内禁止 host↔device
+                # memcpy）。仅在解码图捕获开启（非 enforce_eager）时启用；
+                # enforce_eager 保持原 host 查表路径（基线可回退）。非 LongCat
+                # 模型无此钩子 → no-op。
+                if (
+                    self.config.enforce_eager is False
+                    and hasattr(
+                        self.model_runner.model, "preload_ngram_staging"
+                    )
+                ):
+                    ngram_window = self.input_buffers.ngram_model_kwargs(
+                        total_tokens
+                    ).get("ngram_previous_tokens")
+                    if ngram_window is None:
+                        raise RuntimeError(
+                            "LongCat ngram staging enabled but the "
+                            "ngram_previous_tokens buffer is unallocated "
+                            "(init_ngram_buffers missing)"
+                        )
+                    self.model_runner.model.preload_ngram_staging(
+                        self.input_buffers.input_ids_buf[:total_tokens],
+                        ngram_window,
+                    )
                 if (
                     self.sampling_backend.config.synthetic_acceptance_length is not None
                     and decode_input_ids is not None
