@@ -146,6 +146,10 @@ class VerifyQueryLayout:
         """Gather aligned model inputs in one launch."""
         return gather_query_rows(values, self.packed_rows, self.packed_valid)
 
+    def mask_compact_rows(self, values: torch.Tensor) -> torch.Tensor:
+        """Zero bucket filler without reading its unspecified activations."""
+        return gather_query_rows((values,), self._queries, self.packed_valid)[0]
+
     def expand_rows(self, values: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         """Restore aligned model outputs in one launch."""
         return gather_query_rows(values, self.expanded_rows, self.expanded_valid)

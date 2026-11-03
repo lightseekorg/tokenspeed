@@ -28,6 +28,7 @@ import torch
 
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 
 NAN = float("nan")
 
@@ -43,7 +44,9 @@ def _ctx(bs: int, num_extends: int = 0, width: int = 1):
 
 
 def _logits_output(logits: torch.Tensor, layout_plan=None):
-    return SimpleNamespace(next_token_logits=logits, logits_layout_plan=layout_plan)
+    return LogitsProcessorOutput(
+        next_token_logits=logits, logits_layout_plan=layout_plan
+    )
 
 
 def test_audit_logits_flags_per_extend_row():

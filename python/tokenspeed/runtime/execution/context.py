@@ -156,6 +156,8 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     output_layout: ForwardOutputLayout
     verify_queries: VerifyQueryLayout | None = None
+    # The sampler's score rows; None retains maximum-window logits.
+    logits_queries: VerifyQueryLayout | None = None
     # Decode stage execution; target shapes depend on Q, draft shapes on B.
     decode_graphs: ConfidenceDecodeGraphs | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
