@@ -237,6 +237,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  
     unp_sums_publish,
     xn_wait,
 )
+from tokenspeed_kernel_amd._scheduling import wave_uniform_i32  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.persistent import Launch  # noqa: E402
 
 _VIEW = {
@@ -281,7 +282,7 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
             gl.sum(gl.sum(got, 2), 0),
         )
     elif ROLE == "h4":
-        layout: gl.constexpr = gl.BlockedLayout([1, 16], [16, 4], [1, 8], [1, 0])
+        layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [1, 8], [0, 1])
         r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
         c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
         y = gl.load(floats + r[:, None] * 128 + c[None, :])
@@ -362,3 +363,43 @@ def test_every_cleared_area_splits_into_whole_sender_shares():
     # About 5.6 MB per copy in all, ~44 KB cleared per sender per launch.
     total = sum(4 * area.copy_words for area in f.CLEARED_AREAS)
     assert 5 << 20 < total < 6 << 20
+
+
+@gluon.jit
+def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors, floats, words, copy):  # fmt: skip
+    """h4_sink inside a loop whose trip count differs per wave, as in the
+    MoE down units: a workgroup barrier inside would deadlock."""
+    view = MuseNativeView(
+        heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
+    )
+    zero = gl.program_id(0) * 0
+    launch = Launch(
+        gl.program_id(0), zero, zero, copy.to(gl.int64) + 2, zero + 7, copy, zero,
+        errors, errors + 32, zero.to(gl.int64) + 1000, errors,
+    )  # fmt: skip
+    # The MoE stream's sink layout (MOE_SINK_LAYOUT): wave w's [16, 16] tile,
+    # two whole column pairs per lane.
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [1, 8], [0, 1])
+    r = gl.arange(0, 16, layout=gl.SliceLayout(1, layout))
+    c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+    lane = gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0]))
+    # This wave's index, as a per-wave scalar: wave w runs w + 1 units.
+    units = wave_uniform_i32(gl.max(lane // 64, 0)) + 1
+    for unit in range(units):
+        y = gl.load(floats + unit * 2048 + r[:, None] * 128 + c[None, :])
+        route = gl.load(words + unit * 16 + r)[:, None]
+        h4_sink((view, launch), y, route, (unit * 128 + c)[None, :])
+
+
+def test_h4_sink_moves_no_data_between_lanes():
+    """The sink runs in per-wave code: no workgroup barrier and no LDS
+    traffic, so waves with different trip counts never wait for each other."""
+    signature = dict(_VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32")
+    assembly = _compile(_h4_per_wave_kernel, signature, {})
+    # The loop that pushes (finding the wave index before it needs one
+    # cross-wave reduction, which is the test's, not the sink's).
+    loops = [l for l in innermost_loops(assembly) if "sc0 sc1" in l]
+    assert loops
+    for loop in loops:
+        assert "s_barrier" not in loop
+        assert not re.search(r"\bds_(write|read|bpermute)", loop)

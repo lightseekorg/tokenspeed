@@ -410,34 +410,39 @@ def xn_wait(view, launch, row, on_expiry: gl.constexpr, RANK: gl.constexpr):
 
 
 @gluon.constexpr_function
-def _pair_layout(columns, num_warps):
-    """Two adjacent columns per lane, a row's pairs across consecutive lanes."""
-    pairs = min(columns // 2, 64)
-    return gl.BlockedLayout([1, 2], [64 // pairs, pairs], [num_warps, 1], [1, 0])
+def _whole_pairs(layout):
+    """Whether every lane of ``layout`` holds whole adjacent column pairs."""
+    return isinstance(layout, gl.BlockedLayout) and layout.size_per_thread[-1] % 2 == 0
 
 
 @gluon.jit
 def h4_sink(args, y, route, cols):
     """The MoE down unit's output pushed to its route's column owner (H4):
     the MoE stream's ``sink(args, y, route, cols)`` with ``args = (view,
-    launch)``.
+    launch)``. Called from per-wave code, so it moves no data between lanes
+    (no layout conversion, LDS or barrier).
 
-    ``y``: FP32 partial [R, C], C even; ``route``: [R, 1] route row (token *
-    8 + pick), -1 to skip; ``cols``: [1, C] output columns (0-4095), adjacent
-    pairs consecutive. Whole 32-bit words (two BF16 columns) go out in one
-    store each, since receivers test a word's high half. Columns this rank
-    owns go to the local own slices (read by own4_complete), the rest to
-    slot (7 - distance) of the owner's mailbox: device scope locally, system
-    scope to peers, no wait."""
+    ``y``: FP32 partial [R, C] in a BlockedLayout whose lanes each hold
+    whole adjacent column pairs (an even run of columns, such as
+    ``BlockedLayout([1, 4], [16, 4], [1, num_warps], [1, 0])``: a wave's
+    [16, 16] tile); ``route``: [R, 1] route row (token * 8 + pick), -1 to
+    skip; ``cols``: [1, C] output columns (0-4095, the first of each pair
+    even), both slices of y's layout. Each pair goes out as one 32-bit word
+    (receivers test a word's high half). Columns this rank owns go to the
+    local own slices (read by own4_complete), the rest to slot (7 -
+    distance) of the owner's mailbox: device scope locally, system scope to
+    peers, no wait."""
+    gl.static_assert(
+        _whole_pairs(y.type.layout), "h4_sink: lanes must hold whole pairs"
+    )
     view, launch = args
     rank = view.rank
     R: gl.constexpr = y.shape[0]
     C: gl.constexpr = y.shape[1]
-    layout: gl.constexpr = _pair_layout(C, gl.num_warps())
-    values = _iris_sanitize_lamport_bf16(gl.convert_layout(y, layout).to(gl.bfloat16))
+    values = _iris_sanitize_lamport_bf16(y.to(gl.bfloat16))
     zeros = gl.zeros([R, C], gl.int32, y.type.layout)
-    columns = gl.convert_layout(cols + zeros, layout)
-    routes = gl.convert_layout(route + zeros, layout)
+    columns = cols + zeros
+    routes = route + zeros
     low, high = gl.split(gl.reshape(values, [R, C // 2, 2]))
     words = low.to(gl.uint16, bitcast=True).to(gl.uint32) | (
         high.to(gl.uint16, bitcast=True).to(gl.uint32) << 16
