@@ -91,7 +91,9 @@ struct CacheCoordinatorTestAccess {
     // scratch: every indexed hash has a node whose entry, State, prefix-closed
     // and pair counts match its entries on both tiers, and a node without
     // entries stays only for a child or a write-back on its way to the Host.
-    // Empty when they agree. Call it between coordinator operations.
+    // The CheckpointTree tracks only checkpoints a node holds, and ranks each
+    // by the residency the node's counts give. Empty when they agree. Call it
+    // between coordinator operations.
     static std::vector<std::string> BoundaryTreeMismatches(const CacheCoordinator& coordinator) {
         struct Counts {
             std::array<std::int32_t, 2> entries{};
@@ -142,7 +144,9 @@ struct CacheCoordinatorTestAccess {
         }
         // Every node, by the tree's own links: one without entries hangs on
         // for a child or a store; and none is out of reach.
+        const CheckpointTree& checkpoints = coordinator.Checkpoints();
         std::size_t reached = 0;
+        std::size_t tracked_checkpoints = 0;
         std::vector<const BoundaryTree::Node*> pending;
         for (const BoundaryTree::Node* root = tree.FirstRoot(); root != nullptr; root = root->next_sibling) {
             pending.push_back(root);
@@ -154,12 +158,34 @@ struct CacheCoordinatorTestAccess {
             if (!expected.contains(*node->hash) && node->first_child == nullptr && node->PendingHostStores() == 0) {
                 mismatches.push_back("nothing holds the node " + *node->hash);
             }
+            if (checkpoints.Contains(*node->hash)) {
+                ++tracked_checkpoints;
+                const CheckpointTree::Residency residency = tree.CheckpointResidency(*node);
+                if (!residency.held) {
+                    mismatches.push_back("the checkpoint tree tracks the unheld checkpoint " + *node->hash);
+                }
+                // Distance is reported for a checkpoint present on either tier.
+                const bool present = residency.complete[0] || residency.complete[1] || residency.pending_host_store;
+                if (checkpoints.Distance(*node->hash).has_value() != present) {
+                    mismatches.push_back("checkpoint presence of " + *node->hash);
+                }
+                for (const CacheTier tier : {CacheTier::kDevice, CacheTier::kHost}) {
+                    if (checkpoints.AgedDistance(*node->hash, tier) != 0 &&
+                        !residency.complete[static_cast<std::size_t>(tier)]) {
+                        mismatches.push_back("aged checkpoint " + *node->hash + " incomplete on tier " +
+                                             std::to_string(static_cast<int>(tier)));
+                    }
+                }
+            }
             for (const BoundaryTree::Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
                 pending.push_back(child);
             }
         }
         if (reached != tree.Size()) {
             mismatches.push_back("nodes out of reach of the roots");
+        }
+        if (tracked_checkpoints != checkpoints.Size()) {
+            mismatches.push_back("the checkpoint tree tracks a checkpoint without a boundary node");
         }
         return mismatches;
     }

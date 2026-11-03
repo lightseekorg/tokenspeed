@@ -439,7 +439,9 @@ private:
 
     void releasePrefix(PrefixSegment* segment) {
         while (segment != nullptr) {
-            _assert(segment->references > 0, "checkpoint prefix reference underflow");
+            // Fatal rather than thrown: Update gets here from a boundary-tree
+            // hold's release, which runs in destructors.
+            FatalCheck(segment->references > 0, "checkpoint prefix reference underflow");
             if (--segment->references != 0) {
                 return;
             }

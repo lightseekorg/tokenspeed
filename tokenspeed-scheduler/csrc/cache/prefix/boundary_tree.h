@@ -455,6 +455,8 @@ private:
         if (node.HasHostKvDuplicate() != had_duplicate) {
             host_kv_duplicates_ += had_duplicate ? -1 : 1;
         }
+        // A hold's release runs in destructors, so the CheckpointTree's checks
+        // on this path are fatal checks, like the ones above.
         if (moves_checkpoint) {
             if (const CheckpointTree::Residency residency = CheckpointResidency(node); residency != had_residency) {
                 checkpoints_->Update(*node.hash, residency);

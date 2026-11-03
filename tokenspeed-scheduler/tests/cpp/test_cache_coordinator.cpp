@@ -8060,7 +8060,8 @@ protected:
 
     // Admits a request over `tokens` and publishes all of them as a final
     // frontier: the full pages (hashes_), the tail at an unaligned end, and
-    // every State group's checkpoint at the end. Returns the tail.
+    // every State group's checkpoint at the end, which the CheckpointTree
+    // records. Returns the tail.
     std::optional<TailPublication> PublishFinal(std::vector<BlockTable>& tables,
                                                 const std::vector<std::int32_t>& tokens) {
         const auto num_tokens = static_cast<std::int32_t>(tokens.size());
@@ -8079,7 +8080,8 @@ protected:
             };
         }
         const RequestProgress progress{
-            .completed_pages = CompletedPages{.prefix_hashes = hashes_,
+            .completed_pages = CompletedPages{.tokens = tokens,
+                                              .prefix_hashes = hashes_,
                                               .first_new_prefix_page = 0,
                                               .tail = tail,
                                               .publish_state = true,

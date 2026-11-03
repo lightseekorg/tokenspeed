@@ -504,6 +504,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
         std::int32_t hits = 0;
         std::int32_t chunked = 0;
         std::int32_t floods = 0;
+        std::size_t peak_checkpoints = 0;
         for (int round = 0; round < 200; ++round) {
             const std::int32_t num_tokens = length_dist(rng);
             Session session{.tokens = test::MakeTokens(num_tokens, 1000 * (round + 1))};
@@ -557,7 +558,9 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             if (chunk_pages) {
                 const RequestProgress chunk_end{
                     .completed_pages =
-                        CompletedPages{.prefix_hashes = std::span<const std::string>(session.hashes)
+                        CompletedPages{.tokens = std::span<const std::int32_t>(session.tokens)
+                                                     .first(static_cast<std::size_t>(first_end)),
+                                       .prefix_hashes = std::span<const std::string>(session.hashes)
                                                             .first(static_cast<std::size_t>(*chunk_pages)),
                                        .first_new_prefix_page = first_new,
                                        .publish_state = true,
@@ -574,7 +577,8 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             }
             coordinator.CacheCompletedBlocks(
                 tables,
-                RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = session.hashes,
+                RequestProgress{.completed_pages = CompletedPages{.tokens = session.tokens,
+                                                                  .prefix_hashes = session.hashes,
                                                                   .first_new_prefix_page = published_pages,
                                                                   .tail = session.tail,
                                                                   .publish_state = true,
@@ -609,6 +613,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             }
             const std::vector<std::string> mismatches = CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator);
             ASSERT_TRUE(mismatches.empty()) << "round " << round << ": " << mismatches.front();
+            peak_checkpoints = std::max(peak_checkpoints, coordinator.Checkpoints().Size());
             const auto on_device = [&](const std::string& hash) {
                 return coordinator.GroupPrefixIndex(0).Contains(device, KeyFor(hash, 0));
             };
@@ -634,10 +639,12 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             }
         }
         // The run resumed on hits, published chunk ends, admitted floods, and
-        // evicted under pressure, middle pages with their suffix too.
+        // evicted under pressure, middle pages with their suffix too; the
+        // CheckpointTree tracked the published checkpoints.
         EXPECT_GT(hits, 0);
         EXPECT_GT(chunked, 0);
         EXPECT_GT(floods, 0);
+        EXPECT_GT(peak_checkpoints, 0u);
         const CacheCoordinator::DeviceEvictionStats& evictions = coordinator.DeviceEvictions();
         EXPECT_GT(evictions.admission.blocks, 0u);
         EXPECT_GT(evictions.stranded_suffix.blocks, 0u);
