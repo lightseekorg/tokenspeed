@@ -62,6 +62,7 @@ def test_startup_arms_the_complete_selected_fusion_window(
     monkeypatch, enabled, fusion_tokens, expected_capacity
 ):
     import tokenspeed_kernel.ops.communication.fabric as fabric
+    import tokenspeed_kernel.ops.communication.iris as kernel_iris
 
     import tokenspeed.runtime.distributed.comm_backend as comm_backend
     import tokenspeed.runtime.execution.distributed_initializer as initializer
@@ -107,6 +108,7 @@ def test_startup_arms_the_complete_selected_fusion_window(
         initializer.pg_manager, "get_process_group", lambda *a, **k: None
     )
     monkeypatch.setattr(fabric, "gather_fabric_map", lambda: None)
+    monkeypatch.setattr(kernel_iris, "discover_iris_world", lambda: True)
     monkeypatch.setattr(comm_backend, "get_global_backend", lambda: backend)
 
     assert DistributedInitializer.initialize(config) == 1.0
