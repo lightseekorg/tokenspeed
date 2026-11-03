@@ -1338,7 +1338,11 @@ impl OutputProcessor {
             streamed.push(rid);
             if state.finished() {
                 committed.events.push(finish(rid, nan_detected));
-            } else if is_decode {
+            } else if is_decode && state.decode_reserve != Some(output_length as i32) {
+                // The scheduler keeps a request's decode reservation until it
+                // is sent another (a retraction's image carries it too), so
+                // only a change goes out, not an event per row every round.
+                state.decode_reserve = Some(output_length as i32);
                 committed.events.push(event(
                     ForwardEventKind::UpdateReserveNumTokens,
                     rid,
@@ -1965,6 +1969,37 @@ mod tests {
         assert!(received
             .recv_timeout(std::time::Duration::from_millis(50))
             .is_err());
+    }
+
+    #[test]
+    fn a_decode_reservation_reaches_the_scheduler_only_when_it_changes() {
+        // Verify width 3: each decode row stores three tokens and keeps some.
+        let mut p = processor(Some(3));
+        register(&mut p, "r", 4, 100, &[]);
+        p.commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        let reserves: Vec<Vec<i32>> = [2, 2, 3, 3, 3, 1]
+            .into_iter()
+            .map(|kept| {
+                let committed = p
+                    .commit(
+                        &batch(&[("r", 3, 0, 4)], 0),
+                        None,
+                        &result(&[8, 9, 10], &[kept]),
+                    )
+                    .unwrap();
+                committed
+                    .events
+                    .iter()
+                    .filter(|event| event.kind == ForwardEventKind::UpdateReserveNumTokens)
+                    .map(|event| event.reserve_num_tokens)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            reserves,
+            [vec![2], vec![], vec![3], vec![], vec![], vec![1]]
+        );
     }
 
     #[test]

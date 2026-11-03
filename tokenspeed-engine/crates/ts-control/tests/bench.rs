@@ -24,11 +24,30 @@
 //! several runs each, and compare within a machine.
 
 use std::collections::BTreeSet;
+use std::ffi::CString;
+use std::sync::{mpsc, Once};
 use std::time::{Duration, Instant};
 
-use ts_control::output::{FinishLog, ForwardResult, OutputProcessor, Role};
+use pyo3::{prelude::*, types::PyDict};
+use ts_collective::{Group, Listener, Mesh};
+use ts_control::batch_log::BatchLogConfig;
+use ts_control::control::ControlConfig;
+use ts_control::event_loop::{
+    DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig, Ranks,
+    Subsystems,
+};
+use ts_control::ingress::{Admission, IngressLimits, LogprobServability};
+use ts_control::output::{FinishLog, ForwardResult, OutputProcessor, Role, StreamedOutput};
 use ts_control::request::RequestState;
-use ts_scheduler::ForwardBatchView;
+use ts_scheduler::{CacheEvent, ExecutionPlan, ForwardBatchView, Scheduler};
+use ts_wire::{
+    ControlOutput, ControlRequest, EngineOutput, EngineRequest, SamplingParams,
+    TokenizedGenerateReqInput,
+};
+
+/// The benchmarks allocate as `ts-host` does.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const NO_FINISH_LOG: FinishLog = FinishLog {
     enabled: false,
@@ -101,5 +120,363 @@ fn bench_commit_decode() {
     println!(
         "commit: {:.0} us/commit over {commits} commits",
         start.elapsed().as_secs_f64() * 1e6 / commits as f64
+    );
+}
+
+/// A whole scheduling round's shape: `rows` requests of `prompt` tokens on
+/// `page`-token KV pages, each generating `generate` tokens and replaced by
+/// a new request once it finishes (0: it decodes for the whole run).
+struct RoundShape {
+    rows: usize,
+    prompt: usize,
+    page: usize,
+    generate: usize,
+    warmup_rounds: usize,
+    rounds: usize,
+}
+
+fn interpreter() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
+        ts_scheduler::register_builtin_module();
+        Python::initialize();
+        Python::attach(|py| {
+            ts_scheduler::alias_builtin_module(py).unwrap();
+            let package = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../tokenspeed-scheduler/python"
+            );
+            py.import("sys")
+                .unwrap()
+                .getattr("path")
+                .unwrap()
+                .call_method1("insert", (0, package))
+                .unwrap();
+        });
+    });
+}
+
+/// A scheduler with room for `pages` KV pages, admitting every row at once.
+fn round_scheduler(shape: &RoundShape, pages: usize) -> Scheduler {
+    interpreter();
+    let code = format!(
+        r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.prefix_granularity = {page}
+cfg.max_scheduled_tokens = {tokens}
+cfg.max_batch_size = {rows}
+cfg.num_device_pages = {pages} + 1
+cfg.num_snapshot_pages = 1
+cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={page},
+                                        total_pages={pages} + 1, attn_kind=ts.AttnKind.Full)]
+result = ts.Scheduler(cfg)
+"#,
+        page = shape.page,
+        rows = shape.rows,
+        tokens = shape.rows * (shape.prompt + 16),
+    );
+    Python::attach(|py| {
+        let globals = PyDict::new(py);
+        py.run(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap();
+        Scheduler::from_python(&globals.get_item("result").unwrap().unwrap()).unwrap()
+    })
+}
+
+/// A device whose forwards land at once, one token per row. Plans go to
+/// another thread, which frees them, as the host's forward thread does.
+struct InstantDevice {
+    plans: mpsc::Sender<ExecutionPlan>,
+}
+
+impl DataPlane for InstantDevice {
+    type Pending = ForwardResult;
+
+    fn admit(&mut self, _: &[Admission]) -> Result<(), DataPlaneError> {
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        plan: ExecutionPlan,
+        dispatch: &Dispatch<'_>,
+    ) -> Result<Option<ForwardResult>, DataPlaneError> {
+        let _ = self.plans.send(plan);
+        Ok(dispatch.forward.map(|batch| {
+            let rows = batch.request_ids.len();
+            ForwardResult {
+                output_tokens: vec![7; rows],
+                output_lengths: vec![1; rows],
+                ..ForwardResult::default()
+            }
+        }))
+    }
+
+    fn complete(&mut self, pending: ForwardResult) -> Result<ForwardResult, DataPlaneError> {
+        Ok(pending)
+    }
+
+    fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
+        Ok(Vec::new())
+    }
+
+    fn release(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+        Ok(())
+    }
+
+    fn land(&mut self, _: Option<(i32, Vec<i32>)>, _: Option<i32>) -> Result<(), DataPlaneError> {
+        unreachable!("no PD in the benchmark")
+    }
+
+    fn idle_forward(&mut self, _: &DpRound) -> Result<(), DataPlaneError> {
+        unreachable!("no attention DP in the benchmark")
+    }
+
+    fn check_weight_update(
+        &mut self,
+        _: &ControlRequest,
+    ) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    fn update_weights(&mut self, _: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    fn commit_weight_update(&mut self, _: bool) -> Result<(), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    fn profile(
+        &mut self,
+        _: &ts_wire::control::ProfileReq,
+    ) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    fn release_memory(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    fn resume_memory(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn snapshot_expert_load(&mut self) -> Result<(Vec<Vec<i64>>, Vec<Vec<i32>>), DataPlaneError> {
+        unreachable!("no expert rebalance in the benchmark")
+    }
+
+    fn attach_grammars(&mut self, _: &[(String, u64, Vec<i32>)]) -> Result<(), DataPlaneError> {
+        unreachable!("no grammar in the benchmark")
+    }
+
+    fn epd_publish(&mut self, _: &[ts_pd::LandedRequest]) -> Result<(), DataPlaneError> {
+        unreachable!("no EPD in the benchmark")
+    }
+
+    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
+        unreachable!("no EPD in the benchmark")
+    }
+
+    fn apply_expert_placement(
+        &mut self,
+        _: &[usize],
+        _: &[Vec<i32>],
+        _: &[ts_control::eplb::SlotMoves],
+    ) -> Result<(), DataPlaneError> {
+        unreachable!("no expert rebalance in the benchmark")
+    }
+}
+
+/// A frontend that hands each round's outputs to another thread to encode,
+/// as the transport does, and submits a new request for every one that
+/// finished.
+struct ChurningFrontend {
+    prompt: usize,
+    max_new_tokens: i64,
+    /// Requests to submit next round.
+    due: usize,
+    submitted: usize,
+    encoder: mpsc::Sender<(Vec<StreamedOutput>, Load)>,
+}
+
+impl Frontend for ChurningFrontend {
+    fn receive(&mut self, _: Option<Duration>) -> Vec<EngineRequest> {
+        let due = std::mem::take(&mut self.due);
+        (0..due)
+            .map(|_| {
+                // As long as the UUIDs frontends name requests with.
+                let rid = format!("{:08x}-9f09-89be-5c9d-5d65f086d356", self.submitted);
+                self.submitted += 1;
+                let mut request = TokenizedGenerateReqInput::new(
+                    rid,
+                    SamplingParams {
+                        max_new_tokens: Some(self.max_new_tokens),
+                        ..SamplingParams::default()
+                    },
+                );
+                request.input_ids = Some((1..=self.prompt as i32).collect());
+                request.stream = true;
+                EngineRequest::Add(Box::new(request))
+            })
+            .collect()
+    }
+
+    fn closed(&self) -> bool {
+        false
+    }
+
+    fn send(&mut self, outputs: Vec<StreamedOutput>, load: Load) {
+        self.due += outputs
+            .iter()
+            .filter(|output| output.finish_reason.is_some())
+            .count();
+        let _ = self.encoder.send((outputs, load));
+    }
+
+    fn reply(&mut self, _: ControlOutput) {}
+}
+
+/// Run `shape`'s rounds on one rank and print the microseconds per round.
+fn bench_rounds(name: &str, shape: RoundShape) {
+    let generated = if shape.generate > 0 {
+        shape.generate
+    } else {
+        shape.warmup_rounds + shape.rounds + 1
+    };
+    // Every row may hold its whole request at once.
+    let pages = shape.rows * (shape.prompt + generated + 2 * shape.page) / shape.page + 64;
+    let listener = Listener::bind("127.0.0.1").unwrap();
+    let address = format!("127.0.0.1:{}", listener.port().unwrap());
+    let ranks = Ranks {
+        mesh: Mesh::connect(0, listener, &[address], Duration::from_secs(5)).unwrap(),
+        replica: Group::new(1, vec![0], 0).unwrap(),
+        pp: None,
+        dp: None,
+        ep: None,
+    };
+    let (plans, freed) = mpsc::channel::<ExecutionPlan>();
+    let freeing = std::thread::spawn(move || freed.into_iter().for_each(drop));
+    let (encoder, batches) = mpsc::channel::<(Vec<StreamedOutput>, Load)>();
+    let encoding = std::thread::spawn(move || {
+        for (outputs, load) in batches {
+            let batch = ts_control::transport::output_batch(outputs, 0, load);
+            std::hint::black_box(EngineOutput::Batch(Box::new(batch)).to_frames());
+        }
+    });
+    let config = LoopConfig {
+        in_flight_depth: 1,
+        limits: IngressLimits {
+            vocab_size: 1 << 17,
+            eos_token_ids: vec![2],
+            max_model_len: 1 << 24,
+            max_req_input_len: 1 << 20,
+            enable_output_logprobs: false,
+            requires_bootstrap: false,
+            multimodal: false,
+            grammar: false,
+            reasoning: None,
+            logprobs: LogprobServability {
+                supports_prompt_logprobs: true,
+                logprob_order: "torch".to_owned(),
+                pipeline_parallel: false,
+                disaggregated: false,
+                lm_head_tp_under_dp: false,
+                computes_prompt_logprobs: true,
+            },
+        },
+        kv_total_pages: pages as i64,
+        ngram_context_len: 0,
+        request_token_history: false,
+        controls: ControlConfig {
+            memory_saver: false,
+            memory_regions: Vec::new(),
+            l3_weight_version: None,
+        },
+        batch_log: BatchLogConfig {
+            enabled: false,
+            decode_log_interval: 40,
+            num_total_pages: pages as i64,
+            spec_num_steps: 0,
+            dp_rank: 0,
+            disaggregated: false,
+            cache_state_group_ids: Vec::new(),
+            log_spec_accept_lengths: false,
+        },
+        kv_events: false,
+        epd_receive_enabled: false,
+        eager_grammar: false,
+    };
+    let mut event_loop = EventLoop::new(
+        round_scheduler(&shape, pages),
+        InstantDevice { plans },
+        ChurningFrontend {
+            prompt: shape.prompt,
+            max_new_tokens: generated as i64,
+            due: shape.rows,
+            submitted: 0,
+            encoder,
+        },
+        OutputProcessor::new(None, 1, Some(1 << 24), Role::Plain, NO_FINISH_LOG, None),
+        config,
+        ranks,
+        Subsystems::default(),
+    );
+    for _ in 0..shape.warmup_rounds {
+        event_loop.round(false).unwrap();
+    }
+    let start = Instant::now();
+    for _ in 0..shape.rounds {
+        event_loop.round(false).unwrap();
+    }
+    println!(
+        "{name}: {:.0} us/round over {} rounds",
+        start.elapsed().as_secs_f64() * 1e6 / shape.rounds as f64,
+        shape.rounds
+    );
+    drop(event_loop);
+    freeing.join().unwrap();
+    encoding.join().unwrap();
+}
+
+/// A whole `EventLoop::round` in steady decode: 256 rows of 2K-token
+/// prompts on 64-token pages, every token streamed, over the real
+/// scheduler, with a device and a frontend that cost nothing beyond the
+/// output encoding, so the wall time is the control thread's own.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_decode() {
+    bench_rounds(
+        "round, decode",
+        RoundShape {
+            rows: 256,
+            prompt: 2048,
+            page: 64,
+            generate: 0,
+            warmup_rounds: 200,
+            rounds: 1000,
+        },
+    );
+}
+
+/// [`bench_round_decode`] under churn: each request generates 64 tokens and
+/// a new one takes its row, so every round admits and finishes four
+/// requests besides decoding the rest.
+#[test]
+#[ignore = "a sustained load that A/Bs a whole round"]
+fn bench_round_churn() {
+    bench_rounds(
+        "round, churn",
+        RoundShape {
+            rows: 256,
+            prompt: 512,
+            page: 64,
+            generate: 64,
+            warmup_rounds: 200,
+            rounds: 2000,
+        },
     );
 }

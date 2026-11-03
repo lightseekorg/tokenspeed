@@ -48,8 +48,12 @@ public:
 
     const std::string& Id() const { return id_; }
     const std::string& SessionId() const { return session_id_; }
-    std::uint64_t SessionEpoch() const { return session_epoch_; }
-    void SetSessionEpoch(std::uint64_t epoch) { session_epoch_ = epoch; }
+    // The registration of SessionId() under the request's access epoch that
+    // its first admission returned: held for the request's whole life, which
+    // every later admission, publication and restore under that epoch lies in.
+    void HoldSessionAccess(CacheCoordinator::SessionAccess session_access) {
+        session_access_ = std::move(session_access);
+    }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -224,6 +228,10 @@ public:
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
     std::span<const std::string> PromptPrefixHashes();
+    // The external KV-event hashes (HashKvBlock) of the first num_pages full
+    // pages, each chained on the one before. A page is hashed once, the first
+    // time it is asked for: its tokens never change.
+    std::span<const std::uint64_t> KvEventBlockHashes(std::size_t num_pages);
     std::span<const std::int32_t> TokenSlice(std::int32_t begin, std::int32_t size) const {
         return token_container_.TokenSlice(TokenContainer::Window{.begin = begin, .size = size});
     }
@@ -321,7 +329,7 @@ private:
 
     std::string id_;
     std::string session_id_;
-    std::uint64_t session_epoch_{0};
+    CacheCoordinator::SessionAccess session_access_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
@@ -332,6 +340,7 @@ private:
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
+    std::vector<std::uint64_t> kv_event_block_hashes_;
     fsm::State state_;
 };
 

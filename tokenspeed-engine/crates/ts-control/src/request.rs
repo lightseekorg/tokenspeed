@@ -218,6 +218,9 @@ pub struct RequestState {
     pub session_id: Option<String>,
     /// Speculative verify rounds this request took part in.
     pub spec_verify_ct: i64,
+    /// The decode reservation last sent to the scheduler
+    /// (`UpdateReserveNumTokens`), which keeps it until it is sent another.
+    pub decode_reserve: Option<i32>,
     /// Once it finished with speculative decoding, its accepted tokens per
     /// verify round.
     pub accept_draft_tokens: Option<f64>,
@@ -306,6 +309,7 @@ impl RequestState {
             cached_tokens: 0,
             session_id: None,
             spec_verify_ct: 0,
+            decode_reserve: None,
             accept_draft_tokens: None,
             numerical_error_detected: false,
             finished_reason: None,

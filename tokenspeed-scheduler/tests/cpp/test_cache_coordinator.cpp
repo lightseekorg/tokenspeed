@@ -3075,7 +3075,7 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                     coordinator.CacheHostBlock(block, key, published->metadata);
                 }
                 coordinator.Free(tables);
-                coordinator.ForgetSessionAccess(first->access_epoch);
+                first->session_access = {};
                 if (ended) {
                     ASSERT_EQ(coordinator.DemoteSession("first", true), 2u);
                     EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(host, key)->metadata.last_access_epoch, 0u);
@@ -3111,7 +3111,7 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                 }
                 EXPECT_TRUE(coordinator.TakePendingStores().empty());
                 coordinator.Free(tables);
-                coordinator.ForgetSessionAccess(reused->access_epoch);
+                reused->session_access = {};
             }
         }
     }
@@ -14064,6 +14064,67 @@ TEST(RetractionImageSplitTest, ACheckpointVictimFreesItsStateSiblingInThePlan) {
     coordinator.Free(tables);
 }
 
+// An image waits for an earlier store that carries one of its pages, its own
+// L2 leg and its tail leg; each wait lands with its own op's ACK, in whatever
+// order the ACKs come, and nothing else has to record it.
+TEST(RetractionImageSplitTest, EachStoreTheImageWaitsForLandsWithItsOwnAck) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    BlockPool pool(8, {1});
+    BlockPool host_pool(4, {1});
+    BlockPool snapshot_pool(2, {1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    SnapshotSlotAllocator blob_slots(1);
+    TierTransferManager transfers(coordinator);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    const std::vector<std::string> pages = ContentHashes({{1, 2}, {3, 4}});
+    const std::uint64_t epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+    // Page 0 streams to the Host on a store still in flight; page 1 does not.
+    CacheCompletedBlocksForTest(coordinator, tables, std::span{pages}.first(1), epoch, /*first_new_prefix_page=*/0,
+                                /*num_computed_tokens=*/2, CacheBoundaryKind::kChunk,
+                                /*stream_completed_to_host=*/true, /*publish_state=*/false);
+    const std::optional<WriteBackOperation> earlier =
+        transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
+    ASSERT_TRUE(earlier.has_value());
+    CacheCompletedBlocksForTest(coordinator, tables, pages, epoch, /*first_new_prefix_page=*/1,
+                                /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+
+    TierTransferManager::RetractionImageSplit split =
+        transfers.SplitRetractionImage(tables, /*num_tokens=*/4, coordinator.PublishedDataSlots(tables, 4));
+    ASSERT_FALSE(split.shortfall.has_value());
+    const std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+        "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+        /*num_tokens=*/4, std::move(split));
+    ASSERT_TRUE(stores.has_value());
+    ASSERT_TRUE(stores->host_store.has_value());
+    std::vector<std::uint32_t> waited;
+    for (const StoreWait& wait : stores->image_stores) {
+        waited.push_back(wait.op_id);
+    }
+    EXPECT_EQ(waited,
+              (std::vector<std::uint32_t>{earlier->op_id, stores->host_store->op_id, stores->snapshot_store.op_id}));
+    const auto landed = [&stores] {
+        std::vector<bool> out;
+        for (const StoreWait& wait : stores->image_stores) {
+            out.push_back(wait.Landed());
+        }
+        return out;
+    };
+    EXPECT_EQ(landed(), (std::vector<bool>{false, false, false}));
+    transfers.CompleteSnapshotStore(stores->snapshot_store.op_id);
+    EXPECT_EQ(landed(), (std::vector<bool>{false, false, true}));
+    transfers.CompleteWriteBack(stores->host_store->op_id);
+    EXPECT_EQ(landed(), (std::vector<bool>{false, true, true}));
+    transfers.CompleteWriteBack(earlier->op_id);
+    EXPECT_EQ(landed(), (std::vector<bool>{true, true, true}));
+    coordinator.Free(tables);
+}
+
 // Reconsidering tentative placements lets the older Full parent leave for State
 // while both image pages share the other freed parent. The newer checkpoint stays.
 TEST(RetractionImageSplitTest, JointPlacementPreservesTheNewerCheckpoint) {
@@ -14929,7 +14990,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageDoesNotBorrowAnEvictionWriteBacksTi
     const std::vector<CacheKey> keys = KeysOf(pages, tail);
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
-    EXPECT_TRUE(split.pending_store_ops.empty()) << "nothing borrowed";
+    EXPECT_TRUE(split.host_slot_stores.empty()) << "nothing borrowed";
     ASSERT_EQ(split.slots.size(), 8u);
     ASSERT_EQ(split.num_host_boundaries, split.boundaries.size());
     ASSERT_FALSE(split.shortfall.has_value());
@@ -15425,7 +15486,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageBetweenASegmentsTwoAcksCopiesItsKey
         PublishFinal(image, y_tokens);
         TierTransferManager::RetractionImageSplit split =
             transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
-        EXPECT_TRUE(split.pending_store_ops.empty()) << "nothing borrowed";
+        EXPECT_TRUE(split.host_slot_stores.empty()) << "nothing borrowed";
         ASSERT_EQ(split.slots.size(), own_op_first ? 8u : 4u);
         ASSERT_FALSE(split.shortfall.has_value());
         std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
@@ -15998,8 +16059,48 @@ TEST(CacheCoordinatorStoreCandidates, EndedSessionSuppressesQueuedStoresWithoutF
         EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
         EXPECT_EQ(tables[0].NumBlocks(), 2);
         coordinator.Free(tables);
-        coordinator.ForgetSessionAccess(admitted->access_epoch);
+        admitted->session_access = {};
     }
+}
+
+// A request's session stays registered under its access epoch exactly as long
+// as the handle its first admission returned: a continuing admission
+// registers nothing of its own, a move hands the registration on, and
+// dropping the last holder ends it.
+TEST(CacheCoordinatorSessionAccess, TheRegistrationLivesAsLongAsItsHandle) {
+    BlockPool pool(8, {1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false);
+    std::vector<BlockTable> tables(1);
+    const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{2}}};
+    auto first =
+        coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false, "session");
+    ASSERT_TRUE(first);
+    const std::uint64_t epoch = first->access_epoch;
+    ASSERT_NE(coordinator.SessionForAccess(epoch), nullptr);
+    EXPECT_EQ(coordinator.SessionForAccess(epoch)->id, "session");
+
+    auto continued =
+        coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, epoch, false, "session");
+    ASSERT_TRUE(continued);
+    continued.reset();
+    EXPECT_NE(coordinator.SessionForAccess(epoch), nullptr) << "only the first admission's handle registers";
+
+    CacheCoordinator::SessionAccess held = std::move(first->session_access);
+    first.reset();
+    EXPECT_NE(coordinator.SessionForAccess(epoch), nullptr) << "the move handed the registration on";
+    held = {};
+    EXPECT_EQ(coordinator.SessionForAccess(epoch), nullptr);
+
+    std::vector<BlockTable> untagged_tables(1);
+    const std::array untagged_demands{GroupDemand{.table = &untagged_tables[0], .extent = DenseGrowth{2}}};
+    const auto untagged =
+        coordinator.Admit(coordinator.ProbePrefix({}), untagged_demands, RequestProgress{}, std::nullopt, false, {});
+    ASSERT_TRUE(untagged);
+    EXPECT_EQ(coordinator.SessionForAccess(untagged->access_epoch), nullptr);
+    coordinator.Free(tables);
+    coordinator.Free(untagged_tables);
 }
 
 }  // namespace tokenspeed::test
