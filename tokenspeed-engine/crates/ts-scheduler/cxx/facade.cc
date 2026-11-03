@@ -208,9 +208,10 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
-        .active_lcm_blocks = scheduler.ActiveLcmBlocks(),
     };
 }
+
+std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler) { return scheduler.ActiveLcmBlocks(); }
 
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id) {
     const std::string id(group_id);

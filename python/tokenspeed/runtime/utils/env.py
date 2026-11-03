@@ -275,6 +275,8 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
+    # Scan scheduler page-table values against the supplied page-ID bounds.
+    TOKENSPEED_VALIDATE_PAGE_IDS = EnvBool(False)
     # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
     TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")

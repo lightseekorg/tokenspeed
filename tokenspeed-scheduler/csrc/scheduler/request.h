@@ -225,6 +225,12 @@ public:
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
+    // Full prefix pages [first_page, past_end_page), all of them complete. A
+    // step hashes only the pages it completed through this, never a view of
+    // the whole context.
+    std::vector<std::span<const std::int32_t>> PrefixPages(std::int32_t first_page, std::int32_t past_end_page) const {
+        return token_container_.PrefixPages(prefix_granularity_, first_page, past_end_page);
+    }
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
     std::span<const std::string> PromptPrefixHashes();

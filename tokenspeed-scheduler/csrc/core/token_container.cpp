@@ -21,6 +21,9 @@
 #include "core/token_container.h"
 
 #include <cstddef>
+#include <cstdint>
+
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -30,20 +33,24 @@ void TokenContainer::Extend(const std::vector<std::int32_t>& new_tokens) {
 
 std::vector<std::span<const std::int32_t>> TokenContainer::FullPrefixPages(std::int32_t prefix_granularity,
                                                                            bool except_last) const {
-    std::vector<std::span<const std::int32_t>> result;
-
     if (tokens_.empty()) {
-        return result;
+        return {};
     }
+    const std::int32_t token_size = except_last ? Size() - 1 : Size();
+    return PrefixPages(prefix_granularity, 0, token_size / prefix_granularity);
+}
 
-    std::int32_t token_size = except_last ? tokens_.size() - 1 : tokens_.size();
-    std::size_t num_full_pages = token_size / prefix_granularity;
-    result.reserve(num_full_pages);
-    for (std::size_t i = 0; i < num_full_pages; ++i) {
-        std::size_t start = i * prefix_granularity;
-        result.emplace_back(tokens_.data() + start, prefix_granularity);
+std::vector<std::span<const std::int32_t>> TokenContainer::PrefixPages(std::int32_t prefix_granularity,
+                                                                       std::int32_t first_page,
+                                                                       std::int32_t past_end_page) const {
+    _assert(0 <= first_page && first_page <= past_end_page, "prefix page range is inverted");
+    _assert(static_cast<std::int64_t>(past_end_page) * prefix_granularity <= Size(), "prefix pages must be complete");
+    std::vector<std::span<const std::int32_t>> result;
+    result.reserve(static_cast<std::size_t>(past_end_page - first_page));
+    for (std::int32_t page = first_page; page < past_end_page; ++page) {
+        result.emplace_back(tokens_.data() + static_cast<std::size_t>(page) * prefix_granularity,
+                            static_cast<std::size_t>(prefix_granularity));
     }
-
     return result;
 }
 

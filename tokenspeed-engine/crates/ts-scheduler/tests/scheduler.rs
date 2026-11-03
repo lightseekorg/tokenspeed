@@ -581,14 +581,14 @@ fn session_demotion_preserves_active_pages_and_reusable_cache() {
     scheduler
         .advance(&[event(ForwardEventKind::ExtendResult, "tagged", vec![42])])
         .unwrap();
-    let before = scheduler.sizes().active_lcm_blocks;
+    let before = scheduler.active_lcm_blocks();
     scheduler.demote_session("session-a", true);
-    assert_eq!(scheduler.sizes().active_lcm_blocks, before);
+    assert_eq!(scheduler.active_lcm_blocks(), before);
     scheduler
         .advance(&[event(ForwardEventKind::Finish, "tagged", vec![])])
         .unwrap();
     scheduler.next_execution_plan();
-    assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
+    assert_eq!(scheduler.active_lcm_blocks(), 0);
     // Finish publishes the pages at their already-demoted session's age.
     assert_eq!(scheduler.demote_session("session-a", true), 0);
     let mut resumed = spec("resumed", (1..=40).collect());
@@ -617,7 +617,7 @@ fn session_demotion_counts_only_newly_aged_idle_pages() {
         .advance(&[event(ForwardEventKind::Finish, "tagged", vec![])])
         .unwrap();
     scheduler.next_execution_plan();
-    assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
+    assert_eq!(scheduler.active_lcm_blocks(), 0);
     assert!(scheduler.demote_session("session-a", false) > 0);
     assert_eq!(scheduler.demote_session("session-a", false), 0);
     assert_eq!(scheduler.demote_session("session-a", true), 0);

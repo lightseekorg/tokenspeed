@@ -894,6 +894,14 @@ is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
 
+Set `TOKENSPEED_VALIDATE_PAGE_IDS=1` to check every page ID in each forward's
+block tables against its cache group's page range before the forward runs.
+The structural checks (cache groups, dtype, shape, rows) always run; the scan
+reads every ID of every scheduled row, which at long contexts costs as much as
+the rest of the forward thread's table packing, so it is off by default.
+Enable it while debugging a page-table fault. The model executor reads it once
+at startup. Prefill-graph capture scans the tables it builds either way.
+
 To send observations to another monitoring system, install and select a
 [metric output plugin](../metrics-plugins.md). Selecting only external outputs
 does not start a Prometheus endpoint.
