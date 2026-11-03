@@ -205,6 +205,21 @@ def test_settings_freeze_namespace_inputs_before_weight_version_switch(construct
         executor.close(5.0)
 
 
+def test_settings_separate_yarn_frequency_devices(construction):
+    args, model, _, factory_kwargs = construction
+    args.yarn_ramp_mask_device = "cpu"
+    args.yarn_frequency_device = "cpu"
+    cpu = l3_settings(args, model, None, **factory_kwargs)
+    args.yarn_frequency_device = "cuda"
+    cuda = l3_settings(args, model, None, **factory_kwargs)
+    assert cpu.deployment_id != cuda.deployment_id
+    args.yarn_frequency_device = "cpu"
+    assert (
+        l3_settings(args, model, None, **factory_kwargs).deployment_id
+        == cpu.deployment_id
+    )
+
+
 def test_settings_include_the_draft_checkpoint_identity(construction, tmp_path):
     args, model, _, factory_kwargs = construction
     path = tmp_path / "draft"

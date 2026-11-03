@@ -71,6 +71,16 @@ def test_gather_dispatches_on_the_order():
     torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_megatron_order_preserves_positive_zero(dtype):
+    logits = torch.full((2, VOCAB), -float("inf"), dtype=dtype)
+    tokens = torch.tensor([3, MEGATRON_VOCAB_BLOCK + 3], dtype=torch.int32)
+    logits.scatter_(1, tokens.long()[:, None], 0)
+    got = gather_token_logprobs(logits, tokens, logprob_order="megatron")
+    expected = torch.zeros(2, dtype=torch.float32)
+    assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
+
+
 def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
     def fake_gumbel(logits, req_pool_indices, *pools, min_p_pool=None, **_):
         out = pools[-1]
@@ -239,7 +249,8 @@ def test_megatron_order_dispatches_to_a_registered_vendor_leaf():
     for block in range(1, partials.shape[1]):
         sum_exp = sum_exp + partials[:, block]
     target = shifted.gather(1, tokens.long()[:, None]).squeeze(1)
-    assert torch.equal(got, -(torch.log(sum_exp) - target))
+    expected = target - torch.log(sum_exp)
+    assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
     # The torch order never consults the leaf.
     gather_token_logprobs(logits, tokens, logprob_order="torch")
     assert len(calls) == 1
