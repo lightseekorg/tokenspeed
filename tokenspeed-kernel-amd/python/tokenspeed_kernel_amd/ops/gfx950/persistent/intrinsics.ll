@@ -184,3 +184,12 @@ join:
   %r = phi i64 [ %old, %do ], [ undef, %entry ]
   ret i64 %r
 }
+
+; Acquire for one wave: an IR ordering point (loads after it cannot move
+; above it), with no instruction on gfx950. It replaces the workgroup
+; barrier after a per-wave poll whose result only this wave uses.
+define i32 @__tokenspeed_persistent_wave_acquire() alwaysinline {
+entry:
+  fence syncscope("wavefront") acquire
+  ret i32 0
+}
