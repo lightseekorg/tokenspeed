@@ -18,8 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerics of the native decoder layer's front bodies on gfx950, each as a
-test kernel (native_body_helpers.py) against an FP32 reference."""
+"""Numerics of the native decoder layer's front bodies on gfx950: the o_proj
+sender and the router / pooler K-part consumers, each as a test kernel
+(native_body_helpers.py) against an FP32 reference."""
 
 from __future__ import annotations
 
@@ -30,7 +31,17 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
-from native_body_helpers import sender_kernel  # noqa: E402
+from native_body_helpers import (  # noqa: E402
+    kpart_pooler_kernel,
+    kpart_router_kernel,
+    sender_kernel,
+)
+
+WIDTH = 8192
+PRODUCERS = 64
+PARTS = 8
+POST_EPS = 1e-6
+PRE_EPS = 1e-5
 
 
 @pytest.mark.parametrize("rows", [8, 16])
@@ -54,3 +65,70 @@ def test_sender_matches_fp32_reference(rows: int) -> None:
         w, x, again, rows, K=k, OUTPUTS=outputs, VECTOR=2, num_warps=8
     )
     assert torch.equal(again, out)
+
+
+def _boundary_inputs(rows: int, seed: int) -> dict:
+    """The attention boundary as the K-part consumers see it: the branch b,
+    each producer's four partial sums of its column block, h and the norms'
+    vectors."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    b = torch.randn(rows, WIDTH, device="cuda", generator=g).to(torch.bfloat16)
+    h = torch.randn(rows, WIDTH, device="cuda", generator=g) * 4
+    alpha = torch.rand(WIDTH, device="cuda", generator=g) + 0.5
+    beta = torch.rand(WIDTH, device="cuda", generator=g) + 0.5
+    post = (torch.rand(WIDTH, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    pre = (torch.rand(WIDTH, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    bp = b.float() * post.float()
+    blocks = lambda v: v.view(rows, PRODUCERS, WIDTH // PRODUCERS).sum(-1)  # noqa: E731
+    ah, bb = alpha * h, beta * bp
+    sums = torch.stack(
+        [blocks(bp * bp), blocks(ah * bb), blocks(ah * ah), blocks(bb * bb)], -1
+    ).contiguous()
+    inv1 = torch.rsqrt((bp * bp).sum(-1, keepdim=True) / WIDTH + POST_EPS)
+    hp = beta * bp * inv1 + alpha * h
+    inv2 = torch.rsqrt((hp * hp).sum(-1, keepdim=True) / WIDTH + PRE_EPS)
+    x = hp * inv2 * pre.float()
+    return dict(args=(b, sums, h.contiguous(), alpha, beta, post, pre), x=x, rows=rows)
+
+
+@pytest.mark.parametrize("rows", [8, 16])
+def test_kpart_pooler_matches_fp32_reference(rows: int) -> None:
+    """The pooler K-part partials, summed over the parts, equal the pooler
+    applied to the deferred-norm x (BF16-rounded), within the K split's
+    rounding."""
+    inputs = _boundary_inputs(rows, 3 + rows)
+    outputs, tile_rows = 512, 64
+    w = torch.randn(outputs, WIDTH, device="cuda", dtype=torch.bfloat16) * 0.02
+    parts = torch.zeros(PARTS * rows * outputs, device="cuda", dtype=torch.int64)
+    kpart_pooler_kernel[(outputs // tile_rows * PARTS,)](
+        *inputs["args"], w, parts, 5, rows, WIDTH=WIDTH, OUTPUTS=outputs,
+        ROWS=tile_rows, PRODUCERS=PRODUCERS, PARTS=PARTS, POST_EPS=POST_EPS,
+        PRE_EPS=PRE_EPS, num_warps=8,
+    )  # fmt: skip
+    words = parts.view(PARTS, rows, outputs)
+    assert bool(((words >> 32) == 5).all())
+    actual = (words & 0xFFFFFFFF).to(torch.int32).view(torch.float32).sum(0)
+    expected = inputs["x"].to(torch.bfloat16).float() @ w.float().T
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("rows", [8, 16])
+def test_kpart_router_matches_fp32_reference(rows: int) -> None:
+    """The router K-part logits (FP32 weight as BF16 hi + lo, FP32 x as hi +
+    lo) match the FP32 router on the FP32 x to ~1e-5 relative."""
+    inputs = _boundary_inputs(rows, 30 + rows)
+    experts = 256
+    router = torch.randn(experts, WIDTH, device="cuda") * 0.02
+    hi = router.to(torch.bfloat16)
+    lo = (router - hi.float()).to(torch.bfloat16)
+    parts = torch.zeros(PARTS * rows * experts, device="cuda", dtype=torch.int64)
+    kpart_router_kernel[(experts // 16 * PARTS,)](
+        *inputs["args"], hi, lo, parts, 9, rows, WIDTH=WIDTH, EXPERTS=experts,
+        PRODUCERS=PRODUCERS, PARTS=PARTS, POST_EPS=POST_EPS, PRE_EPS=PRE_EPS,
+        num_warps=8,
+    )  # fmt: skip
+    words = parts.view(PARTS, rows, experts)
+    assert bool(((words >> 32) == 9).all())
+    actual = (words & 0xFFFFFFFF).to(torch.int32).view(torch.float32).sum(0)
+    expected = (inputs["x"].double() @ router.double().T).float()
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)

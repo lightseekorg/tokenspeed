@@ -35,9 +35,15 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     mha_decode_sliding_split_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
+    gemv_a16w16_splitk_hi_lo_sums_gfx950,
+    gemv_a16w16_splitk_publish_gfx950,
     gemv_a16w16_splitk_wave_sums_gfx950,
     gemv_a16w16_splitk_weights_gfx950,
     gemv_a16w16_splitk_x_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.layernorm.deferred import (
+    deferred_norm_rows_gfx950,
+    deferred_norm_scales_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     ERROR_ABORT,
@@ -225,4 +231,125 @@ def sender_kernel(
         sums.to(gl.bfloat16),
         out_ptr,
         (block * 16 + token[:, None]) * OUTPUTS + column[None, :],
+    )
+
+
+@gluon.jit
+def _kpart_x(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    task,
+    M,
+    WIDTH: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """A K-part consumer's x (FP32 B operand) from plain stand-ins of what the
+    layer polls: the branch rows ``b`` (BF16 ``[M, WIDTH]``) and the
+    producers' sums (FP32 ``[M, PRODUCERS, 4]``)."""
+    WAVES: gl.constexpr = gl.num_warps()
+    sums_l: gl.constexpr = gl.BlockedLayout(
+        [16 // WAVES, 1, 4], [1, 64, 1], [WAVES, 1, 1], [2, 1, 0]
+    )
+    t = gl.arange(0, 16, gl.SliceLayout(1, gl.SliceLayout(2, sums_l)))
+    p = gl.arange(0, PRODUCERS, gl.SliceLayout(0, gl.SliceLayout(2, sums_l)))
+    w = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(1, sums_l)))
+    t = gl.minimum(t, M - 1)
+    sums = gl.amd.cdna4.buffer_load(
+        sums_ptr,
+        (t[:, None, None] * PRODUCERS + p[None, :, None]) * 4 + w[None, None, :],
+    )
+    inv1, inv2 = deferred_norm_scales_gfx950(sums, WIDTH, POST_EPS, PRE_EPS)
+    b = gemv_a16w16_splitk_x_gfx950(b_ptr, WIDTH, task, M, WIDTH, PARTS, GROUPS, "")
+    h = gemv_a16w16_splitk_x_gfx950(h_ptr, WIDTH, task, M, WIDTH, PARTS, GROUPS, "")
+    alpha = gemv_a16w16_splitk_x_gfx950(alpha_ptr, 0, task, M, WIDTH, PARTS, GROUPS, "")
+    beta = gemv_a16w16_splitk_x_gfx950(beta_ptr, 0, task, M, WIDTH, PARTS, GROUPS, "")
+    post = gemv_a16w16_splitk_x_gfx950(post_ptr, 0, task, M, WIDTH, PARTS, GROUPS, "")
+    pre = gemv_a16w16_splitk_x_gfx950(pre_ptr, 0, task, M, WIDTH, PARTS, GROUPS, "")
+    token_l: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, b.type.layout))
+    inv1 = gl.convert_layout(inv1, token_l)[None, None, :]
+    inv2 = gl.convert_layout(inv2, token_l)[None, None, :]
+    return deferred_norm_rows_gfx950(b, h, alpha, beta, post, pre, inv1, inv2)
+
+
+@gluon.jit
+def kpart_router_kernel(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    hi_ptr,
+    lo_ptr,
+    part_ptr,
+    tag,
+    M,
+    WIDTH: gl.constexpr,
+    EXPERTS: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    PARTS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """The router K-part task (RTR): 16 experts x WIDTH / PARTS of the FP32
+    router as BF16 hi + lo, over the FP32 x this K part builds."""
+    task = gl.program_id(0)
+    GROUPS: gl.constexpr = EXPERTS // 16
+    hi = gemv_a16w16_splitk_weights_gfx950(hi_ptr, task, WIDTH, 16, PARTS, GROUPS)
+    lo = gemv_a16w16_splitk_weights_gfx950(lo_ptr, task, WIDTH, 16, PARTS, GROUPS)
+    _, x = _kpart_x(
+        b_ptr, sums_ptr, h_ptr, alpha_ptr, beta_ptr, post_ptr, pre_ptr, task, M,
+        WIDTH, PRODUCERS, PARTS, GROUPS, POST_EPS, PRE_EPS,
+    )  # fmt: skip
+    layout: gl.constexpr = sums_layout(gl.num_warps(), 16, 2)
+    logits = gemv_a16w16_splitk_hi_lo_sums_gfx950(hi, lo, x, layout)
+    gemv_a16w16_splitk_publish_gfx950(
+        logits, part_ptr, tag, (task % GROUPS) * 16, task // GROUPS, M, EXPERTS, ".wt"
+    )
+
+
+@gluon.jit
+def kpart_pooler_kernel(
+    b_ptr,
+    sums_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    pre_ptr,
+    w_ptr,
+    part_ptr,
+    tag,
+    M,
+    WIDTH: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    ROWS: gl.constexpr,
+    PRODUCERS: gl.constexpr,
+    PARTS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+):
+    """The pooler K-part task (POOL): ``ROWS`` pooled columns x WIDTH / PARTS
+    of the BF16 pooler over the BF16-rounded x this K part builds."""
+    task = gl.program_id(0)
+    GROUPS: gl.constexpr = OUTPUTS // ROWS
+    tiles = gemv_a16w16_splitk_weights_gfx950(w_ptr, task, WIDTH, ROWS, PARTS, GROUPS)
+    _, x = _kpart_x(
+        b_ptr, sums_ptr, h_ptr, alpha_ptr, beta_ptr, post_ptr, pre_ptr, task, M,
+        WIDTH, PRODUCERS, PARTS, GROUPS, POST_EPS, PRE_EPS,
+    )  # fmt: skip
+    layout: gl.constexpr = sums_layout(gl.num_warps(), ROWS, 2)
+    pooled = gemv_a16w16_splitk_wave_sums_gfx950(tiles, x.to(gl.bfloat16), layout)
+    gemv_a16w16_splitk_publish_gfx950(
+        pooled, part_ptr, tag, (task % GROUPS) * ROWS, task // GROUPS, M, OUTPUTS, ".wt"
     )

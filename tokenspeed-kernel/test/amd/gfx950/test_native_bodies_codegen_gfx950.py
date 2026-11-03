@@ -36,6 +36,8 @@ pytest.importorskip("tokenspeed_kernel_amd")
 from asm_checks import instruction_lines  # noqa: E402
 from native_body_helpers import (  # noqa: E402
     compile_gfx950,
+    kpart_pooler_kernel,
+    kpart_router_kernel,
     sender_kernel,
     split_records_kernel,
 )
@@ -160,3 +162,51 @@ def test_sender_sums_waves_with_wide_lds_reads():
     assert sum(1 for line in code if line.startswith("v_mfma")) == 16
     assert sum(1 for line in code if line == "s_barrier") == 1
     assert _metadata(assembly, "private_segment_fixed_size") == 0
+
+
+@pytest.mark.parametrize(
+    "kernel,extra,constexprs,max_vgprs",
+    [
+        (
+            kpart_router_kernel,
+            {"hi_ptr": "*bf16", "lo_ptr": "*bf16"},
+            dict(EXPERTS=256),
+            192,
+        ),
+        (
+            kpart_pooler_kernel,
+            {"w_ptr": "*bf16"},
+            dict(OUTPUTS=512, ROWS=64),
+            224,
+        ),
+    ],
+    ids=["router", "pooler"],
+)
+def test_kpart_consumers_fit_their_register_budget(
+    kernel, extra, constexprs, max_vgprs
+):
+    """The router and pooler K-part tasks hold their weights and build x
+    from the deferred norm within NATIVE-DESIGN's per-role budget, with no
+    scratch (a spill would drain the resident weights)."""
+    signature = {
+        "b_ptr": "*bf16",
+        "sums_ptr": "*fp32",
+        "h_ptr": "*fp32",
+        "alpha_ptr": "*fp32",
+        "beta_ptr": "*fp32",
+        "post_ptr": "*bf16",
+        "pre_ptr": "*bf16",
+        **extra,
+        "part_ptr": "*i64",
+        "tag": "i32",
+        "M": "i32",
+    }
+    constexprs = dict(
+        WIDTH=8192, PRODUCERS=64, PARTS=8, POST_EPS=1e-6, PRE_EPS=1e-5, **constexprs
+    )
+    assembly = compile_gfx950(kernel, signature, constexprs, num_warps=8).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    assert _metadata(assembly, "vgpr_count") <= max_vgprs
+    code = instruction_lines(assembly)
+    stores = [line for line in code if line.startswith("buffer_store")]
+    assert stores and all(line.endswith("sc0 sc1") for line in stores), stores
