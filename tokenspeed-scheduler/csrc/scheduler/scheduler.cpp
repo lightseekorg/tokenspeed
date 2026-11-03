@@ -498,6 +498,7 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
+        .device_only_entries_not_written_back = coordinator_.DeviceOnlyEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };

@@ -87,6 +87,9 @@ struct HostCacheStats {
     // (SchedulerConfig::demote_superseded_state_checkpoints), never written
     // back; counted under the eviction's cause.
     std::uint64_t demoted_entries_not_written_back{0};
+    // What they dropped the same way because it never reaches Host: a
+    // sliding group's Device-only slid-out pages.
+    std::uint64_t device_only_entries_not_written_back{0};
     CacheCoordinator::DeviceEvictionStats device_evictions;
     // CacheCoordinator::CheckpointResumeGaps, the gaps an admission resumed
     // a State checkpoint after, on either tier.

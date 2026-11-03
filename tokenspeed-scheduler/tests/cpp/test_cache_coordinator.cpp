@@ -387,12 +387,15 @@ TEST(CacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
                                 /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 0)));
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 1)));
+    // The sliding group publishes the page's four blocks under offsets 0..3.
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 0)));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 1)));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 2)));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 3)));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 4)));
     coordinator.Free(tables);
 
+    // A hit claims only the blocks holding the window [4, 8) behind 8.
     const CacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
     EXPECT_EQ(probe.device.num_common_tokens, 8);
     ASSERT_EQ(probe.device.per_group[0].hits.size(), 1u);
@@ -5808,7 +5811,9 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
     coord.Free(tables);
 }
 
-TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
+// Every full page publishes, including page 0, which lies below the window
+// [6, 14) behind the endpoint.
+TEST(SwaRegistrationTest, UnalignedEndpointPublishesEveryFullPage) {
     BlockPool pool(32, {1});
     std::vector<CacheGroupSpec> specs = {{.attn_kind = AttnKind::kSlidingWindow,
                                           .sliding_window = 9,
@@ -5835,10 +5840,124 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                             /*copy_in_point=*/std::nullopt, std::nullopt,
                             /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
-    EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[2], 0)));
+    // Page 0 lies below the window [6, 14): a Device-only entry that never
+    // streams or reaches a Host store. Pages 1 and 2 hold the window.
+    EXPECT_FALSE(coord.GroupPrefixIndex(0).HostEligible(pool, Key(hashes[0], 0)));
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).HostEligible(pool, Key(hashes[1], 0)));
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).HostEligible(pool, Key(hashes[2], 0)));
     coord.Free(tables);
+}
+
+// A Device-only entry's key is never on Host: a Host copy that counted as
+// backed by such an entry could be evicted as a duplicate, and the Device
+// entry then leaves unwritten, losing the page on both tiers. Window 4 behind
+// the endpoint at 8 is [5, 8), block 1, so page 0 is the slid-out page.
+class SlidOutPageHostTest : public ::testing::Test {
+protected:
+    CacheCoordinator MakeSlidingCoordinator(bool stream_device_cache_to_host) {
+        const std::vector<CacheGroupSpec> specs = {{.attn_kind = AttnKind::kSlidingWindow,
+                                                    .sliding_window = 4,
+                                                    .cache_blocks_per_lcm_block = 1,
+                                                    .block_granularity = 4}};
+        return MakeCoordinator(specs, 4, pool_, /*enable_l3_storage=*/false, &host_pool_, /*snapshot_pool=*/nullptr,
+                               stream_device_cache_to_host, /*write_back_evictions=*/false,
+                               /*checkpoint_retention_requests=*/0);
+    }
+    static void Publish(CacheCoordinator& coord, std::vector<BlockTable>& tables,
+                        const std::vector<std::string>& hashes) {
+        const auto tokens = static_cast<std::int32_t>(hashes.size()) * 4;
+        ASSERT_TRUE(AdmitForTest(coord, tables, tokens));
+        CacheCompletedBlocksForTest(coord, tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coord),
+                                    /*first_new_prefix_page=*/0, tokens, CacheBoundaryKind::kEndpoint,
+                                    /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    }
+    void CacheOnHost(CacheCoordinator& coord, const CacheKey& key) {
+        CacheBlockRef host_block = host_pool_.AcquireBlock(0);
+        coord.CacheHostBlock(host_block, key, std::nullopt);
+    }
+
+    BlockPool pool_{32, {1}};
+    BlockPool host_pool_{8, {1}};
+    const std::vector<std::string> hashes_ = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
+};
+
+TEST_F(SlidOutPageHostTest, ASlidOutPageWhoseKeyHostHoldsStaysHostEligible) {
+    CacheCoordinator coord = MakeSlidingCoordinator(/*stream_device_cache_to_host=*/false);
+    CacheOnHost(coord, Key(hashes_[0], 0));
+    std::vector<BlockTable> tables(coord.NumGroups());
+    Publish(coord, tables, hashes_);
+    ASSERT_TRUE(coord.GroupPrefixIndex(0).Contains(pool_, Key(hashes_[0], 0)));
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).HostEligible(pool_, Key(hashes_[0], 0)));
+    coord.Free(tables);
+}
+
+TEST_F(SlidOutPageHostTest, HostCachingASlidOutPageLiftsItsDeviceEntry) {
+    CacheCoordinator coord = MakeSlidingCoordinator(/*stream_device_cache_to_host=*/false);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    Publish(coord, tables, hashes_);
+    ASSERT_FALSE(coord.GroupPrefixIndex(0).HostEligible(pool_, Key(hashes_[0], 0)));
+    // An L3 GET brings the key to Host.
+    CacheOnHost(coord, Key(hashes_[0], 0));
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).HostEligible(pool_, Key(hashes_[0], 0)));
+    coord.Free(tables);
+}
+
+// A later publication whose window holds the slid-out page lifts it; under
+// write-through it then streams like a page published Host-eligible.
+TEST_F(SlidOutPageHostTest, ALiftedSlidOutPageStreamsToHost) {
+    CacheCoordinator coord = MakeSlidingCoordinator(/*stream_device_cache_to_host=*/true);
+    std::vector<BlockTable> first(coord.NumGroups());
+    Publish(coord, first, hashes_);
+    const auto streams = [&](const CacheKey& key) {
+        return std::ranges::any_of(coord.TakePendingStores(),
+                                   [&](const CacheCoordinator::StoreCandidate& store) { return store.key == key; });
+    };
+    ASSERT_FALSE(streams(Key(hashes_[0], 0))) << "a Device-only page does not stream";
+    // A one-page prompt: the window behind 4 is [1, 4), block 0.
+    std::vector<BlockTable> second(coord.NumGroups());
+    Publish(coord, second, {hashes_[0]});
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).HostEligible(pool_, Key(hashes_[0], 0)));
+    EXPECT_TRUE(streams(Key(hashes_[0], 0)));
+    coord.Free(second);
+    coord.Free(first);
+}
+
+// The retraction image's view of a publication (PublishedDataSlotsAfter)
+// matches what the publication registers: a slid-out page that dedupes onto a
+// Host-eligible entry is a published slot.
+TEST_F(SlidOutPageHostTest, ImageCountsASlidOutPageDedupedOntoAWindowAsPublished) {
+    CacheCoordinator coord = MakeSlidingCoordinator(/*stream_device_cache_to_host=*/false);
+    std::vector<BlockTable> publisher(coord.NumGroups());
+    Publish(coord, publisher, {hashes_[0]});
+    ASSERT_TRUE(coord.GroupPrefixIndex(0).HostEligible(pool_, Key(hashes_[0], 0)));
+    std::vector<BlockTable> victim(coord.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coord, victim, /*num_tokens=*/8));
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = hashes_,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
+            },
+        .num_computed_tokens = 8,
+    };
+    const std::vector<std::vector<ImageSlot>> probed = coord.PublishedDataSlotsAfter(victim, 8, progress);
+    coord.CacheCompletedBlocks(victim, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coord));
+    const std::vector<std::vector<ImageSlot>> published = coord.PublishedDataSlots(victim, 8);
+    const auto slots = [](const std::vector<ImageSlot>& image) {
+        std::vector<std::int32_t> out;
+        for (const ImageSlot& slot : image) {
+            out.push_back(slot.slot_index);
+        }
+        return out;
+    };
+    EXPECT_EQ(slots(probed[0]), (std::vector<std::int32_t>{0, 1}));
+    EXPECT_EQ(slots(probed[0]), slots(published[0]));
+    coord.Free(victim);
+    coord.Free(publisher);
 }
 
 // The window behind an in-forward State checkpoint is published as an
@@ -7692,11 +7811,11 @@ TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtThe
     EXPECT_EQ(probe.device.tail->per_group[2].hits, (std::vector<std::uint8_t>{1, 1}));
 
     // Below the tail the page boundary 8 is not resumable for the sliding
-    // group, and a sliding group publishes only its newest boundary's
-    // lookback, so nothing below 8 is resumable either.
+    // group; the probe falls back to the page boundary 4, whose lookback
+    // block [2, 4) page 0 published.
     const CacheCoordinator::PrefixProbe below = coordinator_.ProbePromptPrefix(
         CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 10});
-    EXPECT_EQ(below.device.num_common_tokens, 0);
+    EXPECT_EQ(below.device.num_common_tokens, 4);
 }
 
 // Oracle: whatever the page size P, the block size g and the window W, a
@@ -7947,6 +8066,8 @@ TEST_F(TailCapWriteBackTest, ACappedTailLeftoverIsCollectedOnceUnpinned) {
 // The same leftover, never collected: an admission takes it as the oldest
 // victim. No probe enumerates a tail without its hint, so it is not written
 // back (a dead entry, not written back); the next victim, the second tail, is.
+// A Device-only sliding page below the window, never hit, goes first and is
+// not written back either.
 TEST_F(TailCapWriteBackTest, ACappedTailIsNotWrittenBack) {
     CacheBlockRef pinned;
     const std::vector<TailPublication> tails = PublishNineTails([&](const std::vector<TailPublication>& published) {
@@ -7961,7 +8082,8 @@ TEST_F(TailCapWriteBackTest, ACappedTailIsNotWrittenBack) {
     coordinator_.Free(tables);
 
     EXPECT_FALSE(Cached(0, tails.front().hash, 0));
-    EXPECT_EQ(coordinator_.DeadEntriesNotWrittenBack(), 1u);
+    EXPECT_EQ(coordinator_.DeadEntriesNotWrittenBack(), 1u) << "the capped tail";
+    EXPECT_EQ(coordinator_.DeviceOnlyEntriesNotWrittenBack(), 1u) << "a Device-only page";
     std::vector<CacheKey> recorded;
     for (CacheCoordinator::EvictedSegment& segment : coordinator_.TakeEvictedSegments()) {
         for (const CacheCoordinator::EvictedBlock& member : segment.members) {
@@ -9756,8 +9878,9 @@ TEST(SegmentEvictionWithoutStateTest, ASetAbsorbsTheSetsBelowIt) {
 
 // A sliding window's block only shortens which boundaries its prefix resumes
 // at, so it leaves alone even when evicting by segments: the finish published
-// the two window blocks behind 16 (window 8), the oldest candidates; the fresh
-// request's two blocks take their parents, and no Full page goes.
+// the two window blocks behind 16 (window 8) and, Device-only, the two pages
+// below the window; sliding blocks are the oldest candidates, the fresh
+// request's two blocks take the parents of two of them, and no Full page goes.
 TEST(SegmentEvictionWithoutStateTest, SlidingWindowBlocksStillLeaveAlone) {
     constexpr std::int32_t kP = 4;
     BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
@@ -9780,14 +9903,14 @@ TEST(SegmentEvictionWithoutStateTest, SlidingWindowBlocksStillLeaveAlone) {
                                 CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                 /*publish_state=*/false);
     coordinator.Free(tables);
-    ASSERT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 2);
+    ASSERT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 4);
     const std::vector<CacheBlockRef> held = pool.AcquireBlocks(0, pool.NumEmptyLcmBlocks());
 
     std::vector<BlockTable> next(2);
     ASSERT_TRUE(AdmitForTest(coordinator, next, kP));
-    EXPECT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 0);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 2);
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 4);
-    EXPECT_EQ(coordinator.DeviceEvictions().admission.blocks, 2u) << "the two window blocks";
+    EXPECT_EQ(coordinator.DeviceEvictions().admission.blocks, 2u) << "two sliding blocks";
     coordinator.Free(next);
 }
 
@@ -9835,6 +9958,8 @@ TEST(SegmentEvictionWithoutAClosedGroupTest, TheClimbStopsBelowAPageTheDeviceDoe
 
 // The same over the pages a sliding window left behind: a window of two pages
 // keeps blocks at the last two of four pages, over the checkpoint at 16. The
+// publication starts at page 2, as if the Device-only pages below the window
+// had been evicted since, so the Device holds nothing at pages 0 and 1. The
 // fresh request needs three parents, all held but those the cache fills: the
 // checkpoint's segment climbs to the window's first page and no further, and
 // takes in the two window blocks, chosen alone before it.
@@ -9856,7 +9981,7 @@ TEST(SegmentEvictionWithoutAClosedGroupTest, TheClimbStopsBelowAPageTheWindowLef
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, 4 * kP));
     CacheCompletedBlocksForTest(coordinator, tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4 * kP,
+                                /*first_new_prefix_page=*/2, /*num_computed_tokens=*/4 * kP,
                                 CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                 /*publish_state=*/true);
     coordinator.Free(tables);
@@ -14249,8 +14374,9 @@ TEST(RestoreWriteBackTest, ARestoreDropsASupersededInputRatherThanWritingItBack)
         EXPECT_FALSE(transfers.StartEvictionStores().has_value()) << "nothing was recorded";
         EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
         const TierTransferManager::WriteBackStats& stats = transfers.WriteBackStatsFor(HostStoreCause::kEviction);
-        std::uint64_t outcomes =
-            stats.host_cached + stats.in_flight + stats.no_placement + coordinator.DeadEntriesNotWrittenBack();
+        std::uint64_t outcomes = stats.host_cached + stats.in_flight + stats.no_placement +
+                                 coordinator.DeadEntriesNotWrittenBack() +
+                                 coordinator.DeviceOnlyEntriesNotWrittenBack();
         for (const std::uint64_t blocks : stats.blocks) {
             outcomes += blocks;
         }
@@ -16553,8 +16679,8 @@ TEST_P(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
     // entry evicted is counted as request reclaim, recorded nowhere.)
     const TierTransferManager::WriteBackStats& stats = transfers.WriteBackStatsFor(HostStoreCause::kEviction);
     const CacheCoordinator::DeviceEvictionStats& device_evictions = coordinator.DeviceEvictions();
-    std::uint64_t outcomes =
-        stats.host_cached + stats.in_flight + stats.no_placement + coordinator.DeadEntriesNotWrittenBack();
+    std::uint64_t outcomes = stats.host_cached + stats.in_flight + stats.no_placement +
+                             coordinator.DeadEntriesNotWrittenBack() + coordinator.DeviceOnlyEntriesNotWrittenBack();
     std::uint64_t copied = 0;
     for (const std::uint64_t blocks : stats.blocks) {
         outcomes += blocks;
