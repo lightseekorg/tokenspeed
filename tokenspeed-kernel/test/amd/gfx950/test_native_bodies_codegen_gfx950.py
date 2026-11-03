@@ -47,6 +47,7 @@ from native_body_helpers import (  # noqa: E402
     kpart_router_steps_kernel,
     qkv_task_kernel,
     qkv_task_steps_kernel,
+    router_weights_paced_kernel,
     sender_kernel,
     sender_sums_kernel,
     split_records_kernel,
@@ -522,3 +523,30 @@ def test_full_records_wait_only_for_the_partial_and_merge_issue_first():
     run = reads[: 2 * (16 + 16)]
     assert sum(code[i].startswith("buffer_load_dwordx4") for i in run) == 32
     assert not [line for line in code[run[0] : run[-1]] if "vmcnt" in line]
+
+
+@pytest.mark.parametrize("loads", [1, 4])
+def test_router_weights_pace_by_k_step(loads: int):
+    """The router task's 8 step loads per wave (hi then lo, one stream) keep
+    at most ``loads`` in flight: before each load past the first ``loads``
+    the wave waits until ``loads - 1`` remain (a window of one: none)."""
+    assembly = compile_gfx950(
+        router_weights_paced_kernel,
+        {"hi_ptr": "*bf16", "lo_ptr": "*bf16", "out_ptr": "*fp32"},
+        dict(LOADS=loads),
+        num_warps=8,
+        **persistent_compile_options(),
+    ).asm["amdgcn"]
+    code = instruction_lines(assembly)
+    weights = [
+        i
+        for i, line in enumerate(code)
+        if line.startswith("buffer_load_dwordx4") and line.endswith("sc0 nt")
+    ]
+    assert len(weights) == 8
+    waits = [
+        code[i]
+        for i in range(weights[0], weights[-1])
+        if code[i].startswith("s_waitcnt") and "vmcnt" in code[i]
+    ]
+    assert waits == [f"s_waitcnt vmcnt({loads - 1})"] * (8 - loads), waits

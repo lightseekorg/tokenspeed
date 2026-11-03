@@ -108,7 +108,10 @@ DEFAULT_PLAN_FIELDS = dict(
     tail_num=1,
     tail_den=2,
     num_stages=2,
-    qkv_window=4,
+    # Two 16 KB QKV tiles per CU in flight: the 128 workgroups streaming
+    # theirs while the tail exchanges run stay near 3.3 TB/s, below the
+    # ~4.5 TB/s where polls slow down (four tiles would be ~6).
+    qkv_window=2,
     # Who merges a sliding block's splits: split 0 ("designated") or every
     # split its share of the rows ("spread").
     att_merge="designated",
