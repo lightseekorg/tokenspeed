@@ -1272,6 +1272,7 @@ class MuseIrisState:
                 + self.all_reduce.rank_in_group * local_width * local.element_size()
             ),
             num_warps=8,
+            WAIT_STORES=self._arch.wait_stores,
         )
         return packed, scales
 

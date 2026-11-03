@@ -259,3 +259,59 @@ def test_iris_pull_twoshot_stores_reach_l2_before_release(exit_barrier):
     # consumed before the barrier; its local output stores need not reach L2.
     assert len(releases) == 2 + exit_barrier, releases
     assert all(waited for _, waited in releases[:2]), releases
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 codegen")
+def test_iris_allgather_rmsnorm_mxfp4_stores_reach_l2_before_release():
+    """Every subgroup's staged shard reaches L2 before the readiness release.
+
+    At TP4 the 1024-feature shard spans two of the eight subgroups, and the
+    release run by one thread waits only for its own subgroup's stores.
+    Compile without launching and check that, on every path, each subgroup
+    runs s_waitcnt vmcnt(0) before the barrier preceding the release. The
+    later completion release only reports returned peer reads.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_fused_pull_allgather_rmsnorm_mxfp4 as fn,
+    )
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+    )
+    from utils import vmcnt_zero_before_barrier
+
+    pointers = ("local_input", "symmetric_input", "weight", "ready_flags")
+    signature = {name: "*bf16" for name in pointers[:3]}
+    signature.update(packed_output="*u8", scale_output="*u8", ready_flags="*i32")
+    signature.update(heaps=("i64",) * 4)
+    signature.update(scale_stride_linear="i32", scale_stride_mblock="i32")
+    constexprs = {
+        "rank": 1,
+        "local_width": 1024,
+        "total_width": 4096,
+        "eps": 1e-6,
+        "weight_offset": 1.0,
+        "block_k": 4096,
+        "input_published": False,
+        "num_warps": 8,
+        "WAIT_STORES": iris_arch_policy(ArchVersion(9, 5)).wait_stores,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    signature = {name: signature[name] for name in fn.arg_names}
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers or name.endswith("output")
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn, signature, constexprs=constexprs, attrs=attrs
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 8},
+    )
+    releases = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"], fn.fn.__name__, r"\bglobal_atomic_add\b.*sc0 sc1"
+    )
+    assert len(releases) == 2, releases
+    assert releases[0][1], releases
