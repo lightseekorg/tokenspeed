@@ -169,12 +169,14 @@ def fail_stop(launch, site, detail):
         detail: Site-specific detail, such as a mask of missing peers.
     """
     record = launch.error_ptr + _ERROR_RECORD
-    gl.store(record, site, cache_modifier=".wt")
-    gl.store(record + 1, launch.cta, cache_modifier=".wt")
-    gl.store(record + 2, detail, cache_modifier=".wt")
-    gl.store(record + 3, launch.epoch, cache_modifier=".wt")
-    gl.store(record + 4, launch.label, cache_modifier=".wt")
-    wait_vector_memory()
+    # The first failure owns the record (sites are never zero), so waves
+    # failing together cannot interleave their fields.
+    if gl.atomic_cas(record, 0, site, sem="relaxed", scope="gpu") == 0:
+        gl.store(record + 1, launch.cta, cache_modifier=".wt")
+        gl.store(record + 2, detail, cache_modifier=".wt")
+        gl.store(record + 3, launch.epoch, cache_modifier=".wt")
+        gl.store(record + 4, launch.label, cache_modifier=".wt")
+        wait_vector_memory()
     trap()
 
 
