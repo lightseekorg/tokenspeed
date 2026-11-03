@@ -262,7 +262,9 @@ def muse_plan(key: PlanKey) -> LayerPlan:
     programs = {}
     for xcd in range(XCDS):
         for slot in range(SLOTS):
-            steps = _front(key, xcd, slot) + _moe(key, xcd, slot) + _tail(key, xcd, slot)
+            steps = (
+                _front(key, xcd, slot) + _moe(key, xcd, slot) + _tail(key, xcd, slot)
+            )
             programs[(xcd, slot)] = tuple(steps)
     return LayerPlan(
         name=f"muse_spark{key}",
