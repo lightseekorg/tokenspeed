@@ -533,7 +533,7 @@ def muse_attntail_store_attention(program, gate, att_box, EPS: gl.constexpr):
     zero is stored as zero.
     """
     cfg = program.cfg
-    x = program.merge_splits(att_box, False).to(gl.bfloat16).to(gl.float32)
+    x = program.merge_splits(att_box, False, "").to(gl.bfloat16).to(gl.float32)
     inv = gl.rsqrt(gl.sum(x * x, 1) / cfg.HEAD_DIM + EPS)
     g = gate.to(gl.float32)
     rows = _iris_sanitize_lamport_bf16(
