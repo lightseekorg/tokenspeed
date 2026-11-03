@@ -48,6 +48,7 @@ wave; the caller runs ``on_expiry(launch, site, detail)`` otherwise, which
 must not return (:func:`fail_stop` is the local handler).
 """
 
+from tokenspeed_kernel_amd._scheduling import wave_uniform_i32
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     lane0_add_i64,
@@ -279,8 +280,13 @@ def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry):
             gl.to_tensor(label), error_ptr, abort_ptr, deadline_ticks, arena_ptr,
         )  # fmt: skip
         on_expiry(unknown, _SITE_CLAIM, entry.slot)
-    # The epoch reaches every wave through LDS and one barrier.
+    # The epoch reaches every wave through LDS and one barrier. A value out
+    # of a cross-wave reduction stays in a VGPR; readfirstlane makes it a
+    # scalar, so loops and compares on the tag stay uniform branches.
     epoch = gl.max(gl.where(first, entry.epoch_old + 1, 0), 0)
+    low = wave_uniform_i32((epoch & 0xFFFFFFFF).to(gl.int32))
+    high = wave_uniform_i32((epoch >> 32).to(gl.int32))
+    epoch = (high.to(gl.int64) << 32) | (low.to(gl.int64) & 0xFFFFFFFF)
     tag = launch_tag(epoch, 32).to(gl.int32)
     launch = Launch(
         entry.cta, entry.xcd, entry.slot, epoch, tag, (epoch & 1).to(gl.int32),

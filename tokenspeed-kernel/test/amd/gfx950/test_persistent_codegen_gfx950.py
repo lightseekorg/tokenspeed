@@ -307,3 +307,29 @@ def test_fail_stop_mirrors_the_record_before_the_trap():
     ]
     assert host, "the record is not written through"
     assert "s_waitcnt vmcnt(0)" in before[host[-1] :]
+
+
+@gluon.jit(do_not_specialize=["deadline_ticks"])
+def _tag_poll_kernel(epochs, claims, errors, arena, word, deadline_ticks):
+    entry = enter_issue(epochs, claims)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    if not poll_until(word, launch.tag, launch, "smem"):
+        fail_stop(launch, 16, 0)
+
+
+def test_launch_tag_is_a_scalar():
+    """The epoch comes out of a cross-wave reduction in a VGPR; read back to
+    a scalar, a scalar poll on the tag stays a uniform loop (no exec masks,
+    no lane reads per retry)."""
+    signature = {k: v for k, v in _ENTRY_SIGNATURE.items() if k not in ("w_ptr", "out")}
+    signature["word"] = "*i32"
+    assembly = _compile(_tag_poll_kernel, signature)
+    from asm_checks import innermost_loops
+
+    polls = [l for l in innermost_loops(assembly) if "s_load_dword" in l and "glc" in l]
+    assert polls
+    for loop in polls:
+        # The retry compares two scalars; a VGPR tag needs a lane read or a
+        # vector compare on every retry.
+        assert re.search(r"s_cmp_(eq|lg)_u32 s\d+, s\d+", loop), loop
+        assert "v_readfirstlane" not in loop
