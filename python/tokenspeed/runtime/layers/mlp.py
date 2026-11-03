@@ -70,9 +70,11 @@ def _supports(
             and isinstance(gate_up_method, Nvfp4LinearMethod)
             and isinstance(down_method, Nvfp4LinearMethod)
         )
-    return isinstance(gate_up_method, Mxfp4LinearMethod) and isinstance(
-        down_method, Mxfp4LinearMethod
-    )
+    if fusion is GatedMLPFusion.MXFP4_GEMM_SWIGLU:
+        return isinstance(gate_up_method, Mxfp4LinearMethod) and isinstance(
+            down_method, Mxfp4LinearMethod
+        )
+    raise ValueError(f"Unhandled gated MLP fusion: {fusion}")
 
 
 def gated_activation(hidden_act: str) -> nn.Module:
