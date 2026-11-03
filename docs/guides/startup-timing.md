@@ -43,12 +43,13 @@ final DP barrier, or HTTP readiness.
 Measure process launch to readiness and to the first successful generation
 separately. `scheduler.init` is not an end-to-end server startup metric.
 
-With the existing Triton compile monitor enabled, end records also contain
-`triton_compiles` and `triton_compile_s`: changes in its startup counters over
-the span. A disabled monitor produces `null`, not zero. These are process-wide,
-inclusive observations, not a cache-hit ratio or total backend compilation time.
-In particular, zero Triton compilations does not establish a FlashInfer,
-CuTeDSL, or DeepGEMM cache hit. Keep the serving JIT checks enabled.
+With the existing JIT compile monitor enabled, end records also contain
+`jit_compiles` and `jit_compile_s`: changes in its startup counters of Triton
+and CuTe DSL compilations over the span. A disabled monitor produces `null`,
+not zero. These are process-wide, inclusive observations, not a cache-hit ratio
+or total backend compilation time. In particular, zero compilations does not
+establish a FlashInfer or DeepGEMM cache hit. Keep the serving JIT checks
+enabled.
 
 For an initial audit, hold source, model revision, image, hardware, parallelism,
 and serving parameters fixed. Compare compile-cache-cold and compile-cache-warm

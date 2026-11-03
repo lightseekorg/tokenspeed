@@ -42,6 +42,7 @@ import json
 import threading
 from contextlib import nullcontext
 from dataclasses import replace
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest import mock
 
@@ -77,6 +78,8 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-2gpu")
 
 
 def _execute(handle, plan, planned):
@@ -203,6 +206,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         disable_cudagraph_memory_reserve=not reserve,
         enforce_eager=False,
         enable_memory_saver=False,
+        enable_external_encoder=False,
         device="cuda",
         speculative_algorithm=algorithm,
     )

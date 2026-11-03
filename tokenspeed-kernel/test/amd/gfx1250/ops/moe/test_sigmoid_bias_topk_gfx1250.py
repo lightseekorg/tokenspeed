@@ -177,6 +177,58 @@ def test_public_entry_point_selects_and_captures() -> None:
     _assert_matches_fp32_reference(logits, bias, weights, ids, 8, True, 2.5)
 
 
+def test_kimi3_rows_past_packed_triton_select_gluon_route() -> None:
+    def selected(tokens: int) -> str:
+        return select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            format_signature(router_logits=dense_tensor_format(torch.float32)),
+            traits={"tokens": tokens, "experts": 896, "topk": 16},
+        ).name
+
+    assert selected(512) == "triton_kimi3_packed_sigmoid_bias_topk_gfx1250"
+    assert selected(513) == "gluon_sigmoid_bias_topk_gfx1250"
+
+
+# The Gluon prefill route runs one workgroup per token, so a few rows cover it.
+@pytest.mark.parametrize("normalize,scale", [(True, 2.5), (False, 1.0)])
+def test_kimi3_prefill_route_matches_fp32_reference(
+    normalize: bool, scale: float
+) -> None:
+    gen = torch.Generator(device="cuda").manual_seed(29)
+    logits = torch.randn(5, 896, device="cuda", generator=gen)
+    bias = torch.randn(896, device="cuda", generator=gen) * 0.05
+    weights, ids = moe_topk(
+        logits,
+        16,
+        score_function="sigmoid",
+        selection_method="topk",
+        renormalize=normalize,
+        routed_scaling_factor=scale,
+        correction_bias=bias,
+        override="gluon_sigmoid_bias_topk_gfx1250",
+    )
+    _assert_matches_fp32_reference(logits, bias, weights, ids, 16, normalize, scale)
+
+
+def test_kimi3_prefill_route_ties_choose_lowest_ids() -> None:
+    logits = torch.zeros(3, 896, device="cuda")
+    bias = torch.zeros(896, device="cuda")
+    weights, ids = moe_topk(
+        logits,
+        16,
+        score_function="sigmoid",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        correction_bias=bias,
+        override="gluon_sigmoid_bias_topk_gfx1250",
+    )
+    expected = torch.arange(16, device="cuda", dtype=torch.int32).expand(3, -1)
+    torch.testing.assert_close(ids, expected, rtol=0, atol=0)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
+
+
 def test_token_count_does_not_recompile() -> None:
     bias = torch.randn(256, device="cuda") * 0.05
     logits = torch.randn(1024, 256, device="cuda").bfloat16()

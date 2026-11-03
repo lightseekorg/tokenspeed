@@ -31,6 +31,12 @@ try:
     from tokenspeed_kernel_amd.ops.gfx950.sampling.argmax import (
         launch_gluon_argmax_gfx950 as _argmax_gfx950_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.sampling.eagle4_candidate import (
+        launch_gluon_eagle4_candidate_tail_gfx950 as _eagle4_candidate_tail_gfx950_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.sampling.eagle4_candidate import (
+        launch_gluon_eagle4_shard_topk_gfx950 as _eagle4_shard_topk_gfx950_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.sampling.argmax import (
         launch_gluon_argmax_gfx1250 as _argmax_gfx1250_impl,
     )
@@ -40,6 +46,8 @@ except ImportError as exc:
     _IMPORT_ERROR_MESSAGE = str(exc)
     _argmax_gfx950_impl = None
     _argmax_gfx1250_impl = None
+    _eagle4_candidate_tail_gfx950_impl = None
+    _eagle4_shard_topk_gfx950_impl = None
 else:
     _IMPORT_ERROR_MESSAGE = None
 
@@ -94,6 +102,54 @@ if _IMPORT_ERROR_MESSAGE is None:
         """
         return _argmax_gfx1250_impl(logits, out=out)
 
+    _GFX950 = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
+
+    @register_kernel(
+        "sampling",
+        "eagle4_shard_topk",
+        name="gluon_eagle4_shard_topk_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures("scores", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_eagle4_shard_topk_gfx950(
+        scores: torch.Tensor, k: int, vocab_start: int, global_ids: torch.Tensor
+    ) -> None:
+        _eagle4_shard_topk_gfx950_impl(scores, k, vocab_start, global_ids)
+
+    @register_kernel(
+        "sampling",
+        "eagle4_candidate_tail",
+        name="gluon_eagle4_candidate_tail_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures("cand_logits", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_eagle4_candidate_tail_gfx950(
+        cand_logits: torch.Tensor,
+        cand_tokens: torch.Tensor,
+        top_k: int,
+        logits_out: torch.Tensor,
+        tokens_out: torch.Tensor,
+        topk_probs: torch.Tensor | None,
+        topk_tokens: torch.Tensor | None,
+    ) -> None:
+        _eagle4_candidate_tail_gfx950_impl(
+            cand_logits,
+            cand_tokens,
+            top_k,
+            logits_out,
+            tokens_out,
+            topk_probs,
+            topk_tokens,
+        )
+
 else:
 
     def gluon_argmax_gfx950(
@@ -114,5 +170,32 @@ else:
             f"gluon_argmax_gfx1250 requires tokenspeed-kernel-amd: {_IMPORT_ERROR_MESSAGE}"
         )
 
+    def gluon_eagle4_shard_topk_gfx950(
+        scores: torch.Tensor, k: int, vocab_start: int, global_ids: torch.Tensor
+    ) -> None:
+        raise ImportError(
+            "gluon_eagle4_shard_topk_gfx950 requires tokenspeed-kernel-amd: "
+            f"{_IMPORT_ERROR_MESSAGE}"
+        )
 
-__all__ = ["gluon_argmax_gfx950", "gluon_argmax_gfx1250"]
+    def gluon_eagle4_candidate_tail_gfx950(
+        cand_logits: torch.Tensor,
+        cand_tokens: torch.Tensor,
+        top_k: int,
+        logits_out: torch.Tensor,
+        tokens_out: torch.Tensor,
+        topk_probs: torch.Tensor | None,
+        topk_tokens: torch.Tensor | None,
+    ) -> None:
+        raise ImportError(
+            "gluon_eagle4_candidate_tail_gfx950 requires tokenspeed-kernel-amd: "
+            f"{_IMPORT_ERROR_MESSAGE}"
+        )
+
+
+__all__ = [
+    "gluon_argmax_gfx950",
+    "gluon_argmax_gfx1250",
+    "gluon_eagle4_candidate_tail_gfx950",
+    "gluon_eagle4_shard_topk_gfx950",
+]

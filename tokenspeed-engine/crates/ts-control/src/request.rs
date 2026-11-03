@@ -159,6 +159,9 @@ pub struct StopCriteria {
     pub token_limit: i64,
 }
 
+/// Cache ownership IDs have the same UTF-8 byte limit at ingress and demotion.
+pub(crate) const MAX_CACHE_SESSION_ID_BYTES: usize = 4096;
+
 /// The device's per-request stop table width (`MAX_STOP_TOKEN_IDS`).
 pub const MAX_STOP_TOKEN_IDS: usize = 16;
 
@@ -194,6 +197,9 @@ pub struct RequestState {
     pub output_ids: Vec<i32>,
     /// Their logprobs, when requested.
     pub output_logprobs: Vec<f64>,
+    /// Selected tokens' cumulative probability mass, when diagnostics and
+    /// logprobs are enabled.
+    pub output_token_cumulative_probs: Vec<f64>,
     /// Their top-k alternatives' logprobs and ids, when requested.
     pub output_top_logprobs: Option<TopLogprobs>,
     /// The prompt positions' logprobs as the chunks deliver them, over
@@ -209,6 +215,9 @@ pub struct RequestState {
     pub cached_tokens: i64,
     /// Speculative verify rounds this request took part in.
     pub spec_verify_ct: i64,
+    /// The decode reservation last sent to the scheduler
+    /// (`UpdateReserveNumTokens`), which keeps it until it is sent another.
+    pub decode_reserve: Option<i32>,
     /// Once it finished with speculative decoding, its accepted tokens per
     /// verify round.
     pub accept_draft_tokens: Option<f64>,
@@ -288,6 +297,7 @@ impl RequestState {
             computed_length: 0,
             output_ids: Vec::new(),
             output_logprobs: Vec::new(),
+            output_token_cumulative_probs: Vec::new(),
             output_top_logprobs: None,
             input_logprob_rows: None,
             input_top_logprob_rows: None,
@@ -295,6 +305,7 @@ impl RequestState {
             input_logprobs_sent: false,
             cached_tokens: 0,
             spec_verify_ct: 0,
+            decode_reserve: None,
             accept_draft_tokens: None,
             numerical_error_detected: false,
             finished_reason: None,

@@ -89,6 +89,7 @@ result = ts.Scheduler(cfg)
 
 fn spec(request_id: &str, tokens: Vec<i32>) -> RequestSpec {
     RequestSpec {
+        session_id: String::new(),
         request_id: request_id.to_owned(),
         tokens,
         max_new_tokens: 4,
@@ -226,6 +227,7 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
     let code = NEW_SCHEDULER.replace(
         "result = ts.Scheduler(cfg)",
         "cfg.num_snapshot_pages = 9\n\
+         cfg.host_group_packing = [1]\n\
          cfg.max_retracted_requests = 4\n\
          cfg.debug_force_retraction_interval = 1\n\
          result = ts.Scheduler(cfg)",
@@ -300,6 +302,7 @@ cfg.role = ts.SchedulerConfig.Role.Fused
 cfg.prefix_granularity = 2
 cfg.num_device_pages = 32
 cfg.num_host_pages = 8
+cfg.host_group_packing = [1]
 cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
 cfg.num_snapshot_pages = 1
 cfg.max_scheduled_tokens = 8
@@ -564,4 +567,79 @@ fn a_remote_decode_carries_the_first_token_and_the_prompt_blocks() {
     );
     assert_eq!(rows.block_tables[0].blocks, forward.block_tables[0].blocks);
     assert_eq!(python_transfer_view(plan, "remote_decode"), rows);
+}
+
+#[test]
+fn session_demotion_preserves_active_pages_and_reusable_cache() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let mut request = spec("tagged", (1..=40).collect());
+    request.session_id = "session-a".into();
+    scheduler.submit_requests(&[request]);
+    scheduler.next_execution_plan();
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "tagged", vec![42])])
+        .unwrap();
+    let before = scheduler.sizes().active_lcm_blocks;
+    scheduler.demote_session("session-a", true);
+    assert_eq!(scheduler.sizes().active_lcm_blocks, before);
+    scheduler
+        .advance(&[event(ForwardEventKind::Finish, "tagged", vec![])])
+        .unwrap();
+    scheduler.next_execution_plan();
+    assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
+    // Finish publishes the pages at their already-demoted session's age.
+    assert_eq!(scheduler.demote_session("session-a", true), 0);
+    let mut resumed = spec("resumed", (1..=40).collect());
+    resumed.session_id = "session-b".into();
+    scheduler.submit_requests(&[resumed]);
+    let plan = scheduler.next_execution_plan();
+    assert!(
+        plan.forward_batches()[0].extend_prefix_lens[0] > 0,
+        "demotion must not invalidate reusable KV"
+    );
+}
+
+#[test]
+fn session_demotion_counts_only_newly_aged_idle_pages() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let mut request = spec("tagged", (1..=40).collect());
+    request.session_id = "session-a".into();
+    scheduler.submit_requests(&[request]);
+    scheduler.next_execution_plan();
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "tagged", vec![42])])
+        .unwrap();
+    scheduler
+        .advance(&[event(ForwardEventKind::Finish, "tagged", vec![])])
+        .unwrap();
+    scheduler.next_execution_plan();
+    assert_eq!(scheduler.sizes().active_lcm_blocks, 0);
+    assert!(scheduler.demote_session("session-a", false) > 0);
+    assert_eq!(scheduler.demote_session("session-a", false), 0);
+    assert_eq!(scheduler.demote_session("session-a", true), 0);
+}
+
+#[test]
+fn admission_capacity_uses_native_geometry_and_live_slots() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let initial = scheduler.admission_snapshot(8);
+    assert_eq!(initial.free_slots, initial.total_slots);
+    assert_eq!(initial.available_blocks, initial.total_blocks);
+    assert!(!initial.capacity_blocks.is_empty());
+    assert!(initial
+        .capacity_blocks
+        .windows(2)
+        .all(|pair| pair[0] <= pair[1]));
+    assert!(*initial.capacity_blocks.last().unwrap() <= i64::from(initial.total_blocks));
+    scheduler.submit_requests(&[spec("capacity", (1..=10).collect())]);
+    scheduler.next_execution_plan();
+    let active = scheduler.admission_snapshot(8);
+    assert_eq!(active.free_slots, initial.free_slots - 1);
+    assert!(active.available_blocks < initial.available_blocks);
 }

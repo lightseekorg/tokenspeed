@@ -849,6 +849,7 @@ class NemotronHModel(nn.Module):
 
 class NemotronHForCausalLM(BaseCausalLM):
     model_cls = NemotronHModel
+    supports_aux_capture = True
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())

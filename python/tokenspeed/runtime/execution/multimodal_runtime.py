@@ -36,6 +36,7 @@ import torch
 from tokenspeed.runtime.multimodal.inputs import resolve_mm_pad_substitute_ids
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.host_sync import host_to_device
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -232,16 +233,17 @@ class MultimodalRuntime:
                         "M-RoPE positions table has no rows for prefill chunk "
                         f"[{start}, {end}) of request {forward_op.request_ids[batch_idx]}"
                     )
-                mrope_chunks.append(positions.to(device=self.device, dtype=torch.int64))
+                # The table lives on the host; the chunk is a strided slice.
+                mrope_chunks.append(
+                    host_to_device(positions, dtype=torch.int64, device=self.device)
+                )
                 continue
 
-            delta = mm_input.mrope_position_delta
-            if delta is None:
-                delta = torch.zeros(1, dtype=torch.int64)
-            delta = delta.flatten()[0].to(device=self.device, dtype=torch.int64)
             # Decode positions need (mrope_delta - 1) + seq_len. positions_buf
             # already stores the per-token zero-based position (seq_len - 1 for
-            # decode), so this is the same value without a GPU-to-CPU sync.
+            # decode), so this is the same value without a GPU-to-CPU sync. The
+            # delta is a host scalar, so adding it uploads nothing.
+            delta = self._mrope_delta_scalar(mm_input)
             mrope_chunks.append((base_chunk + delta).unsqueeze(0).expand(3, -1))
 
         mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()

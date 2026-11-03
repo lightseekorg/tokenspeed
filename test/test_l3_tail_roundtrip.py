@@ -72,6 +72,7 @@ def _scheduler(kinds):
     config.num_snapshot_pages = 1
     config.num_device_pages = 64
     config.num_host_pages = _HOST_BLOCKS + 1
+    config.host_group_packing = [1 for _ in kinds]
     config.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     config.max_scheduled_tokens = 64
     config.max_batch_size = 8

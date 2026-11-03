@@ -59,7 +59,7 @@ use ts_metrics::{EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
-    Scheduler, StorageRound, StorageTickView,
+    Scheduler, SchedulerSizes, StorageRound, StorageTickView,
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
@@ -198,10 +198,23 @@ pub trait DataPlane {
     /// batch; returns once it ran.
     fn idle_forward(&mut self, dp: &DpRound) -> Result<(), DataPlaneError>;
 
+    /// Check a weight load's local prerequisites without touching weights
+    /// or their validity. Returns whether this rank can load and why not.
+    /// Every rank must agree before any rank enters a loader.
+    fn check_weight_update(
+        &mut self,
+        op: &ControlRequest,
+    ) -> Result<(bool, String), DataPlaneError>;
+
     /// Apply one weight operation (a load, a group's init or teardown),
     /// behind the forwards dispatched before it. Returns whether it worked
     /// and a message.
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError>;
+
+    /// Publish or invalidate a weight load every rank started, after every
+    /// rank agreed its result and the new cache namespace. Local load
+    /// success alone must never permit a forward or a KV wake.
+    fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError>;
 
     /// Start or stop the profiler (`ProfileReq`). Returns the reply.
     fn profile(
@@ -486,6 +499,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     forward_allowed: bool,
     /// Last load report on the output wire, including idle heartbeats.
     last_load_report: Option<Instant>,
+    /// Last load sent to the frontend, including rounds with no token output.
+    reported_load: Option<Load>,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -539,6 +554,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             dp_idle: true,
             forward_allowed: true,
             last_load_report: None,
+            reported_load: None,
         }
     }
 
@@ -554,11 +570,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     fn idle(&self) -> bool {
+        // The scheduler's counts walk every live request's block tables: ask
+        // for them only once the loop's own state says nothing runs.
+        if !self.in_flight.is_empty()
+            || self.cache_ops.open() != 0
+            || self.outputs.num_running() != 0
+        {
+            return false;
+        }
         let sizes = self.scheduler.sizes();
-        self.in_flight.is_empty()
-            && self.cache_ops.open() == 0
-            && self.outputs.num_running() == 0
-            && sizes.waiting == 0
+        sizes.waiting == 0
             && sizes.prefilling == 0
             && sizes.decoding == 0
             && sizes.retracted == 0
@@ -664,12 +685,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
-        if self.owns_frontend()
-            && (!outputs.is_empty()
-                || self
-                    .last_load_report
-                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)))
-        {
+        if self.owns_frontend() {
             let sizes = self.scheduler.sizes();
             let load = Load {
                 num_running: self.outputs.num_running() as i64,
@@ -678,8 +694,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 kv_total_pages: self.config.kv_total_pages,
                 kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
             };
-            self.frontend.send(outputs, load);
-            self.last_load_report = Some(Instant::now());
+            // Silent aborts must refresh load immediately; periodic heartbeats
+            // also keep an idle engine's load snapshot fresh at its frontend.
+            if !outputs.is_empty()
+                || self.reported_load != Some(load)
+                || self
+                    .last_load_report
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+            {
+                self.frontend.send(outputs, load);
+                self.reported_load = Some(load);
+                self.last_load_report = Some(Instant::now());
+            }
         }
         // A deferred pause or release resolves once the scheduler drained.
         self.finish_drain()?;
@@ -723,6 +749,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
+        // The scheduler's counts as this round planned, for the metrics and
+        // the batch line: nothing between the two mutates the scheduler, and
+        // taking them walks every live request's block tables, so they are
+        // taken once, and only for a reader.
+        let mut planned_sizes: Option<SchedulerSizes> = None;
         if let Some(metrics) = &self.metrics {
             // A retraction victim's image store is the retraction signal.
             let retracted = cache_ops
@@ -735,7 +766,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             // A pre-dispatch snapshot: the running count still holds what
             // this round's commits end.
-            let sizes = self.scheduler.sizes();
+            let sizes = planned_sizes.insert(self.scheduler.sizes());
             let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
                 batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
             });
@@ -791,7 +822,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // empty plan per round and starve the device's own threads.
         let idle_forward = dp.as_ref().is_some_and(|dp| dp.idle_forward);
         if let Some(batch) = &forward {
-            self.log_dispatch(batch);
+            self.log_dispatch(batch, planned_sizes.as_ref());
             self.outputs.mark_scheduled(&batch.request_ids);
         }
         if let (Some(metrics), Some(batch)) = (&self.metrics, &forward) {
@@ -802,10 +833,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 }
             }
         }
+        let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
         if plan.needs_device() || idle_forward {
             if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
-                let batch = forward.clone().expect("a pending forward has a batch");
+                // The batch itself waits for its commit: nothing below reads it.
+                let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
                 self.in_flight.push_back((batch, input_logprobs, pending));
                 forwarded = true;
@@ -815,7 +848,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
         // Commit from the head once the queue exceeds the depth; a round with
         // no new work drains fully so results never wait on future traffic.
-        let depth = if forward.is_some() {
+        let depth = if has_forward {
             self.config.in_flight_depth
         } else {
             0
@@ -948,6 +981,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// one: a prefill chunk that does not complete the
     /// prompt samples a token the commit discards.
     fn grammar_advance(&self, batch: &ForwardBatchView) -> Option<Vec<bool>> {
+        // Only an engine with a grammar backend gives requests grammars.
+        self.grammars.as_ref()?;
         let any = batch.request_ids.iter().any(|rid| {
             self.outputs
                 .state(rid)
@@ -1371,6 +1406,20 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             None
         };
+        // A weight load's prerequisites are agreed before its flush: a load
+        // that no rank may run neither drops the caches nor reaches a device.
+        let ready = match ready {
+            Some(op) if control::is_weight_load(&op) => match self.refuse_weight_load(&op)? {
+                Some(refusal) => {
+                    tracing::info!(op = op.tag(), message = refusal, "weight load refused");
+                    self.controls
+                        .reply(control::gated_reply(&op, false, refusal));
+                    None
+                }
+                None => Some(op),
+            },
+            ready => ready,
+        };
         // One blocking device operation per round: a frontend one first.
         let ready_internal = if all_have_internal && ready.is_none() {
             self.controls.pop_internal()
@@ -1436,8 +1485,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// Finish a gated weight operation: its result is agreed across the
-    /// ranks before the reply.
+    /// ranks before the reply. A weight load reaching here passed the
+    /// all-rank admission in [`Self::gate`].
     fn complete_weight_op(&mut self, op: ControlRequest, flushed: bool) -> Result<(), LoopError> {
+        let flush_refused = control::wants_flush(&op) && !flushed;
         let (success, message) = match &op {
             ControlRequest::RebalanceExperts(_) => {
                 // Not a weight operation: the frontend's trigger of the
@@ -1451,7 +1502,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 };
                 (agreed, message)
             }
-            _ if control::wants_flush(&op) && !flushed => (
+            _ if flush_refused => (
                 false,
                 "cache flush failed; retry the update after in-flight Host cache ops drain \
                  and no request is suspended with a retraction image (retracted or restoring)"
@@ -1483,10 +1534,38 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 }
             }
         };
+        let success = if control::is_weight_load(&op) && !flush_refused {
+            // Every rank started this load: a refused admission never gets
+            // here, and a refused flush loads and commits nothing. Namespace
+            // publication can fail after the load agreement, so no rank
+            // commits usability until that final result also converged.
+            let agreed = self.converge(success)?;
+            self.data_plane.commit_weight_update(agreed)?;
+            agreed
+        } else {
+            success
+        };
         tracing::info!(op = op.tag(), success, message, "weight operation done");
         self.controls
             .reply(control::gated_reply(&op, success, message));
         Ok(())
+    }
+
+    /// Agree a weight load's device prerequisites before its flush and
+    /// before any rank loads. A rank that would refuse must not strand a
+    /// ready peer inside a loading collective; a refusal leaves every rank's
+    /// weights and caches untouched, so serving goes on and the load may be
+    /// retried. Returns the refusal, or `None` when every rank is ready.
+    fn refuse_weight_load(&mut self, op: &ControlRequest) -> Result<Option<String>, LoopError> {
+        let (ready, message) = self.data_plane.check_weight_update(op)?;
+        if self.converge(ready)? {
+            return Ok(None);
+        }
+        Ok(Some(if ready {
+            "weight load refused on another rank in the replica".to_owned()
+        } else {
+            message
+        }))
     }
 
     /// `RebalanceExpertsReqInput`: take the snapshot now, if no rebalance runs.
@@ -1680,6 +1759,45 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             _ => None,
         };
         match self.controls.handle(request, refusal) {
+            Effect::DemoteSessions(ids, ended) => {
+                let changed = self.scheduler.demote_sessions(&ids, ended);
+                self.controls.reply(ControlOutput::DemoteSessions(
+                    ts_wire::control::DemoteSessionsReqOutput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        success: true,
+                        message: format!("demoted {changed} exclusive cached blocks"),
+                    },
+                ));
+            }
+            Effect::AdmissionSnapshot => {
+                // Version 1 rounds demand up to 1024-token buckets. Bump the
+                // contract version if the curve's bucketing semantics change;
+                // see docs/design/cache-concepts.md.
+                const ADMISSION_CONTRACT_VERSION: i64 = 1;
+                const ADMISSION_TOKEN_STEP: i32 = 1024;
+                let snapshot = self.scheduler.admission_snapshot(ADMISSION_TOKEN_STEP);
+                self.controls.reply(ControlOutput::GetAdmission(
+                    ts_wire::control::GetAdmissionReqOutput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        success: true,
+                        contract_version: ADMISSION_CONTRACT_VERSION,
+                        dp_rank: -1,
+                        free_slots: snapshot.free_slots.into(),
+                        total_slots: snapshot.total_slots.into(),
+                        available_blocks: snapshot.available_blocks.into(),
+                        total_blocks: snapshot.total_blocks.into(),
+                        host_free_blocks: snapshot.host_free_blocks.into(),
+                        host_total_blocks: snapshot.host_total_blocks.into(),
+                        retracted: snapshot.retracted as i64,
+                        waiting: snapshot.waiting as i64,
+                        max_tokens: snapshot.max_tokens.into(),
+                        capacity_token_step: snapshot.capacity_token_step.into(),
+                        capacity_blocks: snapshot.capacity_blocks,
+                    },
+                ));
+            }
             Effect::None => {}
             Effect::Profile => {
                 let profile = profile.expect("a profile effect comes from a profile request");
@@ -1931,26 +2049,29 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// The batch line of a dispatched forward.
-    fn log_dispatch(&mut self, batch: &ForwardBatchView) {
-        let sizes = self.scheduler.sizes();
-        let active = i64::from(sizes.active_lcm_blocks);
-        let stats = RoundStats {
-            queued: sizes.waiting,
-            active_pages: active,
-            cached_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks) - active,
-            pd: [
-                sizes.bootstrapping,
-                sizes.prefilling,
-                sizes.remote_prefilling,
-                sizes.decoding,
-                sizes.pd_transfer,
-            ],
-        };
+    /// The batch line of a dispatched forward, from the scheduler's counts
+    /// as the round planned (`planned_sizes`, if the round took them).
+    fn log_dispatch(&mut self, batch: &ForwardBatchView, planned_sizes: Option<&SchedulerSizes>) {
         let (outputs, scheduler) = (&self.outputs, &self.scheduler);
+        let kv_total_pages = self.config.kv_total_pages;
         self.batch_logger.log_dispatch(
             batch,
-            &stats,
+            || {
+                let sizes = planned_sizes.cloned().unwrap_or_else(|| scheduler.sizes());
+                let active = i64::from(sizes.active_lcm_blocks);
+                RoundStats {
+                    queued: sizes.waiting,
+                    active_pages: active,
+                    cached_pages: kv_total_pages - i64::from(sizes.empty_lcm_blocks) - active,
+                    pd: [
+                        sizes.bootstrapping,
+                        sizes.prefilling,
+                        sizes.remote_prefilling,
+                        sizes.decoding,
+                        sizes.pd_transfer,
+                    ],
+                }
+            },
             |rid| {
                 outputs
                     .state(rid)

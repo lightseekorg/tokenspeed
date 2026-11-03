@@ -1024,7 +1024,11 @@ class PrefillTopK(QueryGroups):
                             source_slot = cute.arch.shuffle_sync(
                                 slot, iteration * 2 + lane_idx // 16
                             )
-                            source = keys.iterator + source_slot * _HEAD_DIM + col
+                            source = (
+                                keys.iterator
+                                + cutlass.Int64(source_slot) * _HEAD_DIM
+                                + col
+                            )
                             logical_byte = (
                                 row * 128
                                 + (col % 64) * 2

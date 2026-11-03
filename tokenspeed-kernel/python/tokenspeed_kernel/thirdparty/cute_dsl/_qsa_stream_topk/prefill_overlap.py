@@ -1328,132 +1328,80 @@ class OverlapPrefillTopK(PrefillTopK):
                             cutlass.Uint32(scalars[row_in_group, 0]),
                         )
                     else:
-                        # Dense equal-integer buckets use exact radix. The
-                        # former
-                        # FP16 exponent shortcut is inapplicable to integer
-                        # bins.
+                        # Dense integer buckets use four exact FP32 radix
+                        # rounds without the former FP16 prefix shortcut.
                         tie_remaining = original_remaining
-                        prefix_proven = cutlass.Boolean(False)
-                        second_origin = cutlass.Int32(0)
                         prefix = cutlass.Uint32(0)
                         for radix_round in cutlass.range_constexpr(4):
-                            run_round = cutlass.Boolean(True)
+                            shift = cutlass.const_expr(24 - radix_round * 8)
                             if cutlass.const_expr(radix_round == 0):
-                                run_round = not prefix_proven
-                            narrow_second = cutlass.Boolean(False)
-                            if cutlass.const_expr(radix_round == 1):
-                                narrow_second = prefix_proven
-                            if run_round:
-                                shift = cutlass.const_expr(24 - radix_round * 8)
-                                if cutlass.const_expr(radix_round == 0):
-                                    prefix_mask = cutlass.Uint32(0)
-                                elif cutlass.const_expr(radix_round == 1):
-                                    prefix_mask = cutlass.Uint32(0xFF000000)
-                                elif cutlass.const_expr(radix_round == 2):
-                                    prefix_mask = cutlass.Uint32(0xFFFF0000)
-                                else:
-                                    prefix_mask = cutlass.Uint32(0xFFFFFF00)
-                                if narrow_second:
-                                    if thread_in_row < 32:
-                                        exact_histograms[
-                                            row_in_group, thread_in_row
-                                        ] = cutlass.Int32(0)
-                                else:
-                                    for item in cutlass.range_constexpr(
-                                        self.exact_items_per_thread
-                                    ):
-                                        hist_base = thread_in_row * _EXACT_ITEMS
-                                        histogram_index = hist_base + item
-                                        exact_histograms[
-                                            row_in_group, histogram_index
-                                        ] = cutlass.Int32(0)
-                                topk_barrier.arrive_and_wait()
+                                prefix_mask = cutlass.Uint32(0)
+                            elif cutlass.const_expr(radix_round == 1):
+                                prefix_mask = cutlass.Uint32(0xFF000000)
+                            elif cutlass.const_expr(radix_round == 2):
+                                prefix_mask = cutlass.Uint32(0xFFFF0000)
+                            else:
+                                prefix_mask = cutlass.Uint32(0xFFFFFF00)
+                            for item in cutlass.range_constexpr(
+                                self.exact_items_per_thread
+                            ):
+                                hist_base = thread_in_row * _EXACT_ITEMS
+                                histogram_index = hist_base + item
+                                exact_histograms[row_in_group, histogram_index] = (
+                                    cutlass.Int32(0)
+                                )
+                            topk_barrier.arrive_and_wait()
 
-                                tie_index = thread_in_row
-                                while tie_index < tie_count:
-                                    packed = tie_candidates[
-                                        row_in_group,
-                                        tie_index,
+                            tie_index = thread_in_row
+                            while tie_index < tie_count:
+                                packed = tie_candidates[row_in_group, tie_index]
+                                bits = cutlass.Uint32((packed >> 32) - 1)
+                                ordered = self._ordered(bits)
+                                if (ordered & prefix_mask) == prefix:
+                                    bucket = cutlass.Int32(
+                                        (ordered >> cutlass.Uint32(shift))
+                                        & cutlass.Uint32(0xFF)
+                                    )
+                                    cute.arch.atomic_add(
+                                        exact_histograms.iterator
+                                        + row_in_group * self.stream_tile
+                                        + bucket,
+                                        cutlass.Int32(1),
+                                        sem="relaxed",
+                                        scope="cta",
+                                    )
+                                tie_index += self.selector_threads_per_row
+                            topk_barrier.arrive_and_wait()
+
+                            if warp_in_row == 0:
+                                local_total = cutlass.Int32(0)
+                                counts = cute.make_rmem_tensor((8,), cutlass.Int32)
+                                for item in cutlass.range_constexpr(8):
+                                    count = exact_histograms[
+                                        row_in_group, lane_idx * 8 + item
                                     ]
-                                    bits = cutlass.Uint32((packed >> 32) - 1)
-                                    ordered = self._ordered(bits)
-                                    if (ordered & prefix_mask) == prefix:
-                                        bucket = cutlass.Int32(
-                                            (ordered >> cutlass.Uint32(shift))
-                                            & cutlass.Uint32(0xFF)
+                                    counts[item] = count
+                                    local_total += count
+                                inclusive = self._warp_scan(local_total, lane_idx)
+                                lane_base = inclusive - local_total
+                                local_prefix = cutlass.Int32(0)
+                                for item in cutlass.range_constexpr(8):
+                                    count = counts[item]
+                                    before = lane_base + local_prefix
+                                    after = before + count
+                                    if (
+                                        before < tie_remaining
+                                        and after >= tie_remaining
+                                    ):
+                                        scalars[row_in_group, 0] = lane_idx * 8 + item
+                                        scalars[row_in_group, 1] = (
+                                            tie_remaining - before
                                         )
-                                        if narrow_second:
-                                            bucket -= second_origin
-                                        cute.arch.atomic_add(
-                                            exact_histograms.iterator
-                                            + row_in_group * self.stream_tile
-                                            + bucket,
-                                            cutlass.Int32(1),
-                                            sem="relaxed",
-                                            scope="cta",
-                                        )
-                                    tie_index += self.selector_threads_per_row
-                                topk_barrier.arrive_and_wait()
-
-                                if warp_in_row == 0:
-                                    if narrow_second:
-                                        count = exact_histograms[
-                                            row_in_group,
-                                            lane_idx,
-                                        ]
-                                        inclusive = self._warp_scan(
-                                            count,
-                                            lane_idx,
-                                        )
-                                        before = inclusive - count
-                                        if (
-                                            before < tie_remaining
-                                            and inclusive >= tie_remaining
-                                        ):
-                                            scalars[row_in_group, 0] = (
-                                                lane_idx + second_origin
-                                            )
-                                            scalars[row_in_group, 1] = (
-                                                tie_remaining - before
-                                            )
-                                    else:
-                                        local_total = cutlass.Int32(0)
-                                        counts = cute.make_rmem_tensor(
-                                            (8,), cutlass.Int32
-                                        )
-                                        for item in cutlass.range_constexpr(8):
-                                            count = exact_histograms[
-                                                row_in_group,
-                                                lane_idx * 8 + item,
-                                            ]
-                                            counts[item] = count
-                                            local_total += count
-                                        inclusive = self._warp_scan(
-                                            local_total, lane_idx
-                                        )
-                                        lane_base = inclusive - local_total
-                                        local_prefix = cutlass.Int32(0)
-                                        for item in cutlass.range_constexpr(8):
-                                            count = counts[item]
-                                            before = lane_base + local_prefix
-                                            after = before + count
-                                            if (
-                                                before < tie_remaining
-                                                and after >= tie_remaining
-                                            ):
-                                                scalars[row_in_group, 0] = (
-                                                    lane_idx * 8 + item
-                                                )
-                                                scalars[row_in_group, 1] = (
-                                                    tie_remaining - before
-                                                )
-                                            local_prefix += count
-                                topk_barrier.arrive_and_wait()
-                                bucket = scalars[row_in_group, 0]
-                                tie_remaining = scalars[row_in_group, 1]
-                                prefix |= cutlass.Uint32(
-                                    bucket,
-                                ) << cutlass.Uint32(shift)
+                                    local_prefix += count
+                            topk_barrier.arrive_and_wait()
+                            bucket = scalars[row_in_group, 0]
+                            tie_remaining = scalars[row_in_group, 1]
+                            prefix |= cutlass.Uint32(bucket) << cutlass.Uint32(shift)
 
                 warp_high_count = cutlass.Int32(0)
                 warp_equal_count = cutlass.Int32(0)
@@ -1734,9 +1682,12 @@ class OverlapPrefillTopK(PrefillTopK):
         page_size: cutlass.Constexpr[int],
     ):
         block_idx, _, _ = cute.arch.block_idx()
-        # Both ownership branches use one physical shared-memory allocation.
-        # Their invocations are mutually exclusive within this CTA.
+        # All request segments share this CTA's shared storage and TMEM.
         storage = self._allocate_storage(smem_layout_k, smem_layout_q)
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(tidx // 32)
+        if warp_idx == self.mma_warp:
+            cute.arch.alloc_tmem(self.mma_n * _ACC_STAGES, storage.tmem_ptr_smem)
         if cutlass.const_expr(
             self.enable_pdl and self.group_layout == "ragged",
         ):
@@ -1834,6 +1785,15 @@ class OverlapPrefillTopK(PrefillTopK):
                     storage,
                 )
 
+        # Relinquishing the permit forbids any later allocation by this CTA.
+        # Each group's MMA tail has already waited for its final TMEM readers.
+        if warp_idx == self.mma_warp:
+            tmem_ptr = cute.arch.retrieve_tmem_ptr(
+                cutlass.Int32, 16, storage.tmem_ptr_smem
+            )
+            cute.arch.relinquish_tmem_alloc_permit()
+            cute.arch.dealloc_tmem(tmem_ptr, self.mma_n * _ACC_STAGES)
+
     @cute.jit
     def _run_group(
         self,
@@ -1893,9 +1853,6 @@ class OverlapPrefillTopK(PrefillTopK):
         if cutlass.const_expr(self.group_layout == "aligned"):
             row_base = block_idx * self.query_group
         num_blocks = page_table.shape[1] * page_size
-
-        if warp_idx == self.mma_warp:
-            cute.arch.alloc_tmem(self.mma_n * _ACC_STAGES, tmem_ptr_smem)
 
         k_producer, k_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=_K_STAGES,
@@ -2128,8 +2085,6 @@ class OverlapPrefillTopK(PrefillTopK):
                 acc_handle.commit()
                 k_handle.release()
             acc_producer.tail()
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(tmem_ptr, self.mma_n * _ACC_STAGES)
 
         elif warpgroup_idx < 2:
             query_half = warpgroup_idx

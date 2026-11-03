@@ -22,8 +22,14 @@ Supported task types:
 Task types that start a server (`server_smoke`, `eval`, `perf`) run with
 `TOKENSPEED_JIT_COMPILE_CHECK=error` unless the task's `env` sets it: a
 compile-time kernel parameter that keeps taking new values after startup
-(a per-batch `tl.constexpr`) fails the run. The server log names the kernel,
-the parameter, and the launching call site.
+(a per-batch `tl.constexpr` or static CuTe DSL dimension), a call site that
+keeps recompiling specializations a kernel already has, or a direct
+`@cute.jit` call after startup fails the run. The server log names the kernel,
+the cause, and the launching call site. They also run with
+`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error`, which no task may change
+(validation rejects a task or `runner.env` that sets it): a host
+synchronization on the forward thread's per-round path after startup fails
+the run, and the server log names its Python location.
 
 Currently configured task directories:
 
@@ -49,16 +55,19 @@ each stage run in parallel. The workflow treats a stage with no matching tasks
 as satisfied.
 
 On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
-`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication, and
-CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
-`tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
-once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
-task.
+`tokenspeed-kernel/test/ops/` and `tokenspeed-kernel/test/nvidia/thirdparty/`,
+keeping the numerics suite in a separate process. `ut-tokenspeed-kernel-part-ii`
+runs those two directories, keeping the TRT-LLM communication and CUDA suites in
+separate processes. `ut-tokenspeed-kernel-post-submit` runs the slow files that
+`ut-tokenspeed-kernel-part-i` ignores (the non-FP8 GEMM autotune capacity test)
+on pushes to `main` only. Together the three tasks cover the kernel suite once.
+AMD runners run the whole suite in the single `ut-tokenspeed-kernel` task.
 
-Conversely, AMD runners split the `runtime-1gpu` suite across
-`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
-by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
-runners run the whole suite in `ut-runtime-1gpu`.
+All runners split the `runtime-1gpu` suite across `ut-runtime-1gpu-part-i` and
+`ut-runtime-1gpu-part-ii`, which balance test files by their registered
+`est_time` (`run_ci_suite.py --auto-partition-*`). The suite starts one `pytest`
+process per file, so per-file startup is a large share of its time, and
+running it in one job takes longer than the kernel unit tests.
 
 The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four GB200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
@@ -606,8 +615,8 @@ this repository. Pull-request runs execute the merge commit's dispatcher, so
 the run covers dispatcher changes before merge. The workflow skips fork pull
 requests until the coordinator pool uses ephemeral runners with a protected
 approval environment. Use the manual `Slurm Dispatch` workflow after review.
-New commits cancel the older run for the same pull request or the `main`
-branch.
+New commits cancel the older run for the same pull request. A push to `main`
+does not cancel a running run; only the newest waiting run is kept.
 
 Submission is fail-closed and requires the repository variable
 `TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated

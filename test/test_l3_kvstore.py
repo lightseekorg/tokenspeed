@@ -1345,6 +1345,16 @@ class TestStorageKeyTest:
             )
         )
         fp16 = cache_layout_signature(layout, cache_dtype="float16")
+        aligned = cache_layout_signature(
+            layout, cache_dtype="float16", checkpoint_granularities=(("state", 4096),)
+        )
+        assert aligned != fp16
+        assert aligned != cache_layout_signature(
+            layout, cache_dtype="float16", checkpoint_granularities=(("state", 8192),)
+        )
+        assert fp16 == cache_layout_signature(
+            layout, cache_dtype="float16", checkpoint_granularities=()
+        )
         assert (fp16) == (cache_layout_signature(layout, cache_dtype="float16"))
         assert (fp16) != (cache_layout_signature(layout, cache_dtype="bfloat16"))
         changed = SimpleNamespace(

@@ -123,6 +123,10 @@ public:
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
     std::int32_t AvailableLcmBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    std::int32_t FreeRequestSlots() const { return req_pool_allocator_.AvailableSlots(); }
+    std::int32_t TotalRequestSlots() const { return req_pool_allocator_.Size(); }
+    std::int32_t TotalLcmBlocks() const { return block_pool_.NumLcmBlocks(); }
+    std::vector<std::int64_t> AdmissionCapacityCurve(std::int32_t token_step) const;
     // Per-step gauges: empty parents are O(1), active parents walk the live
     // requests' block tables. Parents resident only as cache are
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
@@ -152,6 +156,11 @@ public:
     std::int32_t HostPoolTotalBlocks() const { return host_pool_.NumLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
+    std::size_t DemoteSession(const std::string& id, bool ended) { return coordinator_.DemoteSession(id, ended); }
+    std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended) {
+        return coordinator_.DemoteSessions(ids, ended);
+    }
+
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
@@ -178,13 +187,13 @@ private:
     bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
-        std::vector<std::string> candidate_prefix_hashes;
-        std::vector<std::string> extension_hashes;
-        std::vector<std::string> prefix_hashes;
-    };
-
-    struct KvEventHashProgress {
-        std::vector<std::uint64_t> block_hashes;
+        bool waits_for_eviction_store{false};
+        std::string prefix_diagnostic;
+        // Views of the request's immutable prompt hashes. Only an admitted
+        // request copies its reused prefix into mutable execution progress.
+        std::span<const std::string> candidate_prefix_hashes;
+        std::span<const std::string> extension_hashes;
+        std::span<const std::string> prefix_hashes;
     };
 
     // What the per-request admission layer reports back to the role
@@ -235,10 +244,12 @@ private:
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
     };
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
-                                                std::int32_t remaining, std::int32_t decode_input_tokens);
+                                                std::int32_t remaining, std::int32_t decode_input_tokens,
+                                                std::int64_t kv_token_limit);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
-                                                             std::int32_t reserve_num_tokens_in_next_schedule_event);
+                                                             std::int32_t reserve_num_tokens_in_next_schedule_event,
+                                                             std::int64_t kv_token_limit);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            Request* request);
 
@@ -257,14 +268,14 @@ private:
                                                            std::optional<std::uint64_t> request_access_epoch,
                                                            bool evict_blocks_past_segments);
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
-        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
+        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
         std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
-    void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+    void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,
     // at a tail, the partial page under its tail hash (token_ids = the rows
     // below T, parent = the last full page).
-    void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+    void registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     // Finished requests whose forwards have all landed: publish the frontier
@@ -330,6 +341,7 @@ private:
         // the same candidates -- its first decode is next round's work).
         std::unordered_set<const Request*> scheduled;
         std::int32_t token_budget{0};
+        std::int32_t kv_page_budget{0};
         // Budget the decode batch must leave untouched for a pending local
         // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
         // fused mixed mode only).
@@ -358,6 +370,12 @@ private:
         // decode steps run against no chunk budget.
         if constexpr (std::is_same_v<Operation, PrefillOperation>) {
             build.token_budget -= operation.input_length;
+            if (config_.max_kv_page_num > 0) {
+                const std::int64_t end =
+                    static_cast<std::int64_t>(operation.extend_prefix_len) + operation.input_length;
+                build.kv_page_budget -=
+                    static_cast<std::int32_t>((end + config_.prefix_granularity - 1) / config_.prefix_granularity);
+            }
             build.pushed_prefill = true;
         } else if (config_.role != Role::kD) {
             build.token_budget -= operation.input_length;
@@ -373,7 +391,8 @@ private:
     std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
-                                                             std::vector<LoadBackOperation>& load_backs);
+                                                             std::vector<LoadBackOperation>& load_backs,
+                                                             std::int32_t kv_page_budget);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
@@ -502,7 +521,6 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).

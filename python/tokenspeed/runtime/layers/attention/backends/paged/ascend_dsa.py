@@ -28,7 +28,6 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
-    ascend_dsa_cp_metadata,
     ascend_dsa_kernels,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -39,6 +38,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.dcp.ascend import (
     AscendDCPContext,
+    AscendDCPMetadata,
     AscendPrefillCache,
     AscendPrefillPlan,
 )
@@ -49,6 +49,9 @@ from tokenspeed.runtime.layers.attention.dcp.placement import (
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import register_backend
+
+# Retain the name used by external native-operator verification fixtures.
+_AscendDSAContextParallel = AscendDCPMetadata
 
 # Fixed page geometry of Ascend SparseFlashAttentionDecode.
 ASCEND_SFAD_PAGE_SIZE = 128
@@ -107,254 +110,6 @@ class _AscendSparseSelection:
     fused: bool
 
 
-@dataclass(frozen=True)
-class _AscendDCPKernelMetadata:
-    page_table: torch.Tensor
-    seq_lens: torch.Tensor
-    init_counts: torch.Tensor
-    local_counts: torch.Tensor
-
-
-@dataclass(frozen=True)
-class _AscendIndexerMetadata:
-    q_ends: torch.Tensor
-    page_table: torch.Tensor
-    seq_lens: torch.Tensor
-    init_counts: torch.Tensor
-    local_counts: torch.Tensor
-    visible_lengths: torch.Tensor | None
-
-
-class _AscendDSAContextParallel:
-    """Local DSA page metadata for one context-parallel group."""
-
-    def __init__(
-        self,
-        *,
-        degree: int,
-        rank: int,
-        ranks: tuple[int, ...],
-        virtual_block_count: int | None,
-    ) -> None:
-        if degree < 1 or len(ranks) != degree or len(set(ranks)) != degree:
-            raise ValueError("invalid DCP group")
-        if not 0 <= rank < degree:
-            raise ValueError("invalid DCP rank")
-        self.degree, self.rank, self.ranks = degree, rank, ranks
-        self.virtual_block_count = virtual_block_count
-        self.page_table: torch.Tensor | None = None
-        self.seq_lens: torch.Tensor | None = None
-        self.init_counts: torch.Tensor | None = None
-        self.local_counts: torch.Tensor | None = None
-        self.query_ends: torch.Tensor | None = None
-        self.write_slots: torch.Tensor | None = None
-        self._metadata_buffers: dict[str, torch.Tensor] = {}
-        self._decode_rows_capacity: int | None = None
-        self._prepared_metadata_key: tuple | None = None
-        self._metadata_sources: tuple[torch.Tensor, ...] = ()
-        self._indexer_metadata: _AscendIndexerMetadata | None = None
-        self._query_group_size: int | None = None
-
-    def clear_forward_metadata(self) -> None:
-        """Invalidate layer-shared results before the next forward/capture."""
-        self._prepared_metadata_key = None
-        self._metadata_sources = ()
-        self._indexer_metadata = None
-        self._query_group_size = None
-
-    def prepare_metadata(
-        self,
-        *,
-        seq_lens,
-        page_table,
-        page_size,
-        block_granularity,
-        init_tokens,
-        local_tokens,
-        query_width,
-        query_group_size,
-        slots,
-    ) -> None:
-        sources = (seq_lens, page_table) + (() if slots is None else (slots,))
-        key = (
-            tuple(
-                (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device) for t in sources
-            ),
-            page_size,
-            block_granularity,
-            init_tokens,
-            local_tokens,
-            query_width,
-            query_group_size,
-        )
-        if key == self._prepared_metadata_key:
-            return
-        self.refresh_metadata(
-            seq_lens=seq_lens,
-            page_table=page_table,
-            page_size=page_size,
-            block_granularity=block_granularity,
-            init_tokens=init_tokens,
-            local_tokens=local_tokens,
-            query_width=query_width,
-            query_group_size=query_group_size,
-            slots=slots,
-        )
-        self._metadata_sources = sources
-        self._prepared_metadata_key = key
-
-    def bind_virtual_block_count(self, virtual_block_count: int) -> None:
-        """Bind the scheduler capacity published by the cache arena."""
-        if virtual_block_count <= 1:
-            raise ValueError("DSA CP cache must contain usable virtual blocks")
-        self.clear_forward_metadata()
-        if self.virtual_block_count != virtual_block_count:
-            self.virtual_block_count = virtual_block_count
-            self.page_table = None
-            self.seq_lens = None
-            self.init_counts = None
-            self.local_counts = None
-
-    def allocate_decode_buffers(self, rows: int, columns: int, device) -> None:
-        """Keep all decode metadata at stable addresses across batch sizes."""
-        self.clear_forward_metadata()
-        self._metadata_buffers = {
-            name: torch.empty(shape, dtype=torch.int32, device=device)
-            for name, shape in (
-                ("query_ends", (rows,)),
-                ("page_table", (rows, columns)),
-                ("seq_lens", (rows,)),
-                ("init_counts", (rows,)),
-                ("local_counts", (rows,)),
-                ("index_q_ends", (rows,)),
-                ("index_page_table", (rows, columns)),
-                ("index_seq_lens", (rows,)),
-                ("index_init_counts", (rows,)),
-            )
-        }
-        self._metadata_buffers["write_slots"] = torch.empty(
-            rows, dtype=torch.int64, device=device
-        )
-        self._decode_rows_capacity = rows
-
-    def _buffer(self, name, shape, device, dtype=torch.int32):
-        target = self._metadata_buffers.get(name)
-        if (
-            target is None
-            or target.ndim != len(shape)
-            or target.shape[1:] != shape[1:]
-            or target.shape[0] < shape[0]
-            or target.dtype != dtype
-            or target.device != device
-        ):
-            if self._decode_rows_capacity is not None:
-                raise RuntimeError(f"DSA {name} exceeds preallocated decode geometry")
-            target = torch.empty(shape, dtype=dtype, device=device)
-            self._metadata_buffers[name] = target
-        return target[: shape[0]]
-
-    def refresh_metadata(
-        self,
-        *,
-        seq_lens,
-        page_table,
-        page_size,
-        block_granularity,
-        init_tokens,
-        local_tokens,
-        query_width,
-        query_group_size,
-        slots,
-    ) -> None:
-        self.clear_forward_metadata()
-        if self.virtual_block_count is None:
-            raise RuntimeError("DSA CP cache metadata was not bound")
-        rows, columns = page_table.shape[0] * query_width, page_table.shape[1]
-        if query_width < 1 or query_group_size < 1 or rows % query_group_size:
-            raise ValueError("DSA query rows must form complete Indexer groups")
-        groups = rows // query_group_size
-        device = page_table.device
-        # Prefill can exceed the decode ladder without replacing captured storage.
-        separate = self._decode_rows_capacity is not None and (
-            rows > self._decode_rows_capacity
-            or columns != self._metadata_buffers["page_table"].shape[1]
-        )
-
-        def buffer(name, shape, dtype=torch.int32):
-            if separate:
-                return torch.empty(shape, dtype=dtype, device=device)
-            return self._buffer(name, shape, device, dtype)
-
-        self.page_table = buffer("page_table", (rows, columns))
-        self.seq_lens = buffer("seq_lens", (rows,))
-        self.init_counts = buffer("init_counts", (rows,))
-        self.local_counts = buffer("local_counts", (rows,))
-        self.query_ends = buffer("query_ends", (rows,))
-        self.write_slots = (
-            None if slots is None else buffer("write_slots", slots.shape, torch.int64)
-        )
-        self._query_group_size = query_group_size
-        self._indexer_metadata = _AscendIndexerMetadata(
-            buffer("index_q_ends", (groups,)),
-            buffer("index_page_table", (groups, columns)),
-            buffer("index_seq_lens", (groups,)),
-            buffer("index_init_counts", (groups,)),
-            self.local_counts,
-            self.seq_lens if query_group_size > 1 else None,
-        )
-        index = self._indexer_metadata
-        ascend_dsa_cp_metadata(
-            page_table,
-            seq_lens,
-            page_size=page_size,
-            block_granularity=block_granularity,
-            virtual_block_count=self.virtual_block_count,
-            degree=self.degree,
-            rank=self.rank,
-            initial_tokens=init_tokens,
-            window_tokens=local_tokens,
-            query_width=query_width,
-            query_group_size=query_group_size,
-            slots=slots,
-            out=self.page_table,
-            local_lengths=self.seq_lens,
-            initial_counts=self.init_counts,
-            window_counts=self.local_counts,
-            query_ends=self.query_ends,
-            index_table=index.page_table,
-            index_lengths=index.seq_lens,
-            index_initial_counts=index.init_counts,
-            index_query_ends=index.q_ends,
-            local_slots=self.write_slots,
-        )
-
-    def metadata(self, *, start: int, end: int) -> _AscendDCPKernelMetadata:
-        values = (self.page_table, self.seq_lens, self.init_counts, self.local_counts)
-        if any(value is None for value in values):
-            raise RuntimeError("DSA CP metadata was not refreshed")
-        page_table, seq_lens, init_counts, local_counts = values
-        assert page_table is not None
-        assert seq_lens is not None
-        assert init_counts is not None
-        assert local_counts is not None
-        return _AscendDCPKernelMetadata(
-            page_table=page_table[start:end],
-            seq_lens=seq_lens[start:end],
-            init_counts=init_counts[start:end],
-            local_counts=local_counts[start:end],
-        )
-
-    def indexer_metadata(self, q_ends, local, *, query_group_size: int):
-        """Return layouts already written by the metadata launch, without copies."""
-        if (
-            query_group_size != self._query_group_size
-            or self._indexer_metadata is None
-            or q_ends.numel() != local.seq_lens.numel()
-        ):
-            raise ValueError("Indexer query layout differs from prepared DSA metadata")
-        return self._indexer_metadata
-
-
 class AscendDSABackend(DSABackend):
     """Ascend DSA execution backed by Ascend indexer and sparse-attention ops."""
 
@@ -398,7 +153,7 @@ class AscendDSABackend(DSABackend):
             raise ValueError("Ascend DSA requires BF16 KV cache")
         if config.kv_cache_quant_method not in (None, "none"):
             raise ValueError("Ascend DSA cache format is selected by kv_cache_dtype")
-        dcp = _AscendDSAContextParallel(
+        dcp = AscendDCPMetadata(
             degree=int(config.kvp_size),
             rank=int(config.kvp_rank),
             ranks=tuple(config.kvp_group),
@@ -430,11 +185,17 @@ class AscendDSABackend(DSABackend):
         self._dcp = dcp
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_runtime = None
+        self._prefill_workspace = None
+        self._prefill_slots: torch.Tensor | None = None
         self._prefill_options = None
 
     @property
     def native_prefill_enabled(self):
         return self._prefill_options is not None
+
+    @property
+    def prefill_needs_host_page_table(self):
+        return self.native_prefill_enabled
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         self.close_prefill()
@@ -446,18 +207,18 @@ class AscendDSABackend(DSABackend):
             if isinstance(cache_pool, AscendPrefillCache)
             else None
         )
+        self._prefill_plan = None
         if self._dcp.degree > 1:
             counts = cache_pool.arena.runtime_contract.virtual_block_counts
             if FULL_ATTENTION not in counts:
                 raise ValueError("DSA CP requires a full-attention cache group")
             self._dcp.bind_virtual_block_count(counts[FULL_ATTENTION])
-        self.prepare_prefill_workspace()
 
     def prepare_prefill_workspace(self) -> int:
         if not self.native_prefill_enabled:
             return 0
         if self._prefill_runtime is not None:
-            return self._prefill_runtime.workspace_bytes
+            return self._prefill_workspace.capacity_bytes
         if self.cache_pool is None:
             raise RuntimeError("Bind the DSA cache before preparing Prefill workspace")
         from tokenspeed.runtime.distributed.process_group_manager import (
@@ -468,30 +229,41 @@ class AscendDSABackend(DSABackend):
         kv = self.cache_pool.get_key_buffer(layer_id)
         index = self.cache_pool.get_component(layer_id, "dsa_index_k")
         group = process_group_manager.get_process_group("gloo", self._dcp.ranks)
-        self._prefill_options.check_workspace(
-            local_rows=kv.numel() // 576, degree=self._dcp.degree, index_width=128
+        workspace, buffers = self._prefill_options.allocate_workspace(
+            local_rows=kv.numel() // 576,
+            degree=self._dcp.degree,
+            index_width=128,
+            device=kv.device,
         )
-        self._prefill_runtime = self._indexer_kernels.prepare_prefill(
+        runtime = self._indexer_kernels.prepare_prefill(
             kv,
             index,
             ranks=self._dcp.ranks,
             bootstrap_group=group,
             max_current_rows=self._prefill_options.max_current_rows,
+            workspace=buffers[:3],
+            max_history_rows=self._prefill_options.history_capacity_rows,
+            history_null_rows=self._prefill_options.kv_page_size,
         )
-        return self._prefill_runtime.workspace_bytes
+        self._prefill_workspace = workspace
+        self._prefill_slots = buffers[3]
+        self._prefill_runtime = runtime
+        return self._prefill_workspace.capacity_bytes
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         """Start the next DSA layer while preceding KDA layers compute."""
-        if self._prefill_runtime is None or self.cache_pool is None:
-            raise RuntimeError("DSA Prefill workspace must be prepared before forward")
         plan = self._prefill_plan
-        if plan is None:
-            raise RuntimeError("DSA Prefill device metadata was not prepared")
+        if not self.native_prefill_enabled or plan is None:
+            raise RuntimeError("Prepare native DSA Prefill metadata first")
+        if self._prefill_runtime is None:
+            self.prepare_prefill_workspace()
         self._prefill_runtime.prefetch(
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),
             self.cache_pool.get_component(layer_id, "dsa_index_k"),
             has_history=not plan.cold,
+            history_slots=None if plan.gather is None else plan.gather.send_slots,
+            history_counts=None if plan.gather is None else plan.gather.row_counts,
         )
 
     def start_prefill_index(self, layer_id, index_key):
@@ -509,6 +281,8 @@ class AscendDSABackend(DSABackend):
         if self._prefill_runtime is not None:
             self._prefill_runtime.close()
             self._prefill_runtime = None
+        self._prefill_workspace = None
+        self._prefill_slots = None
 
     def cache_placement(self, layer) -> CachePlacement | None:
         if self._ascend_placement is None:
@@ -594,7 +368,10 @@ class AscendDSABackend(DSABackend):
             if cmeta is not None:
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
-        if num_extends > 0 and self._prefill_runtime is not None:
+        self._prefill_plan = None
+        if num_extends > 0 and self.native_prefill_enabled:
+            layer_id = min(self.cache_pool.history_group_by_layer())
+            local_rows = self.cache_pool.get_key_buffer(layer_id).numel() // 576
             self._prefill_plan = AscendPrefillPlan.build(
                 self.forward_prefill_metadata,
                 self.cache_placement(None),
@@ -602,8 +379,9 @@ class AscendDSABackend(DSABackend):
                 rank=self._dcp.rank,
                 page_size=self.kernel_page_size,
                 topk=self._indexer_spec.index_topk,
-                local_cache_pages=self._prefill_runtime.local_rows
-                // self.kernel_page_size,
+                local_cache_pages=local_rows // self.kernel_page_size,
+                page_table_cpu=kwargs.get("page_table_cpu"),
+                options=self._prefill_options,
             )
 
     def prepare_prolog_metadata(self, locations, *, init_tokens, local_tokens):
@@ -1127,10 +905,11 @@ class AscendDSABackend(DSABackend):
             width=spec.kv_cache_dim,
             total_rows=sum(plan.row_counts),
         )
-        runtime.patch(
+        plan.patch(
+            runtime,
             layer.layer_id,
             out_cache_loc,
-            plan.current_direct,
+            slots_workspace=self._prefill_slots,
             width=spec.index_head_dim,
             block_rows=block_rows,
             virtual_blocks=virtual_blocks,
@@ -1154,10 +933,11 @@ class AscendDSABackend(DSABackend):
             indices = torch.empty(
                 (0, spec.index_topk), dtype=torch.int32, device=q.device
             )
-        runtime.patch(
+        plan.patch(
+            runtime,
             layer.layer_id,
             out_cache_loc,
-            plan.current_direct,
+            slots_workspace=self._prefill_slots,
             width=spec.kv_cache_dim,
             block_rows=block_rows,
             virtual_blocks=virtual_blocks,

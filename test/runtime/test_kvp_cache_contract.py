@@ -36,6 +36,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
 
+from tokenspeed.runtime.cache.transfer.layout import (
+    CacheField,
+    CacheGroupLayout,
+    CacheTransferLayout,
+)
+from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.distributed.mapping import AttentionLayerMapping
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
@@ -88,6 +94,44 @@ def _contract(*, parents: int, packing: int, shard_count: int) -> CacheRuntimeCo
         group_page_counts={spec.group_id: 1 + parents * packing for spec in specs},
         group_packing={spec.group_id: packing for spec in specs},
     )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_host_ownership_uses_each_tiers_packing_and_bounds(rank):
+    layout = CacheTransferLayout(
+        num_lcm_blocks=2,
+        groups=(
+            CacheGroupLayout("sharded", 4, (CacheField("kv", 0, 0, 32, 32),)),
+            CacheGroupLayout("replicated", 4, (CacheField("state", 0, 0, 80, 80),)),
+        ),
+        buffers=(object(),),
+        consumers=(("kv", "state"),),
+    )
+    contract = _contract(parents=2, packing=4, shard_count=2)
+    owners = BlockOwnerTranslation.for_host_pool(
+        layout,
+        contract,
+        num_host_lcm_blocks=2,
+        host_group_packing=(2, 1),
+        rank=rank,
+    )
+    rows = [(0, 16, 8), (1, 8, 2)]
+    expected = [(1, (1, 8, 2))]
+    if rank == 1:
+        expected.insert(0, (0, (0, 8, 4)))
+    assert owners.owned_positions(rows) == expected
+    for row in [(0, 17, 7), (0, 15, 9), (1, 8, 3)]:
+        with pytest.raises(IndexError):
+            owners.owned_positions([row])
+    for packing in [(2,), (2, 0), (2, -1)]:
+        with pytest.raises(ValueError):
+            BlockOwnerTranslation.for_host_pool(
+                layout,
+                contract,
+                num_host_lcm_blocks=2,
+                host_group_packing=packing,
+                rank=rank,
+            )
 
 
 class TestRuntimeContractTest:
@@ -232,7 +276,6 @@ class TestConfigurationTest:
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
             kv_cache_quant_method="none",
-            prefix_granularity=256,
             kernel_page_size=64,
             context_len=4096,
             max_bs=4,

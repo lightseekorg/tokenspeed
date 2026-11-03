@@ -155,25 +155,3 @@ def test_online_quantization_ignores_linear_attention_layers() -> None:
 
     serialized = Fp8Config(is_checkpoint_fp8_serialized=True)
     assert not serialized.ignored_layers
-
-
-def test_online_quantization_ignores_grouped_wo_a() -> None:
-    """Online fp8 must exclude DeepSeek-V4 ``wo_a``.
-
-    Its grouped projection plan requires serialized weights and scales for
-    backend-owned preprocessing. Online quantization does not provide that
-    checkpoint contract.
-    """
-    from tokenspeed.runtime.layers.quantization.utils import (
-        check_equal_or_regex_match,
-    )
-
-    online = Fp8Config()
-    assert check_equal_or_regex_match("model.layers.0.attn.wo_a", online.ignored_layers)
-    for name in ("model.layers.0.attn.wo_b", "model.layers.0.attn.q_proj"):
-        assert not check_equal_or_regex_match(name, online.ignored_layers)
-
-    serialized = Fp8Config(is_checkpoint_fp8_serialized=True)
-    assert not check_equal_or_regex_match(
-        "model.layers.0.attn.wo_a", serialized.ignored_layers
-    )

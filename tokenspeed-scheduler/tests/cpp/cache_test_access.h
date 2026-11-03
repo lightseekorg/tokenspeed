@@ -52,6 +52,13 @@ struct CacheCoordinatorTestAccess {
                                             /*write_back_segment=*/nullptr);
     }
 
+    static bool RecordDeviceEviction(CacheCoordinator& coordinator, const CacheKey& key,
+                                     CacheCoordinator::EvictedSegment& segment) {
+        const auto location = coordinator.locationOf(coordinator.pool_, key.group_id, key);
+        return location && coordinator.evictCachedBlock(key.group_id, *location,
+                                                        &CacheCoordinator::DeviceEvictionStats::admission, &segment);
+    }
+
     // A Device-cached block, located rather than referenced: a held reference
     // would pin it against eviction.
     static std::optional<CacheBlockLocation> DeviceLocationOf(const CacheCoordinator& coordinator,
@@ -72,6 +79,10 @@ struct CacheCoordinatorTestAccess {
 
     static const BoundaryTree& BoundaryTreeOf(const CacheCoordinator& coordinator) {
         return coordinator.boundary_tree_;
+    }
+
+    static auto NodeEntries(const CacheCoordinator& coordinator, const BlockPool& pool, const ContentHash& hash) {
+        return coordinator.NodeEntries(pool, *coordinator.boundary_tree_.Find(hash));
     }
 };
 
@@ -128,7 +139,8 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
         }
         demands.push_back(demand);
     }
-    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt, /*evict_blocks_past_segments=*/false);
+    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt, /*evict_blocks_past_segments=*/false,
+                             /*session_id=*/{});
 }
 
 // The overloads without progress admit a request that has computed nothing

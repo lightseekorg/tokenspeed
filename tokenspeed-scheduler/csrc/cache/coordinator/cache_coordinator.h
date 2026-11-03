@@ -26,9 +26,11 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -87,10 +89,41 @@ public:
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                      bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                      bool stream_device_cache_to_host, bool write_back_evictions);
+    std::size_t DemoteSession(const std::string& session_id, bool ended);
+    std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
+
+    // A request's session, registered under its access epoch for every
+    // admission, publication and restore that epoch dates
+    // (SessionForAccess). The first admission of a request with a session id
+    // registers it and returns this handle; dropping the handle unregisters
+    // it. Move-only; the coordinator must outlive it.
+    class SessionAccess {
+    public:
+        SessionAccess() noexcept = default;
+        SessionAccess(const SessionAccess&) = delete;
+        SessionAccess& operator=(const SessionAccess&) = delete;
+        SessionAccess(SessionAccess&& other) noexcept;
+        SessionAccess& operator=(SessionAccess&& other) noexcept;
+        ~SessionAccess();
+
+    private:
+        friend class CacheCoordinator;
+
+        SessionAccess(CacheCoordinator& coordinator, std::uint64_t access_epoch, SessionCacheOwner session);
+        void release() noexcept;
+
+        CacheCoordinator* coordinator_{nullptr};
+        std::uint64_t access_epoch_{0};
+    };
+    SessionCacheOwner SessionForAccess(std::uint64_t epoch) const {
+        const auto it = session_access_.find(epoch);
+        return it == session_access_.end() ? nullptr : it->second;
+    }
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
     bool GroupIsState(std::size_t i) const;
+    std::int32_t CheckpointGranularity() const noexcept { return checkpoint_granularity_; }
     // Group blocks one boundary's content hash expands to: the blocks of a
     // prefix page for a History group, one state for a State group.
     std::int32_t BlocksPerBoundary(std::int32_t i) const;
@@ -140,6 +173,16 @@ public:
     // Drops every State table's slot 0 (a decode step that writes slot 1 in
     // place), outside an admission.
     void ReleaseStateInputs(std::span<BlockTable> tables);
+    // Hold one already-published, aligned input checkpoint across either
+    // tier, including every cached sliding window it needs. Full history
+    // is already held by the request. Missing any required block returns
+    // an empty hold; replayable groups need no cached window.
+    std::vector<CacheBlockRef> RetainInputCheckpoint(std::span<const std::string> prefix_hashes,
+                                                     std::int32_t boundary_tokens) const;
+    // A finishing producer makes its retained input available to the next
+    // turn now. Refresh its recency without recording a prefix-cache hit or
+    // changing the finishing request's session ownership.
+    void RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks, std::uint64_t request_access_epoch);
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
                                           bool count_uncached) const {
         const CacheGroup& group = groups_[static_cast<std::size_t>(i)];
@@ -158,6 +201,9 @@ public:
         // An additional known candidate at max_tokens, used by storage before
         // any local publication. It is a hint, never proof of cached data.
         std::optional<TailPublication> tail;
+        // Optional precomputation for exactly prefix_hashes and this
+        // coordinator. Omission expands those identities for this probe.
+        PreparedPrefixKeys prepared_keys;
     };
 
     struct PrefixProbe {
@@ -183,6 +229,9 @@ public:
             // prefix plus a Host suffix when the Host holds part of that KV,
             // else 0; the junction takes the larger of the two tiers'.
             std::int32_t kv_tokens{0};
+            // Device prefix-closed coverage before windows or State shorten
+            // the hit. Reused only within this probe and its storage queries.
+            std::int32_t closed_kv_tokens{0};
             // Hits over group_keys (the full pages): a token-spanned group's
             // relative to the tier's floor (the Device's full pages for the
             // Host tier), a State group's from page 0 on both tiers, since a
@@ -193,7 +242,7 @@ public:
             std::optional<TailHit> tail;
         };
 
-        std::vector<std::vector<CacheKey>> group_keys;
+        PreparedPrefixKeys group_keys;
         // The D role only: every State group's checkpoint at exactly the
         // prompt end (keys and hits for the State groups alone), claimed as
         // slot 0 so the peer's transfer can omit the state. Absent when any
@@ -252,6 +301,10 @@ public:
         // turn ended. The end state the request publishes supersedes it
         // (MarkSupersededStateInput).
         std::optional<ContentHash> resumed_tail_hash;
+        // The first admission of a request with a session id: that session's
+        // registration under access_epoch, for the caller to hold as long as
+        // the request lives. Empty otherwise.
+        SessionAccess session_access;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -260,7 +313,22 @@ public:
     // A missing epoch starts a new request; a supplied epoch continues that
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
+    PreparedPrefixKeys PreparePrefixKeys(std::span<const std::string> content_hashes) const;
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
+    // Whether recorded or in-flight eviction stores would extend the visible
+    // hit using ordinary matching rules. Never acquires unpublished blocks.
+    bool EvictionStoresExtendPrefix(const PromptPrefix& prompt, const PrefixProbe& visible) const;
+
+    // Read-only physical availability, before admission can evict anything.
+    // A bit names a group missing blocks at this boundary. The union permits
+    // arbitrary tier mixing; it is an upper bound, not a resumable prefix.
+    struct PrefixBoundaryAvailability {
+        std::int32_t tokens{0};
+        std::uint64_t device_missing{0};
+        std::uint64_t host_missing{0};
+        std::uint64_t union_missing{0};
+    };
+    std::vector<PrefixBoundaryAvailability> InspectPrefixAvailability(const PromptPrefix& prompt) const;
     // Full pages only: a probe that enumerates no tails.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
 
@@ -289,7 +357,7 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments);
+                                         bool evict_blocks_past_segments, const std::string& session_id);
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;
@@ -513,12 +581,12 @@ public:
         // A segment plan took it as a duplicate of a boundary the Device
         // resumes.
         HostEvictionCounts duplicate;
-        // A segment plan took it as a checkpoint boundary a deeper Device one
-        // supersedes.
+        // A segment plan took a nonaligned input checkpoint whose request
+        // continued to a deeper Device checkpoint. Aligned checkpoints keep
+        // their State LRU rank.
         HostEvictionCounts superseded;
-        // A segment plan took it as a dead entry (judged by the Host's
-        // checkpoint boundaries alone, so a Device checkpoint boundary may
-        // still be under it), CollectDeadEntries evicted it, or a settled
+        // A segment plan took it as a dead entry (no checkpoint on either
+        // tier depends on it), CollectDeadEntries evicted it, or a settled
         // write-back cancelled it (a held member).
         HostEvictionCounts dead_entry;
         // The per-prior tail cap dropped its tail, entry by entry after the
@@ -527,6 +595,9 @@ public:
         HostEvictionCounts tail_cap;
         // ClearCache, after the Device clear, so never device_resident.
         HostEvictionCounts flush;
+        // A segment plan reclaimed a prefix-closed KV copy independently of
+        // the boundary's checkpoints, while the Device still held its key.
+        HostEvictionCounts duplicate_kv;
     };
     struct HostAllocationStats {
         std::size_t requested{0};
@@ -534,7 +605,9 @@ public:
         std::size_t unallocated{0};
         // Prefix-index enumerations, including groups that can donate capacity.
         std::size_t group_scans{0};
-        // Distinct touched parents checked for whole-parent reclamation.
+        // Unpinned entries visited while collecting replacement candidates.
+        std::size_t block_candidates{0};
+        // Distinct parents whose occupancy was simulated during replacement.
         std::size_t parent_candidates{0};
     };
     struct HostAllocationBatch {
@@ -545,22 +618,13 @@ public:
     // content hashes (chain hashes and tail hashes alike) for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
-    std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+    std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
-    // One Host block per (group, bucket) entry, in the bucket of the Device
-    // block it will mirror -- under page-cyclic sharding the owner of a Host
-    // page must be the owner of its Device page, so a copy's two ends select
-    // the same rows on every rank. Free capacity first, then global LRU over
-    // compatible children and fully evictable parents of any group. A parent
-    // is ranked by its newest child; equal epochs prefer one child. A
-    // shortfall leaves an empty reference. Evicting a State checkpoint takes
-    // the other State groups' at its hash along; every block retries free
-    // capacity before it picks a victim, so it places in the room such a
-    // cascade freed before another victim goes. Block by block: it serves
-    // publication and finish stores and L3 prefetches. A retraction image's
-    // Host blocks come from AcquireHostBoundaries, whose per-block plan ranks
-    // victims as this does (change the two together), and the Host blocks of
-    // what an eviction writes back from AcquireHostSegments.
+    // One Host block per (group, bucket), with free capacity assigned first
+    // in input order. The shared eviction plan funds remaining rows globally;
+    // failed rows and unnecessary tentative victims evict nothing. A State
+    // checkpoint takes its unpinned State siblings at the same boundary along.
+    // A shortfall leaves an empty reference, without blocking later rows.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     // One segment of an AcquireHostSegments batch, or one boundary of a
@@ -578,22 +642,29 @@ public:
     // go while the rest cannot fit -- and nothing is evicted that the placed
     // segments do not need. A victim is a Host checkpoint boundary (a
     // BoundaryTree node with has_checkpoint set on the Host: some State group
-    // holds a checkpoint there; one missing another group's is dead) with the
-    // Host pages above it that only it depends on, up to one in use, and the
-    // Host pages under them, or only its checkpoints while deeper Host
-    // checkpoint boundaries still read its page; a Host page no Host checkpoint
-    // boundary depends on (without State groups: a page no Host page continues,
-    // a Host leaf) goes with the Host pages under it. One member in use passes
-    // the whole victim over, as does a parent page an eviction write-back is
-    // bringing to the Host (it would arrive with nothing under it). Victims go
-    // by class: dead entries (a checkpoint boundary missing a State group's
-    // checkpoint, a tail no probe enumerates, a page no Host checkpoint
-    // boundary depends on -- even one with a Device checkpoint boundary under
-    // it, which CollectDeadEntries, counting both tiers, would keep) first;
-    // then duplicates of a boundary the Device resumes and checkpoint
-    // boundaries a deeper Device checkpoint boundary on their chain
-    // supersedes, the newest Device copy first; then Host-only cache, least
-    // recently used first. Once a victim took every Host page under the page
+    // holds a checkpoint there) with the Host pages above it that only it
+    // depends on, up to one in use, and the
+    // Host pages under them, or only its Host State while another checkpoint
+    // on either tier still reads its history (including a Device copy at the
+    // same boundary), or if a history pin blocks the segment while every
+    // State group at the boundary is unpinned; a Host
+    // page no Host checkpoint boundary depends on (without State groups: a
+    // page no Host page continues, a Host leaf) goes with the Host pages under
+    // it. The climb stops before another checkpoint on either tier. A Host
+    // history candidate can still leave at its own rank under pressure;
+    // removing State does not take a Device checkpoint's history with it.
+    // Chosen victims never contain a member in use. A pending write-back
+    // of the parent page also blocks the victim: the page would otherwise
+    // arrive with nothing under it. Victims go
+    // by class: dead entries (a tail no probe enumerates, or incomplete State
+    // and history with no checkpoint on either tier depending on them) first;
+    // then exact Device duplicates and continued nonaligned input checkpoints
+    // (a shared State access epoch proves the continuation), newest Device
+    // copy first; then safe closed-group KV duplicates, held Device copies
+    // first and newer Device copies first within each ownership class; then
+    // Host-only cache, least recently used first. A missing Device window
+    // still protects every closed-group Host page in the required suffix.
+    // Once a victim took every Host page under the page
     // above it, that page is a candidate too. The restore pass then returns,
     // newest first, each victim the placed segments can do without and whose
     // parent page stays. A dropped segment's rows hold empty references. A
@@ -606,12 +677,9 @@ public:
     // covering the rows in order, the shallowest first -- the Host can take
     // whole from the first on, each row in its Device block's bucket. Nothing
     // is evicted or acquired; AcquireHostBoundaries carries out the same plan.
-    // It plans block by block with AcquireHostBlocks' victim ranking against
-    // a shadow of the Host, which does not know which parent the pool gives
-    // each row, so where several parents have room the victims can
-    // differ from those AcquireHostBlocks would take. The write-back policy
-    // places by segments first and never places fewer boundaries than block
-    // by block (docs/design/scheduler.md §2).
+    // Uses AcquireHostBlocks' planner, accepting whole boundaries instead of
+    // individual rows. The write-back policy first tries its segment plan,
+    // without placing fewer boundaries than the block plan alone would.
     std::size_t NumHostBoundariesThatFit(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries) const;
@@ -697,6 +765,9 @@ public:
         // The collection of dead prefix entries, which like the tail cap evicts
         // every block it drops itself; only when evicting by segments.
         DeviceEvictionCounts dead_entry_collection;
+        // Subset of request_reclaim considered for write-back, including
+        // entries later dropped as dead. Superseded inputs are excluded.
+        std::uint64_t request_reclaim_for_write_back{0};
     };
     // Cumulative, never reset (accounting only).
     const DeviceEvictionStats& DeviceEvictions() const { return device_evictions_; }
@@ -735,12 +806,19 @@ public:
     // group by group in offset order, each key under the boundary's namespace
     // and content hash.
     template <typename Visit>
-    void ForEachBoundaryKey(const CacheKey& boundary, std::int32_t tail_tokens, Visit&& visit) const {
+    void ForEachBoundaryKey(CacheKey boundary, std::int32_t tail_tokens, Visit&& visit) const {
+        forEachBoundaryKey(boundary, tail_tokens, std::views::iota(std::size_t{0}, groups_.size()),
+                           std::forward<Visit>(visit));
+    }
+
+private:
+    // Reuse the caller's key storage and expand only the selected groups.
+    // Both complete boundary walks and KV-only policy scans use this geometry.
+    template <typename GroupRange, typename Visit>
+    void forEachBoundaryKey(CacheKey& key, std::int32_t tail_tokens, const GroupRange& group_indices,
+                            Visit&& visit) const {
         _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
-        // One key, its group and offset set in place: the content hash is
-        // copied once per boundary, not once per key.
-        CacheKey key{.namespace_id = boundary.namespace_id, .content_hash = boundary.content_hash};
-        for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+        for (const std::size_t group_index : group_indices) {
             const auto i = static_cast<std::int32_t>(group_index);
             // A replayable group never holds an entry.
             if (GroupIsReplayable(i)) {
@@ -754,6 +832,8 @@ public:
             }
         }
     }
+
+public:
     // One entry a BoundaryTree node holds on the tier of `pool`: in use when
     // anything beside the index holds its block.
     struct NodeEntry {
@@ -830,6 +910,21 @@ private:
         std::size_t num_placed{0};
         std::vector<Victim> victims;
     };
+    struct HostKvDuplicateCandidate {
+        std::uint32_t group_id{0};
+        CacheBlockLocation location;
+        std::uint64_t device_epoch{0};
+        std::int32_t boundary_tokens{0};
+        bool device_in_use{false};
+    };
+    // Unpinned Host KV copies backed by a contiguous Device KV prefix,
+    // excluding pages a sliding group can force into a Host suffix. Keep the
+    // Device facts read during collection for this plan's ranking. Visit in
+    // priority order and stop as soon as the callback returns false.
+    // Defined in host_segments.cpp; callers must stay in that translation
+    // unit unless the template definition is moved into a header.
+    template <typename Visitor>
+    void visitHostKvDuplicateCandidates(Visitor&& visit) const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
@@ -840,10 +935,8 @@ private:
     HostAllocationBatch acquireHostPlacement(const HostPlacementPlan& plan, std::span<const std::uint32_t> group_ids,
                                              std::span<const std::int32_t> buckets,
                                              std::span<const HostSegmentRows> segments);
-    // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
-    // carries out; by whole segments first with place_by_segments (the
-    // write-back policy), else block by block alone. Its per-block victim
-    // ranking is AcquireHostBlocks'; change the two together.
+    // Shared block planning with whole-boundary acceptance. The write-back
+    // policy first tries its segment plan when place_by_segments is set.
     HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
@@ -869,6 +962,9 @@ private:
                               std::int32_t full_tokens, std::int32_t tail_tokens, std::span<const CacheKey> tail_keys,
                               GroupPrefixProbe& tail_hits, GroupPrefixProbe* page_hits,
                               const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
+    bool stateGroupsAcceptBoundary(std::span<const std::size_t> match_order, std::span<const std::string> prefix_hashes,
+                                   std::int32_t full_tokens, std::int32_t tail_tokens, const ContentHash& tail_hash,
+                                   bool allow_host, const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
     // Visits the published boundaries in (floor_tokens, from_tokens] that the
     // prompt's own tokens reach, longest first, as (page_tokens, tail_tokens,
     // published hash); the visitor returns false to stop.
@@ -963,7 +1059,7 @@ private:
     // eviction order and cascades never depend on it) and syncs the entry's
     // tree node. It returns the key that left the index, nullopt when the
     // entry is pinned or gone. A superseded input (MarkSupersededStateInput) an
-    // admission or a restore evicts (`reason` admission or restore) counts as
+    // admission, rotation or restore evicts counts as
     // request_reclaim and is never recorded. With write_back_segment (an
     // admission's or a restore's cache victim under the write-back policy) any
     // other entry that left is recorded there -- its metadata read before it
@@ -1007,6 +1103,9 @@ private:
     // it), and a node no prefix-closed group holds on either tier and no store
     // is bringing (a gap).
     void syncTreeNode(const ContentHash& hash);
+    // Refresh the closed-group coverage and duplicate membership after a
+    // publication, restore, or link gives an existing hash its parent.
+    void syncKvCoverage(BoundaryTree::Node& node);
     // Whether an imaged slot belongs to the page the computed frontier ends
     // inside: the restored request writes and later republishes those blocks,
     // so they are copied, never claimed. Every slot below is immutable.
@@ -1038,6 +1137,7 @@ private:
     bool write_back_evictions_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
+    std::int32_t checkpoint_granularity_{1};
     std::int32_t replay_window_tokens_{0};
     // How many groups are State groups. With any, a boundary serves a resume
     // only with a checkpoint boundary at or under it.
@@ -1045,25 +1145,22 @@ private:
     // Some group is prefix-closed, and needs every page below a boundary: a
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
+    SessionCacheOwner sessionTag(const std::string& id);
+    // One entry per live SessionAccess handle, which adds and erases it.
+    std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
+    std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
+    std::size_t session_tags_since_sweep_{0};
     std::uint64_t next_access_epoch_{0};
     // Issued access epochs start at 1. A superseded input is re-registered
     // at this one (MarkSupersededStateInput), below every other cache entry
     // and level with the blocks no entry holds, until an acquisition or a
     // publication touches it again.
     static constexpr std::uint64_t kSupersededAccessEpoch{0};
-    struct HostParentCandidate {
-        std::uint64_t newest_access_epoch{0};
-        std::int32_t evictable_children{0};
-        bool allocated{false};
-    };
-    // Reuse the direct-indexed scratch buffer; reset only the parents touched
-    // by the previous replacement batch, never the whole Host arena per call.
-    std::vector<HostParentCandidate> host_parent_candidates_;
-    std::vector<std::int32_t> host_touched_parents_;
     TailTable tails_;
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.
     BoundaryTree boundary_tree_;
+    mutable std::uint64_t host_duplicate_scan_generation_{0};
     // Hashes of possibly dead tree nodes, in the order they were queued, for
     // CollectDeadEntries (write_back_evictions only). A node may be gone or
     // alive again by the time it is collected.
@@ -1074,6 +1171,11 @@ private:
     // segments it records into while it adds more. Never an empty one: each
     // call erases its own that ended up empty.
     std::deque<EvictedSegment> evicted_segments_;
+    // Membership lasts from recording through settlement, including the
+    // remainder of the plan before its drain. Probes reuse this set. Only
+    // keys recorded more than once need an additional-reference count.
+    std::unordered_set<CacheKey, CacheKeyHash> pending_eviction_keys_;
+    std::unordered_map<CacheKey, std::size_t, CacheKeyHash> pending_eviction_extra_refs_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
     // Accounting only.

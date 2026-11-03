@@ -55,7 +55,6 @@ def make_leaf(monkeypatch):
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
             kv_cache_quant_method="",
-            prefix_granularity=128,
             context_len=context,
             max_bs=8,
             speculative_num_draft_tokens=queries,

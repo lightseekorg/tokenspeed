@@ -69,6 +69,7 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
     return SimpleNamespace(
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
+        host_group_packing=(),
         num_host_pages=num_host_pages,
         num_snapshot_pages=num_snapshot_pages,
         max_retracted_requests=max_retracted,
@@ -118,6 +119,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
     )
@@ -130,6 +132,22 @@ def test_make_config_requires_and_maps_the_host_write_policy():
     # Mapped as given: the scheduler, not make_config, decides what it runs.
     cfg = make_config(**fields, host_write_policy="write_back")
     assert cfg.host_write_policy == policy.WriteBack
+
+
+@pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])
+def test_prefill_kv_budget_is_translated_to_scheduler_pages(tokens, pages):
+    flags = [] if tokens is None else ["--chunk-prefill-kv-size", str(tokens)]
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.max_kv_page_num == pages
+
+
+@pytest.mark.parametrize("tokens", [0, -1])
+def test_prefill_kv_budget_must_be_positive_when_supplied(tokens):
+    with pytest.raises(ValueError, match="chunk-prefill-kv-size"):
+        ServerArgs(model="x", max_num_seqs=8, chunk_prefill_kv_size=tokens)
 
 
 def test_an_engine_with_l3_passes_its_prefetch_threshold():
@@ -449,6 +467,7 @@ def test_write_back_beside_a_sliding_window_group_starts():
         cache_group_config(spec, total_pages=64, cache_blocks_per_lcm_block=1)
         for spec in group_specs
     ]
+    specs.host_group_packing = (1, 1)
 
     def config(policy: str):
         args = prepare_server_args(
@@ -497,6 +516,7 @@ def test_a_kv_parallel_engine_writes_back_its_sharded_group(role_flags, pool):
             cache_blocks_per_lcm_block=2,
         )
     ]
+    specs.host_group_packing = (2,)
     policies = ts.SchedulerConfig.HostWritePolicy
     for flag, policy in (
         ("write_back", policies.WriteBack),

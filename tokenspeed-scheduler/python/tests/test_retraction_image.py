@@ -59,6 +59,7 @@ def _make_config() -> ts.SchedulerConfig:
             attn_kind=ts.AttnKind.Full,
         )
     ]
+    cfg.host_group_packing = [1]
     return cfg
 
 

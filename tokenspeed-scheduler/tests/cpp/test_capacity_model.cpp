@@ -137,14 +137,14 @@ TEST(CapacityModelTest, L3SizingDoesNotRequireHostPagesBeforeAllocation) {
     sized.host_allocator.total_pages = 9;
     sized.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     sized.storage_config = StorageConfig{8, 64, 4, 16, 64, 4, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};
-    EXPECT_EQ(Scheduler{sized}.MaxSingleRequestTokens(), model.MaxSingleRequestTokens(8));
+    EXPECT_EQ(Scheduler{WithHostPackingFromDevice(sized)}.MaxSingleRequestTokens(), model.MaxSingleRequestTokens(8));
 }
 
 TEST(CapacityModelTest, MatchesTheSchedulerStartupBound) {
     for (const SchedulerConfig& sizing : Sweep()) {
         for (std::int32_t usable_lcm_blocks = 2; usable_lcm_blocks <= 12; ++usable_lcm_blocks) {
             const SchedulerConfig sized = SizedConfig(sizing, usable_lcm_blocks);
-            EXPECT_EQ(Scheduler{sized}.MaxSingleRequestTokens(),
+            EXPECT_EQ(Scheduler{WithHostPackingFromDevice(sized)}.MaxSingleRequestTokens(),
                       CapacityModel{sizing}.MaxSingleRequestTokens(usable_lcm_blocks))
                 << "role=" << static_cast<int>(sizing.role) << " chunk=" << sizing.max_scheduled_tokens
                 << " decode=" << sizing.decode_input_tokens << " overlap=" << sizing.overlap_schedule_depth

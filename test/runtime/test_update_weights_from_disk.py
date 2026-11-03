@@ -124,6 +124,8 @@ def _device_handle(runner, drafter=None) -> DeviceHandle:
         model_runner=runner, drafter=drafter, complete_pending_drafting=lambda: None
     )
     handle._l2 = None
+    # No memory saver: weight loads skip the validity state.
+    handle._weight_memory = None
     return handle
 
 

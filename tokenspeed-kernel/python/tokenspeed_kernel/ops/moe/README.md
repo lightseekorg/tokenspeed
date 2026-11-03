@@ -70,8 +70,10 @@ Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
-tree. FlashInfer can share mutable include-directory storage across native
-modules, so a module loaded later must not redirect private kernel compilation.
+tree. FlashInfer shares one mutable include-directory store across native
+modules, so the private modules use their own: a module loaded later must not
+redirect private kernel compilation, and a private module must not redirect the
+installed module's cold compilation to patched headers.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
@@ -108,6 +110,34 @@ back, data that earlier kernels left in L2, which would otherwise fill the
 pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
 reads the expert offsets once into shared memory while its barriers are set up,
 and fills the lookup table per expert instead of searching per tile.
+
+### Fused SM90 gated FC1
+
+The private `optimized` mode fuses eligible block-FP8 SwiGLU calls with
+hidden size 512, intermediate size 1024, at most 256 input rows, and an
+`expected_m` value that is positive and less than 32. Bias, LoRA, AWQ,
+min-latency mode, and a separate FC2 FP8 quantization scale retain their
+existing paths. The supported paired tile has 128 output channels per half and
+at most 32 token rows; other shapes retain the existing execution path.
+
+A paired tile computes matching gate/up blocks and applies SwiGLU and 1x128
+FP8 quantization before writing its output. Both existing BF16 rounding points
+are preserved: after FC1 accumulation and after SwiGLU. FC2 consumes the dense
+FP8 buffer and padded scales directly. Its BF16 output uses separate workspace,
+and the input descriptor is bounded by the current invocation's capacity.
+
+With `enable_pdl=True`, only the fused FC1 and its FC2 launch as programmatic
+dependents; other grouped GEMMs stay stream-ordered, as upstream. The matching
+eight-stage FC2 can load its first weight tile and weight scales into shared
+memory before waiting for FC1. FC1 triggers dependents only after its own
+dependency wait and writes neither routing metadata nor weights; activation
+and activation-scale reads remain after the dependency wait.
+`enable_pdl=False` keeps all grouped launches ordered and disables this
+first-tile prefetch.
+
+Prepare and warm the callable before graph capture. Fusion and prefetch variants
+have distinct content-keyed kernel caches, and route metadata is refreshed on
+replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
@@ -396,7 +426,7 @@ groups, the top 8 experts of the kept groups, their unbiased scores renormalized
   least one row, a scale that rounds to a finite zero or normal FP32). It
   launches as a programmatic dependent where `pdl_enabled()`.
 
-Beam calls the Triton kernel on NVIDIA SM100 to SM103 where the guard admits the
+Beam calls the Triton kernel on NVIDIA SM90 to SM103 where the guard admits the
 call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
@@ -425,3 +455,124 @@ over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
+
+## NVFP4 MegaMoE for Qwen3.5
+
+The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and
+Kimi K3 SiTU. Gated SiLU selects the existing kernel epilogue with both SiTU
+parameters set to `None`. BF16 inputs are quantized and staged with routing
+directly into the symmetric workspace in one kernel, including masking unused
+capacity rows. BF16 staging rejects routing tensors whose row counts differ
+from the live activation count before launching the staging kernel.
+Prequantized packed E2M1 inputs with linear E4M3 block scales
+remain supported for existing callers. `get_runner` requires an explicit
+`prequantized=True` for packed NVFP4 inputs (including direct workspace writes),
+or `prequantized=False` for fused BF16 quantization and staging.
+Input format is part of the runner's
+tuning key, and calibrated input scales stay runtime tensors across graph replay;
+weights are converted once to interleaved gate/up rows and blocked scales.
+Gate/up global weight scales must match. The adapter currently targets
+SM100/SM103 and requires MoE TP=1.
+
+Qwen3.5 uses precomputed Qwen top-k and a separate, fully replicated shared
+expert with its original sigmoid gate. Select
+`--moe-backend mega_moe --all2all-backend none` with NVFP4 routed weights,
+MoE TP=1 and EP>1. Attention rows must already be scattered before the MoE,
+for example DP4/TP2/EP8 or DP8/TP1/EP8. Layouts with attention TP equal to
+MoE TP*EP (including TP8/EP8) are rejected before weights are constructed.
+The common communication manager handles input and final normalization and
+row gathering; the model needs no additional all-reduce bypass or row slicing.
+
+`Qwen3_5MoeSparseMoeBlock` checks MegaMoE options during construction: EPLB, redundant experts, nontrivial placement
+and external all-to-all backends are unsupported. The NVFP4 weight adapter
+checks MoE TP=1. Weight dtype, activation and
+hardware compatibility are checked by the common MoE kernel planner.
+
+All ranks, including empty token owners, must enter the expert call with the
+same capacity. Existing runner warmup and autotuning reserve the workspace
+before graph capture; returned outputs alias that workspace. Shared experts
+run independently on the existing auxiliary stream during CUDA graph capture
+and replay, overlapping routed experts; the streams join before applying the
+shared sigmoid gate and gathering rows. Warmup retains serialized execution
+so kernel tuning and compilation finish before capture.
+
+Run the kernel regression on Blackwell, for example:
+
+```bash
+PYTHONPATH="tokenspeed-kernel/test:$PYTHONPATH" torchrun --standalone --nproc-per-node=2 \
+  tokenspeed-kernel/test/nvidia/ops/moe/test_trtllm_mega_moe.py \
+  --activation silu --input-format bf16 --intermediate-size 192 --capacity 8 --tokens 5
+```
+
+Repeat with `--input-format nvfp4` to cover prequantized inputs, and with
+`--autotune` for tactic coverage. The test compares a dequantized
+reference, uneven/idle ranks, graph replay and alternating capacities.
+
+`test_trtllm_mega_moe_input_stage.py` separately checks byte-exact packed data
+and scales against FlashInfer quantization, INT32/INT64 route inputs and outputs,
+zero-token owners, changing live counts and alternating captured graphs on the
+same workspace, with a compile guard across changing live counts.
+The stager converts route IDs and scores to their destination buffer dtypes
+and keys compiled specializations by all input and output dtypes; current
+MegaMoE workspaces store INT32 IDs.
+
+Qwen3.5 follows K3's empty-owner path: gate, top-k, quantization and shared
+expert work are skipped when there are no local tokens, but the rank still
+participates in the collective MegaMoE call. Nonempty ranks use normal tuning;
+the model does not disable GEMM tuning for uneven batches.
+
+MegaMoE reserves scratch for all candidate tactics before CUDA graph capture,
+whether tactic autotuning is enabled or disabled. With tuning disabled,
+`forward()` selects the original capacity-based default; enabling
+`MEGAMOE_TACTIC_AUTOTUNE=1` searches the candidates. The candidate set excludes
+FC2 write-back tactics. Token capacity and persistent addresses do not change,
+and launches with an unreserved tactic or capacity are rejected.
+
+The temporary full-capacity workspace experiment reserves the configured maximum
+per-rank token capacity before capture, including the prefill ceiling (8192 in
+the capacity test) and the MTP verification batch (64 requests times 4 tokens).
+This follows the serving-capacity allocation policy of vLLM's MegaMoE buffer;
+the CuTe kernel retains its own layouts and alignment. Each forward executes
+one collective with no 128-token chunk loop. All layers and captured capacities
+continue to share stable workspace addresses. Kimi K3 writes packed activations
+and routes directly into views of this full-capacity symmetric allocation.
+
+## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
+
+On Blackwell with one TP8 group shared by attention and MoE, a decode forward
+(speculative verify included) of 1-8, 16, 32, or 64 token rows that a captured
+decode graph runs takes every MoE layer through one chain of vendored CuTe DSL
+kernels (`thirdparty/cute_dsl/k3_decode`).
+The kernels hand rows to each other through Lamport mailboxes in multicast
+symmetric memory instead of NCCL collectives:
+
+1. One GEMM computes this rank's 112 router logits and 448 latent-down rows
+   and multicasts both to every rank.
+2. One kernel takes the top-16 experts (sigmoid plus correction bias,
+   renormalized, scaled) and gathers the full latent row.
+3. Persistent MXFP4 experts compute this rank's intermediate slice of the
+   chosen experts and combine them into a weighted latent partial.
+4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
+   this rank's up-projection rows, adds the shared expert (run on a side
+   stream), and multicasts the output row.
+5. A ring kernel adds that row to the residual.
+
+Activations enter the experts as MXFP8, as in the TRT-LLM MoE. The routed SiTU
+uses the approximate `tanh`; the shared expert's is exact. A mailbox reader
+re-arms what it read, so the chain needs no separate reset and replays in a
+CUDA graph. Every rank must run the same batches, since each mailbox is shared
+by the group. Other row counts and every non-decode forward keep the TRT-LLM
+MoE.
+
+Three places decide where the chain runs. The Kimi-K3 MoE execution plan
+allows it for one tensor-parallel group shared by attention and MoE on
+Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
+`cutlass` import, so any platform can ask) declares what the kernels serve: TP8
+MXFP4 experts behind an ungrouped sigmoid top-16 router over 896 experts, a
+linear SiTU cap, a BF16 router, PDL enabled, and no batch-invariant reduction.
+The model then binds it where both hold for every MoE layer, the node decodes
+(not a prefill-only disaggregated role), the group has multicast, and the
+decode graphs run a supported row count. Under speculative decoding the
+shared expert uses the splits tuned for verify steps. Each MoE layer keeps a contiguous copy
+of its router rows and latent-down shard (about 7.7 MiB per layer at TP8)
+beside the mailboxes and scratch.

@@ -53,7 +53,9 @@ def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
     return gl.tensor(output.handle, acc.type)
 
 
-def select_kv_splits(*, base_ctas: int, num_pages: int, sm_count: int) -> int:
+def select_kv_splits(
+    *, base_ctas: int, num_pages: int, sm_count: int, max_splits: int = MAX_KV_SPLITS
+) -> int:
     """Pick num_kv_splits to balance occupancy against reduce overhead.
 
     The launch grid is base_ctas * num_kv_splits work-groups. Too few splits
@@ -65,11 +67,15 @@ def select_kv_splits(*, base_ctas: int, num_pages: int, sm_count: int) -> int:
     pages per split), with the pages candidate clamped to [min_page_splits,
     max_page_splits] so a short context still splits without launching empty work
     and a long one does not over-split where reduce cost outgrows the decode win.
+
+    max_page_splits is max_splits, which defaults to MAX_KV_SPLITS, the bound
+    the runtime-count reduce kernels support; a caller whose reduce takes the
+    split count as a constexpr may raise it.
     """
     wave_target = 2
     min_pages_per_split = 2
     min_page_splits = 8
-    max_page_splits = MAX_KV_SPLITS
+    max_page_splits = max_splits
 
     target_ctas = sm_count * wave_target
     splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas

@@ -97,6 +97,7 @@ class HostTransferGeometry:
     device_rows: torch.Tensor | None
     layer_slices: tuple[LayerSlice, ...]
     group_packing: tuple[int, ...]
+    host_group_packing: tuple[int, ...]
     host_lcm_block_bytes: int
     num_host_lcm_blocks: int
     num_device_lcm_blocks: int
@@ -125,7 +126,7 @@ class HostTransferGeometry:
         return self.num_device_lcm_blocks * self.group_packing[group_index]
 
     def max_host_block_id(self, group_index: int) -> int:
-        return self.num_host_lcm_blocks * self.group_packing[group_index]
+        return self.num_host_lcm_blocks * self.host_group_packing[group_index]
 
     def bind(
         self,
@@ -231,6 +232,7 @@ def build_host_transfer_geometry(
     rows: Sequence[GeometryRow],
     layer_slices: Sequence[LayerSlice],
     group_packing: Sequence[int],
+    host_group_packing: Sequence[int],
     host_lcm_block_bytes: int,
     num_host_lcm_blocks: int,
     num_device_lcm_blocks: int,
@@ -248,7 +250,9 @@ def build_host_transfer_geometry(
             reserved, whereas Host blocks are packed without a reserved slot.
         layer_slices: Contiguous ``(row_offset, row_count)`` slices covering
             all field rows in consumer order. Empty consumers have zero rows.
-        group_packing: Positive cache-block counts per LCM block, by group.
+        group_packing: Device cache-block counts per LCM block, by group.
+        host_group_packing: Compact Host cache-block counts per LCM block,
+            in the same group order. Host packing can differ from Device.
         host_lcm_block_bytes: Byte stride of a packed Host LCM block.
         num_host_lcm_blocks: Host LCM capacity used to bound dynamic block IDs.
         num_device_lcm_blocks: Device LCM capacity, excluding reserved block
@@ -274,12 +278,16 @@ def build_host_transfer_geometry(
         raise ValueError("num_device_buffers must be positive")
     if any(packing <= 0 for packing in group_packing):
         raise ValueError("group_packing entries must be positive")
+    if len(host_group_packing) != len(group_packing):
+        raise ValueError("Host and Device packing must cover the same groups")
+    if any(packing <= 0 for packing in host_group_packing):
+        raise ValueError("host_group_packing entries must be positive")
 
     for row_index, row in enumerate(rows):
         _validate_geometry_row(
             row,
             row_index=row_index,
-            group_packing=group_packing,
+            group_packing=host_group_packing,
             num_device_buffers=num_device_buffers,
             host_lcm_block_bytes=host_lcm_block_bytes,
         )
@@ -305,6 +313,7 @@ def build_host_transfer_geometry(
         device_layer_slices=None,
         layer_slices=tuple(layer_slices),
         group_packing=tuple(group_packing),
+        host_group_packing=tuple(host_group_packing),
         host_lcm_block_bytes=int(host_lcm_block_bytes),
         num_host_lcm_blocks=int(num_host_lcm_blocks),
         num_device_lcm_blocks=int(num_device_lcm_blocks),

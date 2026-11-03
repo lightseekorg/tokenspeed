@@ -42,7 +42,6 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,7 +51,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3DecoderLayer,
     DeepseekV3DraftAttentionMLA,
     DeepseekV3ForCausalLM,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +89,6 @@ class DeepseekModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -123,7 +121,6 @@ class DeepseekModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if ctx.forward_mode.is_idle():
@@ -134,10 +131,7 @@ class DeepseekModelNextN(nn.Module):
         else:
             if captured_hidden_states is None:
                 raise ValueError("DeepSeek NextN requires captured_hidden_states.")
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+            hidden_states = self.embed_tokens(input_ids)
             fused = torch.cat(
                 (
                     self.enorm(hidden_states),
@@ -451,27 +445,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         super().end_weight_update()
 
     def post_load_weights(self):
-        self_attn = self.model.decoder.self_attn
-        if (
-            hasattr(self.quant_config, "weight_block_size")
-            and (self.quant_config.weight_block_size is not None)
-            and self_attn.kv_b_proj.weight.dtype
-            in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            )
-        ):
-            weight_block_size = self.quant_config.weight_block_size
-            dtype = torch.get_default_dtype()
-            w = block_dequant(
-                self_attn.kv_b_proj.weight,
-                self_attn.kv_b_proj.weight_scale_inv,
-                weight_block_size,
-            ).to(dtype)
-        else:
-            w = self_attn.kv_b_proj.weight
-
-        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
+        absorb_mla_kv_b_proj(self.model.decoder.self_attn)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

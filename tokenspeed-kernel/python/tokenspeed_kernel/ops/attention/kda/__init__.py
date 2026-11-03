@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import math
 from dataclasses import dataclass
 
@@ -759,7 +760,9 @@ def kda_replay_commit_supported(
 # isort: off
 import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.vllm_recoverssm  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
+
+if importlib.util.find_spec("flash_kda") is not None:
+    import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 

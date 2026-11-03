@@ -932,6 +932,49 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
             )
 
 
+def test_commit_tables_do_not_synchronize_with_the_device(device: str) -> None:
+    """The Inkling backend builds the tables on its first verify round, behind
+    the step in flight: uploading them must not wait for the stream."""
+    layers, pages = 2, 4
+    ring = torch.zeros(layers, 6, R, 24, device=device, dtype=DTYPE)
+    planes = torch.zeros(pages, layers, W - 1, 8, device=device, dtype=DTYPE)
+    hidden = torch.zeros(pages, layers, W - 1, 16, device=device).to(torch.float8_e5m2)
+    streams = [
+        entry
+        for layer in range(layers)
+        for entry in (
+            (layer, 0, 0, (planes[:, layer],)),
+            (layer, 8, 1, (hidden[:, layer],)),
+        )
+    ]
+    torch.cuda.synchronize()
+    # Hold the stream behind a long kernel: an upload that waits for it
+    # returns only after the kernel finished.
+    torch.cuda._sleep(1 << 30)
+    in_flight = torch.cuda.Event()
+    in_flight.record()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        tables = inkling_commit_tables(ring, streams)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert not in_flight.query()
+    torch.cuda.synchronize()
+
+    assert [table.dtype for table in tables] == [DTYPE, torch.float8_e5m2]
+    bf16, fp8 = tables
+    assert bf16.src_offsets.tolist() == [0, ring.stride(0)]
+    assert fp8.src_offsets.tolist() == [8, ring.stride(0) + 8]
+    assert bf16.widths.tolist() == [8, 8]
+    assert fp8.groups.tolist() == [1, 1]
+    assert bf16.addresses.cpu().tolist() == [
+        planes[:, layer].data_ptr() for layer in range(layers)
+    ]
+    assert bf16.page_strides.tolist() == [planes.stride(0)] * layers
+    assert bf16.row_strides.tolist() == [planes.stride(2)] * layers
+
+
 def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
     """Cross-kernel consistency: a short warm extend served by the prefill
     kernel (checkpoint taps) must produce the same output as the decode

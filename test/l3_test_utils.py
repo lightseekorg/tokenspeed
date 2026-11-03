@@ -231,6 +231,7 @@ def storage_scheduler():
     cfg.prefix_granularity = 2
     cfg.num_device_pages = 32
     cfg.num_host_pages = 8
+    cfg.host_group_packing = [1]
     cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 1
     cfg.max_scheduled_tokens = 8

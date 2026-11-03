@@ -113,6 +113,7 @@ def make_config(
     role: str,
     *,
     num_snapshot_pages: int,
+    host_group_packing: Sequence[int],
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
     host_write_policy: str,
@@ -125,6 +126,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    max_kv_page_num: int = 0,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -146,6 +148,8 @@ def make_config(
             resident instead of suspending anyone; more enables suspend and
             restore on the fused and decode roles (the prefill role refuses a
             pool).
+        host_group_packing: Virtual children per compact Host parent in
+            scheduler group order; empty when both Host pools are absent.
         max_retracted_requests: Slot-state arena rows, hence the most
             requests suspended at once; positive exactly when a pool exists.
             A victim whose image does not fit the Host (L2 pins, pool, rows)
@@ -174,6 +178,10 @@ def make_config(
             spans a long prompt's last prefix-page boundary before its replay
             tail also writes the State checkpoint there. Requires prefix
             caching.
+        max_kv_page_num: Per-local-prefill-batch budget for the sum of
+            ``ceil((cached prefix + current chunk) / prefix_granularity)``
+            across requests. 0 leaves the budget unbounded. Derived from
+            ``--chunk-prefill-kv-size``.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -196,11 +204,14 @@ def make_config(
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
+    if max_kv_page_num:
+        cfg.max_kv_page_num = max_kv_page_num
     cfg.max_batch_size = max_batch_size
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
     cfg.num_snapshot_pages = num_snapshot_pages
+    cfg.host_group_packing = list(host_group_packing)
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.storage_config = storage_config
@@ -270,11 +281,12 @@ def resolve_dspark_prefix_replay_tokens(
 ) -> int:
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
-    DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``; V4.1 advertises zero because its windows are cache
-    resident. Same-checkpoint DSpark configurations without that capability
-    remain fail-closed. External generic DSpark configurations keep their
-    existing scheduler behavior until they advertise an equivalent contract.
+    A same-checkpoint DSpark draft advertises the requirement through its
+    draft ``ModelConfig``; DeepSeek V4.1 advertises zero because its windows
+    are cache resident. Same-checkpoint DSpark configurations without that
+    capability remain fail-closed. External generic DSpark configurations
+    keep their existing scheduler behavior until they advertise an
+    equivalent contract.
     """
 
     if speculative_algorithm != "DSPARK":

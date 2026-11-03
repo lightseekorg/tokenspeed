@@ -5,7 +5,7 @@ operation: optional per-head QK RMSNorm, RoPE (full, partial, or multimodal),
 quantization, and the KV cache write. Models describe which steps apply to a
 `PagedAttention` layer. They never apply its per-head norm, rotate, quantize, or
 write its new K/V rows themselves. An MLA model still normalizes its latent
-and projects its absorbed query before the prologue. DeepSeek-V4 and V4.1
+and projects its absorbed query before the prologue. DeepSeek V4.1
 attention is not a `PagedAttention` layer and keeps its own fused steps over
 its own cache groups.
 

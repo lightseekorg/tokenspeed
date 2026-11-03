@@ -26,6 +26,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.configs.numerics import require_verified_numerics
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.model_update import (
     ModelUpdateAdapter,
     model_update_adapter_for,
@@ -224,6 +227,7 @@ class ModelRunner:
             gpu_id=self.gpu_id,
             memory_saver_adapter=self.memory_saver_adapter,
             checkpoint_load_group=self.checkpoint_load_group,
+            is_draft_worker=self.is_draft_worker,
         )
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
@@ -465,7 +469,9 @@ class ModelRunner:
             # itself and raises at its end; this wrap covers the models that
             # take no session (multimodal wrappers).
             rejected: list[str] = []
-            with weight_update_session([self.model]):
+            with weight_update_session(
+                [self.model], require_complete=False, cpu_group=None
+            ):
                 self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
             torch.cuda.synchronize(device)
             if rejected:
@@ -480,7 +486,7 @@ class ModelRunner:
             return False, str(e)
 
     def update_weights_from_mooncake(
-        self, version: int, models: list[torch.nn.Module]
+        self, version: int, models: list[torch.nn.Module], *, require_complete: bool
     ) -> tuple[bool, str]:
         """Read one committed weight-store version into ``models`` in place.
 
@@ -494,6 +500,8 @@ class ModelRunner:
             version: The committed version to load.
             models: Target first, then the draft when the server's
                 ``--model-update-draft-weights`` is ``refresh``.
+            require_complete: Validate the entire canonical source inventory;
+                required whenever old model weights were discarded.
 
         Returns:
             ``(ok, message)`` for the control plane.
@@ -504,7 +512,13 @@ class ModelRunner:
                 "--model-update-config (target runner only)"
             )
         try:
-            with weight_update_session(models):
+            with weight_update_session(
+                models,
+                require_complete=require_complete,
+                cpu_group=pg_manager.get_process_group(
+                    "gloo", self.mapping.world_group
+                ),
+            ):
                 result = self.model_update.update(models, version)
             torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
             return True, f"applied model version {version}: {result}"
@@ -590,7 +604,9 @@ class ModelRunner:
 
             # Same session and KV-cache scale screen as a distributed load.
             rejected: list[str] = []
-            with weight_update_session([self.model]):
+            with weight_update_session(
+                [self.model], require_complete=False, cpu_group=None
+            ):
                 self.model.load_weights(
                     record_non_unit_kv_scales(
                         _counted(),

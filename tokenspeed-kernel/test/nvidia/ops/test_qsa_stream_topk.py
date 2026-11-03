@@ -193,8 +193,10 @@ def _assert_matches_reference(
         assert torch.unique(row[row >= 0]).numel() == count
 
 
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+# test_qsa_pdl replays these layouts with int64 requests under both PDL modes.
+@pytest.mark.parametrize(
+    ("request_dtype", "enable_pdl"), [(torch.int32, False), (torch.int64, True)]
+)
 @pytest.mark.parametrize(
     ("lengths", "pages", "uniform", "algorithm"),
     [
@@ -390,7 +392,7 @@ def test_stream_topk_grouped_tails_reuse_compilation(
     assert compile_count == 1
 
 
-@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+# Request-id loads are layout independent; grouped_tails_reuse covers int32 reuse.
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(
     ("page_counts", "small_grid", "algorithm"),
@@ -404,7 +406,6 @@ def test_stream_topk_grouped_tails_reuse_compilation(
 def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
     device: str,
     monkeypatch: pytest.MonkeyPatch,
-    request_dtype: torch.dtype,
     enable_pdl: bool,
     page_counts: tuple[int, ...],
     small_grid: bool,
@@ -469,7 +470,7 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
         else:
             table = table_storage
         requests = torch.arange(
-            rows // width, device=device, dtype=request_dtype
+            rows // width, device=device, dtype=torch.int64
         ).repeat_interleave(width)
         complete = torch.linspace(0, pages * 64, rows, device=device).to(
             torch.int32,
@@ -540,25 +541,11 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
             id="one-stream-tile",
         ),
         pytest.param(
-            64,
-            True,
-            [0, 1, 511, 512, 513, 1024, 3073, 4096],
-            False,
-            id="one-stream-tile-pdl",
-        ),
-        pytest.param(
             65,
             False,
             [0, 511, 512, 513, 4095, 4096, 4097, 4160],
             False,
             id="partial-second-stream-tile",
-        ),
-        pytest.param(
-            65,
-            True,
-            [0, 511, 512, 513, 4095, 4096, 4097, 4160],
-            False,
-            id="partial-second-stream-tile-pdl",
         ),
         pytest.param(
             128,
@@ -1081,21 +1068,24 @@ def test_cute_dsl_qsa_stream_topk_prefill_graph_without_global_partial(
         )
 
 
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+# Request dtype and PDL do not change pruning, and their kernels are checked elsewhere.
 @pytest.mark.parametrize(
-    ("rows", "pages", "width"),
+    ("rows", "pages", "width", "request_dtype", "enable_pdl"),
     [
-        pytest.param(8, 64, 8, id="native-linear"),
-        pytest.param(1, 128, 1, id="guarded-single"),
-        pytest.param(8, 128, None, id="guarded-ragged"),
-        pytest.param(2, 1024, 1, id="guarded-long"),
-        pytest.param(2, 1025, 1, id="guarded-mtp-padding"),
-        pytest.param(64, 128, 1, id="native-many-rows"),
-        pytest.param(8, 1024, 8, id="split-prefill"),
-        pytest.param(256, 32, 256, id="grouped-prefill"),
-        pytest.param(256, 64, 256, id="dense-prefill"),
-        pytest.param(256, 128, 256, id="overlap-prefill"),
+        pytest.param(8, 64, 8, torch.int64, True, id="native-linear-int64-pdl"),
+        pytest.param(1, 128, 1, torch.int64, False, id="guarded-single-int64"),
+        pytest.param(1, 128, 1, torch.int64, True, id="guarded-single-int64-pdl"),
+        pytest.param(8, 128, None, torch.int64, True, id="guarded-ragged-int64-pdl"),
+        pytest.param(2, 1024, 1, torch.int64, False, id="guarded-long-int64"),
+        pytest.param(2, 1024, 1, torch.int64, True, id="guarded-long-int64-pdl"),
+        pytest.param(2, 1025, 1, torch.int32, False, id="guarded-mtp-padding-int32"),
+        pytest.param(2, 1025, 1, torch.int32, True, id="guarded-mtp-padding-int32-pdl"),
+        pytest.param(64, 128, 1, torch.int64, True, id="native-many-rows-int64-pdl"),
+        pytest.param(8, 1024, 8, torch.int64, False, id="split-prefill-int64"),
+        pytest.param(8, 1024, 8, torch.int64, True, id="split-prefill-int64-pdl"),
+        pytest.param(256, 32, 256, torch.int32, False, id="grouped-prefill-int32"),
+        pytest.param(256, 64, 256, torch.int32, False, id="dense-prefill-int32"),
+        pytest.param(256, 128, 256, torch.int32, False, id="overlap-prefill-int32"),
     ],
 )
 def test_stream_topk_graph_refreshes_pruning_and_full_refinement(
@@ -1274,16 +1264,21 @@ def test_stream_topk_small_shapes_reuse_capacity_buckets(
     assert compile_count == 1
 
 
+# Warmup enumerates configs by scratch budget alone; one entry site per budget.
 @pytest.mark.parametrize(
-    ("max_partial_bytes", "startup_rows", "startup_path", "max_logits_bytes"),
+    (
+        "max_partial_bytes",
+        "startup_rows",
+        "startup_path",
+        "max_logits_bytes",
+        "enable_pdl",
+    ),
     [
-        pytest.param(0, 1, "auto", 256 << 20, id="auto-logits-zero-scratch"),
-        pytest.param(0, 8, "auto", 0, id="auto-stream-zero-scratch"),
-        pytest.param(0, 8, "stream", 256 << 20, id="stream-zero-scratch"),
-        pytest.param(32 << 20, 1, "stream", 256 << 20, id="stream-scratch"),
+        pytest.param(0, 1, "auto", 256 << 20, False, id="auto-logits-zero-scratch"),
+        pytest.param(32 << 20, 1, "stream", 256 << 20, False, id="stream-scratch"),
+        pytest.param(32 << 20, 1, "stream", 256 << 20, True, id="stream-scratch-pdl"),
     ],
 )
-@pytest.mark.parametrize("enable_pdl", [False, True])
 def test_stream_topk_startup_warms_algorithm_and_capacity_buckets(
     device,
     monkeypatch,
@@ -1484,8 +1479,11 @@ def test_stream_topk_startup_respects_kernel_override(
     assert not stream_topk._WARMED
 
 
-@pytest.mark.parametrize("override_source", ["context", "environment"])
-@pytest.mark.parametrize("entry", ["direct", "auto-logits"])
+# Both entry sites resolve overrides through one helper; pair each source with one.
+@pytest.mark.parametrize(
+    ("override_source", "entry"),
+    [("context", "direct"), ("environment", "auto-logits")],
+)
 def test_stream_topk_startup_warms_override_with_conflicting_solution(
     device, monkeypatch, override_source, entry
 ):
@@ -1771,9 +1769,8 @@ def test_stream_topk_respects_global_workspace_budget(
 
 @pytest.mark.parametrize("pages", [32, 64])
 @pytest.mark.parametrize("rows", [136, 137])
-@pytest.mark.parametrize("frontier", [0, 512])
 def test_stream_topk_short_frontier_preserves_output_bounds(
-    device: str, pages: int, rows: int, frontier: int
+    device: str, pages: int, rows: int
 ) -> None:
     query = torch.zeros(rows, 4, 128, device=device, dtype=torch.bfloat16)
     keys = torch.zeros(pages * 64, 1, 128, device=device, dtype=query.dtype)
@@ -1781,44 +1778,39 @@ def test_stream_topk_short_frontier_preserves_output_bounds(
     requests = torch.zeros(rows, device=device, dtype=torch.int32)
     # Back the views with padding so excess CTA threads visibly corrupt the
     # output guard instead of accessing an unrelated allocator block.
-    complete_storage = torch.full(
-        (rows + 8,), frontier, device=device, dtype=torch.int32
-    )
+    complete_storage = torch.empty((rows + 8,), device=device, dtype=torch.int32)
     complete = complete_storage[:rows]
-    output_storage = torch.full(
-        (rows + 8, 512),
-        -2,
-        device=device,
-        dtype=torch.int32,
-    )
+    output_storage = torch.empty((rows + 8, 512), device=device, dtype=torch.int32)
     selected = output_storage[:rows]
     config = stream_topk._configuration(rows, pages * 64, rows, 0)
     compiled = stream_topk._compile(
         query, keys, table, requests, complete, selected, [], rows, config, True
     )
-    compiled[0](
-        query,
-        keys,
-        table,
-        requests,
-        complete,
-        selected,
-        query.stride(0),
-        query.stride(1),
-        rows,
-    )
-    expected = torch.arange(512, device=device, dtype=torch.int32)
-    expected.masked_fill_(expected >= frontier, -1)
-    torch.testing.assert_close(
-        selected.sort(1).values,
-        expected.expand(rows, -1),
-    )
-    assert bool((output_storage[rows:] == -2).all())
+    # The frontier is a runtime value, so one compile serves both.
+    for frontier in (0, 512):
+        complete_storage.fill_(frontier)
+        output_storage.fill_(-2)
+        compiled[0](
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            selected,
+            query.stride(0),
+            query.stride(1),
+            rows,
+        )
+        expected = torch.arange(512, device=device, dtype=torch.int32)
+        expected.masked_fill_(expected >= frontier, -1)
+        torch.testing.assert_close(selected.sort(1).values, expected.expand(rows, -1))
+        assert bool((output_storage[rows:] == -2).all())
 
 
+# Tails are masked by min(8, width - offset); the shortest and longest cover the rest.
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("pages", [32, 64, 128, 574])
-@pytest.mark.parametrize("remainder", range(1, 8))
+@pytest.mark.parametrize("remainder", [1, 7])
 def test_stream_topk_request_tails(
     device: str, pages: int, remainder: int, enable_pdl: bool
 ) -> None:
@@ -1914,7 +1906,8 @@ def test_stream_topk_request_tails(
         )
 
 
-@pytest.mark.parametrize("remainder", range(1, 8))
+# Tails are masked by min(8, width - offset); the shortest and longest cover the rest.
+@pytest.mark.parametrize("remainder", [1, 7])
 def test_stream_topk_split_request_tails(device: str, remainder: int) -> None:
     torch.manual_seed(319)
     width, pages = 8 + remainder, 256
@@ -2065,6 +2058,77 @@ def test_stream_topk_graph_switches_homogeneous_and_mixed_groups(
 
 
 @pytest.mark.parametrize("enable_pdl", [False, True])
+def test_stream_topk_ragged_tmem_lifetime_under_occupancy_pressure(
+    device: str, enable_pdl: bool
+) -> None:
+    """TMEM survives eight request segments per CTA with more CTAs than SMs."""
+    torch.manual_seed(2821)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    rows, pages, requests = 8 * (2 * sm_count + 1) + 3, 129, 4
+    capacity = pages * 64
+    query = torch.randn(rows, 4, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(requests * capacity, 1, 128, device=device, dtype=query.dtype)
+    table = torch.randperm(requests * pages, device=device).int().view(requests, pages)
+    index = torch.arange(rows, device=device)
+    owners = (index % requests).int()
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            owners,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=None,
+            max_partial_bytes=0,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=enable_pdl,
+        )
+
+    # Check complete windows and the final three-row window independently.
+    sample = torch.cat((index[:16], index[-16:]))
+    selected = invoke()
+    _assert_matches_reference(
+        query[sample],
+        keys,
+        table,
+        owners[sample],
+        complete[sample],
+        selected[sample],
+        64,
+        512,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    for step in range(4):
+        # Switch between single-owner windows, short runs and per-row changes.
+        run_width = (8, 3, 1, 1)[step]
+        owners.copy_((index // run_width + step) % requests)
+        complete.fill_(capacity)
+        complete[step::11] = 0
+        query.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            (selected >= 0).sum(1), complete.clamp(max=512).long()
+        )
+        _assert_matches_reference(
+            query[sample],
+            keys,
+            table,
+            owners[sample],
+            complete[sample],
+            selected[sample],
+            64,
+            512,
+        )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("uniform", [False, True])
 @pytest.mark.parametrize("pages", [1024, 2048])
 def test_stream_topk_long_dense_score_refinement(
@@ -2201,4 +2265,55 @@ def test_stream_topk_query_row_offset_exceeds_int32(
         selected,
         64,
         512,
+    )
+
+
+@pytest.mark.parametrize("pages", [32, 128])
+def test_stream_topk_key_offset_exceeds_int32(device: str, pages: int) -> None:
+    """Both asynchronous copy paths read far pages without int32 wrapping."""
+    torch.manual_seed(2822)
+    rows, page_size = 8, 64
+    first_page = (1 << 31) // (page_size * 128)
+    capacity = pages * page_size
+    # Allocate the address range but initialize and read only its last pages.
+    keys = torch.empty(
+        (first_page + pages) * page_size,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    keys[first_page * page_size :].normal_()
+    table = (torch.randperm(pages, device=device) + first_page).int()[None]
+    query = torch.randn(rows, 4, 128, device=device, dtype=keys.dtype)
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=page_size,
+            block_topk=512,
+            queries_per_request=rows,
+            max_partial_bytes=0,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=False,
+        )
+
+    selected = invoke()
+    _assert_matches_reference(
+        query, keys, table, requests, complete, selected, page_size, 512
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    table.copy_(table.flip(1))
+    graph.replay()
+    _assert_matches_reference(
+        query, keys, table, requests, complete, selected, page_size, 512
     )

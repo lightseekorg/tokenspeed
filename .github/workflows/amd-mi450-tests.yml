@@ -15,7 +15,7 @@ on:
       - "test/**"
       - ".github/workflows/amd-mi450-tests.yml"
       - ".github/workflows/nvidia-b200-tests.yml"
-      - ".github/workflows/pr-test-nvidia-arm.yml"
+      - ".github/workflows/nvidia-arm-tests.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -30,7 +30,7 @@ on:
       - "test/**"
       - ".github/workflows/amd-mi450-tests.yml"
       - ".github/workflows/nvidia-b200-tests.yml"
-      - ".github/workflows/pr-test-nvidia-arm.yml"
+      - ".github/workflows/nvidia-arm-tests.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
     inputs:
@@ -54,7 +54,7 @@ env:
 
 concurrency:
   group: pr-test-amd-mi450-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   scan:

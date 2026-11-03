@@ -170,7 +170,10 @@ class _WindowAttention:
         swa_norm_weight,
         swa_norm_eps,
         out_rope_cache=None,
+        key_rows,
     ):
+        if key_rows is not None:
+            raise ValueError("DSpark window attention does not accept query sharding")
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
         kv = self._workspace(
@@ -286,7 +289,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         self.target_layer_ids = taps
         self.hidden_size = config.hidden_size
         self.noise_token_id = config.dspark_noise_token_id
-        self.window_size = config.sliding_window
         self.attention_params = {"head_dim": config.head_dim}
         self.main_proj = _replicated(
             len(taps) * config.hidden_size,
