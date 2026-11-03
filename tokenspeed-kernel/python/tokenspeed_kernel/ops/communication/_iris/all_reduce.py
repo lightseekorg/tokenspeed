@@ -2408,6 +2408,9 @@ def iris_lamport_twoshot_rs_wait_reduce(
     own,
     offsets,
     valid,
+    launch,
+    on_expiry: gl.constexpr,
+    SITE: gl.constexpr,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     MAX_SHARD_ELEMENTS: gl.constexpr,
@@ -2416,13 +2419,18 @@ def iris_lamport_twoshot_rs_wait_reduce(
     """Wait for every peer's part of this rank's shard at offsets and reduce.
 
     own is this rank's part. Returns the FP32 sum in rank order rounded once
-    to BF16 (the one-shot result), with negative zero sent as zero.
+    to BF16 (the one-shot result), with negative zero sent as zero. With
+    ``on_expiry`` (not None) the wait stops at ``launch``'s deadline or abort
+    (iris_wait_lamport_slots).
     """
     PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
-    scattered = _iris_wait_lamport_slots(
+    scattered = iris_wait_lamport_slots(
         region_sym_ptr + stage * (2 * PHASE),
         offsets,
         valid,
+        launch,
+        on_expiry,
+        SITE,
         RANK,
         WORLD_SIZE,
         MAX_SHARD_ELEMENTS,
@@ -2600,6 +2608,9 @@ def iris_lamport_twoshot_bf16_allreduce(
         chunks[0],
         offsets,
         valid,
+        None,
+        None,
+        0,
         RANK,
         WORLD_SIZE,
         MAX_SHARD_ELEMENTS,

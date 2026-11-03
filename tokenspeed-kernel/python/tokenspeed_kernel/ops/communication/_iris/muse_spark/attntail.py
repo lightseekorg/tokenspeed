@@ -28,9 +28,9 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sanitize_lamport_bf16,
     _iris_sanitize_lamport_bf16x2,
     _iris_subgroup_any,
-    _iris_wait_lamport_slots,
     iris_lamport_twoshot_ag_push,
     iris_lamport_twoshot_rs_wait_reduce,
+    iris_wait_lamport_slots,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -513,12 +513,29 @@ _ATT_BOX_EMPTY = gl.constexpr(0x80008000)
 
 @gluon.jit
 def _muse_attntail_wait_box(box_ptr, offsets, valid, LAYOUT: gl.constexpr):
+    """muse_attntail_wait_box without a deadline."""
+    return muse_attntail_wait_box(box_ptr, offsets, valid, None, None, 0, LAYOUT)
+
+
+@gluon.jit
+def muse_attntail_wait_box(
+    box_ptr,
+    offsets,
+    valid,
+    launch,
+    on_expiry: gl.constexpr,
+    SITE: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
     """Wait for this rank's BF16 words at offsets of a local Lamport mailbox.
 
-    The mailbox is _iris_wait_lamport_slots' one-source case: rank 1 of 2
-    polls source 0's slot at box_ptr.
+    The mailbox is iris_wait_lamport_slots' one-source case: rank 1 of 2
+    polls source 0's slot at box_ptr. With ``on_expiry`` (not None) the
+    wait stops at ``launch``'s deadline or abort.
     """
-    return _iris_wait_lamport_slots(box_ptr, offsets, valid, 1, 2, 8, LAYOUT)[0]
+    return iris_wait_lamport_slots(
+        box_ptr, offsets, valid, launch, on_expiry, SITE, 1, 2, 8, LAYOUT
+    )[0]
 
 
 @gluon.jit
@@ -845,6 +862,9 @@ def muse_attntail_own(
     POST_HAS_WEIGHT: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     CLEAR_NEXT_STAGE: gl.constexpr,
+    launch,
+    on_expiry: gl.constexpr,
+    SITE: gl.constexpr,
 ):
     """Reduce this rank's columns [owner * OWNER_COLUMNS, ...) of its column
     shard and publish them with their norm sums.
@@ -853,8 +873,9 @@ def muse_attntail_own(
     markers of every source's reduce-scatter slot for these columns in
     stage + 2 (written through), which a peer writes again only two launches
     on; a two-copy caller clears its areas at entry instead. ``program``
-    picks the first peer of the pushes (see _iris_lamport_push). Then waits
-    for all WORLD_SIZE sources
+    picks the first peer of the pushes (see _iris_lamport_push). With
+    ``on_expiry`` (not None) its waits stop at ``launch``'s deadline or
+    abort. Then waits for all WORLD_SIZE sources
     and sums them in rank order with one BF16 rounding
     (iris_lamport_twoshot_rs_wait_reduce), pushes b to every rank's
     all-gather slot RANK (its own included) and, per row, four FP32 norm sums
@@ -906,12 +927,14 @@ def muse_attntail_own(
     else:
         post = gl.full(columns.shape, 1.0, gl.float32, layout)
     valid = row < rows
-    own = _muse_attntail_wait_box(
-        region + stage * (2 * PHASE) + RANK * MAX_SHARD_ELEMENTS, offsets, valid, layout
-    )
+    own = muse_attntail_wait_box(
+        region + stage * (2 * PHASE) + RANK * MAX_SHARD_ELEMENTS, offsets, valid,
+        launch, on_expiry, SITE, layout,
+    )  # fmt: skip
     b = iris_lamport_twoshot_rs_wait_reduce(
-        region, stage, own, offsets, valid, RANK, WORLD_SIZE, MAX_SHARD_ELEMENTS, layout
-    )
+        region, stage, own, offsets, valid, launch, on_expiry, SITE, RANK,
+        WORLD_SIZE, MAX_SHARD_ELEMENTS, layout,
+    )  # fmt: skip
     iris_lamport_twoshot_ag_push(
         b,
         peers,
@@ -1312,6 +1335,9 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
             POST_HAS_WEIGHT,
             PEER_SIGNAL_STORE_CACHE,
             True,
+            None,
+            None,
+            0,
         )
     elif program < ATTENTION + SENDERS + OWNERS + rows * PARTS:
         index = program - ATTENTION - SENDERS - OWNERS

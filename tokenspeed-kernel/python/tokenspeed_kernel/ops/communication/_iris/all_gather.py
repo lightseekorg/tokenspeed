@@ -47,6 +47,7 @@ if current_platform().is_cdna4:
         _mxfp4_store_cdna4_scale,
         scaled_downcast_layout,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import poll_check, poll_stop_site
 
 
 class IrisAllGather:
@@ -560,13 +561,18 @@ def iris_lamport_allgather_wait(
     peer_words: gl.constexpr,
     CLEAR: gl.constexpr,
     POLL_OWN: gl.constexpr,
+    launch,
+    on_expiry: gl.constexpr,
+    SITE: gl.constexpr,
 ):
     """Wait for every peer's shard of one row; returns the row's uint32 BF16
     pairs [total_width // 1024, 64, 8] (lane L holds columns 1024k + 16L +
     [0, 16)). This rank's own shard comes from ``local_words``, or with
     POLL_OWN from its own mailbox slot (a producer on another workgroup
     pushed it there). With CLEAR, restores the consumed packs; a two-copy
-    caller clears its areas at entry instead."""
+    caller clears its areas at entry instead. With ``on_expiry`` (not None)
+    the wait stops at ``launch``'s deadline or abort and calls
+    ``on_expiry(launch, site, 0)``."""
     # With several waves every wave polls the same words (replicated
     # layouts), so a wave's clear could race another's poll.
     gl.static_assert(not CLEAR or gl.num_warps() == 1)
@@ -604,11 +610,30 @@ def iris_lamport_allgather_wait(
         mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
     )
     missing = remote & (gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0)
-    while _iris_subgroup_any(gl.max(missing.to(gl.int32), 0)):
-        incoming = gl.amd.cdna4.buffer_load(
-            mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
-        )
-        missing = remote & (gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0)
+    if on_expiry is None:
+        while _iris_subgroup_any(gl.max(missing.to(gl.int32), 0)):
+            incoming = gl.amd.cdna4.buffer_load(
+                mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
+            )
+            missing = remote & (
+                gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0
+            )
+    else:
+        start = gl.to_tensor(0).to(gl.int64)
+        retries = 0
+        stop = retries < 0
+        while _iris_subgroup_any(gl.max(missing.to(gl.int32), 0)) & (not stop):
+            incoming = gl.amd.cdna4.buffer_load(
+                mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
+            )
+            missing = remote & (
+                gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0
+            )
+            retries += 1
+            if retries % 64 == 0:
+                stop, start = poll_check(launch, start, retries, False)
+        if stop:
+            on_expiry(launch, poll_stop_site(launch, SITE), 0)
     if CLEAR:
         gl.amd.cdna4.buffer_store(
             gl.full_like(incoming, 0x80000000),
@@ -747,7 +772,7 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     )  # fmt: skip
     words = iris_lamport_allgather_wait(
         region, local_words, row_words, stages, rank, WORLD_SIZE, local_width,
-        total_width, stage_words, peer_words, True, False,
+        total_width, stage_words, peer_words, True, False, None, None, 0,
     )  # fmt: skip
     iris_rmsnorm_mxfp4_row(
         words, row, norm_weights, packed_output, scale_output, total_width, eps,
