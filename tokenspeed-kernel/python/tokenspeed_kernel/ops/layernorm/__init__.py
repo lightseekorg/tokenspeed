@@ -67,6 +67,12 @@ else:
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
         fused_add_rmsnorm as _fused_add_rmsnorm,
     )
+    from tokenspeed_kernel.ops.layernorm.flashinfer import (
+        gemma_fused_add_rmsnorm as _gemma_fused_add_rmsnorm,
+    )
+    from tokenspeed_kernel.ops.layernorm.flashinfer import (
+        gemma_rmsnorm as _gemma_rmsnorm,
+    )
     from tokenspeed_kernel.ops.layernorm.flashinfer import rmsnorm as _rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm as _qk_rmsnorm
 
@@ -112,6 +118,58 @@ def rmsnorm(
             raise ValueError("rmsnorm does not support residual and out together")
         return _rmsnorm(x, weight, eps, residual=residual)
     return _rmsnorm(x, weight, eps, out=out)
+
+
+def _rows(t: torch.Tensor) -> torch.Tensor:
+    # [M, N] rows with dense columns as they are (a column slice of a fused
+    # projection stays a view); other layouts as a [rows, N] view or copy.
+    if t.ndim == 2 and t.stride(-1) == 1:
+        return t
+    return t.reshape(-1, t.shape[-1])
+
+
+def gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Apply Gemma RMSNorm (multiplier ``1 + weight``) over the last dimension.
+
+    Args:
+        x: GPU input shaped ``[..., hidden_size]``.
+        weight: Gemma checkpoint weight offset shaped ``[hidden_size]``.
+        eps: Epsilon added to the mean of squares.
+        residual: Optional ``x``-shaped residual stream. When given, the FP32
+            sum ``x + residual`` is normalized and its rounded copy becomes the
+            new residual; both results are written in place where the layouts
+            allow (dense rows), as FlashInfer's ``gemma_fused_add_rmsnorm`` does.
+
+    Returns:
+        The normalized tensor, or ``(normalized, new_residual)`` with ``residual``.
+    """
+    if _platform.is_amd:
+        if residual is None:
+            return _grouped_gemma_rmsnorm(x, weight, int(x.shape[-1]), eps, out=None)
+        x_rows, residual_rows = _rows(x), _rows(residual)
+        add_rmsnorm(
+            x_rows,
+            residual_rows,
+            weight,
+            eps,
+            x2=None,
+            out=x_rows,
+            out_fp8=None,
+            fp8_scale=None,
+            out_fp4=None,
+            fp4_scale=None,
+            gemma=True,
+        )
+        return x_rows.view(x.shape), residual_rows.view(residual.shape)
+    if residual is not None:
+        _gemma_fused_add_rmsnorm(x, residual, weight, eps)
+        return x, residual
+    return _gemma_rmsnorm(x, weight, eps)
 
 
 def qk_rmsnorm(
@@ -293,6 +351,7 @@ __all__ = [
     "affine_rmsnorm",
     "gated_residual_combine_norm",
     "gated_rmsnorm",
+    "gemma_rmsnorm",
     "grouped_gemma_rmsnorm",
     "grouped_rmsnorm",
     "nvfp4_copy_supported",
