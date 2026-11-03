@@ -589,7 +589,8 @@ class MuseSparkFusedDecoderLayer:
                 prologue.cache.slots.shape[0],
                 1.0 if scales is None else 1.0 / scales.k,
                 1.0 if scales is None else 1.0 / scales.v,
-                residual,
+                # The normed output is the regular next layer's; unused here.
+                state.dummies["bf16"],
             )  # fmt: skip
         else:
             next_q = next_gate = None
