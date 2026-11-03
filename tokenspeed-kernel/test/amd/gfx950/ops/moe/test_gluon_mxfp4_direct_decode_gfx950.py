@@ -663,6 +663,7 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         sorted_routes,
         descriptors,
         group_count,
+        descriptors.shape[0],
         output,
         INTERMEDIATE=INTERMEDIATE,
         OUTPUT=HIDDEN,
