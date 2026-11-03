@@ -46,6 +46,47 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can increase cross-rank
 skew and regress performance even when the generated kernel remains correct.
 
+## Persistent kernels (gfx950)
+
+`gfx950/persistent/` holds device helpers for kernels that keep one
+workgroup on every CU for the whole launch and hand work between workgroups
+through memory instead of kernel boundaries.
+
+#### Contract
+
+- The kernel is a plain launch of `GRID` (256) workgroups that are all
+  resident: each reserves more than half of a CU's LDS.
+- `enter_launch(epochs, claims, errors, deadline_ticks, label, on_expiry)`
+  advances the workgroup's epoch word (one per program id, `.cv` load, `.wt`
+  store), reads its XCD from `HW_REG_XCC_ID`, and claims the logical id
+  `cta = (pid // 8) * 8 + xcd` by exchanging `(tag, pid)` into
+  `claims[xcd][pid // 8]`. It returns a `Launch`. Roles use `cta`, never
+  `pid % 8`: dispatch hands the XCDs workgroups in turn from a start that
+  depends on the kernels before. A claim that finds this launch's tag means
+  two workgroups took one role, and `on_expiry` runs before any
+  role-dependent store. Epoch and claim words are zeroed together, once.
+- `grid_join(joins, launch, on_expiry)` waits until all workgroups arrive.
+  Stores issued before it are visible after it to `.cv` loads.
+- Every wait gives up at `deadline_ticks` (10 ns ticks) or when a peer has
+  set the abort word, then calls `on_expiry(launch, site, detail)`.
+  `fail_stop` records `(site, cta, detail, epoch, label)` in the error words
+  and runs `s_trap 2`, which aborts the process. Kernels pass handlers that
+  do not return; a handler that also stops peers belongs to the caller.
+
+#### Algorithm
+
+- Producers drain (`s_waitcnt vmcnt(0)` in every wave, then a workgroup
+  barrier) before they publish; `gl.barrier()` alone waits for no store.
+  Consumers read with `.cv` loads, which bypass non-coherent L2 lines.
+  Nothing invalidates or writes back L2.
+- The join is a two-level top-bit toggle: the 32 workgroups of an XCD add to
+  their XCD's line (the designated one adds `1 + 2**31 - 32`), so the 32nd
+  arrival flips bit 31; that arrival adds to the grid line the same way.
+  Both levels flip once per join from the same start, so a waiter knows the
+  bit to wait for from its own XCD arrival, and no join needs a reset. One
+  wave polls with no barrier in its loop, exiting on a one-instruction lane
+  vote; a barrier after the loop releases the other waves.
+
 ## GEMM
 
 ### gfx950 dense BF16 projections
