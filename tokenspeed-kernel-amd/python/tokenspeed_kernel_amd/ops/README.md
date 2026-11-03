@@ -77,6 +77,13 @@ Qwen3.8-Flash-Next decode batches.
   single rounding. It reuses the decode tile for `M` and accepts only buckets
   without split-K (Kimi K3 latent up-projection, `2 <= M <= 32`), replacing a
   separate add kernel.
+- `launch_gluon_mm_a16w16_column_shard_gfx950` runs the decode kernel over a
+  column shard `[shard_n, K]` of a replicated weight with full-K 16x16 tiles
+  (512-deep K, three buffers). Every output issues its 16x16x32 MFMAs over K
+  in order on one FP32 accumulator, whatever the tile shape. When the full
+  GEMM's measured config has no split-K
+  (`supports_gluon_mm_a16w16_column_shard_gfx950`), each column therefore
+  equals the replicated GEMM's bitwise.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.
