@@ -28,10 +28,10 @@ from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import plan_variants
 from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.plan import muse_plan
 from tokenspeed_kernel.ops.decoder_layer._gluon.plan import (
     Clear,
+    PlanError,
     Publish,
     Region,
     Wait,
-    PlanError,
     check_plan,
 )
 
@@ -69,7 +69,11 @@ def test_a_variant_without_h1_is_rejected():
         plan = _edit(
             plan,
             cta,
-            lambda s: [x for x in s if not (isinstance(x, Publish) and x.keys[0].startswith("H1.rs"))],
+            lambda s: [
+                x
+                for x in s
+                if not (isinstance(x, Publish) and x.keys[0].startswith("H1.rs"))
+            ],
         )
     with pytest.raises(PlanError, match="no all-to-all hop"):
         check_plan(plan)
@@ -81,9 +85,11 @@ def test_a_vector_poll_behind_its_own_loads_is_rejected():
 
     def drop_flag(steps):
         return [
-            dataclasses.replace(x, issue_wait_compute=False)
-            if isinstance(x, Wait) and x.role == "RTR"
-            else x
+            (
+                dataclasses.replace(x, issue_wait_compute=False)
+                if isinstance(x, Wait) and x.role == "RTR"
+                else x
+            )
             for x in steps
         ]
 
@@ -98,7 +104,11 @@ def test_a_wait_cycle_is_rejected():
     for xcd in range(8):
 
         def ring(steps, xcd=xcd):
-            at = next(i for i, x in enumerate(steps) if x.role == "OWN1" and isinstance(x, Publish))
+            at = next(
+                i
+                for i, x in enumerate(steps)
+                if x.role == "OWN1" and isinstance(x, Publish)
+            )
             wait = Wait("OWN1", "all", (f"H1.ag[{(xcd + 1) % 8}]",), "vector", False)
             return steps[:at] + [wait] + steps[at:]
 
@@ -114,7 +124,9 @@ def test_a_clear_after_the_rs_push_is_rejected():
     def late(steps):
         clear = next(x for x in steps if isinstance(x, Clear))
         steps.remove(clear)
-        at = next(i for i, x in enumerate(steps) if x.role == "SND" and isinstance(x, Publish))
+        at = next(
+            i for i, x in enumerate(steps) if x.role == "SND" and isinstance(x, Publish)
+        )
         return steps[: at + 1] + [clear] + steps[at + 1 :]
 
     with pytest.raises(PlanError, match="after its H1.rs publish"):

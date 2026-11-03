@@ -210,7 +210,9 @@ def check_plan(plan: LayerPlan) -> int:
                     last[group] = node
                 continue
             if step.group not in last:
-                raise PlanError(f"{plan.name}: {cta} step {index}: no group {step.group}")
+                raise PlanError(
+                    f"{plan.name}: {cta} step {index}: no group {step.group}"
+                )
             if last[step.group] is not None:
                 edges[last[step.group]].append(node)
             last[step.group] = node
@@ -218,7 +220,9 @@ def check_plan(plan: LayerPlan) -> int:
                 inflight[step.group] = True
             elif isinstance(step, Wait):
                 if step.load not in ("vector", "smem"):
-                    raise PlanError(f"{plan.name}: {cta} step {index}: load {step.load}")
+                    raise PlanError(
+                        f"{plan.name}: {cta} step {index}: load {step.load}"
+                    )
                 if (
                     step.load == "vector"
                     and inflight[step.group]
@@ -268,7 +272,9 @@ def check_plan(plan: LayerPlan) -> int:
     if unknown:
         raise PlanError(f"{plan.name}: clears of unknown regions {sorted(unknown)}")
     for node, step in queued:
-        if any(key in publishers and publishers[key][0] != node[0] for key in step.keys):
+        if any(
+            key in publishers and publishers[key][0] != node[0] for key in step.keys
+        ):
             raise PlanError(
                 f"{plan.name}: {step.role} on {node[0]} polls {step.keys[0]} "
                 "behind its own loads in flight (P-QUEUE)"

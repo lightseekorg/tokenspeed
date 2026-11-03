@@ -799,6 +799,7 @@ def _muse_attntail_pack_sums(tag, values):
 @gluon.jit
 def muse_attntail_own(
     owner,
+    program,
     region,
     peers,
     sums_peers,
@@ -818,13 +819,17 @@ def muse_attntail_own(
     POST_WEIGHT_OFFSET: gl.constexpr,
     POST_HAS_WEIGHT: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    CLEAR_NEXT_STAGE: gl.constexpr,
 ):
     """Reduce this rank's columns [owner * OWNER_COLUMNS, ...) of its column
     shard and publish them with their norm sums.
 
-    At entry, restores the empty markers of every source's reduce-scatter
-    slot for these columns in stage + 2 (written through), which a peer
-    writes again only two launches on. Then waits for all WORLD_SIZE sources
+    With CLEAR_NEXT_STAGE (three-stage regions), first restores the empty
+    markers of every source's reduce-scatter slot for these columns in
+    stage + 2 (written through), which a peer writes again only two launches
+    on; a two-copy caller clears its areas at entry instead. ``program``
+    picks the first peer of the pushes (see _iris_lamport_push). Then waits
+    for all WORLD_SIZE sources
     and sums them in rank order with one BF16 rounding
     (iris_lamport_twoshot_rs_wait_reduce), pushes b to every rank's
     all-gather slot RANK (its own included) and, per row, four FP32 norm sums
@@ -846,18 +851,19 @@ def muse_attntail_own(
     )
     offsets = row[:, None] * OWNED + local
     PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
-    empty = (
-        gl.where(offsets % 2 == 0, 0, 0x8000)
-        .to(gl.uint16)
-        .to(gl.bfloat16, bitcast=True)
-    )
-    for source in gl.static_range(WORLD_SIZE):
-        gl.amd.cdna4.buffer_store(
-            empty,
-            region + ((stage + 2) % 3) * (2 * PHASE) + source * MAX_SHARD_ELEMENTS,
-            offsets,
-            cache=".wt",
+    if CLEAR_NEXT_STAGE:
+        empty = (
+            gl.where(offsets % 2 == 0, 0, 0x8000)
+            .to(gl.uint16)
+            .to(gl.bfloat16, bitcast=True)
         )
+        for source in gl.static_range(WORLD_SIZE):
+            gl.amd.cdna4.buffer_store(
+                empty,
+                region + ((stage + 2) % 3) * (2 * PHASE) + source * MAX_SHARD_ELEMENTS,
+                offsets,
+                cache=".wt",
+            )
     columns = RANK * OWNED + local
     clamped = gl.minimum(row, rows - 1)
     h = gl.amd.cdna4.buffer_load(stream_ptr, clamped[:, None] * WIDTH + columns)
@@ -887,7 +893,7 @@ def muse_attntail_own(
         stage,
         offsets,
         valid[:, None],
-        gl.program_id(0),
+        program,
         RANK,
         WORLD_SIZE,
         MAX_SHARD_ELEMENTS,
@@ -1260,6 +1266,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     elif program < ATTENTION + SENDERS + OWNERS:
         muse_attntail_own(
             program - ATTENTION - SENDERS,
+            program,
             region,
             rs_peers,
             sums_peers,
@@ -1279,6 +1286,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
             POST_WEIGHT_OFFSET,
             POST_HAS_WEIGHT,
             PEER_SIGNAL_STORE_CACHE,
+            True,
         )
     elif program < ATTENTION + SENDERS + OWNERS + rows * PARTS:
         index = program - ATTENTION - SENDERS - OWNERS
