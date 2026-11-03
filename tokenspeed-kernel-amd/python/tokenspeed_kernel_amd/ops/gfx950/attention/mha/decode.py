@@ -1101,6 +1101,37 @@ def gluon_mha_decode_sliding_gfx950(
 
 
 @gluon.jit
+def mha_decode_sliding_split_gfx950(
+    program, sink_ptr, k_cache_ptr, v_cache_ptr, NUM_STAGES: gl.constexpr
+):
+    """Stream one sliding-window split of ``program`` and store its partial.
+
+    The split's (request, KV head, row block, split) come from ``program``,
+    so a persistent kernel can run splits it assigns itself. The partial
+    (``mid_o`` / ``mid_lse``) is merged later by ``finalize_splits`` (last
+    arriver) or ``merge_split_records`` (designated merger).
+    """
+    cfg = program.cfg
+    q = program.load_q()
+    m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
+    if NUM_STAGES == 1:
+        k_smem = gl.allocate_shared_memory(
+            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+        )
+        v_smem = gl.allocate_shared_memory(
+            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+        )
+        m_i, l_i, acc = _stream_split_single_buffer(
+            program, q, m_i, l_i, acc, k_smem, v_smem
+        )
+    else:
+        m_i, l_i, acc = _stream_split_pipelined(
+            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
+    program.store_split(acc, l_i, m_i)
+
+
+@gluon.jit
 def _mha_decode_sliding_split_atomic(
     q_ptr,
     k_cache_ptr,
@@ -1162,24 +1193,9 @@ def _mha_decode_sliding_split_atomic(
         gl.program_id(1),
         gl.program_id(2),
     )
-    q = program.load_q()
-    m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
-    if NUM_STAGES == 1:
-        k_smem = gl.allocate_shared_memory(
-            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-        )
-        v_smem = gl.allocate_shared_memory(
-            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-        )
-        m_i, l_i, acc = _stream_split_single_buffer(
-            program, q, m_i, l_i, acc, k_smem, v_smem
-        )
-    else:
-        m_i, l_i, acc = _stream_split_pipelined(
-            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
-        )
-
-    program.store_split(acc, l_i, m_i)
+    mha_decode_sliding_split_gfx950(
+        program, sink_ptr, k_cache_ptr, v_cache_ptr, NUM_STAGES
+    )
     program.finalize_splits(out_ptr, sink_ptr, counters_ptr, HAS_SINK)
 
 
