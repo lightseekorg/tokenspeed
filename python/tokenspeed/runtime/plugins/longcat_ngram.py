@@ -59,6 +59,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.models.longcat_flash import (
     LongcatFlashForCausalLM,
     _RuntimeLongcatModel,
@@ -135,7 +136,15 @@ class NgramEmbedding(nn.Module):
             in-tree ``embed_tokens``).
     """
 
-    def __init__(self, config, base_embeddings):
+    def __init__(
+        self,
+        config,
+        base_embeddings,
+        *,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        tp_group=None,
+    ):
         super().__init__()
         _ensure_ngram_config(config)
         self.config = config
@@ -144,6 +153,14 @@ class NgramEmbedding(nn.Module):
         self.m = config.ngram_vocab_size_ratio * config.vocab_size
         self.k = config.emb_split_num
         self.n = config.emb_neighbor_num
+
+        # TP feature-column sharding (official LongCat OE layout): with
+        # ``tp_size > 1`` every rank hosts only its feature slice of the
+        # n-gram tables (~63 GB / tp_size per rank instead of a full copy
+        # each) and the forward all-reduces the local partial contributions.
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.tp_group = tp_group
 
         self._init_ngram_embeddings()
         self._vocab_mods_cache = None
@@ -160,9 +177,34 @@ class NgramEmbedding(nn.Module):
         list) because the checkpoint loader resolves the 24
         ``model.ngram_embeddings.embedders.*.weight`` /
         ``...post_projs.*.weight`` keys through ``named_parameters()``.
+
+        Under TP feature-column sharding the tables hold only
+        ``emb_dim // tp_size`` columns per rank and the projections map that
+        slice onto the full hidden size; checkpoint loaders slice the full
+        weights down to each rank's feature range.
         """
         num_embedders = self.k * (self.n - 1)
         emb_dim = self.config.hidden_size // num_embedders
+        if self.tp_size > 1 and emb_dim % self.tp_size:
+            raise ValueError(
+                f"TP-sharded n-gram tables need emb_dim={emb_dim} divisible "
+                f"by tp_size={self.tp_size}"
+            )
+        local_width = emb_dim // self.tp_size
+        feature_begin = local_width * self.tp_rank
+        feature_end = feature_begin + local_width
+        self._feature_begin = feature_begin
+        self._feature_width = local_width
+
+        def _column_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+            """Slice the checkpoint's full table/projection to this rank's
+            feature columns (a row-major ``[rows, emb_dim]`` tensor)."""
+            if loaded_weight.size(-1) != emb_dim:
+                raise ValueError(
+                    f"loaded n-gram weight has {loaded_weight.size(-1)} "
+                    f"columns, expected {emb_dim}"
+                )
+            param.data.copy_(loaded_weight[:, feature_begin:feature_end])
 
         embedders = []
         post_projs = []
@@ -170,11 +212,15 @@ class NgramEmbedding(nn.Module):
             vocab_size = int(self.m + i * 2 + 1)
             emb = _HostEmbedding(
                 vocab_size,
-                emb_dim,
+                local_width,
                 padding_idx=self.config.pad_token_id,
                 device="cpu",
             )
-            proj = nn.Linear(emb_dim, self.config.hidden_size, bias=False)
+            if self.tp_size > 1:
+                emb.weight.weight_loader = _column_loader
+            proj = nn.Linear(local_width, self.config.hidden_size, bias=False)
+            if self.tp_size > 1:
+                proj.weight.weight_loader = _column_loader
             embedders.append(emb)
             post_projs.append(proj)
 
@@ -283,6 +329,11 @@ class NgramEmbedding(nn.Module):
             ``[.., seq_len, hidden_size]`` enriched embeddings.
         """
         seq_len = input_ids.size(-1)
+        if self.tp_size > 1 and query_shard is not None:
+            raise NotImplementedError(
+                "TP-sharded LongCat n-gram tables require the complete packed "
+                "input batch (query context parallel must be disabled)"
+            )
 
         # Base word embeddings (TP/query-shard aware through the embedding
         # module); the clone keeps the checkpoint's in-place-friendly layout.
@@ -291,6 +342,29 @@ class NgramEmbedding(nn.Module):
         else:
             x = self.word_embeddings(input_ids).clone()
 
+        local_partial = self._ngram_local_partial(input_ids, predecessor_window)
+
+        # TP feature-column sharding: the local table slice contributes only
+        # this rank's feature columns; all-reduce sums the full contribution.
+        if self.tp_size > 1:
+            assert self.tp_group is not None
+            local_partial = all_reduce(local_partial, self.tp_group)
+        x = x + local_partial
+        x = x / (1 + self.k * (self.n - 1))
+        return x
+
+    def _ngram_local_partial(
+        self,
+        input_ids: torch.Tensor,
+        predecessor_window: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum of the n-gram table contribution branches (pre all-reduce).
+
+        Computes the polynomial hash ids from the per-token predecessor
+        window, applies the EOS reset, and accumulates the 12 host-resident
+        table lookups projected onto the hidden size. Under TP feature-column
+        sharding this is the local partial; the caller all-reduces it.
+        """
         # EOS reset, vectorized over the window columns (newest first): the
         # predecessor at distance ``d`` contributes zero when any of the ``d``
         # tokens immediately before the current token is EOS (or is dead),
@@ -307,6 +381,7 @@ class NgramEmbedding(nn.Module):
         for d in range(1, self.n):
             shifted[d] = effective[..., d - 1]
 
+        local_partial = None
         for i in range(2, self.n + 1):
             for j in range(self.k):
                 index = (i - 2) * self.k + j
@@ -324,18 +399,20 @@ class NgramEmbedding(nn.Module):
                 # device for the (NPU-resident) post projection.  Numerically
                 # identical to an on-device ``embedder(new_ids)`` — same ids,
                 # same weights — and leaves the ~63 GB tables off the device.
+                # Under TP feature sharding each rank gathers only its table
+                # slice (~63 GB / tp_size) and reduces the partials above.
                 host_weight = self._host_embedders[index]
                 new_ids_cpu = new_ids.to("cpu")
                 x_ngram = F.embedding(
                     new_ids_cpu,
                     host_weight,
                     padding_idx=self.config.pad_token_id,
-                ).to(x.device)
+                ).to(input_ids.device)
                 x_proj = self.post_projs[index](x_ngram)
-                x = x + x_proj.to(x.device)
-
-        x = x / (1 + self.k * (self.n - 1))
-        return x
+                local_partial = (
+                    x_proj if local_partial is None else local_partial + x_proj
+                )
+        return local_partial
 
     def forward(
         self,
@@ -388,7 +465,13 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
         prefix="",
     ) -> None:
         super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
-        self.ngram_embeddings = NgramEmbedding(config, self.embed_tokens)
+        self.ngram_embeddings = NgramEmbedding(
+            config,
+            self.embed_tokens,
+            tp_rank=mapping.attn.tp_rank,
+            tp_size=mapping.attn.tp_size,
+            tp_group=mapping.attn.tp_group,
+        )
 
     def _history_pad(self, input_ids: torch.Tensor, view) -> torch.Tensor:
         """Per-row committed history, left-padded to width ``n - 1``.
