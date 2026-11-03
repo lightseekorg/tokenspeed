@@ -115,6 +115,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
     gemv_a16w16_splitk_sum_gfx950,
     gemv_a16w16_splitk_wave_sums_gfx950,
     gemv_a16w16_splitk_wave_sums_steps_gfx950,
+    gemv_a16w16_splitk_weight_step_tiles_gfx950,
     gemv_a16w16_splitk_weight_steps_gfx950,
     gemv_a16w16_splitk_weights_gfx950,
     gemv_a16w16_splitk_x_steps_gfx950,
@@ -1600,9 +1601,13 @@ def gluon_decoder_layer_muse_spark_gfx950(
             _POOLED,
         )  # fmt: skip
         if NEXT_KIND != 2:
-            qkv_tiles = gemv_a16w16_splitk_weight_steps_gfx950(
+            # The QKV task's first window of tiles only: the rest would hold
+            # registers through the relay (the same tiles in the same order,
+            # issued in two parts).
+            QKV_FIRST: gl.constexpr = min(QKV_WINDOW, _QKV_TASK_ROWS // 16)
+            qkv_first = gemv_a16w16_splitk_weight_step_tiles_gfx950(
                 qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
-                QKV_WINDOW,
+                QKV_WINDOW, 0, QKV_FIRST,
             )  # fmt: skip
         _unp(
             launch, view, sender, rows, w, s_rows, hprime, exchange, alpha2_ptr,
@@ -1610,6 +1615,14 @@ def gluon_decoder_layer_muse_spark_gfx950(
         )  # fmt: skip
         if slot == 16:
             red_sums(view, launch, rows, iris_fail_stop, RANK, PEER_CACHE)
+        if NEXT_KIND != 2:
+            # The rest once the relay's weights are dead and UNP's (and the
+            # reducer's) pushes and polls are issued: loads complete in issue
+            # order, so earlier they would hold up those hand-offs.
+            qkv_tiles = qkv_first + gemv_a16w16_splitk_weight_step_tiles_gfx950(
+                qkv_w_ptr, task, _HIDDEN, _QKV_TASK_ROWS, _QKV_PARTS, _QKV_GROUPS,
+                QKV_WINDOW, QKV_FIRST, _QKV_TASK_ROWS // 16 - QKV_FIRST,
+            )  # fmt: skip
     else:
         if NEXT_KIND != 2:
             qkv_tiles = gemv_a16w16_splitk_weight_steps_gfx950(

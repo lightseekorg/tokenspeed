@@ -391,14 +391,37 @@ def gemv_a16w16_splitk_weight_steps_gfx950(
     wave's K step ``s``. The same loads in the same order (one 16-byte load
     per lane per tile and step) and the same pacing (``WINDOW`` at least the
     tile count: no wait), for a caller that builds x one step at a time."""
-    TILES: gl.constexpr = ROWS_PER_TASK // 16
+    return gemv_a16w16_splitk_weight_step_tiles_gfx950(
+        w_ptr, task, K, ROWS_PER_TASK, PARTS, GROUPS, WINDOW, 0, ROWS_PER_TASK // 16
+    )
+
+
+@gluon.jit
+def gemv_a16w16_splitk_weight_step_tiles_gfx950(
+    w_ptr,
+    task,
+    K: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    WINDOW: gl.constexpr,
+    FIRST: gl.constexpr,
+    COUNT: gl.constexpr,
+):
+    """Tiles ``[FIRST, FIRST + COUNT)`` of
+    :func:`gemv_a16w16_splitk_weight_steps_gfx950`, paced as there (a wait
+    before each tile ``t >= WINDOW``), so a caller can issue a task's tiles
+    in two parts and join the tuples (``first + rest``) into the same
+    tiles."""
     STEPS: gl.constexpr = K // PARTS // gl.num_warps() // _STEP_K
+    TILES: gl.constexpr = ROWS_PER_TASK // 16
     gl.static_assert(
         1 <= WINDOW and (WINDOW >= TILES or (WINDOW - 1) * STEPS <= _MAX_VMCNT_WAIT)
     )
+    gl.static_assert(FIRST + COUNT <= TILES)
     base, group = _weight_tile_base(task, K, ROWS_PER_TASK, PARTS, GROUPS, _STEP_K)
     tiles = ()
-    for t in gl.static_range(TILES):
+    for t in gl.static_range(FIRST, FIRST + COUNT):
         if t >= WINDOW:
             wait_vmcnt((WINDOW - 1) * STEPS)
         steps = ()
