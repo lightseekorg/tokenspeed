@@ -97,28 +97,32 @@ through memory instead of kernel boundaries.
 
 ## Attention prologue
 
-### gfx950 GQA prologue head (device function)
+### gfx950 GQA prologue
 
-`gqa_prologue_head_gfx950` (`attention/prologue/gqa.py`) runs the GQA
-attention prologue of one head inside another kernel, such as a fused
+`gluon_gqa_prologue_gfx950` (`attention/prologue/gqa.py`) is the gfx950
+`gqa_prologue` solution; its device functions also run inside a fused
 decoder layer.
 
 #### Contract
 
-- Head `head < NUM_Q_HEADS` normalizes (and rotates, unless `HALF_ROTARY`
-  is 0) its query rows and stores them in the query's dtype; KV head
-  `head - NUM_Q_HEADS` writes its key and value rows to the cache slots,
-  scaled by the inverse scales when `KV_SCALED`.
-- The same BF16 q/k/v rows give the same bytes as the Triton GQA prologue.
-- `SRC_CACHE` is the cache modifier of the q/k/v loads (`.cv` when another
-  workgroup of the same launch wrote them). Query and cache rows are stored
-  plainly: their readers run in a later launch.
+- Per-head RMSNorm (required), whole-head interleaved (GPT-J) rotation or
+  none, head dim 64 or 128, BF16/FP16 q/k/v rows with strided rows and heads,
+  native, FP8 or per-tensor scaled FP8 caches; the query in any dtype. Other
+  requests (NEOX, partial or multimodal rotation, returned K/V, MXFP8) select
+  another solution.
+- The same BF16 rows give the Triton prologue's bytes.
+- `gqa_prologue_query_gfx950` / `_key_gfx950` / `_value_gfx950` take one
+  head's rows as values (FP32 holding BF16 values, one token per subgroup
+  row), so a kernel that computes them needs no store and reload;
+  `gqa_prologue_head_gfx950` loads them (`SRC_CACHE` sets the loads' cache
+  bits). Query and cache rows are stored plainly.
 
 #### Algorithm
 
-It repeats the Triton prologue's layouts and operations: a per-head RMSNorm
-summed by one 64-lane reduction, the rotation `fma(x1, cos, -x2 * sin)` /
-`fma(x2, cos, x1 * sin)` on interleaved pairs, and one RTNE rounding.
+The Triton prologue's layouts and operations: the RMS scale from one 64-lane
+reduction per token, the rotation `fma(x1, cos, -x2 * sin)` /
+`fma(x2, cos, x1 * sin)` on interleaved pairs (split from the rows in
+registers), and one RTNE rounding. A program runs one head over 16 tokens.
 
 ## GEMM
 

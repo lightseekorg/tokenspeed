@@ -19,3 +19,13 @@
 # SOFTWARE.
 
 """gfx950 attention-prologue device functions."""
+
+from tokenspeed_kernel_amd.ops.gfx950.attention.prologue.gqa import (
+    launch_gluon_gqa_prologue_gfx950,
+    supports_gluon_gqa_prologue_gfx950,
+)
+
+__all__ = [
+    "launch_gluon_gqa_prologue_gfx950",
+    "supports_gluon_gqa_prologue_gfx950",
+]
