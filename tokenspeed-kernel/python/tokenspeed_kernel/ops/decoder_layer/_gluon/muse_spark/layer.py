@@ -72,6 +72,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
     H6_SLOT,
     H6_WORDS,
     MAX_ROWS,
+    H4SinkArgs,
     MuseNativeView,
     clear_next_copies,
     fin,
@@ -1651,7 +1652,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
         iris_fail_stop(launch, _SITE_XQ, 0)
     _stamp(stamps_ptr, launch.cta, _STAMP_XQ, STAMPS)
     run_moe(
-        launch, handles, bufs, h4_sink, (view, launch), ROWS, _TOPK, N_PHYS1,
+        launch, handles, bufs, h4_sink, H4SinkArgs(view, launch, RANK), ROWS, _TOPK, N_PHYS1,
         N_PHYS2, RING, QUAD_MAP, DN_ORDER, ADDR_SOFFSET, True, SCALE_LANES,
         SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
     )  # fmt: skip

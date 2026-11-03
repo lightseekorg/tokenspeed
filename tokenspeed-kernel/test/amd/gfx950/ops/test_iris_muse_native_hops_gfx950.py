@@ -225,6 +225,7 @@ def test_h6_push_compiles_at_8_waves():
 
 
 from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
+    H4SinkArgs,
     MuseNativeView,
     clear_next_copies,
     fin,
@@ -290,7 +291,7 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
         c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
         y = gl.load(floats + r[:, None] * 128 + c[None, :])
         route = gl.load(words + r)[:, None]
-        h4_sink((view, launch), y, route, (1024 + c)[None, :])
+        h4_sink(H4SinkArgs(view, launch, 3), y, route, (1024 + c)[None, :])
     elif ROLE == "own4":
         own4_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
                       bitcast=True), iris_fail_stop, 3, 0.0, ".wt")  # fmt: skip
@@ -391,7 +392,7 @@ def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, r
     for unit in range(units):
         y = gl.load(floats + unit * 2048 + r[:, None] * 128 + c[None, :])
         route = gl.load(words + unit * 16 + r)[:, None]
-        h4_sink((view, launch), y, route, (unit * 128 + c)[None, :])
+        h4_sink(H4SinkArgs(view, launch, 3), y, route, (unit * 128 + c)[None, :])
 
 
 def test_h4_sink_moves_no_data_between_lanes():
