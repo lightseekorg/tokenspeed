@@ -951,6 +951,19 @@ protected:
                 });
             }
             EXPECT_TRUE(CompletingPrefillsFormAPrefix(*batch)) << ::testing::PrintToString(rows);
+            // Each row's block table is its own request's -- the row of the
+            // chunk that gave way too, moved behind the prompts it carries: a
+            // page for every position up to the chunk's end and, when the
+            // chunk completes its prompt, for its decode slot.
+            const auto tables = batch->BlockTables();
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                const std::vector<std::int32_t>& pages = tables.at("full_attention")[i];
+                const std::int32_t extent =
+                    rows[i].end + (rows[i].end == rows[i].prompt ? config_.decode_input_tokens : 0);
+                EXPECT_EQ(std::ranges::count_if(pages, [](std::int32_t page) { return page > 0; }),
+                          (extent + kPage - 1) / kPage)
+                    << rows[i];
+            }
         }
         handed_off_ = plan.remote_decode ? plan.remote_decode->request_ids : std::vector<std::string>{};
         for (const std::string& id : handed_off_) {
