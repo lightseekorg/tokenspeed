@@ -169,12 +169,32 @@ def gemv_a16w16_splitk_finish_gfx950(
     cache modifiers: "" in a standalone launch, ".cv"/".wt" when x was written
     and the partials are read within the same launch on other XCDs.
     """
+    x = gemv_a16w16_splitk_x_gfx950(x_ptr, x_stride, task, M, K, PARTS, GROUPS, X_CACHE)
+    gemv_a16w16_splitk_finish_x_gfx950(
+        tiles, x, part_ptr, tag, task, M, N, ROWS_PER_TASK, GROUPS, PART_CACHE
+    )
+
+
+@gluon.jit
+def gemv_a16w16_splitk_finish_x_gfx950(
+    tiles,
+    x,
+    part_ptr,
+    tag,
+    task,
+    M,
+    N: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    GROUPS: gl.constexpr,
+    PART_CACHE: gl.constexpr,
+):
+    """:func:`gemv_a16w16_splitk_finish_gfx950` on a B operand ``x`` the
+    caller built (the layout of :func:`gemv_a16w16_splitk_x_gfx950`)."""
     WAVES: gl.constexpr = gl.num_warps()
     TILES: gl.constexpr = ROWS_PER_TASK // 16
     mfma: gl.constexpr = _mfma(WAVES)
     group = task % GROUPS
     part = task // GROUPS
-    x = gemv_a16w16_splitk_x_gfx950(x_ptr, x_stride, task, M, K, PARTS, GROUPS, X_CACHE)
     # Every wave's accumulator of every tile to LDS, one barrier, then each
     # thread sums its (row, token) outputs over the waves.
     bufs = ()
@@ -486,6 +506,7 @@ def launch_gluon_gemv_a16w16_splitk_gfx950(
 __all__ = [
     "gemv_a16w16_splitk_exchange_gfx950",
     "gemv_a16w16_splitk_finish_gfx950",
+    "gemv_a16w16_splitk_finish_x_gfx950",
     "gemv_a16w16_splitk_hi_lo_sums_gfx950",
     "gemv_a16w16_splitk_publish_gfx950",
     "gemv_a16w16_splitk_sum_gfx950",
