@@ -282,7 +282,11 @@ def test_pair_store_is_one_8_byte_store_without_a_wait(scope, bits):
     lines = instruction_lines(assembly)
     # The main path ends at the first s_endpgm; the failure path follows it.
     lines = lines[: lines.index("s_endpgm")]
-    stores = [i for i, l in enumerate(lines) if l.startswith("global_store")]
+    # The pairs' stores follow the entry (its epoch store and claim exchange).
+    claim = next(i for i, l in enumerate(lines) if l.startswith("global_atomic_swap"))
+    stores = [
+        i for i, l in enumerate(lines) if i > claim and l.startswith("global_store")
+    ]
     assert stores and all(lines[i].startswith("global_store_dwordx2") for i in stores)
     assert all(lines[i].endswith(bits) for i in stores)
     assert not any("vmcnt" in l for l in lines[stores[-1] :])

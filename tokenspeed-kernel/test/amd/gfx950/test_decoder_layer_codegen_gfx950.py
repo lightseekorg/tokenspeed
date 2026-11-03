@@ -194,39 +194,37 @@ def test_moe_loops_keep_the_ring_and_have_no_barrier(key):
             assert stream_loop_problems(loop, constexprs["RING"]) == []
 
 
+def _entry_waits(texts, chains):
+    """Indices of the waits inside the launch entry (the vector form's claim
+    exchange waits for the role's loads issued before it, by design)."""
+    return {i for i in _in(chains, "enter_check") if "s_waitcnt" in texts[i]}
+
+
 @pytest.mark.parametrize("key", _variants())
-def test_entry_leaves_nothing_in_flight_for_the_weights_to_wait_on(key):
-    # The entry counters are scalar (lgkmcnt): no vector memory operation is
-    # issued before a role's first weights, so no wait at the weight issue
-    # (the counter-wait analysis merges the role branches and may place
-    # some) can hold the weights back.
+def test_entry_is_an_epoch_store_and_a_claim_exchange(key):
+    # The vector entry: each inlined copy stores the epoch and exchanges the
+    # claim, and runs no other vector memory operation (its epoch read is a
+    # scalar load), so the role's weights issued before it stay in flight
+    # up to the exchange's own wait.
     texts, chains = attributed(key)
     entry = [
-        i
+        texts[i]
         for i, chain in enumerate(chains)
         if {"enter_issue", "enter_check"}.intersection(chain)
         and not _FAILURE_PATHS.intersection(chain)
+        and re.match(r"(global|buffer|flat)_", texts[i])
     ]
-    assert entry
-    vector = [texts[i] for i in entry if re.match(r"(global|buffer|flat)_", texts[i])]
-    assert vector == []
+    stores = [t for t in entry if t.startswith("global_store_dwordx2")]
+    claims = [t for t in entry if t.startswith("global_atomic_swap_x2")]
+    assert claims and len(stores) == len(claims) == len(entry) // 2
+    assert len(stores) + len(claims) == len(entry)
 
 
-@pytest.mark.parametrize("key", _variants("sliding"))
-def test_sliding_router_weights_go_out_before_the_entry_check(key):
-    # In sliding layers the router's tiles are issued with o_proj at entry
-    # and land during attention, well before the box and the all-gather.
-    texts, chains = attributed(key)
-    issued = _loads(texts, _in(chains, "_router_weights"))
-    assert issued
-    check = _next_in(chains, "enter_check", issued[0])
-    assert issued[-1] < check
-
-
-@pytest.mark.parametrize("key", _variants("full"))
-def test_full_router_weights_stay_in_flight_until_the_all_gather(key):
-    # Full layers issue the router's tiles after the push and OWN1; nothing
-    # may retire them before the router's x build waits for the all-gather.
+@pytest.mark.parametrize("key", _variants())
+def test_router_weights_stay_in_flight_until_the_all_gather(key):
+    # The router's tiles are issued after the sender's push (slot 0: after
+    # OWN1); nothing may retire them before the router's x build waits for
+    # the all-gather.
     texts, chains = attributed(key)
     issued = _loads(texts, _in(chains, "_router_weights"))
     assert issued
@@ -236,11 +234,17 @@ def test_full_router_weights_stay_in_flight_until_the_all_gather(key):
 
 @pytest.mark.parametrize("key", _variants())
 def test_pooler_weights_stay_in_flight_until_the_all_gather(key):
+    # Past the entry: a sliding layer issues them before the entry check,
+    # whose claim exchange may wait for them.
     texts, chains = attributed(key)
-    issued = _loads(texts, _in(chains, "_pooler_weights"))
+    name = (
+        "_pooler_weights_sliding" if key.layer_kind == "sliding" else "_pooler_weights"
+    )
+    issued = _loads(texts, _in(chains, name))
     assert issued
     poll = _next_in(chains, "_kpart_state", issued[-1])
-    assert [texts[i] for i in drains_of(texts, issued[-1], poll)] == []
+    drains = set(drains_of(texts, issued[-1], poll)) - _entry_waits(texts, chains)
+    assert [texts[i] for i in sorted(drains)] == []
 
 
 @pytest.mark.parametrize("key", _variants())
