@@ -95,6 +95,7 @@ __all__ = [
     "dspark_anchors",
     "dspark_block",
     "dspark_workspace",
+    "history_pack",
 ]
 
 
@@ -1368,10 +1369,29 @@ def merge_index_candidates(packed, rows, lengths):
     return _kernel("merge_index_candidates", packed)(packed, rows, lengths)
 
 
+def history_pack(cache, table, visible_rows, *, virtual_block_count, degree, rank):
+    """Copy this rank's packed history pages for a byte-wise MAX all-reduce.
+
+    cache is a possibly strided uint8 [local_pages,64,row_bytes] field and
+    table an integer [pages] row of virtual pages, possibly strided. Virtual
+    page v > 0 lives on rank (v - 1) % degree; ids at or past
+    virtual_block_count are invalid. visible_rows is an integer device
+    scalar. Returns contiguous uint8 [pages+1,64,row_bytes]: a zero null page,
+    then each owned, valid page that starts below visible_rows with all its
+    bytes (scales included), and zeros elsewhere. A MAX all-reduce of the
+    owners' results restores every visible page exactly, with shapes fixed
+    for graph replay.
+    """
+    return _kernel("history_pack", cache)(
+        cache, table, visible_rows, virtual_block_count, degree, rank
+    )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41._triton.kvp  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401

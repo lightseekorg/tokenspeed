@@ -543,10 +543,11 @@ def torch_grouped_bf16_projection(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Preserve the original batched projection and its BF16 rounding."""
-    result = torch.einsum("tgd,grd->tgr", x, weight)
     if out is None:
-        return result
-    out.copy_(result)
+        out = x.new_empty((x.shape[0], weight.shape[0], weight.shape[1]))
+    # Token-major rows flatten as a view; out= rejects inputs that need grad.
+    with torch.no_grad():
+        torch.bmm(x.transpose(0, 1), weight.transpose(1, 2), out=out.transpose(0, 1))
     return out
 
 

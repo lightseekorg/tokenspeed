@@ -24,7 +24,7 @@ PR_TEST_WORKFLOWS = (
     "amd-mi350-tests.yml",
     "amd-mi450-tests.yml",
     "nvidia-b200-tests.yml",
-    "pr-test-nvidia-arm.yml",
+    "nvidia-arm-tests.yml",
 )
 MI450_STACK_KEYS = (
     "ROCM_NIGHTLY_INDEX",
@@ -46,6 +46,28 @@ def workflow_dispatch_inputs(name: str) -> dict:
 
 def load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "amd-kernel-benchmark.yml",
+        "amd-mi350-tests.yml",
+        "amd-mi450-tests.yml",
+        "nvidia-b200-tests.yml",
+        "nvidia-gb200-tests.yml",
+        "nvidia-gb300-tests.yml",
+        "ascend-npu-tests.yml",
+        "nvidia-arm-tests.yml",
+    ),
+)
+def test_test_workflows_cancel_only_pull_request_runs(name: str):
+    workflow = load_yaml(REPO_ROOT / ".github" / "workflows" / name)
+
+    assert (
+        workflow["concurrency"]["cancel-in-progress"]
+        == "${{ github.event_name == 'pull_request' }}"
+    )
 
 
 @pytest.mark.parametrize("name", PR_TEST_WORKFLOWS)
@@ -458,10 +480,9 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
 
 
 def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
-    # AMD splits the runtime-1gpu suite across part-i and part-ii; other
-    # runners run it whole in ut-runtime-1gpu.
+    # Every runner splits the runtime-1gpu suite across part-i and part-ii.
     partitions = {}
-    for suffix in ("", "-part-i", "-part-ii"):
+    for suffix in ("-part-i", "-part-ii"):
         task = load_yaml(REPO_ROOT / f"test/ci/ut/ut-runtime-1gpu{suffix}.yaml")
         for command in task["ut"]["commands"]:
             tokens = shlex.split(command)
@@ -1127,7 +1148,6 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     assert set(triggers) == {"push", "pull_request"}
     assert submit["name"] == "${{ matrix.name }}"
     assert submit["runs-on"] == "slurm-dispatch-gb300"
-    assert workflow["concurrency"]["cancel-in-progress"] is True
     assert '--runner "$RUNNER"' in submit_script
     assert "--runner-alias" not in submit_script
     assert '--source-pr "$PR_NUMBER"' in submit_script
@@ -1213,7 +1233,7 @@ def test_gb300_slurm_per_commit_matrix_excludes_nightly_tp8_tasks(monkeypatch):
 
 
 def test_nvidia_arm_workflow_excludes_multi_node_tasks():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-arm-tests.yml")
     scan_script = next(
         step["run"]
         for step in workflow["jobs"]["scan"]["steps"]
@@ -1233,7 +1253,7 @@ def test_qwen35_agentic_allows_declared_80k_context():
 
 
 def test_nvidia_arm_model_tests_allow_runner_wait_time():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-arm-tests.yml")
 
     assert workflow["jobs"]["model-test"]["with"]["timeout_minutes"] >= 120
 
@@ -1523,7 +1543,7 @@ def test_pr_test_finish_ignores_the_union_of_gpu_workflow_paths():
         "amd-mi350-tests",
         "amd-mi450-tests",
         "nvidia-b200-tests",
-        "pr-test-nvidia-arm",
+        "nvidia-arm-tests",
     )
     union = set()
     for name in gpu_workflows:

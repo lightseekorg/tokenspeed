@@ -91,7 +91,7 @@ def vocab_parallel_logprobs(
         override: Optional exact kernel-name or solution override.
 
     Returns:
-        ``[rows]`` fp32 log-probabilities, ``-(log(sum_exp) - target)`` with
+        ``[rows]`` fp32 log-probabilities, ``target - log(sum_exp)`` with
         ``target = logits[row, id] - max`` and ``sum_exp`` the fp32 left fold
         of the leaf's ``[rows, vocab // vocab_block]`` block partials.
     """
@@ -136,5 +136,6 @@ def vocab_parallel_logprobs(
     sum_exp = partials[:, 0]
     for block in range(1, partials.shape[1]):
         sum_exp = sum_exp + partials[:, block]
-    # Megatron returns the NLL; the log-probability is its exact negation.
-    return -(torch.log(sum_exp) - target)
+    # Preserve the trainer's positive zero when target and log(sum_exp) are
+    # both zero. Negating an NLL would instead produce a negative zero.
+    return target - torch.log(sum_exp)

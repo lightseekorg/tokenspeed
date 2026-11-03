@@ -288,6 +288,23 @@ struct HostPublication {
     CacheBlockRef block;
 };
 
+// The lifetime of one asynchronous store op: the transfer manager's record of
+// the op holds the only owning reference, from the op's start to its ACK.
+struct StoreInFlight {};
+
+// One store op a waiter needs landed -- a retraction image waits for the
+// stores that copy or publish its Host slots, an eviction write-back segment
+// for those that carry its members. The id routes the op's publications to
+// the waiter; whether the op landed is read off the weak reference, which
+// expires with the op's record at the ACK, so no ACK has to find and update
+// its waiters.
+struct StoreWait {
+    std::uint32_t op_id{0};
+    std::weak_ptr<const StoreInFlight> in_flight;
+
+    bool Landed() const { return in_flight.expired(); }
+};
+
 // One imaged block of a retracted request's table: the logical slot it sat
 // in and the Host block that holds its bytes. A slot whose Device block was
 // a published prefix entry rides Host L2 as that entry (key set; the image
