@@ -153,39 +153,55 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
 }
 
-// A prompt end T inside the page its pre-tail State checkpoint C starts
+// With the in-forward checkpoint (SchedulerConfig::state_checkpoint_in_forward)
+// a prompt end T inside the page its pre-tail State checkpoint C starts
 // (PrefillStateCheckpointTokens: a prompt longer than the chunk budget whose
-// partial page holds at least the replay tail) is covered once C exists:
-// the request's final forward wrote it and it is still pending (the
-// publication at T then publishes it), or every State group's state at C is
-// cached, on either tier (the KV below C is the request's own). An identical
-// prompt cannot resume at T -- its probe stops short of the final token --
-// and resumes at C; only a longer prompt repeating T's partial page could
-// match T, and it resumes at C instead, recomputing less than a page.
-// C lies below T, so a page-aligned T, a chain boundary a longer prompt
-// resumes from, is never covered. With aligned State checkpoints C is the
-// last segment entrance of any prompt longer than one segment instead, and
-// those groups neither publish nor match a state at a covered T, which is
-// never aligned. A request that resumed from a tail beyond C keeps T: it
-// extends an earlier prompt end in place, and the next request likely
-// extends T the same way. The callers ask only with the in-forward
-// checkpoint (SchedulerConfig::state_checkpoint_in_forward), where C
-// normally exists: the forward spanning C writes it, and a forward that
-// starts or ends at C finds or leaves the state there cached (a hit at C, a
-// chunk end at C), unless it was evicted since. The caller passes the
-// progress before the publication at T, the request's computed frontier.
-bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const {
+// partial page holds at least the replay tail) is dead: an identical prompt
+// cannot resume at T -- its probe stops short of the final token -- and
+// resumes at C; only a longer prompt repeating T's partial page could match
+// T, and it resumes at C instead, recomputing less than a page. C lies below
+// T, so a page-aligned T, a chain boundary a longer prompt resumes from, is
+// never dead. With aligned State checkpoints C is the last segment entrance
+// of any prompt longer than one segment instead, and those groups neither
+// publish nor match a state at a dead T, which is never aligned. A request
+// that resumed from a tail beyond C keeps T: it extends an earlier prompt end
+// in place, and the next request likely extends T the same way. Returns C,
+// or zero when T is not dead (always on the D role, which publishes as
+// ever). It reads only the prompt and the resume point, so the admissions of
+// a fused prompt, made before C exists, decide as its first decode will
+// (firstDecodePublishesPromptEnd). C normally exists by the first decode:
+// the forward spanning C writes it, and a forward that starts or ends at C
+// finds or leaves the state there cached (a hit at C, a chunk end at C).
+std::int32_t Scheduler::promptEndCheckpoint(const Request& request, std::int32_t resume_tokens) const {
+    if (!config_.state_checkpoint_in_forward || config_.role == Role::kD) {
+        return 0;
+    }
     const std::int32_t page = coordinator_.PrefixGranularity();
     const std::int32_t checkpoint = PrefillStateCheckpointTokens(
         coordinator_, request.PrefillSize(), config_.max_scheduled_tokens, config_.prefix_replay_tokens);
-    if (checkpoint <= 0 || checkpoint != request.NumComputedTokens() / page * page ||
-        progress.resume_tokens > checkpoint) {
+    if (checkpoint <= 0 || checkpoint != request.PrefillSize() / page * page || resume_tokens > checkpoint) {
+        return 0;
+    }
+    return checkpoint;
+}
+
+// Whether the checkpoint C that makes a prompt end T dead
+// (promptEndCheckpoint) exists, which a publication in place at T -- a finish
+// there -- needs to skip T: the request's final forward wrote C and it is
+// still pending (the publication at T then publishes it), or every State
+// group's state at C is cached, on either tier (the KV below C is the
+// request's own). Once an admission lets the request's optional hold on C go
+// and evicts it, such a finish publishes T. The caller passes the progress
+// before the publication at T, the request's computed frontier.
+bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const {
+    const std::int32_t checkpoint = promptEndCheckpoint(request, progress.resume_tokens);
+    if (checkpoint == 0) {
         return false;
     }
     if (progress.state_checkpoint_tokens == checkpoint) {
         return true;
     }
-    const auto checkpoint_pages = static_cast<std::size_t>(checkpoint / page);
+    const auto checkpoint_pages = static_cast<std::size_t>(checkpoint / coordinator_.PrefixGranularity());
     return checkpoint_pages <= progress.prefix_hashes.size() &&
            coordinator_.HoldsStateCheckpoint(progress.prefix_hashes[checkpoint_pages - 1]);
 }
@@ -194,14 +210,18 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
 // publishes like a chunk end: its full pages and a pending in-forward
 // checkpoint, but no tail and no state. That is the P role's finish (the
 // transfer ACK; the P never computes past its prompt), and a fused
-// request's that no decode ran past -- the rule its first decode would have
-// applied. A fused finish F past the prompt end publishes like a chunk end
-// too: a next turn that re-renders the generated reply diverges before F,
-// and without its state the tail is no point a hybrid model can resume at.
-// The prompt end was the first decode's to publish or skip (scheduleDecode).
-// A model without State groups keeps its tails: there they are resume points
-// of their own. The D role publishes its frontier as ever. (Validate
-// requires prefix caching with the in-forward checkpoint on the other roles.)
+// request's that no decode ran past. Both publish in place, so they keep a
+// dead prompt end whose checkpoint has left the cache
+// (promptEndIsCoveredByCheckpoint); a fused first decode, which would move
+// off the tail it publishes into copy-in blocks its admissions reserved,
+// decides as they did instead (firstDecodePublishesPromptEnd). A fused finish
+// F past the prompt end publishes like a chunk end too: a next turn that
+// re-renders the generated reply diverges before F, and without its state the
+// tail is no point a hybrid model can resume at. The prompt end was the
+// first decode's to publish or skip (scheduleDecode). A model without State
+// groups keeps its tails: there they are resume points of their own. The D
+// role publishes its frontier as ever. (Validate requires prefix caching with
+// the in-forward checkpoint on the other roles.)
 bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const {
     if (!config_.state_checkpoint_in_forward || config_.role == Role::kD) {
         return false;

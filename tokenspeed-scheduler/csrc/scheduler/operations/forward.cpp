@@ -149,28 +149,6 @@ std::int32_t chunkTowardInForwardCheckpoint(std::int32_t checkpoint, std::int32_
     return (checkpoint - first_pos) % prefix_granularity == 0 ? tokens : checkpoint - first_pos;
 }
 
-// Whether a request's first decode publishes its prompt end and keeps writing
-// past it (PublicationPoint::kOwnerContinues): the fused role with prefix
-// caching. The P role publishes its prompt end at finish, and the D role's
-// prompt end arrived by transfer or was claimed.
-bool firstDecodePublishesPromptEnd(const SchedulerConfig& config) {
-    return config.role == Role::kFused && !config.disable_prefix_cache;
-}
-
-// The point every admission of a request's prompt -- each chunk and a restore
-// before the first decode -- reserves copy-in blocks for: the prompt end its
-// first decode publishes and keeps writing past. Each admission reserves those
-// of the slots whose blocks it allocates (CacheCoordinator::Admit), so the
-// first admission, which prepays the prompt in full-history groups, holds
-// them for those groups from then on.
-std::optional<CacheCoordinator::CopyInPoint> promptEndCopyInPoint(const SchedulerConfig& config,
-                                                                  const Request& request) {
-    if (!firstDecodePublishesPromptEnd(config)) {
-        return std::nullopt;
-    }
-    return CacheCoordinator::CopyInPoint{.tokens = request.PrefillSize()};
-}
-
 // Adds the copy-in blocks an admission reserved (AdmissionResult::
 // copy_in_blocks: null for the slots it allocated no block for) to the ones
 // the request holds, slot by slot.
@@ -204,6 +182,33 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
 }
 
 }  // namespace
+
+// Whether a request's first decode publishes its prompt end and keeps writing
+// past it (PublicationPoint::kOwnerContinues): the fused role with prefix
+// caching, except at a prompt end the in-forward checkpoint makes dead
+// (promptEndCheckpoint), which the first decode skips. The P role publishes
+// its prompt end at finish, and the D role's prompt end arrived by transfer
+// or was claimed. It reads only the prompt and where the request resumed, so
+// every admission of the prompt decides as its first decode will.
+bool Scheduler::firstDecodePublishesPromptEnd(const Request& request, std::int32_t resume_tokens) const {
+    return config_.role == Role::kFused && !config_.disable_prefix_cache &&
+           promptEndCheckpoint(request, resume_tokens) == 0;
+}
+
+// The point every admission of a request's prompt -- each chunk and a restore
+// before the first decode -- reserves copy-in blocks for: the prompt end its
+// first decode publishes and keeps writing past. Each admission reserves those
+// of the slots whose blocks it allocates (CacheCoordinator::Admit), so the
+// first admission, which prepays the prompt in full-history groups, holds
+// them for those groups from then on. A dead prompt end has none: its first
+// decode publishes no tail to move off, so no admission holds a block for it.
+std::optional<CacheCoordinator::CopyInPoint> Scheduler::promptEndCopyInPoint(const Request& request,
+                                                                             std::int32_t resume_tokens) const {
+    if (!firstDecodePublishesPromptEnd(request, resume_tokens)) {
+        return std::nullopt;
+    }
+    return CacheCoordinator::CopyInPoint{.tokens = request.PrefillSize()};
+}
 
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
@@ -609,9 +614,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // round (a cache this full keeps no spare block). That optional block
     // never makes blocks leave one by one (docs/design/scheduler.md §1.4).
     // A local prompt reserves the copy-in blocks of its prompt end with the
-    // blocks they serve; a remote landing computes no prompt here.
+    // blocks they serve, unless the prompt end is dead for a request resuming
+    // at the hit; a remote landing computes no prompt here.
     const std::optional<CacheCoordinator::CopyInPoint> copy_in_point =
-        source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(config_, *request) : std::nullopt;
+        source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
         admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
@@ -753,7 +759,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return demands;
     };
     // The prompt end's copy-in blocks of the slots this chunk allocates.
-    const std::optional<CacheCoordinator::CopyInPoint> copy_in_point = promptEndCopyInPoint(config_, *request);
+    const std::optional<CacheCoordinator::CopyInPoint> copy_in_point =
+        promptEndCopyInPoint(*request, cache_progress.resume_tokens);
     // As for a first chunk: without room for the in-forward checkpoint's
     // block the chunk ends at the boundary instead.
     std::optional<CacheCoordinator::AdmissionResult> admission;
@@ -832,14 +839,14 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // 1 in place and lets slot 0 go. Restricted groups cannot publish that
     // decode-produced live state at finish or retraction either. With the
     // in-forward checkpoint, a fused prompt end its pre-tail State checkpoint
-    // covers (promptEndIsCoveredByCheckpoint) is such a later decode instead:
-    // no tail and no prompt-end state are published, the partial page stays
-    // the owner's and the state is written in place.
+    // makes dead (promptEndCheckpoint) is such a later decode instead: no
+    // tail and no prompt-end state are published, the partial page stays the
+    // owner's and the state is written in place. Its admissions reserved no
+    // copy-in block for it, so it is skipped even if that checkpoint has left
+    // the cache since.
     const bool first_decode = request->Is<fsm::PrefillDone>();
     fsm::CacheProgress& cache_progress = request->CacheProgressRef();
-    const bool prompt_end =
-        first_decode && firstDecodePublishesPromptEnd(config_) &&
-        !(config_.state_checkpoint_in_forward && promptEndIsCoveredByCheckpoint(*request, cache_progress));
+    const bool prompt_end = first_decode && firstDecodePublishesPromptEnd(*request, cache_progress.resume_tokens);
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};
@@ -1560,10 +1567,12 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
 
     // A victim taken before its first decode resumes its prompt: the restore
     // reserves the prompt end's copy-in blocks for the slots it rebuilds or
-    // grows, the retraction having released the ones it held.
+    // grows, the retraction having released the ones it held (none for a
+    // dead prompt end, as at its first admission).
     const std::optional<CacheCoordinator::CopyInPoint> copy_in_point =
-        std::holds_alternative<fsm::ResumeDecoding>(retracted->shape) ? std::nullopt
-                                                                      : promptEndCopyInPoint(config_, *request);
+        std::holds_alternative<fsm::ResumeDecoding>(retracted->shape)
+            ? std::nullopt
+            : promptEndCopyInPoint(*request, retracted->cache_progress.resume_tokens);
     std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator_.Restore(retracted->image, demands, copy_in_point, retracted->cache_progress.access_epoch);
     if (!result) {

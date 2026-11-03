@@ -352,36 +352,43 @@ is the traffic the in-forward checkpoint serves, so with
 `state_checkpoint_in_forward` the scheduler skips both on a model with State
 groups, KV tails included; without it nothing is skipped. A prompt end `T`
 inside the page its pre-tail checkpoint `C` (`PrefillStateCheckpointTokens`,
-the in-forward checkpoint's boundary) starts is published like a chunk end
-once `C` exists — pending from the request's final forward, which the same
-publication publishes, or cached in every State group, on either tier as the
-probe takes it (`promptEndIsCoveredByCheckpoint`); any other prompt end is
-published as before. The request's own hold on a cached `C` is optional
-(above): once an admission lets it go and evicts `C`, `T` is published. A
-request that resumed from a tail beyond `C` keeps its prompt end: it extends
-an earlier prompt end in place, and its successor likely extends this one
-the same way. An identical prompt cannot resume at `T` (it replays the final
-token) and resumes at `C`; a longer prompt repeating `T`'s partial page
-resumes at `C` too, recomputing less than a page. The rule applies at the P
-role's finish (§3.1) and at the fused role's first decode, which is then an
-ordinary decode step: the partial page stays the owner's and the live slot is
-written in place (`kRelease`). A fused finish past the prompt end publishes
-like a chunk end as well, whether or not the prompt has a pre-tail checkpoint
-— its completed full pages, no tail and no state (`finishCheckpointIsDead`)
-— and a finish at the prompt end follows the prompt-end rule. A next turn
-that repeats the previous reply verbatim therefore resumes at `C`, or at a
-prompt end the rule kept, and recomputes the reply (without the in-forward
-checkpoint it would resume at the finish). The skipped entries occupy no
-cache block and never reach Host. A retraction still publishes its frontier
-(§2), the D role publishes as before, and a model without State groups keeps
-its tails: they are resume points there. With aligned State checkpoints
-(below), which require the in-forward checkpoint, `C` is the prompt's last
-segment entrance -- for any prompt longer than one segment, whatever the
-chunk budget -- so the rule covers a prompt end in the first page past it.
-It never skips an aligned checkpoint: a covered prompt end is never a page
-boundary, and a finish past the prompt end holds a decode-produced state,
-which those groups keep private anyway. Their other unaligned prompt ends
-still publish a KV tail, although no hit resumes there either.
+the in-forward checkpoint's boundary) starts is dead (`promptEndCheckpoint`);
+any other prompt end is published as before. A request that resumed from a
+tail beyond `C` keeps its prompt end: it extends an earlier prompt end in
+place, and its successor likely extends this one the same way. An identical
+prompt cannot resume at `T` (it replays the final token) and resumes at `C`;
+a longer prompt repeating `T`'s partial page resumes at `C` too, recomputing
+less than a page. The fused role's first decode skips a dead prompt end and
+is then an ordinary decode step: the partial page stays the owner's and the
+live slot is written in place (`kRelease`). That decision reads only the
+prompt and where the request resumed, so the prompt's admissions take it
+too, before `C` exists, and reserve no copy-in block for a dead prompt end
+(§1, `cache-concepts.md`, copy-in); it stands even if `C` has left the cache
+by the first decode. `C` normally exists by then: the forward spanning it
+writes it, and a chunk that starts or ends there finds or leaves the state
+cached. A publication in place at `T` — the P role's finish (§3.1), or a
+fused finish no decode ran past — skips `T` only once `C` exists: pending
+from the request's final forward, which the same publication publishes, or
+cached in every State group, on either tier as the probe takes it
+(`promptEndIsCoveredByCheckpoint`). The request's own hold on a cached `C` is
+optional (above): once an admission lets it go and evicts `C`, such a
+publication publishes `T`. A fused finish past the prompt end publishes like
+a chunk end as well, whether or not the prompt has a pre-tail checkpoint —
+its completed full pages, no tail and no state (`finishCheckpointIsDead`). A
+next turn that repeats the previous reply verbatim therefore resumes at `C`,
+or at a prompt end the rule kept, and recomputes the reply (without the
+in-forward checkpoint it would resume at the finish). The skipped entries
+occupy no cache block and never reach Host. A retraction still publishes its
+frontier (§2), the D role publishes as before, and a model without State
+groups keeps its tails: they are resume points there. With aligned State
+checkpoints (below), which require the in-forward checkpoint, `C` is the
+prompt's last segment entrance -- for any prompt longer than one segment,
+whatever the chunk budget -- so the rule covers a prompt end in the first
+page past it. It never skips an aligned checkpoint: a dead prompt end is
+never a page boundary, and a finish past the prompt end holds a
+decode-produced state, which those groups keep private anyway. Their other
+unaligned prompt ends still publish a KV tail, although no hit resumes there
+either.
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
@@ -654,7 +661,9 @@ same count again for the **copy-in blocks** (`copyInReserveBlocks`,
 the admission that allocates the blocks they serve -- the first, in
 full-history groups -- until that decode copies the published blocks into
 them, and the first admission can be a hitter's that still pins its copy
-sources. The charges are bucket-blind, so a sharded group whose copy's
+sources. A dead prompt end (§1.2) holds none, but whether a prompt end is
+dead depends on the prompt, so the charge stays.
+The charges are bucket-blind, so a sharded group whose copy's
 bucket is full while other buckets have holes can still make such an
 admission wait.
 
@@ -1278,7 +1287,9 @@ pages:
   **new** request-pool index: the runtime imports the slot-state blob into
   that row.
 - A victim taken before its first decode held copy-in blocks for its prompt
-  end (`cache-concepts.md`, copy-in). They hold no bytes, so the image does
+  end (`cache-concepts.md`, copy-in), unless the prompt end is dead (§1.2),
+  which the restore decides as the first admission did, from where the victim
+  resumed. They hold no bytes, so the image does
   not carry them: the retraction releases them with the tables, and the
   restore reserves them again with the blocks they serve, inside the same
   planner pass -- for a rebuilt slot of the partial page at the image's
@@ -1511,8 +1522,10 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   group's rotation swaps a released block for a fresh one, and each copy-in
   block of the prompt end is reserved with the block it serves -- in
   full-history groups by the first admission, which prepays the prompt (1,
-  cache-concepts.md). Without this a pool full of retraction-exempt requests
-  wedges at their first decodes.
+  cache-concepts.md). Its admissions and its first decode agree on whether
+  the prompt end is published: a dead one (1.2) holds no copy-in block and
+  its first decode spends none. Without this a pool full of
+  retraction-exempt requests wedges at their first decodes.
   A sliding-window group's growth can outrun its reserve (1); the
   empty-round retraction keeps such a pool live (2).
 - A store either pins its Device sources until the ack or is stream-ordered;
