@@ -36,10 +36,12 @@ if not is_cdna4():
 
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     ENTRY_WORDS,
+    ERROR_ABORT,
     ERROR_WORDS,
     GRID,
     JOIN_WORDS,
     LINE_WORDS,
+    SITE_ABORTED,
     SITE_CLAIM,
     SITE_JOIN,
     enter_check,
@@ -300,6 +302,11 @@ _TRAP_CHILD = textwrap.dedent("""
     from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
     state = t._State()
     mirror = FailureMirror(state.errors, sys.argv[2])
+    # 8 workgroups are missing, so the join stalls. "aborted": a peer's
+    # abort marker is already set, so the join's abort check stops it;
+    # otherwise it runs to its deadline.
+    if sys.argv[3] == "aborted":
+        state.errors[t.ERROR_ABORT] = t._MARKER
     t._fail_stop_kernel[(t.GRID - 8,)](
         state.epochs, state.claims, state.joins, state.errors, 1_000_000,
         num_warps=8, **t.persistent_compile_options(),
@@ -316,15 +323,17 @@ def _fail_stop_kernel(epochs, claims, joins, errors, deadline_ticks):
     grid_join(joins, launch, fail_stop, 0, 0)
 
 
-def test_expired_wait_stops_the_queue(tmp_path):
-    """``fail_stop`` raises a queue error: the process ends, it never hangs,
-    and its record survives in the host mirror for the parent to read."""
+# A peer's abort marker: (origin rank + 1) << 16 | the origin's site.
+_MARKER = (5 + 1) << 16 | 40
+
+
+def _run_trap_child(tmp_path, mode):
     from tokenspeed_kernel_amd.ops.gfx950.persistent.mirror import FailureMirror
 
-    path = str(tmp_path / "failure-record")
+    path = str(tmp_path / f"failure-record-{mode}")
     start = time.monotonic()
     child = subprocess.run(
-        [sys.executable, "-c", _TRAP_CHILD, os.path.dirname(__file__), path],
+        [sys.executable, "-c", _TRAP_CHILD, os.path.dirname(__file__), path, mode],
         capture_output=True,
         text=True,
         timeout=300,
@@ -332,7 +341,22 @@ def test_expired_wait_stops_the_queue(tmp_path):
     assert child.returncode != 0, child.stdout + child.stderr
     assert "NO TRAP" not in child.stdout
     assert time.monotonic() - start < 300
-    site, cta, _, epoch, label = FailureMirror.read(path)
+    return FailureMirror.read(path)
+
+
+def test_expired_wait_stops_the_queue(tmp_path):
+    """``fail_stop`` raises a queue error: the process ends, it never hangs,
+    and its record survives in the host mirror for the parent to read."""
+    site, cta, _, epoch, label = _run_trap_child(tmp_path, "expired")
     # The 8 missing workgroups stall the join: a join failure in launch 1.
     assert (site, epoch, label) == (SITE_JOIN, 1, 0)
+    assert 0 <= cta < GRID
+
+
+def test_aborted_wait_records_the_origin_marker(tmp_path):
+    """A wait stopped by a peer's abort records ``SITE_ABORTED`` with the
+    peer's marker as the detail (not the wait's own detail), so the host
+    record names the rank and site that failed first."""
+    site, cta, detail, epoch, _ = _run_trap_child(tmp_path, "aborted")
+    assert (site, detail, epoch) == (SITE_ABORTED, _MARKER, 1)
     assert 0 <= cta < GRID
