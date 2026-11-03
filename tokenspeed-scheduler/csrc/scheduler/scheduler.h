@@ -349,7 +349,8 @@ private:
     // turn resumes there. A shared checkpoint stays too: one another first
     // admission resumed at, or one an access dated after R's publisher
     // acquired it. A boundary no in-forward checkpoint was recorded at (a
-    // junction or prompt end alone) is never demoted. The scheduler sees no
+    // junction or prompt end alone) is never demoted, though it can need a
+    // window block it shares with the demoted one. The scheduler sees no
     // conversations, so another conversation's boundary only this one
     // resumed from so far is demoted like its own.
     void demoteSupersededCheckpoint(const fsm::CacheProgress& progress);
