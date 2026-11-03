@@ -40,9 +40,11 @@ that stride over the same tile index. A tile's last K step issues the next
 tile's first loads, hiding the epilogue and the next tile lookup behind them.
 Its accumulator holds sums in units of the current K block's scale and is
 rescaled at each step, so one accumulator stays live and two programs fit.
-Those batches can also keep the intermediate and ``route_output`` rows in
-expert order, so stage two loads and stores contiguous tiles instead of
-gathering and scattering rows; ``route_rows`` then maps each route to its row.
+Those whose gate/up tiles are 128 rows tall can also keep the intermediate
+and ``route_output`` rows in expert order, so stage two loads and stores
+contiguous tiles instead of gathering and scattering rows; ``route_rows`` then
+maps each route to its row. Shorter gate/up tiles lose more to the ordered
+stores than down gains.
 Persistent programs, and the largest batches' gate/up programs, are renumbered
 so each XCD runs a contiguous run of tiles, keeping tiles that share activation
 rows or expert weights on one L2.
@@ -104,7 +106,7 @@ _REGIMES = (
     (24, _TileConfig(32, 64, 128, 2, 4, ((0, 1), (0, 2)), 1), _MEDIUM_DOWN),
     (40, _TileConfig(32, 64, 128, 2, 4, ((0, 1), (0, 2)), 1), _PERSISTENT_MEDIUM_DOWN),
     (
-        80,
+        64,
         _TileConfig(64, 128, 128, 2, 8, ((0, 1), (0, 2), (1, 0)), 1),
         _PERSISTENT_MEDIUM_DOWN,
     ),
@@ -1329,10 +1331,11 @@ def launch_gluon_fp8_block_experts_gfx1250(
         route_output: BF16 ``[tokens * top_k, hidden]`` output, one row per
             route. Rows of routes no expert lists are left untouched.
         route_rows: Optional int32 ``[tokens * top_k]`` scratch. Batches whose
-            down projection runs persistently then keep the intermediate and
-            ``route_output`` rows in expert order, which turns the down
-            projection's gathers and scattered stores into contiguous tiles,
-            and record route ``r``'s row in ``route_rows[r]``.
+            down projection runs persistently on 128-row gate/up tiles then
+            keep the intermediate and ``route_output`` rows in expert order,
+            which turns the down projection's gathers and scattered stores
+            into contiguous tiles, and record route ``r``'s row in
+            ``route_rows[r]``.
 
     Returns:
         Whether ``route_output`` rows follow ``route_rows``.
@@ -1351,7 +1354,7 @@ def launch_gluon_fp8_block_experts_gfx1250(
     num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     gate_up, down = _select_tiles(num_routes, num_experts, inter, num_sms)
     persistent = isinstance(down, _PersistentTiles)
-    if not persistent:
+    if not persistent or gate_up.block_m < 128:
         route_rows = None
     _launch_gate_up(
         gate_up,
