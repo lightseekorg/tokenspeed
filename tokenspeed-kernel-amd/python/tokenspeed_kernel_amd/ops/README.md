@@ -50,56 +50,80 @@ skew and regress performance even when the generated kernel remains correct.
 
 `gfx950/persistent/` holds device helpers for kernels that keep one
 workgroup on every CU for the whole launch and hand work between workgroups
-through memory instead of kernel boundaries.
+through memory instead of kernel boundaries. They carry no model knowledge.
 
 #### Contract
 
 - The kernel is a plain launch of `GRID` (256) workgroups that are all
-  resident: each reserves more than half of a CU's LDS.
-- `enter_launch(epochs, claims, errors, deadline_ticks, label, on_expiry)`
-  advances the workgroup's epoch word (one per program id, `.cv` load, `.wt`
-  store), reads its XCD from `HW_REG_XCC_ID`, and claims the logical id
-  `cta = (pid // 8) * 8 + xcd` by exchanging `(tag, pid)` into
-  `claims[xcd][pid // 8]`. It returns a `Launch`. Roles use `cta`, never
-  `pid % 8`: dispatch hands the XCDs workgroups in turn from a start that
-  depends on the kernels before. A claim that finds this launch's tag means
-  two workgroups took one role, and `on_expiry` runs before any
-  role-dependent store. Epoch and claim words are zeroed together, once.
-- `grid_join(joins, launch, on_expiry, SET)` waits until all workgroups
-  arrive; `SET` is the join's index in the launch modulo 2. Stores issued
-  before it are visible after it to `.cv` loads.
-- `wait_word(ptr, expected, launch, on_expiry, SITE)` waits until an int32
-  word equals `expected`, then joins the workgroup.
-- Every wait gives up at `deadline_ticks` (10 ns ticks) or when a peer has
-  set the abort word, then calls `on_expiry(launch, site, detail)`.
-  `fail_stop` records `(site, cta, detail, epoch, label)` in the error words
-  and runs `s_trap 2`, which aborts the process. Kernels pass handlers that
-  do not return; a handler that also stops peers belongs to the caller.
+  resident, built with `persistent_compile_options()` (it links the
+  helpers' LLVM intrinsics).
+- Entry is two calls. `enter_issue(epochs, claims)` names the workgroup's
+  role, `cta = (pid // 8) * 8 + xcd` from the hardware XCD id, with no
+  memory access; the role may then issue its first weight or KV loads.
+  `enter_check(entry, errors, arena, deadline_ticks, label, on_expiry)`
+  returns this wave's `Launch` (`cta`, `xcd`, `slot`, 64-bit `epoch`,
+  never-zero 32-bit `tag`, `copy = epoch & 1` for two-copy areas). Roles use
+  `cta`, never the program id: dispatch starts on an XCD that depends on the
+  kernels before.
+- Each wave owns one int64 word in its workgroup's epoch line and one in
+  its role's claim line (`ENTRY_WORDS` each, zeroed together once). Every
+  launch adds exactly one to each, so a wave whose two old values differ
+  found a second workgroup on its role and stops with `SITE_CLAIM`.
+- Every wait is an equality on the launch tag and returns whether it was
+  seen, per wave; the caller then runs `on_expiry(launch, site, detail)`,
+  which must not return. A wait gives up at `deadline_ticks` (10 ns ticks)
+  or when a peer stored its abort marker in this GPU's error words.
+- Waits by hand-off class:
+  - `poll_until(word, expected, launch, LOAD)`: one int32 word. `LOAD` is
+    `"sc1"` (stored on this GPU), `".cv"` (stored by another GPU) or
+    `"smem"` (scalar loads past the scalar cache: words stored on this XCD
+    or in uncached memory). `poll_until_all` waits for one word per lane.
+  - `poll_tags16(line, tag, launch, GLC, BARRIER)`: a 64 B line of 16 tags
+    with scalar loads. `BARRIER` ends with a workgroup barrier (other waves
+    read what the tags guard) or only with `wave_acquire` (this wave reads
+    alone, as in per-wave loops).
+  - `store_pairs` / `poll_pairs`: (value, tag) pairs, one 8-byte store each
+    (`tag << 32 | value`), so no drain and no flag. `poll_pair_sums8` reads
+    eight lines of four same-XCD pairs with scalar loads and returns their
+    sums in line order.
+  - Payload plus flag: the payload stores, `release_drain()` in every
+    storing wave, `gl.barrier()`, then the flag.
+- `grid_join(joins, launch, on_expiry, SET, detail)` waits for every
+  workgroup; prefer the data-driven waits above.
+- `fail_stop(launch, site, detail)` records `(site, cta, detail, epoch,
+  label)` in the error words and in the host page of a `FailureMirror` (if
+  set: after a queue error device memory cannot be read), then traps. Any
+  subset of waves may call it; it has no workgroup barrier.
+- `UncachedBuffer` allocates zeroed uncached device memory for words that
+  scalar loads poll across XCDs.
+- `wave.py` states per-wave facts Gluon cannot express yet: per-wave scalar
+  values (`wave_scalar`), an opaque index that keeps LDS reads in a loop, a
+  value ordered after a load (`after`, to publish once the wave's stores
+  have completed), an issue-order point, and an LDS exchange among the
+  waves of a workgroup without a barrier.
 
 #### Algorithm
 
-- Producers drain (`s_waitcnt vmcnt(0)` in every wave, then a workgroup
-  barrier) before they publish; `gl.barrier()` alone waits for no store.
-  Consumers read with `.cv` loads, which bypass non-coherent L2 lines.
-  Nothing invalidates or writes back L2.
+- One wave's vector memory operations complete in issue order, so a vector
+  poll waits behind every load the wave issued before it. Scalar loads and
+  atomics count separately (`lgkmcnt`): entry and the `smem` polls never
+  wait behind the role's weight loads.
+- Entry: each wave adds 1 to its two counters with returning scalar atomics
+  (`s_atomic_add_x2 … glc`) and waits on `lgkmcnt` only. `epoch` is the old
+  epoch value plus one, kept in scalar registers.
+- Polls run per wave: one owner lane and a one-instruction vote, or scalar
+  loads. Every 64 retries a poll reads the clock (the first check starts the
+  deadline, so a wait met sooner reads no clock) and the abort word, with a
+  scalar load in scalar polls. After a vector poll, one workgroup barrier is
+  the acquire point for the loads that follow.
+- Tags repeat after 2**32 - 1 launches, so every tagged slot a later launch
+  may poll is rewritten or zeroed in every launch.
 - The join is a two-level top-bit toggle: the 32 workgroups of an XCD add to
-  their XCD's line (the designated one adds `1 + 2**31 - 32`), so the 32nd
-  arrival flips bit 31; that arrival adds to the grid line the same way.
-  Both levels flip once per join from the same start, so a waiter knows the
-  bit to wait for from its own XCD arrival, and no join needs a reset.
-  Consecutive joins alternate two line sets; a set is reused only after
-  every workgroup passed the join in between, so the grid line holds exactly
-  0 or `-2**31` while anyone waits on it.
-- `wait_word` polls from one lane with relaxed device-scope loads
-  (`gl.atomic_poll`, no barrier in its loop); its closing workgroup barrier
-  orders the loads after it. It checks the deadline and the abort word every
-  50 us of polling.
-- `wave.py` holds the per-wave facts Gluon cannot state yet (inline asm):
-  per-wave SGPR values, an opaque index that keeps LDS
-  reads in a loop, a value ordered after a load (to publish after the wave's
-  stores retire), and an LDS exchange among the waves of a workgroup without
-  a barrier (its spin has no deadline: only same-workgroup waves that never
-  wait back may be waited for).
+  their XCD's line so that the 32nd arrival flips bit 31, and that arrival
+  adds to the grid line the same way. Consecutive joins alternate two line
+  sets, so no join needs a reset.
+- Nothing invalidates or writes back L2: consumers on other XCDs read
+  write-through payloads with `.cv` loads.
 
 ## Attention prologue
 

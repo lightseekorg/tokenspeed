@@ -92,6 +92,22 @@ the partials of columns [512q, 512q + 512) of every route and publishes them
 with their partial sums of squares, then every rank normalizes, weights and
 sums all columns.
 
+The native fused layer (`muse_spark/fused_layer.py`, one persistent launch
+per decoder layer) calls these bodies as hop ends: the TP8 two-shot, the
+column-owned route exchange (`iris_column_routes_push_words` is the one push
+body; the MoE stream's down units push from their epilogue), the Lamport
+gather and the moetail sender. `MuseNativeIrisState` allocates every
+cross-GPU receive area from the group's heap before capture, in two copies
+chosen by `launch.copy = epoch & 1` and sized for 32 rows. Consumers never
+restore markers: at the entry of launch L the 128 reduce-scatter senders
+re-arm copy `(L + 1) & 1` of every area and drain before their first push of
+L; a peer writes that copy again only in L + 1, which it reaches only after
+this rank's pushes of L. Norm sums
+travel as epoch-tagged (value, tag) 64-bit words, which need no clearing.
+The hop ends wait with the persistent helpers' deadline and abort checks;
+`iris_fail_stop` stores the first failing rank's marker into every rank's
+abort word, so all ranks stop and each record names the origin.
+
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
 
