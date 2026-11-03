@@ -29,8 +29,6 @@ asserted structurally unchanged.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -131,15 +129,24 @@ def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
     assert (output.float() - reference).norm() / reference.norm() < 0.06
     assert torch.count_nonzero(output[:, module.used_rows :]) == 0
     module.quant_method = method
-    attention = SimpleNamespace(
-        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
-    )
+    attention = _kda_attention(module)
     parts = KimiLinearKDA._project_qkvfab(
         attention, x, ctx=None, attnres_partial_args=None
     )
     torch.testing.assert_close(
         torch.cat(parts, dim=-1), output[:, : module.used_rows], rtol=0, atol=0
     )
+
+
+def _kda_attention(projection: torch.nn.Module):
+    """A KDA module holding only the merged projection and its head geometry."""
+    from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
+
+    attention = object.__new__(KimiLinearKDA)
+    torch.nn.Module.__init__(attention)
+    attention.local_num_heads, attention.head_dim = NUM_HEADS // TP_SIZE, HEAD_DIM
+    attention.qkvgb_proj = projection
+    return attention
 
 
 def _dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -324,9 +331,7 @@ def test_per_channel_merged_projection_matches_dequantized_reference(rank) -> No
     assert torch.count_nonzero(module.weight[used:].view(torch.uint8)) == 0
 
     x = torch.randn(33, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    attention = SimpleNamespace(
-        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
-    )
+    attention = _kda_attention(module)
     parts = KimiLinearKDA._project_qkvfab(
         attention, x, ctx=None, attnres_partial_args=None
     )
