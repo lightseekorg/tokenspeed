@@ -63,6 +63,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.column_split import (
     iris_pull_allgather_sorted_mxfp4_slices,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+    iris_columns_lamport_allgather_muse_moetail,
     iris_fused_gemv_lamport_allgather_muse_moetail,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -86,6 +87,10 @@ if current_platform().is_cdna4:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_geometry_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_mm_a16w16_column_shard_gfx950,
+        supports_gluon_mm_a16w16_column_shard_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         sorted_route_capacity,
@@ -115,10 +120,8 @@ _MUSE_INTERMEDIATE_GATHER_PROGRAMS = 64
 # The routed norm is latency bound: 256 programs were within 8% of the best
 # grid from 192 to 8192 tokens.
 _MUSE_COLUMN_NORM_PROGRAMS = 256
-# Most decode rows for the fused post-expert tail at TP8; it lost to the
-# replicated projection plus boundary at 16 rows in 8-rank graph replay.
-# Rows match the single-row tail bit for bit within 1-8 rows; 16 rows take
-# the replicated path.
+# Decode rows whose post-expert tail projects in the gather's senders (column
+# GEMV) at TP8. Rows match the single-row tail bit for bit within 1-8 rows.
 _MUSE_MOETAIL_MAX_ROWS = 8
 # Most decode rows of the fused sliding attention tail: 8 and 16 verify rows
 # (one or two requests). Its two-shot shards rows, so rows are a multiple of 8.
@@ -129,6 +132,13 @@ _MUSE_ATTNTAIL_PROGRAMS = 256
 # Columns one owner workgroup of the attention tail reduces (8 per rank).
 _MUSE_ATTNTAIL_OWNER_COLUMNS = 128
 _MUSE_ATTNTAIL_RESERVED_LDS = 128 * 1024
+# Up to this many rows, a decode GEMM over the rank's column shard (bitwise
+# the replicated GEMM's columns) feeds the same gather. At 16 rows in 8-rank
+# graph replay: about 16 us against 19.4-20.5 us for the replicated
+# projection plus boundary; the column GEMV senders lost there.
+_MUSE_MOETAIL_COLUMN_MAX_ROWS = 16
+# Columns each column-input sender pushes per row.
+_MUSE_MOETAIL_COLUMN_OUTPUTS = 8
 
 
 class MuseIrisState:
@@ -1572,10 +1582,15 @@ class MuseIrisState:
         beta: torch.Tensor,
         pre_weight: torch.Tensor | None,
     ) -> tuple[int, int] | None:
-        """Return the senders' GEMV geometry if the fused tail applies, else None."""
+        """Return the senders' geometry if the fused tail applies, else None.
+
+        The geometry is the column GEMV's (BLOCK_K, WAVES_PER_OUTPUT); above
+        ``_MUSE_MOETAIL_MAX_ROWS`` rows a column-shard decode GEMM projects the
+        rows instead and the geometry is unused.
+        """
         reduction = self.reduction
         # TP4 takes one row: more rows were not measured there.
-        max_rows = _MUSE_MOETAIL_MAX_ROWS if self.world_size == 8 else 1
+        max_rows = _MUSE_MOETAIL_COLUMN_MAX_ROWS if self.world_size == 8 else 1
         if (
             not current_platform().is_cdna4
             or self.world_size not in (4, 8)
@@ -1606,6 +1621,15 @@ class MuseIrisState:
             for value, dtype in vectors
         ):
             return None
+        if rows > _MUSE_MOETAIL_MAX_ROWS:
+            # The replicated path would run the decode GEMM; its column shard
+            # keeps every output's reduction.
+            local_width = _MUSE_BOUNDARY_WIDTH // self.world_size
+            if not supports_gluon_mm_a16w16_column_shard_gfx950(
+                rows, weight.shape[0], local_width, weight.shape[1]
+            ):
+                return None
+            return 0, 0
         # Senders repeat the replicated GEMV's per-output reduction, each
         # storing an even number of outputs in its 16 subgroups.
         block_k, waves = gluon_rowcta_bf16_gemv_geometry_gfx950(*weight.shape)
@@ -1627,7 +1651,7 @@ class MuseIrisState:
 
         ``weight`` is the replicated ``[8192, 4096]`` projection; the rows are
         gathered through the Lamport one-shot mailbox. TP8 takes up to
-        ``_MUSE_MOETAIL_MAX_ROWS`` rows, TP4 one.
+        ``_MUSE_MOETAIL_COLUMN_MAX_ROWS`` rows, TP4 one.
         """
         return (
             self._moetail_geometry(
@@ -1653,8 +1677,9 @@ class MuseIrisState:
         """Project this rank's columns of each row, gather the rows, update the residual.
 
         Returns the FP32 residual and, with ``pre_weight``, the BF16 input of
-        the next layer; each row is the replicated single-row projection of
-        that row followed by the Triton boundary.
+        the next layer; each row is the replicated projection of that row (the
+        single-row GEMV up to ``_MUSE_MOETAIL_MAX_ROWS`` rows, the decode GEMM
+        beyond) followed by the Triton boundary.
         """
         geometry = self._moetail_geometry(
             x.shape[0], weight, stream, post_weight, alpha, beta, pre_weight
@@ -1673,13 +1698,52 @@ class MuseIrisState:
             if pre_weight is not None
             else None
         )
+        local_weight = weight[rank * local_width : (rank + 1) * local_width]
+        if rows > _MUSE_MOETAIL_MAX_ROWS:
+            columns = torch.empty(
+                rows, local_width, dtype=torch.bfloat16, device=x.device
+            )
+            launch_gluon_mm_a16w16_column_shard_gfx950(x, local_weight, columns)
+            outputs = _MUSE_MOETAIL_COLUMN_OUTPUTS
+            # Sixteen-subgroup senders of `outputs` columns each, then one
+            # reducer per row.
+            iris_columns_lamport_allgather_muse_moetail[
+                (local_width // outputs + rows,)
+            ](
+                columns,
+                reduction.lamport_region,
+                reduction.lamport_epochs,
+                reduction.lamport_peer_addresses[: self.world_size],
+                stream,
+                post_weight,
+                alpha,
+                beta,
+                pre_weight if pre_weight is not None else post_weight,
+                out_stream,
+                pre_bf16 if pre_bf16 is not None else x,
+                rows,
+                RANK=rank,
+                WORLD_SIZE=self.world_size,
+                LOCAL_WIDTH=local_width,
+                MAX_ELEMENTS=reduction.lamport_max_numel,
+                BLOCK_M=1 << (rows - 1).bit_length(),
+                OUTPUTS=outputs,
+                POST_EPS=post_eps,
+                POST_WEIGHT_OFFSET=post_weight_offset,
+                PRE_EPS=pre_eps,
+                PRE_WEIGHT_OFFSET=pre_weight_offset,
+                HAS_PRE=pre_weight is not None,
+                PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+                num_warps=16,
+            )
+            return out_stream, pre_bf16
         # Sixteen-subgroup programs of 16 // waves outputs each, then one
         # reducer per row.
         iris_fused_gemv_lamport_allgather_muse_moetail[
             (local_width * waves // 16 + rows,)
         ](
             x,
-            weight[rank * local_width : (rank + 1) * local_width],
+            local_weight,
             reduction.lamport_region,
             reduction.lamport_epochs,
             reduction.lamport_peer_addresses[: self.world_size],

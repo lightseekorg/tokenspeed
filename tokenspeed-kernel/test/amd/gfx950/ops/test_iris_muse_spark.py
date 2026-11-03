@@ -2032,11 +2032,23 @@ def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_mm_a16w16_decode_gfx950,
+    )
 
-    # The replicated single-row projection of each row, then the unfused boundary.
+    # The replicated projection (single-row GEMVs up to 8 rows, the decode
+    # GEMM beyond), then the unfused boundary.
     branch = x.new_empty((x.shape[0], weight.shape[0]))
-    for row in range(x.shape[0]):
-        gluon_rowcta_bf16_gemv_gfx950(x[row : row + 1], weight, branch[row : row + 1])
+    if x.shape[0] > 8:
+        counters = torch.zeros(1, dtype=torch.int32, device=x.device)
+        launch_gluon_mm_a16w16_decode_gfx950(
+            x, weight, torch.bfloat16, counters=counters, out=branch
+        )
+    else:
+        for row in range(x.shape[0]):
+            gluon_rowcta_bf16_gemv_gfx950(
+                x[row : row + 1], weight, branch[row : row + 1]
+            )
     out_stream, _, pre_bf16 = _launch_post_norm_residual_pre_norm(
         stream,
         branch,
@@ -2057,14 +2069,16 @@ def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
 
 
 def _muse_moetail_worker(rank, world_size, device):
-    """The fused tail matches per-row replicated single-row GEMVs plus the boundary.
+    """The fused tail matches the replicated projection plus the boundary.
 
-    Row counts cover every power-of-two bucket at TP8 and odd counts inside
-    them (TP4 takes one row). Two layers alternate weights and next norms, one
+    Up to 8 rows the senders project (column GEMV) and match per-row
+    single-row GEMVs; 9-16 rows take a column-shard decode GEMM first and match
+    the replicated decode GEMM. Row counts cover every power-of-two bucket at
+    TP8 and odd counts inside them (TP4 takes one row). Two layers alternate weights and next norms, one
     rank lags, row counts interleave in one graph, and the stage counters start
     at the last stage so eager calls and replays wrap them.
     """
-    state = _muse_state(rank, device, 1, True)
+    state = _muse_state(rank, device, 2, True)
     reduction = state.reduction
     reduction.lamport_epochs.fill_(2)
     generator = torch.Generator(device=device).manual_seed(2610)
@@ -2081,7 +2095,7 @@ def _muse_moetail_worker(rank, world_size, device):
     ]
     beta = torch.sigmoid(torch.randn(8192, device=device, generator=generator))
     alpha = torch.sqrt(1 - beta.square())
-    counts = (1, 2, 3, 4, 5, 8) if world_size == 8 else (1,)
+    counts = (1, 2, 3, 4, 5, 8, 9, 13, 16) if world_size == 8 else (1,)
     xs = {
         rows: [
             torch.empty(rows, 4096, dtype=torch.bfloat16, device=device)
