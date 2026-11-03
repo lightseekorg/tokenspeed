@@ -215,6 +215,8 @@ struct State {
     /// The rooms of the requests the scheduling loop tracks: a sleep may
     /// not release the cache while one may still send.
     tracked: HashSet<u64>,
+    // Queued and executing jobs that can still read source pages.
+    pending_chunks: HashMap<u64, usize>,
     /// The tracked requests' rooms, by request.
     rooms_by_rid: HashMap<String, u64>,
     /// Rooms no request here has claimed, since when: a Decode rank
@@ -885,19 +887,23 @@ impl Shared {
 
     fn run_worker(&self, queue: &mpsc::Receiver<Chunk>) {
         while let Ok(chunk) = queue.recv() {
-            if let Err(reason) = self.transfer(&chunk) {
-                if self.state().ended(chunk.room()) {
-                    // Another thread failed or dropped the room after it was
-                    // queued: failing it again would replace its reason.
-                    tracing::debug!(
-                        room = chunk.room(),
-                        reason,
-                        "dropping an ended room's transfer"
-                    );
-                    continue;
+            let room = chunk.room();
+            if !self.state().ended(room) {
+                if let Err(reason) = self.transfer(&chunk) {
+                    if !self.state().ended(room) {
+                        tracing::error!(room, reason, "CachePD transfer failed");
+                        self.abort_room(room, &format!("CachePD transfer failed: {reason}"));
+                    }
                 }
-                tracing::error!(room = chunk.room(), reason, "CachePD transfer failed");
-                self.abort_room(chunk.room(), &format!("CachePD transfer failed: {reason}"));
+            }
+            let mut state = self.state();
+            let count = state
+                .pending_chunks
+                .get_mut(&room)
+                .expect("queued chunk counted");
+            *count -= 1;
+            if *count == 0 {
+                state.pending_chunks.remove(&room);
             }
         }
     }
@@ -1111,7 +1117,7 @@ impl PrefillOutbox {
     fn enqueue(&self, rid: &str, chunk: Chunk) {
         let room = chunk.room();
         let shard = {
-            let state = self.shared.state();
+            let mut state = self.shared.state();
             if state.ended(room) {
                 tracing::debug!(rid, room, "the room already failed or ended");
                 return;
@@ -1124,10 +1130,23 @@ impl PrefillOutbox {
                 .iter()
                 .filter_map(|destination| wire::session_port(&destination.session_id))
                 .sum();
+            *state.pending_chunks.entry(room).or_default() += 1;
             (ports % self.queues.len() as u64) as usize
         };
         if self.queues[shard].send(chunk).is_err() {
-            tracing::error!(rid, room, "the PD transfer workers stopped");
+            {
+                let mut state = self.shared.state();
+                let count = state
+                    .pending_chunks
+                    .get_mut(&room)
+                    .expect("queued chunk counted");
+                *count -= 1;
+                if *count == 0 {
+                    state.pending_chunks.remove(&room);
+                }
+            }
+            self.shared
+                .abort_room(room, "the PD transfer workers stopped");
         }
     }
 
@@ -1495,15 +1514,50 @@ impl TransferPeer for PrefillPeer {
         };
         self.log_stalls(&agreed);
 
+        // A failure on any rank cancels work on every rank. The status alone
+        // is not a source-page fence: queued or executing writes must retire
+        // everywhere before the scheduler can release the request's pages.
+        for (rid, &poll) in self.order.iter().zip(&agreed) {
+            if TransferPoll::from_wire(poll) == Some(TransferPoll::Failed) {
+                let sender = self.senders.get_mut(rid).expect("tracked");
+                sender.concluded = Some(TransferPoll::Failed);
+                if self.shared.state().rooms.get(sender.room) != Some(TransferPoll::Failed) {
+                    self.shared
+                        .abort_room(sender.room, "replica transfer failed");
+                }
+            }
+        }
+        let retired: Vec<i64> = {
+            let state = self.shared.state();
+            self.order
+                .iter()
+                .map(|rid| {
+                    let room = self.senders[rid].room;
+                    i64::from(!state.pending_chunks.contains_key(&room))
+                })
+                .collect()
+        };
+        let has_terminal = agreed.iter().any(|&poll| {
+            matches!(
+                TransferPoll::from_wire(poll),
+                Some(TransferPoll::Success | TransferPoll::Failed)
+            )
+        });
+        let retired = if replica.size() > 1 && has_terminal {
+            mesh.all_reduce(replica, &retired, Reduce::Min)?
+        } else {
+            retired
+        };
+
         let mut events = Vec::new();
         let mut ended = Vec::new();
-        for (rid, &poll) in self.order.iter().zip(&agreed) {
+        for ((rid, &poll), &retired) in self.order.iter().zip(&agreed).zip(&retired) {
             let sender = self.senders.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 sender.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
-            } else if poll == TransferPoll::Failed {
+            } else if poll == TransferPoll::Failed && retired != 0 {
                 let reason = self
                     .shared
                     .state()
@@ -1513,7 +1567,10 @@ impl TransferPeer for PrefillPeer {
                 tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
                 events.push(PdEvent::Failed(rid.clone()));
                 ended.push(rid.clone());
-            } else if sender.local == TransferPoll::Bootstrapped && poll == TransferPoll::Success {
+            } else if sender.local == TransferPoll::Bootstrapped
+                && poll == TransferPoll::Success
+                && retired != 0
+            {
                 sender.local = TransferPoll::Success;
                 events.push(PdEvent::Succeeded(rid.clone()));
                 ended.push(rid.clone());

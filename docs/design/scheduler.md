@@ -1079,7 +1079,16 @@ of what the Device holds.
 are pinned until the peer acknowledges, then released wholesale. Retracting a
 prompt whose KV is mid-transfer would strand the decode side.
 
-The PD pin is not recorded anywhere; it is a function of the FSM
+While P holds a request, prefix publication uses a copy of its block table.
+Deduplication may redirect that copy to canonical cache blocks, but the real
+request keeps the physical source blocks named by queued layerwise transfers.
+A client abort waits for the transfer terminal event; a failed transfer also
+waits for outstanding local forward results before freeing its tables. Failed
+requests waiting for those results receive no further forward work. Successful
+and failed terminal paths both release the source references, without an extra
+long-lived copy of the tables.
+
+The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
 pinned — the peer's decode reads the pages from the first scheduled chunk until
 the PD ACK finishes or aborts the request. On the D role the pin is exactly

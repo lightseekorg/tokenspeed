@@ -50,6 +50,12 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
+    if (request->ResultsInFlight() > 0) {
+        retired_pd_failures_.insert(event.request_id);
+        return;
+    }
+    pending_pd_aborts_.erase(event.request_id);
+    retired_pd_failures_.erase(event.request_id);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -65,6 +71,10 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     // frontier is final here, so it finishes like any request -- the P's
     // prompt-end state and partial page, the D's final state and tail are
     // published when it settles.
+    if (pending_pd_aborts_.contains(event.request_id)) {
+        handleEvent(pd::FailedEvent{event.request_id});
+        return;
+    }
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -78,6 +88,9 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
             throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
+        if (pending_pd_aborts_.contains(event.request_id)) {
+            handleEvent(pd::FailedEvent{event.request_id});
+        }
         return;
     }
     if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
@@ -98,6 +111,12 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 
 void Scheduler::settleFinishedRequests() {
     for (const std::unique_ptr<Request>& request : requests_) {
+        if (retired_pd_failures_.contains(request->Id()) && request->ResultsInFlight() == 0) {
+            pending_pd_aborts_.erase(request->Id());
+            retired_pd_failures_.erase(request->Id());
+            request->Apply(fsm::AbortEvent{&coordinator_});
+            continue;
+        }
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
@@ -119,7 +138,8 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         /*stream_completed_to_host=*/false,
         finishCheckpointIsDead(request, progress) ? PublicationPoint::kChunk : PublicationPoint::kFinal,
         /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
-            (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()));
+            (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()),
+        /*preserve_source_blocks=*/false);
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
@@ -259,6 +279,11 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
+        if (pdTransferInFlight(*request)) {
+            pending_pd_aborts_.insert(event.request_id);
+            return;
+        }
+        pending_pd_aborts_.erase(event.request_id);
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
 }
