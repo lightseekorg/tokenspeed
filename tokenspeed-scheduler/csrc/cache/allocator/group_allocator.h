@@ -83,7 +83,13 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        ids.resize(static_cast<std::size_t>(table.ReclaimedPrefixBlocks()), 0);
+        AppendBlockTablePageIds(table, ids);
+        return ids;
+    }
+
+    // Append one absolute row directly to its C++-owned batch buffer.
+    void AppendBlockTablePageIds(const BlockTable& table, std::vector<std::int32_t>& ids) const {
+        ids.insert(ids.end(), static_cast<std::size_t>(table.ReclaimedPrefixBlocks()), 0);
         const BlockPool* previous_pool = nullptr;
         std::int32_t previous_parent = 0;
         std::int32_t parent_base = 0;
@@ -103,7 +109,6 @@ public:
             }
             ids.push_back(parent_base + location.slot_index);
         }
-        return ids;
     }
 
     // The table window handed to PrefixCacheIndex::RegisterFullBlocks. The

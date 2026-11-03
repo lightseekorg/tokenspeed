@@ -330,8 +330,8 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     ASSERT_NE(prefill, nullptr);
     EXPECT_EQ(prefill->request_ids, (std::vector<std::string>{"r0"}));
     EXPECT_EQ(prefill->input_lengths, (std::vector<std::int32_t>{4}));
-    ASSERT_EQ(prefill->block_tables.count("full"), 1u);
-    EXPECT_EQ(prefill->block_tables.at("full").at(0).size(), 3u);
+    ASSERT_EQ(prefill->BlockTables().count("full"), 1u);
+    EXPECT_EQ(prefill->BlockTables().at("full").at(0).size(), 3u);
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 3u);
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
@@ -341,8 +341,8 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     const std::int32_t r0 = FindRequestIndex(decode, "r0");
     ASSERT_GE(r0, 0);
     EXPECT_EQ(decode->decode_input_ids[static_cast<std::size_t>(r0)], 42);
-    ASSERT_EQ(decode->block_tables.count("full"), 1u);
-    EXPECT_EQ(decode->block_tables.at("full")[static_cast<std::size_t>(r0)].size(), 3u);
+    ASSERT_EQ(decode->BlockTables().count("full"), 1u);
+    EXPECT_EQ(decode->BlockTables().at("full")[static_cast<std::size_t>(r0)].size(), 3u);
 }
 
 class DisaggDecodePriorityTestSuite : public DisaggDecodeAdmissionTestSuite {
@@ -673,7 +673,7 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     EXPECT_EQ(resumed->NumExtends(), 0u) << "the D role runs no prefill of any kind";
     EXPECT_EQ(resumed->decode_input_ids.front(), 44)
         << "the first decode after a restore carries its input: the new slot holds no in-flight capture";
-    EXPECT_EQ(resumed->block_tables.at("full").at(0).size(), 4u) << "3 restored pages and the decode slot";
+    EXPECT_EQ(resumed->BlockTables().at("full").at(0).size(), 4u) << "3 restored pages and the decode slot";
     SendForwardDone("running", {45});
     const ExecutionPlan next = PlanOnce();
     const ForwardBatch* ordinary = FindForwardBatch(next.Operations());
@@ -1012,7 +1012,7 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
     ASSERT_NE(destination, nullptr);
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{11}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
-    const auto& swa = destination->block_tables.at("swa").at(0);
+    const auto swa = destination->BlockTables().at("swa").at(0);
     // Seven two-token blocks cover the 13-token prompt and the decode slot.
     ASSERT_EQ(swa.size(), 7u);
     for (std::size_t slot = 0; slot < 4; ++slot) {
@@ -1027,7 +1027,7 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
         << "the block containing token 11 is a fresh page the peer fills whole";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(6)), 1) << "the landing's own block";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(4)), 0) << "a copy destination is never zeroed";
-    const auto& full = destination->block_tables.at("full").at(0);
+    const auto full = destination->BlockTables().at("full").at(0);
     ASSERT_GE(full.size(), 3u);  // the prompt, the decode slot and the D's admission headroom
     EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "the full group's only tail block is the partial one";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(2)), 1);
@@ -1039,7 +1039,7 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
     // copied block [8, 10) has already slid out.
     std::vector<std::int32_t> after_landing = swa;
     after_landing.at(4) = 0;
-    EXPECT_EQ(decode->block_tables.at("swa").at(0), after_landing);
+    EXPECT_EQ(decode->BlockTables().at("swa").at(0), after_landing);
 }
 
 class PdDecodeCapacityTestSuite : public PdSparseDecodeAdmissionTestSuite {
@@ -1166,13 +1166,13 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     const ForwardBatch* destination = FindRemoteAdmission(plan);
     ASSERT_NE(destination, nullptr);
     EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{false});
-    const auto& full = destination->block_tables.at("full").at(0);
+    const auto full = destination->BlockTables().at("full").at(0);
     ASSERT_EQ(full.size(), 5u);
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
     // The peer's final state lands in slot 1; slot 0 is the zero state, so
     // the first decode writes slot 1 in place.
-    const auto& state = destination->block_tables.at("state").at(0);
+    const auto state = destination->BlockTables().at("state").at(0);
     ASSERT_EQ(state.size(), 2u);
     EXPECT_EQ(state[0], 0);
     EXPECT_GT(state[1], 0);
@@ -1187,7 +1187,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     const ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
     ASSERT_NE(decode, nullptr);
-    const auto& decode_state = decode->block_tables.at("state").at(0);
+    const auto decode_state = decode->BlockTables().at("state").at(0);
     ASSERT_EQ(decode_state.size(), 2u);
     EXPECT_EQ(decode_state[0], 0);
     EXPECT_EQ(decode_state[1], state[1]);
@@ -1195,7 +1195,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     const ExecutionPlan later_plan = PlanOnce();
     const ForwardBatch* later = FindForwardBatch(later_plan.Operations());
     ASSERT_NE(later, nullptr);
-    EXPECT_EQ(later->block_tables.at("state").at(0), decode_state) << "every decode writes slot 1 in place";
+    EXPECT_EQ(later->BlockTables().at("state").at(0), decode_state) << "every decode writes slot 1 in place";
 
     SendForwardDone("r0", {44});  // the last decode lands: r0 leaves quiescent
     ExecutionEvent succeeded;
@@ -1235,7 +1235,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{1}));
     EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
-    const auto& state = destination->block_tables.at("state").at(0);
+    const auto state = destination->BlockTables().at("state").at(0);
     ASSERT_EQ(state.size(), 2u);
     EXPECT_GT(state[0], 0) << "the cached prompt-end state is slot 0";
     EXPECT_GT(state[1], 0) << "a fresh live slot for the first decode";
@@ -1243,7 +1243,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     const ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
     ASSERT_NE(decode, nullptr);
-    EXPECT_EQ(decode->block_tables.at("state").at(0), state) << "the first decode reads slot 0, writes slot 1";
+    EXPECT_EQ(decode->BlockTables().at("state").at(0), state) << "the first decode reads slot 0, writes slot 1";
     SendForwardDone("r1", {44});
     const ForwardBatch* later = FindForwardBatch(PlanOnce().Operations());
     ASSERT_NE(later, nullptr);
@@ -1268,9 +1268,9 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     EXPECT_EQ(destination2->extend_prefix_lens, (std::vector<std::int32_t>{9}));
     EXPECT_EQ(destination2->input_lengths, (std::vector<std::int32_t>{1}));
     EXPECT_EQ(destination2->state_prefix_cached, std::vector<bool>{false});
-    EXPECT_EQ(destination2->block_tables.at("state").at(0).at(0), 0);
+    EXPECT_EQ(destination2->BlockTables().at("state").at(0).at(0), 0);
     EXPECT_TRUE(plan2.pages_to_copy.at("full").empty()) << "the hit's only tail block is the partial one";
-    const auto& full2 = destination2->block_tables.at("full").at(0);
+    const auto full2 = destination2->BlockTables().at("full").at(0);
     ASSERT_EQ(full2.size(), 6u);  // five prompt pages and the decode reserve
     EXPECT_EQ(std::ranges::count(plan2.pages_to_zero.at("full"), full2.at(4)), 1)
         << "the block containing token 9 is a fresh page";
@@ -1289,7 +1289,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeFor
         const ForwardBatch* destination = FindRemoteAdmission(plan);
         ASSERT_NE(destination, nullptr);
         ASSERT_EQ(destination->state_prefix_cached, std::vector<bool>{attempt > 0});
-        const auto& state = destination->block_tables.at("state").at(0);
+        const auto state = destination->BlockTables().at("state").at(0);
         ASSERT_EQ(state.size(), 2u);
         if (attempt > 0) {
             ASSERT_GT(state[0], 0);
@@ -1335,11 +1335,11 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAligne
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
     EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
 
-    const auto& full = destination->block_tables.at("full").at(0);
+    const auto full = destination->BlockTables().at("full").at(0);
     ASSERT_EQ(full.size(), 5u);
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
-    const auto& state = destination->block_tables.at("state").at(0);
+    const auto state = destination->BlockTables().at("state").at(0);
     ASSERT_EQ(state.size(), 2u);
     EXPECT_GT(state[0], 0) << "the page-aligned prompt-end checkpoint";
     EXPECT_GT(state[1], 0);
@@ -1354,7 +1354,7 @@ TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMate
     const ExecutionPlan seed_admission = PlanOnce();
     const ForwardBatch* seed_destination = FindRemoteAdmission(seed_admission);
     ASSERT_NE(seed_destination, nullptr);
-    const auto seed_row = seed_destination->block_tables.at("sliding").at(0);
+    const auto seed_row = seed_destination->BlockTables().at("sliding").at(0);
     ASSERT_EQ(seed_row.size(), 5u);
     EXPECT_EQ(seed_row[0], 0);
     EXPECT_EQ(seed_row[1], 0);
@@ -1381,7 +1381,7 @@ TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMate
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{8}));
 
-    const auto& row = destination->block_tables.at("sliding").at(0);
+    const auto row = destination->BlockTables().at("sliding").at(0);
     ASSERT_EQ(row.size(), 9u);
     EXPECT_EQ(row[0], 0);
     EXPECT_EQ(row[1], 0);
@@ -1428,7 +1428,7 @@ TEST_F(PdSlidingPageBlockDecodeAdmissionTestSuite, ATailHitInsideThePromptsLastB
     ASSERT_NE(destination, nullptr);
     EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{5}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{1}));
-    const auto& row = destination->block_tables.at("sliding").at(0);
+    const auto row = destination->BlockTables().at("sliding").at(0);
     ASSERT_EQ(row.size(), 2u) << "blocks [0, 4) and [4, 8): nothing lands beyond the tail's block";
     EXPECT_GT(row[0], 0) << "the window [3, 6) keeps block 0";
     EXPECT_GT(row[1], 0);
@@ -1449,7 +1449,7 @@ TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, DecodeStepsWriteTheLandedStateInPla
         const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
         ASSERT_NE(decode, nullptr);
         ASSERT_EQ(decode->request_ids, (std::vector<std::string>{"r0"}));
-        const std::vector<std::int32_t> state = decode->block_tables.at("state").at(0);
+        const std::vector<std::int32_t> state = decode->BlockTables().at("state").at(0);
         ASSERT_EQ(state.size(), 2u);
         EXPECT_EQ(state[0], 0);
         EXPECT_GT(state[1], 0);

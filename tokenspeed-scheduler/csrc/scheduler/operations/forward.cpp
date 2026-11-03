@@ -78,7 +78,14 @@ bool holdsHeadOfLine(const Request& request) {
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
-    operation.block_tables = BuildBlockTables(coordinator, request.BlockTablesRef(), group_ids);
+    const auto& tables = request.BlockTablesRef();
+    _assert(tables.size() == group_ids.size(), "forward tables/group_ids size mismatch");
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
+            "forward tables/coordinator size mismatch");
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        operation.block_tables.emplace(
+            group_ids[i], ForwardBlockTable{coordinator.Allocator(static_cast<std::int32_t>(i)), tables[i]});
+    }
 }
 
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
@@ -240,8 +247,8 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
         operation.extend_state_checkpoint_len = checkpoint - info.already_scheduled_len;
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             if (const CacheBlockRef& block = cache_progress.state_checkpoint_blocks[i]) {
-                operation.block_tables[group_ids[i]].push_back(
-                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block));
+                operation.block_tables.at(group_ids[i]).checkpoint_page_id =
+                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block);
             }
         }
     }

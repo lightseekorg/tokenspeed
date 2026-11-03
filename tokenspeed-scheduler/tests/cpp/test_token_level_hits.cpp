@@ -206,7 +206,7 @@ TEST_F(TokenLevelHitSuite, RandomStreamsResumeAtTheLongestPublishedBoundary) {
                     const std::int32_t tail_tokens = expected % kP;
                     const std::int32_t tail_blocks = (tail_tokens + block_granularity - 1) / block_granularity;
                     ASSERT_EQ(pairs.size(), static_cast<std::size_t>(tail_blocks)) << id << " " << group_id;
-                    const auto& row = batch->block_tables.at(group_id).at(0);
+                    const auto row = batch->BlockTables().at(group_id).at(0);
                     const std::int32_t first_slot = (expected - tail_tokens) / block_granularity;
                     for (std::int32_t j = 0; j < tail_blocks; ++j) {
                         EXPECT_EQ(row.at(static_cast<std::size_t>(first_slot + j)),
@@ -414,7 +414,7 @@ TEST_F(GptOssShapeWithWholePagesSuite, APromptOneTokenShorterThanAFinishedOneRes
     const ForwardBatch* z = FindForwardBatch(z_plan);
     ASSERT_NE(z, nullptr);
     EXPECT_EQ(z->extend_prefix_lens, std::vector<std::int32_t>{276});
-    const auto& swa = z->block_tables.at("sliding").at(0);
+    const auto swa = z->BlockTables().at("sliding").at(0);
     ASSERT_GE(swa.size(), 5u);
     EXPECT_EQ(swa.at(0), 0);
     EXPECT_EQ(swa.at(1), 0);

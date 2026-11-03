@@ -60,8 +60,17 @@ class CacheBatchMetadata:
         device: torch.device | str,
         contract: CacheRuntimeContract,
         num_requests: int,
+        validate_page_ids: bool,
     ) -> CacheBatchMetadata:
-        """Validate virtual block IDs, pack once, and retain operation provenance."""
+        """Check the tables against the contract, pack once, and retain
+        operation provenance.
+
+        The group set, dtype, shape and row count are always checked. With
+        ``validate_page_ids`` every page ID is also scanned against its
+        group's virtual block count: tables built outside the scheduler
+        (prefill-graph capture) always ask for it, scheduler-built ones under
+        ``TOKENSPEED_VALIDATE_PAGE_IDS``.
+        """
         if forward_op is None:
             raise ValueError("forward_op must not be None")
         require_positive_int("num_reqs", num_requests)
@@ -89,7 +98,8 @@ class CacheBatchMetadata:
             device,
             num_reqs=num_requests,
             expected_group_ids=group_ids,
-            max_page_ids=max_page_ids,
+            # The packer scans every page ID against bounds it is given.
+            max_page_ids=max_page_ids if validate_page_ids else None,
         )
         return cls._from_validated_tables(
             group_ids=group_ids,

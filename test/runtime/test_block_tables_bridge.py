@@ -22,6 +22,39 @@ def _import_bridge():
     return block_tables_from_forward_op
 
 
+@pytest.fixture
+def scheduler_forward_op():
+    import tokenspeed_scheduler as ts
+
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 2
+    cfg.num_device_pages = 32
+    cfg.num_host_pages = 0
+    cfg.num_snapshot_pages = 1
+    cfg.max_scheduled_tokens = 64
+    cfg.max_batch_size = 8
+    cfg.enable_l3_storage = False
+    cfg.disable_l2_cache = True
+    cfg.disable_prefix_cache = True
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id=group_id,
+            block_granularity=2,
+            total_pages=32,
+            attn_kind=ts.AttnKind.Full,
+        )
+        for group_id in ("full", "swa")
+    ]
+    scheduler = ts.Scheduler(cfg)
+    spec = ts.RequestSpec()
+    spec.request_id = "page-id-validation"
+    spec.tokens = [1, 2, 3, 4]
+    scheduler.submit_requests([spec])
+    plan = scheduler.next_execution_plan()
+    assert len(plan.forward) == 1
+    yield plan.forward[0]
+
+
 class TestBlockTablesBridgeTest:
     def setup_method(self):
         try:
@@ -122,7 +155,8 @@ class TestBlockTablesBridgeTest:
         with pytest.raises((ValueError), match=("collide")):
             self.bridge(collision, device="cpu", num_reqs=1, max_page_id=8)
 
-    def test_strict_contract_rejects_malformed_and_out_of_range_tables(self):
+    @pytest.mark.parametrize("page_id", [-2, 99])
+    def test_strict_contract_rejects_malformed_and_out_of_range_tables(self, page_id):
         import numpy as np
 
         wrong_dtype = SimpleNamespace(
@@ -131,7 +165,10 @@ class TestBlockTablesBridgeTest:
         with pytest.raises((ValueError), match=("int32")):
             self.bridge(wrong_dtype, device="cpu", num_reqs=1, max_page_id=8)
 
-        out_of_range = self._make_op({"full": [[1, 99]]})
+        valid = self._make_op({"full": [[-1, 0, 8]]})
+        valid_tables = self.bridge(valid, "cpu", num_reqs=1, max_page_id=8)
+        assert valid_tables["full"].tolist() == [[-1, 0, 8]]
+        out_of_range = self._make_op({"full": [[1, page_id]]})
         with pytest.raises((ValueError), match=("outside -1..8")):
             self.bridge(
                 out_of_range,
@@ -139,6 +176,48 @@ class TestBlockTablesBridgeTest:
                 num_reqs=1,
                 expected_group_ids=("full",),
                 max_page_ids={"full": 8},
+            )
+
+    @pytest.mark.parametrize("per_group", [False, True])
+    def test_page_ids_are_scanned_only_against_supplied_bounds(
+        self, scheduler_forward_op, per_group
+    ):
+        bounds = (
+            {"max_page_ids": {"full": 0, "swa": 0}} if per_group else {"max_page_id": 0}
+        )
+        arrays = scheduler_forward_op.block_tables_arrays()
+        assert any((array > 0).any() for array in arrays.values())
+        tables = self.bridge(
+            scheduler_forward_op,
+            "cpu",
+            num_reqs=1,
+            expected_group_ids=("swa", "full"),
+        )
+        assert list(tables) == ["swa", "full"]
+        for group_id, array in arrays.items():
+            assert tables[group_id].tolist() == array.tolist()
+        assert tables["full"].untyped_storage().data_ptr() == (
+            tables["swa"].untyped_storage().data_ptr()
+        )
+
+        with pytest.raises(ValueError, match="outside -1..0"):
+            self.bridge(scheduler_forward_op, "cpu", num_reqs=1, **bounds)
+
+    def test_page_id_bounds_must_cover_every_group(self, scheduler_forward_op):
+        with pytest.raises(ValueError, match="missing cache group 'swa'"):
+            self.bridge(
+                scheduler_forward_op,
+                "cpu",
+                num_reqs=1,
+                max_page_ids={"full": 31},
+            )
+        with pytest.raises(ValueError, match="not both"):
+            self.bridge(
+                scheduler_forward_op,
+                "cpu",
+                num_reqs=1,
+                max_page_id=31,
+                max_page_ids={"full": 31, "swa": 31},
             )
 
 

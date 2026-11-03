@@ -915,32 +915,26 @@ TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
     EXPECT_THROW(group.Validate(), std::invalid_argument);
 }
 
-TEST(ForwardCacheOpsBuildBlockTables, TwoGroupsRowsAndIds) {
+// The page ids a forward batch exports for a request's tables
+// (GroupAllocator::BlockTablePageIds): one per slot, in slot order.
+
+TEST(BlockTablePageIdsExport, EveryLiveSlotGetsAPositiveId) {
     BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     // 6 tokens, prefix_granularity 2 -> 3 pages per group.
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
 
-    std::vector<std::string> group_ids{"full", "swa"};
-    auto built = BuildBlockTables(coordinator, tables, group_ids);
-
-    ASSERT_EQ(built.size(), 2u);
-    ASSERT_TRUE(built.count("full"));
-    ASSERT_TRUE(built.count("swa"));
-    EXPECT_EQ(built.at("full").size(), 3u);
-    EXPECT_EQ(built.at("swa").size(), 3u);
-    for (std::int32_t id : built.at("full")) {
-        EXPECT_GT(id, 0);
+    for (std::int32_t group = 0; group < coordinator.NumGroups(); ++group) {
+        const std::vector<std::int32_t> ids = coordinator.Allocator(group).BlockTablePageIds(tables[group]);
+        ASSERT_EQ(ids.size(), 3u) << group;
+        for (const std::int32_t id : ids) {
+            EXPECT_GT(id, 0) << group;
+        }
     }
-    // Rows match the source span verbatim: no compaction, null hole = 0 in its slot.
-    const std::vector<std::int32_t> expected_full = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
-    const std::vector<std::int32_t> expected_swa = coordinator.Allocator(1).BlockTablePageIds(tables[1]);
-    EXPECT_EQ(built.at("full"), expected_full);
-    EXPECT_EQ(built.at("swa"), expected_swa);
 }
 
-TEST(ForwardCacheOpsBuildBlockTables, SwaRowGetsNullHoleAfterAdvance) {
+TEST(BlockTablePageIdsExport, ASlidOutSlotExportsAsANullHole) {
     BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -948,70 +942,25 @@ TEST(ForwardCacheOpsBuildBlockTables, SwaRowGetsNullHoleAfterAdvance) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));  // 4 pages/group
     coordinator.ReclaimExpired(tables, /*num_computed_tokens=*/8);
 
-    std::vector<std::string> group_ids{"full", "swa"};
-    auto built = BuildBlockTables(coordinator, tables, group_ids);
-    for (std::int32_t id : built.at("full")) {
+    for (const std::int32_t id : coordinator.Allocator(0).BlockTablePageIds(tables[0])) {
         EXPECT_GT(id, 0);
     }
-    const auto& swa = built.at("swa");
-    EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end());
-    const std::vector<std::int32_t> expected_swa = coordinator.Allocator(1).BlockTablePageIds(tables[1]);
-    EXPECT_EQ(swa, expected_swa);
+    const std::vector<std::int32_t> swa = coordinator.Allocator(1).BlockTablePageIds(tables[1]);
+    ASSERT_EQ(swa.size(), 4u) << "the table never shrinks";
+    EXPECT_EQ(swa.front(), 0) << "a reclaimed slot keeps its place as a null hole";
+    EXPECT_GT(swa.back(), 0);
 }
 
-TEST(ForwardCacheOpsBuildBlockTables, FreshTablesProduceEmptyRows) {
+TEST(BlockTablePageIdsExport, AFreshTableExportsNothing) {
     BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
-    std::vector<std::string> group_ids{"full", "swa"};
-    auto built = BuildBlockTables(coordinator, tables, group_ids);
-
-    ASSERT_EQ(built.size(), 2u);
-    EXPECT_TRUE(built.at("full").empty());
-    EXPECT_TRUE(built.at("swa").empty());
+    EXPECT_TRUE(coordinator.Allocator(0).BlockTablePageIds(tables[0]).empty());
+    EXPECT_TRUE(coordinator.Allocator(1).BlockTablePageIds(tables[1]).empty());
 }
 
-TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
-    BlockPool pool(/*num_lcm_blocks=*/32, {1});
-    std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{
-            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-    };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
-    std::vector<BlockTable> tables(coordinator.NumGroups());
-    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));  // 2 pages
-
-    std::vector<std::string> group_ids{"only"};
-    auto built = BuildBlockTables(coordinator, tables, group_ids);
-
-    ASSERT_EQ(built.size(), 1u);
-    const std::vector<std::int32_t> expected = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
-    EXPECT_EQ(built.at("only"), expected);
-    // Sanity: keyed by the supplied group_id, not a bare index.
-    EXPECT_EQ(built.count("0"), 0u);
-}
-
-TEST(ForwardCacheOpsBuildBlockTables, KeyMatchesSuppliedGroupIdStrings) {
-    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
-    CacheCoordinator coordinator = MakeTwoGroup(pool);
-    std::vector<BlockTable> tables(coordinator.NumGroups());
-    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
-
-    std::vector<std::string> group_ids{"alpha", "beta"};
-    auto built = BuildBlockTables(coordinator, tables, group_ids);
-
-    ASSERT_EQ(built.size(), 2u);
-    EXPECT_TRUE(built.count("alpha"));
-    EXPECT_TRUE(built.count("beta"));
-    const std::vector<std::int32_t> expected_alpha = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
-    EXPECT_EQ(built.at("alpha"), expected_alpha);
-}
-
-TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKernelPageIds) {
+TEST(BlockTablePageIdsExport, ChildSlotsWithinOneParentHaveDistinctKernelPageIds) {
     BlockPool pool(/*num_lcm_blocks=*/4, {2});
     const std::vector<CacheGroupSpec> specs{
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
@@ -1027,13 +976,12 @@ TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKerne
     ASSERT_EQ(parent_ids.size(), 2u);
     EXPECT_EQ(parent_ids[0], parent_ids[1]);
 
-    const auto built = BuildBlockTables(coordinator, tables, std::vector<std::string>{"full"});
-    ASSERT_EQ(built.at("full").size(), 2u);
-    EXPECT_EQ(built.at("full"), (std::vector<std::int32_t>{1, 2}));
-    EXPECT_NE(built.at("full"), parent_ids);
+    const std::vector<std::int32_t> ids = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
+    EXPECT_EQ(ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_NE(ids, parent_ids);
 }
 
-TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
+TEST(BlockTablePageIdsExport, ResolvesEachGroupsPackingRecipe) {
     BlockPool pool(/*num_lcm_blocks=*/16, {2, 1});
     const std::vector<CacheGroupSpec> specs{
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
@@ -1046,17 +994,14 @@ TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
-    const std::vector<std::string> group_ids{"packed", "single"};
-    const auto built = BuildBlockTables(coordinator, tables, group_ids);
-
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     ASSERT_EQ(tables[1].NumBlocks(), 2);
-    EXPECT_EQ(built.at("packed"),
+    EXPECT_EQ(coordinator.Allocator(0).BlockTablePageIds(tables[0]),
               (std::vector<std::int32_t>{
                   coordinator.Allocator(0).ResolveDeviceCacheBlockId(tables[0].Blocks()[0]->Location()),
                   coordinator.Allocator(0).ResolveDeviceCacheBlockId(tables[0].Blocks()[1]->Location()),
               }));
-    EXPECT_EQ(built.at("single"),
+    EXPECT_EQ(coordinator.Allocator(1).BlockTablePageIds(tables[1]),
               (std::vector<std::int32_t>{
                   coordinator.Allocator(1).ResolveDeviceCacheBlockId(tables[1].Blocks()[0]->Location()),
                   coordinator.Allocator(1).ResolveDeviceCacheBlockId(tables[1].Blocks()[1]->Location()),
