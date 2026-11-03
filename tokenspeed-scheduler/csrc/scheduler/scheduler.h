@@ -521,6 +521,9 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
+    // A client abort cannot release pages still used by PD or a local forward.
+    std::unordered_set<std::string> pending_pd_aborts_;
+    std::unordered_set<std::string> retired_pd_failures_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).

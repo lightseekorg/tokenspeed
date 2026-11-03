@@ -211,6 +211,9 @@ struct CompletedPages {
     // is published in place. Only an admission may set it: the copy needs the
     // transaction's capacity.
     bool owner_continues{false};
+    // A transfer still reads the original physical pages: publish references
+    // through a copy, without redirecting the owner to canonical blocks.
+    bool preserve_source_blocks{false};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
     // publishes slot 1 -- the block the forward that ended here wrote --

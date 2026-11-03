@@ -686,6 +686,15 @@ any other detaches from its storage work. Without L3 the round runs none of
 this. L3 requires PP=1; the D role receives its missing cache from its
 prefill peer.
 
+**PD source retirement.** A terminal status alone does not release source
+pages. The prefill peer counts queued and executing transfer jobs. A failure
+agreed by the replica first stops new work on every rank, then every rank must
+have retired its jobs before a terminal event reaches the scheduler. Queued
+jobs for failed rooms are dropped; executing jobs finish or return from the
+synchronous transport call before retiring. Client cancellation keeps the
+request's source ownership until that terminal event. The retirement agreement
+is needed only in rounds with a terminal status.
+
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
 admission, and every round the replica agrees on which transfers changed
 state; their scheduler events join the round's tail feedback, and a failed
