@@ -168,12 +168,13 @@ Qwen3.8-Flash-Next decode batches.
   GEMM's measured config has no split-K
   (`supports_gluon_mm_a16w16_column_shard_gfx950`) each column equals the
   replicated GEMM's bitwise.
-- `column_relay_gfx950` is the column shard's 16-column chain as a device
-  function for a persistent kernel that keeps the weights in registers: wave
-  `w` holds the 512-deep K tile `w` (`column_relay_weights_gfx950`, 64
-  VGPRs), waits in LDS for wave `w - 1`'s FP32 accumulator, adds its 16
-  MFMAs and hands the accumulator on with one count bump. The chain and
-  its K order are the column shard's, so the columns are bitwise equal.
+- `mm_a16w16_column_relay_gfx950` is the column shard's 16-column chain as
+  a device function for a persistent kernel that keeps the weights in
+  registers: wave `w` holds the 512-deep K tile `w`
+  (`mm_a16w16_column_relay_weights_gfx950`, 64 VGPRs), waits in LDS for wave
+  `w - 1`'s FP32 accumulator, adds its 16 MFMAs and hands the accumulator on
+  with one count bump. The chain and its K order are the column shard's, so
+  the columns are bitwise equal.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.

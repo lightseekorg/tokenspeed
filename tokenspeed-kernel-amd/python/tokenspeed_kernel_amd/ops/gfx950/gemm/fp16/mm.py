@@ -1985,7 +1985,7 @@ def _relay_mfma(waves: int):
 
 
 @gluon.jit
-def column_relay_weights_gfx950(w_ptr, column0, K: gl.constexpr):
+def mm_a16w16_column_relay_weights_gfx950(w_ptr, column0, K: gl.constexpr):
     """Issue a 16-column relay's weights: rows ``[column0, column0 + 16)`` of
     a ``[N, K]`` BF16 weight, wave w holding K range ``[512 w, 512 w + 512)``
     (one column-shard K tile) as the MFMA B operand ``[waves, 512, 16]``, 16 KB
@@ -2008,7 +2008,7 @@ def column_relay_weights_gfx950(w_ptr, column0, K: gl.constexpr):
 
 
 @gluon.jit
-def column_relay_gfx950(s, w, relay, relay_count, OUT_LAYOUT: gl.constexpr):
+def mm_a16w16_column_relay_gfx950(s, w, relay, relay_count, OUT_LAYOUT: gl.constexpr):
     """The column shard GEMM's 16-column tile, its K chain relayed across the
     workgroup's waves; bitwise the shard's (and the replicated GEMM's) columns.
 
@@ -2022,7 +2022,7 @@ def column_relay_gfx950(s, w, relay, relay_count, OUT_LAYOUT: gl.constexpr):
     Args:
         s: Activations as the A operand ``[waves, 16 tokens, 512]`` BF16 in
             the relay's MFMA layout (wave w: K tile w of every token).
-        w: :func:`column_relay_weights_gfx950`'s B operand.
+        w: :func:`mm_a16w16_column_relay_weights_gfx950`'s B operand.
         relay: Shared FP32 ``[waves, 16, 16]``, row-major (the hand-off
             slots: wave w reads slot w and writes slot w + 1, the last wave
             slot 0), and ``relay_count`` a shared int32 ``[1]`` that the caller

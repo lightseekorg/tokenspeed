@@ -52,8 +52,8 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
     gemv_a16w16_splitk_x_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-    column_relay_gfx950,
-    column_relay_weights_gfx950,
+    mm_a16w16_column_relay_gfx950,
+    mm_a16w16_column_relay_weights_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.layernorm.deferred import (
     deferred_norm_rows_gfx950,
@@ -563,7 +563,7 @@ def column_relay_kernel(x_ptr, w_ptr, out_ptr, M, K: gl.constexpr):
     waves and stores the rows below ``M`` in BF16."""
     WAVES: gl.constexpr = gl.num_warps()
     column0 = gl.program_id(0) * 16
-    w = column_relay_weights_gfx950(w_ptr, column0, K)
+    w = mm_a16w16_column_relay_weights_gfx950(w_ptr, column0, K)
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
@@ -593,7 +593,7 @@ def column_relay_kernel(x_ptr, w_ptr, out_ptr, M, K: gl.constexpr):
     )
     gl.barrier()
     out_l: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [WAVES, 1], [1, 0])
-    y = column_relay_gfx950(s, w, relay, relay_count, out_l)
+    y = mm_a16w16_column_relay_gfx950(s, w, relay, relay_count, out_l)
     t = gl.arange(0, 16, gl.SliceLayout(1, out_l))
     c = gl.arange(0, 16, gl.SliceLayout(0, out_l))
     N = gl.num_programs(0) * 16
@@ -625,7 +625,7 @@ def sender_sums_kernel(
     tagged FP32 words ``[program, row, 4]`` for the sum reducer."""
     WAVES: gl.constexpr = gl.num_warps()
     column0 = gl.program_id(0) * 16
-    w = column_relay_weights_gfx950(w_ptr, column0, K)
+    w = mm_a16w16_column_relay_weights_gfx950(w_ptr, column0, K)
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
@@ -655,7 +655,7 @@ def sender_sums_kernel(
     )
     gl.barrier()
     out_l: gl.constexpr = gl.BlockedLayout([1, 16], [16, 4], [WAVES, 1], [1, 0])
-    y = column_relay_gfx950(s, w, relay, relay_count, out_l)
+    y = mm_a16w16_column_relay_gfx950(s, w, relay, relay_count, out_l)
     t = gl.minimum(gl.arange(0, 16, gl.SliceLayout(1, out_l)), M - 1)
     c = column0 + gl.arange(0, 16, gl.SliceLayout(0, out_l))
     h = gl.amd.cdna4.buffer_load(h_ptr, t[:, None] * N + c[None, :])
