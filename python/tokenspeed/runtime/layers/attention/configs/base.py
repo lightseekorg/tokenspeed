@@ -222,18 +222,25 @@ class AttnConfig:
             raise ValueError("INT8 KV cache is not supported by the runtime")
         if self.qcp_size > 1:
             softmax = softmax_components[0]
-            # The gathered-history extend arm exists on the GPU DSA leaf only;
-            # every other leaf rejects a query shard at its metadata build.
-            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+            # DSA gathers paged history; V4.1 publishes its packed KV from
+            # gathered projections and keeps full logical metadata.
+            is_v41 = softmax.backend_name == "deepseek_v41"
+            if not (
+                is_v41 or (softmax.is_dsa and softmax.backend_name in (None, "dsa"))
+            ):
                 raise ValueError(
-                    "query context parallelism requires GPU DSA attention; "
+                    "query context parallelism requires GPU DSA or V4.1 attention; "
                     f"got {softmax.backend_name!r}"
                 )
+            if not is_v41 and self.qcp_size != self.kvp_size:
+                raise ValueError(
+                    "DSA query context parallelism requires KVP equal to QCP"
+                )
             if torch.device(self.device).type != "cuda":
-                raise ValueError("GPU DSA query context parallelism requires CUDA")
+                raise ValueError("GPU query context parallelism requires CUDA")
             # The sharded KV write gathers the rotated latent and stores it
             # with latent_store, which writes native (bf16) rows only.
-            if (
+            if not is_v41 and (
                 self.kv_cache_dtype is not torch.bfloat16
                 or self.kv_cache_mxfp8
                 or self.kv_cache_quant_method != "none"

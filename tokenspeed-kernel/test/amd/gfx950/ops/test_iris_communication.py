@@ -20,9 +20,11 @@
 
 
 import math
+import os
 import socket
 import time
 import traceback
+from types import SimpleNamespace
 from typing import List, Tuple
 
 import pytest
@@ -138,6 +140,68 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
     monkeypatch.setattr(iris_ops, "_PRODUCER_TWO_SHOT_MIN_BYTES", {})
     assert iris_ops._use_two_stage_plain(8, 8 * 7168, torch.bfloat16)
     assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    ("configured", "cdna5", "spans_hosts", "expected"),
+    [
+        (None, True, False, None),
+        (None, True, True, "vmem_chunked"),
+        (None, False, True, None),
+        ("vmem", True, True, "vmem"),
+    ],
+    ids=["one-host", "gfx1250-across-hosts", "gfx950-across-hosts", "configured"],
+)
+def test_context_picks_vmem_chunked_only_for_gfx1250_across_hosts(
+    monkeypatch, configured, cdna5, spans_hosts, expected
+):
+    from tokenspeed_kernel.ops.communication import _iris
+
+    created = []
+    monkeypatch.setattr(_iris, "_context", None)
+    monkeypatch.setattr(_iris, "_allocator_type", configured)
+    monkeypatch.setattr(
+        _iris, "current_platform", lambda: SimpleNamespace(is_cdna5=cdna5)
+    )
+    monkeypatch.setattr(_iris, "_job_spans_hosts", lambda: spans_hosts)
+    monkeypatch.setattr(
+        _iris.iris,
+        "iris",
+        lambda heap_size, device, **options: created.append(
+            options.get("allocator_type")
+        ),
+    )
+
+    _iris.get_or_create_context(heap_size=1 << 20)
+    assert created == [expected]
+
+
+def _host_span_worker_fn(rank, world_size, port, distinct_hosts, error_dict):
+    try:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        from tokenspeed_kernel.ops.communication import _iris
+
+        # Every rank shares this machine's hostname, so only the host identity
+        # can tell the ranks apart.
+        _iris._host_identity = lambda: rank if distinct_hosts else 7
+        assert _iris._job_spans_hosts() is distinct_hosts
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("distinct_hosts", [True, False])
+def test_hosts_are_told_apart_by_identity_not_hostname(distinct_hosts):
+    _spawn_and_collect(
+        _host_span_worker_fn, (2, _get_open_port(), distinct_hosts), world_size=2
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +962,59 @@ def test_iris_all_reduce_noncontiguous_subgroups():
     _skip_if_unsupported(world_size, "Iris subgroup all-reduce tests")
     port = _get_open_port()
     _spawn_and_collect(_ar_subgroup_worker_fn, (world_size, port), world_size)
+
+
+def _check_placed_all_reduce(rank: int, world_size: int, gpu: int) -> None:
+    """Reduce over the world from ``gpu``, which need not equal rank % GPUs."""
+    from tokenspeed_kernel.ops.communication._iris import get_or_create_context
+    from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+    device = torch.device(f"cuda:{gpu}")
+    torch.cuda.set_device(device)
+    state = create_iris_state(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=16 * 7168,
+        producer_direct_max_numel=16 * 7168,
+        dtype=torch.bfloat16,
+        heap_size=None,
+        device=torch.device("cuda"),
+    )
+    ctx = get_or_create_context(heap_size=0)
+    assert torch.cuda.current_device() == ctx.gpu_id == gpu
+    assert ctx.zeros((1,), dtype=torch.bfloat16).device == device
+    for shape in ((1, 7168), (16, 7168)):
+        _check_all_reduce(state, rank, world_size, shape, device)
+
+
+def _partial_placement_worker_fn(
+    rank, world_size, port, base_gpu, allocator_type, error_dict
+):
+    try:
+        os.environ["IRIS_ALLOCATOR"] = allocator_type
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        _check_placed_all_reduce(rank, world_size, base_gpu + rank)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("allocator_type", ["torch", "vmem", "vmem_chunked"])
+def test_iris_all_reduce_on_gpus_past_the_rank_index(allocator_type):
+    """Two ranks on GPUs 2-3 of four, as with a base GPU offset of 2."""
+    _skip_if_unsupported(4, "Iris partial-placement tests")
+    _spawn_and_collect(
+        _partial_placement_worker_fn,
+        (2, _get_open_port(), 2, allocator_type),
+        2,
+    )
 
 
 # ---------------------------------------------------------------------------

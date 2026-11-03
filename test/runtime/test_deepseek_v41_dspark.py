@@ -99,7 +99,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
-        def forward(self, hidden, hashes, mask):
+        def forward(self, hidden, hashes, mask, *, query_shard=None):
+            assert query_shard is None
             events.append(("engram", self.layer_id))
             assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
@@ -423,6 +424,7 @@ def test_window_attention_matches_dense_reference():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        key_rows=None,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -500,6 +502,7 @@ def test_window_attention_kernel_matches_reference():
         swa_rope_cache=rotary.cos_sin_cache,
         swa_norm_weight=None,
         swa_norm_eps=config.rms_norm_eps,
+        key_rows=None,
     )
     actual = backend.forward_v41(q, swa, **kwargs)
     kv = backend._workspace(

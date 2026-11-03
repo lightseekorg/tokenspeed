@@ -461,7 +461,8 @@ if platform.is_blackwell:
             max_num_tokens=max_num_tokens,
         )
         num_tokens = x.shape[0]
-        topk_ids = topk_ids.to(torch.int64)
+        # Staging widens ids to the buffer's int64; one input dtype keeps one compile.
+        topk_ids = topk_ids.to(torch.int32)
         stage_mxfp4_mega_moe_inputs(
             x,
             topk_weights,
