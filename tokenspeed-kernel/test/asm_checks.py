@@ -282,9 +282,10 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
 
     - Nothing invalidates or writes back L2.
     - With ``entry`` (a kernel that runs the launch entry): the two
-      counters are returning scalar atomics waited for with lgkmcnt, no
-      store or vector atomic precedes them, and no vmcnt wait precedes them
-      (the role's loads issued before the entry stay in flight).
+      counters are returning scalar atomics waited for with lgkmcnt (one
+      pair per inlined copy of the entry), and no store, vector atomic or
+      vmcnt wait precedes the first pair (the role's loads issued before
+      the entry stay in flight).
     - A store to the address of an earlier global load with a scalar base
       (a per-workgroup word such as the epoch) follows a full drain and a
       workgroup barrier after that load.
@@ -294,9 +295,10 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
       tests a loaded value, not a constant-step counter) reads the clock for its
       deadline and holds no workgroup barrier or LDS exchange; a vector poll
       exits on lane-mask votes or polls from one lane.
-    - A flag poll (scalar, or ``sc1`` without ``sc0``; Lamport polls read
+    - A vector flag poll (``sc1`` without ``sc0``; Lamport polls read
       their data with ``sc0 sc1``) reaches a workgroup barrier before its
-      next load.
+      next load. A scalar poll runs in every wave and may end with a
+      per-wave acquire instead.
     """
     problems = []
     if "buffer_inv" in assembly or "buffer_wbl2" in assembly:
@@ -321,16 +323,22 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
             for i, line in enumerate(lines)
             if re.match(r"\s*s_atomic_add_x2 s\[\d+:\d+\], s\[\d+:\d+\], 0x0 glc", line)
         ]
-        if len(counters) != 2:
-            problems.append("the entry counters are not two returning scalar atomics")
+        # One pair per inlined entry (a kernel whose roles issue different
+        # weights before their check inlines the entry once per role).
+        if not counters or len(counters) % 2:
+            problems.append(
+                "the entry counters are not pairs of returning scalar atomics"
+            )
         else:
-            if any(i < counters[1] for i in writes):
+            first = counters[1]
+            if any(i < first for i in writes):
                 problems.append("a store or atomic precedes the entry counters")
-            if any("vmcnt" in line for line in lines[: counters[1]]):
+            if any("vmcnt" in line for line in lines[:first]):
                 problems.append("a vmcnt wait precedes the entry counters")
-            after = "\n".join(lines[counters[1] : counters[1] + 3])
-            if "s_waitcnt lgkmcnt(0)" not in after:
-                problems.append("the entry does not wait for its counters")
+            for second in counters[1::2]:
+                after = "\n".join(lines[second : second + 3])
+                if "s_waitcnt lgkmcnt(0)" not in after:
+                    problems.append("the entry does not wait for its counters")
     problems += _unordered_read_then_write(lines)
     for position, index in enumerate(writes):
         if re.search(r"global_atomic_add\s", lines[index]) and " sc0" in lines[index]:
@@ -345,13 +353,18 @@ def persistent_codegen_problems(assembly: str, *, entry: bool) -> list[str]:
         loop = "\n".join(raw[i] for i in indices)
         # A poll rereads with sc1 and computes nothing; a K loop over data
         # another work-group wrote (".cv" loads) runs MFMAs.
-        scalar = re.search(r"s_load_dword\w* .*\bglc\b", loop)
+        scalar = re.search(r"s_load_dword\w* .*\bglc\b|s_dcache_inv", loop)
         vector = re.search(r"(global|buffer)_load_\w+ .*sc1\b", loop)
         if not (scalar or vector) or "v_mfma" in loop or _counted_loop(loop):
             continue
-        if scalar or not re.search(r"(global|buffer)_load_\w+ .*\bsc0\b", loop):
-            # The barrier after a flag poll is the acquire that orders the
-            # payload loads after it.
+        if not scalar and not re.search(r"(global|buffer)_load_\w+ .*\bsc0\b", loop):
+            # A vector flag poll reloads in one lane (or for one wave's
+            # lanes), and other waves read what the flag guards: the
+            # workgroup barrier after it is their acquire. A scalar poll
+            # runs in every wave, so each wave's loads after it follow its
+            # own poll; it needs only a per-wave acquire, which emits no
+            # instruction (and a barrier where other waves' LDS writes
+            # are read).
             if _load_before_barrier(raw, set(indices)):
                 problems.append("a load follows a flag poll before a barrier")
         if re.search(r"s_barrier|\bds_|_dpp", loop):

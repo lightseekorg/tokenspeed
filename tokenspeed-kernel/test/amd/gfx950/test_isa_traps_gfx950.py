@@ -37,6 +37,7 @@ from asm_checks import (  # noqa: E402
     instruction_lines,
     isa_report,
     lds_read_widths,
+    persistent_codegen_problems,
     register_problems,
     serialized_coherent_loads,
     split_poll_problems,
@@ -45,6 +46,13 @@ from asm_checks import (  # noqa: E402
     write_through_store_drains,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon, triton  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (  # noqa: E402
+    memrealtime,
+    persistent_compile_options,
+    scalar_load_glc,
+    vote,
+    wave_acquire,
+)
 
 # 4 int32 per lane: one dwordx4 per lane, 1 KB per wave.
 _LANE4 = gl.constexpr(gl.BlockedLayout([4], [64], [1], [0]))
@@ -352,3 +360,49 @@ def test_register_budget_flags_spills_that_drain_resident_weights():
         line.startswith("scratch_store") for line in lines[first_load:first_mfma]
     )
     assert drains_of(lines, first_load, first_mfma)
+
+
+@gluon.jit
+def _flag_then_payload(flag, tags, payload, out, tag, deadline, SCALAR: gl.constexpr):
+    """Wait for a flag without a workgroup barrier, then read the payload."""
+    lanes = gl.arange(0, 64, _LANE1)
+    start = memrealtime()
+    if SCALAR:
+        # Every wave polls for itself.
+        while (scalar_load_glc(flag) != tag) & (memrealtime() - start < deadline):
+            pass
+    else:
+        # One lane polls; the wave's other lanes rely on its vote.
+        owner = lanes == 0
+        seen = gl.atomic_load(flag + lanes * 0, mask=owner, sem="relaxed", scope="gpu")
+        while vote((owner & (seen != tag)).to(gl.int32)) & (
+            memrealtime() - start < deadline
+        ):
+            seen = gl.atomic_load(
+                flag + lanes * 0, mask=owner, sem="relaxed", scope="gpu"
+            )
+    wave_acquire()
+    gl.store(out + lanes, gl.load(payload + lanes, cache_modifier=".cg"))
+
+
+def test_only_vector_flag_polls_need_a_barrier():
+    # A scalar poll runs in every wave, so its own loads may follow a
+    # per-wave acquire; a vector poll answers for the whole workgroup.
+    signature = {
+        "flag": "*i32", "tags": "*i32", "payload": "*i32", "out": "*i32",
+        "tag": "i32", "deadline": "i64",
+    }  # fmt: skip
+    problems = {}
+    for scalar in (True, False):
+        attrs = {(i,): [["tt.divisibility", 16]] for i in range(4)}
+        source = gluon._runtime.GluonASTSource(
+            _flag_then_payload, signature, constexprs={"SCALAR": scalar}, attrs=attrs
+        )
+        assembly = triton.compile(
+            source,
+            target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+            options={"num_warps": 1, **persistent_compile_options()},
+        ).asm["amdgcn"]
+        problems[scalar] = persistent_codegen_problems(assembly, entry=False)
+    assert "a load follows a flag poll before a barrier" in problems[False]
+    assert problems[True] == []
