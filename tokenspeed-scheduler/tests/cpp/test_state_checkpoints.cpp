@@ -2542,18 +2542,20 @@ TEST_F(StateRestoreKvEventsSuite, AWriteBackRestoreRegistersTheTailItEvictedFirs
 }
 
 // Without a Host pool the image rides the snapshot pool whole: the restore
-// copies every slot back as a private copy, evicting r's entries, and
-// republishes nothing. o, admitted while r's image is in flight, finishes at
-// once, so its cache-only entries take the free blocks and are newer than
-// r's: the restore evicts every entry of r's first. The knob retracts r again
-// before it decodes (plan 6), at frontier 8 once more: no page is new, but
-// the State checkpoint lands on the deepest page [5 6 7 101], whose
-// descriptor that retraction registers.
+// copies every slot back as a private copy and republishes nothing. o,
+// admitted while r's image is in flight, takes the free blocks and evicts the
+// tail at 7, its checkpoint and the checkpoint at 8. It finishes at once, so
+// its own entries are newer than r's pages, and the restore evicts both of
+// those: with no block of page 1's left on the Device, a drain drops its
+// descriptor. The knob retracts r again before it decodes (plan 6), at
+// frontier 8 once more: no page is new, but the State checkpoint lands on the
+// deepest page [5 6 7 101], whose descriptor that retraction registers.
 TEST_F(StateRestoreKvEventsSuite, ARetractionAfterAPoolRestoreRegistersThePageItsCheckpointLandsOn) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     const ExecutionPlan retraction = RetractAtEight();
     Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
     PlanAndDrain();  // plan 4: o's prefill; the image's store has not landed
+    ASSERT_FALSE(Stored({5, 6, 7, 101})) << "o's admission evicted the checkpoint at 8";
     SendForwardDone("o", {300});
     SendFinish("o");
     AckImageStores(retraction);
@@ -2563,7 +2565,7 @@ TEST_F(StateRestoreKvEventsSuite, ARetractionAfterAPoolRestoreRegistersThePageIt
     for (const std::string& hash : restore->content_hashes.at(0)) {
         EXPECT_TRUE(hash.empty()) << "every row is a private copy";
     }
-    ASSERT_FALSE(Stored({5, 6, 7, 101})) << "the restore evicted r's entries";
+    ASSERT_EQ(scheduler_->GetHostCacheStats().device_evictions.restore.blocks, 2u) << "the restore evicted r's pages";
     AckRestores(readmit);
     Drain();
 
