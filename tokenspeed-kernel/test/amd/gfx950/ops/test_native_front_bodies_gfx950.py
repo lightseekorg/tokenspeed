@@ -147,10 +147,10 @@ def test_kpart_router_matches_fp32_reference(rows: int) -> None:
     # hi + lo carries ~16 bits of the weight and of x: each product of
     # |x w| ~ 0.02 is off by up to ~2**-15 relative (the dropped lo x lo
     # term and both residuals), ~6e-7. Over K = 8192 terms of random sign
-    # that sums to ~3e-5 (one sigma; GPU max seen 3.5e-5), so 1e-4 is about
-    # 3 sigma. FP32 accumulation adds ~1e-6.
+    # the sum's sigma is ~1e-5 (GPU: max 3.5e-5 over 2048 logits, ~3.5
+    # sigma), so 6e-5 is ~6 sigma. FP32 accumulation adds ~1e-6.
     expected = (inputs["x"].double() @ router.double().T).float()
-    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
+    torch.testing.assert_close(actual, expected, atol=6e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("rows", [8, 16])
