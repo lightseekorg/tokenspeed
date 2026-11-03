@@ -180,6 +180,30 @@ both operands along K into registers, issues every load before the first
 its partial and bumps the tile's arrival counter; the last to arrive sums the
 partials in split order, scales, writes the tile and resets the counter.
 
+### gfx950 FP32 router with a decode GEMM
+
+`gluon_fp32_router_gemv_mm_a16w16_gfx950` (`gemm/fp32/router_gemv.py`) runs
+the router's split-K GEMM and an independent BF16 decode GEMM
+(`gluon_mm_a16w16_medium_gfx950`) in one launch.
+`gemm.fp32_router_gemv_execute_with_mm` selects it.
+
+#### Contract
+
+- Router operands as for the router GEMV; `mm_a` `[M, K']` and `mm_b`
+  `[N', K']` contiguous BF16, `mm_out` an `[M, N']` BF16 destination.
+- `1 <= M <= 16`, `N` a multiple of 16, `K` a multiple of 512, and a measured
+  four-wave decode GEMM config for `(M, N', K')`.
+- `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
+  16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
+  rows and differ from the GEMV's in the last bits at 1-8 rows.
+
+#### Algorithm
+
+Programs `[0, P)` are the router's split-K programs and the rest the decode
+GEMM's, with its program ids offset by `P`. Neither half waits on the other.
+The split-K router reads 32 KB of activations per program, where a GEMV
+program reads all of them, so both weight streams finish together.
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
