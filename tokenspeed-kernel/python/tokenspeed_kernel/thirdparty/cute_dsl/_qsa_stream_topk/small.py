@@ -157,13 +157,15 @@ class WarpScore(SplitSelector):
                     # The validated 64-feature swizzle permits aligned 16B
                     # vectors and ldmatrix row loads.
                     page = table[request, tile_start // 64]
+                    # Widen the physical page before scaling it; the offset
+                    # within the 64-key page stays int32.
+                    page_keys = keys.iterator + cutlass.Int64(page) * (64 * 128)
                     for item in cutlass.range_constexpr(8):
                         vector = tidx + item * self.threads
                         key_row = vector // 16
                         col = (vector % 16) * 8
                         logical_key = tile_start + key_row
-                        slot = page * 64 + logical_key % 64
-                        source = keys.iterator + slot * 128 + col
+                        source = page_keys + (logical_key % 64) * 128 + col
                         address = (
                             k_base + key_row * 128 + (col % 64) * 2 + (col // 64) * 8192
                         )
@@ -180,8 +182,8 @@ class WarpScore(SplitSelector):
                         col = (tidx % 16) * 8
                         source = (
                             query.iterator
-                            + row * q_stride_row
-                            + (q_head % 4) * q_stride_head
+                            + cutlass.Int64(row) * q_stride_row
+                            + cutlass.Int64(q_head % 4) * q_stride_head
                             + col
                         )
                         address = (
@@ -389,13 +391,15 @@ class GuardScore(WarpScore):
                     # The validated 64-feature swizzle permits aligned 16B
                     # vectors and ldmatrix row loads.
                     page = table[request, tile_start // 64]
+                    # Widen the physical page before scaling it; the offset
+                    # within the 64-key page stays int32.
+                    page_keys = keys.iterator + cutlass.Int64(page) * (64 * 128)
                     for item in cutlass.range_constexpr(8):
                         vector = tidx + item * self.threads
                         key_row = vector // 16
                         col = (vector % 16) * 8
                         logical_key = tile_start + key_row
-                        slot = page * 64 + logical_key % 64
-                        source = keys.iterator + slot * 128 + col
+                        source = page_keys + (logical_key % 64) * 128 + col
                         address = (
                             k_base + key_row * 128 + (col % 64) * 2 + (col // 64) * 8192
                         )
@@ -412,8 +416,8 @@ class GuardScore(WarpScore):
                         col = (tidx % 16) * 8
                         source = (
                             query.iterator
-                            + row * q_stride_row
-                            + (q_head % 4) * q_stride_head
+                            + cutlass.Int64(row) * q_stride_row
+                            + cutlass.Int64(q_head % 4) * q_stride_head
                             + col
                         )
                         address = (
@@ -1095,13 +1099,15 @@ class GuardMerge(Merge32):
                     lane,
                 )
             if use_fallback:
+                # Widen the runtime row offset once; in-row offsets stay int32.
+                row_partials = (
+                    partials.iterator + cutlass.Int64(row) * partials.shape[1]
+                )
                 if cutlass.const_expr(self.cache_encoded):
                     values = cute.make_rmem_tensor((self.entries,), cutlass.Uint32)
                     for group in cutlass.range_constexpr(self.entries // 4):
                         source = cute.make_tensor(
-                            partials.iterator
-                            + row * partials.shape[1]
-                            + (tidx + group * self.threads) * 4,
+                            row_partials + (tidx + group * self.threads) * 4,
                             cute.make_layout((4,)),
                         )
                         packet = cute.make_rmem_tensor((4,), cutlass.Uint32)
@@ -1120,7 +1126,7 @@ class GuardMerge(Merge32):
                     )
                 else:
                     values = cute.make_tensor(
-                        partials.iterator + row * partials.shape[1] + tidx,
+                        row_partials + tidx,
                         cute.make_layout((self.entries,), stride=(self.threads,)),
                     )
                     self._select_fine(

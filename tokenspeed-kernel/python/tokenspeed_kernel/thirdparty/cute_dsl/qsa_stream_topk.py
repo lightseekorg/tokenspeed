@@ -321,7 +321,7 @@ def kernel(
     Args:
         query: Aligned BF16 queries shaped ``[rows, 4, 128]``.
         key_cache: Contiguous BF16 keys shaped ``[slots, 1, 128]`` with
-            complete 64-slot physical pages.
+            complete 64-slot physical pages and fewer than ``2**31`` slots.
         page_table: Aligned int32 physical pages shaped ``[requests, pages]``
             with contiguous columns and a runtime row stride; at most 2048
             pages per request, including speculative context padding.
@@ -365,6 +365,10 @@ def kernel(
         or key_cache.shape[1:] != (1, _HEAD_DIM)
     ):
         raise ValueError("CuTe QSA stream kernel requires K shape [slots, 1, 128]")
+    # Slot ids (page * 64 + offset) and TMA row coordinates stay int32 in the
+    # kernels; only the element offsets derived from them are int64.
+    if key_cache.shape[0] >= 2**31:
+        raise ValueError("CuTe QSA stream kernel requires fewer than 2**31 K slots")
     if key_cache.dtype is not torch.bfloat16 or query.dtype is not torch.bfloat16:
         raise TypeError("CuTe QSA stream kernel requires BF16 Q/K")
     if page_table.dtype is not torch.int32:
