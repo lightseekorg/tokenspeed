@@ -1442,6 +1442,53 @@ def test_moetail_lamport_codegen(block_m):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
+@pytest.mark.parametrize("rows", [9, 12, 16])
+def test_moetail_column_senders_push_whole_lines(rows):
+    """Each column sender's push instruction writes whole 128-byte lines.
+
+    A sender pushes its OUTPUTS columns of every row with one 16-byte store
+    per lane; a store instruction that covers only part of each line it
+    touches makes the peer link carry partial-line writes. Lanes map to
+    elements through the send layout, as the store lowering maps them (one
+    instruction per wave; replica waves store nothing).
+    """
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        _MUSE_BOUNDARY_WIDTH,
+        _MUSE_MOETAIL_COLUMN_OUTPUTS,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+        _send_layout,
+    )
+
+    outputs = _MUSE_MOETAIL_COLUMN_OUTPUTS
+    block_m = 1 << (rows - 1).bit_length()
+    row_bytes = 2 * _MUSE_BOUNDARY_WIDTH // 8
+    layout = _send_layout(outputs, 16)
+    per_lane, lanes_per_row = layout.size_per_thread[1], layout.threads_per_warp[1]
+    # One store instruction per wave: each lane's elements are one 16-byte store.
+    assert layout.size_per_thread[0] == 1 and layout.order == [1, 0]
+    assert 2 * per_lane == 16 and per_lane * lanes_per_row == outputs
+    rows_per_wave = layout.threads_per_warp[0]
+    stored = set()
+    for first_output in range(0, _MUSE_BOUNDARY_WIDTH // 8, outputs):
+        for wave in range(16):
+            lines = {}
+            for lane in range(64):
+                row = (wave * rows_per_wave + lane // lanes_per_row) % block_m
+                column = first_output + lane % lanes_per_row * per_lane
+                if row >= rows or (row, column) in stored:
+                    continue  # masked, or a replica's duplicate
+                stored.add((row, column))
+                start = row * row_bytes + 2 * column
+                lines.setdefault(start // 128, set()).update(range(start, start + 16))
+            for line, written in lines.items():
+                assert written == set(range(128 * line, 128 * (line + 1))), (
+                    f"rows={rows}: sender {first_output // outputs}, wave "
+                    f"{wave} writes {len(written)} of line {line}'s 128 bytes"
+                )
+    assert len(stored) == rows * (_MUSE_BOUNDARY_WIDTH // 8) // per_lane
+
+
 def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,
