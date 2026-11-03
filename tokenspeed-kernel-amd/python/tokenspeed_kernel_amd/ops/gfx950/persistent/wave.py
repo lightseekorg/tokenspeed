@@ -35,6 +35,8 @@ in the compiler TODO with the Gluon support that would replace it.
   loop instead of hoisting every iteration's reads into registers.
 - :func:`after`: a value made data-dependent on another, so a store of it is
   issued only after the wave waited for the other's load.
+- :func:`issue_order`: a point vector memory operations do not cross, so a
+  wave issues the ones before it first (the queue then completes them first).
 - :func:`lds_store_count` and :func:`lds_spin_until`: an LDS exchange among
   the waves of a workgroup that the compiler does not model, so it adds no
   barrier. The waves share LDS and one wave's LDS operations complete in
@@ -87,6 +89,20 @@ def after(x, dep):
         is_pure=False,
         pack=1,
     )
+
+
+@gluon.jit
+def issue_order():
+    """Keep this wave's memory operations on their side of this point (an
+    asm memory clobber; one ``s_mov``): the compiler may otherwise reorder
+    loads and stores to different buffers. One wave's vector memory
+    operations complete in issue order, so with :func:`after` a wave can wait
+    for the operations before the point while later loads stay in flight.
+
+    Returns an int32 0 the compiler cannot fold: arithmetic that adds it
+    stays after the point too (the point orders memory operations only).
+    """
+    return gl.inline_asm("s_mov_b32 $0, 0", "=s,~{memory}", [], gl.int32, is_pure=False)
 
 
 @gluon.constexpr_function
