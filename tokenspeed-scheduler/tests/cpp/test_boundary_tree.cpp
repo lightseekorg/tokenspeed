@@ -313,6 +313,24 @@ TEST(BoundaryTreeTest, DuplicatePreflightPrunesPendingAndIncompletePrefixesAcros
     EXPECT_TRUE(tree.HasHostKvDuplicateCandidate());
 }
 
+TEST(BoundaryTreeTest, DuplicatePreflightCountsEachMarkedNodeOnce) {
+    BoundaryTree tree;
+    Node& first = tree.FindOrAdd("first", nullptr, 4, 0);
+    Node& second = tree.FindOrAdd("second", nullptr, 4, 0);
+    tree.SetDeviceKvCoverage(first, true, 4);
+    tree.SetDeviceKvCoverage(second, true, 4);
+    tree.SetHostKvDuplicate(first, true);
+    tree.SetHostKvDuplicate(first, true);
+    tree.SetHostKvDuplicate(second, true);
+    tree.SetHostKvDuplicate(first, false);
+    EXPECT_TRUE(tree.HasHostKvDuplicateCandidate()) << "clearing one mark keeps the other";
+    tree.SetHostKvDuplicate(second, false);
+    EXPECT_FALSE(tree.HasHostKvDuplicateCandidate()) << "a repeated mark counts once";
+    tree.SetHostKvDuplicate(second, false);
+    tree.SetHostKvDuplicate(first, true);
+    EXPECT_TRUE(tree.HasHostKvDuplicateCandidate()) << "a repeated clear counts once";
+}
+
 TEST(BoundaryTreeTest, LinkingAPendingRootAppliesBothStoreHolds) {
     for (const bool ancestor_first : {true, false}) {
         SCOPED_TRACE(ancestor_first);

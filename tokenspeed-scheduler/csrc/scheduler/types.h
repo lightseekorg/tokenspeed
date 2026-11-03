@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 
@@ -115,9 +116,30 @@ struct SchedulerConfig {
     // forward holds one more block per State group, and the request's next
     // publication point publishes it under the boundary's page hash. The
     // runtime writes the state at ForwardBatch::extend_state_checkpoint_lens
-    // into the third entry of every State group's row. Requires prefix
-    // caching, except on the D role, which never computes a prompt.
+    // into the third entry of every State group's row. The State checkpoints,
+    // and their KV tails, that a next turn re-rendering the end of the
+    // previous prompt and its reply cannot resume at are then skipped: a
+    // prompt end that checkpoint covers (P and fused roles) and a fused finish
+    // past the prompt end are published like chunk ends
+    // (docs/design/scheduler.md §1.2). A model without State groups is
+    // unaffected. Requires prefix caching, except on the D role, which never
+    // computes a prompt and publishes as ever.
     bool state_checkpoint_in_forward{false};
+    // Under cache pressure, a State checkpoint more than
+    // checkpoint_retention_leaf_distance from the newest checkpoint on its
+    // branch ranks as if last used this many new requests ago, or at its own
+    // use when older: so it leaves before the entries used since, while entries
+    // unused for longer leave first. 0 ranks every entry by its own use. Unset
+    // means 16 * max_batch_size; at most kMaxCheckpointRetentionRequests.
+    std::optional<std::int64_t> checkpoint_retention_requests;
+    // Checkpoints within this many later requests of the newest on their
+    // branch rank as it does: 0 only the newest request's, 1 the previous
+    // turn's too. Below CheckpointTree::kMaxDistance.
+    std::int32_t checkpoint_retention_leaf_distance{0};
+    std::int64_t CheckpointRetentionRequests() const {
+        return checkpoint_retention_requests.value_or(
+            std::min<std::int64_t>(std::int64_t{16} * max_batch_size, kMaxCheckpointRetentionRequests));
+    }
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

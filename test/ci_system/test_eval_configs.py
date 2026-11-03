@@ -245,7 +245,9 @@ def test_muse_spark_aime26_uses_validated_mxfp4_configuration(tp_size, ep_size):
     assert "--disable-prefill-graph" in server_tokens
     assert "--disable-overlap-schedule" not in server_tokens
     assert flag_value(eval_tokens, "--eval-batch-size") == "8"
-    assert generation_config["max_tokens"] == 32768
+    assert generation_config["max_tokens"] == (
+        63488 if (tp_size, ep_size) == (8, 1) else 32768
+    )
     assert generation_config["extra_body"]["reasoning_effort"] == "high"
     assert task["score_threshold"] == 0.91
 
@@ -379,7 +381,7 @@ def test_kimi_k3_amd_gates_use_eagle3():
     eval_tokens = shlex.split(tasks[0]["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
     assert generation_config["seed"] == 42
-    assert generation_config["max_tokens"] == 32768
+    assert generation_config["max_tokens"] == 63488
     assert flag_value(eval_tokens, "--eval-batch-size") == "16"
     assert "--limit" not in eval_tokens
     assert (

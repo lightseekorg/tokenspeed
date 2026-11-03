@@ -340,7 +340,7 @@ TEST(GroupAllocatorTest, ExpiredSlotBoundIncludesEveryReclaimableBlock) {
         index.Register(pool, blocks[slot], CacheKey{.content_hash = std::to_string(slot)}, /*access_epoch=*/1, slot,
                        CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr, /*session=*/nullptr);
     }
-    BlockTable table = BlockTable::FromBlocks(std::move(blocks), /*available_tokens=*/0);
+    BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, std::move(blocks), /*available_tokens=*/0);
     allocator.ReclaimExpired(pool, table, 1);
     table.EvictToNull(1).reset();
     CacheBlockRef cached_pin = table.Blocks()[2];

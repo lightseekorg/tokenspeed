@@ -8,13 +8,19 @@ from tokenspeed_kernel.numerics.torch.layernorm import (
     torch_rmsnorm,
     torch_weightless_rmsnorm,
 )
-from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
+from tokenspeed_kernel.ops.layernorm import (
+    add_rmsnorm,
+    gemma_rmsnorm,
+    grouped_rmsnorm,
+)
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
+    _grouped_gemma_rmsnorm_kernel,
     _rmsnorm_kernel,
     fused_qk_rmsnorm_rope,
     qk_rmsnorm,
     rmsnorm,
+    triton_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -573,3 +579,105 @@ def test_add_rmsnorm_contract(device: str) -> None:
             fp4_scale=None,
             gemma=False,
         )
+
+
+def _gemma_reference(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """FP32 Gemma RMSNorm of ``x`` (plus ``residual``), and the rounded residual sum."""
+    total = x.float() if residual is None else x.float() + residual.float()
+    normed = total * torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + eps)
+    new_residual = None if residual is None else total.to(x.dtype)
+    return normed * (1.0 + weight.float()), new_residual
+
+
+def _assert_gemma_close(out: torch.Tensor, ref: torch.Tensor) -> None:
+    if out.dtype == torch.float32:
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+        return
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+    # Each value is the FP32 result rounded once: another summation order may
+    # round a value next to a rounding boundary the other way, never further
+    # than one unit in the last place.
+    finfo = torch.finfo(out.dtype)
+    magnitude = torch.maximum(out.float().abs(), ref.abs()).clamp_min(finfo.tiny)
+    ulp = finfo.eps * torch.exp2(torch.floor(torch.log2(magnitude)))
+    assert ((out.float() - ref).abs() <= ulp).all()
+
+
+# The selected kernel (FlashInfer on NVIDIA, Triton elsewhere) and the Triton
+# kernel by name, so NVIDIA runs also cover the portable kernel.
+GEMMA_NORMS = pytest.mark.parametrize(
+    "norm", [gemma_rmsnorm, triton_gemma_rmsnorm], ids=["selected", "triton"]
+)
+
+
+@GEMMA_NORMS
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("hidden_size", [128, 256, 2560, 5120])
+@pytest.mark.parametrize("rows", [1, 7, 300])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_gemma_rmsnorm_matches_reference(
+    norm,
+    dtype: torch.dtype,
+    hidden_size: int,
+    rows: int,
+    with_residual: bool,
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(rows, hidden_size, device=device, dtype=dtype) * 3
+    residual = torch.randn_like(x) * 3 if with_residual else None
+    weight = (torch.randn(hidden_size, device=device) * 0.5).to(dtype)
+    ref, ref_residual = _gemma_reference(x, weight, eps, residual)
+
+    result = norm(x, weight, eps, residual)
+
+    if with_residual:
+        out, new_residual = result
+        assert torch.equal(new_residual, ref_residual)
+    else:
+        out = result
+    assert out.shape == x.shape and out.dtype == dtype
+    _assert_gemma_close(out, ref)
+
+
+@GEMMA_NORMS
+def test_gemma_rmsnorm_reads_strided_and_3d_inputs(norm, device: str) -> None:
+    """Column slices of a fused projection and per-head [tokens, heads, dim] views."""
+    eps = 1e-6
+    wide = torch.randn(9, 3 * 512, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(512, device=device, dtype=torch.bfloat16) * 0.5
+    untouched = wide[:, 512:].clone()
+
+    x = wide[:, :512]
+    residual_wide = torch.randn(9, 2 * 512, device=device, dtype=torch.bfloat16)
+    residual = residual_wide[:, 512:]
+    ref, ref_residual = _gemma_reference(x, weight, eps, residual)
+    out, new_residual = norm(x, weight, eps, residual)
+    _assert_gemma_close(out, ref)
+    assert torch.equal(new_residual, ref_residual)
+    assert torch.equal(wide[:, 512:], untouched)
+
+    x = wide[:, 512 : 2 * 512]
+    ref, _ = _gemma_reference(x, weight, eps, None)
+    _assert_gemma_close(norm(x, weight, eps, None), ref)
+
+    heads = wide.view(9, 3, 512)[:, 1:]
+    ref, _ = _gemma_reference(heads, weight, eps, None)
+    _assert_gemma_close(norm(heads, weight, eps, None), ref)
+
+
+def test_triton_gemma_rmsnorm_compiles_once_across_batch_sizes(device: str) -> None:
+    hidden_size = 5120
+    x = torch.randn(300, hidden_size, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(hidden_size, device=device, dtype=torch.bfloat16)
+
+    def run(rows: int) -> None:
+        triton_gemma_rmsnorm(x[:rows].clone(), weight, 1e-6, x[:rows].clone())
+        triton_gemma_rmsnorm(x[:rows], weight, 1e-6, None)
+
+    run(3)
+    with assert_no_triton_compile(_add_rmsnorm_kernel, _grouped_gemma_rmsnorm_kernel):
+        for rows in (1, 16, 37, 64, 300):
+            run(rows)

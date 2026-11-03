@@ -108,9 +108,9 @@ public:
         // repeatedly prove the same Device prefix from its root.
         bool device_kv_page_complete{false};
         bool device_kv_prefix_complete{false};
+        // Whether some closed group holds this hash's settled block on both
+        // tiers (SetHostKvDuplicate).
         bool has_host_kv_duplicate{false};
-        Node* prev_host_kv_duplicate{nullptr};
-        Node* next_host_kv_duplicate{nullptr};
     };
 
     BoundaryTree() = default;
@@ -253,37 +253,24 @@ public:
         }
     }
 
-    // Nodes with at least one settled closed-group key on both tiers, in
-    // insertion order. Membership does not pin a block or imply a complete
-    // Device prefix; the coordinator checks both when planning reclamation.
+    // Marks whether some closed group holds `node`'s settled block on both
+    // tiers, and counts the marked nodes so a scan with none skips the walk.
+    // A mark does not pin a block or imply a complete Device prefix; the
+    // coordinator checks both when planning reclamation.
     void SetHostKvDuplicate(Node& node, bool duplicate) {
         if (node.has_host_kv_duplicate == duplicate) {
             return;
         }
         node.has_host_kv_duplicate = duplicate;
-        if (duplicate) {
-            node.prev_host_kv_duplicate = last_host_kv_duplicate_;
-            (last_host_kv_duplicate_ != nullptr ? last_host_kv_duplicate_->next_host_kv_duplicate
-                                                : first_host_kv_duplicate_) = &node;
-            last_host_kv_duplicate_ = &node;
-            return;
-        }
-        (node.prev_host_kv_duplicate != nullptr ? node.prev_host_kv_duplicate->next_host_kv_duplicate
-                                                : first_host_kv_duplicate_) = node.next_host_kv_duplicate;
-        (node.next_host_kv_duplicate != nullptr ? node.next_host_kv_duplicate->prev_host_kv_duplicate
-                                                : last_host_kv_duplicate_) = node.prev_host_kv_duplicate;
-        node.prev_host_kv_duplicate = nullptr;
-        node.next_host_kv_duplicate = nullptr;
+        host_kv_duplicates_ += duplicate ? 1 : -1;
     }
-
-    const Node* FirstHostKvDuplicate() const { return first_host_kv_duplicate_; }
 
     // Only a complete Device prefix without a pending store at or above it
     // can replace a Host copy. Prune whole blocked subtrees and stop at the
     // first possible duplicate; pins and checkpoint windows are checked by
     // the coordinator. This needs no per-page ancestor-count maintenance.
     bool HasHostKvDuplicateCandidate() const {
-        if (first_host_kv_duplicate_ == nullptr) {
+        if (host_kv_duplicates_ == 0) {
             return false;
         }
         const Node* node = first_root_;
@@ -333,8 +320,7 @@ public:
         last_root_ = nullptr;
         first_host_leaf_ = nullptr;
         last_host_leaf_ = nullptr;
-        first_host_kv_duplicate_ = nullptr;
-        last_host_kv_duplicate_ = nullptr;
+        host_kv_duplicates_ = 0;
     }
 
     std::size_t Size() const { return nodes_.size(); }
@@ -367,8 +353,8 @@ private:
     Node* last_root_{nullptr};
     Node* first_host_leaf_{nullptr};
     Node* last_host_leaf_{nullptr};
-    Node* first_host_kv_duplicate_{nullptr};
-    Node* last_host_kv_duplicate_{nullptr};
+    // How many nodes have has_host_kv_duplicate set.
+    std::int32_t host_kv_duplicates_{0};
 };
 
 }  // namespace tokenspeed

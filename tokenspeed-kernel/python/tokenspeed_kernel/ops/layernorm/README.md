@@ -69,3 +69,19 @@ two kernels agree byte for byte on `q_out` and `k_out`. Tests:
 `test/nvidia/ops/layernorm/test_beam_norms_cuda.py` (NVIDIA SM90 to SM103: the
 bytes). No
 timing claim is made for the fused kernel in this record.
+
+## `layernorm.gemma_rmsnorm` operator
+
+`gemma_rmsnorm(x, weight, eps, residual=None)` is `GemmaRMSNorm.forward`: the
+norm scaled by `1 + weight` in FP32, and with `residual` the fused add that
+normalizes the FP32 sum, writes the norm into `x` and the rounded sum into
+`residual`, and returns both. The facade selects by the dtype of `x` and calls
+the kernel with `(x, weight, eps, residual)`.
+
+| kernel | solution / band | admits | body |
+| --- | --- | --- | --- |
+| `flashinfer_gemma_rmsnorm` | `flashinfer`, PERFORMANT, NVIDIA | BF16, FP16 | FlashInfer's `gemma_rmsnorm` / `gemma_fused_add_rmsnorm` |
+| `triton_gemma_rmsnorm` | `triton`, PORTABLE | BF16, FP16, FP32 | `grouped_gemma_rmsnorm` with one group per row / `add_rmsnorm(gemma=True)` on `[rows, N]` views (strided column slices stay views) |
+
+Tests: `test/ops/test_layernorm.py` (both kernels, and no recompilation of the
+Triton kernels across batch sizes).

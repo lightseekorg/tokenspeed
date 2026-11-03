@@ -40,6 +40,7 @@
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/boundary_tree.h"
+#include "cache/prefix/checkpoint_tree.h"
 #include "cache/prefix/tail_table.h"
 #include "utils.h"
 
@@ -64,6 +65,9 @@ inline std::int32_t FirstTailBlockNeeded(const CacheGroupSpec& spec, std::int32_
 struct CoordinatorMatch {
     std::int32_t num_common_tokens{0};
     std::vector<PrefixMatch> per_group;
+    // The access epoch the resumed State checkpoint had before this match, 0
+    // when this tier resumes none.
+    std::uint64_t resumed_checkpoint_last_use{0};
 };
 
 // Multi-group fan-out over the per-attention groups, one shared BlockPool. Holds no per-request
@@ -82,16 +86,45 @@ public:
     // (the Host write-back policy; it needs a Host pool and excludes
     // streaming). The snapshot pool holds retracted requests' private KV
     // images (Snapshot / Restore); nullptr means the engine never retracts.
-    // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host
-    // and write_back_evictions have no defaults: a shorter call would convert
-    // a pool pointer to bool and silently disable a tier instead of failing
-    // to compile.
+    // checkpoint_retention_requests and checkpoint_retention_leaf_distance are
+    // SchedulerConfig's: a State checkpoint more than the leaf distance from a
+    // leaf ranks, under pressure, as if last used that many new requests ago
+    // (0 requests ranks every entry by its own use).
+    // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host,
+    // write_back_evictions and checkpoint_retention_requests have no defaults:
+    // a shorter call would convert a pool pointer to bool and silently disable
+    // a tier instead of failing to compile. A leaf distance of 0 ranks only
+    // the newest checkpoint on a branch as a leaf.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                      bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
-                     bool stream_device_cache_to_host, bool write_back_evictions);
+                     bool stream_device_cache_to_host, bool write_back_evictions,
+                     std::int64_t checkpoint_retention_requests, std::int32_t checkpoint_retention_leaf_distance = 0);
     std::size_t DemoteSession(const std::string& session_id, bool ended);
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
-    void ForgetSessionAccess(std::uint64_t epoch) { session_access_.erase(epoch); }
+
+    // A request's session, registered under its access epoch for every
+    // admission, publication and restore that epoch dates
+    // (SessionForAccess). The first admission of a request with a session id
+    // registers it and returns this handle; dropping the handle unregisters
+    // it. Move-only; the coordinator must outlive it.
+    class SessionAccess {
+    public:
+        SessionAccess() noexcept = default;
+        SessionAccess(const SessionAccess&) = delete;
+        SessionAccess& operator=(const SessionAccess&) = delete;
+        SessionAccess(SessionAccess&& other) noexcept;
+        SessionAccess& operator=(SessionAccess&& other) noexcept;
+        ~SessionAccess();
+
+    private:
+        friend class CacheCoordinator;
+
+        SessionAccess(CacheCoordinator& coordinator, std::uint64_t access_epoch, SessionCacheOwner session);
+        void release() noexcept;
+
+        CacheCoordinator* coordinator_{nullptr};
+        std::uint64_t access_epoch_{0};
+    };
     SessionCacheOwner SessionForAccess(std::uint64_t epoch) const {
         const auto it = session_access_.find(epoch);
         return it == session_access_.end() ? nullptr : it->second;
@@ -240,6 +273,12 @@ public:
         // and on the D role.
         std::int32_t device_only_hit_tokens{0};
     };
+    // The publication point an admission reserves copy-in blocks for: the
+    // fused role's prompt end, which the request's first decode publishes and
+    // keeps writing past (OwnerTail::kCopiedIn).
+    struct CopyInPoint {
+        std::int32_t tokens{0};
+    };
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
         std::int32_t host_prefix_tokens{0};
@@ -264,20 +303,34 @@ public:
         std::vector<std::vector<std::int32_t>> new_page_ids;
         // Device -> Device whole-block copies, aligned by group_id, as
         // (source, destination) virtual block ids: a hitter's private copy of
-        // the partial block containing its boundary, or an owner's fresh
-        // block at a publication point it keeps writing past. Both ends share
-        // a bucket; the destination sits in the request's table.
+        // the partial block containing its boundary, or an owner's copy-in at
+        // a publication point it keeps writing past (into the block it
+        // reserved for the slot). Both ends share a bucket; the destination
+        // sits in the request's table.
         std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
         // Aligned by group_id: the fresh block each State group's
         // StateStep::checkpoint acquired outside the table (also listed in
         // new_page_ids), null elsewhere. The caller holds it until the
         // request's next publication point publishes it.
         std::vector<CacheBlockRef> state_checkpoint_blocks;
+        // With a copy-in point: aligned by group_id, one entry per slot of
+        // CopyInSlots(i, point), in slot order -- the copy-in block this
+        // admission reserved for a slot whose block it allocates, fills from
+        // the prefix or rebuilds, in that block's bucket, and null for a slot
+        // an earlier admission covered or a later one will. Held outside the
+        // table -- and not in new_page_ids: the copy-in fills a block whole --
+        // until the admission that publishes the point spends it (Admit's
+        // copy_in_blocks). Empty without a copy-in point.
+        std::vector<std::vector<CacheBlockRef>> copy_in_blocks;
         // The tail whose checkpoints the Device supplied as the State groups'
         // slot 0: a first admission resuming inside a page, where an earlier
         // turn ended. The end state the request publishes supersedes it
         // (MarkSupersededStateInput).
         std::optional<ContentHash> resumed_tail_hash;
+        // The first admission of a request with a session id: that session's
+        // registration under access_epoch, for the caller to hold as long as
+        // the request lives. Empty otherwise.
+        SessionAccess session_access;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -316,19 +369,30 @@ public:
     // demands say what each group needs for the round ahead; progress says
     // what the request completed since its previous admission. Completed
     // pages are published and expired slots reclaimed inside this
-    // transaction, before the new pages are acquired. Under
-    // write_back_evictions each set of cache victims is recorded for the
-    // plan's drain (TakeEvictedSegments); each call erases the records it
-    // added that ended up empty. evict_blocks_past_segments (write-back only):
-    // once whole segments cannot fund the admission, what they passed over
-    // leaves block by block, written back like any set -- for a request no
-    // other one holds pages beside, which waiting would never fund
-    // (docs/design/scheduler.md §1.4). Only the plan without the copy-in
-    // evicts so: the copy-in is dropped first. A caller that may drop part of
-    // its demand (an in-forward State checkpoint's block) passes false for
-    // the attempt with it.
+    // transaction, before the new pages are acquired. An owner that keeps
+    // writing past the point it publishes (OwnerTail::kCopiedIn) moves off
+    // its published tail blocks into copy_in_blocks, the blocks the request
+    // holds for that point (aligned like AdmissionResult::copy_in_blocks,
+    // every slot filled): Admit swaps in the ones it uses and releases the
+    // rest, leaving copy_in_blocks empty, so the publication needs no block
+    // the request did not reserve. Any other admission passes none.
+    // copy_in_point is the request's next such point: this admission reserves
+    // its copy-in blocks for the slots whose blocks it allocates or fills
+    // from the prefix, each with the block it serves
+    // (AdmissionResult::copy_in_blocks). Under write_back_evictions each set
+    // of cache victims is recorded
+    // for the plan's drain (TakeEvictedSegments); each call erases the records
+    // it added that ended up empty. evict_blocks_past_segments (write-back
+    // only): once whole segments cannot fund the admission, what they passed
+    // over leaves block by block, written back like any set -- for a request
+    // no other one holds pages beside, which waiting would never fund
+    // (docs/design/scheduler.md §1.4). A caller that may drop part of its
+    // demand (an in-forward State checkpoint's block) passes false for the
+    // attempt with it.
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
+                                         std::span<std::vector<CacheBlockRef>> copy_in_blocks,
+                                         std::optional<CopyInPoint> copy_in_point,
                                          std::optional<std::uint64_t> request_access_epoch,
                                          bool evict_blocks_past_segments, const std::string& session_id);
 
@@ -396,12 +460,15 @@ public:
     // snapshot_pairs the snapshot pool -> Device copies, new_page_ids only
     // the reserve pages appended
     // beyond the imaged shape (the copies fill their destinations whole, so
-    // the plan zeroes nothing it restores). request_access_epoch is the
-    // request's first-admission epoch, carried on. Under
-    // write_back_evictions each set of cache victims is recorded for the
-    // plan's drain as an admission's is; each call erases the records it
+    // the plan zeroes nothing it restores). copy_in_point as for Admit: the
+    // retraction released the copy-in blocks the victim held, and the restore
+    // reserves those of the slots it rebuilds or grows.
+    // request_access_epoch is the request's first-admission epoch, carried
+    // on. Under write_back_evictions each set of cache victims is recorded for
+    // the plan's drain as an admission's is; each call erases the records it
     // added that ended up empty.
     std::optional<AdmissionResult> Restore(const RetractionImage& snapshot, std::span<const GroupDemand> demands,
+                                           std::optional<CopyInPoint> copy_in_point,
                                            std::uint64_t request_access_epoch);
     bool HasHostPool() const { return host_pool_ != nullptr; }
     bool HasSnapshotPool() const { return snapshot_pool_ != nullptr; }
@@ -771,6 +838,11 @@ public:
     // content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
+    // Whether every State group caches its checkpoint published under the
+    // chain hash content_hash, on the Device or the Host, as the probe takes
+    // each from whichever tier holds it (false for a model without State
+    // groups).
+    bool HoldsStateCheckpoint(const ContentHash& content_hash) const;
     // The cache keys one boundary holds in each group that publishes it:
     // BlocksPerBoundary of them for a chain hash (tail_tokens 0), a tail's
     // blocks from FirstTailBlockNeeded on (tail_tokens = T mod P), one for a
@@ -819,6 +891,15 @@ public:
     // State checkpoints first.
     std::vector<NodeEntry> NodeEntries(const BlockPool& pool, const BoundaryTree::Node& node) const;
 
+    // How an eviction plan on `tier` ranks State checkpoints that are not
+    // leaves (cache-concepts.md, checkpoint retention).
+    CheckpointAging CheckpointAgingFor(CacheTier tier) const;
+    const CheckpointTree& Checkpoints() const { return checkpoints_; }
+    // New requests admitted between a resumed checkpoint's last use and the
+    // resume: index 0 counts none, index b >= 1 counts [2^(b-1), 2^b), and
+    // the last index counts gaps as long as the admissions kept, or longer.
+    const std::vector<std::uint64_t>& CheckpointResumeGaps() const { return checkpoint_resume_gaps_; }
+
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped.
     std::size_t NumTailEntries() const { return tails_.Size(); }
@@ -849,6 +930,14 @@ public:
         return tokenspeed::FirstTailBlockNeeded(groups_[index].Spec(), geometry_[index].BlockGranularity(),
                                                 tail_tokens);
     }
+    // The table slots of group i an owner copies in at a publication point
+    // ending at `tokens` that it keeps writing past: exactly the slots that
+    // point's publication registers under the tail's hash (completedBlockRanges)
+    // -- the page's blocks below `tokens`, from the window's first block on in
+    // a sliding group. None at a page boundary, for a State group (which moves
+    // off its published slot by rotation) or for a replayable one (which
+    // publishes nothing).
+    BlockRange CopyInSlots(std::size_t i, std::int32_t tokens) const;
 
 private:
     friend struct CacheCoordinatorTestAccess;
@@ -1076,6 +1165,11 @@ private:
     // it), and a node no prefix-closed group holds on either tier and no store
     // is bringing (a gap).
     void syncTreeNode(const ContentHash& hash);
+    // The checkpoint tree follows the State entries each tier holds.
+    void recordCheckpoints(const CompletedPages& completed, std::uint64_t access_epoch);
+    void syncCheckpoint(const ContentHash& hash);
+    void recordAdmission(std::uint64_t access_epoch);
+    void recordResumeGap(std::uint64_t last_used_epoch);
     // Refresh the closed-group coverage and duplicate membership after a
     // publication, restore, or link gives an existing hash its parent.
     void syncKvCoverage(BoundaryTree::Node& node);
@@ -1086,6 +1180,10 @@ private:
     bool deviceCacheIsClearable() const;
     bool hostCacheIsClearable() const;
     void validateProgress(const RequestProgress& progress) const;
+    // Admit's copy_in_blocks: every slot's block for an owner copying in past
+    // its tail, none otherwise.
+    void validateCopyInBlocks(const RequestProgress& progress,
+                              std::span<const std::vector<CacheBlockRef>> copy_in_blocks) const;
     std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].ExpiredBlocksAt(groups_[static_cast<std::size_t>(i)].Spec(),
                                                                       num_computed_tokens);
@@ -1119,6 +1217,7 @@ private:
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
     SessionCacheOwner sessionTag(const std::string& id);
+    // One entry per live SessionAccess handle, which adds and erases it.
     std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
     std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
     std::size_t session_tags_since_sweep_{0};
@@ -1132,6 +1231,15 @@ private:
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.
     BoundaryTree boundary_tree_;
+    CheckpointTree checkpoints_;
+    std::int64_t checkpoint_retention_requests_{0};
+    // The access epochs of the latest new-request admissions, oldest first
+    // from num_admissions_ (a ring); it covers the retention window and the
+    // resume gaps.
+    std::vector<std::uint64_t> admission_epochs_;
+    static constexpr std::size_t kResumeGapAdmissions{std::size_t{1} << 16};
+    std::uint64_t num_admissions_{0};
+    std::vector<std::uint64_t> checkpoint_resume_gaps_;
     mutable std::uint64_t host_duplicate_scan_generation_{0};
     // Hashes of possibly dead tree nodes, in the order they were queued, for
     // CollectDeadEntries (write_back_evictions only). A node may be gone or
@@ -1167,5 +1275,7 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
-                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions);
+                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
+                                 std::int64_t checkpoint_retention_requests,
+                                 std::int32_t checkpoint_retention_leaf_distance = 0);
 }  // namespace tokenspeed

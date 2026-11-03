@@ -48,7 +48,13 @@ from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
 @pytest.mark.parametrize(
     ("pages", "rows", "max_partial_bytes", "expected"),
     [
-        pytest.param(80, 8, 32 * 1024 * 1024, True, id="small-partial-second-tile"),
+        pytest.param(
+            80,
+            8,
+            32 * 1024 * 1024,
+            True,
+            id="small-partial-second-tile",
+        ),
         pytest.param(81, 8, 32 * 1024 * 1024, True, id="long-small-grid"),
         pytest.param(128, 64, 32 * 1024 * 1024, True, id="long-populated-grid"),
         pytest.param(
@@ -58,10 +64,22 @@ from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
             True,
             id="long-with-small-partial-budget",
         ),
-        pytest.param(1024, 16384, 32 * 1024 * 1024, True, id="prefill-256k-capacity"),
+        pytest.param(
+            1024,
+            16384,
+            32 * 1024 * 1024,
+            True,
+            id="prefill-256k-capacity",
+        ),
         pytest.param(1024, 16384, 0, True, id="prefill-without-partial-budget"),
         pytest.param(1025, 16384, 0, True, id="prefill-with-mtp-padding"),
-        pytest.param(1025, 4, 32 * 1024 * 1024, True, id="decode-with-mtp-padding"),
+        pytest.param(
+            1025,
+            4,
+            32 * 1024 * 1024,
+            True,
+            id="decode-with-mtp-padding",
+        ),
         pytest.param(2048, 16384, 0, True, id="prefill-512k-capacity"),
         pytest.param(2049, 16384, 0, False, id="unsupported-capacity"),
     ],
@@ -74,10 +92,27 @@ def test_cute_dsl_qsa_stream_topk_dispatch_boundary(
     expected: bool,
 ) -> None:
     query = torch.empty(rows, 4, 128, device=device, dtype=torch.bfloat16)
-    key_cache = torch.empty(pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
-    page_table = torch.arange(pages, device=device, dtype=torch.int32).unsqueeze(0)
+    key_cache = torch.empty(
+        pages * 64,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.arange(
+        pages,
+        device=device,
+        dtype=torch.int32,
+    ).unsqueeze(
+        0,
+    )
     request_indices = torch.zeros(rows, device=device, dtype=torch.int32)
-    complete_blocks = torch.full((rows,), pages * 64, device=device, dtype=torch.int32)
+    complete_blocks = torch.full(
+        (rows,),
+        pages * 64,
+        device=device,
+        dtype=torch.int32,
+    )
 
     assert (
         can_use_cute_dsl_qwen4_exp_qsa_block_topk(
@@ -147,7 +182,10 @@ def _assert_matches_reference(
         rtol=1e-5,
         atol=1e-4,
     )
-    expected_count = complete_blocks.clamp(0, min(scores.shape[1], block_topk)).long()
+    expected_count = complete_blocks.clamp(
+        0,
+        min(scores.shape[1], block_topk),
+    ).long()
     torch.testing.assert_close((selected >= 0).sum(dim=1), expected_count)
     assert bool((selected >= -1).all())
     assert bool(((selected < complete_blocks[:, None]) | (selected < 0)).all())
@@ -164,9 +202,21 @@ def _assert_matches_reference(
     [
         pytest.param([129], 9, True, "prefill", id="uniform-prefill-tail"),
         pytest.param([65, 65], 64, True, "dense", id="uniform-dense-tails"),
-        pytest.param([67, 67], 129, True, "overlap", id="uniform-overlap-tails"),
+        pytest.param(
+            [67, 67],
+            129,
+            True,
+            "overlap",
+            id="uniform-overlap-tails",
+        ),
         pytest.param([1] * 129, 9, True, "prefill", id="uniform-singletons"),
-        pytest.param([3, 61, 67, 7, 1], 9, False, "prefill", id="ragged-prefill"),
+        pytest.param(
+            [3, 61, 67, 7, 1],
+            9,
+            False,
+            "prefill",
+            id="ragged-prefill",
+        ),
         pytest.param([65, 72, 9], 64, False, "dense", id="ragged-dense"),
         pytest.param([127, 1, 9], 129, False, "overlap", id="ragged-overlap"),
         pytest.param(
@@ -180,15 +230,32 @@ def test_stream_topk_request_tails_and_ragged_graph_replay(
     torch.manual_seed(163)
     rows = sum(lengths)
     capacity = pages * 64
-    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    query = torch.randn(
+        rows,
+        5,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )[:, :4]
     keys = torch.randn(
-        (len(lengths) * pages + 1) * 64, 1, 128, device=device, dtype=torch.bfloat16
+        (len(lengths) * pages + 1) * 64,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
     )
     keys[:64].fill_(float("nan"))
-    table = torch.empty((len(lengths), pages + 3), device=device, dtype=torch.int32)
+    table = torch.empty(
+        (len(lengths), pages + 3),
+        device=device,
+        dtype=torch.int32,
+    )
     table = table[:, :pages]
     table.copy_(
-        torch.randperm(len(lengths) * pages, device=device).reshape(len(lengths), pages)
+        torch.randperm(len(lengths) * pages, device=device).reshape(
+            len(lengths),
+            pages,
+        )
         + 1
     )
     original_requests = torch.arange(
@@ -226,7 +293,16 @@ def test_stream_topk_request_tails_and_ragged_graph_replay(
         enable_pdl,
         config,
     ) in stream_topk._COMPILED
-    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+    _assert_matches_reference(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        selected,
+        64,
+        512,
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         selected = invoke()
@@ -250,7 +326,11 @@ def test_stream_topk_request_tails_and_ragged_graph_replay(
 
 
 @pytest.mark.parametrize("uniform", [False, True])
-def test_stream_topk_grouped_tails_reuse_compilation(device, monkeypatch, uniform):
+def test_stream_topk_grouped_tails_reuse_compilation(
+    device,
+    monkeypatch,
+    uniform,
+):
     monkeypatch.setattr(stream_topk, "_COMPILED", {})
     compile_count = 0
     original_compile = stream_topk._compile
@@ -272,10 +352,20 @@ def test_stream_topk_grouped_tails_reuse_compilation(device, monkeypatch, unifor
         query = torch.randn(rows, 5, 256, device=device, dtype=torch.bfloat16)[
             :, :4, :128
         ]
-        keys = torch.randn(pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
-        table = torch.arange(pages, device=device, dtype=torch.int32)[None].repeat(
-            len(lengths), 1
+        keys = torch.randn(
+            pages * 64,
+            1,
+            128,
+            device=device,
+            dtype=torch.bfloat16,
         )
+        table = torch.arange(
+            pages,
+            device=device,
+            dtype=torch.int32,
+        )[
+            None
+        ].repeat(len(lengths), 1)
         requests = torch.arange(
             len(lengths), device=device, dtype=torch.int32
         ).repeat_interleave(torch.tensor(lengths, device=device))
@@ -354,9 +444,19 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
         if small_grid:
             rows = width * (2 + i % 3)
         query = torch.randn(
-            rows, storage_heads, storage_dim, device=device, dtype=torch.bfloat16
+            rows,
+            storage_heads,
+            storage_dim,
+            device=device,
+            dtype=torch.bfloat16,
         )[:, :4, :128]
-        keys = torch.randn(pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
+        keys = torch.randn(
+            pages * 64,
+            1,
+            128,
+            device=device,
+            dtype=torch.bfloat16,
+        )
         table_storage = torch.stack(
             [torch.randperm(pages, device=device) for _ in range(rows // width)]
         ).to(torch.int32)
@@ -372,7 +472,9 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
         requests = torch.arange(
             rows // width, device=device, dtype=torch.int64
         ).repeat_interleave(width)
-        complete = torch.linspace(0, pages * 64, rows, device=device).to(torch.int32)
+        complete = torch.linspace(0, pages * 64, rows, device=device).to(
+            torch.int32,
+        )
         assert can_use_cute_dsl_qwen4_exp_qsa_block_topk(
             query,
             keys,
@@ -485,9 +587,19 @@ def test_cute_dsl_qsa_stream_topk_matches_reference(
     key_cache = torch.randn(
         pages * page_size, 1, head_dim, device=device, dtype=torch.bfloat16
     )
-    page_table = torch.randperm(pages, device=device).to(torch.int32).unsqueeze(0)
+    page_table = (
+        torch.randperm(pages, device=device)
+        .to(torch.int32)
+        .unsqueeze(
+            0,
+        )
+    )
     request_indices = torch.zeros(rows, device=device, dtype=torch.int64)
-    complete_blocks = torch.tensor(complete_counts, device=device, dtype=torch.int32)
+    complete_blocks = torch.tensor(
+        complete_counts,
+        device=device,
+        dtype=torch.int32,
+    )
 
     if direct:
         selected = cute_dsl_qsa_stream_topk(
@@ -532,7 +644,8 @@ def test_cute_dsl_qsa_stream_topk_matches_reference(
 
 
 @pytest.mark.parametrize(
-    ("queries_per_request", "pages"), [(8, 65), (136, 32), (136, 64), (136, 128)]
+    ("queries_per_request", "pages"),
+    [(8, 65), (136, 32), (136, 64), (136, 128)],
 )
 def test_cute_dsl_qsa_stream_topk_keeps_groups_within_requests(
     device: str,
@@ -558,7 +671,11 @@ def test_cute_dsl_qsa_stream_topk_keeps_groups_within_requests(
     second_pages = torch.arange(
         2 * pages - 1, pages - 1, -1, device=device, dtype=torch.int32
     )
-    page_table = torch.empty((2, 1025), device=device, dtype=torch.int32)[:, :pages]
+    page_table = torch.empty(
+        (2, 1025),
+        device=device,
+        dtype=torch.int32,
+    )[:, :pages]
     page_table.copy_(torch.stack((first_pages, second_pages)))
     request_indices = torch.arange(
         2, device=device, dtype=torch.int32
@@ -605,11 +722,23 @@ def test_cute_dsl_qsa_stream_topk_multitile_ties_are_unique(
 
     rows, heads, head_dim = 8, 4, 128
     page_size, pages, block_topk = 64, 193, 512
-    query = torch.zeros(rows, heads, head_dim, device=device, dtype=torch.bfloat16)
+    query = torch.zeros(
+        rows,
+        heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     key_cache = torch.zeros(
         pages * page_size, 1, head_dim, device=device, dtype=torch.bfloat16
     )
-    page_table = torch.randperm(pages, device=device).to(torch.int32).unsqueeze(0)
+    page_table = (
+        torch.randperm(pages, device=device)
+        .to(torch.int32)
+        .unsqueeze(
+            0,
+        )
+    )
     request_indices = torch.zeros(rows, device=device, dtype=torch.int64)
     complete_blocks = torch.full(
         (rows,), pages * page_size, device=device, dtype=torch.int32
@@ -640,12 +769,24 @@ def test_cute_dsl_qsa_stream_topk_mixes_compact_and_full_refinement(
     torch.manual_seed(109)
     rows, heads, head_dim = 8, 4, 128
     page_size, pages, block_topk = 64, 128, 512
-    query = torch.randn(rows, heads, head_dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(
+        rows,
+        heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     query[0].zero_()
     key_cache = torch.randn(
         pages * page_size, 1, head_dim, device=device, dtype=torch.bfloat16
     )
-    page_table = torch.randperm(pages, device=device).to(torch.int32).unsqueeze(0)
+    page_table = (
+        torch.randperm(pages, device=device)
+        .to(torch.int32)
+        .unsqueeze(
+            0,
+        )
+    )
     request_indices = torch.zeros(rows, device=device, dtype=torch.int32)
     complete_blocks = torch.full(
         (rows,), pages * page_size, device=device, dtype=torch.int32
@@ -686,18 +827,32 @@ def test_cute_dsl_qsa_stream_topk_graph_refreshes_mixed_frontiers(
 
     torch.manual_seed(127)
     rows, width, pages = 16, 8, 129
-    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    query = torch.randn(
+        rows,
+        5,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )[:, :4]
     query[::3].zero_()
-    keys = torch.randn(2 * pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(
+        2 * pages * 64,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     table = torch.stack(
         (
             torch.randperm(pages, device=device),
             torch.randperm(pages, device=device) + pages,
         )
     ).to(torch.int32)
-    requests = torch.arange(2, device=device, dtype=torch.int32).repeat_interleave(
-        width
-    )
+    requests = torch.arange(
+        2,
+        device=device,
+        dtype=torch.int32,
+    ).repeat_interleave(width)
     complete = torch.full((rows,), pages * 64, device=device, dtype=torch.int32)
 
     def invoke() -> torch.Tensor:
@@ -726,7 +881,9 @@ def test_cute_dsl_qsa_stream_topk_graph_refreshes_mixed_frontiers(
         [0, 1, 63, 64, 255, 511, 512, 0],
         [0] * width,
     ):
-        complete.copy_(torch.tensor(counts * 2, device=device, dtype=torch.int32))
+        complete.copy_(
+            torch.tensor(counts * 2, device=device, dtype=torch.int32),
+        )
         graph.replay()
         _assert_matches_reference(
             query, keys, table, requests, complete, selected, 64, 512
@@ -738,11 +895,17 @@ def test_cute_dsl_qsa_stream_topk_overlap_graph_refreshes_candidates(
     device: str,
     enable_pdl: bool,
 ) -> None:
-    """Refresh frontiers while the two producer halves progress independently."""
+    """Refresh frontiers while producer halves progress independently."""
 
     torch.manual_seed(131)
     rows, width, pages = 136, 8, 129
-    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    query = torch.randn(
+        rows,
+        5,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )[:, :4]
     query[::3].zero_()
     requests_count = rows // width
     keys = torch.randn(
@@ -795,7 +958,11 @@ def test_cute_dsl_qsa_stream_topk_overlap_graph_refreshes_candidates(
         [0] * width,
     ):
         complete.copy_(
-            torch.tensor(counts * requests_count, device=device, dtype=torch.int32)
+            torch.tensor(
+                counts * requests_count,
+                device=device,
+                dtype=torch.int32,
+            )
         )
         graph.replay()
         _assert_matches_reference(
@@ -813,7 +980,13 @@ def test_cute_dsl_qsa_stream_topk_prefill_graph_without_global_partial(
 
     torch.manual_seed(131)
     rows, capacity_pages, page_size, block_topk = 16384, 1024, 64, 512
-    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    query = torch.randn(
+        rows,
+        5,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )[:, :4]
     query[::257].zero_()
     keys = torch.randn(
         capacity_pages * page_size, 1, 128, device=device, dtype=torch.bfloat16
@@ -890,7 +1063,9 @@ def test_cute_dsl_qsa_stream_topk_prefill_graph_without_global_partial(
         )
         assert bool(((selected < complete[:, None]) | (selected < 0)).all())
         ordered = selected.sort(dim=1).values
-        assert bool(((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] < 0)).all())
+        assert bool(
+            ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] < 0)).all(),
+        )
 
 
 # Request dtype and PDL do not change pruning, and their kernels are checked elsewhere.
@@ -925,8 +1100,20 @@ def test_stream_topk_graph_refreshes_pruning_and_full_refinement(
 
     torch.manual_seed(149)
     capacity = pages * 64
-    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
-    keys = torch.randn((pages + 1) * 64, 1, 128, device=device, dtype=torch.bfloat16)
+    query = torch.randn(
+        rows,
+        5,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )[:, :4]
+    keys = torch.randn(
+        (pages + 1) * 64,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     table = torch.arange(1, pages + 1, device=device, dtype=torch.int32)[None]
     requests = torch.zeros(rows, device=device, dtype=request_dtype)
     complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
@@ -994,10 +1181,21 @@ def test_stream_topk_graph_refreshes_pruning_and_full_refinement(
             torch.testing.assert_close(
                 (selected >= 0).sum(1), complete.clamp(0, 512).long()
             )
-            assert bool(((selected < complete[:, None]) | (selected == -1)).all())
+            assert bool(
+                ((selected < complete[:, None]) | (selected == -1)).all(),
+            )
             ordered = selected.sort(dim=1).values
             assert bool(
-                ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)).all()
+                (
+                    (
+                        ordered[:, 1:]
+                        != ordered[
+                            :,
+                            :-1,
+                        ]
+                    )
+                    | (ordered[:, 1:] == -1)
+                ).all()
             )
 
 
@@ -1029,11 +1227,25 @@ def test_stream_topk_small_shapes_reuse_capacity_buckets(
         )
     )
     for rows, pages in layouts:
-        query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
-        keys = torch.randn(pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
+        query = torch.randn(
+            rows,
+            5,
+            128,
+            device=device,
+            dtype=torch.bfloat16,
+        )[:, :4]
+        keys = torch.randn(
+            pages * 64,
+            1,
+            128,
+            device=device,
+            dtype=torch.bfloat16,
+        )
         table = torch.randperm(pages, device=device).to(torch.int32)[None]
         requests = torch.zeros(rows, device=device, dtype=torch.int32)
-        complete = torch.linspace(513, pages * 64, rows, device=device).to(torch.int32)
+        complete = torch.linspace(513, pages * 64, rows, device=device).to(
+            torch.int32,
+        )
         selected = cute_dsl_qsa_stream_topk(
             query,
             keys,
@@ -1094,7 +1306,14 @@ def test_stream_topk_startup_warms_algorithm_and_capacity_buckets(
             requests = torch.zeros(rows, device=device, dtype=torch.int32)
             request_count = 1
         else:
-            requests = torch.arange(rows, device=device, dtype=torch.int32) // width
+            requests = (
+                torch.arange(
+                    rows,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                // width
+            )
             request_count = rows // width
         complete = torch.linspace(0, pages * 64, rows, device=device).int()
         if rows == 1:
@@ -1122,7 +1341,8 @@ def test_stream_topk_startup_warms_algorithm_and_capacity_buckets(
 
     # A tiny auto-path startup can use logits even though later grouped
     # prefill calls use stream kernels without any global scratch.
-    # The logits startup uses its portable selector; this test targets CuTe warmup.
+    # The logits startup uses its portable selector; this test targets CuTe
+    # warmup.
     with (
         kernel_warmup(enabled=True),
         kernel_override("attention", "qsa_block_topk_select", "triton"),
@@ -1138,7 +1358,13 @@ def test_stream_topk_startup_warms_algorithm_and_capacity_buckets(
     # independently of the representative shapes chosen by warmup.
     layouts = [(rows, None) for rows in range(1, 257)]
     layouts.extend(
-        (rows, width) for width in range(1, 257) for rows in range(width, 257, width)
+        (rows, width)
+        for width in range(1, 257)
+        for rows in range(
+            width,
+            257,
+            width,
+        )
     )
     configurations = {}
     for pages in range(1, table_storage.shape[1] + 1):
@@ -1152,7 +1378,12 @@ def test_stream_topk_startup_warms_algorithm_and_capacity_buckets(
         values = inputs(rows, pages, width)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            selected = forward(values, width, path="stream", solution="cute_dsl")
+            selected = forward(
+                values,
+                width,
+                path="stream",
+                solution="cute_dsl",
+            )
         assert stream_topk._COMPILED == compiled
         graph.replay()
         query, table, requests, complete = values
@@ -1173,7 +1404,10 @@ def test_stream_topk_startup_warms_algorithm_and_capacity_buckets(
 
 
 @pytest.mark.parametrize("override_source", ["context", "environment"])
-@pytest.mark.parametrize("entry", ["auto-logits", "auto-stream", "stream", "direct"])
+@pytest.mark.parametrize(
+    "entry",
+    ["auto-logits", "auto-stream", "stream", "direct"],
+)
 def test_stream_topk_startup_respects_kernel_override(
     device, monkeypatch, override_source, entry
 ):
@@ -1200,11 +1434,16 @@ def test_stream_topk_startup_respects_kernel_override(
     )
     if override_source == "environment":
         monkeypatch.setenv(
-            "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_QSA_BLOCK_TOPK_STREAM", "triton"
+            "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_QSA_BLOCK_TOPK_STREAM",
+            "triton",
         )
         context = nullcontext()
     else:
-        context = kernel_override("attention", "qsa_block_topk_stream", "triton")
+        context = kernel_override(
+            "attention",
+            "qsa_block_topk_stream",
+            "triton",
+        )
     with (
         context,
         kernel_override("attention", "qsa_block_scores", "triton"),
@@ -1226,7 +1465,16 @@ def test_stream_topk_startup_respects_kernel_override(
                 max_logits_bytes=0 if entry == "auto-stream" else 256 << 20,
                 **kwargs,
             )
-    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+    _assert_matches_reference(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        selected,
+        64,
+        512,
+    )
     assert not stream_topk._COMPILED
     assert not stream_topk._WARMED
 
@@ -1284,7 +1532,14 @@ def test_stream_topk_startup_warms_override_with_conflicting_solution(
                 max_logits_bytes=256 << 20,
                 **kwargs,
             )
-        return qsa_block_topk_stream(query, keys, table, requests, complete, **kwargs)
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            **kwargs,
+        )
 
     with context:
         with kernel_warmup(enabled=True):
@@ -1339,7 +1594,7 @@ def test_stream_topk_graph_preserves_ids_above_65535(
     pages: int,
     enable_pdl: bool,
 ) -> None:
-    """MTP padding must neither wrap high ids nor hide them after graph capture."""
+    """MTP padding preserves high IDs through Graph capture."""
 
     capacity = pages * 64
     query = torch.ones(rows, 4, 128, device=device, dtype=torch.bfloat16)
@@ -1377,7 +1632,14 @@ def test_stream_topk_graph_preserves_ids_above_65535(
         complete.fill_(frontier)
         graph.replay()
         _assert_matches_reference(
-            query[:2], keys, table, requests[:2], complete[:2], selected[:2], 64, 512
+            query[:2],
+            keys,
+            table,
+            requests[:2],
+            complete[:2],
+            selected[:2],
+            64,
+            512,
         )
         torch.testing.assert_close(
             (selected >= 0).sum(1), complete.clamp(0, 512).long()
@@ -1394,7 +1656,10 @@ def test_stream_topk_graph_preserves_ids_above_65535(
             torch.tensor(counts * (rows // 8), device=device, dtype=torch.int32)
         )
         graph.replay()
-        sampled_rows = torch.tensor([0, 3, 4, 7, rows - 4, rows - 1], device=device)
+        sampled_rows = torch.tensor(
+            [0, 3, 4, 7, rows - 4, rows - 1],
+            device=device,
+        )
         _assert_matches_reference(
             query[sampled_rows],
             keys,
@@ -1424,7 +1689,10 @@ def test_stream_topk_graph_preserves_ids_above_65535(
     )
 
 
-@pytest.mark.parametrize(("rows", "pages", "width"), [(8, 128, 1), (64, 1024, 64)])
+@pytest.mark.parametrize(
+    ("rows", "pages", "width"),
+    [(8, 128, 1), (64, 1024, 64)],
+)
 def test_stream_topk_respects_global_workspace_budget(
     device: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1437,7 +1705,12 @@ def test_stream_topk_respects_global_workspace_budget(
     table = torch.arange(pages, device=device, dtype=torch.int32)[None]
     requests = torch.zeros(rows, device=device, dtype=torch.int32)
     complete = torch.full((rows,), pages * 64, device=device, dtype=torch.int32)
-    config = stream_topk._configuration(rows, pages * 64, width, 32 * 1024 * 1024)
+    config = stream_topk._configuration(
+        rows,
+        pages * 64,
+        width,
+        32 * 1024 * 1024,
+    )
     required = stream_topk._workspace_bytes(rows, config)
     allocations = []
     original_empty = torch.empty
@@ -1482,7 +1755,13 @@ def test_stream_topk_respects_global_workspace_budget(
             enable_pdl=False,
         )
         torch.cuda.synchronize()
-        assert sum(allocations) - selected.numel() * selected.element_size() <= budget
+        assert (
+            sum(
+                allocations,
+            )
+            - selected.numel() * selected.element_size()
+            <= budget
+        )
         _assert_matches_reference(
             query, keys, table, requests, complete, selected, 64, 512
         )
@@ -1535,11 +1814,17 @@ def test_stream_topk_short_frontier_preserves_output_bounds(
 def test_stream_topk_request_tails(
     device: str, pages: int, remainder: int, enable_pdl: bool
 ) -> None:
-    """Partial groups must not read/write the following request or tensor end."""
+    """Partial groups stay inside the request and tensor bounds."""
     torch.manual_seed(317)
     width, requests_count = 16 + remainder, 9
     rows, capacity = width * requests_count, pages * 64
-    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    query = torch.randn(
+        rows,
+        5,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )[:, :4]
     keys = torch.randn(capacity, 1, 128, device=device, dtype=query.dtype)
     table = torch.stack(
         [torch.randperm(pages, device=device) for _ in range(requests_count)]
@@ -1547,7 +1832,9 @@ def test_stream_topk_request_tails(
     requests = torch.arange(requests_count, device=device, dtype=torch.int32)
     requests = requests.repeat_interleave(width)
     frontiers = torch.tensor(
-        [0, 1, 511, 512, 513, capacity - 1, capacity], device=device, dtype=torch.int32
+        [0, 1, 511, 512, 513, capacity - 1, capacity],
+        device=device,
+        dtype=torch.int32,
     )
     complete = frontiers[torch.arange(rows, device=device) % frontiers.numel()]
     complete[:width] = 0
@@ -1596,7 +1883,16 @@ def test_stream_topk_request_tails(
         assert bool(((selected < complete[:, None]) | (selected < 0)).all())
         ordered = selected.sort(1).values
         assert bool(
-            ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, :-1] == -1)).all()
+            (
+                (
+                    ordered[:, 1:]
+                    != ordered[
+                        :,
+                        :-1,
+                    ]
+                )
+                | (ordered[:, :-1] == -1)
+            ).all()
         )
         _assert_matches_reference(
             query[sample],
@@ -1619,11 +1915,16 @@ def test_stream_topk_split_request_tails(device: str, remainder: int) -> None:
     query = torch.randn(rows, 4, 128, device=device, dtype=torch.bfloat16)
     keys = torch.randn(capacity, 1, 128, device=device, dtype=query.dtype)
     table = torch.stack(
-        [torch.randperm(pages, device=device), torch.randperm(pages, device=device)]
+        [
+            torch.randperm(pages, device=device),
+            torch.randperm(pages, device=device),
+        ]
     ).to(torch.int32)
-    requests = torch.arange(2, device=device, dtype=torch.int64).repeat_interleave(
-        width
-    )
+    requests = torch.arange(
+        2,
+        device=device,
+        dtype=torch.int64,
+    ).repeat_interleave(width)
     complete = torch.linspace(0, capacity, rows, device=device).to(torch.int32)
     selected = cute_dsl_qsa_stream_topk(
         query,
@@ -1641,5 +1942,503 @@ def test_stream_topk_split_request_tails(device: str, remainder: int) -> None:
     assert config is not None
     assert config.algorithm == "split"
     assert config.group_layout == "uniform"
-    assert (query.device.index, requests.dtype, True, config) in stream_topk._COMPILED
+    assert (
+        query.device.index,
+        requests.dtype,
+        True,
+        config,
+    ) in stream_topk._COMPILED
+    _assert_matches_reference(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        selected,
+        64,
+        512,
+    )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+def test_stream_topk_graph_switches_homogeneous_and_mixed_groups(
+    device: str, request_dtype: torch.dtype, enable_pdl: bool
+) -> None:
+    """One captured grid handles full groups, mixed owners and partial tails."""
+    torch.manual_seed(156)
+    rows, pages, requests = 31, 1024, 4
+    capacity = pages * 64
+    backing = torch.full(
+        (rows, 9, 128), float("nan"), device=device, dtype=torch.bfloat16
+    )
+    query = backing[:, :8:2]
+    query.normal_()
+    keys = torch.randn(
+        (requests * pages + 1) * 64,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    keys[:64].fill_(float("nan"))
+    table = torch.empty(requests, pages + 3, device=device, dtype=torch.int32)[
+        :, :pages
+    ]
+    physical = (
+        torch.randperm(requests * pages, device=device).view(
+            requests,
+            pages,
+        )
+        + 1
+    ).int()
+    table.copy_(physical)
+    index = torch.arange(rows, device=device)
+    patterns = (
+        index // 8,
+        torch.zeros_like(index),
+        index % requests,
+        (index // 3) % requests,
+        (index >= 7).long() + (index >= 19).long(),
+        (index * 3 + index // 5) % requests,
+        index // 8,
+        index.flip(0) // 8,
+    )
+    owners = patterns[0].to(request_dtype)
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+    frontiers = torch.tensor(
+        [0, 1, 511, 512, 513, 896, 1120, 65535, 65536, 90001],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            owners,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=None,
+            max_partial_bytes=0,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=enable_pdl,
+        )
+
+    _assert_matches_reference(
+        query,
+        keys,
+        table,
+        owners,
+        complete,
+        invoke(),
+        64,
+        512,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    for step, pattern in enumerate(patterns):
+        owners.copy_(pattern)
+        query.normal_()
+        if step in (1, 5):
+            query[::3].zero_()
+        table.copy_(physical.flip(1) if step % 2 else physical)
+        if step in (2, 6):
+            complete.copy_(frontiers[index % frontiers.numel()])
+        else:
+            complete.fill_(capacity)
+        graph.replay()
+        _assert_matches_reference(
+            query, keys, table, owners, complete, selected, 64, 512
+        )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_stream_topk_ragged_tmem_lifetime_under_occupancy_pressure(
+    device: str, enable_pdl: bool
+) -> None:
+    """TMEM survives eight request segments per CTA with more CTAs than SMs."""
+    torch.manual_seed(2821)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    rows, pages, requests = 8 * (2 * sm_count + 1) + 3, 129, 4
+    capacity = pages * 64
+    query = torch.randn(rows, 4, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(requests * capacity, 1, 128, device=device, dtype=query.dtype)
+    table = torch.randperm(requests * pages, device=device).int().view(requests, pages)
+    index = torch.arange(rows, device=device)
+    owners = (index % requests).int()
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            owners,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=None,
+            max_partial_bytes=0,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=enable_pdl,
+        )
+
+    # Check complete windows and the final three-row window independently.
+    sample = torch.cat((index[:16], index[-16:]))
+    selected = invoke()
+    _assert_matches_reference(
+        query[sample],
+        keys,
+        table,
+        owners[sample],
+        complete[sample],
+        selected[sample],
+        64,
+        512,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    for step in range(4):
+        # Switch between single-owner windows, short runs and per-row changes.
+        run_width = (8, 3, 1, 1)[step]
+        owners.copy_((index // run_width + step) % requests)
+        complete.fill_(capacity)
+        complete[step::11] = 0
+        query.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            (selected >= 0).sum(1), complete.clamp(max=512).long()
+        )
+        _assert_matches_reference(
+            query[sample],
+            keys,
+            table,
+            owners[sample],
+            complete[sample],
+            selected[sample],
+            64,
+            512,
+        )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("uniform", [False, True])
+@pytest.mark.parametrize("pages", [1024, 2048])
+def test_stream_topk_long_dense_score_refinement(
+    device: str, pages: int, uniform: bool, enable_pdl: bool
+) -> None:
+    """Dense scores cross score-queue and 64K offset boundaries after replay."""
+    rows, requests = 16, 2
+    capacity = pages * 64
+    query = torch.zeros(
+        rows,
+        9,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )[:, :8:2]
+    query[:, 0, 0] = 1
+    keys = torch.zeros(
+        (requests * pages + 1) * 64,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    keys[:64].fill_(float("nan"))
+    table = (
+        torch.randperm(requests * pages, device=device)
+        .view(
+            requests,
+            pages,
+        )
+        .int()
+        + 1
+    )
+    owners = torch.arange(rows, device=device, dtype=torch.int64) // 8
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+    slots = (
+        table.long()[:, :, None] * 64
+        + torch.arange(
+            64,
+            device=device,
+        )
+    ).flatten()
+    increasing = torch.arange(capacity, device=device, dtype=torch.float32)
+    distributions = (
+        increasing,
+        increasing.flip(0),
+        torch.zeros_like(increasing),
+        torch.ones_like(increasing),
+    )
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            owners,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=8 if uniform else None,
+            max_partial_bytes=0,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=enable_pdl,
+        )
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    for step, values in enumerate(distributions):
+        keys[slots, 0, 0] = values.repeat(requests).to(torch.bfloat16)
+        complete.fill_(capacity)
+        if step == 2:
+            start = min(capacity - 512, 90000)
+            logical = torch.arange(start, start + 512, device=device)
+            peaks = (
+                table[
+                    :,
+                    logical // 64,
+                ].long()
+                * 64
+                + logical % 64
+            ).flatten()
+            keys[peaks, 0, 0] = 100
+        elif step == 3:
+            complete[::2] = 65536
+        graph.replay()
+        _assert_matches_reference(
+            query, keys, table, owners, complete, selected, 64, 512
+        )
+
+
+@pytest.mark.parametrize(
+    ("rows", "pages", "width"),
+    [
+        pytest.param(3, 64, 1, id="small"),
+        pytest.param(3, 128, 1, id="guarded-small"),
+        pytest.param(136, 128, 1, id="overlap"),
+        pytest.param(136, 32, 136, id="prefill"),
+        pytest.param(136, 64, 136, id="dense"),
+        pytest.param(16, 256, 8, id="split"),
+    ],
+)
+def test_stream_topk_query_row_offset_exceeds_int32(
+    device: str,
+    rows: int,
+    pages: int,
+    width: int,
+) -> None:
+    """Every algorithm reads large-stride queries eagerly and in graph replay."""
+    stride = ((1 << 31) // (rows - 1) + 127) // 128 * 128 + 128
+    storage = torch.empty(
+        (rows - 1) * stride + 512,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    query = storage.as_strided((rows, 4, 128), (stride, 128, 1))
+    query.normal_()
+    capacity = pages * 64
+    keys = torch.randn(capacity, 1, 128, device=device, dtype=torch.bfloat16)
+    table = torch.randperm(pages, device=device).int()[None]
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=32 * 1024 * 1024,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=False,
+        )
+
+    selected = invoke()
+    _assert_matches_reference(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        selected,
+        64,
+        512,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    query.normal_()
+    complete[::2] = 513
+    graph.replay()
     _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+
+
+@pytest.mark.parametrize("pages", [32, 128])
+def test_stream_topk_key_offset_exceeds_int32(device: str, pages: int) -> None:
+    """Both asynchronous copy paths read far pages without int32 wrapping."""
+    torch.manual_seed(2822)
+    rows, page_size = 8, 64
+    first_page = (1 << 31) // (page_size * 128)
+    capacity = pages * page_size
+    # Allocate the address range but initialize and read only its last pages.
+    keys = torch.empty(
+        (first_page + pages) * page_size,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    keys[first_page * page_size :].normal_()
+    table = (torch.randperm(pages, device=device) + first_page).int()[None]
+    query = torch.randn(rows, 4, 128, device=device, dtype=keys.dtype)
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=page_size,
+            block_topk=512,
+            queries_per_request=rows,
+            max_partial_bytes=0,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=False,
+        )
+
+    selected = invoke()
+    _assert_matches_reference(
+        query, keys, table, requests, complete, selected, page_size, 512
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    table.copy_(table.flip(1))
+    graph.replay()
+    _assert_matches_reference(
+        query, keys, table, requests, complete, selected, page_size, 512
+    )
+
+
+# One layout per score kernel: prefill, dense and overlap take more than 128
+# rows; split, native and both guarded small-grid scorers (with their merges)
+# take fewer.
+_FAR_OFFSET_LAYOUTS = [
+    pytest.param(136, 32, None, "prefill", 0, id="prefill"),
+    pytest.param(136, 64, None, "dense", 0, id="dense"),
+    pytest.param(136, 128, None, "overlap", 0, id="overlap"),
+    pytest.param(8, 256, 8, "split", 0, id="split"),
+    pytest.param(9, 32, None, "small", 0, id="small"),
+    pytest.param(3, 128, None, "small", 16, id="guarded"),
+    pytest.param(3, 256, None, "small", 8, id="guarded-compact"),
+]
+
+
+def _far_offset_topk(
+    query: torch.Tensor, keys: torch.Tensor, table: torch.Tensor, width: int | None
+) -> None:
+    requests = torch.zeros(query.shape[0], device=query.device, dtype=torch.int32)
+    complete = torch.full_like(requests, table.shape[1] * 64)
+
+    def invoke() -> torch.Tensor:
+        return cute_dsl_qsa_stream_topk(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=32 << 20,
+            enable_pdl=False,
+        )
+
+    selected = invoke()
+    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    query.normal_()
+    table.copy_(table.flip(1))
+    complete[::2] = 513
+    graph.replay()
+    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+
+
+@pytest.mark.parametrize(
+    ("rows", "pages", "width", "algorithm", "keep"), _FAR_OFFSET_LAYOUTS
+)
+def test_stream_topk_key_offsets_exceed_int32(
+    device: str, rows: int, pages: int, width: int | None, algorithm: str, keep: int
+) -> None:
+    """Keys whose element offsets pass 2**31 are read from the far pool end."""
+    # Local import: test_qsa_cute_dsl_barriers imports this module in a
+    # subprocess that does not have the test directory on sys.path.
+    from utils import move_pages_past_int32
+
+    torch.manual_seed(337)
+    config = stream_topk._configuration(rows, pages * 64, width, 32 << 20)
+    assert (config.algorithm, config.keep) == (algorithm, keep)
+    query = torch.randn(rows, 4, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(pages, 64, 1, 128, device=device, dtype=torch.bfloat16)
+    table = torch.randperm(pages, device=device).to(torch.int32)[None]
+    (pool,), table = move_pages_past_int32((keys,), table)
+    # Every table page starts past 2**31 elements; slot ids still fit int32.
+    assert int(table.min()) * 64 * 128 > 2**31
+    _far_offset_topk(query, pool.view(-1, 1, 128), table, width)
+
+
+@pytest.mark.parametrize("far_stride", ["row", "head"])
+@pytest.mark.parametrize(
+    ("rows", "pages", "width", "algorithm", "keep"), _FAR_OFFSET_LAYOUTS
+)
+def test_stream_topk_query_offsets_exceed_int32(
+    device: str,
+    rows: int,
+    pages: int,
+    width: int | None,
+    algorithm: str,
+    keep: int,
+    far_stride: str,
+) -> None:
+    """Query vectors past 2**31 elements are read from the far storage end."""
+    torch.manual_seed(347)
+    config = stream_topk._configuration(rows, pages * 64, width, 32 << 20)
+    assert (config.algorithm, config.keep) == (algorithm, keep)
+    # Each stride fits its int32 argument; only the last row (or the last
+    # head of every row, for head-major storage) starts past 2**31.
+    if far_stride == "row":
+        stride = (2**31 // (rows - 1) // 128 + 1) * 128
+        strides, size = (stride, 128, 1), (rows - 1) * stride + 512
+    else:
+        stride = (2**31 // 3 // 128 + 1) * 128
+        strides, size = (128, stride, 1), 3 * stride + rows * 128
+    assert (rows - 1) * strides[0] + 3 * strides[1] > 2**31 > max(strides)
+    storage = torch.empty(size, device=device, dtype=torch.bfloat16)
+    query = storage.as_strided((rows, 4, 128), strides)
+    query.normal_()
+    keys = torch.randn(pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
+    table = torch.randperm(pages, device=device).to(torch.int32)[None]
+    _far_offset_topk(query, keys, table, width)

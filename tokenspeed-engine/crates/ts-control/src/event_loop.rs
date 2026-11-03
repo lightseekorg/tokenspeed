@@ -59,7 +59,7 @@ use ts_metrics::{EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
-    Scheduler, StorageRound, StorageTickView,
+    Scheduler, SchedulerSizes, StorageRound, StorageTickView,
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
@@ -141,6 +141,40 @@ fn decode_rows(bytes: &[u8]) -> Option<Vec<Vec<i32>>> {
 
 /// How long an idle loop waits for a request before checking `stop` again.
 const IDLE_WAIT: Duration = Duration::from_millis(10);
+
+/// How long the scheduler's active page count is reused before it is taken
+/// again.
+const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
+
+/// The scheduler's active page count, as the load report, the metrics and
+/// the batch line read it. Taking it walks every live request's block
+/// tables, which at long contexts costs a round more than the rest of its
+/// work, so it is taken at most once per [`ACTIVE_PAGES_REFRESH`] -- the
+/// frontend considers a load report fresh for seconds -- and whenever the
+/// loop runs no request, when the walk costs nothing and an engine that went
+/// idle reports none active at once. A count taken while idle is not kept:
+/// the first round after requests arrive takes a new one, so an engine that
+/// just took a burst does not report none active for the next 100 ms.
+#[derive(Debug, Default)]
+struct ActivePages {
+    /// The last count taken while requests ran, and when.
+    taken: Option<(Instant, i32)>,
+}
+
+impl ActivePages {
+    /// The count at `now`: the last one while it is fresh and requests run,
+    /// else a new one from `take`.
+    fn read(&mut self, now: Instant, idle: bool, take: impl FnOnce() -> i32) -> i32 {
+        match self.taken {
+            Some((at, pages)) if !idle && now.duration_since(at) < ACTIVE_PAGES_REFRESH => pages,
+            _ => {
+                let pages = take();
+                self.taken = (!idle).then_some((now, pages));
+                pages
+            }
+        }
+    }
+}
 
 /// An admitted request on its way to the scheduler.
 struct Submission {
@@ -501,6 +535,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     last_load_report: Option<Instant>,
     /// Last load sent to the frontend, including rounds with no token output.
     reported_load: Option<Load>,
+    /// The scheduler's active page count, reused across rounds.
+    active_pages: ActivePages,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -555,6 +591,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             forward_allowed: true,
             last_load_report: None,
             reported_load: None,
+            active_pages: ActivePages::default(),
         }
     }
 
@@ -569,12 +606,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         self.ranks.replica.index() == 0
     }
 
+    /// The scheduler's active page count, at most [`ACTIVE_PAGES_REFRESH`]
+    /// old (see [`ActivePages`]).
+    fn active_pages(&mut self) -> i32 {
+        let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
+        self.active_pages
+            .read(Instant::now(), idle, || scheduler.active_lcm_blocks())
+    }
+
     fn idle(&self) -> bool {
+        // The scheduler's counts are a pass over its requests per state: ask
+        // for them only once the loop's own state says nothing runs.
+        if !self.in_flight.is_empty()
+            || self.cache_ops.open() != 0
+            || self.outputs.num_running() != 0
+        {
+            return false;
+        }
         let sizes = self.scheduler.sizes();
-        self.in_flight.is_empty()
-            && self.cache_ops.open() == 0
-            && self.outputs.num_running() == 0
-            && sizes.waiting == 0
+        sizes.waiting == 0
             && sizes.prefilling == 0
             && sizes.decoding == 0
             && sizes.retracted == 0
@@ -685,7 +735,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let load = Load {
                 num_running: self.outputs.num_running() as i64,
                 num_waiting: sizes.waiting as i64,
-                kv_active_pages: i64::from(sizes.active_lcm_blocks),
+                kv_active_pages: i64::from(self.active_pages()),
                 kv_total_pages: self.config.kv_total_pages,
                 kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
             };
@@ -744,6 +794,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
+        // The scheduler's counts as this round planned, for the metrics and
+        // the batch line: nothing between the two mutates the scheduler, so
+        // they are taken once, and only for a reader.
+        let mut planned_sizes: Option<SchedulerSizes> = None;
         if let Some(metrics) = &self.metrics {
             // A retraction victim's image store is the retraction signal.
             let retracted = cache_ops
@@ -756,14 +810,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             // A pre-dispatch snapshot: the running count still holds what
             // this round's commits end.
-            let sizes = self.scheduler.sizes();
+            let sizes = planned_sizes.insert(self.scheduler.sizes());
             let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
                 batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
             });
+            let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
+            let active_pages = self
+                .active_pages
+                .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
             metrics.record_scheduler_iteration(
                 self.outputs.num_running() as i64,
                 sizes.waiting as i64,
-                i64::from(sizes.active_lcm_blocks),
+                i64::from(active_pages),
                 self.config.kv_total_pages,
                 iteration_tokens,
             );
@@ -812,7 +870,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // empty plan per round and starve the device's own threads.
         let idle_forward = dp.as_ref().is_some_and(|dp| dp.idle_forward);
         if let Some(batch) = &forward {
-            self.log_dispatch(batch);
+            self.log_dispatch(batch, planned_sizes.as_ref());
             self.outputs.mark_scheduled(&batch.request_ids);
         }
         if let (Some(metrics), Some(batch)) = (&self.metrics, &forward) {
@@ -823,10 +881,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 }
             }
         }
+        let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
         if plan.needs_device() || idle_forward {
             if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
-                let batch = forward.clone().expect("a pending forward has a batch");
+                // The batch itself waits for its commit: nothing below reads it.
+                let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
                 self.in_flight.push_back((batch, input_logprobs, pending));
                 forwarded = true;
@@ -836,7 +896,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
         // Commit from the head once the queue exceeds the depth; a round with
         // no new work drains fully so results never wait on future traffic.
-        let depth = if forward.is_some() {
+        let depth = if has_forward {
             self.config.in_flight_depth
         } else {
             0
@@ -969,6 +1029,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// one: a prefill chunk that does not complete the
     /// prompt samples a token the commit discards.
     fn grammar_advance(&self, batch: &ForwardBatchView) -> Option<Vec<bool>> {
+        // Only an engine with a grammar backend gives requests grammars.
+        self.grammars.as_ref()?;
         let any = batch.request_ids.iter().any(|rid| {
             self.outputs
                 .state(rid)
@@ -2035,26 +2097,35 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// The batch line of a dispatched forward.
-    fn log_dispatch(&mut self, batch: &ForwardBatchView) {
-        let sizes = self.scheduler.sizes();
-        let active = i64::from(sizes.active_lcm_blocks);
-        let stats = RoundStats {
-            queued: sizes.waiting,
-            active_pages: active,
-            cached_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks) - active,
-            pd: [
-                sizes.bootstrapping,
-                sizes.prefilling,
-                sizes.remote_prefilling,
-                sizes.decoding,
-                sizes.pd_transfer,
-            ],
-        };
+    /// The batch line of a dispatched forward, from the scheduler's counts
+    /// as the round planned (`planned_sizes`, if the round took them).
+    fn log_dispatch(&mut self, batch: &ForwardBatchView, planned_sizes: Option<&SchedulerSizes>) {
         let (outputs, scheduler) = (&self.outputs, &self.scheduler);
+        let idle = outputs.num_running() == 0;
+        let active_pages = &mut self.active_pages;
+        let kv_total_pages = self.config.kv_total_pages;
         self.batch_logger.log_dispatch(
             batch,
-            &stats,
+            || {
+                let sizes = planned_sizes.cloned().unwrap_or_else(|| scheduler.sizes());
+                let active = i64::from(
+                    active_pages.read(Instant::now(), idle, || scheduler.active_lcm_blocks()),
+                );
+                // The active count may be a moment older than the empty one.
+                let resident = kv_total_pages - i64::from(sizes.empty_lcm_blocks);
+                RoundStats {
+                    queued: sizes.waiting,
+                    active_pages: active,
+                    cached_pages: (resident - active).max(0),
+                    pd: [
+                        sizes.bootstrapping,
+                        sizes.prefilling,
+                        sizes.remote_prefilling,
+                        sizes.decoding,
+                        sizes.pd_transfer,
+                    ],
+                }
+            },
             |rid| {
                 outputs
                     .state(rid)
@@ -2186,5 +2257,49 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             submissions.push(submission);
         }
         self.route(submissions, outputs, released)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_active_page_count_is_reused_while_fresh_and_requests_run() {
+        let mut active = ActivePages::default();
+        let start = Instant::now();
+        let mut walks = 0;
+        let mut read = |active: &mut ActivePages, after: Duration, idle: bool, live: i32| {
+            active.read(start + after, idle, || {
+                walks += 1;
+                live
+            })
+        };
+        assert_eq!(read(&mut active, Duration::ZERO, false, 7), 7);
+        // Fresh: the last count, though the scheduler's changed.
+        assert_eq!(read(&mut active, Duration::from_millis(99), false, 9), 7);
+        // Stale: taken again.
+        assert_eq!(read(&mut active, ACTIVE_PAGES_REFRESH, false, 9), 9);
+        // No request runs: taken at once, so an idle engine reports none.
+        assert_eq!(
+            read(
+                &mut active,
+                ACTIVE_PAGES_REFRESH + Duration::from_millis(1),
+                true,
+                0
+            ),
+            0
+        );
+        // Requests arrive: the idle count is not reused, though it is fresh.
+        assert_eq!(
+            read(
+                &mut active,
+                ACTIVE_PAGES_REFRESH + Duration::from_millis(2),
+                false,
+                5
+            ),
+            5
+        );
+        assert_eq!(walks, 4);
     }
 }

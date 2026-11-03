@@ -71,6 +71,17 @@ use ts_wire::EngineCoreReadyResponse;
 
 use crate::data_plane::PythonDataPlane;
 
+/// Rust's allocations go to mimalloc. The control thread allocates for every
+/// row of every round (scheduler events, outputs, the batches' columns); with
+/// glibc's allocator those allocations also contend with the forward thread's
+/// frees of the C++ plans the control thread built, as glibc returns a chunk
+/// to the arena that allocated it under that arena's lock. mimalloc frees
+/// across threads without one, and allocates small objects faster. Python,
+/// the C++ scheduler and the kernels keep the system allocator; nothing
+/// allocated on one side is freed on the other, as every boundary copies.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// How long the host waits for the frontend's INIT and for the other ranks
 /// to connect.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -358,6 +369,7 @@ impl HostConfig {
             limits: IngressLimits {
                 vocab_size: config.getattr("vocab_size")?.extract()?,
                 eos_token_ids: config.getattr("eos_token_ids")?.extract()?,
+                top_k_exclusive_max: config.getattr("top_k_exclusive_max")?.extract()?,
                 max_model_len: config.getattr("max_model_len")?.extract()?,
                 max_req_input_len: config.getattr("max_req_input_len")?.extract()?,
                 enable_output_logprobs: config

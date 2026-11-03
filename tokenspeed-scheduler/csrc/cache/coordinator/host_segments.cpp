@@ -256,10 +256,12 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                 "Host block bucket is outside the group's shard count");
         ++need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
     }
+    // Host rows land in their source's bucket: no dense blocks, no free-bucket pairs.
     const std::vector<std::int64_t> no_dense_need(groups_.size(), 0);
+    const std::vector<std::int64_t> no_pair_need(groups_.size(), 0);
     ShadowOccupancy shadow{*host_pool_, groups_};
     // Nothing is evicted while free capacity fits every segment.
-    if (shadow.Fits(need_by_bucket, no_dense_need)) {
+    if (shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
         return HostPlacementPlan{.num_placed = segments.size()};
     }
     // These snapshots and indexes live for one plan only. Allocate their
@@ -283,6 +285,22 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     };
     std::vector<Victim> victims;
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> taken{&scratch};
+    const CheckpointAging aging = CheckpointAgingFor(CacheTier::kHost);
+    // Aged checkpoints a taken descendant turned back into leaves.
+    std::pmr::unordered_set<const BoundaryTree::Node*> unaged{&scratch};
+    const auto taken_from_host = [&](const ContentHash& hash) {
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (!GroupIsState(i)) {
+                continue;
+            }
+            const auto entry =
+                groups_[i].Index().Inspect(*host_pool_, CacheKey{.group_id = groups_[i].Id(), .content_hash = hash});
+            if (entry && taken.contains(entry->location)) {
+                return true;
+            }
+        }
+        return false;
+    };
     // Per node, how many Host checkpoint boundaries at or under it a victim
     // takes.
     std::pmr::unordered_map<const BoundaryTree::Node*, std::int32_t> taken_checkpoint_boundary_counts{&scratch};
@@ -454,7 +472,8 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // superseded checkpoint boundary's Device copy, newest first, since the
     // Device keeps that one longest -- then the shallower boundary, keeping
     // the longer frontier as Device eviction does, then the candidate
-    // node's first Host entry.
+    // node's first Host entry. An aged Host-only checkpoint ranks as
+    // CheckpointAging says: the larger distance first, then the older.
     enum class VictimClass : std::uint8_t { kDead, kCoveredByDevice, kHostOnly };
     struct Candidate {
         const BoundaryTree::Node* candidate_node{nullptr};
@@ -462,15 +481,28 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         // The epoch above, complemented for kCoveredByDevice so its newest
         // goes first.
         std::uint64_t epoch_sort_key{0};
+        std::int32_t aged_distance{0};
+        // An aged checkpoint's own State epoch, which its rank at the cutoff
+        // hides; 0 otherwise.
+        std::uint64_t aged_epoch{0};
         std::int32_t boundary_tokens{0};
         CacheBlockLocation first_entry_location;
         HostEvictionCounts HostEvictionStats::*reason{nullptr};
     };
     const auto ranks_after = [](const Candidate& lhs, const Candidate& rhs) {
-        return std::tuple{lhs.victim_class, lhs.epoch_sort_key, lhs.boundary_tokens,
-                          lhs.first_entry_location.lcm_block_id, lhs.first_entry_location.slot_index} >
-               std::tuple{rhs.victim_class, rhs.epoch_sort_key, rhs.boundary_tokens,
-                          rhs.first_entry_location.lcm_block_id, rhs.first_entry_location.slot_index};
+        return std::tuple{lhs.victim_class,
+                          lhs.epoch_sort_key,
+                          -lhs.aged_distance,
+                          lhs.aged_epoch,
+                          lhs.boundary_tokens,
+                          lhs.first_entry_location.lcm_block_id,
+                          lhs.first_entry_location.slot_index} > std::tuple{rhs.victim_class,
+                                                                            rhs.epoch_sort_key,
+                                                                            -rhs.aged_distance,
+                                                                            rhs.aged_epoch,
+                                                                            rhs.boundary_tokens,
+                                                                            rhs.first_entry_location.lcm_block_id,
+                                                                            rhs.first_entry_location.slot_index};
     };
     std::priority_queue<Candidate, std::pmr::vector<Candidate>, decltype(ranks_after)> candidates{
         ranks_after, std::pmr::vector<Candidate>{&scratch}};
@@ -542,6 +574,13 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                 // checkpoint. Rank the State by its own accesses, so that KV
                 // traversal does not keep an unused checkpoint young.
                 candidate.epoch_sort_key = state_epoch;
+                if (aging.tree != nullptr && state_epoch >= aging.cutoff_epoch && !unaged.contains(&node)) {
+                    candidate.aged_distance = aging.tree->AgedDistance(*node.hash, CacheTier::kHost);
+                    if (candidate.aged_distance != 0) {
+                        candidate.epoch_sort_key = aging.cutoff_epoch;
+                        candidate.aged_epoch = state_epoch;
+                    }
+                }
             } else {
                 candidate.epoch_sort_key = *newest_epoch(*host_pool_, node, /*kv_only=*/false);
             }
@@ -578,7 +617,16 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // page by page would otherwise be walked once per page).
     std::pmr::unordered_set<const BoundaryTree::Node*> walked_by_taken_victims{&scratch};
     bool added_kv_duplicates = false;
-    while (!shadow.Fits(need_by_bucket, no_dense_need)) {
+    while (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
+        // Descendants taken in this plan can bring an aged checkpoint within
+        // the leaf distance, where it ranks by its own use.
+        while (!candidates.empty() && candidates.top().aged_distance != 0 &&
+               !aging.tree->StaysAged(*candidates.top().candidate_node->hash, CacheTier::kHost, taken_from_host)) {
+            const BoundaryTree::Node* node = candidates.top().candidate_node;
+            candidates.pop();
+            unaged.insert(node);
+            add_candidate(*node);
+        }
         // Existing dead and Device-covered segments retain their priority.
         // Reclaim safe duplicates before the only copy of a checkpoint,
         // including when the Device KV is no longer held by a request.
@@ -591,7 +639,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                     victim.reason = &HostEvictionStats::duplicate_kv;
                     victims.push_back(std::move(victim));
                 }
-                return !shadow.Fits(need_by_bucket, no_dense_need);
+                return !shadow.Fits(need_by_bucket, no_dense_need, no_pair_need);
             });
             added_kv_duplicates = true;
             continue;
@@ -757,7 +805,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     }
 
     // Whole segments go, the last first, while the rest cannot fit.
-    while (!shadow.Fits(need_by_bucket, no_dense_need)) {
+    while (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
         _assert(num_placed_segments > 0, "a batch without rows always fits");
         --num_placed_segments;
         const HostSegmentRows& dropped = segments[num_placed_segments];
@@ -777,7 +825,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         for (const auto& [group_id, location] : victim.members) {
             shadow.Restore(group_id, location);
         }
-        if (!shadow.Fits(need_by_bucket, no_dense_need)) {
+        if (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
             for (const auto& [group_id, location] : victim.members) {
                 shadow.Remove(group_id, location);
             }

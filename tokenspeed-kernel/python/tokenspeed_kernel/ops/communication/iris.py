@@ -55,13 +55,31 @@ def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None
 
     Args:
         heap_size: Initial heap capacity in bytes, or None for automatic sizing.
-        allocator_type: Iris allocator name, or None for ``vmem_chunked`` when a
-            gfx1250 job spans hosts and Iris's ``torch`` default otherwise. Iris's
+        allocator_type: Iris allocator name, or None for ``vmem_chunked`` when
+            the world spans hosts and Iris's ``torch`` default otherwise. Iris's
             ``IRIS_ALLOCATOR`` environment override retains its normal precedence.
     """
     from tokenspeed_kernel.ops.communication._iris import configure_iris as configure
 
     configure(heap_size=heap_size, allocator_type=allocator_type)
+
+
+def discover_iris_world() -> bool:
+    """Decide whether one Iris heap can map every world rank; every rank calls it.
+
+    Run it on AMD during distributed initialization: the first call is a world
+    collective, and later calls return the cached answer.
+    """
+    from tokenspeed_kernel.ops.communication._iris import discover_world
+
+    return discover_world()
+
+
+def iris_maps_world() -> bool | None:
+    """``discover_iris_world``'s cached answer, or None before it ran."""
+    from tokenspeed_kernel.ops.communication._iris import maps_world
+
+    return maps_world()
 
 
 def producer_direct_all_reduce_can_run(

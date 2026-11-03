@@ -61,6 +61,7 @@ global_server_args_dict: dict = {
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+    "chunk_prefill_kv_size": ServerArgs.chunk_prefill_kv_size,
     "mla_chunk_multiplier": ServerArgs.mla_chunk_multiplier,
     "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
     "init_expert_location": ServerArgs.init_expert_location,
@@ -126,6 +127,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
+            "chunk_prefill_kv_size": server_args.chunk_prefill_kv_size,
             "mla_chunk_multiplier": server_args.mla_chunk_multiplier,
             "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
             "init_expert_location": server_args.init_expert_location,
@@ -275,6 +277,8 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
+    # Scan scheduler page-table values against the supplied page-ID bounds.
+    TOKENSPEED_VALIDATE_PAGE_IDS = EnvBool(False)
     # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
     TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")

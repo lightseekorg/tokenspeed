@@ -59,6 +59,7 @@ from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slot
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.segmented_rmsnorm import segmented_rmsnorm
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -67,7 +68,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     absorb_mla_kv_b_proj,
 )
-from tokenspeed.runtime.models.dflash import DFlashMLP
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
@@ -235,9 +235,15 @@ class K3DSparkDecoderLayer(nn.Module):
         )
         self.layer_id = layer_id
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.mlp = DFlashMLP(
-            config=config,
-            mapping=mapping,
+        self.mlp = GatedMLP.tensor_parallel(
+            hidden_size=hidden_size,
+            intermediate_size=int(config.intermediate_size),
+            activation=gated_activation(getattr(config, "hidden_act", "silu")),
+            tp_rank=mapping.dense.tp_rank,
+            tp_size=mapping.dense.tp_size,
+            tp_group=mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )

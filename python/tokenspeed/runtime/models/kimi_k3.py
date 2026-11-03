@@ -203,7 +203,13 @@ from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
-    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoELayer
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
+        KimiK3DecodeAttentionLayer,
+        KimiK3DecodeMoELayer,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.attn_res.prepared import (
+        PreparedAttnRes,
+    )
 
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.multimodal.encoder_cudagraph import (
@@ -653,6 +659,17 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                     dim=-1,
                 )
                 gate = projection.gate
+        return self._project_query(hidden_states, q_a, latent_cache, gate, ctx)
+
+    def _project_query(
+        self,
+        hidden_states: torch.Tensor,
+        q_a: torch.Tensor,
+        latent_cache: torch.Tensor,
+        gate: torch.Tensor | None,
+        ctx: ForwardContext | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Normalize q_a and kv_a, then project the query (and absorbed query)."""
         kv_a = latent_cache[..., : self.kv_lora_rank]
         if q_a.shape[0] == 0:
             # Empty owners joined QKV but have no local norm or attention work.
@@ -785,6 +802,52 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             return mm(attn_output, self.o_proj.weight, bias=None, out=projection_out)
         output, _ = self.o_proj(attn_output, ctx=ctx)
         return output
+
+    def o_proj_input(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+        comm_manager,
+        *,
+        projection,
+    ) -> torch.Tensor:
+        """This rank's gated BF16 o-projection input [T, heads * 128] for T > 0.
+
+        Args:
+            positions: The token positions, passed to the attention core.
+            hidden_states: The attention input [T, hidden].
+            ctx: The forward context.
+            comm_manager: The layer's communication manager.
+            projection: Computes the packed [q_a | kv_a | gate] projection.
+        """
+        packed = comm_manager.pre_attn_comm(projection(hidden_states), ctx)
+        q_a, latent_cache, gate = packed.split(
+            [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self._gate_width,
+            ],
+            dim=-1,
+        )
+        q, latent_cache, gate, absorbed_query = self._project_query(
+            hidden_states, q_a, latent_cache, gate, ctx
+        )
+        fused = (
+            ctx.num_extends == 0
+            and ctx.attn_backend.supports_mla_projected_value_decode
+            and not self.o_proj.supports_fp8_group128_input
+        )
+        attn_output = self._attn(
+            positions,
+            q,
+            latent_cache,
+            ctx,
+            expanded=None,
+            output_gate=gate if fused else None,
+            absorbed_query=absorbed_query,
+        )
+        return attn_output if fused else sigmoid_mul(attn_output, gate)
 
 
 def _sliced_scratch(like: torch.Tensor, slot: int, n_tokens: int):
@@ -1490,7 +1553,6 @@ class KimiLinearKDA(nn.Module):
         attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project every KDA hidden-state consumer."""
-        proj_local = self.local_num_heads * self.head_dim
         if attnres_partial_args is not None and (
             self.qkvgb_proj.fp8_channel_quant
             or self.qkvgb_proj.fp8_block_quant
@@ -1512,10 +1574,16 @@ class KimiLinearKDA(nn.Module):
                 scratch_b,
                 eps=eps,
             )
+        return self._split_qkvfab(output)
+
+    def _split_qkvfab(
+        self, output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(q|k|v, g, f_a, beta) views of the merged projection output."""
+        proj_local = self.local_num_heads * self.head_dim
         f_a_end = 4 * proj_local + self.head_dim
-        mixed_qkv = output[:, : 3 * proj_local]
         return (
-            mixed_qkv,
+            output[:, : 3 * proj_local],
             output[:, 3 * proj_local : 4 * proj_local],
             output[:, 4 * proj_local : f_a_end],
             output[:, f_a_end : self.qkvgb_proj.used_rows],
@@ -1561,12 +1629,6 @@ class KimiLinearKDA(nn.Module):
         h = hidden_states
         num_tokens = h.shape[0]
         hn, hd = self.local_num_heads, self.head_dim
-        # The hybrid backend re-splits key_dim/value_dim by attn_tp_size to
-        # recover the per-rank head count, so pass the FULL (pre-TP) projection
-        # width. The projected tensors (mixed_qkv, g_raw, beta) and the returned
-        # core_out are already per-rank from their column-parallel layers, so the
-        # output reshape below uses the per-rank head count ``hn``.
-        proj = self.num_heads * hd
 
         # Raw (pre-conv) q/k/v projections concatenated; the hybrid backend runs
         # the short causal conv (+ SiLU) and manages the conv / recurrent state
@@ -1588,6 +1650,63 @@ class KimiLinearKDA(nn.Module):
                     scales = None
                 return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
             return h
+        core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
+        if self.o_proj.supports_fp8_group128_input:
+            values, scales = quantize_fp8_with_gate(
+                core_out,
+                out_gate,
+                norm_weight=self.o_norm.weight,
+                eps=self.o_norm.variance_epsilon,
+                enable_pdl=pdl_enabled(),
+            )
+            return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
+        core_out = self._gated_norm(core_out, out_gate)
+        if projection_out is not None:
+            return mm(core_out, self.o_proj.weight, bias=None, out=projection_out)
+        output, _ = self.o_proj(core_out, ctx=ctx)
+        return output
+
+    def o_proj_input(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+        comm_manager,
+        *,
+        projection,
+    ) -> torch.Tensor:
+        """This rank's BF16 o-projection input [T, heads * head_dim] for T > 0.
+
+        Args:
+            positions: Unused; KDA has no positional encoding.
+            hidden_states: The attention input [T, hidden].
+            ctx: The forward context.
+            comm_manager: Unused; KDA needs no attention-side communication here.
+            projection: Computes the merged input projection [T, rows].
+        """
+        del positions, comm_manager
+        mixed_qkv, out_gate, f_a_out, beta = self._split_qkvfab(
+            projection(hidden_states)
+        )
+        core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
+        return self._gated_norm(core_out, out_gate)
+
+    def _recurrent_core(
+        self,
+        mixed_qkv: torch.Tensor,
+        f_a_out: torch.Tensor,
+        beta: torch.Tensor,
+        ctx: "ForwardContext",
+    ) -> torch.Tensor:
+        """Short conv, gates and the delta-rule recurrence: [T, heads * head_dim]."""
+        num_tokens = mixed_qkv.shape[0]
+        hn, hd = self.local_num_heads, self.head_dim
+        # The hybrid backend re-splits key_dim/value_dim by attn_tp_size to
+        # recover the per-rank head count, so pass the FULL (pre-TP) projection
+        # width. The projected tensors (mixed_qkv, g_raw, beta) and the returned
+        # core_out are already per-rank from their column-parallel layers, so the
+        # output reshape below uses the per-rank head count ``hn``.
+        proj = self.num_heads * hd
         # Pass the projection's q|k|v view directly; the backend handles its
         # layout.
         # f_b runs inside the backend: fused into the decode scan kernel, a
@@ -1622,29 +1741,21 @@ class KimiLinearKDA(nn.Module):
             seq_len=num_tokens,
         )
 
-        core_out = core_out.reshape(num_tokens, hn * hd)
-        if self.o_proj.supports_fp8_group128_input:
-            values, scales = quantize_fp8_with_gate(
-                core_out,
-                out_gate,
-                norm_weight=self.o_norm.weight,
-                eps=self.o_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
-            )
-            return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
-        core_out = rmsnorm_gated_sigmoid(
+        return core_out.reshape(num_tokens, hn * hd)
+
+    def _gated_norm(
+        self, core_out: torch.Tensor, out_gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Gated RMSNorm of the core output, the BF16 o-projection input."""
+        return rmsnorm_gated_sigmoid(
             core_out.contiguous(),
             out_gate,
             self.o_norm.weight,
             self.o_norm.variance_epsilon,
-            hn,
-            hd,
+            self.local_num_heads,
+            self.head_dim,
             enable_pdl=pdl_enabled(),
         )
-        if projection_out is not None:
-            return mm(core_out, self.o_proj.weight, bias=None, out=projection_out)
-        output, _ = self.o_proj(core_out, ctx=ctx)
-        return output
 
 
 class KimiLinearMoEGate(nn.Module):
@@ -3095,6 +3206,9 @@ class KimiLinearDecoderLayer(nn.Module):
         self.k3_comm = K3AttnComm(mapping=mapping, hidden_size=config.hidden_size)
 
         self.attn_fork = StreamFork(alt_stream)
+        # AttnRes entry and o-projection exit of the decode chain; bound by
+        # prepare_communication_runtime.
+        self.decode_attention: KimiK3DecodeAttentionLayer | None = None
         # (proj_w_getter, norm, valid_blocks) for the NEXT layer's attn-side
         # mix; set by the backbone after all layers exist. The partial launches
         # from this (MoE) layer's aux branch, hidden under the routed experts.
@@ -3690,6 +3804,10 @@ class KimiLinearModel(nn.Module):
             self.output_attn_res_proj = None
         # One-based completed-layer ids; see set_eagle3_layers_to_capture.
         self.eagle3_layers_to_capture: tuple[int, ...] = ()
+        # Closing AttnRes of the decode chain and the row counts it serves; bound
+        # by prepare_communication_runtime.
+        self.decode_final: PreparedAttnRes | None = None
+        self.decode_batches: tuple[int, ...] = ()
 
         # DFLASH/DSpark speculative decoding: layer indices whose *output*
         # stream is captured for the draft. Populated by
@@ -3797,6 +3915,14 @@ class KimiLinearModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(input_ids)
 
+        if (
+            self.decode_final is not None
+            and pp_inbound is None
+            and ctx.forward_mode.is_decode()
+            and hidden_states.shape[0] in self.decode_batches
+        ):
+            return self._forward_decode_chain(positions, hidden_states, ctx)
+
         # Per-forward AttnRes scratch, block-major so block_residual[:m] is a
         # contiguous kernel slice (fresh alloc = CUDA-graph safe); new_empty is
         # safe: slot j is written at layer j*block_size before any read.
@@ -3831,17 +3957,14 @@ class KimiLinearModel(nn.Module):
         prefix_sum = hidden_states
 
         def capture_tap(layer_idx: int) -> None:
-            captured = self._dspark_capture_stream(
-                layer_idx, prefix_sum, block_residual
+            self._capture_tap(
+                ctx,
+                layer_idx,
+                prefix_sum,
+                block_residual,
+                projected_context,
+                aux_hidden_states,
             )
-            capture_idx = self._dflash_capture_idx_map[layer_idx]
-            if dspark_context is not None:
-                dspark_context.add_capture(projected_context, capture_idx, captured)
-            else:
-                if ctx.target_capture_sink is not None:
-                    ctx.target_capture_sink.on_target_capture(capture_idx, captured)
-                assert aux_hidden_states is not None
-                aux_hidden_states.append(captured)
 
         for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
             layer = self.layers[layer_idx]
@@ -3881,27 +4004,7 @@ class KimiLinearModel(nn.Module):
             capture_tap(self.config.num_hidden_layers - 1)
 
         if dspark_context is not None:
-            # Target and draft views share the full-history group's page-id
-            # space; keep the target's packed order: extend rows, then verify
-            # rows. A pure prefill round (every request extending -- a PD
-            # prefill engine never publishes a decode window) reads the
-            # extend span only.
-            if ctx.num_extends == ctx.bs:
-                cache_locs = ctx.attn_backend.extend_span_locations()
-            elif ctx.num_extends == 0:
-                cache_locs = ctx.attn_backend.decode_window_locations()
-            else:
-                cache_locs = torch.cat(
-                    (
-                        ctx.attn_backend.extend_span_locations(),
-                        ctx.attn_backend.decode_window_locations(),
-                    )
-                )
-            dspark_context.write_context(
-                projected_context,
-                positions,
-                cache_locs[: ctx.input_num_tokens],
-            )
+            self._write_dspark_context(ctx, positions, projected_context)
 
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -3912,6 +4015,134 @@ class KimiLinearModel(nn.Module):
             out_norm=self.norm,
         )
         return hidden_states, aux_hidden_states
+
+    def _capture_tap(
+        self,
+        ctx: "ForwardContext",
+        layer_idx: int,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+        projected_context,
+        aux_hidden_states: list | None,
+    ) -> None:
+        """Hand the drafter's capture of ``layer_idx``'s output to its consumer.
+
+        ``block_residual`` is block-major.
+        """
+        captured = self._dspark_capture_stream(layer_idx, prefix_sum, block_residual)
+        capture_idx = self._dflash_capture_idx_map[layer_idx]
+        dspark_context = ctx.dspark_context_producer
+        if dspark_context is not None:
+            dspark_context.add_capture(projected_context, capture_idx, captured)
+        else:
+            if ctx.target_capture_sink is not None:
+                ctx.target_capture_sink.on_target_capture(capture_idx, captured)
+            assert aux_hidden_states is not None
+            aux_hidden_states.append(captured)
+
+    def _write_dspark_context(
+        self, ctx: "ForwardContext", positions: torch.Tensor, projected_context
+    ) -> None:
+        """Write the DSpark context of this forward's rows into the draft cache."""
+        # Target and draft views share the full-history group's page-id
+        # space; keep the target's packed order: extend rows, then verify
+        # rows. A pure prefill round (every request extending -- a PD
+        # prefill engine never publishes a decode window) reads the
+        # extend span only.
+        if ctx.num_extends == ctx.bs:
+            cache_locs = ctx.attn_backend.extend_span_locations()
+        elif ctx.num_extends == 0:
+            cache_locs = ctx.attn_backend.decode_window_locations()
+        else:
+            cache_locs = torch.cat(
+                (
+                    ctx.attn_backend.extend_span_locations(),
+                    ctx.attn_backend.decode_window_locations(),
+                )
+            )
+        ctx.dspark_context_producer.write_context(
+            projected_context,
+            positions,
+            cache_locs[: ctx.input_num_tokens],
+        )
+
+    def _forward_decode_chain(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+    ) -> tuple[torch.Tensor, list | None]:
+        """Decode through the TP8 mailbox chain; returns the normalized output and
+        the captured hidden states, as the ordinary forward does.
+
+        Each layer's AttnRes entry adds the previous feed-forward output (the
+        MoE tail's ring row, or the dense MLP output) to ``prefix`` in place, so
+        a layer's output is captured right after the next entry (the last one
+        after the closing AttnRes). ``blocks`` is token-major here.
+        """
+        num_blocks = ceil_div(
+            self.config.num_hidden_layers, self.config.attn_res_block_size
+        )
+        tokens, hidden = hidden_states.shape
+        prefix = torch.empty_like(hidden_states)
+        blocks = hidden_states.new_empty(tokens, num_blocks, hidden)
+        entry_out = torch.empty_like(hidden_states)
+        feed_in = torch.empty_like(hidden_states)
+        dspark_context = ctx.dspark_context_producer
+        projected_context = (
+            None
+            if dspark_context is None
+            else dspark_context.begin_stage(hidden_states, None)
+        )
+        aux_hidden_states: list | None = (
+            []
+            if (self.layers_to_capture and dspark_context is None)
+            or self.eagle3_layers_to_capture
+            else None
+        )
+
+        def capture(layer_idx: int) -> None:
+            if layer_idx in self.layers_to_capture:
+                # Only the AttnRes stream reads the snapshots, block-major.
+                block_residual = blocks.transpose(0, 1)
+                if self.dflash_aux_stream == "attn_res":
+                    block_residual = block_residual.contiguous()
+                self._capture_tap(
+                    ctx,
+                    layer_idx,
+                    prefix,
+                    block_residual,
+                    projected_context,
+                    aux_hidden_states,
+                )
+            if layer_idx + 1 in self.eagle3_layers_to_capture:
+                aux_hidden_states.append(prefix.clone())
+
+        delta, ring = hidden_states, False
+        for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
+            layer = self.layers[layer_idx]
+            chain = layer.decode_attention
+            h = chain.enter(delta, prefix, blocks, entry_out, ring=ring)
+            if layer_idx > self.pp_start_layer:
+                capture(layer_idx - 1)
+            local = layer.self_attn.o_proj_input(
+                positions, h, ctx, layer.comm_manager, projection=chain.project
+            )
+            x = chain.leave(local, prefix, blocks, feed_in)
+            if layer.is_moe_layer:
+                layer.block_sparse_moe.decode_moe.publish(x)
+                ring = True
+            else:
+                delta, ring = layer.mlp(x), False
+        out = torch.empty_like(hidden_states)
+        if ring:
+            self.decode_final.run_ring(prefix, blocks, out)
+        else:
+            self.decode_final.run(delta, prefix, blocks, out)
+        capture(self.pp_end_layer - 1)
+        if dspark_context is not None:
+            self._write_dspark_context(ctx, positions, projected_context)
+        return out, aux_hidden_states
 
 
 class KimiLinearForCausalLM(BaseCausalLM):
@@ -3976,12 +4207,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     moe_comm = moe.comm
         if moe_comm is not None:
             prepared = moe_comm.prepare(max_num_tokens) or prepared
-        prepared = self._prepare_decode_moe() or prepared
+        prepared = self._prepare_decode_chain() or prepared
         return bool(shared_mlps) or prepared
 
-    def _prepare_decode_moe(self) -> bool:
+    def _prepare_decode_chain(self) -> bool:
         """Bind the decode MoE chain where every MoE layer's execution plan allows it
-        and its kernels serve the layer; other layers keep their plan's path."""
+        and its kernels serve the layer, then every layer's AttnRes entry and
+        o-projection exit when all attention modules allow it."""
         config, args = self.config, global_server_args_dict
         layers = [
             layer
@@ -4003,6 +4235,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
             return False
         from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
             BATCHES,
+            attention_supports,
             supports,
         )
 
@@ -4077,6 +4310,68 @@ class KimiLinearForCausalLM(BaseCausalLM):
         logger.info(
             f"K3 decode MoE chain bound to {len(layers)} layers for batches {batches}"
         )
+
+        decoders = [
+            layer
+            for layer in self.model.layers
+            if isinstance(layer, KimiLinearDecoderLayer)
+        ]
+
+        def attention_served(layer) -> bool:
+            # The chain owns the o-projection's reduction and gates MLA outputs.
+            attn = layer.self_attn
+            kda = isinstance(attn, KimiLinearKDA)
+            projection = attn.qkvgb_proj if kda else attn.fused_qkv_a_proj_with_mqa
+            return (
+                attn.qkv_parallel is None
+                and attn.output_parallel is None
+                and not attn.o_proj.supports_fp8_group128_input
+                and (kda or attn.use_output_gate)
+                and attention_supports(
+                    projection_rows=projection.weight.shape[0],
+                    o_proj_width=attn.o_proj.weight.shape[1],
+                    projection_dtype=projection.weight.dtype,
+                    o_proj_dtype=attn.o_proj.weight.dtype,
+                )
+            )
+
+        if len(decoders) != self.config.num_hidden_layers or not all(
+            attention_served(layer) for layer in decoders
+        ):
+            return True
+        from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
+            KimiK3DecodeAttention,
+        )
+
+        attention = KimiK3DecodeAttention(
+            group=pg_manager.get_device_process_group(self.mapping.attn.tp_group),
+            batches=batches,
+            moe=owner,
+        )
+        for layer in decoders:
+            mla = isinstance(layer.self_attn, KimiLinearMLAAttention)
+            projection = (
+                layer.self_attn.fused_qkv_a_proj_with_mqa
+                if mla
+                else layer.self_attn.qkvgb_proj
+            )
+            layer.decode_attention = attention.layer(
+                layer,
+                layer_idx=layer.layer_id,
+                mla=mla,
+                first=layer is decoders[0],
+                projection_weight=projection.weight,
+            )
+        self.model.decode_final = attention.final(
+            res_norm=self.model.output_attn_res_norm,
+            res_proj=self.model.output_attn_res_proj,
+            out_norm=self.model.norm,
+            num_blocks=ceil_div(
+                self.config.num_hidden_layers, self.config.attn_res_block_size
+            ),
+        )
+        self.model.decode_batches = batches
+        logger.info(f"K3 decode attention chain bound to {len(decoders)} layers")
         return True
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:

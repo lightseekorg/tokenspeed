@@ -363,8 +363,6 @@ mod ffi {
         pd_transfer: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
-        /// Cache blocks held by running requests.
-        active_lcm_blocks: i32,
     }
 
     /// A prefix-cache mutation (`KvBlockStoredEvent` / `KvBlockRemovedEvent`).
@@ -419,6 +417,7 @@ mod ffi {
         fn demote_session(scheduler: Pin<&mut Scheduler>, session_id: &str, ended: bool) -> usize;
         fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
+        fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
@@ -593,9 +592,17 @@ impl Scheduler {
         ffi::admission_snapshot(self.get(), token_step)
     }
 
-    /// Request and physical block counts.
+    /// Request and physical block counts: a pass over the requests per
+    /// state, and the empty-block count, which the pool keeps.
     pub fn sizes(&self) -> SchedulerSizes {
         ffi::sizes(self.get())
+    }
+
+    /// Cache blocks held by running requests. Taking the count walks every
+    /// live request's block tables, so its cost grows with the batch's
+    /// context; a caller on the round's path reuses it.
+    pub fn active_lcm_blocks(&self) -> i32 {
+        ffi::active_lcm_blocks(self.get())
     }
 
     /// One cache group's page counts.

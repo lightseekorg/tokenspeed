@@ -108,6 +108,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.muse_spark_audio import MuseSparkAudioTower
 from tokenspeed.runtime.models.muse_spark_vision import MuseSparkVisionTower
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
@@ -2024,7 +2025,6 @@ class MuseSparkModel(BaseTransformerModel):
             and self.config.moe_hidden_size == 4096
             and self.config.num_local_experts == 256
             and self.config.num_experts_per_tok == 8
-            and not self.layers_to_capture
         ):
             return False
         for index, layer in enumerate(self.layers):
@@ -2059,7 +2059,7 @@ class MuseSparkModel(BaseTransformerModel):
         positions: torch.Tensor,
         ctx: ForwardContext,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         hidden_states = self._embed_hidden(
             input_ids=input_ids,
             input_embeds=input_embeds,
@@ -2082,7 +2082,18 @@ class MuseSparkModel(BaseTransformerModel):
             )
             stream[:valid_rows].copy_(hidden_states[first_row : first_row + valid_rows])
             hidden_states = stream
+        aux_hidden_states: list[torch.Tensor] = []
+        # An idle forward captures no hidden states, as in the base model's loop.
+        taps_live = owned_global_rows is not None or not ctx.forward_mode.is_idle()
         for layer_index, layer in enumerate(self.layers):
+            if taps_live and layer_index in self.layers_to_capture:
+                self._capture(
+                    layer_index,
+                    hidden_states,
+                    owned_global_rows,
+                    aux_hidden_states,
+                    ctx,
+                )
             # Each FFN boundary emits the next layer's attention input rows.
             next_input_layernorm = (
                 self.layers[layer_index + 1].input_layernorm
@@ -2099,13 +2110,55 @@ class MuseSparkModel(BaseTransformerModel):
                 next_input_layernorm,
                 owned_global_rows,
             )
-        if owned_global_rows is not None or not ctx.forward_mode.is_idle():
+        if taps_live:
+            final_layer_index = len(self.layers) + 1
+            if final_layer_index in self.layers_to_capture:
+                self._capture(
+                    final_layer_index,
+                    hidden_states,
+                    owned_global_rows,
+                    aux_hidden_states,
+                    ctx,
+                )
             hidden_states = self.norm(hidden_states, self.embed_tokens.weight.dtype)
         if owned_global_rows is not None:
             iris = self.iris_state
             assert iris is not None
             hidden_states = iris.all_gather_owned_rows(hidden_states, rows, False)
-        return hidden_states, None
+        return hidden_states, aux_hidden_states or None
+
+    def _capture(
+        self,
+        layer_index: int,
+        hidden_states: torch.Tensor,
+        owned_global_rows: int | None,
+        aux_hidden_states: list[torch.Tensor],
+        ctx: ForwardContext,
+    ) -> None:
+        """Capture the FP32 residual stream entering ``layer_index`` for a draft.
+
+        The draft model reads every token's full row in the model dtype (that
+        of the token embedding), so each capture is rounded from FP32. When
+        each rank holds only its owned rows, only the captured layers gather
+        full rows; the other layers keep the owned-row layout.
+        """
+        tap = hidden_states.to(self.embed_tokens.weight.dtype)
+        if owned_global_rows is None:
+            # The final capture (index num_layers + 1) gathers like the last layer's.
+            layer = self.layers[min(layer_index, len(self.layers) - 1)]
+            tap = layer.comm_manager.gather_residual(tap, ctx)
+        else:
+            iris = self.iris_state
+            assert iris is not None
+            tap = iris.all_gather_owned_rows(tap, owned_global_rows, False)
+        aux_hidden_states.append(tap)
+        if ctx.target_capture_sink is not None:
+            notify_target_capture(
+                ctx.target_capture_sink,
+                self._dflash_capture_idx_map,
+                layer_index,
+                aux_hidden_states,
+            )
 
 
 _CHECKPOINT_PREFIXES = (
@@ -2356,6 +2409,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
     """Muse Spark conditional generation model with shared vision and audio towers."""
 
     model_cls = MuseSparkModel
+    supports_aux_capture = True
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""
@@ -2563,6 +2617,10 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             num_logical_experts=config.num_local_experts,
             num_groups=None,
         )
+
+    def get_input_embeddings(self) -> nn.Module:
+        """The raw token embedding a block drafter borrows, before Muse's input norm."""
+        return self.model.embed_tokens
 
     def resolve_logits_processor(self, config: MuseSparkConfig) -> LogitsProcessor:
         return LogitsProcessor(
