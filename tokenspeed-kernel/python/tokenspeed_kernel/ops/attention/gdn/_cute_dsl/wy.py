@@ -236,6 +236,23 @@ class GdnWYKernel:
     W = (D * QK) (I + M)^-1 diag(beta), then
     O = (exp(G) Q - W exp(G) K) H0^T + W V. This avoids a per-token
     state and a separate KH0 product. H0 is stored in K-last [V, K] order.
+
+    Attributes:
+        heads: Query head count ``H``.
+        vheads: Value head count ``HV``; query heads group evenly onto it.
+        normalize: Whether to L2-normalize q and k rows in FP32.
+        tree: Whether per-token ancestor bitmasks replace the causal mask.
+        replay: Whether to fill the raw replay payload while reading operands.
+        enable_pdl: Whether to launch with programmatic dependent launch.
+        accumulators: MMA accumulator fragments per output tile (1 or 2).
+        value_tile: Value columns handled per CTA tile (64 or 128).
+        token_bound: Compile-time token bucket (4, 8 or 16).
+        use_tma_qkv: Whether q, k and v tiles load through TMA.
+        use_tma_state: Whether checkpoint state tiles load through TMA.
+        gram_rows: Gram matrix side length (8 or 16).
+        key_chunk: Checkpoint key columns loaded per stage (64 or 128).
+        reduction_bound: Token reduction bound derived from ``token_bound``
+            (8 for short windows, 16 otherwise).
     """
 
     def __init__(
@@ -374,6 +391,28 @@ class GdnWYKernel:
         key_offset: cutlass.Constexpr,
         initialize: cutlass.Constexpr,
     ):
+        """Cooperatively load one value tile of the recurrent state into smem.
+
+        Uses TMA with an mbarrier under ``use_tma_state``, otherwise 16-byte
+        cp.async on 16-byte-aligned addresses, with a scalar element-wise
+        fallback elsewhere. Zero-fills the tile when ``idx < 0``.
+
+        Args:
+            pool: Raw pointer to the K-last state pool ``[rows, HV, 128, 128]``.
+            pool_stride: Element stride between pool rows.
+            idx: Pool row of this request; negative rows zero-fill.
+            hv: Value head index within the row.
+            tile: Value tile index; columns start at ``tile * value_tile``.
+            tid: Thread index within the CTA.
+            warp: Warp index within the CTA; warp 0 issues the TMA copy.
+            shared: Shared-memory destination tensor.
+            barrier: TMA transaction barrier, or ``None`` without TMA.
+            atom: TMA copy atom for the state tile, or ``None`` without TMA.
+            source: TMA gmem source tensor, or ``None`` without TMA.
+            key_offset: First key column of this stage within the row.
+            initialize: Whether this first stage initializes the mbarrier;
+                every stage arms its expected transaction bytes.
+        """
         h_stride = self.key_chunk + 128 // pool.element_type.width
         element_bytes = pool.element_type.width // 8
         col_base = tile * self.value_tile
@@ -466,6 +505,40 @@ class GdnWYKernel:
         state_source,
         h_layout,
     ):
+        """Compute the output-only WY verification, one value tile per CTA.
+
+        The grid maps one CTA of 128 threads (four warps) to each (request,
+        value head, value tile) triple. ``operands`` packs twelve raw gmem
+        pointers in this order:
+
+        - ``q``, ``k``: BF16/FP16 ``[B, T, H, 128]``.
+        - ``v``: ``q``-dtype ``[B, T, HV, 128]``.
+        - ``a``, ``b``: ``q``-dtype gate and beta logits ``[B, T, HV]``.
+        - ``A_log``, ``dt_bias``: FP32 decay parameters ``[HV]``.
+        - ``pool``: read-only K-last state pool ``[rows, HV, 128, 128]``.
+        - ``indices``: int32/int64 pool rows ``[B]``; negative rows start
+          from zero.
+        - ``tree``: int64 ancestor-or-self bitmasks ``[B, T]``, or a
+          placeholder when ``self.tree`` is off.
+        - ``replay``: raw ``[k | v | a | b]`` payload destination
+          ``[B*T, H*128 + HV*128 + 2*HV]``, or a placeholder when
+          ``self.replay`` is off.
+        - ``out``: ``q``-dtype output ``[B, T, HV, 128]``.
+
+        ``strides`` packs the element strides of ``q``, ``k``, ``v``, ``a``
+        and ``b``, followed by the pool row stride.
+
+        Args:
+            operands: The twelve raw pointers described above.
+            strides: Per-operand element strides ``(qs, ks, vs, as_, bs, ps)``.
+            tokens: Runtime token count per request, at most ``token_bound``.
+            scale: Query scale multiplied into the normalized queries.
+            atoms: TMA copy atoms for q, k and v; empty without TMA.
+            sources: TMA gmem source tensors for q, k and v; empty without TMA.
+            state_atom: TMA copy atom for checkpoint tiles, or ``None``.
+            state_source: TMA gmem source for the state pool, or ``None``.
+            h_layout: Shared-memory layout of the TMA state tile, or ``None``.
+        """
         tid = cute.arch.thread_idx()[0]
         warp, lane = tid // 32, tid % 32
         nh, tile, _ = cute.arch.block_idx()
