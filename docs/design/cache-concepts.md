@@ -265,9 +265,19 @@ storage the cache layer allocated. The scheduler owns allocation, so its output 
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
 Export and active-parent accounting skip reading those released references.
-Within one export, adjacent live slots sharing a parent reuse its resolved ID
-base; the owning pool remains part of that check because Host and Device
-packing can differ.
+
+A table resolves a block's id once, when the block enters a slot, and keeps
+it beside the reference (`BlockTable::PageIds`): a forward batch exports
+every scheduled row each round, and resolving every block of a long context
+again each round was most of a control-thread round. The id cannot go stale on
+its own: a parent's group binding, and with it the packing the id follows,
+holds while any reference keeps the parent occupied, and the block's own pool
+resolves it, so Host and Device packing may differ. Every write to a table
+goes through `GroupAllocator`, which keeps the ids in step. The one write
+from outside, a prefix index replacing a published block with the key's
+canonical block, goes through the allocator's publish window, which resolves
+its slots again when it closes. Debug builds (no `NDEBUG`) check each
+exported row against a fresh resolution.
 
 Operations borrow their scheduled request's tables only until their batch is
 built. A request selected for that build cannot be retracted or scheduled
@@ -827,7 +837,8 @@ dependency is visible in the signature, not hidden in shared state. The
 reverse direction is symmetric: publishing a table's completed blocks may
 replace one with the key's existing canonical block, and that write goes
 through a mutable window the allocator hands out
-(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`.
+(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`;
+the window keeps the table's page ids current when it closes.
 The index never sees a `BlockTable`; the allocator remains its only mutator.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
@@ -2256,9 +2267,10 @@ carve-out Principle 3 makes for CacheBlock ids.
 Decision (2026-08-13): emitted table entries are **`CacheBlock` ids**, and
 that is the accepted contract. The code works this way: rows are logical
 (row *i* covers `[i*block_granularity, (i+1)*block_granularity)`), entries
-come from `ResolveCacheBlockId`
-(`csrc/cache/allocator/group_allocator.h`), and the packing fold lives on
-the Python side of the contract (`recipes/cache_runtime.py` validates
+come from `ResolveCacheBlockId` (`csrc/cache/core/block_pool.h`), applied
+when a block enters a table (`csrc/cache/core/block_table.h`), and the
+packing fold lives on the Python side of the contract
+(`recipes/cache_runtime.py` validates
 `group page counts == num_lcm_blocks * packing + 1`; the bridge in
 `engine/scheduler_utils.py` ships the folded counts), so Python's
 per-forward mapping only subdivides `block_granularity → kernel_page_size`

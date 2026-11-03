@@ -76,7 +76,7 @@ TEST(HostPacking, ABlockIdUsesTheOwningPoolsPacking) {
     // Both pools use parent 2, but their first child IDs differ. Holes and
     // a return to the Device pool must preserve every logical table slot.
     BlockTable table = BlockTable::FromBlocks(
-        {device_blocks[4], device_blocks[5], {}, host_blocks[6], host_blocks[7], device_blocks[5]}, 0);
+        /*group_id=*/0, {device_blocks[4], device_blocks[5], {}, host_blocks[6], host_blocks[7], device_blocks[5]}, 0);
     EXPECT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{5, 6, 0, 7, 8, 6}));
     allocator.ReclaimExpired(device, table, 2);
     EXPECT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{0, 0, 0, 7, 8, 6}));
@@ -93,8 +93,9 @@ TEST(BlockTableAccounting, ReleasedPrefixesAndSharedParentsCountOnce) {
                                        /*write_back_evictions=*/false);
     const auto blocks = device.AcquireBlocks(0, 8);
     ASSERT_EQ(blocks.size(), 8u);
-    std::vector<BlockTable> first{BlockTable::FromBlocks({blocks.begin(), blocks.begin() + 7}, 0)};
-    std::vector<BlockTable> second{BlockTable::FromBlocks({blocks[0], {}, {}, {}, {}, {}, {}, blocks[7]}, 0)};
+    std::vector<BlockTable> first{BlockTable::FromBlocks(/*group_id=*/0, {blocks.begin(), blocks.begin() + 7}, 0)};
+    std::vector<BlockTable> second{
+        BlockTable::FromBlocks(/*group_id=*/0, {blocks[0], {}, {}, {}, {}, {}, {}, blocks[7]}, 0)};
     const std::vector<std::span<const BlockTable>> requests{first, second};
     coordinator.Allocator(0).ReclaimExpired(device, first[0], 6);
     EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 2);
@@ -117,7 +118,7 @@ TEST(HostPacking, SnapshotAdmissionCountsTheSnapshotPoolsChildren) {
                             &snapshots, /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
         const std::int32_t blocks = host_packing == 2 ? 3 : 5;
         const std::int32_t tokens = blocks * 2;
-        std::vector<BlockTable> tables{BlockTable::FromBlocks(device.AcquireBlocks(0, blocks), 0)};
+        std::vector<BlockTable> tables{BlockTable::FromBlocks(/*group_id=*/0, device.AcquireBlocks(0, blocks), 0)};
         const std::vector<std::vector<ImageSlot>> host_slots(1);
         const bool fits = blocks <= host_packing;
         EXPECT_EQ(coordinator.SnapshotPoolHolds(tables, tokens, host_slots), fits);

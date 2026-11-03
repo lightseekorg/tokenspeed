@@ -27,7 +27,9 @@
 #include <utility>
 #include <vector>
 
+#include "cache/allocator/group_allocator.h"
 #include "cache/core/block_pool.h"
+#include "cache/core/block_table.h"
 #include "cache/core/cache_types.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache_test_access.h"
@@ -979,6 +981,64 @@ TEST(BlockTablePageIdsExport, ChildSlotsWithinOneParentHaveDistinctKernelPageIds
     const std::vector<std::int32_t> ids = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
     EXPECT_EQ(ids, (std::vector<std::int32_t>{1, 2}));
     EXPECT_NE(ids, parent_ids);
+}
+
+// A table resolves a block's page id when the block enters a slot; the
+// export copies those ids, so every write must leave them current.
+
+TEST(BlockTablePageIdsExport, AStateTableExportsTheBlocksOfEachStep) {
+    BlockPool pool(/*num_lcm_blocks=*/4, {1});
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    BlockTable table;
+    allocator.ShapeStateTable(table, CacheBlockRef{});
+    EXPECT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{0, 0}));
+    ASSERT_TRUE(allocator.AcquireStateInput(pool, table));
+    ASSERT_TRUE(allocator.AcquireStateLive(pool, table));
+    const std::vector<std::int32_t> first = allocator.BlockTablePageIds(table);
+    EXPECT_EQ(first, (std::vector<std::int32_t>{allocator.ResolveCacheBlockId(*table.Blocks()[0]),
+                                                allocator.ResolveCacheBlockId(*table.Blocks()[1])}));
+
+    allocator.ReleaseStateInput(table);
+    allocator.RotateState(table);
+    EXPECT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{first[1], 0}))
+        << "the block the last step wrote is the next step's input";
+    ASSERT_TRUE(allocator.AcquireStateLive(pool, table));
+    EXPECT_EQ(allocator.BlockTablePageIds(table),
+              (std::vector<std::int32_t>{first[1], allocator.ResolveCacheBlockId(*table.Blocks()[1])}));
+}
+
+TEST(BlockTablePageIdsExport, ASwappedSlotExportsTheFreshBlock) {
+    BlockPool pool(/*num_lcm_blocks=*/4, {1});
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, pool.AcquireBlocks(0, 2), /*available_tokens=*/0);
+    const std::vector<std::int32_t> before = allocator.BlockTablePageIds(table);
+
+    const CacheBlockRef replaced = allocator.SwapInFreshBlock(pool, table, /*slot=*/1, /*available_tokens=*/0);
+
+    ASSERT_TRUE(replaced);
+    EXPECT_EQ(allocator.ResolveCacheBlockId(*replaced), before[1]);
+    const std::vector<std::int32_t> after = allocator.BlockTablePageIds(table);
+    EXPECT_EQ(after, (std::vector<std::int32_t>{before[0], allocator.ResolveCacheBlockId(*table.Blocks()[1])}));
+    EXPECT_NE(after[1], before[1]);
+}
+
+TEST(BlockTablePageIdsExport, AHostExtensionExportsItsDeviceDestinations) {
+    BlockPool device(/*num_lcm_blocks=*/4, {1});
+    BlockPool host(/*num_lcm_blocks=*/4, {1});
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, device.AcquireBlocks(0, 1), /*available_tokens=*/0);
+    std::vector<CacheBlockRef> host_blocks;
+    host_blocks.push_back(host.AcquireBlock(0));
+    host_blocks.emplace_back();
+    std::vector<BlockTransfer> loads;
+
+    allocator.AppendHostExtension(device, table, std::move(host_blocks), loads, /*tail_available_tokens=*/0);
+
+    ASSERT_EQ(loads.size(), 1u);
+    EXPECT_EQ(allocator.BlockTablePageIds(table),
+              (std::vector<std::int32_t>{allocator.ResolveCacheBlockId(*table.Blocks()[0]),
+                                         allocator.ResolveCacheBlockId(*loads[0].destination), 0}))
+        << "a Host hit's slot names its Device destination, a hole stays page 0";
 }
 
 TEST(BlockTablePageIdsExport, ResolvesEachGroupsPackingRecipe) {

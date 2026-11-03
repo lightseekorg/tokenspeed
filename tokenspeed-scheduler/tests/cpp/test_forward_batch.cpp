@@ -57,7 +57,7 @@ struct GroupSource {
                 if (!blocks.back()) throw std::runtime_error("test block pool exhausted");
             }
         }
-        rows.push_back(BlockTable::FromBlocks(std::move(blocks), /*available_tokens=*/0));
+        rows.push_back(BlockTable::FromBlocks(/*group_id=*/0, std::move(blocks), /*available_tokens=*/0));
         return rows.back();
     }
 
