@@ -295,6 +295,25 @@ private:
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
+    // (outside_event_handler.cpp): the pre-tail State checkpoint that makes a
+    // request's prompt end dead, from the prompt and where the request
+    // resumed (zero for none); whether that checkpoint exists, so a
+    // publication in place at the prompt end publishes no tail and no state
+    // there; and whether a finishing request publishes its frontier like a
+    // chunk end.
+    std::int32_t promptEndCheckpoint(const Request& request, std::int32_t resume_tokens) const;
+    bool promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const;
+    bool finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const;
+    // Whether the first decode of a request that resumed at resume_tokens
+    // publishes its prompt end and keeps writing past it, and the copy-in
+    // point every admission of its prompt reserves for that publication
+    // (operations/forward.cpp). Both read promptEndCheckpoint, so the
+    // admissions reserve copy-in blocks exactly for a prompt end the first
+    // decode publishes.
+    bool firstDecodePublishesPromptEnd(const Request& request, std::int32_t resume_tokens) const;
+    std::optional<CacheCoordinator::CopyInPoint> promptEndCopyInPoint(const Request& request,
+                                                                      std::int32_t resume_tokens) const;
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);

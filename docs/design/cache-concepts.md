@@ -380,6 +380,11 @@ Publication also registers every non-replayable sliding window at that
 checkpoint's boundary before the request reclaims expired table blocks. The
 forward's final window may start later and cannot replace this earlier window,
 even when the forward ends on a full page.
+Conversely, `--enable-state-checkpoint-in-forward` also skips the natural
+checkpoints that a next turn re-rendering the end of the previous prompt
+cannot resume at, with their KV tails: a prompt end inside the page whose start
+holds the pre-tail checkpoint, and a fused finish past the prompt end (same
+section).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -943,7 +948,12 @@ Its responsibilities:
   restore before the first decode -- passes the prompt end as its
   `copy_in_point` and reserves the copy-in blocks of the slots whose blocks
   it allocates, fills from the prefix or rebuilds, each in that block's
-  bucket. A slot the prefix fills (the hitter's copy, a Host load) or a
+  bucket. A prompt end the in-forward State checkpoint makes dead
+  ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints))
+  has no copy-in point: its first decode publishes no tail, and its
+  admissions decide that as the first decode does, from the prompt and where
+  the request resumed.
+  A slot the prefix fills (the hitter's copy, a Host load) or a
   restore rebuilds has a known bucket; a slot the admission's growth fills
   takes its block and its copy-in block together, in the one bucket the fit
   chooses for the pair (below). The request holds them beside its tables
@@ -954,10 +964,10 @@ Its responsibilities:
   chunks nor its first decode need a block that admission did not reserve
   there (a sliding-window group allocates the tail's blocks with the chunk
   that reaches them, like the rest of its window growth), and every prompt
-  end is published whatever the pool's pressure. A chunk end cut at a
-  junction keeps writing past its point too, but needs no copy: the
-  junction's KV is cached already, so it publishes the state there, under
-  the tail's hash, and its KV blocks stay its own, unpublished
+  end that is not dead is published whatever the pool's pressure. A chunk
+  end cut at a junction keeps writing past its point too, but needs no
+  copy: the junction's KV is cached already, so it publishes the state
+  there, under the tail's hash, and its KV blocks stay its own, unpublished
   (`OwnerTail::kKept`). On the Device the owner would keep its own block
   anyway; a Host tail pairs with the Device checkpoint in the probe's Host
   suffix. Should that tail leave both tiers before the publication, the
@@ -1152,7 +1162,7 @@ Its responsibilities:
   without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
-  admission) queues its tail and state checkpoint too, a junction cut its
+  admission) queues the tail and state it publishes too, a junction cut its
   state checkpoint;
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and

@@ -385,7 +385,10 @@ class ServerArgs:
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
-    # no chunk is cut for it.
+    # no chunk is cut for it. The prompt end that checkpoint covers and a
+    # fused finish past the prompt end then publish no state and no KV tail:
+    # a next turn that re-renders the end of the prompt and its reply cannot
+    # resume there (docs/design/scheduler.md section 1.2).
     enable_state_checkpoint_in_forward: bool = False
     # Hybrid models: a State checkpoint a later request's checkpoint extends
     # ranks, under cache pressure, as if last used this many new requests ago. None
@@ -1388,7 +1391,8 @@ class ServerArgs:
         """Whether this engine's prefill forwards write in-forward State checkpoints.
 
         This is the flag, except on a decode server, whose prompts arrive by
-        transfer.
+        transfer. Its scheduler then also skips the dead prompt-end and finish
+        checkpoints; a decode server publishes them as ever.
         """
         return (
             self.enable_state_checkpoint_in_forward
@@ -2705,8 +2709,16 @@ class ServerArgs:
             "(normally the final token) also writes the recurrent state there, so "
             "a later request that resends the prompt or diverges from it after "
             "that boundary resumes there. No extra prefill round; that forward "
-            "holds one more state block. Requires prefix caching. See "
-            "docs/design/scheduler.md section 1.2.",
+            "holds one more state block. The prompt end in the page that "
+            "boundary starts and every finish past the prompt end then publish "
+            "no recurrent state and no KV tail to the prefix cache, since a next "
+            "turn that re-renders the end of the previous prompt and its reply "
+            "cannot resume there (a prompt end published at the request's "
+            "finish, as on a prefill server, is kept if the state at the "
+            "boundary has left the cache); a next turn that repeats the "
+            "previous reply verbatim resumes at an earlier checkpoint instead "
+            "and recomputes the reply. Requires prefix caching; a decode server "
+            "ignores it. See docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
             "--checkpoint-retention-requests",

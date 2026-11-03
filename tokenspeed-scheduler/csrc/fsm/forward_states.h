@@ -75,6 +75,12 @@ struct CacheProgress {
     // frontier to replace it. Admission may release this optional hold for
     // capacity, and retraction drops it before imaging the request.
     std::vector<CacheBlockRef> retained_input_checkpoint;
+    // The boundary the first admission resumed from (its prefix hit; zero for
+    // none). The pre-tail State checkpoint makes the prompt end dead
+    // (SchedulerConfig::state_checkpoint_in_forward) only for a request that
+    // resumed at or below it, which every admission of the prompt and its
+    // first decode read alike (Scheduler::promptEndCheckpoint).
+    std::int32_t resume_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
