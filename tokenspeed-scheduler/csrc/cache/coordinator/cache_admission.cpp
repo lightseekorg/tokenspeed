@@ -1036,8 +1036,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 "request access epoch was not issued by this coordinator");
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
+    // Registered before anything is acquired or published under the epoch.
+    SessionAccess session_access;
     if (!request_access_epoch && !session_id.empty()) {
-        session_access_[access_epoch] = sessionTag(session_id);
+        session_access = SessionAccess{*this, access_epoch, sessionTag(session_id)};
     }
     // The boundaries inside a block, per tier: the hitter's table ends in a
     // private copy of the Device tail's partial block, or in a fresh page the
@@ -1058,6 +1060,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
         .state_checkpoint_blocks = std::vector<CacheBlockRef>(groups_.size()),
+        .session_access = std::move(session_access),
     };
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         if (GroupIsState(i)) {

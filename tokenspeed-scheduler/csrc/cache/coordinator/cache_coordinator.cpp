@@ -59,6 +59,35 @@ SessionCacheOwner CacheCoordinator::sessionTag(const std::string& id) {
     return tag;
 }
 
+CacheCoordinator::SessionAccess::SessionAccess(CacheCoordinator& coordinator, std::uint64_t access_epoch,
+                                               SessionCacheOwner session)
+    : coordinator_{&coordinator}, access_epoch_{access_epoch} {
+    const bool inserted = coordinator.session_access_.emplace(access_epoch, std::move(session)).second;
+    _assert(inserted, "an access epoch registers one session");
+}
+
+CacheCoordinator::SessionAccess::SessionAccess(SessionAccess&& other) noexcept
+    : coordinator_{std::exchange(other.coordinator_, nullptr)}, access_epoch_{std::exchange(other.access_epoch_, 0)} {}
+
+CacheCoordinator::SessionAccess& CacheCoordinator::SessionAccess::operator=(SessionAccess&& other) noexcept {
+    if (this != &other) {
+        release();
+        coordinator_ = std::exchange(other.coordinator_, nullptr);
+        access_epoch_ = std::exchange(other.access_epoch_, 0);
+    }
+    return *this;
+}
+
+CacheCoordinator::SessionAccess::~SessionAccess() {
+    release();
+}
+
+void CacheCoordinator::SessionAccess::release() noexcept {
+    if (CacheCoordinator* coordinator = std::exchange(coordinator_, nullptr)) {
+        coordinator->session_access_.erase(access_epoch_);
+    }
+}
+
 std::size_t CacheCoordinator::DemoteSession(const std::string& session_id, bool ended) {
     return DemoteSessions({session_id}, ended);
 }

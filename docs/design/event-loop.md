@@ -18,8 +18,9 @@ One engine rank is one `ts-host` process. Its threads:
 | forward (`ts-forward`) | the Python `HostDataPlane`'s operations, one at a time in queue order: everything that touches CUDA | the `DeviceHandle`, behind it the executor, models, KV pools, CUDA graphs; takes the GIL per operation |
 
 Peripheral threads stay off the round: the wire's Tokio runtime
-(`ts_control::transport`), the PD transfer peer's workers (`ts-pd`), the
-grammar compilers, the KV event publisher, the expert-rebalance solver.
+(`ts_control::transport`, which also encodes each round's outputs), the PD
+transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
+publisher, the expert-rebalance solver.
 
 With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
@@ -561,6 +562,11 @@ Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
+`active_lcm_blocks()` walks every live request's block tables, so a serving
+round reads the scheduler's counts once for the frontend's load report, and
+once more as it planned only when the metrics or a batch line read them (they
+share that read). The idle check reads them only when the loop holds no
+request, in-flight forward or open cache op.
 
 ## Subsystems in detail
 

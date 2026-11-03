@@ -196,10 +196,6 @@ private:
         std::span<const std::string> prefix_hashes;
     };
 
-    struct KvEventHashProgress {
-        std::vector<std::uint64_t> block_hashes;
-    };
-
     // What the per-request admission layer reports back to the role
     // grammars. Together with the output ExecutionPlan (where admit()
     // records fresh pages to zero) this is ALL that layer sees of a
@@ -274,12 +270,12 @@ private:
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
         std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
-    void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+    void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,
     // at a tail, the partial page under its tail hash (token_ids = the rows
     // below T, parent = the last full page).
-    void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+    void registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     // Finished requests whose forwards have all landed: publish the frontier
@@ -525,7 +521,6 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).

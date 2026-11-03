@@ -536,3 +536,43 @@ the CuTe kernel retains its own layouts and alignment. Each forward executes
 one collective with no 128-token chunk loop. All layers and captured capacities
 continue to share stable workspace addresses. Kimi K3 writes packed activations
 and routes directly into views of this full-capacity symmetric allocation.
+
+## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
+
+On Blackwell with one TP8 group shared by attention and MoE, a decode forward
+(speculative verify included) of 1-8, 16, 32, or 64 token rows that a captured
+decode graph runs takes every MoE layer through one chain of vendored CuTe DSL
+kernels (`thirdparty/cute_dsl/k3_decode`).
+The kernels hand rows to each other through Lamport mailboxes in multicast
+symmetric memory instead of NCCL collectives:
+
+1. One GEMM computes this rank's 112 router logits and 448 latent-down rows
+   and multicasts both to every rank.
+2. One kernel takes the top-16 experts (sigmoid plus correction bias,
+   renormalized, scaled) and gathers the full latent row.
+3. Persistent MXFP4 experts compute this rank's intermediate slice of the
+   chosen experts and combine them into a weighted latent partial.
+4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
+   this rank's up-projection rows, adds the shared expert (run on a side
+   stream), and multicasts the output row.
+5. A ring kernel adds that row to the residual.
+
+Activations enter the experts as MXFP8, as in the TRT-LLM MoE. The routed SiTU
+uses the approximate `tanh`; the shared expert's is exact. A mailbox reader
+re-arms what it read, so the chain needs no separate reset and replays in a
+CUDA graph. Every rank must run the same batches, since each mailbox is shared
+by the group. Other row counts and every non-decode forward keep the TRT-LLM
+MoE.
+
+Three places decide where the chain runs. The Kimi-K3 MoE execution plan
+allows it for one tensor-parallel group shared by attention and MoE on
+Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
+`cutlass` import, so any platform can ask) declares what the kernels serve: TP8
+MXFP4 experts behind an ungrouped sigmoid top-16 router over 896 experts, a
+linear SiTU cap, a BF16 router, PDL enabled, and no batch-invariant reduction.
+The model then binds it where both hold for every MoE layer, the node decodes
+(not a prefill-only disaggregated role), the group has multicast, and the
+decode graphs run a supported row count. Under speculative decoding the
+shared expert uses the splits tuned for verify steps. Each MoE layer keeps a contiguous copy
+of its router rows and latent-down shard (about 7.7 MiB per layer at TP8)
+beside the mailboxes and scratch.
