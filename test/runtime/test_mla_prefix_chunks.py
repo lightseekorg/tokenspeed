@@ -293,7 +293,12 @@ def test_attention_partition_accuracy_and_graph_replay(
 
     before, before_lse = run(0)
     after, after_lse = run(1)
-    torch.testing.assert_close(after, before, atol=3e-3, rtol=1e-2)
+    # The two plans cut the history at different positions, so the partial
+    # softmax states merge in a different order before the bf16 rounding of
+    # the output; with FP8 inputs the partials themselves carry more rounding
+    # noise and the merged outputs may land one bf16 ulp apart.
+    atol = 3e-3 if dtype == torch.bfloat16 else 1e-2
+    torch.testing.assert_close(after, before, atol=atol, rtol=1e-2)
     torch.testing.assert_close(after_lse, before_lse, atol=2e-4, rtol=2e-4)
     if dtype == torch.bfloat16:
         offset = 0
