@@ -98,6 +98,10 @@ __all__ = [
     "GROUPS_PER_EXPERT",
     "TAG_WORDS_PER_EXPERT",
     "UNITS_PER_EXPERT",
+    "MoeBuffers",
+    "NativeMoeState",
+    "gluon_mxfp4_moe_native_stream_gfx950",
+    "launch_gluon_mxfp4_moe_native_stream_gfx950",
     "native_moe_plan",
     "prefetch_moe",
     "run_moe",
@@ -1468,8 +1472,6 @@ class NativeMoeState:
 def _int32_words(scale):
     """The uint8 scale tensor's bytes from its first element on, as int32
     words: the stream reads E8M0 scales one dword at a time."""
-    import torch
-
     storage = scale.untyped_storage()
     if scale.dtype != torch.uint8 or scale.storage_offset() % 4:
         raise ValueError("scales must be uint8 starting on a 4-byte boundary")
@@ -1520,8 +1522,6 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         swiglu_alpha, swiglu_limit, swiglu_beta: The model's SwiGLU.
         deadline_ticks: How long a readiness wait may last (10 ns ticks).
     """
-    from tokenspeed_kernel_amd.ops.gfx950.persistent import GRID
-
     rows, top_k = topk_ids.shape
     # The stream's tiling is the EP1 slice of a 4096-wide model with 512
     # intermediate columns per rank.

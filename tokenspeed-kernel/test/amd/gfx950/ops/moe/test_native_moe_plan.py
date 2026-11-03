@@ -265,12 +265,9 @@ def test_lane_major_scales_follow_the_mfma_lanes():
     scale = torch.randint(0, 256, (3, 64, 32), dtype=torch.uint8, generator=generator)
     packed = pack_cdna4_mxfp4_scale_lanes(scale)
     assert packed.shape == (3, 4, 64, 8) and packed.is_contiguous()
-    for e in range(3):
-        for strip in range(4):
-            for lane in range(64):
-                for step in range(8):
-                    n, quad = lane % 16, lane // 16
-                    assert (
-                        packed[e, strip, lane, step]
-                        == scale[e, 16 * strip + n, 4 * step + quad]
-                    )
+    # Lane 16 q + n of strip s holds column 16 s + n, K quad q, at step t.
+    strip, lane, step = torch.meshgrid(
+        torch.arange(4), torch.arange(64), torch.arange(8), indexing="ij"
+    )
+    expected = scale[:, 16 * strip + lane % 16, 4 * step + lane // 16]
+    assert torch.equal(packed, expected)
