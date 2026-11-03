@@ -1221,11 +1221,13 @@ Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
 headroom per rank. Each buffer counts at the size its configured pinned
-allocator reserves. On CUDA/ROCm, the launcher defaults
-`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
-up to 1 GiB round to a power of two; larger buffers use their requested size.
-This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
-and other allocator options are preserved. To override the default, set
+allocator reserves. When the CUDA/ROCm allocator supports it, the launcher sets
+`pinned_max_round_threshold_mb:1024` as the default before starting the ranks.
+Allocations up to 1 GiB round to a power of two; larger buffers use their
+requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Allocators without this
+option keep their native defaults. Explicit thresholds and other allocator
+options are preserved. To override the default, set
 `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
 the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
 take precedence, in that order. The check reads the effective allocator
