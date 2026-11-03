@@ -24,11 +24,13 @@
 
 #include "cache/prefix/prefix_hasher.h"
 #include "fsm/forward_events.h"
+#include "scheduler/kv_cache_events.h"
 
 namespace tokenspeed {
 
 Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
+      session_id_{spec.session_id},
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
@@ -44,6 +46,19 @@ std::span<const std::string> Request::PromptPrefixHashes() {
         prompt_prefix_hashes_ = ComputePrefixHashes(pages, "");
     }
     return *prompt_prefix_hashes_;
+}
+
+std::span<const std::uint64_t> Request::KvEventBlockHashes(std::size_t num_pages) {
+    if (kv_event_block_hashes_.size() < num_pages) {
+        const std::vector<std::span<const std::int32_t>> pages = FullPrefixPages(false);
+        _assert(num_pages <= pages.size(), "KV event hashes exceed the request's complete pages");
+        for (std::size_t i = kv_event_block_hashes_.size(); i < num_pages; ++i) {
+            const std::optional<std::uint64_t> parent_hash =
+                i == 0 ? std::nullopt : std::optional<std::uint64_t>{kv_event_block_hashes_[i - 1]};
+            kv_event_block_hashes_.push_back(HashKvBlock(pages[i], parent_hash));
+        }
+    }
+    return std::span<const std::uint64_t>{kv_event_block_hashes_}.first(num_pages);
 }
 
 PrefillInfo Request::CurrentPrefillInfo() const {

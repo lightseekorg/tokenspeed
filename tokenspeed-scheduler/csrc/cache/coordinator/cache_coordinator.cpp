@@ -43,6 +43,92 @@
 
 namespace tokenspeed {
 
+SessionCacheOwner CacheCoordinator::sessionTag(const std::string& id) {
+    auto& weak = session_tags_[id];
+    if (auto tag = weak.lock(); tag && !tag->ended) {
+        tag->demoted = false;
+        return tag;
+    }
+    auto tag = std::make_shared<SessionCacheTag>();
+    tag->id = id;
+    weak = tag;
+    if (++session_tags_since_sweep_ >= 4096) {
+        session_tags_since_sweep_ = 0;
+        std::erase_if(session_tags_, [](const auto& entry) { return entry.second.expired(); });
+    }
+    return tag;
+}
+
+CacheCoordinator::SessionAccess::SessionAccess(CacheCoordinator& coordinator, std::uint64_t access_epoch,
+                                               SessionCacheOwner session)
+    : coordinator_{&coordinator}, access_epoch_{access_epoch} {
+    const bool inserted = coordinator.session_access_.emplace(access_epoch, std::move(session)).second;
+    _assert(inserted, "an access epoch registers one session");
+}
+
+CacheCoordinator::SessionAccess::SessionAccess(SessionAccess&& other) noexcept
+    : coordinator_{std::exchange(other.coordinator_, nullptr)}, access_epoch_{std::exchange(other.access_epoch_, 0)} {}
+
+CacheCoordinator::SessionAccess& CacheCoordinator::SessionAccess::operator=(SessionAccess&& other) noexcept {
+    if (this != &other) {
+        release();
+        coordinator_ = std::exchange(other.coordinator_, nullptr);
+        access_epoch_ = std::exchange(other.access_epoch_, 0);
+    }
+    return *this;
+}
+
+CacheCoordinator::SessionAccess::~SessionAccess() {
+    release();
+}
+
+void CacheCoordinator::SessionAccess::release() noexcept {
+    if (CacheCoordinator* coordinator = std::exchange(coordinator_, nullptr)) {
+        coordinator->session_access_.erase(access_epoch_);
+    }
+}
+
+std::size_t CacheCoordinator::DemoteSession(const std::string& session_id, bool ended) {
+    return DemoteSessions({session_id}, ended);
+}
+
+std::size_t CacheCoordinator::DemoteSessions(const std::vector<std::string>& ids, bool ended) {
+    std::vector<SessionCacheOwner> owners;
+    std::unordered_set<const SessionCacheTag*> tags;
+    for (const auto& id : ids) {
+        auto it = session_tags_.find(id);
+        if (it == session_tags_.end()) continue;
+        auto tag = it->second.lock();
+        if (!tag) {
+            session_tags_.erase(it);
+            continue;
+        }
+        tag->demoted = true;
+        tag->ended = tag->ended || ended;
+        tags.insert(tag.get());
+        owners.push_back(std::move(tag));
+    }
+    if (tags.empty()) return 0;
+    std::size_t changed = 0;
+    for (auto& group : groups_) {
+        changed += group.Index().DemoteSessions(pool_, tags);
+        if (host_pool_) changed += group.Index().DemoteSessions(*host_pool_, tags);
+    }
+    return changed;
+}
+
+std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStores() {
+    auto pending = std::exchange(pending_stores_, {});
+    std::erase_if(pending, [this](const StoreCandidate& candidate) {
+        const auto& index = groups_[candidate.key.group_id].Index();
+        auto location = locationOf(pool_, candidate.key.group_id, candidate.key);
+        if (!location) return false;
+        auto metadata = index.MetadataFor(pool_, *location);
+        return metadata && metadata->session && metadata->session->ended;
+    });
+    return pending;
+}
+
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                                    bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                                    bool stream_device_cache_to_host, bool write_back_evictions)
@@ -438,22 +524,23 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         // A State group's hits count from page 0 (PrefixProbe::Tier).
         const std::int32_t floor_pages = GroupIsState(i) ? 0 : floor_tokens / geometry_[i].BlockGranularity();
-        out.per_group[i] =
-            groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
+        out.per_group[i] = groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i],
+                                                             access_epoch, SessionForAccess(access_epoch));
         if constexpr (Tier == CacheTier::kDevice) {
             if (host_pool_ != nullptr) {
                 groups_[i].Index().TouchExisting(*host_pool_, std::span{group_keys[i]}.subspan(floor_pages),
-                                                 out.per_group[i].blocks, access_epoch);
+                                                 out.per_group[i].blocks, access_epoch, SessionForAccess(access_epoch));
             }
         }
         if (probe.tail && !probe.tail->group_keys[i].empty()) {
             // The tail's blocks follow the full pages in the same table.
-            PrefixMatch tail_match = groups_[i].Index().AcquireMatched(
-                pool, probe.tail->group_keys[i], /*begin_blocks=*/0, probe.tail->per_group[i], access_epoch);
+            PrefixMatch tail_match = groups_[i].Index().AcquireMatched(pool, probe.tail->group_keys[i],
+                                                                       /*begin_blocks=*/0, probe.tail->per_group[i],
+                                                                       access_epoch, SessionForAccess(access_epoch));
             if constexpr (Tier == CacheTier::kDevice) {
                 if (host_pool_ != nullptr) {
                     groups_[i].Index().TouchExisting(*host_pool_, probe.tail->group_keys[i], tail_match.blocks,
-                                                     access_epoch);
+                                                     access_epoch, SessionForAccess(access_epoch));
                 }
             }
             out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
@@ -1176,12 +1263,13 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
             if (probe.state_at_prompt_end->group_keys[i].empty()) {
                 continue;
             }
-            PrefixMatch match = groups_[i].Index().AcquireMatched(
-                pool_, probe.state_at_prompt_end->group_keys[i],
-                /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i], access_epoch);
+            PrefixMatch match =
+                groups_[i].Index().AcquireMatched(pool_, probe.state_at_prompt_end->group_keys[i],
+                                                  /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i],
+                                                  access_epoch, SessionForAccess(access_epoch));
             if (host_pool_ != nullptr) {
                 groups_[i].Index().TouchExisting(*host_pool_, probe.state_at_prompt_end->group_keys[i], match.blocks,
-                                                 access_epoch);
+                                                 access_epoch, SessionForAccess(access_epoch));
             }
             out.state_at_prompt_end[i] = std::move(match.blocks.front());
             if (BoundaryTree::Node* node = boundary_tree_.Find(probe.state_at_prompt_end->hash)) {
@@ -1413,17 +1501,18 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
                                            std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
                                            bool stream_completed_to_host) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
+    const SessionCacheOwner session = SessionForAccess(access_epoch);
     const bool automatically_streams_to_host =
         stream_device_cache_to_host_ &&
         (groups_[group_index].Spec().attn_kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     groups_[group_index].Index().RegisterFullBlocks(tierPool<Tier>(), blocks, keys, access_epoch, first_logical_block,
-                                                    boundary_kind,
-                                                    Tier == CacheTier::kDevice ? &newly_cached : nullptr);
+                                                    boundary_kind, Tier == CacheTier::kDevice ? &newly_cached : nullptr,
+                                                    session);
     if constexpr (Tier == CacheTier::kHost) {
         return;
     }
     if (host_pool_ != nullptr) {
-        groups_[group_index].Index().TouchExisting(*host_pool_, keys, blocks, access_epoch);
+        groups_[group_index].Index().TouchExisting(*host_pool_, keys, blocks, access_epoch, session);
     }
     for (auto& [key, block_ref] : newly_cached) {
         // Every hash an index holds has a tree node: a publication linked its
@@ -1442,7 +1531,7 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
         }
-        if (!automatically_streams_to_host) {
+        if (!automatically_streams_to_host || (session && session->ended)) {
             continue;
         }
         pending_stores_.push_back(StoreCandidate{
@@ -2363,13 +2452,14 @@ void CacheCoordinator::MarkSupersededStateInput(const ContentHash& resumed_tail_
     // Registering touches an existing entry with the epoch given (and keeps
     // its position and boundary kind): the tail's blocks and checkpoints
     // leave the eviction order's newest end for its oldest.
-    ForEachBoundaryKey(
-        CacheKey{.content_hash = resumed_tail_hash}, *tail_tokens, [&](std::size_t i, const CacheKey& key) {
-            if (CacheBlockRef block = groups_[i].Index().Find(pool_, key)) {
-                groups_[i].Index().Register(pool_, block, key, kSupersededAccessEpoch, /*logical_block_index=*/-1,
-                                            CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
-            }
-        });
+    ForEachBoundaryKey(CacheKey{.content_hash = resumed_tail_hash}, *tail_tokens,
+                       [&](std::size_t i, const CacheKey& key) {
+                           if (CacheBlockRef block = groups_[i].Index().Find(pool_, key)) {
+                               groups_[i].Index().Register(pool_, block, key, kSupersededAccessEpoch,
+                                                           /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                           /*newly_cached=*/nullptr, SessionForAccess(access_epoch));
+                           }
+                       });
 }
 
 void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
@@ -2579,10 +2669,11 @@ std::vector<CacheBlockRef> CacheCoordinator::RetainInputCheckpoint(std::span<con
     return blocks;
 }
 
-void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks) {
+void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks, std::uint64_t request_access_epoch) {
     if (blocks.empty()) {
         return;
     }
+    const SessionCacheOwner session = SessionForAccess(request_access_epoch);
     const std::uint64_t access_epoch = ++next_access_epoch_;
     for (CacheBlockRef& block : blocks) {
         _assert(block.IsOwnedBy(pool_) || host_pool_ != nullptr && block.IsOwnedBy(*host_pool_),
@@ -2598,7 +2689,7 @@ void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks
         const auto metadata = index.MetadataFor(pool, block->Location());
         _assert(metadata.has_value(), "a cached block has eviction metadata");
         index.Register(pool, block, *key, access_epoch, metadata->logical_block_index, metadata->boundary_kind,
-                       /*newly_cached=*/nullptr);
+                       /*newly_cached=*/nullptr, session);
         if (GroupIsState(key->group_id)) {
             BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
             _assert(node != nullptr, "a cached checkpoint has a boundary-tree node");
@@ -2865,7 +2956,7 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
         metadata.last_access_epoch = ++next_access_epoch_;
     }
     index.Register(*host_pool_, block_ref, key, metadata.last_access_epoch, metadata.logical_block_index,
-                   metadata.boundary_kind, /*newly_cached=*/nullptr);
+                   metadata.boundary_kind, /*newly_cached=*/nullptr, metadata.session);
     // A store's entry keeps the node its Device publication linked while
     // either tier holds the hash; an L3 GET's, or a store's whose Device
     // entry left before the ACK, starts one without a parent, until a
@@ -2902,7 +2993,7 @@ void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey
     _assert(key.group_id < groups_.size(), "CacheDeviceBlock group id out of range");
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     groups_[key.group_id].Index().Register(pool_, block_ref, key, access_epoch, logical_block_index, boundary_kind,
-                                           &newly_cached);
+                                           &newly_cached, SessionForAccess(access_epoch));
     // The node the restored entry was published under is gone when no tier
     // held the hash meanwhile; then it starts one without a parent, until a
     // publication through its hash gives it its boundary (and, past page 0,

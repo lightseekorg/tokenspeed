@@ -25,7 +25,7 @@ jobs:
             group: pr-test-amd-kernel-benchmark
           - name: NVIDIA B200 Tests
             group: pr-test-nvidia
-          - name: PR Test NVIDIA ARM
+          - name: NVIDIA ARM Tests
             group: pr-test-nvidia-arm
           - name: NVIDIA GB200 Tests
             group: gb200-slurm-per-commit

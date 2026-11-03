@@ -20,6 +20,7 @@
 
 """Check the fused stager against FlashInfer quantization and captured reuse."""
 
+import gc
 from contextlib import nullcontext
 
 import pytest
@@ -99,6 +100,8 @@ def test_fused_nvfp4_input_stage(hidden, ids_dtype, routes_dtype, scores_dtype):
             run(x, ids, scores)
         check(x, ids, scores)
 
+    # Serving collects first too; a dead CuTe executor's unload breaks capture.
+    gc.collect()
     captured = []
     for n in (3, 13, 0):
         x, ids, scores = inputs(n)

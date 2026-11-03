@@ -108,13 +108,15 @@ impl BatchLogger {
         )
     }
 
-    /// Log the round being dispatched. `context_length` is a running
-    /// request's tokens (prompt and generated); `group_pages` a cache group's
-    /// total and available pages. Both are read only for an emitted line.
+    /// Log the round being dispatched. `stats` are the scheduler's counts;
+    /// `context_length` is a running request's tokens (prompt and
+    /// generated); `group_pages` a cache group's total and available pages.
+    /// Each is read only for an emitted line: the counts walk the
+    /// scheduler's block tables.
     pub fn log_dispatch(
         &mut self,
         batch: &ForwardBatchView,
-        stats: &RoundStats,
+        stats: impl FnOnce() -> RoundStats,
         context_length: impl Fn(&str) -> i64,
         group_pages: impl Fn(&str) -> (i32, i32),
     ) {
@@ -125,9 +127,9 @@ impl BatchLogger {
         let num_extends = batch.num_extends;
         let bs = batch.request_ids.len();
         if num_extends > 0 {
-            self.log_extend(batch, stats);
+            self.log_extend(batch, &stats());
         } else if self.step % self.config.decode_log_interval.max(1) == 0 {
-            self.log_decode(batch, bs, stats, context_length, group_pages);
+            self.log_decode(batch, bs, &stats(), context_length, group_pages);
         }
     }
 
@@ -287,7 +289,7 @@ mod tests {
             cached_pages: 0,
             pd: [0; 5],
         };
-        logger.log_dispatch(&batch(&["a"], 1, &[4]), &stats, |_| 0, |_| (0, 0));
+        logger.log_dispatch(&batch(&["a"], 1, &[4]), || stats, |_| 0, |_| (0, 0));
         assert!(logger.seen_prefill_ids.contains("a"));
         logger.record_decode(&[1, 3]);
         assert_eq!(
@@ -295,5 +297,40 @@ mod tests {
             (4, 2)
         );
         assert_eq!(logger.step, 1);
+    }
+
+    #[test]
+    fn only_an_emitted_line_reads_the_scheduler_counts() {
+        let mut logger = BatchLogger::new(BatchLogConfig {
+            enabled: true,
+            decode_log_interval: 3,
+            num_total_pages: 100,
+            spec_num_steps: 0,
+            dp_rank: 0,
+            disaggregated: false,
+            cache_state_group_ids: Vec::new(),
+            log_spec_accept_lengths: false,
+        });
+        let stats = RoundStats {
+            queued: 0,
+            active_pages: 1,
+            cached_pages: 0,
+            pd: [0; 5],
+        };
+        let decode = batch(&["a"], 0, &[]);
+        let mut reads = 0;
+        for _ in 0..6 {
+            logger.log_dispatch(
+                &decode,
+                || {
+                    reads += 1;
+                    stats
+                },
+                |_| 0,
+                |_| (0, 0),
+            );
+        }
+        // A decode line goes out every third round.
+        assert_eq!(reads, 2);
     }
 }

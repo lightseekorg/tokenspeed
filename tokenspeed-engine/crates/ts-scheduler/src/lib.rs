@@ -45,6 +45,8 @@ mod ffi {
     struct RequestSpec {
         /// Request id.
         request_id: String,
+        /// Router-only cache retention identity, empty when untracked.
+        session_id: String,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -378,6 +380,23 @@ mod ffi {
         evicted_then_needed_tokens: Vec<u64>,
     }
 
+    #[derive(Debug, Clone, PartialEq)]
+    /// Snapshot in physical allocator units. The curve is a conservative
+    /// fresh-request bound from the scheduler's own multi-group capacity model.
+    struct AdmissionSnapshot {
+        free_slots: i32,
+        total_slots: i32,
+        available_blocks: i32,
+        total_blocks: i32,
+        host_free_blocks: i32,
+        host_total_blocks: i32,
+        retracted: usize,
+        waiting: usize,
+        max_tokens: i32,
+        capacity_token_step: i32,
+        capacity_blocks: Vec<i64>,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
@@ -445,6 +464,13 @@ mod ffi {
             done: &[StorageDoneView],
             cache_events: &[CacheEvent],
         ) -> Result<()>;
+        fn demote_sessions(
+            scheduler: Pin<&mut Scheduler>,
+            session_ids: &[String],
+            ended: bool,
+        ) -> usize;
+        fn demote_session(scheduler: Pin<&mut Scheduler>, session_id: &str, ended: bool) -> usize;
+        fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
@@ -613,7 +639,22 @@ impl Scheduler {
         )
     }
 
-    /// Request and page counts.
+    /// Apply one batch with a single scan of each cache index.
+    pub fn demote_sessions(&mut self, session_ids: &[String], ended: bool) -> usize {
+        ffi::demote_sessions(self.pinned(), session_ids, ended)
+    }
+
+    /// Lower only this session's exclusive cache entries in the eviction order.
+    pub fn demote_session(&mut self, session_id: &str, ended: bool) -> usize {
+        ffi::demote_session(self.pinned(), session_id, ended)
+    }
+
+    /// Poll native capacity; token_step must be positive.
+    pub fn admission_snapshot(&self, token_step: i32) -> ffi::AdmissionSnapshot {
+        ffi::admission_snapshot(self.get(), token_step)
+    }
+
+    /// Request and physical block counts.
     pub fn sizes(&self) -> SchedulerSizes {
         ffi::sizes(self.get())
     }

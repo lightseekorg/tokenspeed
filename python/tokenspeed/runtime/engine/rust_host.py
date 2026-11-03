@@ -290,6 +290,8 @@ def start_rust_host(
                 sys.executable,
                 "--control-fd",
                 str(child.fileno()),
+                "--enable-async-logging",
+                str(server_args.enable_async_logging).lower(),
             ],
             executable=binary,
             pass_fds=[child.fileno(), held_until_exit],
