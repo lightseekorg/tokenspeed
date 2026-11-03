@@ -2107,12 +2107,17 @@ class MuseSparkDecoderLayer(nn.Module):
             "post_attention_norm": norm(self.post_attention_layernorm),
             "post_attention_gate": post_attention,
             "pre_feedforward_norm": norm(self.pre_feedforward_layernorm),
+            # [hidden, experts] FP32; the logits are scaled by the multiplier
+            # before the sigmoid.
             "router": mlp.gate.weight,
+            "router_multiplier": mlp.gate.multiplier,
             "router_bias": mlp.gate.e_score_correction_bias,
             "pooler": mlp.pre_expert_proj.weight,
+            "pooler_replicated": mlp.pre_expert_proj.replicated,
             "pooled_norm": norm(mlp.pre_expert_norm),
             "experts": mlp.experts,
             "post_expert_proj": mlp.post_expert_proj.weight,
+            "post_expert_replicated": mlp.post_expert_proj.replicated,
             "post_expert_norm": norm(mlp.post_expert_norm),
             "post_feedforward_norm": norm(self.post_feedforward_layernorm),
             "post_feedforward_gate": post_feedforward,
