@@ -35,7 +35,7 @@ import pytest
 
 pytest.importorskip("tokenspeed_kernel_amd")
 
-from tokenspeed_kernel_amd._triton import gluon, triton  # noqa: E402
+from tokenspeed_kernel_amd._triton import gl, gluon, triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import native_stream  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     persistent_compile_options,
@@ -61,9 +61,31 @@ VARIANTS = [
 ]
 
 
-def _compile(fields):
+@gluon.jit
+def _pair_word_sink(args, y, route, cols):
+    """A Lamport-style sink like the layer's H4 push: whole bf16 pairs as
+    32-bit words, one relaxed system-scope store each, all in the lane."""
+    words_ptr = args[0].to(gl.pointer_type(gl.int32), bitcast=True)
+    zeros = gl.zeros(y.shape, gl.int32, y.type.layout)
+    low, high = gl.split(gl.reshape(y.to(gl.bfloat16), [16, 64, 2]))
+    column, _ = gl.split(gl.reshape(cols + zeros, [16, 64, 2]))
+    row, _ = gl.split(gl.reshape(route + zeros, [16, 64, 2]))
+    words = low.to(gl.uint16, bitcast=True).to(gl.uint32) | (
+        high.to(gl.uint16, bitcast=True).to(gl.uint32) << 16
+    )
+    gl.atomic_store(
+        words_ptr + row * 2048 + column // 2,
+        words.to(gl.int32, bitcast=True),
+        mask=row >= 0,
+        sem="relaxed",
+        scope="sys",
+    )
+
+
+def _compile(fields, sink=native_stream.store_routes_sink):
     fn = native_stream.gluon_mxfp4_moe_native_stream_gfx950
     const = dict(
+        SINK=sink,
         N_PHYS1=1024,
         N_PHYS2=4096,
         TOPK=8,
@@ -217,3 +239,20 @@ def test_item_loops_keep_the_ring(fields):
                 assert len(scales) == 2, scales
             else:
                 assert sum(s.startswith("buffer_load_dword ") for s in body) == 16
+
+
+def test_down_loop_sink_stays_in_the_wave():
+    """A sink that packs column pairs works in the handed layout: the down
+    loop (per-wave trip counts) gets no barrier and no LDS round trip."""
+    fields = dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=0)
+    plain = _compile(fields)
+    paired = _compile(fields, _pair_word_sink)
+    ins = _instructions(paired)
+    start, end = _item_loops(ins)[16]
+    body = [s for s, _ in ins[start : end + 1]]
+    assert not any(s.startswith("s_barrier") for s in body)
+    assert not any(s.startswith("ds_write") for s in body)
+    vgprs = [
+        int(re.search(r"\.vgpr_count:\s+(\d+)", a).group(1)) for a in (plain, paired)
+    ]
+    assert vgprs[1] <= vgprs[0] + 8, vgprs
