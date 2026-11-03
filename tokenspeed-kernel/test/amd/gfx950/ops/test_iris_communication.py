@@ -20,10 +20,12 @@
 
 
 import math
+import os
 import socket
 import time
 import traceback
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -138,6 +140,100 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
     monkeypatch.setattr(iris_ops, "_PRODUCER_TWO_SHOT_MIN_BYTES", {})
     assert iris_ops._use_two_stage_plain(8, 8 * 7168, torch.bfloat16)
     assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
+
+
+def test_context_maps_hosts_with_vmem_chunked(monkeypatch):
+    from tokenspeed_kernel.ops.communication import _iris
+
+    created = []
+    monkeypatch.setattr(_iris, "_context", None)
+    monkeypatch.setattr(_iris, "_allocator_type", None)
+    # A mapped world across hosts needs gfx1250 trays in one fabric domain.
+    monkeypatch.setattr(_iris, "_spans_hosts", True)
+    monkeypatch.setattr(_iris, "_unmapped_reason", None)
+    monkeypatch.setattr(
+        _iris.iris,
+        "iris",
+        lambda heap_size, device, **options: created.append(
+            options.get("allocator_type")
+        ),
+    )
+
+    _iris.get_or_create_context(heap_size=1 << 20)
+    assert created == ["vmem_chunked"]
+
+
+def test_context_refuses_a_world_it_cannot_map(monkeypatch):
+    from tokenspeed_kernel.ops.communication import _iris
+
+    monkeypatch.setattr(_iris, "_context", None)
+    monkeypatch.setattr(_iris, "_spans_hosts", True)
+    monkeypatch.setattr(
+        _iris, "_unmapped_reason", "the GPUs are not all in one fabric domain"
+    )
+    monkeypatch.setattr(
+        _iris.iris, "iris", Mock(side_effect=AssertionError("heap created"))
+    )
+
+    with pytest.raises(RuntimeError, match="not all in one fabric domain"):
+        _iris.get_or_create_context(heap_size=1 << 20)
+
+
+def _discover_world_worker_fn(rank, world_size, port, hosts, error_dict):
+    try:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        from tokenspeed_kernel.ops.communication import _iris
+        from tokenspeed_kernel.ops.communication.iris import (
+            discover_iris_world,
+            iris_maps_world,
+        )
+
+        # Both ranks run on this machine; each claims the host given to it.
+        identity, hostname = hosts[rank]
+        _iris.host_identity = lambda: identity
+        _iris.socket.gethostname = lambda: hostname
+        assert iris_maps_world() is None
+        maps = discover_iris_world()
+        assert iris_maps_world() is maps
+        error_dict[rank] = (maps, _iris._spans_hosts, _iris._unmapped_reason)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    ("hosts", "spans_hosts", "reason"),
+    [
+        (((7, "a"), (7, "a")), False, None),
+        (((1, "a"), (2, "a")), True, "hostnames and boot ids disagree"),
+        (((7, "a"), (7, "b")), False, "hostnames and boot ids disagree"),
+        (((1, "a"), (2, "b")), True, "only gfx1250"),
+    ],
+    ids=["one-host", "shared-hostname", "split-hostname", "two-hosts"],
+)
+def test_discover_world_tells_hosts_apart_as_iris_does(hosts, spans_hosts, reason):
+    if reason == "only gfx1250" and current_platform().is_cdna5:
+        pytest.skip("gfx1250 across hosts runs Iris's fabric topology discovery")
+    results = mp.Manager().dict()
+    mp.spawn(
+        _discover_world_worker_fn,
+        args=(2, _get_open_port(), hosts, results),
+        nprocs=2,
+        join=True,
+    )
+    for rank in range(2):
+        assert not isinstance(results[rank], str), results[rank]
+        maps, spans, unmapped = results[rank]
+        assert maps is (reason is None)
+        assert spans is spans_hosts
+        assert (unmapped is None) if reason is None else (reason in unmapped)
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +994,59 @@ def test_iris_all_reduce_noncontiguous_subgroups():
     _skip_if_unsupported(world_size, "Iris subgroup all-reduce tests")
     port = _get_open_port()
     _spawn_and_collect(_ar_subgroup_worker_fn, (world_size, port), world_size)
+
+
+def _check_placed_all_reduce(rank: int, world_size: int, gpu: int) -> None:
+    """Reduce over the world from ``gpu``, which need not equal rank % GPUs."""
+    from tokenspeed_kernel.ops.communication._iris import get_or_create_context
+    from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+    device = torch.device(f"cuda:{gpu}")
+    torch.cuda.set_device(device)
+    state = create_iris_state(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=16 * 7168,
+        producer_direct_max_numel=16 * 7168,
+        dtype=torch.bfloat16,
+        heap_size=None,
+        device=torch.device("cuda"),
+    )
+    ctx = get_or_create_context(heap_size=0)
+    assert torch.cuda.current_device() == ctx.gpu_id == gpu
+    assert ctx.zeros((1,), dtype=torch.bfloat16).device == device
+    for shape in ((1, 7168), (16, 7168)):
+        _check_all_reduce(state, rank, world_size, shape, device)
+
+
+def _partial_placement_worker_fn(
+    rank, world_size, port, base_gpu, allocator_type, error_dict
+):
+    try:
+        os.environ["IRIS_ALLOCATOR"] = allocator_type
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        _check_placed_all_reduce(rank, world_size, base_gpu + rank)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("allocator_type", ["torch", "vmem", "vmem_chunked"])
+def test_iris_all_reduce_on_gpus_past_the_rank_index(allocator_type):
+    """Two ranks on GPUs 2-3 of four, as with a base GPU offset of 2."""
+    _skip_if_unsupported(4, "Iris partial-placement tests")
+    _spawn_and_collect(
+        _partial_placement_worker_fn,
+        (2, _get_open_port(), 2, allocator_type),
+        2,
+    )
 
 
 # ---------------------------------------------------------------------------

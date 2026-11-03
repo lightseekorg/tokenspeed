@@ -1367,7 +1367,13 @@ Notes:
 - Serving requires `--dtype bfloat16`. Beam's flag-free defaults, the `trtllm`
   attention backend and the `flashinfer_trtllm` MoE backend, apply on NVIDIA
   SM100 to SM103 and were validated on SM100 (GB200) only. Beam serves without
-  TF32 on every platform.
+  TF32 on every platform. Beam's own Triton kernels (routing, SSMax, the
+  residual norm and the soft cap) and the BF16x3 router GEMM run on NVIDIA SM90
+  to SM103.
+- On NVIDIA SM90 the BF16 checkpoint's experts run on the Triton BF16 MoE and
+  the FP8 checkpoint's experts on the Triton FP8 per-channel MoE; the FP8
+  checkpoint's dense linears are dequantized to BF16 at load. NVFP4 experts
+  need SM100 to SM103.
 - `--grammar-backend xgrammar` lets forced tool choice and JSON
   `response_format` work, and `--enable-mixed-batch
   --prefill-graph-max-tokens 8192` runs a prompt chunk in the same step as the

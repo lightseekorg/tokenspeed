@@ -140,13 +140,28 @@ def test_remote_selection_is_valid_but_remote_write_is_masked():
     assert not backend.cuda_graph_support.prefill_graph
     tables = _tables("cpu")
     tables[R1][0, :2] = torch.tensor([1, 2], dtype=torch.int32)
+    # The shared _extend helper supplies host tables. Omit them explicitly
+    # here to test the invalid-input contract before exercising real KVP.
+    lengths = torch.tensor([128], dtype=torch.int32)
+    zeros = torch.zeros(1, dtype=torch.int32)
     with pytest.raises(ValueError, match="host block tables"):
-        _extend(backend, tables, [128], [0], [0], [128])
-    # Use the existing fixture to initialize all baseline metadata, then restore KVP.
-    backend.kvp_size = 1
+        backend.init_forward_metadata(
+            1,
+            1,
+            torch.zeros(1, dtype=torch.int64),
+            lengths,
+            ForwardMode.EXTEND,
+            block_tables=tables,
+            extend_seq_lens=lengths,
+            extend_seq_lens_cpu=lengths,
+            extend_prefix_lens=zeros,
+            extend_prefix_lens_cpu=zeros,
+            extend_replay_lens_cpu=zeros,
+            extend_prompt_lens_cpu=lengths,
+            extend_with_prefix=False,
+            query_shard=None,
+        )
     _extend(backend, tables, [128], [0], [0], [128])
-    backend.kvp_size = 2
-    backend._kvp_tables_cpu = tables
     positions = torch.tensor([0, 64], dtype=torch.int64)
     requests = torch.zeros(2, dtype=torch.int64)
     writes = backend.cache_slots(R1, positions, requests, ForwardMode.EXTEND)
@@ -161,7 +176,7 @@ def test_remote_selection_is_valid_but_remote_write_is_masked():
     "role,speculative,mixed,graph",
     [
         ("encode", None, False, False),
-        ("decode", None, False, False),
+        ("decode", "MTP", False, False),
         ("prefill", "MTP", False, False),
         ("prefill", None, True, False),
         ("prefill", None, False, True),
@@ -312,6 +327,7 @@ def test_kvp_decode_refresh_has_no_host_history_plan(
                 ForwardMode.DECODE,
                 None,
                 projected_partition=None,
+                query_shard=None,
             )
         assert calls == ([False] * 4 if local_reindex else [False] * 4 + [True] * 2)
         assert len(history_calls) == (4 if local_reindex else 6)

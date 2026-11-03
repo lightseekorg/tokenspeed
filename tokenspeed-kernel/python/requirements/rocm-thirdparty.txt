@@ -1,2 +1,2 @@
-tokenspeed-iris==0.0.0.post20261013
+tokenspeed-iris==0.0.0.post20261031
 tokenspeed-kernel-amd>=0.1.4

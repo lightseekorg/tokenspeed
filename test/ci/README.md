@@ -63,10 +63,11 @@ separate processes. `ut-tokenspeed-kernel-post-submit` runs the slow files that
 on pushes to `main` only. Together the three tasks cover the kernel suite once.
 AMD runners run the whole suite in the single `ut-tokenspeed-kernel` task.
 
-Conversely, AMD runners split the `runtime-1gpu` suite across
-`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
-by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
-runners run the whole suite in `ut-runtime-1gpu`.
+All runners split the `runtime-1gpu` suite across `ut-runtime-1gpu-part-i` and
+`ut-runtime-1gpu-part-ii`, which balance test files by their registered
+`est_time` (`run_ci_suite.py --auto-partition-*`). The suite starts one `pytest`
+process per file, so per-file startup is a large share of its time, and
+running it in one job takes longer than the kernel unit tests.
 
 The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four GB200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
@@ -614,8 +615,8 @@ this repository. Pull-request runs execute the merge commit's dispatcher, so
 the run covers dispatcher changes before merge. The workflow skips fork pull
 requests until the coordinator pool uses ephemeral runners with a protected
 approval environment. Use the manual `Slurm Dispatch` workflow after review.
-New commits cancel the older run for the same pull request or the `main`
-branch.
+New commits cancel the older run for the same pull request. A push to `main`
+does not cancel a running run; only the newest waiting run is kept.
 
 Submission is fail-closed and requires the repository variable
 `TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated

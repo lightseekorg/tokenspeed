@@ -302,6 +302,7 @@ class TestKimiK3RegistrationTests:
                 use_trtllm=True,
                 overlap_shared_experts=False,
                 joint_moe_reduce=False,
+                decode_chain=False,
             )
         )
         moe = built.layer
@@ -328,6 +329,7 @@ class TestKimiK3RegistrationTests:
                 use_trtllm=True,
                 overlap_shared_experts=False,
                 joint_moe_reduce=False,
+                decode_chain=False,
             )
         )
         config, mapping = built.config, built.mapping
@@ -372,6 +374,7 @@ class TestKimiK3RegistrationTests:
                 use_trtllm=True,
                 overlap_shared_experts=False,
                 joint_moe_reduce=False,
+                decode_chain=False,
             ),
             routed_hidden=60,
         )
@@ -392,6 +395,7 @@ class TestKimiK3RegistrationTests:
                 use_marlin=True,
                 overlap_shared_experts=False,
                 joint_moe_reduce=False,
+                decode_chain=False,
             )
         )
         self._assert_latent_projection_sharding(
@@ -415,6 +419,7 @@ class TestKimiK3RegistrationTests:
                 use_trtllm=True,
                 overlap_shared_experts=False,
                 joint_moe_reduce=False,
+                decode_chain=False,
             ),
             moe_layer_freq=2,
             layer_index=4,
@@ -1004,6 +1009,7 @@ class TestKimiK3RegistrationTests:
                     use_trtllm=False,
                     overlap_shared_experts=False,
                     joint_moe_reduce=True,
+                    decode_chain=False,
                 ),
             ),
             mock.patch.object(
@@ -1094,6 +1100,7 @@ class TestKimiK3RegistrationTests:
                     use_trtllm=False,
                     overlap_shared_experts=False,
                     joint_moe_reduce=False,
+                    decode_chain=False,
                 ),
             ),
             mock.patch.dict(
@@ -1136,6 +1143,7 @@ class TestKimiK3RegistrationTests:
                     use_trtllm=False,
                     overlap_shared_experts=False,
                     joint_moe_reduce=True,
+                    decode_chain=False,
                 ),
             ),
             mock.patch.dict(
