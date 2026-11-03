@@ -58,6 +58,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
 from tokenspeed_kernel_amd.ops.gfx950.layernorm.deferred import (
     deferred_norm_rows_gfx950,
     deferred_norm_scales_gfx950,
+    deferred_norm_terms_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
     sigmoid_bias_topk_keys_gfx950,
@@ -601,4 +602,78 @@ def column_relay_kernel(x_ptr, w_ptr, out_ptr, M, K: gl.constexpr):
         out_ptr,
         t[:, None] * N + column0 + c[None, :],
         mask=(t < M)[:, None] & (c >= 0)[None, :],
+    )
+
+
+@gluon.jit
+def sender_sums_kernel(
+    x_ptr,
+    w_ptr,
+    h_ptr,
+    alpha_ptr,
+    beta_ptr,
+    post_ptr,
+    sums_ptr,
+    tag,
+    M,
+    K: gl.constexpr,
+    N: gl.constexpr,
+):
+    """The post-expert sender's partial norm sums: the relayed 16-column
+    tile rounded to BF16 (the H6 value), and per row the FFN boundary's four
+    sums over those columns (``deferred_norm_terms_gfx950``), published as
+    tagged FP32 words ``[program, row, 4]`` for the sum reducer."""
+    WAVES: gl.constexpr = gl.num_warps()
+    column0 = gl.program_id(0) * 16
+    w = column_relay_weights_gfx950(w_ptr, column0, K)
+    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[WAVES, 1, 1],
+    )
+    a_l: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=8)
+    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, a_l)))
+    token = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, a_l)))
+    k = gl.arange(0, K // WAVES, gl.SliceLayout(0, gl.SliceLayout(1, a_l)))
+    s = gl.amd.cdna4.buffer_load(
+        x_ptr,
+        token[None, :, None] * K
+        + (wave * (K // WAVES))[:, None, None]
+        + k[None, None, :],
+        mask=(token < M)[None, :, None] & (k >= 0)[None, None, :],
+        other=0.0,
+    )
+    relay = gl.allocate_shared_memory(
+        gl.float32, [WAVES, 16, 16], gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
+    )
+    relay_count = gl.allocate_shared_memory(
+        gl.int32, [1], gl.SwizzledSharedLayout(1, 1, 1, [0])
+    )
+    relay_count.store(
+        gl.zeros([1], gl.int32, gl.BlockedLayout([1], [64], [WAVES], [0]))
+    )
+    gl.barrier()
+    out_l: gl.constexpr = gl.BlockedLayout([1, 16], [16, 4], [WAVES, 1], [1, 0])
+    y = column_relay_gfx950(s, w, relay, relay_count, out_l)
+    t = gl.minimum(gl.arange(0, 16, gl.SliceLayout(1, out_l)), M - 1)
+    c = column0 + gl.arange(0, 16, gl.SliceLayout(0, out_l))
+    h = gl.amd.cdna4.buffer_load(h_ptr, t[:, None] * N + c[None, :])
+    alpha = gl.amd.cdna4.buffer_load(alpha_ptr, c)[None, :]
+    beta = gl.amd.cdna4.buffer_load(beta_ptr, c)[None, :]
+    post = gl.amd.cdna4.buffer_load(post_ptr, c)[None, :]
+    terms = deferred_norm_terms_gfx950(y.to(gl.bfloat16), h, alpha, beta, post)
+    sums = gl.sum(terms, axis=1)  # [16, 4]: sum b^2, B, A, C over the 16 columns
+    SL: gl.constexpr = sums.type.layout
+    row = gl.arange(0, 16, gl.SliceLayout(1, SL))
+    which = gl.arange(0, 4, gl.SliceLayout(0, SL))
+    word = (tag.to(gl.int64) << 32) | (
+        sums.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF
+    )
+    gl.amd.cdna4.buffer_store(
+        word,
+        sums_ptr,
+        (gl.program_id(0) * 16 + row[:, None]) * 4 + which[None, :],
+        mask=(row < M)[:, None] & (which >= 0)[None, :],
+        cache=".wt",
     )

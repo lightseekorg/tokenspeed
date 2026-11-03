@@ -345,6 +345,9 @@ pre-norm into their consumers.
 
 - Producers publish four FP32 sums per row and column block: `sum b^2`,
   `B = sum (alpha h)(beta b)`, `A = sum (alpha h)^2`, `C = sum (beta b)^2`.
+- `deferred_norm_terms_gfx950` gives a producer the four terms per element
+  (`b` is the producer's BF16 output times `post`), `[..., 4]` in that
+  order, for it to sum over its own columns.
 - `deferred_norm_scales_gfx950` takes them as `[rows, producers, 4]` with the
   producers across one wave's lanes and returns `inv1`, `inv2` per row.
 - `deferred_norm_rows_gfx950` returns `h' = fma(beta, b post inv1, alpha h)`

@@ -44,6 +44,7 @@ from native_body_helpers import (  # noqa: E402
     kpart_router_kernel,
     qkv_task_kernel,
     sender_kernel,
+    sender_sums_kernel,
     split_records_kernel,
     topk_keys_kernel,
 )
@@ -353,3 +354,36 @@ def test_column_relay_holds_its_k_tile_and_chains_one_accumulator():
     )
     assert spins[0] < mfmas[0] and mfmas[-1] < handoff < spins[1]
     assert not [line for line in code[spins[0] : spins[1]] if line == "s_barrier"]
+
+
+def test_sender_sums_add_their_columns_in_each_thread():
+    """After the relay's last hand-off the sender forms its four norm sums
+    with no LDS traffic beyond reading the relayed tile and no cross-lane
+    reduction, and publishes them as tagged words; no scratch."""
+    assembly = compile_gfx950(
+        sender_sums_kernel,
+        {
+            "x_ptr": "*bf16",
+            "w_ptr": "*bf16",
+            "h_ptr": "*fp32",
+            "alpha_ptr": "*fp32",
+            "beta_ptr": "*fp32",
+            "post_ptr": "*bf16",
+            "sums_ptr": "*i64",
+            "tag": "i32",
+            "M": "i32",
+        },
+        dict(K=4096, N=8192),
+        num_warps=8,
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    code = instruction_lines(assembly)
+    handoff = max(i for i, line in enumerate(code) if line.startswith("ds_add_rtn_u32"))
+    tail = code[handoff:]
+    assert not [
+        line
+        for line in tail
+        if line.startswith(("ds_write", "ds_swizzle", "ds_bpermute"))
+    ]
+    assert not [line for line in tail if "dpp" in line or line == "s_barrier"]
+    assert [line for line in tail if line.startswith("buffer_store_dwordx4")]
