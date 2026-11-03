@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.gemm import mv_fp8_weight
 from tokenspeed_kernel.ops.sampling import (
     vocab_shard_topk,
     vocab_shard_topk_supports,
@@ -63,6 +64,9 @@ class VocabParallelTopK:
             so it changes the scores but never which candidates survive.
         skip_all_gather: The owning processor keeps its logits rank-local.
         dp_sampling_enabled: The owning processor samples per DP rank.
+        fp8_weight: ``(weight, scale)``, a weight-only FP8 copy of this
+            rank's head rows (``mv_fp8_weight``) to project through instead
+            of ``lm_head``, or None to use ``lm_head`` itself.
     """
 
     def __init__(
@@ -78,8 +82,10 @@ class VocabParallelTopK:
         softcapping: float | None,
         skip_all_gather: bool,
         dp_sampling_enabled: bool,
+        fp8_weight: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> None:
         self.lm_head = lm_head
+        self.fp8_weight = fp8_weight
         self.tp_size = int(tp_size)
         self.tp_group = tp_group
         self.vocab_size = int(vocab_size)
@@ -256,6 +262,9 @@ class VocabParallelTopK:
         Returns:
             This rank's ``[rows, shard_padded]`` logits.
         """
+        if self.fp8_weight is not None:
+            weight, scale = self.fp8_weight
+            return mv_fp8_weight(hidden_states, weight, scale)
         head = self.lm_head
         quant_method = getattr(head, "quant_method", None)
         if should_apply_lm_head_quant_method(head, quant_method):
