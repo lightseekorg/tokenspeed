@@ -168,6 +168,18 @@ def scalar_load_glc(word_ptr):
     )  # fmt: skip
 
 
+# OR of (tag_i ^ tag) over s64..s79 into $0, after the 16 tags were loaded.
+_XOR_TAGS16 = "s_xor_b32 $0, s64, $2" + "".join(
+    f"\n\ts_xor_b32 s80, s{64 + i}, $2\n\ts_or_b32 $0, $0, s80" for i in range(1, 16)
+)
+_LOAD_TAGS16 = "s_load_dwordx16 s[64:79], $1, 0x0{}\n\ts_waitcnt lgkmcnt(0)\n\t"
+_TAGS16_GLC = gl.constexpr(_LOAD_TAGS16.format(" glc") + _XOR_TAGS16)
+_TAGS16_CACHED = gl.constexpr(
+    "s_dcache_inv\n\t" + _LOAD_TAGS16.format("") + _XOR_TAGS16
+)
+_TAGS16_CONSTRAINTS = gl.constexpr("=&s,s,s,~{memory},~{scc},~{s[64:79]},~{s80}")
+
+
 @gluon.jit
 def scalar_tags16_differ(word_ptr, tag, GLC: gl.constexpr):
     """One ``s_load_dwordx16`` of 16 int32 tags at ``word_ptr`` (64 B aligned,
@@ -176,46 +188,10 @@ def scalar_tags16_differ(word_ptr, tag, GLC: gl.constexpr):
     ``s_dcache_inv``. Clobbers s[64:80]."""
     if GLC:
         return gl.inline_asm(
-            "s_load_dwordx16 s[64:79], $1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)\n\t"
-            "s_xor_b32 $0, s64, $2\n\t"
-            "s_xor_b32 s80, s65, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s66, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s67, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s68, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s69, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s70, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s71, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s72, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s73, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s74, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s75, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s76, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s77, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s78, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s79, $2\n\ts_or_b32 $0, $0, s80",
-            "=&s,s,s,~{memory},~{scc},~{s[64:79]},~{s80}",
-            [word_ptr, tag], gl.int32, is_pure=False,
-        )  # fmt: skip
+            _TAGS16_GLC, _TAGS16_CONSTRAINTS, [word_ptr, tag], gl.int32, is_pure=False
+        )
     else:
         return gl.inline_asm(
-            "s_dcache_inv\n\t"
-            "s_load_dwordx16 s[64:79], $1, 0x0\n\ts_waitcnt lgkmcnt(0)\n\t"
-            "s_xor_b32 $0, s64, $2\n\t"
-            "s_xor_b32 s80, s65, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s66, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s67, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s68, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s69, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s70, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s71, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s72, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s73, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s74, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s75, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s76, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s77, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s78, $2\n\ts_or_b32 $0, $0, s80\n\t"
-            "s_xor_b32 s80, s79, $2\n\ts_or_b32 $0, $0, s80",
-            "=&s,s,s,~{memory},~{scc},~{s[64:79]},~{s80}",
-            [word_ptr, tag], gl.int32, is_pure=False,
+            _TAGS16_CACHED, _TAGS16_CONSTRAINTS, [word_ptr, tag], gl.int32,
+            is_pure=False,
         )  # fmt: skip
