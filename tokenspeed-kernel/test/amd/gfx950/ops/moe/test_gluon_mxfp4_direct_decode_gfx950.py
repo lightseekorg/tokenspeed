@@ -629,6 +629,8 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         sorted_routes,
         descriptors,
         group_count,
+        sorted_routes,
+        descriptors,
         intermediate,
         intermediate_scales,
         rows,
@@ -662,7 +664,6 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         descriptors,
         group_count,
         output,
-        rows,
         INTERMEDIATE=INTERMEDIATE,
         OUTPUT=HIDDEN,
         XS0=intermediate_scales.stride(0),
@@ -675,10 +676,6 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         BLOCK_K=128,
         BLOCK_M=16,
         PREFETCH_TILES=1,
-        ROUTES_FROM_IDS=False,
-        TOPK=TOPK,
-        EXPERT_START=expert_start,
-        NUM_EXPERTS=NUM_EXPERTS,
         num_warps=1,
     )
     owned = (ids.flatten() >= expert_start) & (
