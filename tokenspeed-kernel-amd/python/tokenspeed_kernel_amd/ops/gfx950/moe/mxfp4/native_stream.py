@@ -59,6 +59,8 @@ MXFP4 quantization of the mids and down chain, so the output is bitwise equal.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
@@ -73,6 +75,10 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
     _mxfp4_quantize_tile_in_layout,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+    pack_cdna4_mxfp4_scale_lanes,
+    unswizzle_cdna4_mxfp4_scale,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     ENTRY_WORDS,
@@ -101,9 +107,11 @@ __all__ = [
     "MOE_SINK_LAYOUT",
     "MoeBuffers",
     "NativeMoeState",
+    "NativeMoeWeights",
     "gluon_mxfp4_moe_native_stream_gfx950",
     "launch_gluon_mxfp4_moe_native_stream_gfx950",
     "native_moe_plan",
+    "native_moe_weights",
     "prefetch_moe",
     "run_moe",
     "store_routes_sink",
@@ -1498,17 +1506,116 @@ def _int32_words(scale):
     return alias.set_(storage, scale.storage_offset() // 4, (words,), (1,))
 
 
+@dataclasses.dataclass(frozen=True)
+class NativeMoeWeights:
+    """The experts' prepared tensors as the stream reads them, in place.
+
+    ``s13`` / ``s2`` are the CDNA4-swizzled E8M0 scales as int32 words (the
+    stream reads a dword at a time); strides are in bytes of the uint8
+    tensors. ``s13_lanes`` is the optional lane-major copy of the gate/up
+    scales (``SCALE_LANES``), as int32 words, or None.
+    """
+
+    w13: torch.Tensor
+    s13: torch.Tensor
+    s13_lanes: torch.Tensor | None
+    w2: torch.Tensor
+    s2: torch.Tensor
+    stride_w13: int
+    stride_s13: int
+    stride_s13lin: int
+    stride_s13nb: int
+    stride_w2: int
+    stride_s2: int
+    stride_s2lin: int
+    stride_s2nb: int
+    n_phys1: int
+    n_phys2: int
+
+
+def native_moe_weights(experts, *, scale_lanes: bool) -> NativeMoeWeights:
+    """The stream's view of a processed gfx950 MXFP4 MoE layer.
+
+    Reads the tensors today's EP1 decode reads (``w13_weight_triton_tensor``
+    and ``w2_weight_triton_tensor``, gdot128-shuffled, with their
+    precision configs' CDNA4-swizzled scales), without copying them.
+
+    Args:
+        experts: The MoE layer after ``preprocess_gluon_mxfp4_gfx950_moe_weights``
+            (the model's ``mlp.experts``).
+        scale_lanes: Also build the lane-major gate/up scales
+            (``SCALE_LANES``). That is a copy: 32 MiB per layer of 256
+            local experts (2 GB over 60 layers).
+
+    Raises:
+        ValueError: The layout is not the EP1 slice the stream tiles
+            (``(E, 2048, 1024)`` gate/up, ``(E, 256, 4096)`` down), or a
+            stride the kernels specialize on is not a multiple of 16.
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        _extract_gluon_raw_s,
+        _extract_gluon_raw_w,
+    )
+
+    w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
+    s13 = _extract_gluon_raw_s(experts.w13_precision_config.b_mx_scale)
+    w2 = _extract_gluon_raw_w(experts.w2_weight_triton_tensor)
+    s2 = _extract_gluon_raw_s(experts.w2_precision_config.b_mx_scale)
+    experts_n = w13.shape[0]
+    if w13.dtype != torch.uint8 or w13.shape[1:] != (HIDDEN // 2, GATE_UP):
+        raise ValueError(
+            f"native MoE stream: gate/up weights must be (E, {HIDDEN // 2}, "
+            f"{GATE_UP}) uint8 gdot128, got {tuple(w13.shape)} {w13.dtype}"
+        )
+    if w2.dtype != torch.uint8 or w2.shape != (experts_n, INTER // 2, HIDDEN):
+        raise ValueError(
+            f"native MoE stream: down weights must be (E, {INTER // 2}, "
+            f"{HIDDEN}) uint8 gdot128, got {tuple(w2.shape)} {w2.dtype}"
+        )
+    for name, scale in (("gate/up", s13), ("down", s2)):
+        if scale.dtype != torch.uint8 or scale.stride(1) != 1:
+            raise ValueError(
+                f"native MoE stream: {name} scales must be CDNA4-swizzled uint8 "
+                f"(stride(1) == 1), got {scale.dtype} strides {scale.stride()}"
+            )
+    strides = dict(
+        stride_w13=w13.stride(0),
+        stride_s13=s13.stride(0),
+        stride_s13lin=s13.stride(1),
+        stride_s13nb=s13.stride(2),
+        stride_w2=w2.stride(0),
+        stride_s2=s2.stride(0),
+        stride_s2lin=s2.stride(1),
+        stride_s2nb=s2.stride(2),
+    )
+    uneven = {k: v for k, v in strides.items() if not k.endswith("lin") and v % 16}
+    if uneven:
+        raise ValueError(
+            f"native MoE stream: strides must be multiples of 16, got {uneven}"
+        )
+    lanes = None
+    if scale_lanes:
+        canonical = unswizzle_cdna4_mxfp4_scale(s13, GATE_UP, HIDDEN // 32)
+        lanes = _int32_words(pack_cdna4_mxfp4_scale_lanes(canonical))
+    return NativeMoeWeights(
+        w13=w13,
+        s13=_int32_words(s13),
+        s13_lanes=lanes,
+        w2=w2,
+        s2=_int32_words(s2),
+        n_phys1=w13.shape[2],
+        n_phys2=w2.shape[2],
+        **strides,
+    )
+
+
 def launch_gluon_mxfp4_moe_native_stream_gfx950(
     xq,
     xs,
-    w13,
-    w13_scale,
-    w2,
-    w2_scale,
+    weights: NativeMoeWeights,
     topk_ids,
     out,
     state,
-    w13_scale_lanes,
     *,
     ring: int,
     quad_map: int,
@@ -1527,11 +1634,8 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
     Args:
         xq, xs: MXFP4 activation rows ``(rows, 2048)`` and their CDNA4-swizzled
             E8M0 scales (``_quantize_mxfp4_activation``).
-        w13, w13_scale, w2, w2_scale: gdot128-shuffled weights and
-            CDNA4-swizzled scales (the direct decode's raw tensors).
-        w13_scale_lanes: The gate/up scales lane-major
-            (``pack_cdna4_mxfp4_scale_lanes``), or None to read the
-            swizzled ones.
+        weights: From :func:`native_moe_weights`; ``SCALE_LANES`` follows
+            whether it holds lane-major scales.
         topk_ids: ``(rows, top_k)`` int32 global expert ids (EP1: all local).
         out: ``(rows * top_k, 4096)`` bf16, written per route.
         state: :class:`NativeMoeState`.
@@ -1541,62 +1645,27 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         deadline_ticks: How long a readiness wait may last (10 ns ticks).
     """
     rows, top_k = topk_ids.shape
-    # The stream's tiling is the EP1 slice of a 4096-wide model with 512
-    # intermediate columns per rank.
-    if (
-        xq.shape[1] != HIDDEN // 2
-        or w13.shape[2] != GATE_UP
-        or w2.shape[1] < INTER // 2
-    ):
-        raise ValueError("native MoE stream: unsupported shape")
+    if xq.shape[1] != HIDDEN // 2:
+        raise ValueError(
+            f"native MoE stream: activations must be (rows, {HIDDEN // 2}), "
+            f"got {tuple(xq.shape)}"
+        )
     if rows > 16 or out.shape != (rows * top_k, HIDDEN):
         raise ValueError(
             "native MoE stream: at most 16 rows, out is (rows * top_k, hidden)"
         )
+    w = weights
     gluon_mxfp4_moe_native_stream_gfx950[(GRID,)](
-        state.epochs,
-        state.claims,
-        state.errors,
-        state.arena,
-        topk_ids,
-        xq,
-        xs,
-        w13,
-        _int32_words(w13_scale),
-        _int32_words(w13_scale if w13_scale_lanes is None else w13_scale_lanes),
-        w2,
-        _int32_words(w2_scale),
-        state.mids,
-        state.mids_scale,
-        state.tags,
-        out,
-        xs.stride(0),
-        xs.stride(1),
-        w13.stride(0),
-        w13_scale.stride(0),
-        w13_scale.stride(1),
-        w13_scale.stride(2),
-        w2.stride(0),
-        w2_scale.stride(0),
-        w2_scale.stride(1),
-        w2_scale.stride(2),
+        state.epochs, state.claims, state.errors, state.arena, topk_ids, xq, xs,
+        w.w13, w.s13, w.s13 if w.s13_lanes is None else w.s13_lanes, w.w2, w.s2,
+        state.mids, state.mids_scale, state.tags, out,
+        xs.stride(0), xs.stride(1), w.stride_w13, w.stride_s13, w.stride_s13lin,
+        w.stride_s13nb, w.stride_w2, w.stride_s2, w.stride_s2lin, w.stride_s2nb,
         deadline_ticks,
-        ROWS=rows,
-        TOPK=top_k,
-        N_PHYS1=w13.shape[2],
-        N_PHYS2=w2.shape[2],
-        RING=ring,
-        QUAD_MAP=quad_map,
-        DN_ORDER=dn_order,
-        ADDR_SOFFSET=addr_soffset,
-        TAG_GLC=tag_glc,
-        SCALE_LANES=int(w13_scale_lanes is not None),
-        TAIL_NUM=tail_num,
-        TAIL_DEN=tail_den,
-        SWIGLU_ALPHA=swiglu_alpha,
-        SWIGLU_LIMIT=swiglu_limit,
-        SWIGLU_BETA=swiglu_beta,
-        SINK=store_routes_sink,
-        num_warps=8,
-        **persistent_compile_options(),
-    )
+        ROWS=rows, TOPK=top_k, N_PHYS1=w.n_phys1, N_PHYS2=w.n_phys2, RING=ring,
+        QUAD_MAP=quad_map, DN_ORDER=dn_order, ADDR_SOFFSET=addr_soffset,
+        TAG_GLC=tag_glc, SCALE_LANES=int(w.s13_lanes is not None),
+        TAIL_NUM=tail_num, TAIL_DEN=tail_den, SWIGLU_ALPHA=swiglu_alpha,
+        SWIGLU_LIMIT=swiglu_limit, SWIGLU_BETA=swiglu_beta, SINK=store_routes_sink,
+        num_warps=8, **persistent_compile_options()
+    )  # fmt: skip

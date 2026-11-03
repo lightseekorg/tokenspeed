@@ -89,6 +89,7 @@ __all__ = [
     "is_swizzled_cdna4_mxfp4_scale",
     "pack_cdna4_mxfp4_scale_lanes",
     "swizzle_cdna4_mxfp4_scale",
+    "unswizzle_cdna4_mxfp4_scale",
 ]
 
 
@@ -190,6 +191,25 @@ def swizzle_cdna4_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
     scale = scale.transpose(-1, -2)
     assert scale.stride(-2) == 1
     return scale
+
+
+def unswizzle_cdna4_mxfp4_scale(
+    scale: torch.Tensor, n: int, k_scale: int
+) -> torch.Tensor:
+    """Inverse of :func:`swizzle_cdna4_mxfp4_scale`.
+
+    Input:  swizzled ``(L, K_SCALE_pad * 32, N_pad / 32)`` scales (any
+            strides), for the logical ``n`` rows and ``k_scale`` columns.
+    Output: contiguous ``(L, n, k_scale)`` scales.
+    """
+    leading, k32, n_blocks = scale.shape
+    k_scale_pad = k32 // 32
+    n_pad = n_blocks * 32
+    blocks = scale.transpose(-1, -2).reshape(leading, n_blocks, k_scale_pad * 32)
+    blocks = blocks.view(leading, n_pad // 32, k_scale_pad // 8, 4, 16, 2, 2, 1)
+    # Undo the swizzle's permute(0, 1, 4, 6, 3, 5, 2, 7).
+    blocks = blocks.permute(0, 1, 6, 4, 2, 5, 3, 7)
+    return blocks.reshape(leading, n_pad, k_scale_pad)[:, :n, :k_scale].contiguous()
 
 
 def pack_cdna4_mxfp4_scale_lanes(scale: torch.Tensor) -> torch.Tensor:

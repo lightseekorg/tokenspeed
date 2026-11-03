@@ -35,6 +35,7 @@ import pytest
 
 pytest.importorskip("tokenspeed_kernel_amd")
 
+from native_moe_helpers import DIVISIBLE, PHYS  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon, triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import native_stream  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
@@ -43,15 +44,6 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
 
 _LOAD = re.compile(r"^(buffer|global)_load_\w+")
 _STORE = re.compile(r"^(buffer|global)_store_\w+")
-_DIVISIBLE = {
-    "stride_w13",
-    "stride_s13",
-    "stride_s13nb",
-    "stride_w2",
-    "stride_s2",
-    "stride_s2nb",
-    "stride_xsnb",
-}
 
 VARIANTS = [
     dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=1),
@@ -86,8 +78,7 @@ def _compile(fields, sink=native_stream.store_routes_sink):
     fn = native_stream.gluon_mxfp4_moe_native_stream_gfx950
     const = dict(
         SINK=sink,
-        N_PHYS1=1024,
-        N_PHYS2=4096,
+        **PHYS,
         TOPK=8,
         TAG_GLC=1,
         TAIL_NUM=1,
@@ -119,7 +110,7 @@ def _compile(fields, sink=native_stream.store_routes_sink):
     attrs = {
         (i,): [["tt.divisibility", 16]]
         for i, n in enumerate(fn.arg_names)
-        if signature.get(n, "").startswith("*") or n in _DIVISIBLE
+        if signature.get(n, "").startswith("*") or n in DIVISIBLE
     }
     source = gluon._runtime.GluonASTSource(fn, signature, constexprs=const, attrs=attrs)
     target = triton.backends.compiler.GPUTarget("hip", "gfx950", 64)

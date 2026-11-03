@@ -25,10 +25,9 @@ random (not constant) E8M0 scales, every plan variant, repeated launches and
 a captured graph (each launch carries a new tag).
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
+from native_moe_helpers import make_experts
 from test_native_moe_plan import RECORDED_ROUTINGS
 from utils import is_cdna4
 
@@ -49,13 +48,10 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (  # noqa: E402
     NativeMoeState,
     launch_gluon_mxfp4_moe_native_stream_gfx950,
+    native_moe_weights,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E402
     empty_swizzled_cdna4_mxfp4_scale,
-    pack_cdna4_mxfp4_scale_lanes,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
-    preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
 
 EXPERTS, HIDDEN, INTER, TOPK = 256, 4096, 512, 8
@@ -71,45 +67,8 @@ VARIANTS = [
 
 
 @pytest.fixture(scope="module")
-def weights():
-    """Random MXFP4 experts with random scales, in the direct decode's layout."""
-    generator = torch.Generator(device="cuda").manual_seed(20261103)
-
-    def payload(*shape):
-        return torch.randint(
-            0, 256, shape, dtype=torch.uint8, device="cuda", generator=generator
-        )
-
-    def scales(*shape):
-        return torch.randint(
-            118, 131, shape, dtype=torch.uint8, device="cuda", generator=generator
-        )
-
-    module = torch.nn.Module()
-    module.w13_input_layout = "interleaved"
-    module.quant_config = SimpleNamespace(use_dynamic_mxfp4_activations=True)
-    module.w13_weight = torch.nn.Parameter(
-        payload(EXPERTS, 2 * INTER, HIDDEN // 2), requires_grad=False
-    )
-    module.w13_weight_scale = torch.nn.Parameter(
-        scales(EXPERTS, 2 * INTER, HIDDEN // 32), requires_grad=False
-    )
-    # Interleaved input: the scales' rows are already the physical columns.
-    w13_lanes = pack_cdna4_mxfp4_scale_lanes(module.w13_weight_scale.data)
-    module.w2_weight = torch.nn.Parameter(
-        payload(EXPERTS, HIDDEN, INTER // 2), requires_grad=False
-    )
-    module.w2_weight_scale = torch.nn.Parameter(
-        scales(EXPERTS, HIDDEN, INTER // 32), requires_grad=False
-    )
-    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
-    return (
-        _extract_gluon_raw_w(module.w13_weight_triton_tensor),
-        _extract_gluon_raw_s(module.w13_precision_config.b_mx_scale),
-        _extract_gluon_raw_w(module.w2_weight_triton_tensor),
-        _extract_gluon_raw_s(module.w2_precision_config.b_mx_scale),
-        w13_lanes,
-    )
+def experts():
+    return make_experts(EXPERTS, "cuda", 20261103)[0]
 
 
 def _direct_decode(xq, xs, w13, w13_scale, w2, w2_scale, ids):
@@ -144,10 +103,13 @@ def _direct_decode(xq, xs, w13, w13_scale, w2, w2_scale, ids):
     "variant", VARIANTS, ids=lambda v: "-".join(f"{k}{x}" for k, x in v.items())
 )
 @pytest.mark.parametrize("rows", [8, 16])
-def test_native_stream_is_bitwise_direct_decode(weights, variant, rows):
-    w13, w13_scale, w2, w2_scale, w13_lanes = weights
+def test_native_stream_is_bitwise_direct_decode(experts, variant, rows):
     variant = dict(variant)
-    lanes = w13_lanes if variant.pop("lanes") else None
+    weights = native_moe_weights(experts, scale_lanes=variant.pop("lanes"))
+    w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
+    w13_scale = _extract_gluon_raw_s(experts.w13_precision_config.b_mx_scale)
+    w2 = _extract_gluon_raw_w(experts.w2_weight_triton_tensor)
+    w2_scale = _extract_gluon_raw_s(experts.w2_precision_config.b_mx_scale)
     generator = torch.Generator(device="cuda").manual_seed(rows)
     state = NativeMoeState("cuda", rows, TOPK)
     for step, routing in enumerate(RECORDED_ROUTINGS[rows]):
@@ -163,14 +125,10 @@ def test_native_stream_is_bitwise_direct_decode(weights, variant, rows):
             launch_gluon_mxfp4_moe_native_stream_gfx950(
                 xq,
                 xs,
-                w13,
-                w13_scale,
-                w2,
-                w2_scale,
+                weights,
                 ids,
                 out,
                 state,
-                lanes,
                 tag_glc=1,
                 tail_num=1,
                 tail_den=2,
