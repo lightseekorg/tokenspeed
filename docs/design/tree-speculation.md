@@ -178,7 +178,8 @@ from this document in `drafter/eagle_harness/__init__.py`.
 ### The drafter scores, the tree selects
 
 `Eagle._score_candidates` is the one place a drafter decides how to score
-candidates (today `logprob_topk` over the full draft vocabulary). `DraftTree`
+candidates (today `logprob_topk` over the full draft vocabulary; EAGLE-4 takes
+the log of its candidate head's draft top-k). `DraftTree`
 only records `(scores, tokens)` and selects. A child's score is at most its
 parent's (`draft_tree_expand` clamps child log-probabilities at 0). A new
 drafter changes the scorer, not the tree machinery.

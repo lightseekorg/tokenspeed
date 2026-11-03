@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.sampling.triton import logprob_topk
 from transformers import LlamaConfig
 
 sys.path.insert(
@@ -143,13 +144,11 @@ def _static_tree_drafter(model: LlamaForCausalLMEagle4, topk: int) -> Eagle4:
     return drafter
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Candidates are the top rank-r scores; their logits are the exact LM head's;
-    the draft top-k is the best of their softmax."""
-    num_candidates, vocab = 128, 256
+def _candidate_head_model(
+    monkeypatch: pytest.MonkeyPatch, num_candidates: int
+) -> tuple[LlamaForCausalLMEagle4, CandidateHeads]:
+    """A dense draft over a 256-token vocab with random low-rank candidate heads."""
+    vocab = 256
     config = LlamaConfig(
         vocab_size=vocab,
         hidden_size=_HIDDEN,
@@ -181,6 +180,17 @@ def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
         down_proj=model.efficient_lm_head_down_proj,
         num_candidates=num_candidates,
     )
+    return model, heads
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidates are the top rank-r scores; their logits are the exact LM head's;
+    the draft top-k is the best of their softmax."""
+    num_candidates = 128
+    model, heads = _candidate_head_model(monkeypatch, num_candidates)
     processor = model.logits_processor
     processor.draft_top_k = 4
     hidden = torch.randn(3, _HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -207,10 +217,33 @@ def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
     probs, tokens = output.draft_topk
     torch.testing.assert_close(probs, top.values, rtol=0, atol=0)
     assert torch.equal(tokens, ids.gather(-1, top.indices))
-    # A static EAGLE-4 tree ranks the same candidates by log-probability.
-    scores, tree_tokens = _static_tree_drafter(model, 4)._score_candidates(output)
-    assert torch.equal(tree_tokens.long(), tokens)
-    torch.testing.assert_close(scores.exp(), probs, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_eagle4_static_tree_scores_candidates_by_log_softmax_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A static tree's best K children of a row are the head's draft top-k:
+    the tokens and log-probabilities of a log-softmax top-k over the row's
+    candidate logits."""
+    model, heads = _candidate_head_model(monkeypatch, 128)
+    drafter = _static_tree_drafter(model, 4)
+    processor = model.logits_processor
+    # Binding the tree asks the head for each row's best 4.
+    assert processor.draft_top_k == 4
+    hidden = torch.randn(64, _HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    output = processor(
+        None,
+        hidden,
+        heads,
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
+    )
+    scores, tokens = drafter._score_candidates(output)
+
+    want_scores, columns = logprob_topk(output.next_token_logits, 4)
+    assert torch.equal(tokens, output.candidate_ids.gather(-1, columns))
+    torch.testing.assert_close(scores, want_scores, rtol=1e-6, atol=1e-6)
 
 
 # Toy sizes; the MoE's are the smallest the BF16 squared-ReLU expert kernels plan for.

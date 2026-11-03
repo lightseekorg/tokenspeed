@@ -43,7 +43,6 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.triton import logprob_topk
 from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
     eagle_harness_draft_depth_update,
     eagle_harness_publish_draft_q,
@@ -94,7 +93,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.layers.attention.configs.base import resolve_cache_layer_types
-from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SpeculativeSamplingPools,
@@ -153,14 +151,21 @@ class Eagle4(Eagle):
         )
 
     @override
-    def _score_candidates(
-        self, logits_output: LogitsProcessorOutput
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        scores, columns = logprob_topk(
-            logits_output.next_token_logits, self.draft_tree.topk
+    def bind_tree(self, tree_spec: TreeSpec) -> None:
+        super().bind_tree(tree_spec)
+        # The candidate head's last kernel also ranks each row's best K (draft_topk).
+        self.draft_model_runner.model.logits_processor.draft_top_k = (
+            tree_spec.config.topk
         )
-        tokens = logits_output.candidate_ids.gather(-1, columns.long())
-        return scores, tokens.to(columns.dtype)
+
+    @override
+    def _score_candidates(
+        self, logits_output: Eagle4LogitsOutput
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The candidate head's draft top-k: its best K softmax probabilities
+        over the row's candidates (best first) as log-probabilities."""
+        probs, tokens = logits_output.draft_topk
+        return probs.log(), tokens
 
 
 class EagleHarness(Eagle4):
