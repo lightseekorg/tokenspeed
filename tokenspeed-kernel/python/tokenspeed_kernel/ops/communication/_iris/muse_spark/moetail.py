@@ -45,7 +45,12 @@ from tokenspeed_kernel.platform import current_platform
 if current_platform().is_cdna4:
     # Senders keep the replicated single-row GEMV's per-output reduction.
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        gluon_rowcta_bf16_gemv_rows_finish_gfx950,
+        gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950,
+        gluon_rowcta_bf16_gemv_rows_stage_x_gfx950,
         gluon_rowcta_bf16_gemv_rows_sums_gfx950,
+        gluon_rowcta_bf16_gemv_rows_weights_gfx950,
+        gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.persistent import (
         poll_expired,
@@ -106,6 +111,85 @@ def iris_muse_moetail_project(
         1,
         NUM_WARPS,
         X_CACHE,
+    )
+    return gl.convert_layout(values.to(gl.bfloat16), _send_layout(OUTPUTS, NUM_WARPS))
+
+
+@gluon.jit
+def iris_muse_moetail_project_weights(
+    weight_ptr,
+    first_output,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Issue the weights of outputs [first_output, first_output + OUTPUTS);
+    a persistent kernel calls this at entry and
+    :func:`iris_muse_moetail_project_issued` once its rows are ready."""
+    return gluon_rowcta_bf16_gemv_rows_weights_gfx950(
+        weight_ptr, first_output, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS
+    )  # fmt: skip
+
+
+@gluon.jit
+def iris_muse_moetail_project_issued(
+    weights,
+    x_ptr,
+    M,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    X_CACHE: gl.constexpr,
+):
+    """:func:`iris_muse_moetail_project` on weights issued earlier
+    (:func:`iris_muse_moetail_project_weights`); same reduction and result."""
+    xs = gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950(
+        x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS, X_CACHE
+    )  # fmt: skip
+    values = gluon_rowcta_bf16_gemv_rows_finish_gfx950(
+        weights, xs, x_ptr, M, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS,
+        X_CACHE
+    )  # fmt: skip
+    return gl.convert_layout(values.to(gl.bfloat16), _send_layout(OUTPUTS, NUM_WARPS))
+
+
+@gluon.jit
+def iris_muse_moetail_stage_rows(
+    x_ptr,
+    M,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    X_CACHE: gl.constexpr,
+):
+    """Stage every row to project in LDS once per workgroup (16-byte copies);
+    every sender program of the workgroup then reads it
+    (:func:`iris_muse_moetail_project_staged`)."""
+    return gluon_rowcta_bf16_gemv_rows_stage_x_gfx950(
+        x_ptr, M, K, BLOCK_M, NUM_WARPS, X_CACHE
+    )
+
+
+@gluon.jit
+def iris_muse_moetail_project_staged(
+    weights,
+    x_smem,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """:func:`iris_muse_moetail_project` on issued weights and LDS-staged rows;
+    same reduction and result."""
+    values = gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950(
+        weights, x_smem, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, 1, NUM_WARPS
     )
     return gl.convert_layout(values.to(gl.bfloat16), _send_layout(OUTPUTS, NUM_WARPS))
 
@@ -548,9 +632,13 @@ def iris_fused_gemv_lamport_allgather_muse_moetail(
             PRE_WEIGHT_OFFSET, HAS_PRE, NUM_WARPS
         )  # fmt: skip
     else:
-        values = iris_muse_moetail_project(
-            x_ptr, weight_ptr, program * OUTPUTS, M, K, BLOCK_M, OUTPUTS, BLOCK_K,
-            WAVES_PER_OUTPUT, NUM_WARPS, ""
+        # The rows go to LDS in a few wide copies, then the weights issue.
+        x_smem = iris_muse_moetail_stage_rows(x_ptr, M, K, BLOCK_M, NUM_WARPS, "")
+        weights = iris_muse_moetail_project_weights(
+            weight_ptr, program * OUTPUTS, K, BLOCK_M, BLOCK_K, WAVES_PER_OUTPUT, NUM_WARPS
+        )  # fmt: skip
+        values = iris_muse_moetail_project_staged(
+            weights, x_smem, K, BLOCK_M, OUTPUTS, BLOCK_K, WAVES_PER_OUTPUT, NUM_WARPS
         )  # fmt: skip
         stage = iris_muse_moetail_send_stage(
             epochs, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS
