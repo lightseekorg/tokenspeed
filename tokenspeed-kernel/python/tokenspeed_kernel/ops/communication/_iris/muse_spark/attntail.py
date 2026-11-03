@@ -523,17 +523,27 @@ def _muse_attntail_wait_box(box_ptr, offsets, valid, LAYOUT: gl.constexpr):
 
 @gluon.jit
 def muse_attntail_store_attention(program, gate, att_box, EPS: gl.constexpr):
-    """Merge this row block's splits, gate and normalize, and publish them.
+    """Merge this row block's splits, gate and normalize, and publish them
+    (:func:`muse_attntail_publish_attention`). Only the last-arriving split
+    calls it."""
+    muse_attntail_publish_attention(
+        program, program.merge_splits(att_box, False, ""), gate, att_box, EPS
+    )
 
-    Only the last-arriving split calls it. As attention followed by
-    weightless_rmsnorm_gated_sigmoid: the merged rows round to BF16, then per
-    head x * rsqrt(mean(x^2) + EPS) * sigmoid(gate) in FP32, rounded to BF16.
-    The rows go to att_box ([tokens, heads * head_dim] BF16, empty marker
-    -0.0) written through, since readers on every XCD poll them; negative
-    zero is stored as zero.
+
+@gluon.jit
+def muse_attntail_publish_attention(program, merged, gate, att_box, EPS: gl.constexpr):
+    """Gate and normalize this row block's merged rows and publish them.
+
+    ``merged`` is the FP32 merge (``AttentionProgram.merge_splits``). As
+    attention followed by weightless_rmsnorm_gated_sigmoid: the merged rows
+    round to BF16, then per head x * rsqrt(mean(x^2) + EPS) * sigmoid(gate) in
+    FP32, rounded to BF16. The rows go to att_box ([tokens, heads * head_dim]
+    BF16, empty marker -0.0) written through, since readers on every XCD poll
+    them; negative zero is stored as zero.
     """
     cfg = program.cfg
-    x = program.merge_splits(att_box, False, "").to(gl.bfloat16).to(gl.float32)
+    x = merged.to(gl.bfloat16).to(gl.float32)
     inv = gl.rsqrt(gl.sum(x * x, 1) / cfg.HEAD_DIM + EPS)
     g = gate.to(gl.float32)
     rows = _iris_sanitize_lamport_bf16(
@@ -662,35 +672,12 @@ def muse_attntail_o_proj_prefetch(w_ptr, block, K: gl.constexpr, OUTPUTS: gl.con
 
 
 @gluon.jit
-def muse_attntail_send(
-    tiles,
-    block,
-    att_box,
-    rs_peers,
-    stage,
-    rows,
-    K: gl.constexpr,
-    OUTPUTS: gl.constexpr,
-    WIDTH: gl.constexpr,
-    RANK: gl.constexpr,
-    WORLD_SIZE: gl.constexpr,
-    MAX_SHARD_ELEMENTS: gl.constexpr,
-    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
-):
-    """Project the attention box through this sender's o_proj rows and push
-    the BF16 partials to their columns' owner.
-
-    Waits for the box rows (rows <= 16), multiplies them by the resident
-    tiles (muse_attntail_o_proj_prefetch), sums the waves' K parts in a fixed
-    order, and stores row r's OUTPUTS columns in reduce-scatter slot RANK of
-    the rank owning them (WIDTH / WORLD_SIZE columns each), at r * (WIDTH /
-    WORLD_SIZE) + column % (WIDTH / WORLD_SIZE): the two-shot region's layout
-    with column shards.
-    """
+def muse_attntail_read_box(att_box, rows, K: gl.constexpr):
+    """Wait for the attention box's first ``rows`` (<= 16) rows of ``K``
+    BF16 and return them as the o_proj MFMA's B operand ``[waves, K /
+    waves, 16 tokens]``."""
     WAVES: gl.constexpr = gl.num_warps()
     KW: gl.constexpr = K // WAVES
-    TILES: gl.constexpr = OUTPUTS // 16
-    gl.static_assert(TILES == 4)
     # The 16 x K box as 256 packs (one per lane of 4 waves), one-source Lamport wait.
     PACK: gl.constexpr = 16 * K // 256
     packs: gl.constexpr = gl.BlockedLayout([1, PACK], [64, 1], [WAVES, 1], [1, 0])
@@ -728,6 +715,45 @@ def muse_attntail_send(
     )
     x = gl.convert_layout(
         gl.permute(gl.reshape(box, [16, WAVES, KW]), [1, 2, 0]), b_layout
+    )
+    return x
+
+
+@gluon.jit
+def muse_attntail_send(
+    tiles,
+    block,
+    att_box,
+    rs_peers,
+    stage,
+    rows,
+    K: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    WIDTH: gl.constexpr,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Project the attention box through this sender's o_proj rows and push
+    the BF16 partials to their columns' owner.
+
+    Waits for the box rows (rows <= 16), multiplies them by the resident
+    tiles (muse_attntail_o_proj_prefetch), sums the waves' K parts in a fixed
+    order, and stores row r's OUTPUTS columns in reduce-scatter slot RANK of
+    the rank owning them (WIDTH / WORLD_SIZE columns each), at r * (WIDTH /
+    WORLD_SIZE) + column % (WIDTH / WORLD_SIZE): the two-shot region's layout
+    with column shards.
+    """
+    WAVES: gl.constexpr = gl.num_warps()
+    TILES: gl.constexpr = OUTPUTS // 16
+    gl.static_assert(TILES == 4)
+    x = muse_attntail_read_box(att_box, rows, K)
+    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[WAVES, 1, 1],
     )
     sums_layout: gl.constexpr = gl.BlockedLayout(
         [WAVES, 1, 1], [1, 4, 16], [1, WAVES, 1], [2, 1, 0]
