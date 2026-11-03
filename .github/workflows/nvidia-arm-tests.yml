@@ -128,7 +128,11 @@ jobs:
         id: scan
         if: steps.changes.outputs.should_run == 'true'
         env:
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
+          # GB200 per-commit tests run through Slurm in nvidia-gb200-tests.yml,
+          # and B300 has no per-commit runners. Exclude both here rather than
+          # only through the repository variable, which is empty for pull
+          # requests from forks.
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: gb200,b300,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           for stage in \
             unit:unit-test \

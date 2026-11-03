@@ -1243,6 +1243,53 @@ def test_nvidia_arm_workflow_excludes_multi_node_tasks():
     assert "--multi-node exclude" in scan_script
 
 
+def test_nvidia_arm_scan_schedules_nothing_for_fork_pull_requests(tmp_path):
+    # Repository variables are empty for pull requests from forks, so the
+    # workflow's own exclusions must leave the ARM matrices empty.
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-arm-tests.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["scan"]["steps"]
+        if step.get("name") == "Build task matrix"
+    )
+    script = re.sub(r"\$\{\{ github.event_name.*?\}\}", "per-commit", step["run"])
+    (tmp_path / "tokenspeed-changed-files.txt").write_text(
+        "python/tokenspeed/runtime/engine/io_struct.py\n"
+    )
+
+    def scan(excluded_labels: str) -> dict[str, list]:
+        output = tmp_path / "outputs"
+        output.unlink(missing_ok=True)
+        env = {
+            **os.environ,
+            "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+            "RUNNER_TEMP": str(tmp_path),
+            "GITHUB_OUTPUT": str(output),
+            "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS": excluded_labels,
+        }
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        return {
+            stage: json.loads(values[f"{stage}_matrix"])["include"]
+            for stage in ("unit", "model")
+        }
+
+    # Without exclusions the ARM group has per-commit tasks for this change,
+    # so an empty result below comes from the exclusion, not the change.
+    assert scan("")["unit"]
+    fork_labels = step["env"]["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"].replace(
+        "${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}", ""
+    )
+    assert scan(fork_labels) == {"unit": [], "model": []}
+
+
 def test_qwen35_agentic_allows_declared_80k_context():
     task = load_yaml(
         REPO_ROOT / "test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml"

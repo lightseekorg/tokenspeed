@@ -258,8 +258,9 @@ repositories. `pull_request` runs keep their existing behavior. The configured
 repository must also provide the matching self-hosted runner labels and any
 required secrets. This variable only controls the repository gate.
 
-The NVIDIA PR workflow excludes `h100` and `b300` runners by default, including
-for fork PRs where repository variables are unavailable. To temporarily remove
+The NVIDIA B200 workflow excludes `h100` and `b300` runners by default, and
+the NVIDIA ARM workflow excludes `gb200` and `b300`, including for fork PRs
+where repository variables are unavailable. To temporarily remove
 additional unavailable GPU runners from PR test matrices, set the
 `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS` repository variable to comma-separated,
 case-insensitive substrings such as `gb200, mi355`. Matching uses the resolved
@@ -267,8 +268,8 @@ runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`. `mi355` therefore
 matches `amd-mi355-*`. The workflow ignores empty entries. Excluding every
 runner in a workflow group skips its matrix job, while the workflow itself
 still finishes. This variable applies only to the three PR test workflows.
-Clear or unset it to restore all runner labels except the NVIDIA workflow's
-`h100` and `b300` baselines.
+Clear or unset it to restore all runner labels except these per-workflow
+baselines.
 
 The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use
@@ -276,8 +277,10 @@ The CI system derives `SM` from common runner label prefixes by default:
 override or extend the defaults for a single runner label.
 
 PR workflows split runner labels by vendor and host architecture. `NVIDIA
-B200 Tests` uses the `nvidia-x86` runner group, while the disabled `PR Test
-NVIDIA ARM` workflow uses the `nvidia-arm` runner group. The CI system
+B200 Tests` uses the `nvidia-x86` runner group, while the `NVIDIA ARM Tests`
+workflow uses the `nvidia-arm` runner group. Its `gb200` and `b300` baseline
+exclusions leave it no per-commit tasks; GB200 per-commit tests run through
+Slurm in `NVIDIA GB200 Tests`. The CI system
 classifies GB300 as NVIDIA ARM, but no task YAML declares GB300, so it does
 not enter default CI matrices.
 
