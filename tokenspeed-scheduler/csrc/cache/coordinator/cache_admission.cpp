@@ -302,9 +302,9 @@ private:
                                 .group_id = entry.group_id, .location = entry.location, .in_stranded_suffix = false});
                         }
                     }
-                } else if (blocks_alone ? coordinator_.GroupIsState(group_id)
-                                        : num_staying_checkpoint_boundaries(*candidate_node) >= 2 ||
-                                              unproven_state_checkpoint) {
+                } else if (blocks_alone
+                               ? coordinator_.GroupIsState(group_id)
+                               : num_staying_checkpoint_boundaries(*candidate_node) >= 2 || unproven_state_checkpoint) {
                     // Deeper checkpoint boundaries still read this page. A nested
                     // checkpoint leaves alone, every State group's at once; the
                     // page leaves with the last checkpoint boundary under it, or is

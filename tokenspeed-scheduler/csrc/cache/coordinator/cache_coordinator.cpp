@@ -2757,8 +2757,7 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
         const auto shared = static_cast<std::size_t>(own_first - range.first_cache_block);
         if (shared > 0) {
             cacheFullBlocksForGroup<Tier>(group_index, table, keys.first(shared), range.first_cache_block,
-                                          range.first_logical_block, access_epoch, range.boundary_kind,
-                                          stream_to_host);
+                                          range.first_logical_block, access_epoch, range.boundary_kind, stream_to_host);
         }
         if (own_first < past_end) {
             _assert(own_first == own_tail.first && past_end == own_tail.past_end,
