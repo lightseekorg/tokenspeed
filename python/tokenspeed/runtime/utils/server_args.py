@@ -3000,11 +3000,11 @@ class ServerArgs:
             dest="drop_short_prompt_end_checkpoints",
             default=ServerArgs.drop_short_prompt_end_checkpoints,
             help="Prefill servers, hybrid (recurrent-state) models: a prompt too "
-            "short for the in-forward checkpoint (no longer than the chunk "
-            "budget) whose end lies inside a prefix page publishes only its full "
-            "pages to the prefix cache, no recurrent state and no KV tail at its "
-            "end, since a next turn that re-renders the end of the prompt cannot "
-            "resume there; a longer prompt that repeats it whole resumes at an "
+            "short for the in-forward checkpoint (by default, one no longer than "
+            "the chunk budget) whose end lies inside a prefix page publishes only "
+            "its full pages to the prefix cache, no recurrent state and no KV tail "
+            "at its end, since a next turn that re-renders the end of the prompt "
+            "cannot resume there; a longer prompt that repeats it whole resumes at an "
             "earlier checkpoint instead. A page-aligned prompt end keeps its "
             "state. Requires --enable-state-checkpoint-in-forward. A fused "
             "server (--disaggregation-mode null) refuses it; decode and encode "
