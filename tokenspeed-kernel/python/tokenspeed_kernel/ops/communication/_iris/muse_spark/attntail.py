@@ -724,7 +724,9 @@ def muse_attntail_read_box(
     muse_attntail_wait_box(
         box_ptr, probe_offsets, probe, launch, on_expiry, SITE, words
     )
-    box = muse_attntail_wait_box(box_ptr, offsets, valid, launch, on_expiry, SITE, packs)
+    box = muse_attntail_wait_box(
+        box_ptr, offsets, valid, launch, on_expiry, SITE, packs
+    )
     # [16 tokens, K] -> the MFMA B operand [waves, K / waves, 16 tokens].
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
