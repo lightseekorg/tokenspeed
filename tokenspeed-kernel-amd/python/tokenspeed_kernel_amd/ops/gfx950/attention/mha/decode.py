@@ -269,8 +269,12 @@ class AttentionProgram:
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        batch,
+        head_block,
+        split_id,
     ):
-        """Locate this program's request, KV head, row block and split.
+        """Locate a program's request, KV head, row block and split from its
+        request index, head block (KV head x row block) and split index.
 
         The rows of a block share one pass over the union of the keys they
         see: up to its last row's causal end and, under a sliding window, from
@@ -278,11 +282,8 @@ class AttentionProgram:
         its MAX_SEQLEN_Q query tokens, so query position p sees the keys
         before seq_len - (MAX_SEQLEN_Q - 1 - p).
         """
-        batch = gl.program_id(0)
-        head_block = gl.program_id(1)
         kv_head = head_block // cfg.NUM_ROW_BLOCKS
         row_start = (head_block - kv_head * cfg.NUM_ROW_BLOCKS) * cfg.BLOCK_M
-        split_id = gl.program_id(2)
         seq_len = gl.load(cache_seqlens_ptr + batch)
         if cfg.MAX_SEQLEN_Q == 1:
             first_end = maximum(seq_len, 0)
@@ -645,12 +646,41 @@ class AttentionProgram:
     @gluon.jit
     def finalize_splits(self, out_ptr, sink_ptr, counters_ptr, has_sink: gl.constexpr):
         """Let the last arriving split merge this row block and reset its counter."""
+        if self.arrive(counters_ptr) == self.cfg.NUM_KV_SPLITS - 1:
+            output = self.merge_splits(sink_ptr, has_sink).to(out_ptr.dtype.element_ty)
+            cfg = self.cfg
+            offs_m = gl.arange(
+                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
+            )
+            offs_d = gl.arange(
+                0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout)
+            )
+            tokens = self.row_tokens(offs_m)
+            q_heads = self.row_heads(offs_m)
+            valid = self.row_valid(offs_m)
+            out_offsets = (
+                tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
+            ) * cfg.HEAD_DIM + offs_d[None, :]
+            cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
+            gl.store(counters_ptr + self.split_counter_offset(), 0)
+
+    @gluon.jit
+    def split_counter_offset(self):
+        """This row block's arrival counter among the request's KV heads."""
         cfg = self.cfg
-        counter_offset = (
+        return (
             self.batch * (cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS)
             + self.kv_head * cfg.NUM_ROW_BLOCKS
             + self.row_start // cfg.BLOCK_M
         )
+
+    @gluon.jit
+    def arrive(self, counters_ptr):
+        """Count this split's partial as stored; return the splits counted
+        before it (NUM_KV_SPLITS - 1 for the last). The last arriver merges
+        the row block and resets its counter to 0."""
+        cfg = self.cfg
+        counter_offset = self.split_counter_offset()
         if cfg.NUM_WARPS > 1:
             # One thread performs the increment, and its release waits only
             # for its own wave's stores. So every wave runs s_waitcnt
@@ -677,89 +707,87 @@ class AttentionProgram:
             sem="acq_rel",
             scope="gpu",
         )
-        if old == cfg.NUM_KV_SPLITS - 1:
-            offs_m = gl.arange(
-                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
-            )
-            offs_d = gl.arange(
-                0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout)
-            )
-            tokens = self.row_tokens(offs_m)
-            q_heads = self.row_heads(offs_m)
-            valid = self.row_valid(offs_m)
-            final_m = gl.full(
-                [cfg.BLOCK_M],
-                value=-float("inf"),
-                dtype=gl.float32,
-                layout=gl.SliceLayout(1, cfg.store_layout),
-            )
-            final_l = gl.zeros(
-                [cfg.BLOCK_M],
-                dtype=gl.float32,
-                layout=gl.SliceLayout(1, cfg.store_layout),
-            )
-            final_acc = gl.zeros(
-                [cfg.BLOCK_M, cfg.HEAD_DIM],
-                dtype=gl.float32,
-                layout=cfg.store_layout,
-            )
-            # Each split's waves stored their partials before its acq_rel
-            # increment, so this split's increment orders the partial loads
-            # after all of them, and the loads can be ordinary cached loads;
-            # volatile loads would bypass the caches and slow the merge. Only
-            # the incrementing wave acquires, but its BUFFER_INV invalidates
-            # the CU's whole vector L1 cache, which all of the work-group's
-            # waves share, and the L2's non-coherently cached lines (CDNA4
-            # ISA 9.1.10.2, Table 52), and the barrier that
-            # broadcasts the old count orders their loads after it.
-            for split in range(0, cfg.NUM_KV_SPLITS):
-                base = (
-                    (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
-                    * cfg.NUM_KV_SPLITS
-                    + split
-                ) * cfg.HEAD_DIM + offs_d[None, :]
-                part_o = gl.load(
-                    self.mid_o_ptr + base,
-                    mask=valid[:, None],
-                    other=0.0,
-                ).to(gl.float32)
-                lse_offset = (
-                    tokens * cfg.NUM_Q_HEADS + q_heads
-                ) * cfg.NUM_KV_SPLITS + split
-                part_lse = gl.load(
-                    self.mid_lse_ptr + lse_offset,
-                    mask=valid,
-                    other=-float("inf"),
-                ).to(gl.float32)
-                next_m = maximum(final_m, part_lse)
-                if cfg.MAX_SEQLEN_Q > 1:
-                    # A later query position's first splits can all precede
-                    # its window, leaving -inf - -inf.
-                    next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
-                    alpha = gl.exp2(final_m - next_m_safe)
-                    beta = gl.exp2(part_lse - next_m_safe)
-                else:
-                    alpha = gl.exp2(final_m - next_m)
-                    beta = gl.exp2(part_lse - next_m)
-                final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
-                final_l = final_l * alpha + beta
-                final_m = next_m
-            if has_sink:
-                sink_log2 = (
-                    gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
-                    * _INV_LN2
-                )
-                next_m = maximum(final_m, sink_log2)
-                alpha = gl.exp2(final_m - next_m)
-                beta = gl.exp2(sink_log2 - next_m)
-                final_acc *= alpha[:, None]
-                final_l = final_l * alpha + beta
-            output = (final_acc / final_l[:, None]).to(out_ptr.dtype.element_ty)
-            out_offsets = (
-                tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
+        return old
+
+    @gluon.jit
+    def merge_splits(self, sink_ptr, has_sink: gl.constexpr):
+        """Merge the row block's split partials (and the sink) into its FP32
+        output rows, ``[BLOCK_M, HEAD_DIM]`` in ``cfg.store_layout``. Only the
+        last arriver (see ``arrive``) may call it."""
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        tokens = self.row_tokens(offs_m)
+        q_heads = self.row_heads(offs_m)
+        valid = self.row_valid(offs_m)
+        final_m = gl.full(
+            [cfg.BLOCK_M],
+            value=-float("inf"),
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.store_layout),
+        )
+        final_l = gl.zeros(
+            [cfg.BLOCK_M],
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.store_layout),
+        )
+        final_acc = gl.zeros(
+            [cfg.BLOCK_M, cfg.HEAD_DIM],
+            dtype=gl.float32,
+            layout=cfg.store_layout,
+        )
+        # Each split's waves stored their partials before its acq_rel
+        # increment, so this split's increment orders the partial loads
+        # after all of them, and the loads can be ordinary cached loads;
+        # volatile loads would bypass the caches and slow the merge. Only
+        # the incrementing wave acquires, but its BUFFER_INV invalidates
+        # the CU's whole vector L1 cache, which all of the work-group's
+        # waves share, and the L2's non-coherently cached lines (CDNA4
+        # ISA 9.1.10.2, Table 52), and the barrier that
+        # broadcasts the old count orders their loads after it.
+        for split in range(0, cfg.NUM_KV_SPLITS):
+            base = (
+                (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
+                * cfg.NUM_KV_SPLITS
+                + split
             ) * cfg.HEAD_DIM + offs_d[None, :]
-            cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
-            gl.store(counters_ptr + counter_offset, 0)
+            part_o = gl.load(
+                self.mid_o_ptr + base,
+                mask=valid[:, None],
+                other=0.0,
+            ).to(gl.float32)
+            lse_offset = (
+                tokens * cfg.NUM_Q_HEADS + q_heads
+            ) * cfg.NUM_KV_SPLITS + split
+            part_lse = gl.load(
+                self.mid_lse_ptr + lse_offset,
+                mask=valid,
+                other=-float("inf"),
+            ).to(gl.float32)
+            next_m = maximum(final_m, part_lse)
+            if cfg.MAX_SEQLEN_Q > 1:
+                # A later query position's first splits can all precede
+                # its window, leaving -inf - -inf.
+                next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
+                alpha = gl.exp2(final_m - next_m_safe)
+                beta = gl.exp2(part_lse - next_m_safe)
+            else:
+                alpha = gl.exp2(final_m - next_m)
+                beta = gl.exp2(part_lse - next_m)
+            final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
+            final_l = final_l * alpha + beta
+            final_m = next_m
+        if has_sink:
+            sink_log2 = (
+                gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
+                * _INV_LN2
+            )
+            next_m = maximum(final_m, sink_log2)
+            alpha = gl.exp2(final_m - next_m)
+            beta = gl.exp2(sink_log2 - next_m)
+            final_acc *= alpha[:, None]
+            final_l = final_l * alpha + beta
+        return final_acc / final_l[:, None]
 
 
 # ===-----------------------------------------------------------------------===#
@@ -933,6 +961,9 @@ def gluon_mha_decode_gfx950(
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        gl.program_id(0),
+        gl.program_id(1),
+        gl.program_id(2),
     )
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
@@ -1007,6 +1038,9 @@ def gluon_mha_decode_sliding_gfx950(
         cache_seqlens_ptr,
         out_ptr,
         out_ptr,
+        gl.program_id(0),
+        gl.program_id(1),
+        gl.program_id(2),
     )
     k_smem = gl.allocate_shared_memory(
         k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
@@ -1093,6 +1127,9 @@ def _mha_decode_sliding_split_atomic(
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        gl.program_id(0),
+        gl.program_id(1),
+        gl.program_id(2),
     )
     k_smem = gl.allocate_shared_memory(
         k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
