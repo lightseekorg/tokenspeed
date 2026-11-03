@@ -62,25 +62,17 @@ if not (
 from muse_layer_builder import (  # noqa: E402
     EPS,
     HEAD_DIM,
-    INTER,
-    KV_HEADS,
-    KV_WIDTH,
-    POOLED,
     Q_HEADS,
     Q_WIDTH,
-    TOPK,
     TRAITS,
-    WIDTH,
     build_layer_inputs,
-    fresh_next_prologue,
 )
-from tokenspeed_kernel.numerics.torch.residual import (  # noqa: E402
-    torch_post_norm_residual_pre_norm,
+from muse_layer_reference import (  # noqa: E402
+    assert_matches,
+    attention_reference,
+    regular_reference,
+    run_fused,
 )
-from tokenspeed_kernel.ops.attention.mha import (  # noqa: E402
-    mha_decode_with_kvcache,
-)
-from tokenspeed_kernel.ops.attention.prologue import gqa_prologue  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
     BOX_WORDS,
 )
@@ -92,193 +84,11 @@ from tokenspeed_kernel.ops.decoder_layer import (  # noqa: E402
 from tokenspeed_kernel.ops.layernorm.fused_norm import (  # noqa: E402
     weightless_rmsnorm_gated_sigmoid,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (  # noqa: E402
-    invoke_stage1_mxfp4_mfma_decode_gluon,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (  # noqa: E402
-    invoke_stage2_mxfp4_mfma_decode_gluon,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
-    _extract_gluon_raw_s,
-    _extract_gluon_raw_w,
-    _quantize_mxfp4_activation,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E402
-    empty_swizzled_cdna4_mxfp4_scale,
-)
 
 # Cached tokens per request before the verify rows. Full layers read the
 # whole context: one request at ~141k (the served context), and two, whose
 # split schedule then gives workgroups two items.
 CONTEXT = {"sliding": (1500, 2600), "full": (141_000, 141_000)}
-SWIGLU = dict(swiglu_alpha=1.0, swiglu_limit=0.0, swiglu_beta=0.0)
-# 8th vs 9th biased routing score: far above the logit error of a reordered
-# FP32 sum over 8192 products (~2**-20 relative).
-ROUTING_GAP = 1e-3
-
-
-def _run(fused, key, inputs):
-    """One fused launch; the residual and the next caches it updates are
-    copies, so a launch can be repeated."""
-    residual = inputs["residual"].clone()
-    common = dict(positions=inputs["positions"], cache=inputs["cache"])
-    if key.next_kind == "regular":
-        normed, residual = fused.forward_last(
-            inputs["prepared_query"], residual, next_norm=inputs["next_norm"], **common
-        )
-        return dict(normed=normed, residual=residual)
-    target = fresh_next_prologue(inputs["next_prologue"])
-    (q, gate), residual = fused.forward(
-        inputs["prepared_query"], residual, next_prologue=target, **common
-    )
-    return dict(q=q.reshape(q.shape[0], -1), gate=gate, residual=residual,
-                next_k=target.cache.k_cache, next_v=target.cache.v_cache)  # fmt: skip
-
-
-def _attention(inputs):
-    """Today's decode of the step's rows over the FP8 cache (the registered
-    kernel the MHA backend calls, with the forward's split schedule on full
-    layers): [rows, Q_WIDTH] BF16."""
-    q, _ = inputs["prepared_query"]
-    cache = inputs["cache"]
-    rows = q.shape[0]
-    out = mha_decode_with_kvcache(
-        q=q.view(rows, Q_HEADS, HEAD_DIM), k_cache=cache.k_cache,
-        v_cache=cache.v_cache, page_table=cache.page_table,
-        cache_seqlens=cache.seq_lens, max_seqlen_k=cache.max_seqlen_k,
-        max_seqlen_q=WIDTH, window_left=cache.window_left,
-        schedule=cache.split_schedule,
-    )  # fmt: skip
-    return out.reshape(rows, Q_WIDTH)
-
-
-def _direct_decode(xq, xs, experts, ids):
-    """Today's MXFP4 decode stages on this rank's expert slices."""
-    rows = ids.shape[0]
-    w13 = _extract_gluon_raw_w(experts.w13_weight_triton_tensor)
-    w13_scale = _extract_gluon_raw_s(experts.w13_precision_config.b_mx_scale)
-    w2 = _extract_gluon_raw_w(experts.w2_weight_triton_tensor)
-    w2_scale = _extract_gluon_raw_s(experts.w2_precision_config.b_mx_scale)
-    mids = torch.empty((rows * TOPK, INTER // 2), dtype=torch.uint8, device="cuda")
-    mids_scale = empty_swizzled_cdna4_mxfp4_scale(
-        rows * TOPK, INTER // 32, device=torch.device("cuda")
-    )
-    invoke_stage1_mxfp4_mfma_decode_gluon(
-        xq, xs, w13, w13_scale, ids, mids, TOPK, 0, mids_scale,
-        prefetch_tiles=8, BLOCK_N=64, **SWIGLU,
-    )  # fmt: skip
-    out = torch.empty((rows * TOPK, POOLED), dtype=torch.bfloat16, device="cuda")
-    invoke_stage2_mxfp4_mfma_decode_gluon(
-        mids, mids_scale, w2, w2_scale, ids, None, out, TOPK, 0, False, None
-    )
-    return out
-
-
-def _rmsnorm(x, weight, eps, offset):
-    x = x.double()
-    x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
-    return x * (weight.float() + offset).to(torch.bfloat16).double()
-
-
-def _reference(key, weights, inputs):
-    """The regular layer's steps on the same inputs (collectives over the
-    world group)."""
-    q, gate = inputs["prepared_query"]
-    gated = weightless_rmsnorm_gated_sigmoid(
-        _attention(inputs), gate, Q_HEADS, HEAD_DIM, EPS, False
-    )
-    attention = gated.float() @ weights["o_proj"].float().t()
-    dist.all_reduce(attention)
-    post_w, post_eps, post_offset = weights["post_attention_norm"]
-    pre_w, pre_eps, pre_offset = weights["pre_feedforward_norm"]
-    stream, pre, pre_bf16 = torch_post_norm_residual_pre_norm(
-        inputs["residual"], attention.to(torch.bfloat16), post_w, post_eps,
-        post_offset, *weights["post_attention_gate"], pre_w, pre_eps, pre_offset,
-        False, None, 1,
-    )  # fmt: skip
-
-    # Router: FP32 logits scaled, sigmoid scores, the bias picks only.
-    logits = (pre.float() @ weights["router"]) * weights["router_multiplier"]
-    scores = logits.sigmoid()
-    biased = scores + weights["router_bias"]
-    ranked = biased.sort(dim=-1, descending=True).values
-    gap = (ranked[:, TOPK - 1] - ranked[:, TOPK]).min().item()
-    assert gap > ROUTING_GAP, f"routing ties within {gap}; draw other inputs"
-    ids = biased.topk(TOPK, dim=-1).indices
-    route_weights = scores.gather(1, ids)
-    route_weights = route_weights / route_weights.sum(-1, keepdim=True)
-    route_weights = route_weights * weights["routed_scaling_factor"]
-
-    # Pooler, its norm and the MXFP4 activation the experts read.
-    pooled = (pre_bf16.float() @ weights["pooler"].float().t()).to(torch.bfloat16)
-    normed = _rmsnorm(pooled, *weights["pooled_norm"]).to(torch.bfloat16)
-    xq, xs = _quantize_mxfp4_activation(normed)
-    routes = _direct_decode(xq, xs, weights["experts"], ids.to(torch.int32)).float()
-    dist.all_reduce(routes)
-    routes = routes.view(-1, TOPK, POOLED)
-    combined = (
-        _rmsnorm(routes, *weights["post_expert_norm"])
-        * route_weights.double()[..., None]
-    ).sum(1)
-    mlp = combined.to(torch.bfloat16).float() @ weights["post_expert_proj"].float().t()
-    post2_w, post2_eps, post2_offset = weights["post_feedforward_norm"]
-    next_w, next_eps, next_offset = weights["next_input_norm"]
-    stream, _, next_input = torch_post_norm_residual_pre_norm(
-        stream.float(), mlp.to(torch.bfloat16), post2_w, post2_eps, post2_offset,
-        *weights["post_feedforward_gate"], next_w, next_eps, next_offset,
-        False, None, 1,
-    )  # fmt: skip
-    if key.next_kind == "regular":
-        return dict(normed=next_input, residual=stream.float())
-
-    qkvg = (next_input.float() @ weights["next_qkv_proj"].float().t()).to(
-        torch.bfloat16
-    )
-    q, k, v, next_gate = qkvg.split((Q_WIDTH, KV_WIDTH, KV_WIDTH, Q_WIDTH), dim=-1)
-    target = fresh_next_prologue(inputs["next_prologue"])
-    prepared = gqa_prologue(
-        q, k, v, norm=target.norm, rotary=target.rotary, cache=target.cache,
-        query_dtype=target.query_dtype, return_kv=False, solution=None, override=None,
-    )  # fmt: skip
-    return dict(q=prepared.q, gate=next_gate, residual=stream.float(),
-                next_k=target.cache.k_cache, next_v=target.cache.v_cache)  # fmt: skip
-
-
-def _relative_rms(actual, expected):
-    actual, expected = actual.double(), expected.double()
-    return (
-        ((actual - expected).square().mean() / expected.square().mean()).sqrt().item()
-    )
-
-
-# One BF16 rounding is 2**-9 relative RMS; each reordered sum on the path
-# (attention all-reduce, router and pooler K parts, route sum, QKV K parts)
-# adds at most one, and a reordered value that crosses an MXFP4 rounding
-# boundary moves that element one E2M1 step (rare: the bound leaves room).
-_BF16_BOUND = 2**-6
-# The FP8 E4M3 query and K/V: one rounding is 2**-4 relative.
-_FP8_BOUND = 2**-3
-
-
-def _compare(key, actual, expected):
-    for name in ("residual", "normed", "gate"):
-        if name in expected:
-            error = _relative_rms(actual[name], expected[name])
-            assert error < _BF16_BOUND, (key, name, error)
-    if "q" in expected:
-        error = _relative_rms(actual["q"].float(), expected["q"].float())
-        assert error < _FP8_BOUND, (key, "q", error)
-        for name in ("next_k", "next_v"):
-            got = actual[name].view(-1, KV_HEADS, HEAD_DIM)
-            want = expected[name].view(-1, KV_HEADS, HEAD_DIM)
-            error = _relative_rms(got.float(), want.float())
-            assert error < _FP8_BOUND, (key, name, error)
-            # Only the step's slots are written.
-            written = torch.zeros(got.shape[0], dtype=torch.bool, device="cuda")
-            written[expected["slots"]] = True
-            assert not got[~written].float().any(), (key, name)
-
-
 PLAN_KEYS = [
     PlanKey(requests, kind, next_kind)
     for kind in ("sliding", "full")
@@ -295,7 +105,7 @@ def _check_attention_box(state, inputs):
     q, gate = inputs["prepared_query"]
     rows = q.shape[0]
     expected = weightless_rmsnorm_gated_sigmoid(
-        _attention(inputs), gate, Q_HEADS, HEAD_DIM, EPS, False
+        attention_reference(inputs), gate, Q_HEADS, HEAD_DIM, EPS, False
     )
     # This launch's copy of the box (epoch & 1), as BF16 rows.
     epoch = int(state.epochs[0])
@@ -336,16 +146,16 @@ def _worker(rank, port, record_dir, errors):
             )  # fmt: skip
             assert fused is not None
             assert fused.decline_reasons(key.requests) == [], key
-            expected = _reference(key, weights, inputs)
+            expected = regular_reference(key, weights, inputs)
             expected["slots"] = inputs["slots"]
-            actual = _run(fused, key, inputs)
+            actual = run_fused(fused, key, inputs, inputs["residual"].clone())
             if key.layer_kind == "full":
                 _check_attention_box(state, inputs)
-            _compare(key, actual, expected)
+            assert_matches(key, actual, expected)
 
             # Deterministic: the same launch again, at the next epoch and
             # the other copy of every two-copy area, gives the same bits.
-            again = _run(fused, key, inputs)
+            again = run_fused(fused, key, inputs, inputs["residual"].clone())
             for name, value in actual.items():
                 assert torch.equal(
                     value.view(torch.uint8), again[name].view(torch.uint8)
@@ -359,7 +169,7 @@ def _worker(rank, port, record_dir, errors):
             # Graph replay equals eager.
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                captured = _run(fused, key, inputs)
+                captured = run_fused(fused, key, inputs, inputs["residual"].clone())
             graph.replay()
             torch.cuda.synchronize()
             for name, value in actual.items():
