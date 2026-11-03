@@ -274,6 +274,9 @@ class AttnConfig:
                     raise ValueError("FlashMLA DCP decode requires CUDA")
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
+            elif softmax.backend_name in ("mla", "gluon") and not softmax.is_dsa:
+                if self.draft_block_decode:
+                    raise ValueError("MLA DCP decode does not support block drafts")
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 device_type = torch.device(self.device).type
                 if device_type not in ("cuda", "npu"):
@@ -294,7 +297,7 @@ class AttnConfig:
             else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
-                    "DSA, FlashMLA or CuTe MLA attention"
+                    "DSA, FlashMLA, CuTe MLA or MLA attention"
                 )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
