@@ -20,18 +20,23 @@
 
 """GatedMLP runs separate kernels unless the model lists a fused one."""
 
+import os
 import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
-from ci_system.ci_register import register_cuda_ci
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
