@@ -107,6 +107,44 @@ def gemv_a16w16_splitk_weights_gfx950(
 
 
 @gluon.jit
+def gemv_a16w16_splitk_x_gfx950(
+    x_ptr,
+    x_stride,
+    task,
+    M,
+    K: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    X_CACHE: gl.constexpr,
+):
+    """Load task ``task``'s slice of x as the MFMA B operand.
+
+    Returns ``[waves, K / PARTS / waves, 16]`` BF16: wave w's contiguous K
+    range of the task's part, for 16 token slots; slots past ``M`` reread
+    token ``M - 1``. ``X_CACHE`` as in :func:`gemv_a16w16_splitk_finish_gfx950`.
+    """
+    WAVES: gl.constexpr = gl.num_warps()
+    KP: gl.constexpr = K // PARTS
+    KW: gl.constexpr = KP // WAVES
+    b_l: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=_mfma(WAVES), k_width=8
+    )
+    part = task // GROUPS
+    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, b_l)))
+    k = gl.arange(0, KW, gl.SliceLayout(0, gl.SliceLayout(2, b_l)))
+    token = gl.minimum(
+        gl.arange(0, _BLOCK_T, gl.SliceLayout(0, gl.SliceLayout(1, b_l))), M - 1
+    )
+    return cdna4.buffer_load(
+        x_ptr,
+        token[None, None, :] * x_stride
+        + (part * KP + wave * KW)[:, None, None]
+        + k[None, :, None],
+        cache=X_CACHE,
+    )
+
+
+@gluon.jit
 def gemv_a16w16_splitk_finish_gfx950(
     tiles,
     x_ptr,
@@ -132,25 +170,11 @@ def gemv_a16w16_splitk_finish_gfx950(
     and the partials are read within the same launch on other XCDs.
     """
     WAVES: gl.constexpr = gl.num_warps()
-    KP: gl.constexpr = K // PARTS
-    KW: gl.constexpr = KP // WAVES
     TILES: gl.constexpr = ROWS_PER_TASK // 16
     mfma: gl.constexpr = _mfma(WAVES)
-    b_l: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
     group = task % GROUPS
     part = task // GROUPS
-    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, b_l)))
-    k = gl.arange(0, KW, gl.SliceLayout(0, gl.SliceLayout(2, b_l)))
-    token = gl.minimum(
-        gl.arange(0, _BLOCK_T, gl.SliceLayout(0, gl.SliceLayout(1, b_l))), M - 1
-    )
-    x = cdna4.buffer_load(
-        x_ptr,
-        token[None, None, :] * x_stride
-        + (part * KP + wave * KW)[:, None, None]
-        + k[None, :, None],
-        cache=X_CACHE,
-    )
+    x = gemv_a16w16_splitk_x_gfx950(x_ptr, x_stride, task, M, K, PARTS, GROUPS, X_CACHE)
     # Every wave's accumulator of every tile to LDS, one barrier, then each
     # thread sums its (row, token) outputs over the waves.
     bufs = ()
@@ -366,6 +390,7 @@ __all__ = [
     "gemv_a16w16_splitk_finish_gfx950",
     "gemv_a16w16_splitk_sum_gfx950",
     "gemv_a16w16_splitk_weights_gfx950",
+    "gemv_a16w16_splitk_x_gfx950",
     "gluon_gemv_a16w16_splitk_gfx950",
     "gluon_gemv_a16w16_splitk_reduce_gfx950",
     "launch_gluon_gemv_a16w16_splitk_gfx950",
