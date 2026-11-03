@@ -45,35 +45,53 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
 _LOAD = re.compile(r"^(buffer|global)_load_\w+")
 _STORE = re.compile(r"^(buffer|global)_store_\w+")
 
+_BASE = dict(QUAD_MAP=0, DN_ORDER=0, DN_LINES=0, ADDR_SOFFSET=0, SCALE_LANES=0)
 VARIANTS = [
-    dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=1),
-    dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=0),
-    dict(ROWS=16, RING=8, QUAD_MAP=1, DN_ORDER=1, ADDR_SOFFSET=1, SCALE_LANES=0),
-    dict(ROWS=16, RING=16, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=0),
+    dict(_BASE, ROWS=8, RING=8, SCALE_LANES=1),
+    dict(_BASE, ROWS=8, RING=8),
+    dict(_BASE, ROWS=16, RING=8, QUAD_MAP=1, DN_ORDER=1, ADDR_SOFFSET=1),
+    dict(_BASE, ROWS=16, RING=16),
+    dict(_BASE, ROWS=16, RING=16, DN_LINES=1),
+    dict(_BASE, ROWS=8, RING=8, QUAD_MAP=1, ADDR_SOFFSET=1, DN_LINES=1),
 ]
 
 
 @gluon.jit
-def _pair_word_sink(args, y, route, cols, col0):
+def _pair_word_sink(args, ys, route, cols, col0):
     """A Lamport-style sink like the layer's H4 push: whole bf16 pairs as
     32-bit words, one relaxed system-scope store each, all in the lane, to a
     per-wave owner slice picked by the scalar first column."""
     words_ptr = args[0].to(gl.pointer_type(gl.int32), bitcast=True) + (col0 // 512) * 8
-
-    zeros = gl.zeros(y.shape, gl.int32, y.type.layout)
-    low, high = gl.split(gl.reshape(y.to(gl.bfloat16), [16, 64, 2]))
-    column, _ = gl.split(gl.reshape(cols + zeros, [16, 64, 2]))
-    row, _ = gl.split(gl.reshape(route + zeros, [16, 64, 2]))
-    words = low.to(gl.uint16, bitcast=True).to(gl.uint32) | (
-        high.to(gl.uint16, bitcast=True).to(gl.uint32) << 16
-    )
-    gl.atomic_store(
-        words_ptr + row * 2048 + column // 2,
-        words.to(gl.int32, bitcast=True),
-        mask=row >= 0,
-        sem="relaxed",
-        scope="sys",
-    )
+    if len(ys) == 1:
+        y = ys[0]
+        zeros = gl.zeros(y.shape, gl.int32, y.type.layout)
+        low, high = gl.split(gl.reshape(y.to(gl.bfloat16), [16, 64, 2]))
+        column, _ = gl.split(gl.reshape(cols[0] + zeros, [16, 64, 2]))
+        row, _ = gl.split(gl.reshape(route + zeros, [16, 64, 2]))
+        words = low.to(gl.uint16, bitcast=True).to(gl.uint32) | (
+            high.to(gl.uint16, bitcast=True).to(gl.uint32) << 16
+        )
+        gl.atomic_store(
+            words_ptr + row * 2048 + column // 2,
+            words.to(gl.int32, bitcast=True),
+            mask=row >= 0,
+            sem="relaxed",
+            scope="sys",
+        )
+    else:
+        # Whole lines: strips 0 and 2 (1 and 3) are a lane's even and odd
+        # columns.
+        for line in gl.static_range(2):
+            low = ys[line].to(gl.bfloat16).to(gl.uint16, bitcast=True)
+            high = ys[line + 2].to(gl.bfloat16).to(gl.uint16, bitcast=True)
+            words = low.to(gl.uint32) | (high.to(gl.uint32) << 16)
+            gl.atomic_store(
+                words_ptr + route * 2048 + cols[line] // 2,
+                words.to(gl.int32, bitcast=True),
+                mask=(route >= 0) & (cols[line] >= 0),
+                sem="relaxed",
+                scope="sys",
+            )
 
 
 def _compile(fields, sink=native_stream.store_routes_sink):
@@ -228,12 +246,28 @@ def test_item_loops_keep_the_ring(fields):
             body = [s for s, _ in ins[start:end]]
             dwords = sum(s.startswith("buffer_load_dword ") for s in body)
             assert dwords == (0 if fields["SCALE_LANES"] else 16), dwords
+        else:
+            # Down scales: strips 16 columns apart share their E8M0 dwords
+            # (one per 32-column block and step pair), with or without whole
+            # lines.
+            body = [s for s, _ in ins[start:end]]
+            dwords = [s for s in body if s.startswith("buffer_load_dword ")]
+            assert sum(not s.endswith(" sc1") for s in dwords) == 4, dwords
+            # The default sink stores bf16 runs of 4 per strip, or whole
+            # 16-byte lines (two per lane) with DN_LINES.
+            stores = [s.split()[0] for s in body if _STORE.match(s.split()[0])]
+            if fields["DN_LINES"]:
+                assert stores == ["buffer_store_dwordx4"] * 2, stores
+            else:
+                assert stores == ["buffer_store_dwordx2"] * 4, stores
 
 
-def test_down_loop_sink_stays_in_the_wave():
+@pytest.mark.parametrize("lines", [0, 1])
+def test_down_loop_sink_stays_in_the_wave(lines):
     """A sink that packs column pairs works in the handed layout: the down
-    loop (per-wave trip counts) gets no barrier and no LDS round trip."""
-    fields = dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=0)
+    loop (per-wave trip counts) gets no barrier and no LDS round trip, and
+    keeps its ring."""
+    fields = dict(_BASE, ROWS=8, RING=16, DN_LINES=lines)
     plain = _compile(fields)
     paired = _compile(fields, _pair_word_sink)
     ins = _instructions(paired)
@@ -241,6 +275,8 @@ def test_down_loop_sink_stays_in_the_wave():
     body = [s for s, _ in ins[start : end + 1]]
     assert not any(s.startswith("s_barrier") for s in body)
     assert not any(s.startswith("ds_write") for s in body)
+    waits = _walk(ins[start : end + 1])[0]
+    assert min(n for n, before in waits if n < before) >= fields["RING"] - 1, waits
     vgprs = [
         int(re.search(r"\.vgpr_count:\s+(\d+)", a).group(1)) for a in (plain, paired)
     ]

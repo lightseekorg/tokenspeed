@@ -297,7 +297,11 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
             gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0])) // 64
         )
         h4_sink(
-            H4SinkArgs(view, launch, 3), y, route, (1024 + c)[None, :], 1024 + 16 * wave
+            H4SinkArgs(view, launch, 3),
+            (y,),
+            route,
+            ((1024 + c)[None, :],),
+            1024 + 16 * wave,
         )
     elif ROLE == "own4":
         own4_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
@@ -435,7 +439,7 @@ def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, r
         y = gl.load(floats + unit * 2048 + r[:, None] * 128 + c[None, :])
         route = gl.load(words + unit * 16 + r)[:, None]
         h4_sink(
-            H4SinkArgs(view, launch, 3), y, route, (unit * 128 + c)[None, :],
+            H4SinkArgs(view, launch, 3), (y,), route, ((unit * 128 + c)[None, :],),
             unit * 128 + 16 * wave_scalar(lane // 64),
         )  # fmt: skip
 

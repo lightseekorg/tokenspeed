@@ -599,11 +599,35 @@ def _expert_at(rank_smem, rank):
 
 
 @gluon.jit
+def _line_column(pos, st: gl.constexpr):
+    """Column (within a 64-column down unit) that MFMA output position
+    ``pos`` (0-15) of strip ``st`` computes when a unit's strips are mapped
+    to whole lines. Lane ``k = pos // 4`` holds positions ``4 k + j``; strips
+    0 and 2 give it the even and odd columns of ``base(k) + 0..7``, strips 1
+    and 3 those of ``base(k) + 16..23``, with ``base(k) = 32 (k // 2) + 8 (k
+    % 2)``. Strips ``st`` and ``st ^ 1`` stay 16 columns apart, so they share
+    their E8M0 dwords as the plain mapping does."""
+    k = pos // 4
+    return 32 * (k // 2) + 8 * (k % 2) + 16 * (st % 2) + st // 2 + 2 * (pos % 4)
+
+
+@gluon.jit
 def _strip_offsets(
-    expert, column, w_stride, s_stride, s_lin, s_nb, N_PHYS: gl.constexpr
+    expert,
+    column,
+    w_stride,
+    s_stride,
+    s_lin,
+    s_nb,
+    N_PHYS: gl.constexpr,
+    LINE_STRIP: gl.constexpr,
 ):
     """Lane offsets of a 16-column strip's first K step and the per-step
     advances, all from ``decode_common``'s layout functions.
+
+    ``LINE_STRIP`` -1 computes columns ``column + 0..15``; 0-3 computes strip
+    ``LINE_STRIP`` of the 64-column unit at ``column`` under the whole-line
+    mapping (:func:`_line_column`).
 
     Returns ``(w, w_pair, w_odd, s, s_pair)``: step ``kt`` reads weight bytes
     at ``w + (kt // 2) * w_pair + (kt % 2) * w_odd`` and its E8M0 byte at
@@ -618,19 +642,22 @@ def _strip_offsets(
     # lane's 16 bytes one dwordx4.
     column = gl.multiple_of(column, 16)
     w_expert = expert.to(gl.int64) * w_stride
-    n_col = column + bn % 16
+    if LINE_STRIP < 0:
+        n_col = column + bn % 16
+    else:
+        n_col = column + _line_column(bn % 16, LINE_STRIP)
     w0 = _gluon_dot_preshuffled_w_offset(w_expert, bk, n_col, N_PHYS)
     w1 = _gluon_dot_preshuffled_w_offset(w_expert, 64 + bk, n_col, N_PHYS)
     w2 = _gluon_dot_preshuffled_w_offset(w_expert, 128 + bk, n_col, N_PHYS)
     bsn = gl.arange(0, 128, layout=gl.SliceLayout(1, lsb))[:, None]
     bsk = gl.arange(0, 4, layout=gl.SliceLayout(0, lsb))[None, :]
     s_expert = expert.to(gl.int64) * s_stride
-    s0 = _cdna4_swizzled_mxfp4_scale_offset(
-        s_expert, column + bsn % 16, bsk, s_lin, s_nb
-    )
-    s2 = _cdna4_swizzled_mxfp4_scale_offset(
-        s_expert, column + bsn % 16, 8 + bsk, s_lin, s_nb
-    )
+    if LINE_STRIP < 0:
+        s_col = column + bsn % 16
+    else:
+        s_col = column + _line_column(bsn % 16, LINE_STRIP)
+    s0 = _cdna4_swizzled_mxfp4_scale_offset(s_expert, s_col, bsk, s_lin, s_nb)
+    s2 = _cdna4_swizzled_mxfp4_scale_offset(s_expert, s_col, 8 + bsk, s_lin, s_nb)
     # The advances are whole 1 KB chunks and whole scale dwords (asserted by
     # the codegen test's dwordx4 / dword loads).
     return (
@@ -813,6 +840,7 @@ def prefetch_moe(
         bufs.stride_s13lin,
         bufs.stride_s13nb,
         N_PHYS1,
+        -1,
     )
     wdesc = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.w13, 0x7FFFFFF0)
     sdesc = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.s13, 0x7FFFFFF0)
@@ -840,17 +868,40 @@ def prefetch_moe(
 
 
 @gluon.jit
-def store_routes_sink(args, y, route, cols, col0):
+def _bf16_pairs(even, odd):
+    """bf16 column pairs as 32-bit words: ``even`` in the low half."""
+    lo = even.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint32)
+    hi = odd.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint32)
+    return lo | (hi << 16)
+
+
+@gluon.jit
+def store_routes_sink(args, ys, route, cols, col0):
     """Default down-unit sink (see :func:`run_moe`): ``out[route, cols] =
     bf16(y)`` with ``out = args[0]`` of shape ``(rows * top_k, hidden)``;
-    rows with ``route < 0`` are skipped. The layer passes its H4 push."""
+    rows with ``route < 0`` are skipped. With 4 strips (whole lines) each
+    lane stores its two lines as 32-bit column pairs, one 16-byte store per
+    line. The layer passes its H4 push."""
     out = args[0]
-    gl.amd.cdna4.buffer_store(
-        y.to(gl.bfloat16),
-        out,
-        (route * _HIDDEN + cols).to(gl.int32),
-        mask=(route >= 0) & (cols >= 0),
-    )
+    if len(ys) == 1:
+        gl.amd.cdna4.buffer_store(
+            ys[0].to(gl.bfloat16),
+            out,
+            (route * _HIDDEN + cols[0]).to(gl.int32),
+            mask=(route >= 0) & (cols[0] >= 0),
+        )
+    else:
+        words = out.to(gl.pointer_type(gl.uint32), bitcast=True)
+        for line in gl.static_range(2):
+            # A lane's 4 words are one aligned run (the compiler cannot see
+            # it through the halving).
+            word = gl.max_contiguous(gl.multiple_of(cols[line] // 2, [1, 4]), [1, 4])
+            gl.amd.cdna4.buffer_store(
+                _bf16_pairs(ys[line], ys[line + 2]),
+                words,
+                (route * (_HIDDEN // 2) + word).to(gl.int32),
+                mask=(route >= 0) & (word >= 0),
+            )
 
 
 @gluon.jit
@@ -876,47 +927,33 @@ def _dn_st(c, order):
     return c % 4 if order == 0 else c // 4
 
 
+@gluon.constexpr_function
+def _line_strip(st, lines):
+    """``_strip_offsets``' LINE_STRIP for strip ``st`` of a down unit."""
+    return st if lines else -1
+
+
 @gluon.jit
-def _unit_offsets(expert, unit, bufs, N_PHYS2: gl.constexpr):
-    """Per-strip lane offsets of a down unit (4 strips of 16 columns)."""
+def _unit_offsets(expert, unit, bufs, N_PHYS2: gl.constexpr, DN_LINES: gl.constexpr):
+    """Per-strip lane offsets of a down unit (4 strips of 16 columns; with
+    ``DN_LINES`` the whole-line column mapping)."""
     n0 = unit * 64
-    w0, w_pair, w_odd, s0, s_pair = _strip_offsets(
-        expert,
-        n0,
-        bufs.stride_w2,
-        bufs.stride_s2,
-        bufs.stride_s2lin,
-        bufs.stride_s2nb,
-        N_PHYS2,
-    )
-    w1, _p1, _o1, s1, _q1 = _strip_offsets(
-        expert,
-        n0 + 16,
-        bufs.stride_w2,
-        bufs.stride_s2,
-        bufs.stride_s2lin,
-        bufs.stride_s2nb,
-        N_PHYS2,
-    )
-    w2, _p2, _o2, s2, _q2 = _strip_offsets(
-        expert,
-        n0 + 32,
-        bufs.stride_w2,
-        bufs.stride_s2,
-        bufs.stride_s2lin,
-        bufs.stride_s2nb,
-        N_PHYS2,
-    )
-    w3, _p3, _o3, s3, _q3 = _strip_offsets(
-        expert,
-        n0 + 48,
-        bufs.stride_w2,
-        bufs.stride_s2,
-        bufs.stride_s2lin,
-        bufs.stride_s2nb,
-        N_PHYS2,
-    )
-    return (w0, w1, w2, w3), w_pair, w_odd, (s0, s1, s2, s3), s_pair
+    w = ()
+    s = ()
+    for st in gl.static_range(4):
+        ws, w_pair, w_odd, ss, s_pair = _strip_offsets(
+            expert,
+            n0 + (0 if DN_LINES else 16 * st),
+            bufs.stride_w2,
+            bufs.stride_s2,
+            bufs.stride_s2lin,
+            bufs.stride_s2nb,
+            N_PHYS2,
+            _line_strip(st, DN_LINES),
+        )
+        w = w + (ws,)
+        s = s + (ss,)
+    return w, w_pair, w_odd, s, s_pair
 
 
 @gluon.constexpr_function
@@ -1019,6 +1056,7 @@ def run_moe(
     RING: gl.constexpr,
     QUAD_MAP: gl.constexpr,
     DN_ORDER: gl.constexpr,
+    DN_LINES: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
     TAG_GLC: gl.constexpr,
     SCALE_LANES: gl.constexpr,
@@ -1034,25 +1072,33 @@ def run_moe(
     launch that advances the epoch must run the stream, since it zeroes the
     tag copy the next launch polls.
 
-    Every down unit's output goes to ``sink(sink_args, y, route, cols,
-    col0)``, once per 16-column strip: ``y`` the fp32 ``[16, 128]`` result in
-    ``MOE_SINK_LAYOUT`` (wave w's own 16 columns; each lane holds 4
-    consecutive columns of one row), ``route`` the ``[16, 1]`` route per
-    token row (-1: the token does not pick the expert) and ``cols`` the
-    ``[1, 128]`` output columns, both in its slice layouts, and ``col0`` the
-    wave's first column (``cols[16 w + c] == col0 + c``) as a per-wave
-    scalar: a multiple of 16 whose 16 columns lie within one 512-column
-    slice. Like other per-wave scalars, use ``col0`` for addresses and
-    branches only. The waves call the sink
-    independently, with different trip counts, so the sink must stay within
-    the wave: no layout conversion across waves, no barrier, no shared
-    memory a wave does not own. Elementwise math, in-lane ``reshape`` /
-    ``split`` of the column pairs and stores are fine.
+    Every down unit's output goes to ``sink(sink_args, ys, route, cols,
+    col0)``: ``ys`` a tuple of fp32 ``[16, 128]`` strip results in
+    ``MOE_SINK_LAYOUT`` (wave w's own 16 columns; each lane holds 4 values
+    of one row), ``cols`` the matching tuple of ``[1, 128]`` output columns,
+    ``route`` the ``[16, 1]`` route per token row (-1: the token does not
+    pick the expert), all in its slice layouts, and ``col0`` the wave's
+    first column as a per-wave scalar. Without ``DN_LINES`` the sink is
+    called once per strip with 1-tuples: lane l holds columns ``col0 + 4 (l
+    // 16) + 0..3`` and ``col0`` is a multiple of 16. With ``DN_LINES`` it is
+    called once per unit with the 4 strips and ``col0`` the unit's first
+    column (a multiple of 64): with ``base = 32 (k // 2) + 8 (k % 2)`` for
+    ``k = (l // 16) % 4``, value j of strip 0 is column ``col0 + base + 2
+    j`` and of strip 2 the next one; strips 1 and 3 likewise from ``col0 +
+    base + 16``. Each lane's strips 0 and 2 (1 and 3) thus form one whole
+    16-byte bf16 line, 4 column pairs. Either way a
+    call's columns lie within one 512-column slice. Like other per-wave
+    scalars, use ``col0`` for addresses and branches only. The waves call
+    the sink independently, with different trip counts, so the sink must
+    stay within the wave: no layout conversion across waves, no barrier, no
+    shared memory a wave does not own. Elementwise math, in-lane
+    ``reshape`` / ``split`` / ``join`` and stores are fine.
 
     Plan fields: ``RING`` weight chunks in flight per wave; ``QUAD_MAP`` 0
     runs a group's 4 strips on waves 4q..4q+3, 1 on waves q, q+2, q+4, q+6;
     ``DN_ORDER`` 0 runs a down unit K-step-major, 1 strip-major;
-    ``ADDR_SOFFSET`` advances weight addresses in the scalar offset;
+    ``DN_LINES`` maps a down unit's columns to strips so each lane's results
+    form whole lines (above; same sums, bit for bit); ``ADDR_SOFFSET`` advances weight addresses in the scalar offset;
     ``TAG_GLC`` sets the readiness poll's GLC bit; ``SCALE_LANES`` reads the
     gate/up scales lane-major (``bufs.s13_lanes``, one dwordx4 per lane per
     16 steps) instead of one swizzled dword per 2 steps.
@@ -1142,6 +1188,7 @@ def run_moe(
         bufs.stride_s13lin,
         bufs.stride_s13nb,
         N_PHYS1,
+        -1,
     )
     lscale = _lanes_base(expert, group * 64 + plan.strip * 16, N_PHYS1, _K_STEPS)
     pend_word = rank * 0 - 1
@@ -1158,6 +1205,7 @@ def run_moe(
             bufs.stride_s13lin,
             bufs.stride_s13nb,
             N_PHYS1,
+            -1,
         )
         nlscale = _lanes_base(nexpert, ngroup * 64 + plan.strip * 16, N_PHYS1, _K_STEPS)
         # An opaque index keeps the 32 steps' A reads in the loop (hoisted,
@@ -1273,7 +1321,9 @@ def run_moe(
     POLL_AT: gl.constexpr = max(_DN_CHUNKS - RING - 1, 0)
     dlive = plan.n_dn > 0
     dexpert, drank, dunit = _unit_of(plan, 0, rank_smem)
-    wb, dw_pair, dw_odd, sb, ds_pair = _unit_offsets(dexpert, dunit, bufs, N_PHYS2)
+    wb, dw_pair, dw_odd, sb, ds_pair = _unit_offsets(
+        dexpert, dunit, bufs, N_PHYS2, DN_LINES
+    )
     # First unit, in the steady state's issue order (side loads, then the
     # ring): the loop's first waits are the minimum over this entry and its
     # back edge. Its readiness wait therefore precedes its weights, once per
@@ -1309,7 +1359,7 @@ def run_moe(
         nexpert, nrank, nunit = _unit_of(plan, u + 1, rank_smem)
         nlive = u + 1 < plan.n_dn
         nwb, nw_pair, nw_odd, nsb, ns_pair = _unit_offsets(
-            nexpert, nunit, bufs, N_PHYS2
+            nexpert, nunit, bufs, N_PHYS2, DN_LINES
         )
         nroute_a = route_a
         nroute_s = route_s
@@ -1385,10 +1435,19 @@ def run_moe(
         # moves, and each wave owns its 16 columns.
         rows = gl.arange(0, 16, layout=gl.SliceLayout(1, rowl))
         route = _routes(ids_t, dexpert, rows, TOPK)[:, None]
-        cols = gl.arange(0, 128, layout=gl.SliceLayout(0, rowl))[None, :] % 16
-        for st in gl.static_range(4):
-            y = gl.convert_layout(accs[st], rowl, assert_trivial=True)
-            sink(sink_args, y, route, dunit * 64 + st * 16 + cols, dunit * 64 + st * 16)
+        pos = gl.arange(0, 128, layout=gl.SliceLayout(0, rowl))[None, :] % 16
+        if DN_LINES:
+            ys = ()
+            cols = ()
+            for st in gl.static_range(4):
+                ys = ys + (gl.convert_layout(accs[st], rowl, assert_trivial=True),)
+                cols = cols + (dunit * 64 + _line_column(pos, st),)
+            sink(sink_args, ys, route, cols, dunit * 64)
+        else:
+            for st in gl.static_range(4):
+                y = gl.convert_layout(accs[st], rowl, assert_trivial=True)
+                col0 = dunit * 64 + st * 16
+                sink(sink_args, (y,), route, (col0 + pos,), col0)
         dexpert, drank, dunit = nexpert, nrank, nunit
         wb, dw_pair, dw_odd, sb, ds_pair = nwb, nw_pair, nw_odd, nsb, ns_pair
         route_a, route_s = nroute_a, nroute_s
@@ -1436,6 +1495,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     RING: gl.constexpr,
     QUAD_MAP: gl.constexpr,
     DN_ORDER: gl.constexpr,
+    DN_LINES: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
     TAG_GLC: gl.constexpr,
     SCALE_LANES: gl.constexpr,
@@ -1447,7 +1507,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     SINK: gl.constexpr,
 ):
     """The MoE stream as its own persistent launch of 256 workgroups x 8
-    waves; ``SINK((out,), y, route, cols, col0)`` takes the down units' output
+    waves; ``SINK((out,), ys, route, cols, col0)`` takes the down units' output
     (``store_routes_sink``: ``out[route, :]`` in bf16)."""
     # Entry counters first, then the plan and the first weights (they depend
     # only on the ids), then the entry check.
@@ -1502,6 +1562,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         RING,
         QUAD_MAP,
         DN_ORDER,
+        DN_LINES,
         ADDR_SOFFSET,
         TAG_GLC,
         SCALE_LANES,
@@ -1655,6 +1716,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
     ring: int,
     quad_map: int,
     dn_order: int,
+    dn_lines: int,
     addr_soffset: int,
     tag_glc: int,
     tail_num: int,
@@ -1674,7 +1736,8 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         topk_ids: ``(rows, top_k)`` int32 global expert ids (EP1: all local).
         out: ``(rows * top_k, 4096)`` bf16, written per route.
         state: :class:`NativeMoeState`.
-        ring, quad_map, dn_order, addr_soffset, tag_glc, tail_num, tail_den:
+        ring, quad_map, dn_order, dn_lines, addr_soffset, tag_glc, tail_num,
+            tail_den:
             Plan fields, see :func:`run_moe` and :func:`prefetch_moe`.
         swiglu_alpha, swiglu_limit, swiglu_beta: The model's SwiGLU.
         deadline_ticks: How long a readiness wait may last (10 ns ticks).
@@ -1698,7 +1761,8 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         w.stride_s13nb, w.stride_w2, w.stride_s2, w.stride_s2lin, w.stride_s2nb,
         deadline_ticks,
         ROWS=rows, TOPK=top_k, N_PHYS1=w.n_phys1, N_PHYS2=w.n_phys2, RING=ring,
-        QUAD_MAP=quad_map, DN_ORDER=dn_order, ADDR_SOFFSET=addr_soffset,
+        QUAD_MAP=quad_map, DN_ORDER=dn_order, DN_LINES=dn_lines,
+        ADDR_SOFFSET=addr_soffset,
         TAG_GLC=tag_glc, SCALE_LANES=int(w.s13_lanes is not None),
         TAIL_NUM=tail_num, TAIL_DEN=tail_den, SWIGLU_ALPHA=swiglu_alpha,
         SWIGLU_LIMIT=swiglu_limit, SWIGLU_BETA=swiglu_beta, SINK=store_routes_sink,
