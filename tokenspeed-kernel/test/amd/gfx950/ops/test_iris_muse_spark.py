@@ -786,6 +786,7 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
     from tokenspeed.runtime.distributed.comm_backend.registry import (
         initialize_comm_backend,
     )
+    from tokenspeed.runtime.models.base.layer_stack import DecoderLayerStack
     from tokenspeed.runtime.models.muse_spark import MuseSparkForConditionalGeneration
 
     group = tuple(range(world_size))
@@ -817,7 +818,11 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
         config=SimpleNamespace(
             hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
         ),
-        model=SimpleNamespace(iris_state=None, layers=[layer]),
+        # The default stack: this model runs no fused layers, so it reserves
+        # no heap for them and prepares nothing.
+        model=SimpleNamespace(
+            iris_state=None, layers=[layer], layer_stack=DecoderLayerStack()
+        ),
     )
     assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
     state = owner.model.iris_state
