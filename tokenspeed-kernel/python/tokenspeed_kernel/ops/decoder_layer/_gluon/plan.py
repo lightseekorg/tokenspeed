@@ -51,8 +51,7 @@ resident cannot deadlock and its hand-offs keep their contracts:
    will write has drained); the all-to-all key is present in every plan;
 5. P-QUEUE: a vector poll of another workgroup's key never sits behind the
    group's own loads in flight (a CU returns loads in order), unless the
-   wait is marked issue-wait-compute (the loads feed the compute after it);
-   scalar polls are exempt;
+   wait states why (``Wait.queued``); scalar polls are exempt;
 6. every region spans at least the plan's rows.
 """
 
@@ -84,15 +83,18 @@ class Wait:
 
     Attributes:
         load: ``"vector"`` (``sc1``/``.cv``/Lamport words) or ``"smem"``.
-        issue_wait_compute: The loads in flight feed the compute after this
-            wait (allowed behind its own loads, P-QUEUE).
+        queued: Why a vector poll may sit behind the group's own loads in
+            flight (P-QUEUE), or ``""``: ``"issue-wait-compute"`` (the loads
+            feed the compute after this wait) or ``"landed"`` (the plan
+            issues them early enough to land before this wait, a timing
+            assumption the design states).
     """
 
     role: str
     group: str
     keys: tuple[str, ...]
     load: str
-    issue_wait_compute: bool
+    queued: str
 
 
 @dataclass(frozen=True)
@@ -199,7 +201,10 @@ def check_plan(plan: LayerPlan) -> int:
     queued: list[tuple[tuple, Wait]] = []
     for cta, steps in plan.programs.items():
         last = dict.fromkeys(plan.groups)
-        inflight = dict.fromkeys(plan.groups, False)
+        # Per wave group: the roles whose loads are still in flight. A
+        # role's compute (after its wait, or before its publish) consumes
+        # its own loads, not other roles'.
+        inflight = {group: set() for group in plan.groups}
         for index, step in enumerate(steps):
             node = (cta, index)
             nodes.append(node)
@@ -217,24 +222,23 @@ def check_plan(plan: LayerPlan) -> int:
                 edges[last[step.group]].append(node)
             last[step.group] = node
             if isinstance(step, Load):
-                inflight[step.group] = True
+                inflight[step.group].add(step.role)
             elif isinstance(step, Wait):
                 if step.load not in ("vector", "smem"):
                     raise PlanError(
                         f"{plan.name}: {cta} step {index}: load {step.load}"
                     )
-                if (
-                    step.load == "vector"
-                    and inflight[step.group]
-                    and not step.issue_wait_compute
-                ):
+                if step.queued not in ("", "issue-wait-compute", "landed"):
+                    raise PlanError(
+                        f"{plan.name}: {cta} step {index}: queued {step.queued}"
+                    )
+                if step.load == "vector" and inflight[step.group] and not step.queued:
                     queued.append((node, step))
-                # The compute after a wait consumes the loads before it.
-                inflight[step.group] = False
+                inflight[step.group].discard(step.role)
                 for key in step.keys:
                     waits[key].append(node)
             elif isinstance(step, Publish):
-                inflight[step.group] = False
+                inflight[step.group].discard(step.role)
                 for key in step.keys:
                     if key in publishers:
                         raise PlanError(
