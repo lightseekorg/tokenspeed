@@ -140,6 +140,7 @@ __all__ = [
     "gluon_decoder_layer_muse_spark_gfx950",
     "DIVISIBLE_ARGS",
     "offline_compile_args",
+    "offline_signature",
 ]
 
 NUM_WARPS = 8
@@ -499,6 +500,7 @@ def _topk(
     group,
     rows,
     logits_ptr,
+    multiplier,
     bias_ptr,
     exchange_ptr,
     ROUTED_SCALING_FACTOR: gl.constexpr,
@@ -525,7 +527,9 @@ def _topk(
         iris_fail_stop,
         _SITE_LOGITS,
     )
-    logits = gl.convert_layout(gl.reshape(logits, [WAVES, _EXPERTS]), layout)
+    logits = (
+        gl.convert_layout(gl.reshape(logits, [WAVES, _EXPERTS]), layout) * multiplier
+    )
     out_l: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [WAVES, 1], [1, 0])
     ids, weights = sigmoid_bias_topk_keys_gfx950(
         logits, bias_ptr, _EXPERTS, _TOPK, _TOPK, True, ROUTED_SCALING_FACTOR,
@@ -895,6 +899,7 @@ def _head(
     next_k_cache_ptr,
     next_v_cache_ptr,
     slots_ptr,
+    num_slots,
     k_inv_scale,
     v_inv_scale,
     ROTARY: gl.constexpr,
@@ -904,14 +909,16 @@ def _head(
 ):
     """HEAD task ``head``: q heads (prologue to the FP8 query), (K, V) head
     pairs (prologue into the next layer's cache), then the output-gate
-    heads (BF16). The operands that do not wait load first."""
+    heads (BF16). The operands that do not wait load first. Rows past
+    ``num_slots`` (graph padding) write no cache row."""
     rows_l: gl.constexpr = gqa_prologue_rows_layout(gl.num_warps())
     tokens = gl.arange(0, 16, gl.SliceLayout(1, rows_l)).to(gl.int64)
     row_mask = tokens < rows
+    kv_mask = row_mask & (tokens < num_slots)
     cos, sin = gqa_prologue_rope_gfx950(
         cos_sin_ptr, cos_sin_stride, positions_ptr, tokens, row_mask, _HEAD_DIM // 2
     )
-    slot = gl.load(slots_ptr + tokens, mask=row_mask, other=0).to(gl.int64)
+    slot = gl.load(slots_ptr + tokens, mask=kv_mask, other=0).to(gl.int64)
     if head < _Q_HEADS:
         q = _head_rows(launch, qkv_parts, head * _HEAD_DIM, rows)
         gqa_prologue_query_gfx950(
@@ -923,13 +930,13 @@ def _head(
         k_rows = _head_rows(launch, qkv_parts, (_Q_HEADS + kv) * _HEAD_DIM, rows)
         gqa_prologue_key_gfx950(
             k_rows, next_k_cache_ptr + (slot * _KV_HEADS + kv) * _HEAD_DIM, k_norm_ptr,
-            cos, sin, row_mask, k_inv_scale, ROTARY, QK_EPS, QK_OFFSET, KV_SCALED,
+            cos, sin, kv_mask, k_inv_scale, ROTARY, QK_EPS, QK_OFFSET, KV_SCALED,
         )  # fmt: skip
         v_rows = _head_rows(
             launch, qkv_parts, (_Q_HEADS + _KV_HEADS + kv) * _HEAD_DIM, rows
         )
         gqa_prologue_value_gfx950(
-            v_rows, next_v_cache_ptr + (slot * _KV_HEADS + kv) * _HEAD_DIM, row_mask,
+            v_rows, next_v_cache_ptr + (slot * _KV_HEADS + kv) * _HEAD_DIM, kv_mask,
             v_inv_scale, KV_SCALED,
         )  # fmt: skip
     else:
@@ -1001,7 +1008,7 @@ def _bnd2(
 # ---------------------------------------------------------------------------
 
 
-@gluon.jit(do_not_specialize=("deadline_ticks", "label", "gate_stride"))
+@gluon.jit(do_not_specialize=("deadline_ticks", "label", "gate_stride", "num_slots"))
 def gluon_decoder_layer_muse_spark_gfx950(
     # Launch state.
     epochs,
@@ -1047,6 +1054,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     # Router, pooler.
     router_hi_ptr,
     router_lo_ptr,
+    router_multiplier,
     router_bias_ptr,
     logits_parts,
     pooler_ptr,
@@ -1093,6 +1101,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     next_k_cache_ptr,
     next_v_cache_ptr,
     slots_ptr,
+    num_slots,
     k_inv_scale,
     v_inv_scale,
     # The last fused layer's boundary output (next layer regular).
@@ -1236,8 +1245,8 @@ def gluon_decoder_layer_muse_spark_gfx950(
             )  # fmt: skip
         if (slot == _ATT_FIRST_SLOT) & (xcd >= 8 - REQUESTS):
             _topk(
-                launch, 7 - xcd, rows, logits_parts, router_bias_ptr, exchange,
-                ROUTED_SCALING_FACTOR,
+                launch, 7 - xcd, rows, logits_parts, router_multiplier, router_bias_ptr,
+                exchange, ROUTED_SCALING_FACTOR,
             )  # fmt: skip
         if (slot >= 25) & (slot < 25 + REQUESTS):
             _xn(
@@ -1326,7 +1335,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             _head(
                 launch, head, rows, qkv_parts, q_out_ptr, gate_out_ptr, q_norm_ptr,
                 k_norm_ptr, cos_sin_ptr, cos_sin_stride, positions_ptr,
-                next_k_cache_ptr, next_v_cache_ptr, slots_ptr, k_inv_scale,
+                next_k_cache_ptr, next_v_cache_ptr, slots_ptr, num_slots, k_inv_scale,
                 v_inv_scale, NEXT_KIND == 0, QK_EPS, QK_OFFSET, KV_SCALED,
             )  # fmt: skip
     elif is_tail:
@@ -1388,6 +1397,7 @@ _POINTER_TYPES = dict(
     post_attn_bf16_ptr="*bf16",
     pre_ffn_bf16_ptr="*bf16",
     router_hi_ptr="*bf16",
+    router_multiplier="fp32",
     router_lo_ptr="*bf16",
     router_bias_ptr="*fp32",
     logits_parts="*i64",
@@ -1540,6 +1550,21 @@ MUSE_SPARK_CONSTANTS = ModelConstants(
 )
 
 
+def offline_signature(constexprs: dict) -> dict:
+    """The kernel's non-constexpr argument types for an offline compile:
+    ``heaps`` a tuple of 8 int64, tensors as ``_POINTER_TYPES``, the rest
+    int32 scalars."""
+    signature = {}
+    for name in gluon_decoder_layer_muse_spark_gfx950.arg_names:
+        if name in constexprs:
+            continue
+        if name == "heaps":
+            signature[name] = ("i64",) * WORLD_SIZE
+        else:
+            signature[name] = _POINTER_TYPES.get(name, "i32")
+    return signature
+
+
 # Integer arguments a launch passes as multiples of 16, which Triton then
 # specializes as such (weight and scale strides).
 DIVISIBLE_ARGS = frozenset(
@@ -1571,16 +1596,9 @@ def offline_compile_args(key: PlanKey, rank: int):
     fn = gluon_decoder_layer_muse_spark_gfx950
     constexprs = kernel_constexprs(
         key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=8, quad_map=0,
-        dn_order=0, addr_soffset=0, scale_lanes=1, tail_num=1, tail_den=2,
+        dn_order=0, addr_soffset=0, scale_lanes=0, tail_num=1, tail_den=2,
         n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False, qkv_window=4,
     )  # fmt: skip
-    signature = {}
-    for name in fn.arg_names:
-        if name in constexprs:
-            continue
-        if name == "heaps":
-            signature[name] = ("i64",) * WORLD_SIZE
-        else:
-            signature[name] = _POINTER_TYPES.get(name, "i32")
+    signature = offline_signature(constexprs)
     options = {"num_warps": NUM_WARPS, **persistent_compile_options()}
     return fn, signature, constexprs, options
