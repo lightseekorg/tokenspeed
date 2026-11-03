@@ -416,11 +416,17 @@ class _RuntimeLongcatMoE(nn.Module):
         # expert placement adds past E). Nothing here depends on whether a
         # placement is active; the bound is checked device-side, graph-safe.
         topk_ids = topk_output.topk_ids
-        torch._assert_async(
-            (topk_ids < self.experts.num_experts).all(),
-            f"LongCat top-k id at or beyond the {self.experts.num_experts} "
-            "physical experts; zero experts must be -1",
-        )
+        # NPU has no device-side ``_assert_async``: the op falls back to the
+        # CPU, whose D2H sync is rejected under an active stream capture
+        # (aclrtMemcpy 107030). Skip the assert when recording a graph on NPU
+        # (the eager path still checks); on CUDA the assert is device-side and
+        # stays graph-safe.
+        if not (_get_is_capture_mode() and _longcat_platform.is_npu):
+            torch._assert_async(
+                (topk_ids < self.experts.num_experts).all(),
+                f"LongCat top-k id at or beyond the {self.experts.num_experts} "
+                "physical experts; zero experts must be -1",
+            )
         zero_expert_mask = topk_ids < 0
         zero_expert_weights = torch.where(
             zero_expert_mask,
@@ -429,8 +435,16 @@ class _RuntimeLongcatMoE(nn.Module):
         )
         # Fused MoE kernels still read every selected expert id while building
         # the dispatch plan, so zero-expert slots must keep a valid id.
-        topk_output.topk_ids[zero_expert_mask] = 0
-        topk_output.topk_weights[zero_expert_mask] = 0.0
+        # NPU cannot run a masked ``tensor[mask] = v`` inside a captured graph
+        # (the masked-assign lowering calls nonzero, which 910B3 rejects as an
+        # inner error under capture); zero the slots with an in-place
+        # device-side multiply instead, which is graph-safe.
+        topk_output.topk_ids.mul_(
+            zero_expert_mask.logical_not().to(topk_output.topk_ids.dtype)
+        )
+        topk_output.topk_weights.mul_(
+            zero_expert_mask.logical_not().to(topk_output.topk_weights.dtype)
+        )
 
         if self.zero_expert_type in ("identity", "copy"):
             if not self.adds_zero_expert_residual:

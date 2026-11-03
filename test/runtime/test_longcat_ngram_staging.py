@@ -26,8 +26,13 @@ in-graph forward reads only the staging.  These tests verify the L1-1
 contract: (1) the preloaded staging content is bit-identical to the original
 host lookup ``F.embedding(new_ids_cpu, host_weight)``; (2) the staging-path
 ``_ngram_local_partial`` output is bit-identical to the host-lookup path;
-(3) the eager baseline (``staging`` None) still uses the original host path;
-(4) batch overflow raises instead of silently truncating.
+(3) the eager baseline (``use_staging=False``) still uses the original host
+path; (4) batch overflow raises instead of silently truncating.
+
+Staging allocation is decoupled from capture (方案C L1 fix): ``_ensure_staging``
+allocates the buffer on module placement, so ``staging`` may be non-None even
+on the eager baseline — the ``use_staging`` flag, not ``staging is None``,
+selects the lookup path.
 """
 
 import os
@@ -62,8 +67,9 @@ def _cfg(hidden=3072, vocab=512):
 def _build_pair(cfg, device, seed=0):
     """Two NgramEmbedding instances with identical weights on ``device``.
 
-    Returns ``(host_mod, staging_mod)`` where ``host_mod.staging`` stays None
-    (original host-lookup path) and ``staging_mod`` gets preloaded.
+    Returns ``(host_mod, staging_mod)`` where ``host_mod.use_staging`` stays
+    False (original host-lookup path) and ``staging_mod`` gets preloaded with
+    ``use_staging=True``.
     """
     torch.manual_seed(seed)
     base = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size, device=device)
@@ -134,6 +140,7 @@ def test_staging_partial_matches_host_partial_bit_exact():
 
     with torch.no_grad():
         host_out = host_mod._ngram_local_partial(ids, window)
+        staging_mod.use_staging = True
         staging_mod.preload_staging(ids, window)
         staging_out = staging_mod._ngram_local_partial(ids, window)
     assert list(staging_out.shape) == list(ids.shape) + [cfg.hidden_size]
@@ -145,17 +152,49 @@ def test_staging_partial_matches_host_partial_bit_exact():
 
 
 def test_eager_baseline_keeps_host_lookup():
-    """With staging None the original host-lookup path still runs (eager)."""
+    """With use_staging=False the original host-lookup path still runs (eager)."""
     cfg = _cfg()
     host_mod, staging_mod = _build_pair(cfg, "cpu")
     ids = torch.randint(0, cfg.vocab_size, (2, 8))
     window = host_mod._window_from_context(ids, 0)
+    assert staging_mod.use_staging is False
     with torch.no_grad():
-        out = staging_mod(ids)  # forward without preload -> host path
+        out = staging_mod(ids)  # forward without staging -> host path
+        ref = host_mod(ids)
     assert out.shape == (2, 8, cfg.hidden_size)
     assert torch.isfinite(out).all()
-    # staging must still be None (no graph preload happened)
-    assert staging_mod.staging is None
+    # The eager baseline must stay bit-identical to the host reference even
+    # though the staging buffer itself may already be allocated (allocation
+    # is decoupled from the lookup-path switch).
+    assert torch.equal(out, ref), "eager forward must match host reference"
+    assert staging_mod.use_staging is False
+
+
+def test_use_staging_requires_allocated_staging():
+    """use_staging=True with no staging allocated must raise, not fall back."""
+    cfg = _cfg()
+    host_mod, staging_mod = _build_pair(cfg, "cpu")
+    ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    window = host_mod._window_from_context(ids, 0)
+    # Simulate a capture where the executor forgot to pre-allocate: force the
+    # buffer away and keep the switch on — the staging branch must raise.
+    staging_mod.staging = None
+    staging_mod.use_staging = True
+    with pytest.raises(RuntimeError):
+        staging_mod._ngram_local_partial(ids, window)
+
+
+def test_ensure_staging_idempotent_and_device_placed():
+    """_ensure_staging allocates once, on the module's device."""
+    cfg = _cfg()
+    _, mod = _build_pair(cfg, "cpu")
+    mod.staging = None
+    mod._ensure_staging()
+    first = mod.staging
+    assert first is not None
+    assert first.device.type == "cpu"
+    mod._ensure_staging()
+    assert mod.staging is first  # idempotent, no re-allocation
 
 
 def test_preload_overflow_raises():

@@ -51,8 +51,14 @@ fixed device ``staging`` buffer *outside* the graph (``preload_ngram_staging``
 called from ``ModelExecutor.settle()``) and the in-graph forward reads only
 the staging.  The preload reuses the same ``_compute_new_ids`` hash the
 in-graph partial computes, so the staging rows align with the in-graph reads
-bit-exactly (verified maxdiff=0 over ACL Graph replays).  ``staging`` stays
-None on the eager / no-graph baseline, which keeps the original host lookup.
+bit-exactly (verified maxdiff=0 over ACL Graph replays).  ``use_staging``
+selects the lookup path: False keeps the original host lookup (eager
+baseline), True reads the preloaded staging (decode ACL Graph).  Staging
+allocation is decoupled from capture — ``_ensure_staging`` allocates it on
+module placement and in ``preload_staging``, before any capture — so a
+captured graph always records reads of an already-fixed staging address and
+the eager baseline never silently falls back to the host lookup inside a
+graph (the fallback is what 910B3 rejects as 107030).
 
 The module is an in-tree runtime plugin: importing it runs ``register()``,
 which calls :func:`tokenspeed.runtime.plugins.registry.register_model`. The
@@ -182,10 +188,39 @@ class NgramEmbedding(nn.Module):
         # memcpy is rejected during capture on 910B3), so the executor
         # preloads the current batch's rows H2D into this fixed staging
         # buffer *outside* the graph and the in-graph lookup reads only the
-        # staging.  Allocated lazily by ``preload_staging`` (None keeps the
-        # eager / no-graph baseline on the original host-table lookup path).
+        # staging.  Staging allocation is decoupled from capture:
+        # ``_ensure_staging`` allocates it once the module is placed on its
+        # device (``_apply``) and ``preload_staging`` keeps it alive, so a
+        # captured graph always records reads of an already-fixed staging
+        # address.  ``use_staging`` selects the lookup path: False keeps the
+        # original host-table lookup (eager baseline), True reads the
+        # preloaded device staging (decode ACL Graph).  The eager baseline
+        # must never silently fall back to the host lookup inside a captured
+        # graph (that fallback is what 910B3 rejects as 107030), so the
+        # staging branch raises when staging is missing.
         self._max_num_seqs = max_num_seqs
+        self.use_staging: bool = False
         self.register_buffer("staging", None, persistent=False)
+
+    def _ensure_staging(self) -> None:
+        """Allocate the fixed device ``staging`` buffer (idempotent).
+
+        The buffer is created on the module's device with the host tables'
+        dtype (bf16 under the deployment dtype) so the H2D preload copy is
+        bit-exact.  Allocation is decoupled from graph capture: it happens on
+        module placement (``_apply``) and again in ``preload_staging``, so by
+        the time any capture runs the staging address is fixed and the graph
+        records reads of an already-allocated buffer.
+        """
+        if self.staging is not None:
+            return
+        device = self.post_projs[0].weight.device
+        num_embedders = self.k * (self.n - 1)
+        self.staging = torch.empty(
+            (self._max_num_seqs, num_embedders, self._feature_width),
+            dtype=self._host_embedders[0].dtype,
+            device=device,
+        ).zero_()
 
     def _init_ngram_embeddings(self) -> None:
         """Initialize the per-slot embedder/projection pairs.
@@ -273,10 +308,16 @@ class NgramEmbedding(nn.Module):
         """
         embedders = self._modules.pop("embedders", None)
         try:
-            return super()._apply(fn, recurse=recurse)
+            result = super()._apply(fn, recurse=recurse)
         finally:
             if embedders is not None:
                 self._modules["embedders"] = embedders
+        # 方案C L1 修复: staging 分配与图捕获解耦 —— 模块就位（.to('npu')
+        # 等）后立即在模块 device 上分配固定 staging，任何捕获之前就绪。
+        # 幂等：已分配时是 no-op。host 表保持 float32 不受 fn 影响，staging
+        # 以 host 表 dtype 分配，H2D 预载逐位一致。
+        self._ensure_staging()
+        return result
 
     def _window_from_context(
         self, context: torch.Tensor, committed: int
@@ -390,19 +431,14 @@ class NgramEmbedding(nn.Module):
                 f"the batch needs {num_tokens}"
             )
         num_embedders = self.k * (self.n - 1)
-        if self.staging is None:
-            # Lazily allocated once: a captured graph pins the staging data
-            # pointer, so it must never be re-allocated after capture.  The
-            # dtype tracks the host tables (bf16 under the deployment dtype),
-            # which keeps the H2D copy bit-exact for the maxdiff=0 contract.
-            # Zero-fill so rows beyond the current batch are finite (benign
-            # padding) — capture warmup reads the staging before any live
-            # preload has filled it.
-            self.staging = torch.empty(
-                (self._max_num_seqs, num_embedders, self._feature_width),
-                dtype=self._host_embedders[0].dtype,
-                device=device,
-            ).zero_()
+        # Allocate (idempotent) before any copy: a captured graph pins the
+        # staging data pointer, so it must never be re-allocated after
+        # capture. The dtype tracks the host tables (bf16 under the
+        # deployment dtype), which keeps the H2D copy bit-exact for the
+        # maxdiff=0 contract. Zero-fill so rows beyond the current batch are
+        # finite (benign padding) — capture warmup reads the staging before
+        # any live preload has filled it.
+        self._ensure_staging()
         with torch.no_grad():
             for index in range(num_embedders):
                 new_ids = self._compute_new_ids(
@@ -478,13 +514,17 @@ class NgramEmbedding(nn.Module):
         window (via the shared ``_compute_new_ids``) and accumulates the 12
         table lookups projected onto the hidden size.  Two lookup paths:
 
-        * ``staging`` is None (eager / no decode graph): the original
+        * ``use_staging`` is False (eager / no decode graph): the original
           host-resident lookup — ids D2H, ``F.embedding`` on the CPU table,
           rows H2D (W18 scheme 2).  Preserved as the baseline path.
-        * ``staging`` is allocated (decode ACL Graph, 方案C L1): the graph
+        * ``use_staging`` is True (decode ACL Graph, 方案C L1): the graph
           -external ``preload_staging`` has already H2D-copied this batch's
           rows into the device buffer; the in-graph path reads them directly
-          (no host/device transfer inside the captured graph).
+          (no host/device transfer inside the captured graph).  Staging must
+          already be allocated at that point — the branch raises instead of
+          silently falling back to the host lookup, because that silent
+          fallback is exactly the host<->device memcpy 910B3 rejects under
+          capture (107030).
 
         Under TP feature-column sharding this is the local partial; the
         caller all-reduces it.
@@ -492,7 +532,7 @@ class NgramEmbedding(nn.Module):
         local_partial = None
         for index in range(self.k * (self.n - 1)):
             new_ids = self._compute_new_ids(input_ids, predecessor_window, index)
-            if self.staging is None:
+            if not self.use_staging:
                 # Host-resident lookup (W18 scheme 2, eager baseline).
                 host_weight = self._host_embedders[index]
                 new_ids_cpu = new_ids.to("cpu")
@@ -505,6 +545,12 @@ class NgramEmbedding(nn.Module):
                 # 方案C L1: in-graph read-only lookup of the preloaded
                 # device staging (token rows were aligned by the shared
                 # hash at preload time).
+                if self.staging is None:
+                    raise RuntimeError(
+                        "NgramEmbedding staging enabled (use_staging=True) but "
+                        "the staging buffer is not allocated; the executor must "
+                        "allocate it before any capture (107030 regression guard)"
+                    )
                 x_ngram = self.staging[: input_ids.numel(), index, :]
                 if input_ids.dim() > 1:
                     x_ngram = x_ngram.reshape(*input_ids.shape, -1)
@@ -730,6 +776,60 @@ class LongcatFlashNgramForCausalLM(LongcatFlashForCausalLM):
     """
 
     model_cls = _RuntimeLongcatNgramModel
+
+    def prepare_model_kwargs(self, ctx, input_ids, kwargs) -> dict:
+        """Pass the n-gram serving kwargs through the CausalLM wrapper.
+
+        The base ``CausalLM`` wrapper forwards only ``input_embeds`` /
+        ``inputs_embeds`` / ``pp_inbound``; without this override the n-gram
+        embedding would never see its per-token predecessor window or
+        request-token history and would fall back to a single-row in-input
+        window.  Besides degrading the serving numerics, that fallback breaks
+        the 方案C L1 staging alignment: the executor preloads rows by the
+        packed window while the in-graph forward would hash a different
+        (in-input-only) window.  Forwarding the n-gram kwargs keeps the
+        in-graph path and the preload on the same ``(input_ids, window)``
+        pair.
+        """
+        model_kwargs = super().prepare_model_kwargs(ctx, input_ids, kwargs)
+        for key in (
+            "ngram_previous_tokens",
+            "request_token_history",
+            "engram_hash_ids",
+            "engram_token_mask",
+        ):
+            value = kwargs.get(key)
+            if value is not None:
+                model_kwargs[key] = value
+        return model_kwargs
+
+    def preload_ngram_staging(
+        self,
+        input_ids: torch.Tensor,
+        predecessor_window: torch.Tensor,
+    ) -> None:
+        """Graph-external preload hook (方案C L1), exposed on the wrapper.
+
+        ``ModelExecutor`` calls hooks on ``model_runner.model``, which is
+        this CausalLM wrapper; the inner runtime model owns the n-gram
+        embeddings, so delegate (the runtime model's own hook reaches
+        ``NgramEmbedding.preload_staging``).
+        """
+        self.model.preload_ngram_staging(input_ids, predecessor_window)
+
+    def set_ngram_staging(self, enabled: bool) -> None:
+        """Toggle the device-staging lookup path for the decode ACL Graph."""
+        embeddings = self.model.ngram_embeddings
+        embeddings.use_staging = bool(enabled)
+        if enabled:
+            # Allocate the fixed staging address before any capture records
+            # reads of it (idempotent).
+            embeddings._ensure_staging()
+
+    @property
+    def ngram_staging_enabled(self) -> bool:
+        """Whether the n-gram device-staging path is active."""
+        return self.model.ngram_embeddings.use_staging
 
     def get_ngram_hash_parameters(self) -> None:
         """The n-gram embedding hashes with its own polynomial; no Engram params.

@@ -26,6 +26,13 @@ per-token predecessor window are preloaded H2D into the device staging
 ``forward_from_window`` path (including the in-graph ``_ngram_local_partial``
 staging lookup).  Two replay rounds with refreshed input/staging must be
 bit-identical to the eager host-lookup reference (maxdiff=0).
+
+The second test covers the engine probe path (方案C L1 fix regression): the
+boot's probe capture runs a dummy decode through ``NgramEmbedding.forward``
+(the ``[bs, seq]`` 2-D entry the wrapper reaches when it drops the n-gram
+kwargs) — with ``use_staging=True`` and the staging allocated the captured
+forward must read the staging and replay 2 rounds maxdiff=0, never touching
+the host tables inside the graph.
 """
 
 import os
@@ -66,33 +73,35 @@ def _fresh_window(ids, n, eos, vocab, device):
     return window
 
 
-@pytest.mark.skipif(not torch.npu.is_available(), reason="requires NPU")
-def test_decode_graph_staging_replays_match_host_reference():
-    dev = "npu:0"
-    cfg = _cfg()
-    num_embedders = cfg.emb_split_num * (cfg.emb_neighbor_num - 1)
-    hidden = cfg.hidden_size
-    T = 8  # decode batch (bs)
-
-    # Graph-side module (staging path) and host-side reference (host path),
-    # identical weights, everything but the CPU host tables on NPU.
+def _build_graph_ref_pair(cfg, dev):
+    """Graph-side module (staging path) and host-side reference (host path),
+    identical weights, everything but the CPU host tables on ``dev``."""
     torch.manual_seed(0)
     with torch.device(dev):
-        base_g = torch.nn.Embedding(cfg.vocab_size, hidden)
-        base_r = torch.nn.Embedding(cfg.vocab_size, hidden)
+        base_g = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        base_r = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         m_graph = NgramEmbedding(cfg, base_g).to(dev)
         m_ref = NgramEmbedding(cfg, base_r).to(dev)
     with torch.no_grad():
         m_ref.word_embeddings.weight.data.copy_(m_graph.word_embeddings.weight.data)
-        for i in range(num_embedders):
+        for i in range(cfg.emb_split_num * (cfg.emb_neighbor_num - 1)):
             m_ref.embedders[i].weight.data.copy_(m_graph.embedders[i].weight.data)
-            m_ref.post_projs[i].weight.data.copy_(
-                m_graph.post_projs[i].weight.data
-            )
+            m_ref.post_projs[i].weight.data.copy_(m_graph.post_projs[i].weight.data)
     m_graph.eval()
     m_ref.eval()
     m_graph.requires_grad_(False)
     m_ref.requires_grad_(False)
+    return m_graph, m_ref
+
+
+@pytest.mark.skipif(not torch.npu.is_available(), reason="requires NPU")
+def test_decode_graph_staging_replays_match_host_reference():
+    dev = "npu:0"
+    cfg = _cfg()
+    hidden = cfg.hidden_size
+    T = 8  # decode batch (bs)
+
+    m_graph, m_ref = _build_graph_ref_pair(cfg, dev)
 
     # Address-stable device buffers the captured graph reads.
     ids_buf = torch.randint(0, cfg.vocab_size, (T,), device=dev)
@@ -103,6 +112,9 @@ def test_decode_graph_staging_replays_match_host_reference():
 
     def graph_body():
         out_buf.copy_(m_graph.forward_from_window(ids_buf, win_buf))
+
+    # The staging path is on: the in-graph forward reads the preloaded rows.
+    m_graph.use_staging = True
 
     # Warm-up run (eager) so the captured kernels are warm, then capture.
     with torch.npu.stream(torch.npu.current_stream()):
@@ -132,6 +144,58 @@ def test_decode_graph_staging_replays_match_host_reference():
         got = out_buf.float()
         assert torch.equal(got, ref), (
             f"round {round_}: graph replay vs eager host reference mismatch"
+        )
+        md = (got - ref).abs().max().item()
+        assert md == 0.0, f"round {round_}: maxdiff={md}"
+
+
+@pytest.mark.skipif(not torch.npu.is_available(), reason="requires NPU")
+def test_probe_forward_2d_staging_replays_match_host_reference():
+    """Engine probe path: a dummy decode through ``NgramEmbedding.forward``
+    (the ``[bs, seq]`` 2-D entry) with staging allocated + use_staging=True
+    must replay 2 rounds maxdiff=0 vs the host reference (no host memcpy
+    inside the captured graph — the 107030 regression)."""
+    dev = "npu:0"
+    cfg = _cfg()
+    hidden = cfg.hidden_size
+    bs, seq = 1, 8
+
+    m_graph, m_ref = _build_graph_ref_pair(cfg, dev)
+    m_graph.use_staging = True
+
+    ids_buf = torch.randint(0, cfg.vocab_size, (bs, seq), device=dev)
+    out_buf = torch.empty((bs, seq, hidden), dtype=torch.float32, device=dev)
+
+    def graph_body():
+        out_buf.copy_(m_graph.forward(ids_buf))
+
+    # Preload the same (input, in-input window) pair the in-graph forward
+    # hashes — this is what the engine's capture-time preload guarantees.
+    window = m_graph._window_from_context(ids_buf, 0)
+    m_graph.preload_staging(ids_buf, window)
+
+    with torch.npu.stream(torch.npu.current_stream()):
+        graph_body()
+        torch.npu.synchronize()
+
+    g = torch.npu.NPUGraph()
+    with torch.npu.stream(torch.npu.current_stream()):
+        with torch.npu.graph(g):
+            graph_body()
+        torch.npu.synchronize()
+
+    for round_ in range(2):
+        ids = torch.randint(0, cfg.vocab_size, (bs, seq), device=dev)
+        ids_buf.copy_(ids)
+        window = m_graph._window_from_context(ids_buf, 0)
+        m_graph.preload_staging(ids_buf, window)
+        with torch.no_grad():
+            ref = m_ref.forward(ids_buf).float()
+        g.replay()
+        torch.npu.synchronize()
+        got = out_buf.float()
+        assert torch.equal(got, ref), (
+            f"round {round_}: probe 2-D graph replay vs eager host reference mismatch"
         )
         md = (got - ref).abs().max().item()
         assert md == 0.0, f"round {round_}: maxdiff={md}"

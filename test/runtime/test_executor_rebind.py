@@ -207,7 +207,12 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     seen = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
-    executor.config = SimpleNamespace(enable_cudagraph_gc=False)
+    # The capture_graphs n-gram staging hook reads config + model_runner;
+    # "target model" carries no preload_ngram_staging hook, so the block skips.
+    executor.config = SimpleNamespace(
+        enable_cudagraph_gc=False, enforce_eager=False
+    )
+    executor.model_runner = SimpleNamespace(model="target model")
     executor.forward_step = SimpleNamespace(
         disable=False,
         stream="stream",

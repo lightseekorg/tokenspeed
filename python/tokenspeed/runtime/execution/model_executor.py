@@ -1154,14 +1154,21 @@ class ModelExecutor:
                 # LongCat ngram（方案C L1）：解码图捕获前强制分配 device staging。
                 # 捕获会记录图内 forward 读 staging 的 data pointer——若 staging 尚未
                 # 分配（None），捕获记录到的将是原 host 查表分支（其 host↔device
-                # memcpy 在流捕获下被拒，即历史 decode 图失败根因）。用空批次触发
-                # 一次预载（只分配不搬运），此后 staging 地址固定、由 settle() 逐
-                # step 刷新内容。
+                # memcpy 在流捕获下被拒，即历史 decode 图失败根因）。先置
+                # use_staging=True（图内 forward 走 staging 分支、绝不回退 host），
+                # 再用空批次触发一次预载（只分配不搬运），此后 staging 地址固定、
+                # 由 settle() 逐 step 刷新内容。任何捕获（含 probe 的 dummy decode
+                # 走 forward 2-D 路径）之前 staging 均已就绪。
                 if (
                     self.config.enforce_eager is False
                     and hasattr(self.model_runner.model, "preload_ngram_staging")
                     and self.input_buffers.ngram_previous_tokens_buf is not None
                 ):
+                    set_staging = getattr(
+                        self.model_runner.model, "set_ngram_staging", None
+                    )
+                    if set_staging is not None:
+                        set_staging(True)
                     self.model_runner.model.preload_ngram_staging(
                         self.input_buffers.input_ids_buf[:0],
                         self.input_buffers.ngram_previous_tokens_buf[:0],
@@ -2835,13 +2842,16 @@ class ModelExecutor:
                 # load_round_inputs 刚把 packed ids + 每 token predecessor window
                 # 填好，这里把 host 表当前批行 H2D 预载到固定 device staging，
                 # 图内 forward 只读 staging（ACL Graph 捕获内禁止 host↔device
-                # memcpy）。仅在解码图捕获开启（非 enforce_eager）时启用；
-                # enforce_eager 保持原 host 查表路径（基线可回退）。非 LongCat
-                # 模型无此钩子 → no-op。
+                # memcpy）。仅在图捕获已启用 staging（非 enforce_eager + 模型
+                # 有钩子 + ngram_staging_enabled）时预载；enforce_eager 保持原
+                # host 查表路径（基线可回退）。非 LongCat 模型无此钩子 → no-op。
                 if (
                     self.config.enforce_eager is False
                     and hasattr(
                         self.model_runner.model, "preload_ngram_staging"
+                    )
+                    and getattr(
+                        self.model_runner.model, "ngram_staging_enabled", False
                     )
                 ):
                     ngram_window = self.input_buffers.ngram_model_kwargs(
