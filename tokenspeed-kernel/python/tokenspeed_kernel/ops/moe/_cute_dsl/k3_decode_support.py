@@ -29,6 +29,9 @@ from __future__ import annotations
 import torch
 
 HIDDEN, LATENT, EXPERTS = 7168, 3584, 896
+# Per-rank packed input projection rows (KDA q|k|v|g|f_a|beta, MLA q_a|kv_a|gate)
+# and o-projection input width (12 heads of 128).
+KDA_ROWS, MLA_ROWS, O_PROJ_WIDTH = 6288, 3648, 1536
 # Decode batches the chain is compiled for; others take the ordinary MoE.
 BATCHES = (*range(1, 9), 16, 32, 64)
 
@@ -80,4 +83,30 @@ def supports(
         and expert_dtype == "mxfp4"
         and pdl
         and not batch_invariant
+    )
+
+
+def attention_supports(
+    *,
+    projection_rows: int,
+    o_proj_width: int,
+    projection_dtype: torch.dtype,
+    o_proj_dtype: torch.dtype,
+) -> bool:
+    """Whether the chain's AttnRes entry, input projection and o-projection exit
+    serve a decoder layer.
+
+    Args:
+        projection_rows: Rows of the layer's packed input projection on this rank.
+        o_proj_width: Input width of this rank's o-projection shard.
+        projection_dtype: The packed input projection's weight dtype.
+        o_proj_dtype: The o-projection's weight dtype.
+
+    Returns:
+        True for this model's TP8 KDA and MLA layers with BF16 projections.
+    """
+    return (
+        projection_rows in (KDA_ROWS, MLA_ROWS)
+        and o_proj_width == O_PROJ_WIDTH
+        and projection_dtype == o_proj_dtype == torch.bfloat16
     )
