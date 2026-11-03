@@ -695,8 +695,12 @@ public:
     // pinned ones: while more are cached, evicts the unpinned ones, oldest
     // access epoch first, then shallowest, each with its blocks in every
     // State group, dropped under either Host write policy. Counted over the
-    // first State group (every State group publishes a checkpoint together);
-    // returns how many were evicted.
+    // first State group, which is exact: each one sits at the start of a
+    // local prefill chunk, and while any State group is restricted every
+    // chunk starts on its grain, CheckpointGranularity() (PrefillChunkTokens
+    // asserts it and cuts every chunk but a prompt's last to whole grains),
+    // so every State group publishes it (completedBlockRanges skips only a
+    // boundary off the group's grain). Returns how many were evicted.
     std::int32_t TrimUnprovenStateCheckpoints(std::int32_t limit);
     // Checkpoints TrimUnprovenStateCheckpoints has evicted since start.
     std::int64_t UnprovenStateCheckpointTrims() const { return unproven_state_checkpoint_trims_; }

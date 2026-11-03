@@ -5473,6 +5473,63 @@ TEST_F(FrequentStateCheckpointSuite, ABoundaryAtAChunkEndStaysAnEndpoint) {
     EXPECT_EQ(Probe("diverges29", probe).prefix_tokens, 24);
 }
 
+// A restricted State group first and unrestricted ones after it: state0
+// checkpoints on an 8-token grain (two pages; a grain requires the in-forward
+// checkpoint), state1 and state2 on any page. The cap counts unproven
+// checkpoints over state0 alone, so it sees every one only if every one sits
+// on the grain, where state0 publishes it too. The 12-token budget is three
+// pages, no whole number of grains.
+class FrequentStateCheckpointRestrictedFirstSuite : public FrequentStateCheckpointSuite {
+protected:
+    static constexpr std::int32_t kGrain = 2 * kP;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 3 * kP;
+        cfg.state_checkpoint_in_forward = true;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            if (group.group_id == "state0") {
+                group.checkpoint_granularity = kGrain;
+            }
+        }
+        return cfg;
+    }
+};
+
+// Chunks are cut to whole grains, with the mode on or off: the 42-token
+// prompt runs [0, 8) ... [24, 32) and then [32, 42), whose forward writes the
+// in-forward checkpoint at 40, so the frequent checkpoints 8, 16, 24 and 32
+// all sit on the grain. Under a cap of two the trim takes 8 and 16, each from
+// all three State groups; 24 and 32 stay, resumable, and are all the mode
+// adds to the cache: one block per State group each.
+TEST_F(FrequentStateCheckpointRestrictedFirstSuite, EveryCheckpointSitsOnTheGrainInEveryStateGroupUnderTheCap) {
+    const std::vector<std::int32_t> tokens = MakeTokens(42);
+    std::vector<std::int32_t> empty;
+    for (const bool frequent : {false, true}) {
+        SCOPED_TRACE(frequent);
+        ResetFrequent(frequent, /*cap=*/2);
+        const std::vector<Chunk> chunks = RunAndFinish("seed", tokens);
+        std::vector<std::pair<std::int32_t, std::int32_t>> spans;
+        for (const Chunk& chunk : chunks) {
+            spans.emplace_back(chunk.prefix_tokens, chunk.prefix_tokens + chunk.tokens);
+            EXPECT_EQ(chunk.prefix_tokens % kGrain, 0) << "a chunk start inside the prompt is a frequent checkpoint";
+        }
+        EXPECT_EQ(spans,
+                  (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 8}, {8, 16}, {16, 24}, {24, 32}, {32, 42}}));
+        ASSERT_FALSE(chunks.empty());
+        EXPECT_EQ(chunks.back().checkpoint_len, 8) << "the in-forward checkpoint at 40";
+        empty.push_back(scheduler_->EmptyLcmBlocks());
+    }
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 2) << "four published under a cap of two";
+    EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.unproven_state_checkpoint_trim.blocks, 2u * 3u)
+        << "each trimmed checkpoint left all three State groups";
+    EXPECT_EQ(empty[0] - empty[1], 2 * 3) << "two checkpoints x three State groups, and nothing else";
+    EXPECT_EQ(Probe("diverges9", Diverging(tokens, 9)).prefix_tokens, 0);
+    EXPECT_EQ(Probe("diverges17", Diverging(tokens, 17)).prefix_tokens, 0);
+    EXPECT_EQ(Probe("diverges25", Diverging(tokens, 25)).prefix_tokens, 24);
+    EXPECT_EQ(Probe("diverges33", Diverging(tokens, 33)).prefix_tokens, 32);
+}
+
 // Mixed batches beside one decoding request, which takes one token of every
 // round's 8 and leaves 7 for the prefill.
 class FrequentStateCheckpointMixedSuite : public FrequentStateCheckpointSuite {
