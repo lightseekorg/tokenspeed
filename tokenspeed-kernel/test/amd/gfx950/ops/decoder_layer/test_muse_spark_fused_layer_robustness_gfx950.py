@@ -53,6 +53,8 @@ if not (
 
 from muse_layer_builder import HIDDEN, WIDTH, build_layer_inputs  # noqa: E402
 from muse_layer_reference import (  # noqa: E402
+    SEEDS,
+    RoutingTie,
     assert_matches,
     regular_reference,
     run_fused,
@@ -124,11 +126,18 @@ def _steps(rank):
     """Both request counts' inputs and references; one weights dict (the
     builder draws the same weights for both, from the same seed)."""
     device = torch.device("cuda", rank)
-    weights, one = build_layer_inputs(ONE, rank, 0, device, CONTEXT[1])
-    _, two = build_layer_inputs(TWO, rank, 0, device, CONTEXT[2])
-    steps = {ONE: one, TWO: two}
-    references = {key: regular_reference(key, weights, steps[key]) for key in steps}
-    return weights, steps, references
+    for seed in SEEDS:
+        weights, one = build_layer_inputs(ONE, rank, seed, device, CONTEXT[1])
+        _, two = build_layer_inputs(TWO, rank, seed, device, CONTEXT[2])
+        steps = {ONE: one, TWO: two}
+        try:
+            references = {
+                key: regular_reference(key, weights, steps[key]) for key in steps
+            }
+        except RoutingTie:
+            continue
+        return weights, steps, references
+    raise AssertionError("every seed has a routing tie")
 
 
 def _launch(fused, key, inputs, residual=None):

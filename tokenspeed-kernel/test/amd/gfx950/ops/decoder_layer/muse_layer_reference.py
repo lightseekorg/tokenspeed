@@ -73,6 +73,14 @@ SWIGLU = dict(swiglu_alpha=1.0, swiglu_limit=0.0, swiglu_beta=0.0)
 # 8th vs 9th biased routing score: far above the logit error of a reordered
 # FP32 sum over 8192 products (~2**-20 relative).
 ROUTING_GAP = 1e-3
+# Seeds a test tries, in order, until the inputs have no routing tie.
+SEEDS = range(16)
+
+
+class RoutingTie(AssertionError):
+    """The inputs' 8th and 9th routing scores are within ``ROUTING_GAP``:
+    a correct kernel may pick either expert. Every rank raises it together
+    (the scores follow the all-reduce), so a test can draw the next seed."""
 
 
 def run_fused(fused, key, inputs, residual):
@@ -161,7 +169,8 @@ def regular_reference(key, weights, inputs):
     biased = scores + weights["router_bias"]
     ranked = biased.sort(dim=-1, descending=True).values
     gap = (ranked[:, TOPK - 1] - ranked[:, TOPK]).min().item()
-    assert gap > ROUTING_GAP, f"routing ties within {gap}; draw other inputs"
+    if gap <= ROUTING_GAP:
+        raise RoutingTie(f"routing ties within {gap}")
     ids = biased.topk(TOPK, dim=-1).indices
     route_weights = scores.gather(1, ids)
     route_weights = route_weights / route_weights.sum(-1, keepdim=True)

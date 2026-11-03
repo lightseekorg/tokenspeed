@@ -68,6 +68,8 @@ from muse_layer_builder import (  # noqa: E402
     build_layer_inputs,
 )
 from muse_layer_reference import (  # noqa: E402
+    SEEDS,
+    RoutingTie,
     assert_matches,
     attention_reference,
     regular_reference,
@@ -136,17 +138,24 @@ def _worker(rank, port, record_dir, errors):
             device=torch.device("cuda", rank),
         )
         for key in PLAN_KEYS:
-            weights, inputs = build_layer_inputs(
-                key, rank, 0, torch.device("cuda", rank),
-                CONTEXT[key.layer_kind][: key.requests],
-            )  # fmt: skip
+            for seed in SEEDS:
+                weights, inputs = build_layer_inputs(
+                    key, rank, seed, torch.device("cuda", rank),
+                    CONTEXT[key.layer_kind][: key.requests],
+                )  # fmt: skip
+                try:
+                    expected = regular_reference(key, weights, inputs)
+                    break
+                except RoutingTie:
+                    continue
+            else:
+                raise AssertionError(f"{key}: every seed has a routing tie")
             fused = prepare_decoder_layer(
                 recipe="muse_spark", plan_keys=[key], traits=TRAITS,
                 weights=weights, state=state,
             )  # fmt: skip
             assert fused is not None
             assert fused.decline_reasons(key.requests) == [], key
-            expected = regular_reference(key, weights, inputs)
             expected["slots"] = inputs["slots"]
             actual = run_fused(fused, key, inputs, inputs["residual"].clone())
             if key.layer_kind == "full":
