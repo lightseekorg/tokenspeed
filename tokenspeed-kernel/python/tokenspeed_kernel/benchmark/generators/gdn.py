@@ -216,6 +216,7 @@ def prepare_gdn_decode_mtp(
     its own pool row, as the staged verify does; ``"none"`` leaves the pool
     untouched, as the ReplaySSM verify does.
     ``state_dtype`` explicitly selects float32 or bfloat16 for the pool.
+    It is required for output-only verify as well as state-writing calls.
     """
 
     model_profile, profile = _profile(request)

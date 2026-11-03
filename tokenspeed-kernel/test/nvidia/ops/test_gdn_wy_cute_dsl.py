@@ -863,7 +863,8 @@ def test_flashinfer_bf16_state_rejects_unsupported_value_dim(require):
 @pytest.mark.parametrize(
     "tokens,state_writes", [(8, "none"), (17, "none"), (8, "per_token")]
 )
-def test_wy_benchmark_preparation(tokens, state_writes):
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+def test_wy_benchmark_preparation(tokens, state_writes, state_dtype):
     from tokenspeed_kernel.benchmark.generators.gdn import prepare_gdn_decode_mtp
     from tokenspeed_kernel.benchmark.harness import (
         BenchmarkCaseError,
@@ -877,6 +878,7 @@ def test_wy_benchmark_preparation(tokens, state_writes):
         parameters={
             "model_profile": "qwen38_flash_tp2",
             "dtype": "bfloat16",
+            "state_dtype": state_dtype,
             "batch": 1,
             "tokens": tokens,
             "state_writes": state_writes,
@@ -892,6 +894,7 @@ def test_wy_benchmark_preparation(tokens, state_writes):
         assert error.value.status == BenchmarkStatus.NOT_APPLICABLE
     else:
         prepared = prepare_gdn_decode_mtp(request, current_platform())
+        assert prepared.parameters["state_dtype"] == state_dtype
         result = prepared.invocation.invoke()
         assert result.shape == (1, tokens, 24, 128) and result.isfinite().all()
 
