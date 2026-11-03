@@ -98,6 +98,7 @@ __all__ = [
     "GROUPS_PER_EXPERT",
     "TAG_WORDS_PER_EXPERT",
     "UNITS_PER_EXPERT",
+    "MOE_SINK_LAYOUT",
     "MoeBuffers",
     "NativeMoeState",
     "gluon_mxfp4_moe_native_stream_gfx950",
@@ -546,14 +547,19 @@ class MoeBuffers:
         self.stride_s2nb = stride_s2nb
 
 
+# The layout of a down unit's result as handed to the sink: [16 rows, 128
+# columns], wave w owns columns 16w..16w+15 (its own unit), and lane l of a
+# wave holds row l % 16 and 4 consecutive columns from 4 (l // 16), i.e. two
+# whole bf16 pairs. It is the transposed MFMA result layout.
+MOE_SINK_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 4], [16, 4], [1, 8], [0, 1]))
+
+
 @gluon.constexpr_function
 def _layouts():
     # MFMA 16x16x128 (transposed result: a lane holds one row, 4 consecutive
     # columns), warps along N: wave w owns columns 16w..16w+15.
     mfma, dot_a, dot_b, a_scale, b_scale = _direct_mxfp4_mfma_layouts(16, 128, 4, 8)
-    rows = gl.BlockedLayout(
-        [1, 4], [16, 4], [1, 8], [0, 1]
-    )  # == mfma, as a blocked layout
+    rows = MOE_SINK_LAYOUT  # == mfma, as a blocked layout
     lane = gl.BlockedLayout([1], [64], [8], [0])  # one element per lane
     quant = gl.BlockedLayout(
         [1, 8], [4, 16], [8, 1], [1, 0]
@@ -810,9 +816,9 @@ def prefetch_moe(
 
 @gluon.jit
 def store_routes_sink(args, y, route, cols):
-    """Default down-unit sink: ``out[route, cols] = bf16(y)`` with ``out =
-    args[0]`` of shape ``(rows * top_k, hidden)``; rows with ``route < 0``
-    are skipped. The composer passes its H4 push instead."""
+    """Default down-unit sink (see :func:`run_moe`): ``out[route, cols] =
+    bf16(y)`` with ``out = args[0]`` of shape ``(rows * top_k, hidden)``;
+    rows with ``route < 0`` are skipped. The layer passes its H4 push."""
     out = args[0]
     gl.amd.cdna4.buffer_store(
         y.to(gl.bfloat16),
@@ -998,12 +1004,19 @@ def run_moe(
     """Stream this workgroup's MoE work: gate/up strips, then down units.
 
     ``ctx`` is the launch (``persistent.Launch``); its ``tag`` marks this
-    launch's mids. ``bufs.xq`` and
-    ``bufs.xs`` must be published before the call. Every down unit's output
-    goes to ``sink(sink_args, y, route, cols)``: ``y`` the fp32 ``[16, 128]``
-    MFMA result (wave w's 16 columns), ``route`` the ``[16, 1]`` route per
-    token row (-1: the token does not pick the expert), ``cols`` the
-    ``[1, 128]`` output columns.
+    launch's mids. ``bufs.xq`` and ``bufs.xs`` must be published before the
+    call.
+
+    Every down unit's output goes to ``sink(sink_args, y, route, cols)``,
+    once per 16-column strip: ``y`` the fp32 ``[16, 128]`` result in
+    ``MOE_SINK_LAYOUT`` (wave w's own 16 columns; each lane holds whole
+    adjacent column pairs), ``route`` the ``[16, 1]`` route per token row
+    (-1: the token does not pick the expert) and ``cols`` the ``[1, 128]``
+    output columns, both in its slice layouts. The waves call the sink
+    independently, with different trip counts, so the sink must stay within
+    the wave: no layout conversion across waves, no barrier, no shared
+    memory a wave does not own. Elementwise math, in-lane ``reshape`` /
+    ``split`` of the column pairs and stores are fine.
 
     Plan fields: ``RING`` weight chunks in flight per wave; ``QUAD_MAP`` 0
     runs a group's 4 strips on waves 4q..4q+3, 1 on waves q, q+2, q+4, q+6;
@@ -1322,12 +1335,15 @@ def run_moe(
                 )
             ring2 = ring2[: c % RING] + (nb,) + ring2[c % RING + 1 :]
             gl.amd.hint.sched_barrier()
-        # S-MOE4 (down unit -> sink: the H4 push in the layer)
-        rows = gl.arange(0, 16, layout=gl.SliceLayout(1, mfma))
+        # S-MOE4 (down unit -> sink: the H4 push in the layer). Handed over in
+        # MOE_SINK_LAYOUT, which is the MFMA result's own layout: no data
+        # moves, and each wave owns its 16 columns.
+        rows = gl.arange(0, 16, layout=gl.SliceLayout(1, rowl))
         route = _routes(ids_t, dexpert, rows, TOPK)[:, None]
-        cols = gl.arange(0, 128, layout=gl.SliceLayout(0, mfma))[None, :] % 16
+        cols = gl.arange(0, 128, layout=gl.SliceLayout(0, rowl))[None, :] % 16
         for st in gl.static_range(4):
-            sink(sink_args, accs[st], route, dunit * 64 + st * 16 + cols)
+            y = gl.convert_layout(accs[st], rowl, assert_trivial=True)
+            sink(sink_args, y, route, dunit * 64 + st * 16 + cols)
         dexpert, drank, dunit = nexpert, nrank, nunit
         wb, dw_pair, dw_odd, sb, ds_pair = nwb, nw_pair, nw_odd, nsb, ns_pair
         route_a, route_s = nroute_a, nroute_s
@@ -1383,9 +1399,11 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    SINK: gl.constexpr,
 ):
     """The MoE stream as its own persistent launch of 256 workgroups x 8
-    waves, with ``out[route, :]`` (bf16) as the down units' sink."""
+    waves; ``SINK((out,), y, route, cols)`` takes the down units' output
+    (``store_routes_sink``: ``out[route, :]`` in bf16)."""
     # Entry counters first, then the plan and the first weights (they depend
     # only on the ids), then the entry check.
     entry = enter_issue(epochs, claims)
@@ -1430,7 +1448,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         ctx,
         handles,
         bufs,
-        store_routes_sink,
+        SINK,
         (out,),
         ROWS,
         TOPK,
@@ -1578,6 +1596,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         SWIGLU_ALPHA=swiglu_alpha,
         SWIGLU_LIMIT=swiglu_limit,
         SWIGLU_BETA=swiglu_beta,
+        SINK=store_routes_sink,
         num_warps=8,
         **persistent_compile_options(),
     )
