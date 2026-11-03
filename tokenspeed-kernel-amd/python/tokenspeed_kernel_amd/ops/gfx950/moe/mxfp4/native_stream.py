@@ -92,6 +92,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     poll_check,
     poll_tags16,
     release_drain,
+    vote,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.arena import UncachedBuffer
 from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import (
@@ -1060,15 +1061,38 @@ def _wait_quad(ctx, ex_count, counter, target, detail):
 
 
 @gluon.jit
-def _wait_ready(ctx, tags, rank, TAG_GLC: gl.constexpr):
+def _wait_ready(ctx, tags, rank, TAG_POLL: gl.constexpr):
     """Wait until every group tag of the expert at ``rank`` carries this
     launch's tag (64 words: 16 groups x 4 strips, each published by its
     wave). Per wave, without a workgroup barrier: the wave's own mids loads
-    follow its scalar poll in program order. Fails the launch on expiry."""
-    for j in gl.static_range(_TAGS // 16):
-        seen = poll_tags16(tags + rank * _TAGS + 16 * j, ctx.tag, ctx, TAG_GLC, False)
-        if not seen:
+    follow its poll in program order. Fails the launch on expiry.
+
+    ``TAG_POLL`` 0 and 1 poll with scalar loads (1 past the scalar cache),
+    which do not wait behind the wave's weight loads; 2 polls with one
+    uncached vector load per lane (a lane per tag word) and a wave vote,
+    which waits for every load the wave issued before it.
+    """
+    if TAG_POLL == 2:
+        lane: gl.constexpr = _layouts()[6]
+        words = tags + rank * _TAGS + gl.arange(0, 64 * gl.num_warps(), lane) % 64
+        missing = gl.load(words, cache_modifier=".cv") != ctx.tag
+        start = gl.to_tensor(0).to(gl.int64)
+        retries = 0
+        stop = retries < 0
+        while vote(missing.to(gl.int32)) & (not stop):
+            retries += 1
+            missing = gl.load(words, cache_modifier=".cv") != ctx.tag
+            if retries % 64 == 0:
+                stop, start = poll_check(ctx, start, retries, True)
+        if stop:
             fail_stop(ctx, _SITE_MOE_READY, rank)
+    else:
+        for j in gl.static_range(_TAGS // 16):
+            seen = poll_tags16(
+                tags + rank * _TAGS + 16 * j, ctx.tag, ctx, TAG_POLL == 1, False
+            )
+            if not seen:
+                fail_stop(ctx, _SITE_MOE_READY, rank)
 
 
 @gluon.jit
@@ -1087,7 +1111,7 @@ def run_moe(
     DN_ORDER: gl.constexpr,
     DN_LINES: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
-    TAG_GLC: gl.constexpr,
+    TAG_POLL: gl.constexpr,
     SCALE_LANES: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -1128,7 +1152,7 @@ def run_moe(
     ``DN_ORDER`` 0 runs a down unit K-step-major, 1 strip-major;
     ``DN_LINES`` maps a down unit's columns to strips so each lane's results
     form whole lines (above; same sums, bit for bit); ``ADDR_SOFFSET`` advances weight addresses in the scalar offset;
-    ``TAG_GLC`` sets the readiness poll's GLC bit; ``SCALE_LANES`` reads the
+    ``TAG_POLL`` picks the readiness poll (:func:`_wait_ready`); ``SCALE_LANES`` reads the
     gate/up scales lane-major (``bufs.s13_lanes``, one dwordx4 per lane per
     16 steps) instead of one swizzled dword per 2 steps.
     """
@@ -1365,7 +1389,7 @@ def run_moe(
     # wave, right after the gate/up drain.
     if dlive:
         # Mids ready: the expert's group tags, polled with scalar loads.
-        _wait_ready(ctx, bufs.tags + tag_base, drank, TAG_GLC)
+        _wait_ready(ctx, bufs.tags + tag_base, drank, TAG_POLL)
     route_a, route_s = _unit_routes(ids_t, dexpert, TOPK)
     sdw = ()
     for i in gl.static_range(4):
@@ -1418,7 +1442,7 @@ def run_moe(
             if c == POLL_AT:
                 # The next unit's readiness: scalar loads only.
                 if nlive:
-                    _wait_ready(ctx, bufs.tags + tag_base, nrank, TAG_GLC)
+                    _wait_ready(ctx, bufs.tags + tag_base, nrank, TAG_POLL)
                 nroute_a, nroute_s = _unit_routes(ids_t, nexpert, TOPK)
             for kt in gl.static_range(_DN_STEPS):
                 if c == _a_release(kt, DN_ORDER, POLL_AT):
@@ -1532,7 +1556,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     DN_ORDER: gl.constexpr,
     DN_LINES: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
-    TAG_GLC: gl.constexpr,
+    TAG_POLL: gl.constexpr,
     SCALE_LANES: gl.constexpr,
     TAIL_NUM: gl.constexpr,
     TAIL_DEN: gl.constexpr,
@@ -1601,7 +1625,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         DN_ORDER,
         DN_LINES,
         ADDR_SOFFSET,
-        TAG_GLC,
+        TAG_POLL,
         SCALE_LANES,
         SWIGLU_ALPHA,
         SWIGLU_LIMIT,
@@ -1759,7 +1783,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
     dn_order: int,
     dn_lines: int,
     addr_soffset: int,
-    tag_glc: int,
+    tag_poll: int,
     tail_num: int,
     tail_den: int,
     swiglu_alpha: float,
@@ -1777,7 +1801,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         topk_ids: ``(rows, top_k)`` int32 global expert ids (EP1: all local).
         out: ``(rows * top_k, 4096)`` bf16, written per route.
         state: :class:`NativeMoeState`.
-        ring, quad_map, dn_order, dn_lines, addr_soffset, tag_glc, tail_num,
+        ring, quad_map, dn_order, dn_lines, addr_soffset, tag_poll, tail_num,
             tail_den:
             Plan fields, see :func:`run_moe` and :func:`prefetch_moe`.
         swiglu_alpha, swiglu_limit, swiglu_beta: The model's SwiGLU.
@@ -1804,7 +1828,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         ROWS=rows, TOPK=top_k, N_PHYS1=w.n_phys1, N_PHYS2=w.n_phys2, RING=ring,
         QUAD_MAP=quad_map, DN_ORDER=dn_order, DN_LINES=dn_lines,
         ADDR_SOFFSET=addr_soffset,
-        TAG_GLC=tag_glc, SCALE_LANES=int(w.s13_lanes is not None),
+        TAG_POLL=tag_poll, SCALE_LANES=int(w.s13_lanes is not None),
         TAIL_NUM=tail_num, TAIL_DEN=tail_den, SWIGLU_ALPHA=swiglu_alpha,
         SWIGLU_LIMIT=swiglu_limit, SWIGLU_BETA=swiglu_beta, SINK=store_routes_sink,
         num_warps=8, **persistent_compile_options()
