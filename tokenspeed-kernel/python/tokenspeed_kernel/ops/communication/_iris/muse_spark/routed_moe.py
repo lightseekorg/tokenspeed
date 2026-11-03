@@ -97,12 +97,11 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     row_offsets = token * width + columns
     local = combined.to(gl.bfloat16)
     gl.store(symmetric_input + row_offsets, local, mask=valid)
-    # A barrier does not wait for memory, and the one-thread release below
-    # waits only for its own subgroup's stores before writing back L2. So each
-    # subgroup first waits until its stores reach L2 (s_waitcnt vmcnt(0) on
-    # gfx950).
+    # The barrier the compiler inserts before the one-thread release does not
+    # wait for memory, and the release waits only for its own subgroup's
+    # stores before writing back L2. So each subgroup first waits until its
+    # stores reach L2 (s_waitcnt vmcnt(0) on gfx950).
     WAIT_STORES(args=[], constraints="=r,~{memory}")
-    gl.barrier()
 
     local_heap = _iris_group_heap_base(rank, heaps)
     epoch_ptr = ready_flags + token * WORLD_SIZE + rank
@@ -125,9 +124,6 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
             ).to(gl.float32)
     gl.store(output + row_offsets, reduced.to(gl.bfloat16), mask=valid)
 
-    # Each subgroup's peer reads returned before it stored their sum; the
-    # barrier holds the release until every subgroup has stored.
-    gl.barrier()
     done_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_peers(ready_flags, token, done_epoch, heaps, rank, num_warps)
 
