@@ -34,10 +34,16 @@ from flashinfer.autotuner import (
     TuningConfig,
 )
 from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.sm_reservation import max_active_clusters, reserved_sm_clusters
 from tokenspeed_kernel.thirdparty.trtllm_blockwise import _arguments
 
+# Keyed by (device index, reserved SM clusters): grids fit beside reserved SMs.
 _compiled = {}
 _lock = threading.Lock()
+
+
+def _key(device: torch.device) -> tuple[int, int]:
+    return device.index, reserved_sm_clusters(device)
 
 
 @functools.cache
@@ -82,10 +88,10 @@ def _tactics():
 
 def prepare_tactics(device: torch.device) -> None:
     """Compile dynamic-shape tactics before startup tuning or graph capture."""
-    if device.index in _compiled:
+    if _key(device) in _compiled:
         return
     with torch.cuda.device(device), _lock:
-        if device.index in _compiled:
+        if _key(device) in _compiled:
             return
         if torch.cuda.is_current_stream_capturing() or is_serving():
             raise RuntimeError(
@@ -93,7 +99,6 @@ def prepare_tactics(device: torch.device) -> None:
             )
         import cutlass
         import cutlass.cute as cute
-        import cutlass.utils as utils
         from cutlass.runtime import make_fake_stream
         from tokenspeed_kernel.thirdparty.trtllm_blockwise._kernel import (
             Sm100BlockwiseGemmKernel,
@@ -110,7 +115,7 @@ def prepare_tactics(device: torch.device) -> None:
             kernel = Sm100BlockwiseGemmKernel(
                 cutlass.Float32, two, (tile, 128), (cm, cn)
             )
-            active = utils.HardwareInfo().get_max_active_clusters(cm * cn)
+            active = max_active_clusters(device, cm * cn)
             compiled[tactic] = cute.compile(
                 kernel.wrapper,
                 *_arguments(a, b, sa, sb, out),
@@ -118,7 +123,7 @@ def prepare_tactics(device: torch.device) -> None:
                 make_fake_stream(use_tvm_ffi_env_stream=False),
                 options="--opt-level 2 --enable-tvm-ffi",
             )
-        _compiled[device.index] = compiled
+        _compiled[_key(device)] = compiled
 
 
 class ExistingBlockFp8Runner(TunableRunner):
@@ -160,7 +165,7 @@ class CuteBlockFp8Runner(TunableRunner):
                 if m <= 64
                 else ((128, 1, 1, False) if m <= 128 else (256, 2, 1, True))
             )
-        _compiled[a.device.index][tuple(tactic)](
+        _compiled[_key(a.device)][tuple(tactic)](
             *_arguments(a, b, sa.T.contiguous(), sb.contiguous(), out),
             CUstream(torch.cuda.current_stream(a.device).cuda_stream),
         )
@@ -201,7 +206,7 @@ def tuned_blockwise_gemm(a, b, a_scales, b_scales, out, *, allow_existing: bool)
     inputs = [a, b, a_scales, b_scales, out]
     if (
         allow_existing
-        and a.device.index not in _compiled
+        and _key(a.device) not in _compiled
         and (torch.cuda.is_current_stream_capturing() or is_serving())
     ):
         return _existing(inputs, tactic=-1)

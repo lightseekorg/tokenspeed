@@ -22,21 +22,22 @@
 
 When every GPU pulls peer weights at once, copy-engine reads slow to about
 420 GB/s per GPU and slow further with the rate of compute kernel launches.
-About 32 CTAs of 512 threads issuing loads reach about 680 GB/s.
+TMA bulk copies from 24 single-warp CTAs reach about 650 GB/s. The CTAs launch
+in clusters of ``CLUSTER_SIZE`` so they hold whole 8-SM slots; reserve them
+with ``tokenspeed_kernel.sm_reservation`` so persistent grids fit beside them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
+from pathlib import Path
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
 
+CLUSTER_SIZE = 8
 _ALIGN = 16
 _WORD = 8
-# 128 KiB per CTA iteration with 16 warps keeps enough loads in flight.
-_BLOCK_WORDS = 16384
-_NUM_WARPS = 16
 
 
 @dataclass(frozen=True)
@@ -94,21 +95,14 @@ def build_fetch_plan(
     return FetchPlan(tiles, tuple(leftovers))
 
 
-@triton.jit(do_not_specialize=["num_tiles"])
-def _peer_fetch_kernel(base, tiles, counter, num_tiles, BLOCK: tl.constexpr):
-    # Tiles are claimed from a counter so CTAs that start late, behind other
-    # kernels, take fewer tiles instead of delaying the whole copy.
-    g = tl.atomic_add(counter, 1)
-    while g < num_tiles:
-        dst = tl.multiple_of(tl.load(tiles + g * 3), 2)
-        src = tl.multiple_of(tl.load(tiles + g * 3 + 1), 2)
-        words = tl.multiple_of(tl.load(tiles + g * 3 + 2), 2)
-        for start in range(0, words, BLOCK):
-            offs = start + tl.arange(0, BLOCK)
-            mask = offs < words
-            value = tl.load(base + src + offs, mask=mask, cache_modifier=".cg")
-            tl.store(base + dst + offs, value, mask=mask, cache_modifier=".cs")
-        g = tl.atomic_add(counter, 1)
+@cache
+def load_peer_fetch_module():
+    """Compile the copy kernel; call at startup, before serving."""
+    from tokenspeed_kernel.thirdparty.flashinfer.jit import build_cuda_module
+
+    return build_cuda_module(
+        "tokenspeed_peer_fetch_v1", [Path(__file__).with_name("peer_fetch.cu")]
+    )
 
 
 def launch_peer_fetch(
@@ -124,12 +118,11 @@ def launch_peer_fetch(
         plan: Tiles from ``build_fetch_plan`` with the same ``base`` address.
         base: int64 tensor whose data pointer is the plan's base address.
         counter: One int32 element, reset here; reuse only in stream order.
-        ctas: Number of copying CTAs; fixed for the store lifetime.
+        ctas: Copying CTAs, a positive multiple of ``CLUSTER_SIZE``; fixed
+            for the store lifetime.
     """
-    num_tiles = plan.tiles.shape[0]
-    if not num_tiles:
+    if ctas <= 0 or ctas % CLUSTER_SIZE:
+        raise ValueError(f"Copy CTAs must be a positive multiple of {CLUSTER_SIZE}")
+    if not plan.tiles.shape[0]:
         return
-    counter.zero_()
-    _peer_fetch_kernel[(ctas,)](
-        base, plan.tiles, counter, num_tiles, BLOCK=_BLOCK_WORDS, num_warps=_NUM_WARPS
-    )
+    load_peer_fetch_module().fetch(plan.tiles, counter, base.data_ptr(), ctas)

@@ -58,8 +58,11 @@ A prefetch is either copy-engine copies or one SM copy kernel on the store's
 copy stream; both follow the same slot events. The kernel's tile table is built
 at finalize, interleaves peers so every owner is read at once, and lets CTAs
 claim tiles so late-starting CTAs do not delay completion. Its CTA count trades
-fetch bandwidth against SMs taken from concurrent compute: persistent kernels
-sized to every SM stall while copy CTAs occupy SMs.
+fetch bandwidth against SMs taken from concurrent compute. The CTAs launch in
+clusters of 8 and the store reserves them (`tokenspeed_kernel.sm_reservation`)
+before kernels compile: a persistent grid sized to every SM would run its
+leftover CTAs as a second wave, so persistent GEMMs size their grids to the
+cluster slots the copy leaves free.
 
 The event loop receives only `DeviceSpecs.requires_forward_coordination`,
 derived from execution groups. It continues using the same scheduler and

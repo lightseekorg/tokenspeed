@@ -24,8 +24,15 @@ import threading
 
 import torch
 
+# Keyed by (device index, tile, reserved SM clusters).
 _compiled = {}
 _compile_lock = threading.Lock()
+
+
+def _key(device, tile):
+    from tokenspeed_kernel.sm_reservation import reserved_sm_clusters
+
+    return device.index, tile, reserved_sm_clusters(device)
 
 
 def _arguments(a, b, sa, sb, out):
@@ -52,8 +59,8 @@ def _arguments(a, b, sa, sb, out):
 def _compile(a, b, sa, sb, out, tile_m):
     import cutlass
     import cutlass.cute as cute
-    import cutlass.utils as utils
     from cutlass.runtime import make_fake_stream
+    from tokenspeed_kernel.sm_reservation import max_active_clusters
     from tokenspeed_kernel.thirdparty.trtllm_blockwise._kernel import (
         Sm100BlockwiseGemmKernel,
     )
@@ -61,7 +68,7 @@ def _compile(a, b, sa, sb, out, tile_m):
     two = tile_m == 256
     cluster = (2, 1) if two else (1, 1)
     kernel = Sm100BlockwiseGemmKernel(cutlass.Float32, two, (tile_m, 128), cluster)
-    active = utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
+    active = max_active_clusters(a.device, cluster[0] * cluster[1])
     return cute.compile(
         kernel.wrapper,
         *_arguments(a, b, sa, sb, out),
@@ -74,7 +81,7 @@ def _compile(a, b, sa, sb, out, tile_m):
 def prepare(device):
     """Compile reusable dynamic-shape variants on device before graph capture."""
     with torch.cuda.device(device), _compile_lock:
-        if (device.index, 64) in _compiled:
+        if _key(device, 64) in _compiled:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Prepare TRT-LLM CuTe-DSL before CUDA graph capture")
@@ -84,7 +91,7 @@ def prepare(device):
         sb = torch.empty((1, 1), device=device, dtype=torch.float32)
         out = torch.empty((256, 128), device=device, dtype=torch.bfloat16)
         compiled = {
-            (device.index, tile): _compile(a, b, sa, sb, out, tile)
+            _key(device, tile): _compile(a, b, sa, sb, out, tile)
             for tile in (64, 128, 256)
         }
         _compiled.update(compiled)
@@ -99,7 +106,7 @@ def blockwise_gemm(a, b, a_scales, b_scales, out):
     if m == 0:
         return out
     tile = 64 if m <= 64 else (128 if m <= 128 else 256)
-    key = (a.device.index, tile)
+    key = _key(a.device, tile)
     if key not in _compiled:
         prepare(a.device)
     from cuda.bindings.driver import CUstream

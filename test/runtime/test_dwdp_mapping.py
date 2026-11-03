@@ -131,12 +131,21 @@ BASE = [
     "16",
     "--disaggregation-mode",
     "prefill",
+    "--disaggregation-decode-allocation-policy",
+    "independent",
+    "--disaggregation-layerwise-interval",
+    "0",
     "--prefill-graph-max-tokens",
     "0",
     "--enforce-eager",
     "--load-balance-method",
     "round_robin",
 ]
+
+
+def test_copy_kernel_ctas_fill_whole_clusters():
+    args = prepare_server_args(BASE + ["--moe-weight-sharing-copy-ctas", "24"])
+    assert args.moe_weight_sharing_copy_ctas == 24
 
 
 def test_cli_selects_storage_separately_from_execution():
@@ -159,9 +168,12 @@ def test_cli_selects_storage_separately_from_execution():
         ["--enable-memory-saver"],
         ["--load-format", "dummy"],
         ["--load-format", "extensible"],
+        ["--moe-weight-sharing-copy-ctas", "0"],
+        ["--moe-weight-sharing-copy-ctas", "12"],
     ],
 )
 def test_unsupported_layouts_fail_before_loading(replacement):
+    prepare_server_args(BASE)
     with pytest.raises(ValueError):
         prepare_server_args(BASE + replacement)
 

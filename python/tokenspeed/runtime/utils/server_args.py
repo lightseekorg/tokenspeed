@@ -1167,9 +1167,11 @@ class ServerArgs:
         if self.moe_weight_sharing_copy_ctas is not None and (
             self.moe_weight_sharing_size is None
             or self.moe_weight_sharing_copy_ctas < 1
+            or self.moe_weight_sharing_copy_ctas % 8
         ):
             raise ValueError(
-                "--moe-weight-sharing-copy-ctas needs a positive value and --moe-weight-sharing-size"
+                "--moe-weight-sharing-copy-ctas needs a positive multiple of 8 and "
+                "--moe-weight-sharing-size"
             )
         if self.moe_weight_sharing_size is not None:
             if self.load_format not in ("auto", "safetensors"):
@@ -3931,8 +3933,9 @@ class ServerArgs:
             "--moe-weight-sharing-copy-ctas",
             type=int,
             default=ServerArgs.moe_weight_sharing_copy_ctas,
-            help="Fetch peer expert weights with a copy kernel on this many CTAs instead "
-            "of copy engines, which slow down while every worker pulls at once. "
+            help="Fetch peer expert weights with a copy kernel on this many CTAs (a "
+            "multiple of 8) instead of copy engines, which slow down while every "
+            "worker pulls at once. Persistent GEMM grids leave these SMs free. "
             "Omission keeps copy-engine transfers. Requires --moe-weight-sharing-size.",
         )
         parser.add_argument(

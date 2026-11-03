@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.communication.peer_weights import (
     ExpertWeightShard,
     create_peer_weight_store,
 )
+from tokenspeed_kernel.sm_reservation import reserved_sm_clusters
 
 
 @pytest.fixture(scope="module")
@@ -337,9 +338,20 @@ def test_slot_reuse_waits_for_readers_across_streams(peers, switch_stream, copy)
 
 
 @pytest.mark.parametrize(
-    "copy", [("simple", 8), ("kernel", None), ("kernel", 0), ("fast", None)]
+    "copy",
+    [("simple", 8), ("kernel", None), ("kernel", 0), ("kernel", 12), ("fast", None)],
 )
 def test_copy_configuration_is_explicit(peers, copy):
     partition, device = peers
     with pytest.raises(ValueError):
         _store(partition, device, copy)
+
+
+def test_copy_kernel_reserves_its_sms_while_open(peers):
+    partition, device = peers
+    store = _store(partition, device, ("kernel", 16))
+    try:
+        assert reserved_sm_clusters(device) == 2
+    finally:
+        store.close()
+    assert reserved_sm_clusters(device) == 0

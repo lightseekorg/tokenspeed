@@ -22,13 +22,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.communication._triton.peer_fetch import (
-    _peer_fetch_kernel,
+from tokenspeed_kernel.ops.communication._cuda.peer_fetch import (
     build_fetch_plan,
     launch_peer_fetch,
 )
 from tokenspeed_kernel.platform import current_platform
-from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia, reason="peer fetch needs an NVIDIA GPU"
@@ -53,7 +51,7 @@ def _fetch(copies, src, dst, *, tile_bytes, ctas):
     return plan
 
 
-@pytest.mark.parametrize("ctas", [1, 7, 64])
+@pytest.mark.parametrize("ctas", [8, 24, 64])
 def test_fetch_copies_every_range_exactly(ctas):
     torch.manual_seed(0)
     src = torch.randint(0, 256, (8 << 20,), dtype=torch.uint8, device="cuda")
@@ -90,19 +88,15 @@ def test_tiles_interleave_ranges():
     assert [(s * 8 - (1 << 30)) // 4096 for s in sources] == [0, 1, 2, 0, 1, 2]
 
 
-def test_tile_count_does_not_recompile():
-    src = torch.randint(0, 256, (4 << 20,), dtype=torch.uint8, device="cuda")
-    dst = torch.zeros_like(src)
-    copies = [(dst.data_ptr(), src.data_ptr(), 1 << 20)]
-    _fetch(copies, src, dst, tile_bytes=64 << 10, ctas=4)
-    with assert_no_triton_compile(_peer_fetch_kernel):
-        for size in (17 << 16, 33 << 16, 3 << 20):
-            _fetch(
-                [(dst.data_ptr(), src.data_ptr(), size)],
-                src,
-                dst,
-                tile_bytes=64 << 10,
-                ctas=4,
-            )
-    torch.cuda.synchronize()
-    assert torch.equal(dst[: 3 << 20], src[: 3 << 20])
+@pytest.mark.parametrize("ctas", [0, 12])
+def test_ctas_must_fill_whole_clusters(ctas):
+    src = torch.zeros(1 << 20, dtype=torch.uint8, device="cuda")
+    dst = torch.empty_like(src)
+    with pytest.raises(ValueError):
+        _fetch(
+            [(dst.data_ptr(), src.data_ptr(), 1 << 20)],
+            src,
+            dst,
+            tile_bytes=64 << 10,
+            ctas=ctas,
+        )

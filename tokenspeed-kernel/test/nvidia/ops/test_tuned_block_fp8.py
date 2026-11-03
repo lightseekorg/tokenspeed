@@ -143,6 +143,36 @@ def test_tuned_block_fp8_preserves_strided_output():
     assert torch.all(storage[:, 256:] == 7)
 
 
+def test_reserved_sms_keep_cute_results_exact():
+    from tokenspeed_kernel.sm_reservation import reserve_sm_clusters
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise.tuning import (
+        tuned_blockwise_gemm,
+    )
+
+    # Enough output tiles that grids are capped by the cluster slots.
+    x = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(4096, 1024, device="cuda", dtype=torch.bfloat16)
+    a, sa = quantize_fp8(
+        x, granularity="token_group", group_size=128, solution="triton"
+    )
+    b, sb = quantize_fp8(
+        w, granularity="block", block_size=(128, 128), solution="triton"
+    )
+
+    def run():
+        out = torch.empty(2048, 4096, device="cuda", dtype=torch.bfloat16)
+        return tuned_blockwise_gemm(a, b, sa, sb, out, allow_existing=False)
+
+    expected = run()
+    device = torch.device("cuda", torch.cuda.current_device())
+    reserve_sm_clusters(device, 3)
+    try:
+        actual = run()
+    finally:
+        reserve_sm_clusters(device, 0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_unprepared_auto_retains_existing_serving_path():
     import subprocess
     import sys

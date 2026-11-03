@@ -25,15 +25,18 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication._triton.peer_fetch import (
+from tokenspeed_kernel.ops.communication._cuda.peer_fetch import (
+    CLUSTER_SIZE,
     FetchPlan,
     build_fetch_plan,
     launch_peer_fetch,
+    load_peer_fetch_module,
 )
 from tokenspeed_kernel.ops.communication.peer_weights import (
     ExpertPartition,
     ExpertWeightShard,
 )
+from tokenspeed_kernel.sm_reservation import reserve_sm_clusters
 from tokenspeed_kernel.thirdparty.cuda.dwdp import vmm
 from tokenspeed_kernel.thirdparty.cuda.dwdp.layout import WeightLayout
 
@@ -85,10 +88,13 @@ class CudaPeerWeightStore:
                 f"Unsupported peer copy implementation: {copy_implementation}"
             )
         if (copy_implementation == "kernel") != (
-            copy_kernel_ctas is not None and copy_kernel_ctas > 0
+            copy_kernel_ctas is not None
+            and copy_kernel_ctas > 0
+            and copy_kernel_ctas % CLUSTER_SIZE == 0
         ):
             raise ValueError(
-                "copy_kernel_ctas must be positive exactly for the kernel copy"
+                "copy_kernel_ctas must be a positive multiple of "
+                f"{CLUSTER_SIZE} exactly for the kernel copy"
             )
         if dist.get_backend(group) != "gloo":
             raise ValueError("Weight setup requires a CPU gloo group")
@@ -118,6 +124,9 @@ class CudaPeerWeightStore:
         self._views: dict[int, dict[str, torch.Tensor]] = {}
         self._plans: dict[int, list[tuple[int, int, int]]] = {}
         self._copy_kernel_ctas = copy_kernel_ctas
+        if copy_kernel_ctas is not None:
+            # Persistent kernels compiled from here on fit beside the copy CTAs.
+            reserve_sm_clusters(device, copy_kernel_ctas // CLUSTER_SIZE)
         self._fetch_plans: dict[int, FetchPlan] = {}
         # Tile offsets are relative to this tensor's address; fetches run in
         # order on one copy stream, so they share one tile counter.
@@ -411,6 +420,7 @@ class CudaPeerWeightStore:
             self._views[layer.index] = views
             self._plans[layer.index] = plan
             if self._copy_kernel_ctas is not None:
+                load_peer_fetch_module()
                 self._fetch_plans[layer.index] = build_fetch_plan(
                     plan,
                     base=self._fetch_base.data_ptr(),
@@ -507,4 +517,6 @@ class CudaPeerWeightStore:
             vmm.free_address(address, size)
         for handle in reversed(self._handles):
             vmm.release_handle(handle)
+        if self._copy_kernel_ctas is not None:
+            reserve_sm_clusters(self.device, 0)
         self._closed = True
