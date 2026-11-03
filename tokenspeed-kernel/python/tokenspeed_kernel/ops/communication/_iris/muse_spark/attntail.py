@@ -485,4 +485,7 @@ def iris_fused_lamport_allreduce_muse_attntail(
             NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE,
         )
+    # A subgroup loading the stage after this store would send to the next
+    # stage's slot. Each has used its stage before the barrier: no wait needed.
+    gl.barrier()
     gl.store(epoch, (stage + 1) % 3)
