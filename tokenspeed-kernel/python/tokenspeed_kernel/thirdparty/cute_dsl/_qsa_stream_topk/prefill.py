@@ -921,7 +921,7 @@ class PrefillTopK(QueryGroups):
                     head = q_head - q_row * _HEADS
                     source = (
                         query.iterator
-                        + (row_base + q_row) * q_stride_row
+                        + cutlass.Int64(row_base + q_row) * q_stride_row
                         + head * q_stride_head
                         + col
                     )

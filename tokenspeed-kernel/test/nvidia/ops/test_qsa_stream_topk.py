@@ -2222,13 +2222,24 @@ def test_stream_topk_long_dense_score_refinement(
         )
 
 
-@pytest.mark.parametrize(("rows", "pages"), [(3, 64), (3, 128), (136, 128)])
+@pytest.mark.parametrize(
+    ("rows", "pages", "width"),
+    [
+        pytest.param(3, 64, 1, id="small"),
+        pytest.param(3, 128, 1, id="guarded-small"),
+        pytest.param(136, 128, 1, id="overlap"),
+        pytest.param(136, 32, 136, id="prefill"),
+        pytest.param(136, 64, 136, id="dense"),
+        pytest.param(16, 256, 8, id="split"),
+    ],
+)
 def test_stream_topk_query_row_offset_exceeds_int32(
     device: str,
     rows: int,
     pages: int,
+    width: int,
 ) -> None:
-    """Runtime row-stride products use 64-bit addresses in both score paths."""
+    """Every algorithm reads large-stride queries eagerly and in graph replay."""
     stride = ((1 << 31) // (rows - 1) + 127) // 128 * 128 + 128
     storage = torch.empty(
         (rows - 1) * stride + 512,
@@ -2242,20 +2253,24 @@ def test_stream_topk_query_row_offset_exceeds_int32(
     table = torch.randperm(pages, device=device).int()[None]
     requests = torch.zeros(rows, device=device, dtype=torch.int32)
     complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
-    selected = qsa_block_topk_stream(
-        query,
-        keys,
-        table,
-        requests,
-        complete,
-        page_size=64,
-        block_topk=512,
-        queries_per_request=1,
-        max_partial_bytes=32 * 1024 * 1024,
-        solution="cute_dsl",
-        override=None,
-        enable_pdl=False,
-    )
+
+    def invoke() -> torch.Tensor:
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=32 * 1024 * 1024,
+            solution="cute_dsl",
+            override=None,
+            enable_pdl=False,
+        )
+
+    selected = invoke()
     _assert_matches_reference(
         query,
         keys,
@@ -2266,6 +2281,13 @@ def test_stream_topk_query_row_offset_exceeds_int32(
         64,
         512,
     )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    query.normal_()
+    complete[::2] = 513
+    graph.replay()
+    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
 
 
 @pytest.mark.parametrize("pages", [32, 128])
