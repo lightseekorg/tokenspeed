@@ -101,6 +101,35 @@ through memory instead of kernel boundaries.
   a barrier (its spin has no deadline: only same-workgroup waves that never
   wait back may be waited for).
 
+## Attention prologue
+
+### gfx950 GQA prologue
+
+`gluon_gqa_prologue_gfx950` (`attention/prologue/gqa.py`) is the gfx950
+`gqa_prologue` solution; its device functions also run inside a fused
+decoder layer.
+
+#### Contract
+
+- Per-head RMSNorm (required), whole-head interleaved (GPT-J) rotation or
+  none, head dim 64 or 128, BF16/FP16 q/k/v rows with strided rows and heads,
+  native, FP8 or per-tensor scaled FP8 caches; the query in any dtype. Other
+  requests (NEOX, partial or multimodal rotation, returned K/V, MXFP8) select
+  another solution.
+- The same BF16 rows give the Triton prologue's bytes.
+- `gqa_prologue_query_gfx950` / `_key_gfx950` / `_value_gfx950` take one
+  head's rows as values (FP32 holding BF16 values, one token per subgroup
+  row), so a kernel that computes them needs no store and reload;
+  `gqa_prologue_head_gfx950` loads them (`SRC_CACHE` sets the loads' cache
+  bits). Query and cache rows are stored plainly.
+
+#### Algorithm
+
+The Triton prologue's layouts and operations: the RMS scale from one 64-lane
+reduction per token, the rotation `fma(x1, cos, -x2 * sin)` /
+`fma(x2, cos, x1 * sin)` on interleaved pairs (split from the rows in
+registers), and one RTNE rounding. A program runs one head over 16 tokens.
+
 ## GEMM
 
 ### gfx950 dense BF16 projections
@@ -139,6 +168,13 @@ Qwen3.8-Flash-Next decode batches.
   GEMM's measured config has no split-K
   (`supports_gluon_mm_a16w16_column_shard_gfx950`) each column equals the
   replicated GEMM's bitwise.
+- `mm_a16w16_column_relay_gfx950` is the column shard's 16-column chain as
+  a device function for a persistent kernel that keeps the weights in
+  registers: wave `w` holds the 512-deep K tile `w`
+  (`mm_a16w16_column_relay_weights_gfx950`, 64 VGPRs), waits in LDS for wave
+  `w - 1`'s FP32 accumulator, adds its 16 MFMAs and hands the accumulator on
+  with one count bump. The chain and its K order are the column shard's, so
+  the columns are bitwise equal.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.
@@ -295,6 +331,10 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   wave-summed `[16, rows]` FP32 in the caller's layout;
   `gemv_a16w16_splitk_publish_gfx950` stores such sums as the finish's
   tagged words.
+- `gemv_a16w16_splitk_weights_paced_gfx950` issues the same loads with at
+  most `WINDOW` tiles in flight per wave (counted `vmcnt` waits), so a weight
+  stream overlapping a latency-bound chain stays below the fabric's knee;
+  `gemv_a16w16_splitk_finish_x_gfx950` finishes on a caller-built x.
 
 #### Algorithm
 
@@ -316,6 +356,9 @@ pre-norm into their consumers.
 
 - Producers publish four FP32 sums per row and column block: `sum b^2`,
   `B = sum (alpha h)(beta b)`, `A = sum (alpha h)^2`, `C = sum (beta b)^2`.
+- `deferred_norm_terms_gfx950` gives a producer the four terms per element
+  (`b` is the producer's BF16 output times `post`), `[..., 4]` in that
+  order, for it to sum over its own columns.
 - `deferred_norm_scales_gfx950` takes them as `[rows, producers, 4]` with the
   producers across one wave's lanes and returns `inv1`, `inv2` per row.
 - `deferred_norm_rows_gfx950` returns `h' = fma(beta, b post inv1, alpha h)`

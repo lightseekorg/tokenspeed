@@ -43,14 +43,17 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+    MAX_VMCNT_WAIT,
     poll_expired,
     poll_stop_site,
+    wait_vmcnt,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
 
 cdna4 = gl.amd.cdna4
 
 NUM_WARPS = 8
+_MAX_VMCNT_WAIT = gl.constexpr(MAX_VMCNT_WAIT)
 # Token tile of the MFMA B operand; rows past the call's rows reread its last row.
 _BLOCK_T = gl.constexpr(16)
 
@@ -80,10 +83,67 @@ def gemv_a16w16_splitk_weights_gfx950(
     ``ROWS_PER_TASK / 16 * K / PARTS / 8 / 32 * 4`` VGPRs (72 for 144 rows and
     K = 8192 in 16 parts). Loads are ``.cg`` (streamed once).
     """
+    TILES: gl.constexpr = ROWS_PER_TASK // 16
+    base, group = _weight_tile_base(task, K, ROWS_PER_TASK, PARTS, GROUPS)
+    tiles = ()
+    for t in gl.static_range(TILES):
+        tiles += (
+            cdna4.buffer_load(w_ptr, base + (group * TILES + t) * 16 * K, cache=".cg"),
+        )
+    return tiles
+
+
+@gluon.jit
+def gemv_a16w16_splitk_weights_paced_gfx950(
+    w_ptr,
+    task,
+    K: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    WINDOW: gl.constexpr,
+):
+    """:func:`gemv_a16w16_splitk_weights_gfx950` with at most ``WINDOW``
+    tiles' loads in flight per wave: before issuing tile ``t >= WINDOW`` the
+    wave waits until ``(WINDOW - 1)`` tiles' loads remain (a counted
+    ``s_waitcnt vmcnt``, never ``vmcnt(0)``). A stream that overlaps a
+    latency-bound chain stays below the fabric's knee this way; the rate is
+    about ``waves * WINDOW * tile bytes`` per load latency per CU. Loads the
+    wave issued earlier count against the window too.
+    """
+    WAVES: gl.constexpr = gl.num_warps()
+    TILES: gl.constexpr = ROWS_PER_TASK // 16
+    # dwordx4 loads per wave per tile: 16 rows x K / PARTS / WAVES BF16 over 64 lanes.
+    LOADS: gl.constexpr = K // PARTS // WAVES // 32
+    # WINDOW >= TILES issues every tile at once (no wait).
+    gl.static_assert(
+        1 <= WINDOW and (WINDOW >= TILES or (WINDOW - 1) * LOADS <= _MAX_VMCNT_WAIT)
+    )
+    base, group = _weight_tile_base(task, K, ROWS_PER_TASK, PARTS, GROUPS)
+    tiles = ()
+    for t in gl.static_range(TILES):
+        if t >= WINDOW:
+            wait_vmcnt((WINDOW - 1) * LOADS)
+        tiles += (
+            cdna4.buffer_load(w_ptr, base + (group * TILES + t) * 16 * K, cache=".cg"),
+        )
+    return tiles
+
+
+@gluon.jit
+def _weight_tile_base(
+    task,
+    K: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+):
+    """Element offsets of a task's weight rows in the MFMA A layout, without
+    the row group, and the group: tile ``t`` is ``(group * TILES + t) * 16 *
+    K`` past them."""
     WAVES: gl.constexpr = gl.num_warps()
     KP: gl.constexpr = K // PARTS
     KW: gl.constexpr = KP // WAVES
-    TILES: gl.constexpr = ROWS_PER_TASK // 16
     gl.static_assert(ROWS_PER_TASK % 16 == 0 and KW % 32 == 0)
     a_l: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=_mfma(WAVES), k_width=8
@@ -98,12 +158,7 @@ def gemv_a16w16_splitk_weights_gfx950(
         + (part * KP + wave * KW)[:, None, None]
         + k[None, None, :]
     )
-    tiles = ()
-    for t in gl.static_range(TILES):
-        tiles += (
-            cdna4.buffer_load(w_ptr, base + (group * TILES + t) * 16 * K, cache=".cg"),
-        )
-    return tiles
+    return base, group
 
 
 @gluon.jit
@@ -169,12 +224,32 @@ def gemv_a16w16_splitk_finish_gfx950(
     cache modifiers: "" in a standalone launch, ".cv"/".wt" when x was written
     and the partials are read within the same launch on other XCDs.
     """
+    x = gemv_a16w16_splitk_x_gfx950(x_ptr, x_stride, task, M, K, PARTS, GROUPS, X_CACHE)
+    gemv_a16w16_splitk_finish_x_gfx950(
+        tiles, x, part_ptr, tag, task, M, N, ROWS_PER_TASK, GROUPS, PART_CACHE
+    )
+
+
+@gluon.jit
+def gemv_a16w16_splitk_finish_x_gfx950(
+    tiles,
+    x,
+    part_ptr,
+    tag,
+    task,
+    M,
+    N: gl.constexpr,
+    ROWS_PER_TASK: gl.constexpr,
+    GROUPS: gl.constexpr,
+    PART_CACHE: gl.constexpr,
+):
+    """:func:`gemv_a16w16_splitk_finish_gfx950` on a B operand ``x`` the
+    caller built (the layout of :func:`gemv_a16w16_splitk_x_gfx950`)."""
     WAVES: gl.constexpr = gl.num_warps()
     TILES: gl.constexpr = ROWS_PER_TASK // 16
     mfma: gl.constexpr = _mfma(WAVES)
     group = task % GROUPS
     part = task // GROUPS
-    x = gemv_a16w16_splitk_x_gfx950(x_ptr, x_stride, task, M, K, PARTS, GROUPS, X_CACHE)
     # Every wave's accumulator of every tile to LDS, one barrier, then each
     # thread sums its (row, token) outputs over the waves.
     bufs = ()
@@ -486,11 +561,13 @@ def launch_gluon_gemv_a16w16_splitk_gfx950(
 __all__ = [
     "gemv_a16w16_splitk_exchange_gfx950",
     "gemv_a16w16_splitk_finish_gfx950",
+    "gemv_a16w16_splitk_finish_x_gfx950",
     "gemv_a16w16_splitk_hi_lo_sums_gfx950",
     "gemv_a16w16_splitk_publish_gfx950",
     "gemv_a16w16_splitk_sum_gfx950",
     "gemv_a16w16_splitk_wave_sums_gfx950",
     "gemv_a16w16_splitk_weights_gfx950",
+    "gemv_a16w16_splitk_weights_paced_gfx950",
     "gemv_a16w16_splitk_x_gfx950",
     "gluon_gemv_a16w16_splitk_gfx950",
     "gluon_gemv_a16w16_splitk_reduce_gfx950",

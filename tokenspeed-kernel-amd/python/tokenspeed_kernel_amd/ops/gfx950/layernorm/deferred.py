@@ -38,7 +38,28 @@ These are the attention tail finisher's operations, in its order.
 
 from tokenspeed_kernel_amd._triton import gl, gluon
 
-__all__ = ["deferred_norm_rows_gfx950", "deferred_norm_scales_gfx950"]
+__all__ = [
+    "deferred_norm_rows_gfx950",
+    "deferred_norm_scales_gfx950",
+    "deferred_norm_terms_gfx950",
+]
+
+
+@gluon.jit
+def deferred_norm_terms_gfx950(b, h, alpha, beta, post):
+    """A producer's per-element terms of the four sums, elementwise:
+    ``[..., 4]`` = ``(b'^2, (alpha h)(beta b'), (alpha h)^2, (beta b')^2)``
+    with ``b' = b * post`` (FP32). The producer sums them over its columns
+    (in its own fixed order) and publishes ``sum b^2, B, A, C``."""
+    weighted = b.to(gl.float32) * post.to(gl.float32)
+    alpha_h = alpha * h
+    beta_b = beta * weighted
+    # join(join(p, q), join(r, s)) orders the trailing 2 x 2 as p, r, q, s.
+    terms = gl.join(
+        gl.join(weighted * weighted, alpha_h * alpha_h),
+        gl.join(alpha_h * beta_b, beta_b * beta_b),
+    )
+    return gl.reshape(terms, list(weighted.shape) + list([4]))
 
 
 @gluon.jit

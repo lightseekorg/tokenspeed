@@ -37,10 +37,14 @@ pytest.importorskip("tokenspeed_kernel_amd")
 
 from asm_checks import instruction_lines  # noqa: E402
 from native_body_helpers import (  # noqa: E402
+    column_relay_kernel,
     compile_gfx950,
+    head_task_kernel,
     kpart_pooler_kernel,
     kpart_router_kernel,
+    qkv_task_kernel,
     sender_kernel,
+    sender_sums_kernel,
     split_records_kernel,
     topk_keys_kernel,
 )
@@ -234,3 +238,152 @@ def test_topk_keys_stay_in_one_wave():
     assert not [line for line in code if line.startswith("ds_") or line == "s_barrier"]
     assert any(line.startswith("v_cmp_gt_i64") for line in code)
     assert _metadata(assembly, "private_segment_fixed_size") == 0
+
+
+@pytest.mark.parametrize("window", [3, 9], ids=["paced", "all-at-once"])
+def test_qkv_task_paces_its_weights_and_fits(window: int):
+    """The QKV task (144 rows x K/16, x built from the FFN boundary's
+    deferred norm) keeps at most ``window`` weight tiles in flight with
+    counted waits, never draining its stream while issuing, and fits the
+    budget with no scratch: NATIVE-DESIGN's one-task form (204 VGPRs [C])."""
+    assembly = compile_gfx950(
+        qkv_task_kernel,
+        {
+            "b_ptr": "*bf16",
+            "sums_ptr": "*fp32",
+            "h_ptr": "*fp32",
+            "alpha_ptr": "*fp32",
+            "beta_ptr": "*fp32",
+            "post_ptr": "*bf16",
+            "pre_ptr": "*bf16",
+            "w_ptr": "*bf16",
+            "part_ptr": "*i64",
+            "tag": "i32",
+            "M": "i32",
+        },
+        dict(
+            WIDTH=8192, N=2304, PRODUCERS=64, WINDOW=window, POST_EPS=1e-6, PRE_EPS=1e-5
+        ),
+        num_warps=8,
+        **persistent_compile_options(),
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    assert _metadata(assembly, "vgpr_count") <= 204
+    code = instruction_lines(assembly)
+    weights = [
+        i
+        for i, line in enumerate(code)
+        if line.startswith("buffer_load_dwordx4") and line.endswith("sc0 nt")
+    ]
+    assert len(weights) == 18  # 9 tiles x 2 loads per wave
+    waits = [
+        code[i]
+        for i in range(weights[0], weights[-1])
+        if code[i].startswith("s_waitcnt") and "vmcnt" in code[i]
+    ]
+    if window >= 9:
+        # Unpaced: other loads may be waited for in between, never the stream.
+        assert "s_waitcnt vmcnt(0)" not in waits, waits
+    else:
+        # Before each tile past the window: wait until (window - 1) tiles remain.
+        assert waits == [f"s_waitcnt vmcnt({2 * (window - 1)})"] * (9 - window), waits
+
+
+def test_head_task_prologue_runs_on_summed_partials():
+    """A HEAD task sums its head's 16 K-part partials (tag-polled 64-bit
+    words) and runs the GQA prologue on the rows in registers: no store and
+    reload of the rows, no scratch."""
+    assembly = compile_gfx950(
+        head_task_kernel,
+        {
+            "part_ptr": "*i64",
+            "q_out_ptr": "*fp8e4nv",
+            "q_weight_ptr": "*bf16",
+            "k_weight_ptr": "*bf16",
+            "cos_sin_ptr": "*fp32",
+            "positions_ptr": "*i64",
+            "k_cache_ptr": "*fp8e4nv",
+            "v_cache_ptr": "*fp8e4nv",
+            "slots_ptr": "*i64",
+            "error_ptr": "*i32",
+            "tag": "i32",
+            "deadline_ticks": "i64",
+            "M": "i32",
+        },
+        dict(NUM_Q_HEADS=16, NUM_KV_HEADS=2, HEAD_DIM=64),
+        num_warps=8,
+        **persistent_compile_options(),
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    code = instruction_lines(assembly)
+    # The rows never go through memory: the only multi-dword stores would be
+    # rows of the summed head; the prologue writes FP8 bytes.
+    assert not [
+        line
+        for line in code
+        if line.startswith(("global_store_dwordx", "buffer_store_dwordx"))
+    ]
+    polls = [line for line in code if line.startswith("buffer_load_dwordx2")]
+    assert polls and all(line.endswith("sc0 sc1") for line in polls), polls[:4]
+
+
+def test_column_relay_holds_its_k_tile_and_chains_one_accumulator():
+    """Each wave of the post-expert sender holds one 512-deep K tile (16 KB,
+    16 weight loads) and runs 16 MFMAs on one accumulator chain, between a
+    spin for its predecessor and a hand-off (LDS writes and one
+    ``ds_add_rtn``); no barrier inside the relay and no scratch."""
+    assembly = compile_gfx950(
+        column_relay_kernel,
+        {"x_ptr": "*bf16", "w_ptr": "*bf16", "out_ptr": "*bf16", "M": "i32"},
+        dict(K=4096),
+        num_warps=8,
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    code = instruction_lines(assembly)
+    weights = [
+        line
+        for line in code
+        if line.startswith("buffer_load_dwordx4") and line.endswith("sc0 nt")
+    ]
+    assert len(weights) == 16
+    mfmas = [i for i, line in enumerate(code) if line.startswith("v_mfma")]
+    assert len(mfmas) == 16
+    spins = [i for i, line in enumerate(code) if line.startswith("s_cbranch_vccnz")]
+    handoff = next(
+        i for i, line in enumerate(code) if line.startswith("ds_add_rtn_u32")
+    )
+    assert spins[0] < mfmas[0] and mfmas[-1] < handoff < spins[1]
+    assert not [line for line in code[spins[0] : spins[1]] if line == "s_barrier"]
+
+
+def test_sender_sums_add_their_columns_in_each_thread():
+    """After the relay's last hand-off the sender forms its four norm sums
+    with no LDS traffic beyond reading the relayed tile and no cross-lane
+    reduction, and publishes them as tagged words; no scratch."""
+    assembly = compile_gfx950(
+        sender_sums_kernel,
+        {
+            "x_ptr": "*bf16",
+            "w_ptr": "*bf16",
+            "h_ptr": "*fp32",
+            "alpha_ptr": "*fp32",
+            "beta_ptr": "*fp32",
+            "post_ptr": "*bf16",
+            "sums_ptr": "*i64",
+            "tag": "i32",
+            "M": "i32",
+        },
+        dict(K=4096, N=8192),
+        num_warps=8,
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    code = instruction_lines(assembly)
+    handoff = max(i for i, line in enumerate(code) if line.startswith("ds_add_rtn_u32"))
+    tail = code[handoff:]
+    assert not [
+        line
+        for line in tail
+        if line.startswith(("ds_write", "ds_swizzle", "ds_bpermute"))
+    ]
+    assert not [line for line in tail if "dpp" in line or line == "s_barrier"]
+    assert [line for line in tail if line.startswith("buffer_store_dwordx4")]

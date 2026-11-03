@@ -309,6 +309,7 @@ native, FP8, or MXFP8 cache; every step but the write is optional.
 | --- | --- | --- |
 | `triton` | one launch; each program takes a tile of tokens of one head (4 at decode sizes, up to 2048 elements past 256 tokens) | AMD and NVIDIA, native or FP8 caches |
 | `composite` | `qk_rmsnorm`, `embedding.rope`, then the cache store | everything; rounds between steps; the path for MXFP8 caches and Ascend |
+| `gluon` | gfx950 only; one launch, each program one head over 16 tokens; the same device functions a fused decoder layer runs on rows it computes | a head norm, whole-head GPT-J or no rotation, head dim 64 or 128, native or FP8 caches (also per-tensor scaled); the Triton kernel's bytes |
 
 The tiled Triton kernel beats the CUDA `embedding.rope` with its fused K/V
 store at every size measured (1 to 8192 tokens, 64 to 512 wide heads), so no
