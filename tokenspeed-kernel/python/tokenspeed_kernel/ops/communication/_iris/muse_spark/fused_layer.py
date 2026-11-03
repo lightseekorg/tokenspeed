@@ -449,48 +449,10 @@ def _wave_strips(layout, warps):
 
 
 @gluon.jit
-def h4_sink(args, ys, route, cols, col0):
-    """The MoE down unit's output pushed to its route's column owner (H4):
-    the MoE stream's ``sink(args, ys, route, cols, col0)`` with ``args`` an
-    H4SinkArgs, one strip per call (``ys = (y,)``, ``cols = (cols,)``).
-    Called from per-wave code, so it moves no data between lanes (no layout
-    conversion, LDS or barrier).
-
-    ``y``: FP32 partial [R, 16 * num_warps] in a BlockedLayout where wave
-    w holds columns [16 w, 16 w + 16) of every row, 4 adjacent ones per lane
-    (``BlockedLayout([1, 4], [16, 4], [1, num_warps], [0, 1])``);
-    ``route``: [R, 1] route row (token * 8 + pick), -1 to skip, a slice of
-    y's layout; ``cols`` is not read; ``col0``: this wave's first column
-    (a per-wave scalar, a multiple of 16), so its 16 columns lie in one
-    owner's 512-column slice. Each column pair goes out as one 32-bit word
-    (receivers test a word's high half), a lane's two words in one 8-byte
-    store. Columns this rank owns go to the local own slices (read by
-    own4_complete), the rest to the owner's mailbox
-    (iris_column_routes_push_words, copy ``launch.copy``), no wait."""
-    gl.static_assert(len(ys) == 1, "h4_sink: one strip per call")
-    y = ys[0]
-    gl.static_assert(
-        _wave_strips(y.type.layout, gl.num_warps()),
-        "h4_sink: wave w must hold columns 16 w .. 16 w + 15, 4 per lane",
-    )
-    gl.static_assert(y.shape[1] == 16 * gl.num_warps(), "h4_sink: 16 columns a wave")
-    view = args.view
-    launch = args.launch
-    RANK: gl.constexpr = args.RANK
-    R: gl.constexpr = y.shape[0]
-    C: gl.constexpr = y.shape[1]
-    halves = y.to(gl.bfloat16).to(gl.uint16, bitcast=True)
-    low, high = gl.split(gl.reshape(halves, [R, C // 2, 2]))
-    words = low.to(gl.uint32) | (high.to(gl.uint32) << 16)
-    words_l: gl.constexpr = words.type.layout
-    route_row = gl.convert_layout(
-        gl.reshape(route, [R]), gl.SliceLayout(1, words_l), assert_trivial=True
-    )[:, None]
-    # This wave's 8 words of the owner's 512-column slice: built from an
-    # arange so the stores see each lane's two words as contiguous.
-    within = gl.arange(0, C // 2, gl.SliceLayout(0, words_l)) % 8
-    slice_words = (gl.multiple_of((col0 % 512) // 2, 8) + within)[None, :]
-    owner = col0 // 512
+def _h4_store(view, launch, words, route_row, slice_words, owner, RANK: gl.constexpr):
+    """One H4 store of BF16-pair ``words`` at ``slice_words`` of route rows
+    ``route_row`` in ``owner``'s 512-column slice (``owner`` a per-wave
+    scalar): to the local own slices, or pushed to that owner's mailbox."""
     valid = (route_row >= 0) & (slice_words >= 0)
     if owner == RANK:
         own = gl.multiple_of(
@@ -509,6 +471,74 @@ def h4_sink(args, ys, route, cols, col0):
             _peer_addresses(view.routes, view.heaps, RANK), RANK, _WORLD,
             _MAX_ROWS, _ROUTES_WORDS, ".wt",
         )  # fmt: skip
+
+
+@gluon.jit
+def _bf16_pairs(even, odd):
+    """32-bit words of BF16 column pairs: ``even`` in the low half."""
+    low = even.to(gl.bfloat16).to(gl.uint16, bitcast=True)
+    high = odd.to(gl.bfloat16).to(gl.uint16, bitcast=True)
+    return low.to(gl.uint32) | (high.to(gl.uint32) << 16)
+
+
+@gluon.jit
+def h4_sink(args, ys, route, cols, col0):
+    """The MoE down unit's output pushed to its route's column owner (H4):
+    the MoE stream's ``sink(args, ys, route, cols, col0)`` with ``args`` an
+    H4SinkArgs. Called from per-wave code, so it moves no data between
+    lanes (no layout conversion, LDS or barrier).
+
+    ``ys`` holds FP32 partials [R, 16 * num_warps] in a BlockedLayout where
+    wave w holds columns [16 w, 16 w + 16) of every row, 4 per lane
+    (``BlockedLayout([1, 4], [16, 4], [1, num_warps], [0, 1])``);
+    ``route``: [R, 1] route row (token * 8 + pick), -1 to skip, a slice of
+    that layout; ``col0``: the wave's first column, a per-wave scalar whose
+    512-column slice holds all of the wave's columns (its owner). Each
+    column pair goes out as one 32-bit word (receivers test a word's high
+    half). Columns this rank owns go to the local own slices (read by
+    own4_complete), the rest to the owner's mailbox
+    (iris_column_routes_push_words, copy ``launch.copy``), no wait.
+
+    - One strip (``ys = (y,)``, ``col0`` a multiple of 16): a lane's 4
+      adjacent columns, two words in one 8-byte store; ``cols`` is not read.
+    - Four strips of one down unit (``ys``, ``cols`` 4-tuples, ``col0`` a
+      multiple of 64): strips ``s`` and ``s + 2`` hold a lane's even and odd
+      columns ``cols[s]`` (s = 0, 1), so each lane writes two 16-byte lines,
+      one store each.
+    """
+    view = args.view
+    launch = args.launch
+    RANK: gl.constexpr = args.RANK
+    owner = col0 // 512
+    gl.static_assert(
+        _wave_strips(ys[0].type.layout, gl.num_warps()),
+        "h4_sink: wave w must hold columns 16 w .. 16 w + 15, 4 per lane",
+    )
+    R: gl.constexpr = ys[0].shape[0]
+    C: gl.constexpr = ys[0].shape[1]
+    gl.static_assert(C == 16 * gl.num_warps(), "h4_sink: 16 columns a wave")
+    if len(ys) == 1:
+        halves = gl.reshape(ys[0], [R, C // 2, 2])
+        even, odd = gl.split(halves)
+        words = _bf16_pairs(even, odd)
+        words_l: gl.constexpr = words.type.layout
+        route_row = gl.convert_layout(
+            gl.reshape(route, [R]), gl.SliceLayout(1, words_l), assert_trivial=True
+        )[:, None]
+        # This wave's 8 words of the owner's slice, built from an arange so
+        # the store sees each lane's two words as adjacent.
+        within = gl.arange(0, C // 2, gl.SliceLayout(0, words_l)) % 8
+        slice_words = (gl.multiple_of((col0 % 512) // 2, 8) + within)[None, :]
+        _h4_store(view, launch, words, route_row, slice_words, owner, RANK)
+    else:
+        gl.static_assert(len(ys) == 4, "h4_sink: one or four strips")
+        for line in gl.static_range(2):
+            words = _bf16_pairs(ys[line], ys[line + 2])
+            # A lane's 4 words are adjacent and 16-byte aligned.
+            slice_words = gl.max_contiguous(
+                gl.multiple_of((cols[line] % 512) // 2, [1, 4]), [1, 4]
+            )
+            _h4_store(view, launch, words, route, slice_words, owner, RANK)
 
 
 @gluon.jit
