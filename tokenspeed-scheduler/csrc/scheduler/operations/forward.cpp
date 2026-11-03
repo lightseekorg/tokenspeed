@@ -569,7 +569,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         feedback.admission_failed = true;
         return FirstChunkOutcome{};
     }
-    request->SetSessionEpoch(admission->access_epoch);
+    request->HoldSessionAccess(std::move(admission->session_access));
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
     // Every Host hit is an entry the admission acquired in the same step, so
@@ -812,16 +812,14 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                         std::vector<LoadBackOperation>& load_back_operations) {
-    const auto* admission = request->AdmissionResourcesPtr();
-    const auto storage_id = admission->storage_hold ? admission->storage_hold->operation_id : 0;
+    // The event consumes the Submitted state and with it any L3 Ready hold:
+    // the admission's load pairs, and then the ordinary H2D ticket, own the
+    // Host sources.
     PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
     if (!load_pairs.empty()) {
         load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
     }
-    // Admission and the ordinary H2D ticket now own the Host sources. The
-    // Submitted state was consumed above, so retire its saved Ready hold here.
-    if (storage_id) storage_transfers_->Detach(storage_id);
     return operation;
 }
 
@@ -1075,7 +1073,7 @@ std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuil
     build.snapshot_stores.push_back(std::move(stores->snapshot_store));
     victim.Apply(fsm::SnapshotRetractEvent{&coordinator_, next_retraction_epoch_++, victim.HasGeneratedOutput(),
                                            std::move(stores->image), std::move(blob_slot),
-                                           std::move(stores->pending_store_ops)});
+                                           std::move(stores->image_stores)});
     spdlog::info("[Scheduler] retract: suspended request {} ({} tokens) with its image", victim.Id(),
                  victim.TokenSize());
     return std::nullopt;

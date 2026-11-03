@@ -274,6 +274,25 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
     EXPECT_EQ(ids_a, ids_b);
 }
 
+// A request hashes its full pages for KV events once each, every page chained
+// on the one before: asking for more pages extends the chain, asking for
+// fewer reads a prefix of it.
+TEST(RequestKvEventBlockHashes, ChainEachFullPageOnTheOneBefore) {
+    Request request(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 4, 5, 6, 7}}, /*prefix_granularity=*/2,
+                    Role::kFused);
+    const std::uint64_t first = HashKvBlock(std::vector<std::int32_t>{1, 2}, std::nullopt);
+    const std::uint64_t second = HashKvBlock(std::vector<std::int32_t>{3, 4}, first);
+    const std::uint64_t third = HashKvBlock(std::vector<std::int32_t>{5, 6}, second);
+    const auto hashes = [&request](std::size_t num_pages) {
+        const std::span<const std::uint64_t> span = request.KvEventBlockHashes(num_pages);
+        return std::vector<std::uint64_t>(span.begin(), span.end());
+    };
+    EXPECT_EQ(hashes(2), (std::vector<std::uint64_t>{first, second}));
+    EXPECT_EQ(hashes(3), (std::vector<std::uint64_t>{first, second, third}));
+    EXPECT_EQ(hashes(1), std::vector<std::uint64_t>{first});
+    EXPECT_THROW(request.KvEventBlockHashes(4), std::runtime_error) << "token 7 fills no fourth page";
+}
+
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
