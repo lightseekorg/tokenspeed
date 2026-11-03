@@ -134,8 +134,12 @@ def _direct_decode(xq, xs, experts, ids):
         prefetch_tiles=8, BLOCK_N=64, **SWIGLU,
     )  # fmt: skip
     out = torch.empty((rows * TOPK, POOLED), dtype=torch.bfloat16, device="cuda")
+    # Per-route outputs (the caller applies the route weights): unit weights,
+    # and the route index buffer stage 2 needs without finalize is scratch.
+    ones = torch.ones((rows, TOPK), dtype=torch.float32, device="cuda")
+    route_index = torch.empty((rows * TOPK,), dtype=torch.int32, device="cuda")
     invoke_stage2_mxfp4_mfma_decode_gluon(
-        mids, mids_scale, w2, w2_scale, ids, None, out, TOPK, 0, False, None
+        mids, mids_scale, w2, w2_scale, ids, ones, out, TOPK, 0, False, route_index
     )
     return out
 
