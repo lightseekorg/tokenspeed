@@ -5729,8 +5729,9 @@ TEST(SwaRegistrationTest, TheWindowBehindAnInForwardStateCheckpointIsPublishedAs
             {.table = &tables[0], .extent = DenseGrowth{10}},
             {.table = &tables[1], .extent = StateStep{.kind = StateStep::Kind::kRotate, .checkpoint = checkpoint}},
         };
-        std::optional<CacheCoordinator::AdmissionResult> admission = coord.Admit(
-            coord.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, /*evict_blocks_past_segments=*/false);
+        std::optional<CacheCoordinator::AdmissionResult> admission =
+            coord.Admit(coord.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
+                        /*evict_blocks_past_segments=*/false, /*session_id=*/{});
         ASSERT_TRUE(admission);
         const RequestProgress chunk_end{
             .completed_pages =
