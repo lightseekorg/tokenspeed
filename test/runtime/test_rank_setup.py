@@ -235,6 +235,55 @@ def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
 
 
 @pytest.mark.parametrize(
+    "flags, enabled",
+    [
+        (["--enable-state-checkpoint-in-forward"], False),
+        (
+            [
+                "--enable-state-checkpoint-in-forward",
+                "--demote-superseded-state-checkpoints",
+            ],
+            True,
+        ),
+    ],
+)
+def test_superseded_checkpoint_demotion_is_off_unless_the_flag_is_given(flags, enabled):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.demote_superseded_state_checkpoints is enabled
+
+
+def test_superseded_checkpoint_demotion_is_refused_without_in_forward_checkpoints():
+    # Only in-forward checkpoints are ever demoted.
+    with pytest.raises(
+        ValueError, match="requires --enable-state-checkpoint-in-forward"
+    ):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            demote_superseded_state_checkpoints=True,
+        )
+
+
+def test_a_decode_server_takes_the_demotion_flag_as_a_no_op():
+    # A decode server computes no prompt and writes no in-forward checkpoint,
+    # so a PD launcher may pass both flags to both roles.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        demote_superseded_state_checkpoints=True,
+    )
+    assert not args.demotes_superseded_state_checkpoints
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
+    assert not cfg.demote_superseded_state_checkpoints
+
+
+@pytest.mark.parametrize(
     "flags, policy, pool",
     [
         ([], ts.SchedulerConfig.HostWritePolicy.WriteThrough, (5, 8)),
