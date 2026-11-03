@@ -105,6 +105,7 @@ def _warmup_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
         cache_block_size=64,
         max_decode_tokens=32,
         device=device,
+        logits_dtype=torch.bfloat16,
     )
 
 
@@ -135,7 +136,7 @@ def _paged_scores(
         )
     if queries[0].shape[0] == 0:
         return (
-            torch.zeros((0, capacity), dtype=torch.float32, device=cache.device),
+            torch.zeros((0, capacity), dtype=torch.bfloat16, device=cache.device),
             valid_lengths,
             None,
         )
@@ -169,7 +170,7 @@ def _paged_scores(
         schedule_meta=schedule,
         max_context_len=capacity,
         clean_logits=False,
-        logits_dtype=torch.float32,
+        logits_dtype=torch.bfloat16,
     )
     if prepare_blocks:
         input_alignment, _ = deep_select_alignment()
@@ -205,7 +206,7 @@ def _dense_scores(
         cu_seq_len_k_end=ends,
         clean_logits=False,
         max_seqlen_k=capacity,
-        logits_dtype=torch.float32,
+        logits_dtype=torch.bfloat16,
     )
     if prepare_blocks:
         input_alignment, _ = deep_select_alignment()
@@ -280,18 +281,17 @@ def index_topk(
         blocks.fill_(-1)
         block_lengths.zero_()
         return out
-    # Scores and selection scratch are transient and independent of configured
-    # request count. Never materialize the full prefill-by-history matrix.
+    # Scores and selection scratch are transient. Dense prefill additionally
+    # bounds the query-by-history matrix; paged queries use the caller's tile.
     sparse = _use_sparse_candidate_scores(index_cache, candidate_blocks, candidate_topk)
     dense = not sparse and page_table.stride(0) == 0 and n > 1
     # Wide histories benefit from skipping wholly future cleaning tiles;
     # combine full-width block preparation only for smaller capacities.
     prepare_blocks = candidate_topk > 0 and capacity <= 65536
-    # Sparse width is bounded by candidates; use the caller's query tile.
     tile = query_chunk_size
-    if not sparse:
-        budget = (128 if dense else 32) << 20
-        tile = min(tile, max(1, budget // (capacity * 4)))
+    if dense:
+        budget = 128 << 20
+        tile = min(tile, max(1, budget // (capacity * torch.bfloat16.itemsize)))
     cache = index_cache.as_strided(
         (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
     )
