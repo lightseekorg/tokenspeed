@@ -23,8 +23,8 @@
 
 A persistent stream runs independent work per wave inside one workgroup,
 while Gluon models a workgroup as one program. The helpers here state the
-per-wave facts Gluon cannot express, each with inline asm. Each one is listed
-in the compiler TODO with the Gluon support that would replace it.
+per-wave facts Gluon cannot express, each with inline asm, until Gluon can
+state them itself.
 
 - :func:`wave_scalar`: a value uniform within a wave but different across
   waves, in an SGPR. Use it for addresses, trip counts and branches whose
