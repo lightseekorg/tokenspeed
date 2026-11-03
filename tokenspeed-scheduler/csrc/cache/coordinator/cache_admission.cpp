@@ -547,11 +547,12 @@ private:
     // Whether a candidate is an unproven frequent State checkpoint
     // (CacheCoordinator::IsUnprovenStateCheckpoint). That shapes its victim
     // set, never the order: CacheEvictionCandidates ranks it as the
-    // probationary boundary it is, so it leads its own epoch, the shallowest
-    // first, and no class sets it before older epochs -- the Device is full
-    // in steady state, and such a class would hand it to the very next
-    // admission that needs room, long before a sibling arrives.
-    // TrimUnprovenStateCheckpoints bounds how many stay.
+    // probationary boundary it is, so it leads its own epoch (or, aged, its
+    // retention rank like any checkpoint), the shallowest first, and no class
+    // sets it before older epochs -- the Device is full in steady state, and
+    // such a class would hand it to the very next admission that needs room,
+    // long before a sibling arrives. TrimUnprovenStateCheckpoints bounds how
+    // many stay.
     bool isUnprovenStateCheckpoint(const VictimCandidate& candidate) const {
         if (!coordinator_.FrequentStateCheckpoints() || !coordinator_.GroupIsState(candidate.group_id)) {
             return false;

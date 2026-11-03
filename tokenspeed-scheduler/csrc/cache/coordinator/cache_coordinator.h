@@ -673,7 +673,8 @@ public:
     // State checkpoint: with frequent State checkpoints on, one a frequent
     // chunk end published (kChunk at its page depth) that no hit has acquired
     // and no endpoint has republished, which would have raised its kind. The
-    // admission planner ranks these at their own access epoch, each first
+    // admission planner ranks these at their own access epoch (an aged one at
+    // its retention rank, like any checkpoint: CheckpointAging), each first
     // within it (a probationary boundary, the shallowest first), and takes one
     // alone, every State group's block at once, never as a segment of its
     // pages; TrimUnprovenStateCheckpoints bounds how many stay. They never
