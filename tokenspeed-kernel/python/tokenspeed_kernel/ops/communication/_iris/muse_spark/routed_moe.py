@@ -433,7 +433,9 @@ _SLICE_WORDS = gl.constexpr(256)
 @gluon.jit
 def _iris_column_routes_offsets():
     """Lane l's four 32-bit words (BF16 columns 8l + [0, 8)) of a 512-column slice."""
-    layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [1, 1], [1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
     lane = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
     return lane[:, None] * 4 + word[None, :]
@@ -465,6 +467,42 @@ def _iris_column_routes_send(
         )
     )
     stage = gl.load(epochs + token * WORLD_SIZE + owner).to(gl.uint32) % 3
+    iris_column_routes_push(
+        partial,
+        row,
+        delta,
+        stage,
+        regions,
+        RANK,
+        WORLD_SIZE,
+        MAX_ROWS,
+        STAGE_WORDS,
+        PEER_SIGNAL_STORE_CACHE,
+    )
+
+
+@gluon.jit
+def iris_column_routes_push(
+    partial,
+    row,
+    delta,
+    stage,
+    regions,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+    STAGE_WORDS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Push one route's partial of the 512 columns rank (RANK + delta) owns.
+
+    ``partial`` is lane l's four sanitized 32-bit words (BF16 columns 8l +
+    [0, 8)) of route ``row``'s slice, in _iris_column_routes_offsets' layout;
+    ``stage`` selects the owner's mailbox copy (STAGE_WORDS words each).
+    """
+    PEERS: gl.constexpr = WORLD_SIZE - 1
+    owner = (RANK + delta) % WORLD_SIZE
+    words = _iris_column_routes_offsets()
     # The owner keeps one slot per other rank, indexed by distance - 1.
     offsets = (
         (stage * STAGE_WORDS).to(gl.int32)
@@ -493,21 +531,10 @@ def _iris_column_routes_complete(
     WEIGHT_OFFSET: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
-    """Complete this rank's 512 columns of one route and publish them to every rank.
-
-    Sums the eight partials in FP32 rank order with one BF16 rounding, as the
-    Lamport two-shot all-reduce does, and publishes the BF16 columns and the
-    partial sum of squares of the gained route that the portable inverse-RMS
-    kernel's subgroup RANK computes.
-    """
-    PEERS: gl.constexpr = WORLD_SIZE - 1
-    P1_WORDS: gl.constexpr = PEERS * MAX_ROWS * _ROUTE_WORDS
-    P2_WORDS: gl.constexpr = WORLD_SIZE * MAX_ROWS * _ROUTE_WORDS
+    """iris_column_routes_complete with this rank's partial from ``routes``,
+    the stage from ``epochs``, and the consumed markers restored."""
     token = row // 8
-    route = row % 8
     stage = gl.load(epochs + token * WORLD_SIZE + RANK).to(gl.uint32) % 3
-    base = (stage * STAGE_WORDS).to(gl.int32)
-    words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
     words = _iris_column_routes_offsets()
     own = _iris_sanitize_lamport_bf16x2(
         gl.amd.cdna4.buffer_load(
@@ -515,6 +542,60 @@ def _iris_column_routes_complete(
             row * _ROUTE_WORDS + RANK * _SLICE_WORDS + words,
         )
     )
+    iris_column_routes_complete(
+        own,
+        stage,
+        norm_weight,
+        region,
+        regions,
+        row,
+        RANK,
+        WORLD_SIZE,
+        MAX_ROWS,
+        STAGE_WORDS,
+        WEIGHT_OFFSET,
+        PEER_SIGNAL_STORE_CACHE,
+        True,
+    )
+
+
+@gluon.jit
+def iris_column_routes_complete(
+    own,
+    stage,
+    norm_weight,
+    region,
+    regions,
+    row,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+    STAGE_WORDS: gl.constexpr,
+    WEIGHT_OFFSET: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    CLEAR: gl.constexpr,
+):
+    """Complete this rank's 512 columns of one route and publish them to every rank.
+
+    ``own`` is this rank's partial (iris_column_routes_push's layout);
+    ``stage`` selects the mailbox copy. Sums the eight partials in FP32 rank
+    order with one BF16 rounding, as the Lamport two-shot all-reduce does,
+    and publishes the BF16 columns and the partial sum of squares of the
+    gained route that the portable inverse-RMS kernel's subgroup RANK
+    computes. With CLEAR, restores the consumed markers afterwards; a
+    two-copy caller clears its areas at entry instead.
+    """
+    # With several waves every wave polls the same words (replicated
+    # layouts), so a wave's clear could race another's poll.
+    gl.static_assert(not CLEAR or gl.num_warps() == 1)
+    PEERS: gl.constexpr = WORLD_SIZE - 1
+    P1_WORDS: gl.constexpr = PEERS * MAX_ROWS * _ROUTE_WORDS
+    P2_WORDS: gl.constexpr = WORLD_SIZE * MAX_ROWS * _ROUTE_WORDS
+    token = row // 8
+    route = row % 8
+    base = (stage * STAGE_WORDS).to(gl.int32)
+    words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
+    words = _iris_column_routes_offsets()
     slices = base + row * _SLICE_WORDS + words
     received = ()
     missing = gl.zeros_like(slices)
@@ -552,7 +633,7 @@ def _iris_column_routes_complete(
         gl.reshape(gl.join(sum_even, sum_odd), [_SLICE_FEATURES]).to(gl.bfloat16)
     )
     # The inverse-RMS kernel's subgroup layout: lane l holds columns 8l + [0, 8).
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [1], [0])
+    layout: gl.constexpr = gl.BlockedLayout([8], [64], [gl.num_warps()], [0])
     columns = gl.arange(0, _SLICE_FEATURES, layout=layout)
     values = gl.convert_layout(completed, layout).to(gl.float32)
     gain = gl.load(norm_weight + RANK * _SLICE_FEATURES + columns).to(gl.float32)
@@ -563,7 +644,7 @@ def _iris_column_routes_complete(
     # included (write-through: its readers may run on another XCD).
     published = gl.convert_layout(
         gl.reshape(completed, [64, 8]),
-        gl.BlockedLayout([1, 8], [64, 1], [1, 1], [1, 0]),
+        gl.BlockedLayout([1, 8], [64, 1], [gl.num_warps(), 1], [1, 0]),
     )
     p_lane = gl.arange(0, 64, layout=gl.SliceLayout(1, published.type.layout))
     p_elem = gl.arange(0, 8, layout=gl.SliceLayout(0, published.type.layout))
@@ -572,7 +653,9 @@ def _iris_column_routes_complete(
     ) + (p_lane[:, None] * 8 + p_elem[None, :])
     # Every rank's eight column owners each get a copy of the sum of squares:
     # words [token][source][route][owner].
-    owners = gl.arange(0, WORLD_SIZE, layout=gl.BlockedLayout([1], [64], [1], [0]))
+    owners = gl.arange(
+        0, WORLD_SIZE, layout=gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    )
     squares = gl.full(owners.shape, 0, gl.float32, owners.type.layout) + partial
     s_offsets = (
         base
@@ -608,12 +691,13 @@ def _iris_column_routes_complete(
             s_offsets,
             cache=PEER_SIGNAL_STORE_CACHE,
         )
-    # Restore the consumed markers.
-    empty = gl.full_like(slices, 0x80000000).to(gl.uint32)
-    for slot in gl.static_range(PEERS):
-        gl.amd.cdna4.buffer_store(
-            empty, words_ptr, slices + slot * (MAX_ROWS * _ROUTE_WORDS), cache=".wt"
-        )
+    if CLEAR:
+        # Restore the consumed markers.
+        empty = gl.full_like(slices, 0x80000000).to(gl.uint32)
+        for slot in gl.static_range(PEERS):
+            gl.amd.cdna4.buffer_store(
+                empty, words_ptr, slices + slot * (MAX_ROWS * _ROUTE_WORDS), cache=".wt"
+            )
 
 
 @gluon.jit
@@ -636,17 +720,54 @@ def _iris_column_routes_finish(
     rank's partial sums of squares, which only this program reads and
     clears, then advances the (token, owner) stage it alone advances.
     """
-    PEERS: gl.constexpr = WORLD_SIZE - 1
-    P1_WORDS: gl.constexpr = PEERS * MAX_ROWS * _ROUTE_WORDS
-    P2_WORDS: gl.constexpr = WORLD_SIZE * MAX_ROWS * _ROUTE_WORDS
     token = program // WORLD_SIZE
     owner = program % WORLD_SIZE
     counter = epochs + token * WORLD_SIZE + owner
     stage = gl.load(counter).to(gl.uint32) % 3
+    loaded, squares = iris_column_routes_wait(
+        region, stage, token, owner, WORLD_SIZE, MAX_ROWS, STAGE_WORDS, True
+    )
+    # Only a later launch reads the restored markers or this stage, so the
+    # advance need not wait for the clears.
+    gl.store(counter, ((stage + 1) % 3).to(gl.int32))
+    combined = iris_column_routes_combine(
+        loaded, squares, route_weights, norm_weight, token, owner, EPS, WEIGHT_OFFSET
+    )
+    v_column = gl.arange(0, _SLICE_FEATURES, layout=combined.type.layout)
+    gl.store(
+        output + token * _ROUTE_FEATURES + owner * _SLICE_FEATURES + v_column,
+        combined.to(gl.bfloat16),
+    )
+
+
+@gluon.jit
+def iris_column_routes_wait(
+    region,
+    stage,
+    token,
+    owner,
+    WORLD_SIZE: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+    STAGE_WORDS: gl.constexpr,
+    CLEAR: gl.constexpr,
+):
+    """Wait for owner's completed columns of the token's eight routes and
+    every rank's partial sums of squares in mailbox copy ``stage``.
+
+    Returns ``(loaded, squares)`` for iris_column_routes_combine. With CLEAR,
+    restores their markers (only this caller reads them); a two-copy caller
+    clears its areas at entry instead.
+    """
+    gl.static_assert(not CLEAR or gl.num_warps() == 1)
+    PEERS: gl.constexpr = WORLD_SIZE - 1
+    P1_WORDS: gl.constexpr = PEERS * MAX_ROWS * _ROUTE_WORDS
+    P2_WORDS: gl.constexpr = WORLD_SIZE * MAX_ROWS * _ROUTE_WORDS
     base = (stage * STAGE_WORDS).to(gl.int32)
     words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
     # Every lane holds all eight routes of its four words.
-    poll: gl.constexpr = gl.BlockedLayout([8, 1, 4], [1, 64, 1], [1, 1, 1], [2, 1, 0])
+    poll: gl.constexpr = gl.BlockedLayout(
+        [8, 1, 4], [1, 64, 1], [1, gl.num_warps(), 1], [2, 1, 0]
+    )
     route = gl.arange(0, 8, layout=gl.SliceLayout(1, gl.SliceLayout(2, poll)))
     lane = gl.arange(0, 64, layout=gl.SliceLayout(0, gl.SliceLayout(2, poll)))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, poll)))
@@ -658,7 +779,7 @@ def _iris_column_routes_finish(
         + (lane[None, :, None] * 4 + word[None, None, :])
     )
     # Lane l reads the sum of squares of source l // 8, route l % 8.
-    square_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    square_layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     index = gl.arange(0, 64, layout=square_layout)
     sums = base + P1_WORDS + P2_WORDS + (token * 64 + index) * WORLD_SIZE + owner
     loaded = gl.amd.cdna4.buffer_load(words_ptr, slices, cache=".cv")
@@ -676,22 +797,37 @@ def _iris_column_routes_finish(
         missing |= gl.convert_layout(
             ((squares >> 16) == 0x8000).to(gl.int32), missing.type.layout
         )
-    gl.amd.cdna4.buffer_store(
-        gl.full_like(loaded, 0x80000000), words_ptr, slices, cache=".wt"
-    )
-    gl.amd.cdna4.buffer_store(
-        gl.full_like(squares, 0x80000000), words_ptr, sums, cache=".wt"
-    )
-    # Only a later launch reads the restored markers or this stage, so the
-    # advance need not wait for the clears.
-    gl.store(counter, ((stage + 1) % 3).to(gl.int32))
+    if CLEAR:
+        gl.amd.cdna4.buffer_store(
+            gl.full_like(loaded, 0x80000000), words_ptr, slices, cache=".wt"
+        )
+        gl.amd.cdna4.buffer_store(
+            gl.full_like(squares, 0x80000000), words_ptr, sums, cache=".wt"
+        )
+    return loaded, squares
 
+
+@gluon.jit
+def iris_column_routes_combine(
+    loaded,
+    squares,
+    route_weights,
+    norm_weight,
+    token,
+    owner,
+    EPS: gl.constexpr,
+    WEIGHT_OFFSET: gl.constexpr,
+):
+    """The token's normalized, weighted route sum over owner's 512 columns
+    (FP32, one subgroup's [512] layout), from iris_column_routes_wait."""
     # Add each route's eight partial sums (source s = 4a + 2b + c) as the
     # inverse-RMS kernel's cross-subgroup butterfly does:
     # ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7)).
     partials = gl.convert_layout(
         gl.reshape(squares.to(gl.float32, bitcast=True), [2, 2, 2, 8]),
-        gl.BlockedLayout([2, 2, 2, 8], [1, 1, 1, 64], [1, 1, 1, 1], [3, 2, 1, 0]),
+        gl.BlockedLayout(
+            [2, 2, 2, 8], [1, 1, 1, 64], [1, 1, 1, gl.num_warps()], [3, 2, 1, 0]
+        ),
     )
     a0, a1 = gl.split(gl.permute(partials, (1, 2, 3, 0)))
     b0, b1 = gl.split(gl.permute(a0 + a1, (1, 2, 0)))
@@ -719,11 +855,7 @@ def _iris_column_routes_finish(
         if route == 0:
             combined = gl.zeros_like(selected)
         combined = gl.fma(selected, weight, combined)
-    v_column = gl.arange(0, _SLICE_FEATURES, layout=combined.type.layout)
-    gl.store(
-        output + token * _ROUTE_FEATURES + owner * _SLICE_FEATURES + v_column,
-        combined.to(gl.bfloat16),
-    )
+    return combined
 
 
 @gluon.jit(do_not_specialize=["rows"])

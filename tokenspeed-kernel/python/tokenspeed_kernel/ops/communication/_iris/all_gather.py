@@ -505,58 +505,25 @@ def _iris_tile_stage(stages, tile):
 
 
 @gluon.jit
-def iris_fused_lamport_allgather_rmsnorm_mxfp4(
-    local_input,
-    weight,
-    packed_output,
-    scale_output,
-    region,
-    epochs,
+def iris_lamport_allgather_push(
+    local_words,
+    row_words,
+    stages,
     regions,
     rank: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
     local_width: gl.constexpr,
-    total_width: gl.constexpr,
-    eps: gl.constexpr,
-    weight_offset: gl.constexpr,
-    scale_stride_linear,
-    scale_stride_mblock,
-    max_elements: gl.constexpr,
+    stage_words: gl.constexpr,
+    peer_words: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
-    WAIT_STORES: gl.constexpr,
 ):
-    """Gather BF16 row shards through Lamport mailboxes, then RMSNorm + MXFP4.
-
-    Launch one single-subgroup program per row. Uses ``ProducerAllReduce``'s
-    Lamport mailbox and per-512-element stage counters. Negative zero is sent as
-    zero; otherwise outputs match ``iris_fused_pull_allgather_rmsnorm_mxfp4``.
-    """
-    WORLD_SIZE: gl.constexpr = len(regions)
-    REPS: gl.constexpr = total_width // 1024
-    TILES: gl.constexpr = local_width // 512
-    gl.static_assert(local_width % 512 == 0)
-    # The mailbox layout (512-element tiles) must match
-    # iris_lamport_bf16_allreduce word for word.
-    gl.static_assert(max_elements % 512 == 0)
-    gl.static_assert(total_width == local_width * WORLD_SIZE)
-    # The eight-subgroup layout covers 1024 columns per repetition.
-    gl.static_assert(total_width % 1024 == 0)
-    gl.static_assert((total_width & (total_width - 1)) == 0)
-    row = gl.program_id(0)
-    stages = ()
-    for tile in gl.static_range(TILES):
-        stages += (gl.load(epochs + row * TILES + tile).to(gl.uint32) % 3,)
-    stage_words: gl.constexpr = WORLD_SIZE * max_elements // 2
-    peer_words: gl.constexpr = max_elements // 2
-    row_words = row * (local_width // 2)
-    local_words = tl.cast(local_input, gl.pointer_type(gl.uint32)) + row_words
-    quant_layout: gl.constexpr = gl.BlockedLayout([1, 16], [1, 64], [1, 1], [1, 0])
-    quant_columns = gl.arange(0, 1024, layout=gl.SliceLayout(0, quant_layout))
-    norm_weights = ()
-    for rep in gl.static_range(REPS):
-        norm_weights += (gl.load(weight + rep * 1024 + quant_columns).to(gl.float32),)
-
+    """Push one row's BF16 shard (``local_words``, uint32 pairs) to slot
+    ``rank`` of every peer's mailbox; ``stages`` holds the copy of each
+    512-element tile (stage_words words per copy)."""
+    push_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
     # Lanes split this rank's shard into 16-byte packs and push each to every peer.
-    push_layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [1, 1], [1, 0])
     pack = gl.arange(0, local_width // 8, layout=gl.SliceLayout(1, push_layout))
     pack_word = gl.arange(0, 4, layout=gl.SliceLayout(0, push_layout))
     push_words = (pack * 4)[:, None] + pack_word[None, :]
@@ -578,8 +545,36 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
             cache=PEER_SIGNAL_STORE_CACHE,
         )
 
+
+@gluon.jit
+def iris_lamport_allgather_wait(
+    region,
+    local_words,
+    row_words,
+    stages,
+    rank: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    local_width: gl.constexpr,
+    total_width: gl.constexpr,
+    stage_words: gl.constexpr,
+    peer_words: gl.constexpr,
+    CLEAR: gl.constexpr,
+    POLL_OWN: gl.constexpr,
+):
+    """Wait for every peer's shard of one row; returns the row's uint32 BF16
+    pairs [total_width // 1024, 64, 8] (lane L holds columns 1024k + 16L +
+    [0, 16)). This rank's own shard comes from ``local_words``, or with
+    POLL_OWN from its own mailbox slot (a producer on another workgroup
+    pushed it there). With CLEAR, restores the consumed packs; a two-copy
+    caller clears its areas at entry instead."""
+    # With several waves every wave polls the same words (replicated
+    # layouts), so a wave's clear could race another's poll.
+    gl.static_assert(not CLEAR or gl.num_warps() == 1)
+    REPS: gl.constexpr = total_width // 1024
     # Lane L holds columns 1024k + 16L + [0, 16) for every repetition k.
-    layout: gl.constexpr = gl.BlockedLayout([1, 1, 8], [1, 64, 1], [1, 1, 1], [2, 1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 8], [1, 64, 1], [1, gl.num_warps(), 1], [2, 1, 0]
+    )
     rep_index = gl.arange(0, REPS, layout=gl.SliceLayout(1, gl.SliceLayout(2, layout)))
     lane = gl.arange(0, 64, layout=gl.SliceLayout(0, gl.SliceLayout(2, layout)))
     word = gl.arange(0, 8, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout)))
@@ -587,14 +582,20 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     owner = column // local_width
     within = column % local_width
     shard_words = (within // 2)[:, :, None] + word[None, None, :]
-    remote = owner != rank
+    if POLL_OWN:
+        remote = owner >= 0
+    else:
+        remote = owner != rank
     mailbox_offsets = (
         (_iris_tile_stage(stages, within // 512) * stage_words).to(gl.int32)
         + owner * peer_words
         + row_words
     )[:, :, None] + shard_words
-    # Every lane's address lies in this row's shard; only own columns use it.
-    own = _iris_sanitize_lamport_bf16x2(gl.load(local_words + shard_words))
+    if POLL_OWN:
+        own = shard_words.to(gl.uint32)
+    else:
+        # Every lane's address lies in this row's shard; only own columns use it.
+        own = _iris_sanitize_lamport_bf16x2(gl.load(local_words + shard_words))
     mailbox = tl.cast(region, gl.pointer_type(gl.uint32))
     # Issue all reads before checking any; arrived packs stay unchanged until
     # this rank clears them, so retries reread them all. Payload high halves are
@@ -608,15 +609,38 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
             mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
         )
         missing = remote & (gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0)
-    gl.amd.cdna4.buffer_store(
-        gl.full_like(incoming, 0x80000000),
-        mailbox,
-        mailbox_offsets,
-        mask=remote[:, :, None],
-        cache=".wt",
-    )
+    if CLEAR:
+        gl.amd.cdna4.buffer_store(
+            gl.full_like(incoming, 0x80000000),
+            mailbox,
+            mailbox_offsets,
+            mask=remote[:, :, None],
+            cache=".wt",
+        )
 
-    words = gl.where(remote[:, :, None], incoming, own)
+    return gl.where(remote[:, :, None], incoming, own)
+
+
+@gluon.jit
+def iris_rmsnorm_mxfp4_row(
+    words,
+    row,
+    norm_weights,
+    packed_output,
+    scale_output,
+    total_width: gl.constexpr,
+    eps: gl.constexpr,
+    weight_offset: gl.constexpr,
+    scale_stride_linear,
+    scale_stride_mblock,
+):
+    """RMSNorm one gathered row (iris_lamport_allgather_wait's ``words``) and
+    store it as MXFP4 with CDNA4-swizzled scales; ``norm_weights`` holds the
+    FP32 weight of each 1024-column repetition in the quantize layout."""
+    REPS: gl.constexpr = total_width // 1024
+    quant_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 16], [1, 64], [gl.num_warps(), 1], [1, 0]
+    )
     low = (words & 0xFFFF).to(gl.uint16).to(gl.bfloat16, bitcast=True)
     high = (words >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
     values = gl.join(low, high).reshape([REPS, 64, 16]).to(gl.float32)
@@ -662,6 +686,73 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
             M_SWIZZLE=32,
             K_SWIZZLE=8,
         )
+
+
+@gluon.jit
+def iris_fused_lamport_allgather_rmsnorm_mxfp4(
+    local_input,
+    weight,
+    packed_output,
+    scale_output,
+    region,
+    epochs,
+    regions,
+    rank: gl.constexpr,
+    local_width: gl.constexpr,
+    total_width: gl.constexpr,
+    eps: gl.constexpr,
+    weight_offset: gl.constexpr,
+    scale_stride_linear,
+    scale_stride_mblock,
+    max_elements: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
+):
+    """Gather BF16 row shards through Lamport mailboxes, then RMSNorm + MXFP4.
+
+    Launch one single-subgroup program per row. Uses ``ProducerAllReduce``'s
+    Lamport mailbox and per-512-element stage counters. Negative zero is sent as
+    zero; otherwise outputs match ``iris_fused_pull_allgather_rmsnorm_mxfp4``.
+    """
+    WORLD_SIZE: gl.constexpr = len(regions)
+    REPS: gl.constexpr = total_width // 1024
+    TILES: gl.constexpr = local_width // 512
+    gl.static_assert(local_width % 512 == 0)
+    # The mailbox layout (512-element tiles) must match
+    # iris_lamport_bf16_allreduce word for word.
+    gl.static_assert(max_elements % 512 == 0)
+    gl.static_assert(total_width == local_width * WORLD_SIZE)
+    # The eight-subgroup layout covers 1024 columns per repetition.
+    gl.static_assert(total_width % 1024 == 0)
+    gl.static_assert((total_width & (total_width - 1)) == 0)
+    row = gl.program_id(0)
+    stages = ()
+    for tile in gl.static_range(TILES):
+        stages += (gl.load(epochs + row * TILES + tile).to(gl.uint32) % 3,)
+    stage_words: gl.constexpr = WORLD_SIZE * max_elements // 2
+    peer_words: gl.constexpr = max_elements // 2
+    row_words = row * (local_width // 2)
+    local_words = tl.cast(local_input, gl.pointer_type(gl.uint32)) + row_words
+    quant_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 16], [1, 64], [gl.num_warps(), 1], [1, 0]
+    )
+    quant_columns = gl.arange(0, 1024, layout=gl.SliceLayout(0, quant_layout))
+    norm_weights = ()
+    for rep in gl.static_range(REPS):
+        norm_weights += (gl.load(weight + rep * 1024 + quant_columns).to(gl.float32),)
+
+    iris_lamport_allgather_push(
+        local_words, row_words, stages, regions, rank, WORLD_SIZE, local_width,
+        stage_words, peer_words, PEER_SIGNAL_STORE_CACHE,
+    )  # fmt: skip
+    words = iris_lamport_allgather_wait(
+        region, local_words, row_words, stages, rank, WORLD_SIZE, local_width,
+        total_width, stage_words, peer_words, True, False,
+    )  # fmt: skip
+    iris_rmsnorm_mxfp4_row(
+        words, row, norm_weights, packed_output, scale_output, total_width, eps,
+        weight_offset, scale_stride_linear, scale_stride_mblock,
+    )  # fmt: skip
 
     # Finish clearing the consumed packs before advancing the row's stages.
     WAIT_STORES(args=[], constraints="=r,~{memory}")
