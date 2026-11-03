@@ -464,13 +464,14 @@ def poll_until_all(word_ptrs, valid, expected, launch, LOAD: gl.constexpr):
 @gluon.jit
 def store_pairs(pair_ptrs, values, launch, mask, SCOPE: gl.constexpr):
     """Publish int32 ``values`` as (value, tag) pairs: one 8-byte relaxed
-    atomic store each (``dwordx2``), value in the high half. No wait after it.
+    atomic store each (``dwordx2``), ``tag << 32 | value``, the H1 norm sums'
+    format. No wait after it.
 
     ``SCOPE``: ``"cta"`` (``sc0``) for readers on this XCD only, ``"gpu"``
     (``sc1``) for readers on any XCD. Every pair is written at most once per
     launch.
     """
-    word = (values.to(gl.int64) << 32) | (launch.tag.to(gl.int64) & 0xFFFFFFFF)
+    word = (launch.tag.to(gl.int64) << 32) | (values.to(gl.int64) & 0xFFFFFFFF)
     gl.atomic_store(pair_ptrs, word, mask=mask, sem="relaxed", scope=SCOPE)
 
 
@@ -480,15 +481,15 @@ def poll_pairs(pair_ptrs, valid, launch, SCOPE: gl.constexpr):
 
     Each lane reloads its pair with one 8-byte relaxed load (``SCOPE``
     ``"gpu"``: ``sc1``, for pairs this GPU stored; ``"sys"`` for pairs
-    another GPU stored) until the tag half equals the launch tag; the value
-    half comes from that same load, so no second read is needed.
+    another GPU stored) until the high (tag) half equals the launch tag; the
+    low (value) half comes from that same load, so no second read is needed.
 
     Returns:
         ``(values, seen)``: the int32 values (0 in invalid lanes) and whether
         this wave saw all its pairs; after one workgroup barrier.
     """
     words = gl.atomic_load(pair_ptrs, mask=valid, sem="relaxed", scope=SCOPE)
-    missing = valid & ((words & 0xFFFFFFFF).to(gl.int32) != launch.tag)
+    missing = valid & ((words >> 32).to(gl.int32) != launch.tag)
     start = gl.to_tensor(0).to(gl.int64)
     retries = 0
     stop = retries < 0
@@ -499,11 +500,11 @@ def poll_pairs(pair_ptrs, valid, launch, SCOPE: gl.constexpr):
             gl.atomic_load(pair_ptrs, mask=missing, sem="relaxed", scope=SCOPE),
             words,
         )
-        missing = valid & ((words & 0xFFFFFFFF).to(gl.int32) != launch.tag)
+        missing = valid & ((words >> 32).to(gl.int32) != launch.tag)
         if retries % _CHECK_RETRIES == 0:
             stop, start = poll_check(launch, start, retries, False)
     gl.barrier()
-    return gl.where(valid, (words >> 32).to(gl.int32), 0), not stop
+    return gl.where(valid, words.to(gl.int32), 0), not stop
 
 
 @gluon.jit
