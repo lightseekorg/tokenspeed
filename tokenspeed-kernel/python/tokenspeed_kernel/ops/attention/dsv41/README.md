@@ -1,14 +1,14 @@
 # DeepSeek V4.1 indexer scores
 
 The native Blackwell DeepGEMM indexer writes BF16 logits and passes BF16 rows
-through masking, alignment, candidate gathering and DeepSelect. Head weights
+through masking, alignment, candidate gathering, and DeepSelect. Head weights
 retain their existing precision. Paged scoring uses the caller's query tile;
 replicated-cache decode supplies the complete local query batch, including
 speculative verify rows. Owner-local history retains its per-request windows.
 This avoids splitting a decode batch solely because its configured history
 capacity is large. Each score tensor uses two bytes per query-by-history entry;
-native logits and their cleaned copy can coexist, so peak storage includes both
-matrices, alignment and selection scratch.
+native logits and their cleaned copy can coexist, so peak storage includes the
+score matrices, alignment, and selection scratch.
 Dense broadcast prefill retains its 128 MiB score budget and the runtime's
 prefill query windows. The sparse candidate scorer already produces BF16 logits.
 Kernel warmup uses the same output dtype as execution.

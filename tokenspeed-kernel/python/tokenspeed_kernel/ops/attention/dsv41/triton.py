@@ -3485,7 +3485,7 @@ def _block_maxima_kernel(
     blocks,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1) * TILE + tl.arange(0, TILE)
     col = block[:, None] * 8 + tl.arange(0, 8)[None, :]
     values = tl.load(
@@ -3578,7 +3578,7 @@ def _clean_block_maxima_kernel(
     workers,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     worker = tl.program_id(1)
     length = tl.minimum(tl.maximum(tl.load(Lengths + row * length_stride), 0), width)
     end = (length + 7) // 8
