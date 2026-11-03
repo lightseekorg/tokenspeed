@@ -257,6 +257,48 @@ def innermost_loops(assembly: str) -> list[str]:
     ]
 
 
+def _load_before_barrier(lines: list[str], loop: set[int]) -> bool:
+    """Whether a path leaving the loop (its line indices) reaches a vector
+    memory load before a workgroup barrier, following branches."""
+    labels = {}
+    for index, line in enumerate(lines):
+        label = re.match(r"^(\.L\w+):", line)
+        if label:
+            labels[label[1]] = index
+
+    def successors(index: int) -> list[int]:
+        line = lines[index]
+        target = re.search(r"\bs_(c?branch)\w*\s+(\.L\w+)", line)
+        nexts = [labels[target[2]]] if target and target[2] in labels else []
+        if not re.search(r"\bs_branch\s", line) and "s_endpgm" not in line:
+            nexts.append(index + 1)
+        return [n for n in nexts if n < len(lines)]
+
+    # Exits: successors outside the loop of the loop lines its header reaches
+    # (lines after an unconditional branch only start other blocks' code).
+    inside, todo = set(), [min(loop)]
+    while todo:
+        index = todo.pop()
+        if index in inside or index not in loop:
+            continue
+        inside.add(index)
+        todo.extend(successors(index))
+    seen: set[int] = set()
+    todo = [n for i in inside for n in successors(i) if n not in loop]
+    while todo:
+        index = todo.pop()
+        if index in seen or index in loop:
+            continue
+        seen.add(index)
+        line = lines[index]
+        if "s_barrier" in line:
+            continue
+        if re.search(r"\b(global|buffer)_load", line):
+            return True
+        todo.extend(successors(index))
+    return False
+
+
 def persistent_codegen_problems(assembly: str) -> list[str]:
     """Return the ordering rules a persistent kernel's assembly breaks.
 
@@ -310,12 +352,7 @@ def persistent_codegen_problems(assembly: str) -> list[str]:
         if not re.search(r"(global|buffer)_load_\w+ .*\bsc0\b", loop):
             # The barrier after a flag poll is the acquire that orders the
             # payload loads after it.
-            after = (
-                line
-                for line in raw[indices[-1] + 1 :]
-                if re.search(r"s_barrier|(global|buffer)_load", line)
-            )
-            if "s_barrier" not in next(after, "s_barrier"):
+            if _load_before_barrier(raw, set(indices)):
                 problems.append("a load follows a flag poll before a barrier")
         if re.search(r"s_barrier|\bds_|_dpp", loop):
             problems.append("workgroup barrier or LDS exchange inside a poll loop")

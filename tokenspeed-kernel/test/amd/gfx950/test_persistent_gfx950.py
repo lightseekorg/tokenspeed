@@ -82,12 +82,12 @@ def _join_rounds_kernel(
     for r in gl.static_range(ROUNDS):
         value = (launch.epoch * ROUNDS + r) * 1000 + launch.cta
         gl.store(values + launch.cta, value, cache_modifier=".wt")
-        grid_join(joins, launch, _record_and_return, 0)
+        grid_join(joins, launch, _record_and_return, 0, 0)
         other = (launch.cta + 1 + r) % _GRID
         got = gl.load(values + other, cache_modifier=".cv")
         expect = (launch.epoch * ROUNDS + r) * 1000 + other
         gl.atomic_add(seen + launch.cta, (got == expect).to(gl.int32), sem="relaxed")
-        grid_join(joins, launch, _record_and_return, 1)
+        grid_join(joins, launch, _record_and_return, 1, 1)
 
 
 class _State:
@@ -219,7 +219,7 @@ _TRAP_CHILD = textwrap.dedent("""
 @gluon.jit(do_not_specialize=["deadline_ticks"])
 def _fail_stop_kernel(epochs, claims, joins, errors, deadline_ticks):
     launch = enter_launch(epochs, claims, errors, deadline_ticks, 0, fail_stop)
-    grid_join(joins, launch, fail_stop, 0)
+    grid_join(joins, launch, fail_stop, 0, 0)
 
 
 def test_expired_wait_stops_the_queue():

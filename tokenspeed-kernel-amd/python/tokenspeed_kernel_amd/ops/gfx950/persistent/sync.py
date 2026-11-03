@@ -149,20 +149,40 @@ def launch_tag(epoch, BITS: gl.constexpr):
 def fail_stop(launch, site, detail):
     """Record a failure in the error words and stop the queue; never returns.
 
+    Callable from any subset of waves (a poll that expires in one wave):
+    every calling lane tries to claim the record, so it never depends on a
+    particular wave, and no workgroup barrier is involved.
+
     Args:
         launch: The failing workgroup's :class:`Launch`.
         site: What failed: a ``SITE_*`` value, or a kernel's own site.
         detail: Site-specific detail, such as a mask of missing peers.
     """
-    record = launch.error_ptr + _ERROR_RECORD
-    # The first failure owns the record (sites are never zero), so waves
-    # failing together cannot interleave their fields.
-    if gl.atomic_cas(record, 0, site, sem="relaxed", scope="gpu") == 0:
-        gl.store(record + 1, launch.cta, cache_modifier=".wt")
-        gl.store(record + 2, detail, cache_modifier=".wt")
-        gl.store(record + 3, launch.epoch, cache_modifier=".wt")
-        gl.store(record + 4, launch.label, cache_modifier=".wt")
-        wait_vector_memory()
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    lane = gl.arange(0, 64 * gl.num_warps(), layout)
+    record = launch.error_ptr + _ERROR_RECORD + lane * 0
+    # The first claim owns the record (sites are never zero), so failing
+    # waves and workgroups cannot interleave their fields. (A scalar atomic
+    # would run on the workgroup's first thread only, which may not be in a
+    # calling wave.)
+    owner = (
+        gl.atomic_cas(
+            record, gl.zeros_like(lane), gl.zeros_like(lane) + site, sem="relaxed",
+            scope="gpu",
+        )
+        == 0
+    )  # fmt: skip
+    gl.store(
+        record + 1, gl.zeros_like(lane) + launch.cta, mask=owner, cache_modifier=".wt"
+    )
+    gl.store(record + 2, gl.zeros_like(lane) + detail, mask=owner, cache_modifier=".wt")
+    gl.store(
+        record + 3, gl.zeros_like(lane) + launch.epoch, mask=owner, cache_modifier=".wt"
+    )
+    gl.store(
+        record + 4, gl.zeros_like(lane) + launch.label, mask=owner, cache_modifier=".wt"
+    )
+    wait_vector_memory()
     trap()
 
 
@@ -234,13 +254,15 @@ def enter_launch(epoch_ptr, claim_ptr, error_ptr, deadline_ticks, label, on_expi
 
 
 @gluon.jit
-def wait_word(word_ptr, expected, launch, on_expiry: gl.constexpr, SITE: gl.constexpr):
+def wait_word(
+    word_ptr, expected, launch, on_expiry: gl.constexpr, SITE: gl.constexpr, detail
+):
     """Wait until the int32 at ``word_ptr`` equals ``expected``.
 
     One lane polls with relaxed device-scope loads (``gl.atomic_poll``) while
     the other waves wait at its closing barrier. Every ``_WAIT_SLICE_NS`` the
     workgroup checks the launch deadline and the abort word, and calls
-    ``on_expiry(launch, site, 0)`` when either stops it. Returns after a
+    ``on_expiry(launch, site, detail)`` when either stops it. Returns after a
     workgroup barrier, so ``.cv`` loads after it see what the word's writer
     stored before writing it.
     """
@@ -262,13 +284,16 @@ def wait_word(word_ptr, expected, launch, on_expiry: gl.constexpr, SITE: gl.cons
                 timeout_ns=_WAIT_SLICE_NS,
             )
     if not seen:
-        on_expiry(launch, poll_stop_site(launch, SITE), 0)
+        on_expiry(launch, poll_stop_site(launch, SITE), detail)
     gl.barrier()
 
 
 @gluon.jit
-def grid_join(join_ptr, launch, on_expiry, SET: gl.constexpr):
+def grid_join(join_ptr, launch, on_expiry, SET: gl.constexpr, detail):
     """Wait until every workgroup of the grid has reached this join.
+
+    ``detail`` names the join in a failure record (such as the phase before
+    it).
 
     A two-level top-bit toggle (``JOIN_WORDS`` int32 words, zeroed once when
     the state is created): the 32 workgroups of an XCD arrive on their XCD's
@@ -296,4 +321,4 @@ def grid_join(join_ptr, launch, on_expiry, SET: gl.constexpr):
         top_add = gl.where(launch.xcd == 0, _TOP_TOGGLE_ADD, 1)
         gl.atomic_add(lines + _XCDS * _LINE, top_add, sem="relaxed", scope="gpu")
     flipped = gl.where(before, 0, -(2**31))
-    wait_word(lines + _XCDS * _LINE, flipped, launch, on_expiry, _SITE_JOIN)
+    wait_word(lines + _XCDS * _LINE, flipped, launch, on_expiry, _SITE_JOIN, detail)
