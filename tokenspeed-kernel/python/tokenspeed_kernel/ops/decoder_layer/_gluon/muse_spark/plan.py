@@ -31,7 +31,8 @@ balanced attention schedule list every possible producer.
 Per XCD, in launch order:
 
 - front: slots 0-15 SND (o_proj and router weights at entry; at full layers
-  after the first attention item) then RTR, slot 0 also OWN1 between them and
+  o_proj after the first attention item and the router weights after the
+  push) then RTR, slot 0 also OWN1 between them and
   slot 1 publishing h'[:, part xcd]; slots 16-23 POOL (slot 16 + T on XCD T
   reduces tile T); sliding attention blocks b on XCD b, slots 24-31 (split s
   on slot 24 + s, merger split 0); full layers run balanced items cta and cta
@@ -146,9 +147,11 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
 
     if slot < 16:
         sender = xcd * 16 + slot
-        # o_proj (SND) and the router's hi / lo (RTR), issued together.
+        # Sliding: o_proj (SND) and the router's hi / lo (RTR) at entry.
+        # Full: o_proj at the attention items' hook, the router after the
+        # push (and OWN1).
         if full:
-            steps += items(("SND", "RTR"))
+            steps += items(("SND",))
         else:
             steps += [Load("SND", _ALL), Load("RTR", _ALL)]
         steps += [
@@ -158,12 +161,14 @@ def _front(key: PlanKey, xcd: int, slot: int) -> list:
         ]
         if slot == 0:
             rs = (f"H1.rs[{2 * xcd}]", f"H1.rs[{2 * xcd + 1}]")
-            # The router weights are still in flight here; the plan paces
-            # them to land before this poll.
+            # At sliding layers the router weights are still in flight here;
+            # they are paced to land before this poll.
             steps += [
-                Wait("OWN1", _ALL, rs, "vector", _LANDED),
+                Wait("OWN1", _ALL, rs, "vector", "" if full else _LANDED),
                 Publish("OWN1", _ALL, (f"H1.ag[{xcd}]",)),
             ]
+        if full:
+            steps.append(Load("RTR", _ALL))
         # The router weights feed the K-part compute after this wait.
         steps.append(Wait("RTR", _ALL, ag, "vector", _IWC))
         if slot == 1:
