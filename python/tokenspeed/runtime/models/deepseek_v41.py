@@ -143,6 +143,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -165,7 +166,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     is_engram_embed_checkpoint_name,
     resolve_engram_host_layout,
 )
-from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
+from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -1471,16 +1472,18 @@ class DeepseekV41MoE(DeepseekV4MoE):
             self.config = config
             self.n_shared_experts = config.n_shared_experts
             if config.n_shared_experts is not None:
-                self.shared_experts = DeepseekV4MLP(
-                    config.hidden_size,
-                    config.moe_intermediate_size * config.n_shared_experts,
-                    config.hidden_act,
-                    mapping,
-                    quant_config,
-                    add_prefix("shared_experts", prefix),
-                    swiglu_limit=config.swiglu_limit,
+                self.shared_experts = GatedMLP.tensor_parallel(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size
+                    * config.n_shared_experts,
+                    activation=gated_activation(config.hidden_act, config.swiglu_limit),
+                    tp_rank=mapping.dense.tp_rank,
+                    tp_size=mapping.dense.tp_size,
+                    tp_group=mapping.dense.tp_group,
                     reduce_results=False,
-                    is_shared_expert=False,
+                    fusions=(),
+                    quant_config=quant_config,
+                    prefix=add_prefix("shared_experts", prefix),
                 )
 
     def _renormalize_routing_weights(self) -> bool:

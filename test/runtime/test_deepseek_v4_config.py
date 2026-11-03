@@ -31,7 +31,6 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
 )
@@ -56,7 +55,6 @@ from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import (
-    DeepseekV4MLP,
     DeepseekV4MoE,
     DeepseekV4MoEGate,
     DeepseekV4TopK,
@@ -582,33 +580,6 @@ class TestDeepseekV4Config:
         torch.testing.assert_close(
             actual, hidden_states * 2 + hidden_states + 3, atol=0, rtol=0
         )
-
-    def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
-        mapping = Mapping(
-            rank=1,
-            world_size=4,
-            attn_tp_size=1,
-            attn_dp_size=4,
-            dense_tp_size=1,
-            dense_dp_size=4,
-            moe_tp_size=1,
-            moe_ep_size=4,
-            moe_dp_size=1,
-        )
-
-        shared_mlp = DeepseekV4MLP(
-            hidden_size=8,
-            intermediate_size=16,
-            hidden_act="silu",
-            mapping=mapping,
-            quant_config=None,
-            prefix="model.layers.0.ffn.shared_experts",
-        )
-
-        assert (shared_mlp.tp_rank) == (mapping.dense.tp_rank)
-        assert (shared_mlp.tp_size) == (mapping.dense.tp_size)
-        assert (shared_mlp.tp_group) == (mapping.dense.tp_group)
-        assert (shared_mlp.tp_size) != (mapping.moe.tp_ep_size)
 
     def _make_fake_mega_deepseek_v4_moe(
         self, hidden_states, input_ids, shared_experts, calls
