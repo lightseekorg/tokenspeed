@@ -241,9 +241,20 @@ def test_eagle4_static_tree_scores_candidates_by_log_softmax_top_k(
     )
     scores, tokens = drafter._score_candidates(output)
 
-    want_scores, columns = logprob_topk(output.next_token_logits, 4)
-    assert torch.equal(tokens, output.candidate_ids.gather(-1, columns))
+    want_scores, _ = logprob_topk(output.next_token_logits, 4)
     torch.testing.assert_close(scores, want_scores, rtol=1e-6, atol=1e-6)
+    # BF16 logits tie often, and the two top-k kernels may order tied
+    # candidates differently: each token must be a distinct candidate of its
+    # row whose log-probability is its slot's score.
+    ids = output.candidate_ids
+    match = tokens.unsqueeze(-1) == ids.unsqueeze(1)
+    assert torch.equal(match.sum(-1), torch.ones_like(tokens))
+    columns = match.int().argmax(-1)
+    assert (columns.sort(-1).values.diff(dim=-1) > 0).all()
+    logprobs = torch.log_softmax(output.next_token_logits.float(), -1)
+    torch.testing.assert_close(
+        logprobs.gather(-1, columns), want_scores, rtol=1e-6, atol=1e-6
+    )
 
 
 # Toy sizes; the MoE's are the smallest the BF16 squared-ReLU expert kernels plan for.
