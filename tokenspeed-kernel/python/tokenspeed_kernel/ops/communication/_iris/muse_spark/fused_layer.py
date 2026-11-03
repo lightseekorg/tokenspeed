@@ -245,8 +245,12 @@ def clear_next_copies(view, launch, sender):
     iris_clear_share(box + nxt * _BOX_WORDS, sender, _BOX_WORDS, _BOX_EMPTY)
     iris_clear_share(h1 + nxt * _H1_WORDS, sender, _H1_WORDS, _LAMPORT_EMPTY)
     iris_clear_share(h3 + nxt * _H3_WORDS, sender, _H3_WORDS, _LAMPORT_EMPTY)
-    iris_clear_share(h4_own + nxt * _H4_OWN_WORDS, sender, _H4_OWN_WORDS, _LAMPORT_EMPTY)
-    iris_clear_share(routes + nxt * _ROUTES_WORDS, sender, _ROUTES_WORDS, _LAMPORT_EMPTY)
+    iris_clear_share(
+        h4_own + nxt * _H4_OWN_WORDS, sender, _H4_OWN_WORDS, _LAMPORT_EMPTY
+    )
+    iris_clear_share(
+        routes + nxt * _ROUTES_WORDS, sender, _ROUTES_WORDS, _LAMPORT_EMPTY
+    )
     iris_clear_share(h6 + nxt * _H6_WORDS, sender, _H6_WORDS, _LAMPORT_EMPTY)
 
 
@@ -279,14 +283,28 @@ def own1(
 ):
     """OWN1 ``owner`` (0-7): wait for the 16 sources of its 128 columns, sum
     in rank order, push the AG words and the four norm sums (tagged with
-    launch.tag) to every rank."""
+    launch.tag) to every rank. Then zero its sums of rows [rows, MAX_ROWS)
+    on every rank: 32-bit tags repeat after 2**32 - 1 launches, so a row a
+    later, wider launch reads must not keep a tag that old (TAG-LIVE)."""
+    sums_peers = _peer_addresses(view.h1_sums, view.heaps, RANK)
     muse_attntail_own(
         owner, launch.cta, view.h1, _peer_addresses(view.h1, view.heaps, RANK),
-        _peer_addresses(view.h1_sums, view.heaps, RANK), launch.tag, launch.copy,
-        rows, stream_ptr, post_weight_ptr, alpha_ptr, beta_ptr, _HIDDEN, RANK,
-        _WORLD, _H1_SHARD, _MAX_ROWS, _OWNER_COLUMNS, POST_WEIGHT_OFFSET,
-        POST_HAS_WEIGHT, PEER_CACHE, False,
+        sums_peers, launch.tag, launch.copy, rows, stream_ptr, post_weight_ptr,
+        alpha_ptr, beta_ptr, _HIDDEN, RANK, _WORLD, _H1_SHARD, _MAX_ROWS,
+        _OWNER_COLUMNS, POST_WEIGHT_OFFSET, POST_HAS_WEIGHT, PEER_CACHE, False,
     )  # fmt: skip
+    OWNERS: gl.constexpr = _HIDDEN // _WORLD // _OWNER_COLUMNS
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [32, 2], [gl.num_warps(), 1], [1, 0]
+    )
+    row = gl.arange(0, _MAX_ROWS, layout=gl.SliceLayout(1, layout))
+    which = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
+    slot = ((RANK * OWNERS + owner) * _MAX_ROWS + row[:, None]) * 4 + which[None, :]
+    stale = (row >= rows)[:, None] & (which >= 0)[None, :]
+    zero = gl.zeros([_MAX_ROWS, 4], gl.int64, layout)
+    for peer in gl.static_range(_WORLD):
+        destination = gl.multiple_of(sums_peers[peer].to(gl.pointer_type(gl.int64)), 16)
+        gl.amd.cdna4.buffer_store(zero, destination, slot, mask=stale, cache=".wt")
 
 
 @gluon.jit
@@ -319,7 +337,9 @@ def h3_sink(
     published = ()
     for _ in gl.static_range(1, _WORLD):
         published += (v,)
-    _iris_lamport_push(published, peers, 0, offsets, valid, tile, RANK, _WORLD, PEER_CACHE)
+    _iris_lamport_push(
+        published, peers, 0, offsets, valid, tile, RANK, _WORLD, PEER_CACHE
+    )
     own = gl.multiple_of(view.h3.to(gl.pointer_type(gl.bfloat16), bitcast=True), 16)
     gl.amd.cdna4.buffer_store(v, own, offsets, mask=valid, cache=".wt")
 
@@ -386,11 +406,16 @@ def h4_sink(args, y, route, cols):
     offset = view.routes.to(gl.int64, bitcast=True) - _iris_group_heap_base(
         rank, view.heaps
     )
-    target = _iris_group_heap_base(owner, view.heaps) + offset + 4 * (
-        launch.copy * _ROUTES_WORDS
-        + (_WORLD - 1 - distance) * (_MAX_ROWS * 2 * 1024)
-        + within
-    ).to(gl.int64)
+    target = (
+        _iris_group_heap_base(owner, view.heaps)
+        + offset
+        + 4
+        * (
+            launch.copy * _ROUTES_WORDS
+            + (_WORLD - 1 - distance) * (_MAX_ROWS * 2 * 1024)
+            + within
+        ).to(gl.int64)
+    )
     gl.atomic_store(
         target.to(gl.pointer_type(gl.uint32)),
         words,
@@ -413,11 +438,20 @@ def own4_complete(
     """OWN4 of ``route_row``: wait for this rank's own 512-column slice (the
     local dn units' share), then complete it with the peers' partials and
     push the completed columns and sum of squares to every rank (H5)."""
-    layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [gl.num_warps(), 1], [1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
     lane = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
-    offsets = launch.copy * _H4_OWN_WORDS + route_row * _SLICE + lane[:, None] * 4 + word[None, :]
-    own_ptr = gl.multiple_of(view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
+    offsets = (
+        launch.copy * _H4_OWN_WORDS
+        + route_row * _SLICE
+        + lane[:, None] * 4
+        + word[None, :]
+    )
+    own_ptr = gl.multiple_of(
+        view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True), 16
+    )
     own = gl.amd.cdna4.buffer_load(own_ptr, offsets, cache=".cv")
     while _iris_subgroup_any(gl.max(((own >> 16) == 0x8000).to(gl.int32), 1)):
         own = gl.amd.cdna4.buffer_load(own_ptr, offsets, cache=".cv")
