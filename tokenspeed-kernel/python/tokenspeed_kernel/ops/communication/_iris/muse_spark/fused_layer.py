@@ -576,7 +576,8 @@ def h6_sink(
 @gluon.jit
 def unp_sums_publish(view, launch, sums, sender, rows):
     """UNP ``sender`` (0-7) of this XCD publishes its FP32 [16, SUMS] norm-sum
-    partials (rows < rows) to its XCD's RED: one (value, tag) pair each."""
+    partials (rows < rows) to its XCD's RED: one (value, tag) pair each; the
+    pairs of rows [rows, 16) are zeroed."""
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 4], [16, 4], [gl.num_warps(), 1], [1, 0]
     )
@@ -588,6 +589,14 @@ def unp_sums_publish(view, launch, sums, sender, rows):
     ]
     valid = (row < rows)[:, None] & (which >= 0)[None, :]
     store_pairs(view.red_in + slot, values, launch, valid, "gpu")
+    # Rows past ``rows`` get tag 0, which never matches (TAG-LIVE).
+    gl.atomic_store(
+        view.red_in + slot,
+        gl.zeros_like(slot).to(gl.int64),
+        mask=(row >= rows)[:, None] & (which >= 0)[None, :],
+        sem="relaxed",
+        scope="gpu",
+    )
 
 
 @gluon.jit
