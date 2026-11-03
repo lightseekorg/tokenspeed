@@ -392,6 +392,38 @@ class GlmDsaSparseAttentionMixin:
         )
         return q_fp8.view(tokens, heads, head_dim), q_scales
 
+    def _dcp_scorer_index_query(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_k_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """The index query, weights and score scale as ``select_dsa_topk``
+        takes them, scoring the query :meth:`_scorer_index_query` gives the
+        paged scorers.
+
+        The candidate scorers take a BF16 query. A quantized query passes as
+        its E4M3 values in BF16 (exact), with its scales and the score scale
+        folded into FP32 weights, so DCP ranks select from the scores the
+        one-rank scorers compute.
+
+        Args:
+            q: ``[tokens, index_heads, head_dim]`` BF16 index query.
+            weights: ``[tokens, index_heads]`` indexer weights.
+            index_k_cache: The layer's index-K plane.
+
+        Returns:
+            ``(q, weights, softmax_scale)`` for ``select_dsa_topk``.
+        """
+        softmax_scale = self.indexer.weights_softmax_scale
+        q_fp8, q_scales = self._scorer_index_query(q, index_k_cache)
+        if q_scales is None:
+            return q, weights, softmax_scale
+        tokens, heads, _ = q.shape
+        q_scales = q_scales.reshape(-1)[: tokens * heads].view(tokens, heads)
+        weights = weights.float() * q_scales * float(softmax_scale)
+        return q_fp8.to(torch.bfloat16), weights, 1.0
+
     def _get_decode_topk_workspace(
         self,
         rows: int,
@@ -642,6 +674,9 @@ class GlmDsaSparseAttentionMixin:
         dcp_index = None
         capturing = False
         if placement is not None:
+            q, weights, softmax_scale = self._dcp_scorer_index_query(
+                q, weights, index_k_cache
+            )
             page_size = ctx.token_to_kv_pool.index_k_page_size
             capturing = is_current_stream_capturing(q.device)
             dcp_index = self._reusable_dcp_index(
@@ -683,7 +718,7 @@ class GlmDsaSparseAttentionMixin:
                 placement=placement,
                 page_size=page_size,
                 topk=topk,
-                softmax_scale=self.indexer.weights_softmax_scale,
+                softmax_scale=softmax_scale,
                 initial_tokens=0,
                 local_tokens=0,
                 max_logits_bytes=None,
@@ -1021,6 +1056,9 @@ class GlmDsaSparseAttentionMixin:
         if placement is not None:
             if indexer_output.query_proj is not None:
                 q = indexer_output.query_proj(q)
+            q, weights, softmax_scale = self._dcp_scorer_index_query(
+                q, weights, index_k_cache
+            )
             # Both gates read host values equal on every KVP rank, so the ranks issue the same collectives.
             row_owner = q.shape[0] >= _KVP_PREFILL_ROW_OWNER_MIN_ROWS
             global_starts, global_ends = row_starts, row_ends
@@ -1054,7 +1092,7 @@ class GlmDsaSparseAttentionMixin:
                 placement=placement,
                 page_size=ctx.token_to_kv_pool.index_k_page_size,
                 topk=topk,
-                softmax_scale=self.indexer.weights_softmax_scale,
+                softmax_scale=softmax_scale,
                 initial_tokens=0,
                 local_tokens=0,
                 max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
