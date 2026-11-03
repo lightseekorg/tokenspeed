@@ -95,6 +95,31 @@ through memory instead of kernel boundaries.
   orders the loads after it. It checks the deadline and the abort word every
   50 us of polling.
 
+## Attention prologue
+
+### gfx950 GQA prologue head (device function)
+
+`gqa_prologue_head_gfx950` (`attention/prologue/gqa.py`) runs the GQA
+attention prologue of one head inside another kernel, such as a fused
+decoder layer.
+
+#### Contract
+
+- Head `head < NUM_Q_HEADS` normalizes (and rotates, unless `HALF_ROTARY`
+  is 0) its query rows and stores them in the query's dtype; KV head
+  `head - NUM_Q_HEADS` writes its key and value rows to the cache slots,
+  scaled by the inverse scales when `KV_SCALED`.
+- The same BF16 q/k/v rows give the same bytes as the Triton GQA prologue.
+- `SRC_CACHE` is the cache modifier of the q/k/v loads (`.cv` when another
+  workgroup of the same launch wrote them). Query and cache rows are stored
+  plainly: their readers run in a later launch.
+
+#### Algorithm
+
+It repeats the Triton prologue's layouts and operations: a per-head RMSNorm
+summed by one 64-lane reduction, the rotation `fma(x1, cos, -x2 * sin)` /
+`fma(x2, cos, x1 * sin)` on interleaved pairs, and one RTNE rounding.
+
 ## GEMM
 
 ### gfx950 dense BF16 projections
