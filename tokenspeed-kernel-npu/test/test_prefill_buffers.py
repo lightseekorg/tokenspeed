@@ -202,6 +202,51 @@ def test_temporary_packed_history_and_current_keep_exact_bytes(
     runtime.close()
 
 
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_patch_copies_router_slots_into_owned_native_buffer(
+    transport_class, monkeypatch, slot_dtype
+):
+    cls, _ = transport_class
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    cache = payload(256, 576, 1)
+    runtime = cls(
+        cache,
+        None,
+        ranks=(0,),
+        history_group=None,
+        max_current_rows=2,
+        history_null_rows=128,
+    )
+    runtime.prefetch(
+        1,
+        cache,
+        None,
+        batch_key=object(),
+        total_rows=2,
+        has_history=False,
+        history_slots=torch.empty(0, dtype=torch.int64),
+        history_counts=(0,),
+    )
+    runtime.gather_current(1, cache[:2], width=576, total_rows=2)
+    slots = torch.tensor([128, 129], dtype=slot_dtype)
+    workspace = torch.empty(2, dtype=torch.int64)
+    runtime.patch(
+        1,
+        width=576,
+        slots=slots,
+        direct=torch.zeros(2, dtype=torch.uint8),
+        block_rows=128,
+        slots_workspace=workspace,
+        mapped_slots=torch.tensor([128, 129], dtype=torch.int64),
+        virtual_blocks=3,
+    )
+    assert workspace.tolist() == [128, 129]
+    slots.fill_(0)
+    assert workspace.tolist() == [128, 129]
+    runtime.finish(1)
+    runtime.close()
+
+
 def test_history_ensure_rejects_stale_batch_and_different_stream(
     transport_class, monkeypatch
 ):

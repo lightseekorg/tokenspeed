@@ -101,7 +101,7 @@ class TestDraftHistoryScrubTest:
         router = _draft_router(device="cpu")
         _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
         _refresh(router, 4, 1, torch.full((1, 4), 3, dtype=torch.int32))
-        out = torch.zeros(8, dtype=torch.int64)
+        out = torch.zeros(8, dtype=torch.int32)
         router.draft_write_locations_uniform(
             out, cache_start=torch.zeros(4, dtype=torch.int32), num_tokens=2
         )
@@ -115,12 +115,9 @@ class TestDraftHistoryScrubTest:
         assert (router.draft_history_view().table == 0).all()
 
 
-class TestWideDraftSlots:
+class TestInt32DraftSlots:
     @pytest.mark.parametrize("device", ["cpu", "npu", "cuda"])
-    @pytest.mark.parametrize("page", [2**25 + 5, 2**31 - 1])
-    def test_uniform_draft_preserves_large_slots_and_published_buffer(
-        self, device, page
-    ):
+    def test_uniform_draft_keeps_int32_scratch_and_published_slots(self, device):
         if device == "npu":
             pytest.importorskip("torch_npu")
             if not torch.npu.is_available():
@@ -128,8 +125,9 @@ class TestWideDraftSlots:
         if device == "cuda" and not torch.cuda.is_available():
             pytest.skip("CUDA unavailable")
         router = _draft_router(device=device)
+        page = 17
         table = torch.tensor(
-            [[page, 0, page, 0], [0, 0, 0, 0], [page] * 4, [page] * 4],
+            [[page, 0, page, 0], [0] * 4, [page] * 4, [page] * 4],
             dtype=torch.int32,
             device=device,
         )
@@ -137,22 +135,18 @@ class TestWideDraftSlots:
         published = router.stacks.decode_locations(FULL, 4, 1)
         original = published.clone()
         pointer = published.data_ptr()
-        starts = torch.tensor(
-            [126, 0, 512, 2**31 - 2], dtype=torch.int32, device=device
-        )
-        out = torch.full((18,), -7, dtype=torch.int64, device=device)
+        starts = torch.tensor([126, 0, 512, 126], dtype=torch.int32, device=device)
+        out = torch.full((18,), -7, dtype=torch.int32, device=device)
         result = router.draft_write_locations_uniform(out, starts, 4)
-        assert result.data_ptr() == out.data_ptr()
-        assert result.dtype == torch.int64
-        assert (
-            out.tolist() == [page * 128 + 126, page * 128 + 127] + [0] * 14 + [-7] * 2
+        assert result.data_ptr() == out.data_ptr() and result.dtype == torch.int32
+        assert out.tolist() == (
+            [page * 128 + 126, page * 128 + 127]
+            + [0] * 10
+            + [page * 128 + 126, page * 128 + 127, page * 128, page * 128 + 1]
+            + [-7] * 2
         )
         assert published.data_ptr() == pointer
         torch.testing.assert_close(published, original)
-        narrow = torch.full((16,), -7, dtype=torch.int32, device=device)
-        with pytest.raises(ValueError, match="draft write slot output must use int64"):
-            router.draft_write_locations_uniform(narrow, starts, 4)
-        assert narrow.tolist() == [-7] * 16
 
 
 class TestIdleReplayScrubTest:

@@ -899,9 +899,8 @@ class CacheGroupRouter(AttentionBackend):
     def draft_write_locations_uniform(
         self, out: torch.Tensor, cache_start: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
-        """Fill caller-owned int64 scratch without changing published step slots."""
-        if out.dtype != torch.int64:
-            raise ValueError("draft write slot output must use int64")
+        """Scratch-buffer slot resolve over the full-history table (side
+        writes that must not clobber the published step window)."""
         view = self.draft_history_view()
         if view.table.is_cuda:
             from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -926,7 +925,7 @@ class CacheGroupRouter(AttentionBackend):
         pages = view.table[:bs].to(torch.int64).gather(1, page_idx)
         locs = pages * view.page_size + pos % view.page_size
         locs = torch.where(overflow | (pages <= 0), torch.zeros_like(locs), locs)
-        out[: bs * num_tokens].copy_(locs.reshape(-1))
+        out[: bs * num_tokens].copy_(locs.reshape(-1).to(out.dtype))
         return out
 
     def publish_draft_step_locations(

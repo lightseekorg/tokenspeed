@@ -441,11 +441,11 @@ never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
 
-Kernel page tables retain int32 IDs. The router computes token write slots in
-int64 and publishes int64 decode, extend, mixed and padded views from the
-first allocation. A valid int32 page ID times its page size may exceed 2^31;
-neither eager refresh nor graph replay may narrow the resulting slot. Scratch
-write-location destinations also require int64.
+Kernel page tables and router write-slot buffers retain int32. Cache binding
+bounds local and virtual token slots to the int32 range, including sharded
+groups. Kernel address offsets cast the index to int64 before multiplying
+by a tensor stride. Ascend adapters accept int32 router slots and prepare
+int64 buffers only for native consumers that require them.
 
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,

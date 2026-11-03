@@ -188,7 +188,7 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     page = 128
     table = torch.tensor([[2, 5, 3], [6, 4, 1]], dtype=torch.int32)[: len(extends)]
     total = sum(extends)
-    slots = torch.empty((1, total), dtype=torch.int64)
+    slots = torch.empty((1, total), dtype=torch.int32)
     extend_write_locations(
         table[None],
         torch.tensor([page]),

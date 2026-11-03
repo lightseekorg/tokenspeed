@@ -1735,7 +1735,10 @@ def test_ordinary_selection_rejects_fused_prolog_query(monkeypatch):
 
 @pytest.mark.parametrize("width", [1, 8, 9])
 @pytest.mark.parametrize("page,block", [(64, 128), (128, 128), (128, 256)])
-def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(width, page, block):
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(
+    width, page, block, slot_dtype
+):
     owner = ascend_dcp.AscendDCPMetadata(
         degree=8, rank=1, ranks=tuple(range(8)), virtual_block_count=19
     )
@@ -1745,7 +1748,7 @@ def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(width, page, 
     placement = CachePlacement(block, 19, tuple(range(8)), 1)
     # Authoritative router slots include null, foreign, owned and invalid IDs.
     locations = torch.tensor(
-        [0, block, 2 * block + 3, 19 * block, -1] * width, dtype=torch.int64
+        [0, block, 2 * block + 3, 19 * block, -1] * width, dtype=slot_dtype
     )
 
     def prepare():
@@ -1777,13 +1780,19 @@ def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(width, page, 
     replaced_slots = owner.prepare_write_slots(replacement, placement)
     assert replaced_slots is not slots
     torch.testing.assert_close(
-        replaced_slots, torch.full_like(locations, block + 5), atol=0, rtol=0
+        replaced_slots,
+        torch.full_like(locations, block + 5, dtype=torch.int64),
+        atol=0,
+        rtol=0,
     )
     replacement.set_(torch.full_like(replacement, 2 * block + 9))
     rebound_slots = owner.prepare_write_slots(replacement, placement)
     assert rebound_slots is not replaced_slots
     torch.testing.assert_close(
-        rebound_slots, torch.full_like(locations, block + 9), atol=0, rtol=0
+        rebound_slots,
+        torch.full_like(locations, block + 9, dtype=torch.int64),
+        atol=0,
+        rtol=0,
     )
     # Next step overwrites the same router/input storage; no stale metadata or
     # ownership mask can escape the step invalidation.
@@ -1796,7 +1805,10 @@ def test_mla_uses_shared_metadata_and_router_slots_for_every_layer(width, page, 
     assert torch.count_nonzero(owner.seq_lens) == 0
     slots = owner.prepare_write_slots(locations, placement)
     torch.testing.assert_close(
-        slots, torch.full_like(locations, block + 7), atol=0, rtol=0
+        slots,
+        torch.full_like(locations, block + 7, dtype=torch.int64),
+        atol=0,
+        rtol=0,
     )
 
 

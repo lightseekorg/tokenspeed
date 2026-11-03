@@ -28,9 +28,6 @@ per request in q/k/v token order. Null and hole pages (id <= 0) and positions
 past the table route to slot 0, the zero-initialized dummy page that never
 aliases a live request.
 
-Page IDs remain int32. Slot arithmetic and output storage use int64 because
-a valid page ID multiplied by its token span can exceed the int32 range.
-
 Every function takes the stacked ``[G, max_bs, max_num_pages]`` table the
 router fills (``group_tables.GroupTableStacks``) so all groups' locations
 come from one launch. CUDA tensors run the triton kernels; CPU and NPU
@@ -50,7 +47,7 @@ def _decode_locs_kernel(
     tables_ptr,  # [G, max_bs, max_num_pages] int32
     page_sizes_ptr,  # [G] int32
     seq_lens_ptr,  # [bs] int32
-    out_ptr,  # [G, cap] int64
+    out_ptr,  # [G, cap] int32
     stride_g,
     stride_b,
     max_num_pages,
@@ -60,8 +57,8 @@ def _decode_locs_kernel(
     seq_len_offset,  # added to every loaded length
     BLOCK: tl.constexpr,
 ):
-    g = tl.program_id(0).to(tl.int64)
-    start = tl.program_id(1).to(tl.int64) * BLOCK
+    g = tl.program_id(0)
+    start = tl.program_id(1) * BLOCK
     tok = start + tl.arange(0, BLOCK)  # token-major index into out[g]
     mask = tok < num_tokens
     req = tok // tokens_per_req
@@ -73,11 +70,13 @@ def _decode_locs_kernel(
     overflow = page_idx >= max_num_pages
     page_idx = tl.minimum(page_idx, max_num_pages - 1)
     page = tl.load(
-        tables_ptr + g * stride_g + req * stride_b + page_idx, mask=mask, other=0
+        tables_ptr + g.to(tl.int64) * stride_g + req.to(tl.int64) * stride_b + page_idx,
+        mask=mask,
+        other=0,
     ).to(tl.int64)
     loc = page * page_size + pos % page_size
     loc = tl.where(overflow | (page <= 0), 0, loc)
-    tl.store(out_ptr + g * out_stride_g + tok, loc, mask=mask)
+    tl.store(out_ptr + g.to(tl.int64) * out_stride_g + tok, loc.to(tl.int32), mask=mask)
 
 
 @triton.jit(do_not_specialize=["max_num_pages", "out_stride_g"])
@@ -86,16 +85,16 @@ def _extend_locs_kernel(
     page_sizes_ptr,  # [G] int32
     prefix_lens_ptr,  # [bs] int32
     extend_lens_ptr,  # [bs] int32
-    cu_extend_lens_ptr,  # [bs + 1] int64
-    out_ptr,  # [G, total] int64
+    cu_extend_lens_ptr,  # [bs + 1] int32
+    out_ptr,  # [G, total] int32
     stride_g,
     stride_b,
     max_num_pages,
     out_stride_g,
     BLOCK: tl.constexpr,
 ):
-    g = tl.program_id(0).to(tl.int64)
-    req = tl.program_id(1).to(tl.int64)
+    g = tl.program_id(0)
+    req = tl.program_id(1)
     prefix = tl.load(prefix_lens_ptr + req).to(tl.int64)
     num_new = tl.load(extend_lens_ptr + req)
     out_base = tl.load(cu_extend_lens_ptr + req).to(tl.int64)
@@ -108,13 +107,20 @@ def _extend_locs_kernel(
         overflow = page_idx >= max_num_pages
         page_idx = tl.minimum(page_idx, max_num_pages - 1)
         page = tl.load(
-            tables_ptr + g * stride_g + req * stride_b + page_idx,
+            tables_ptr
+            + g.to(tl.int64) * stride_g
+            + req.to(tl.int64) * stride_b
+            + page_idx,
             mask=mask,
             other=0,
         ).to(tl.int64)
         loc = page * page_size + pos % page_size
         loc = tl.where(overflow | (page <= 0), 0, loc)
-        tl.store(out_ptr + g * out_stride_g + out_base + offs, loc, mask=mask)
+        tl.store(
+            out_ptr + g.to(tl.int64) * out_stride_g + out_base + offs,
+            loc.to(tl.int32),
+            mask=mask,
+        )
 
 
 def _decode_positions(seq_lens: torch.Tensor, tokens_per_req: int) -> torch.Tensor:
@@ -137,7 +143,9 @@ def _gather_slots(
     overflow = page_idx >= max_num_pages
     page = table[req, page_idx.clamp_max(max_num_pages - 1)].to(torch.int64)
     loc = page * page_size + pos % page_size
-    return torch.where(overflow | (page <= 0), torch.zeros_like(loc), loc)
+    return torch.where(overflow | (page <= 0), torch.zeros_like(loc), loc).to(
+        torch.int32
+    )
 
 
 def decode_write_locations(
@@ -159,7 +167,7 @@ def decode_write_locations(
         page_sizes: ``[G]`` int32 kernel page size per group.
         seq_lens: ``[>= bs]`` int32 lengths including the newest token(s);
             request ``b`` writes positions ``seq_lens[b] - n .. seq_lens[b] - 1``.
-        out: ``[G, cap]`` int64 destination, ``cap >= bs * tokens_per_req``;
+        out: ``[G, cap]`` int32 destination, ``cap >= bs * tokens_per_req``;
             filled token-major per request (the verify layout).
         bs: Requests to compute (padded requests read seq_len 1 and land on
             slot 0).
@@ -223,8 +231,6 @@ def _write_locations(
     *,
     page_sizes_cpu: tuple[int, ...] | None = None,
 ) -> None:
-    if out.dtype != torch.int64:
-        raise ValueError("write slot output must use int64")
     n = max(int(tokens_per_req), 1)
     num_tokens = bs * n
     if num_tokens == 0 or tables.shape[0] == 0:
@@ -281,20 +287,18 @@ def extend_write_locations(
         extend_seq_lens: ``[bs]`` int32 new tokens per request.
         total_tokens: ``sum(extend_seq_lens)`` from the host mirror — no
             device sync here.
-        out: ``[G, total_tokens]`` int64 rows to fill; a view of the router's
+        out: ``[G, total_tokens]`` int32 rows to fill; a view of the router's
             persistent buffer, so a captured graph can record its address.
 
     Returns:
         ``out``. The optional ``page_sizes_cpu`` host tuple replaces only
         static page-size scalar reads on the Torch fallback.
     """
-    if out.dtype != torch.int64:
-        raise ValueError("write slot output must use int64")
     bs = extend_seq_lens.shape[0]
     if total_tokens == 0 or tables.shape[0] == 0 or bs == 0:
         return out
-    cu_extend = torch.zeros(bs + 1, dtype=torch.int64, device=tables.device)
-    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int64, out=cu_extend[1:])
+    cu_extend = torch.zeros(bs + 1, dtype=torch.int32, device=tables.device)
+    torch.cumsum(extend_seq_lens, dim=0, out=cu_extend[1:])
     if tables.is_cuda:
         _extend_locs_kernel[(tables.shape[0], bs)](
             tables,
