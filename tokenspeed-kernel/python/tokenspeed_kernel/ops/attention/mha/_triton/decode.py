@@ -19,12 +19,35 @@
 # SOFTWARE.
 
 import math
+from functools import cache
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
+# Split the keys until the stage-1 grid has about this many programs per
+# compute unit; a small batch otherwise leaves most of the GPU idle while each
+# program walks its whole cache.
+_PROGRAMS_PER_CU = 4
+
+
+@cache
+def _compute_units(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _num_kv_splits(q: torch.Tensor, num_kv_heads: int, max_kv_splits: int) -> int:
+    """Key splits per query: the batch shape alone decides, so one captured
+    graph keeps one split count. The splits are a runtime tensor, so a new
+    count reuses the compiled kernels."""
+    group = q.shape[1] // num_kv_heads
+    # Stage-1 programs per query: one per head, or per block of up to 16
+    # grouped heads.
+    heads = q.shape[1] if group == 1 else num_kv_heads * triton.cdiv(group, 16)
+    programs = q.shape[0] * heads
+    target = _PROGRAMS_PER_CU * _compute_units(q.device)
+    return max(1, min(max_kv_splits, triton.cdiv(target, programs)))
 
 
 @triton.jit
@@ -541,6 +564,7 @@ def _fwd_kernel_stage2(
     Mid_O,
     Mid_O_1,
     O,
+    Lse,
     cache_seqlens,
     num_kv_splits,
     sink_ptr,
@@ -556,6 +580,7 @@ def _fwd_kernel_stage2(
     Lv: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
 ):
     cur_q = tl.program_id(0)
     cur_batch = cur_q // MAX_SEQLEN_Q
@@ -608,11 +633,19 @@ def _fwd_kernel_stage2(
         cur_sink = tl.load(sink_ptr + cur_head)
         e_sum += tl.exp(cur_sink - e_max)
 
+    # A query with no keys in reach (an empty cache) has nothing to attend:
+    # zero output and an LSE of -inf, so a caller merging partials drops it.
+    has_keys = e_sum > 0.0
     tl.store(
         O + cur_q * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum,
+        tl.where(has_keys, acc / e_sum, 0.0),
         mask=mask_d,
     )
+    if RETURN_LSE:
+        tl.store(
+            Lse + cur_q.to(tl.int64) * tl.num_programs(1) + cur_head,
+            tl.where(has_keys, e_max + tl.log(e_sum), -float("inf")),
+        )
 
 
 def _decode_softmax_reducev_fwd(
@@ -627,6 +660,7 @@ def _decode_softmax_reducev_fwd(
     max_seqlen_q,
     window_left,
     sinks=None,
+    lse_out=None,
 ):
     platform = current_platform()
     total_q, head_num = q.shape[0], q.shape[1]
@@ -645,6 +679,7 @@ def _decode_softmax_reducev_fwd(
         logits,
         lse,
         o,
+        lse_out,
         cache_seqlens,
         num_kv_splits,
         sinks,
@@ -660,6 +695,7 @@ def _decode_softmax_reducev_fwd(
         Lv=Lv,
         WINDOW_LEFT=window_left,
         HAS_SINK=HAS_SINK,
+        RETURN_LSE=lse_out is not None,
         num_warps=4,
         num_stages=2,
         **extra_kargs,
@@ -684,6 +720,7 @@ def decode_attention_fwd_normal(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    lse_out=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -714,6 +751,7 @@ def decode_attention_fwd_normal(
         max_seqlen_q,
         window_left,
         sinks,
+        lse_out,
     )
 
 
@@ -735,6 +773,7 @@ def decode_attention_fwd_grouped(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    lse_out=None,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -765,6 +804,7 @@ def decode_attention_fwd_grouped(
         max_seqlen_q,
         window_left,
         sinks,
+        lse_out,
     )
 
 
@@ -786,6 +826,7 @@ def decode_attention_fwd(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    lse_out=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] == cache_seqlens.shape[0] * max_seqlen_q
@@ -813,6 +854,7 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
+            lse_out=lse_out,
         )
     else:
         # GQA/MQA/MLA
@@ -834,6 +876,7 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
+            lse_out=lse_out,
         )
 
 
@@ -874,8 +917,16 @@ def _triton_mha_decode_with_kvcache_impl(
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    num_kv_splits = torch.full(
+        (cache_seqlens.shape[0],),
+        _num_kv_splits(q, k_cache.shape[2], max_kv_splits),
+        dtype=torch.int32,
+        device=q.device,
+    )
+    lse = (
+        torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
     )
     decode_attention_fwd(
         q,
@@ -895,5 +946,6 @@ def _triton_mha_decode_with_kvcache_impl(
         sm_scale=softmax_scale,
         logit_cap=logit_cap,
         sinks=sinks,
+        lse_out=lse,
     )
-    return out
+    return (out, lse) if return_lse else out

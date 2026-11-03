@@ -161,7 +161,7 @@ def triton_mha_extend_with_kvcache(
     priority=Priority.PORTABLE,
     traits={
         "logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False}),
+        "return_lse": frozenset({False, True}),
         "sinks": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
     },
