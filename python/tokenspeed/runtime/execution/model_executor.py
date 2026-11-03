@@ -525,7 +525,7 @@ class ModelExecutorConfig:
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
             prefix_granularity=prefix_granularity,
-            max_num_seqs=server_args.max_num_seqs,
+            max_num_seqs=server_args.request_state_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
