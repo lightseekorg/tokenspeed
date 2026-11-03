@@ -140,7 +140,9 @@ except for the measured `(N, K)` entries in `_CONFIGS`.
 
 A few-row program streams a tile of weight rows, reusing each load across
 its input rows. Each (input row, output) keeps the single-row reduction;
-FMA throughput limits this path to a few rows. The gated projection
+FMA throughput limits this path to a few rows. All of a lane's weight chunks
+are issued up front and the input rows one chunk ahead, so a wave waits for
+one memory round trip instead of one per chunk. The gated projection
 recomputes its normalized, gated input in every program.
 
 ### gfx950 FP32 router GEMV
