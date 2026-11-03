@@ -61,6 +61,10 @@ from tokenspeed.runtime.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from tokenspeed.runtime.utils.failure_records import (
+    discard_failure_records,
+    report_failure_records,
+)
 from tokenspeed.runtime.utils.launcher import (
     interface_for_host,
     set_pinned_allocator_default,
@@ -392,6 +396,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
         metrics_service.start(server_args, port_args)
         kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
+        discard_failure_records(os.getpid())
         # Nothing else stops a follower node's ranks, so they must not outlive
         # it, even when it is SIGKILLed; the first node's frontend notices.
         parent_death_signal = server_args.node_rank >= 1
@@ -449,6 +454,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         for descendant in scheduler_descendants:
             with contextlib.suppress(psutil.NoSuchProcess):
                 descendant.kill()
+        # A rank whose kernel failed on the device left its record behind.
+        report_failure_records(os.getpid(), logger)
         if kv_bootstrap_server is not None:
             kv_bootstrap_server.close()
         metrics_service.close(timeout=2.0)

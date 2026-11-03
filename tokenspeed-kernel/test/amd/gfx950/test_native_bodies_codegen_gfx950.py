@@ -1,0 +1,236 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Offline gfx950 codegen checks of the native decoder layer's device bodies.
+
+These compile without a GPU, so they run on any host with the AMD backend;
+the test tree's conftest needs a device, so on a GPU-less host run them with
+``pytest --noconftest``.
+Each test names the instruction-level contract its body promises
+(NATIVE-DESIGN P-ISA): waits, cache bits, and what may not drain a stream.
+"""
+
+from __future__ import annotations
+
+import re
+
+import pytest
+
+pytest.importorskip("tokenspeed_kernel_amd")
+
+from asm_checks import instruction_lines  # noqa: E402
+from native_body_helpers import (  # noqa: E402
+    compile_gfx950,
+    kpart_pooler_kernel,
+    kpart_router_kernel,
+    sender_kernel,
+    split_records_kernel,
+    topk_keys_kernel,
+)
+from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+    persistent_compile_options,
+)
+
+# The Muse Spark sliding layer at 8 rows: FP8 q and KV, 16 q / 2 KV heads of
+# 64, an 8-token verify block, 8 splits of a 2048-token window, 2 stages.
+_MUSE_SLIDING = dict(
+    Q_STRIDE_B=1024,
+    Q_STRIDE_H=64,
+    Q_STRIDE_D=1,
+    SM_SCALE=0.18033688011112042,
+    PAGE_TABLE_STRIDE=8192,
+    PAGE_SIZE=64,
+    NUM_KV_SPLITS=8,
+    MAX_SEQLEN_Q=8,
+    NUM_Q_HEADS=16,
+    NUM_KV_HEADS=2,
+    HEAD_DIM=64,
+    BLOCK_M=64,
+    BLOCK_N=64,
+    NUM_WARPS=4,
+    WINDOW_LEFT=2047,
+    IS_FP8=True,
+    NUM_STAGES=2,
+)
+
+
+def test_split_record_follows_the_wave_drain_of_its_partial():
+    """Each wave's record (one ``buffer_store_dword`` of the tag) comes after a
+    ``s_waitcnt vmcnt(0)`` that follows the wave's last partial store, with no
+    store between them, and the merger reads the partials ``sc0 nt`` without
+    any L2 writeback or invalidate, issuing the splits' partial loads back to
+    back with no full drain among them."""
+    kernel = compile_gfx950(
+        split_records_kernel,
+        {
+            "q_ptr": "*fp8e4nv",
+            "k_cache_ptr": "*fp8e4nv",
+            "v_cache_ptr": "*fp8e4nv",
+            "page_table_ptr": "*i32",
+            "cache_seqlens_ptr": "*i32",
+            "mid_o_ptr": "*fp32",
+            "mid_lse_ptr": "*fp32",
+            "out_ptr": "*bf16",
+            "record_ptr": "*i32",
+            "error_ptr": "*i32",
+            "tag": "i32",
+            "deadline_ticks": "i64",
+        },
+        _MUSE_SLIDING,
+        num_warps=_MUSE_SLIDING["NUM_WARPS"],
+        **persistent_compile_options(),
+    )
+    code = instruction_lines(kernel.asm["amdgcn"])
+    assert not [line for line in code if re.match(r"buffer_(wbl2|inv)", line)]
+    # The record is the last store before the merger's scalar record poll.
+    poll = next(i for i, line in enumerate(code) if line.startswith("s_load_dwordx16"))
+    record = max(
+        i
+        for i, line in enumerate(code[:poll])
+        if line.startswith("buffer_store_dword ")
+    )
+    stores = [
+        i
+        for i, line in enumerate(code[:record])
+        if line.startswith(("buffer_store", "global_store")) and i != record
+    ]
+    assert stores, "the partial stores precede the record"
+    drains = [
+        i
+        for i in range(stores[-1] + 1, record)
+        if code[i].startswith("s_waitcnt") and "vmcnt(0)" in code[i]
+    ]
+    assert drains, code[stores[-1] : record + 1]
+    loads = [
+        i for i, line in enumerate(code) if i > poll and line.startswith("buffer_load")
+    ]
+    partial_loads = [code[i] for i in loads]
+    assert partial_loads and all(
+        line.endswith("sc0 nt") for line in partial_loads
+    ), partial_loads
+    # The splits' partials stream back to back: the fold waits for them one
+    # at a time (counted waits) and never drains the loads still in flight.
+    assert not [
+        line
+        for line in code[loads[0] : loads[-1]]
+        if line.startswith("s_waitcnt") and "vmcnt(0)" in line
+    ]
+    first_wait = next(
+        i for i in range(loads[0], len(code)) if code[i].startswith("s_waitcnt vmcnt")
+    )
+    assert (
+        sum(1 for i in loads if i < first_wait) >= 16
+    ), "every split's partial load is issued before the first wait"
+
+
+def _metadata(assembly: str, key: str) -> int:
+    return int(re.search(rf"\.{key}:\s+(\d+)", assembly).group(1))
+
+
+def test_sender_sums_waves_with_wide_lds_reads():
+    """The o_proj sender (64 columns x K 1024, 8 waves) multiplies resident
+    weights with no cross-wave traffic before one LDS exchange, and reads the
+    exchange as whole 8-byte runs per wave (the columns are stored fastest),
+    not as scattered 4-byte reads."""
+    kernel = compile_gfx950(
+        sender_kernel,
+        {"w_ptr": "*bf16", "x_ptr": "*bf16", "out_ptr": "*bf16", "M": "i32"},
+        dict(K=1024, OUTPUTS=64, VECTOR=2),
+        num_warps=8,
+    )
+    assembly = kernel.asm["amdgcn"]
+    code = instruction_lines(assembly)
+    reads = [line.split()[0] for line in code if line.startswith("ds_read")]
+    assert reads and not [
+        r for r in reads if r in ("ds_read_b32", "ds_read2_b32")
+    ], reads
+    assert len(reads) <= 4, reads
+    assert sum(1 for line in code if line.startswith("v_mfma")) == 16
+    assert sum(1 for line in code if line == "s_barrier") == 1
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+
+
+@pytest.mark.parametrize(
+    "kernel,extra,constexprs,max_vgprs",
+    [
+        (
+            kpart_router_kernel,
+            {"hi_ptr": "*bf16", "lo_ptr": "*bf16"},
+            dict(EXPERTS=256),
+            192,
+        ),
+        (
+            kpart_pooler_kernel,
+            {"w_ptr": "*bf16"},
+            dict(OUTPUTS=512, ROWS=64),
+            224,
+        ),
+    ],
+    ids=["router", "pooler"],
+)
+def test_kpart_consumers_fit_their_register_budget(
+    kernel, extra, constexprs, max_vgprs
+):
+    """The router and pooler K-part tasks hold their weights and build x
+    from the deferred norm within NATIVE-DESIGN's per-role budget, with no
+    scratch (a spill would drain the resident weights)."""
+    signature = {
+        "b_ptr": "*bf16",
+        "sums_ptr": "*fp32",
+        "h_ptr": "*fp32",
+        "alpha_ptr": "*fp32",
+        "beta_ptr": "*fp32",
+        "post_ptr": "*bf16",
+        "pre_ptr": "*bf16",
+        **extra,
+        "part_ptr": "*i64",
+        "tag": "i32",
+        "M": "i32",
+    }
+    constexprs = dict(
+        WIDTH=8192, PRODUCERS=64, PARTS=8, POST_EPS=1e-6, PRE_EPS=1e-5, **constexprs
+    )
+    assembly = compile_gfx950(kernel, signature, constexprs, num_warps=8).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    assert _metadata(assembly, "vgpr_count") <= max_vgprs
+    code = instruction_lines(assembly)
+    stores = [line for line in code if line.startswith("buffer_store")]
+    assert stores and all(line.endswith("sc0 sc1") for line in stores), stores
+
+
+def test_topk_keys_stay_in_one_wave():
+    """The top-8 of a row runs on its wave alone: no LDS, no barrier, no
+    scratch, 64-bit key compares."""
+    assembly = compile_gfx950(
+        topk_keys_kernel,
+        {
+            "logits_ptr": "*fp32",
+            "bias_ptr": "*fp32",
+            "ids_ptr": "*i32",
+            "weights_ptr": "*fp32",
+            "M": "i32",
+        },
+        dict(E=256, TOPK=8, ROUTED_SCALING_FACTOR=2.5),
+        num_warps=8,
+    ).asm["amdgcn"]
+    code = instruction_lines(assembly)
+    assert not [line for line in code if line.startswith("ds_") or line == "s_barrier"]
+    assert any(line.startswith("v_cmp_gt_i64") for line in code)
+    assert _metadata(assembly, "private_segment_fixed_size") == 0

@@ -125,6 +125,27 @@ def head_norm(q_norm: HeadRMSNorm, k_norm: HeadRMSNorm) -> HeadNorm:
     )
 
 
+@dataclass(frozen=True)
+class GQAPrologueTarget:
+    """What a GQA layer's prologue applies and where it writes K/V.
+
+    For a kernel that runs this layer's prologue inside a larger launch: it
+    must apply ``norm`` and ``rotary``, round the query to ``query_dtype`` and
+    write K/V into ``cache`` exactly as ``gqa_prologue`` does.
+
+    Attributes:
+        cache: The pool's write target at this forward's padded write slots.
+        norm: The per-head query and key norm, or None.
+        rotary: The rotary embedding at the forward's positions, or None.
+        query_dtype: The dtype core attention reads the query in.
+    """
+
+    cache: HeadKVCache
+    norm: HeadNorm | None
+    rotary: Rotary | None
+    query_dtype: torch.dtype
+
+
 class PagedAttention(nn.Module):
     """
     The attention layer implementation.
@@ -299,18 +320,46 @@ class PagedAttention(nn.Module):
             The prepared query, and the key/value rows unless the forward
             decodes (decode attention reads the cache).
         """
-        norm, rotary = self._steps(positions)
+        target = self.prologue_target(positions, q.shape[0], q.dtype, ctx)
         return gqa_prologue(
             q,
             k,
             v,
-            norm=norm,
-            rotary=rotary,
-            cache=self._write_target(q, ctx),
-            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
+            norm=target.norm,
+            rotary=target.rotary,
+            cache=target.cache,
+            query_dtype=target.query_dtype,
             return_kv=not ctx.forward_mode.is_decode(),
             solution=None,
             override=None,
+        )
+
+    def prologue_target(
+        self,
+        positions: torch.Tensor,
+        rows: int,
+        projection_dtype: torch.dtype,
+        ctx: ForwardContext,
+    ) -> GQAPrologueTarget:
+        """This GQA layer's prologue steps and K/V write target for ``rows``
+        rows of the forward, the ones :meth:`prologue` applies.
+
+        Args:
+            positions: The forward's token positions.
+            rows: The rows the forward carries, padding included.
+            projection_dtype: The dtype of the projected q/k/v rows.
+            ctx: The forward's context.
+        """
+        norm, rotary = self._steps(positions)
+        slots = ctx.attn_backend.padded_write_locations(self, ctx.forward_mode, rows)
+        cache = self._local_target(slots, ctx)
+        return GQAPrologueTarget(
+            cache=cache,
+            norm=norm,
+            rotary=rotary,
+            query_dtype=ctx.attn_backend.query_dtype(
+                self, ctx.forward_mode, projection_dtype
+            ),
         )
 
     def store_prepared(

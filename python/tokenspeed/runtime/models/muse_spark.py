@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable
 from functools import partial
@@ -30,6 +31,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.decoder_layer import FusedDecoderLayer, PlanKey
 from tokenspeed_kernel.ops.gemm import (
     _use_mv,
     fp32_router_gemv_counters,
@@ -93,6 +95,11 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+from tokenspeed.runtime.layers.fused_decoder_layer import (
+    agree_served_shapes,
+    current_deployment,
+    deployment_decline_reasons,
+)
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -131,12 +138,19 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.common import make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.failure_records import rank_record_path
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
 
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
+
+logger = logging.getLogger(__name__)
+
+# Requests per decode step that fused decoder layers are prepared for: most
+# speculative decode steps carry one or two requests.
+_FUSED_REQUESTS = (1, 2)
 
 # Row limit of the generic column gather and the NVLS mailbox.
 _GATHER_WORKSPACE_ROWS = 64
@@ -951,6 +965,20 @@ class MuseSparkAttention(nn.Module):
             pdl_enabled(),
         )
         return self._project(output)
+
+    def prepare_query(
+        self,
+        positions: torch.Tensor,
+        normalized: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project and prepare this layer's query and write its K/V, the way
+        a fused layer hands the next one its query: ``(q, output gate)``."""
+        qkv_gate, _ = self.qkv_proj(normalized)
+        q, k, v, output_gate = qkv_gate.split(
+            (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
+        )
+        return self.attn.prologue(q, k, v, positions, ctx).q, output_gate
 
     def forward_sliding_tail(
         self,
@@ -2009,6 +2037,12 @@ class MuseSparkDecoderLayer(nn.Module):
             config.hidden_size, self.residual_gate_temperature
         )
         self.iris_state: MuseIrisState | None = None
+        self.layer_kind = (
+            "full" if self.self_attn.attn.sliding_window_size < 0 else "sliding"
+        )
+        # The prepared fused layer for this decoder layer, set at startup
+        # (``MuseSparkModel.prepare_fused_layers``); None runs the regular layer.
+        self.fused: FusedDecoderLayer | None = None
 
     def _sliding_attention_tail(
         self,
@@ -2055,6 +2089,98 @@ class MuseSparkDecoderLayer(nn.Module):
             pre_norm,
             iris,
         )
+
+    def fused_weights(self, next_layer: MuseSparkDecoderLayer) -> dict[str, object]:
+        """The tensors a fused launch of this layer reads in place: this
+        layer's attention output, boundaries, router, pooler, experts and
+        post-expert projection, and the next layer's input norm and query
+        projection (the launch ends with them)."""
+        attention, mlp = self.self_attn, self.mlp
+        post_attention = self.post_attention_residual_gate._gate_coefficients()
+        post_feedforward = self.post_feedforward_residual_gate._gate_coefficients()
+
+        def norm(module: MuseSparkRMSNorm) -> tuple:
+            return module.weight, module.eps, module.weight_offset
+
+        return {
+            "o_proj": attention.o_proj.weight,
+            "post_attention_norm": norm(self.post_attention_layernorm),
+            "post_attention_gate": post_attention,
+            "pre_feedforward_norm": norm(self.pre_feedforward_layernorm),
+            "router": mlp.gate.weight,
+            "router_bias": mlp.gate.e_score_correction_bias,
+            "pooler": mlp.pre_expert_proj.weight,
+            "pooled_norm": norm(mlp.pre_expert_norm),
+            "experts": mlp.experts,
+            "post_expert_proj": mlp.post_expert_proj.weight,
+            "post_expert_norm": norm(mlp.post_expert_norm),
+            "post_feedforward_norm": norm(self.post_feedforward_layernorm),
+            "post_feedforward_gate": post_feedforward,
+            "next_input_norm": norm(next_layer.input_layernorm),
+            "next_qkv_proj": next_layer.self_attn.qkv_proj.weight,
+        }
+
+    def prepare_fused_query(
+        self,
+        positions: torch.Tensor,
+        attention_input: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The first fused layer's query, prepared from the regular boundary's
+        attention input; its K/V rows are written."""
+        return self.self_attn.prepare_query(
+            positions, self.comm_manager.pre_attn_comm(attention_input, ctx), ctx
+        )
+
+    def forward_fused(
+        self,
+        positions: torch.Tensor,
+        prepared_query: tuple[torch.Tensor, torch.Tensor],
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        next_layer: MuseSparkDecoderLayer,
+    ) -> tuple[
+        torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor | None
+    ]:
+        """Run this layer as one fused launch.
+
+        Args:
+            prepared_query: This layer's ``(q, output gate)``, its K/V rows
+                already written.
+            next_layer: The next decoder layer. When it runs fused too, this
+                launch prepares its query and writes its K/V; otherwise the
+                launch ends at the FFN boundary with its input norm applied.
+
+        Returns:
+            ``(residual, next prepared query, None)`` when ``next_layer`` runs
+            fused, else ``(residual, None, next layer's attention input)``.
+        """
+        fused = self.fused
+        assert fused is not None
+        cache = self.self_attn.attn.decode_kv_view(ctx)
+        assert cache is not None, "fused layers run decode forwards only"
+        if next_layer.fused is None:
+            norm = next_layer.input_layernorm
+            normed, residual = fused.forward_last(
+                prepared_query,
+                hidden_states,
+                positions=positions,
+                cache=cache,
+                next_norm=(norm.weight, norm.eps, norm.weight_offset),
+            )
+            return residual, None, normed
+        attention = next_layer.self_attn
+        next_prologue = attention.attn.prologue_target(
+            positions, hidden_states.shape[0], attention.qkv_proj.weight.dtype, ctx
+        )
+        next_query, residual = fused.forward(
+            prepared_query,
+            hidden_states,
+            positions=positions,
+            cache=cache,
+            next_prologue=next_prologue,
+        )
+        return residual, next_query, None
 
     def refresh_residual_gates(self) -> None:
         """Re-derive ``(alpha, beta)`` in place so captured graphs read reloaded gates."""
@@ -2314,6 +2440,13 @@ class MuseSparkModel(BaseTransformerModel):
         )
         self._final_norm_op = self._build_final_norm_op()
         self.iris_state: MuseIrisState | None = None
+        # (requests, tokens per request) decode shapes every rank serves with
+        # fused layers (``prepare_fused_layers``); empty runs every layer
+        # regular.
+        self.fused_shapes: frozenset[tuple[int, int]] = frozenset()
+        # The launch state and communication regions every fused layer of
+        # this group shares; allocated once, before the KV cache is sized.
+        self.fused_state: object | None = None
 
     def resolve_layers(
         self,
@@ -2407,6 +2540,112 @@ class MuseSparkModel(BaseTransformerModel):
             and (mapping.moe.tp_size == 1 or rows <= iris.owned_route_max_rows)
         )
 
+    def prepare_fused_layers(self, rank_in_group: int) -> None:
+        """Prepare the fused decoder layers and agree, across the attention
+        group, on the decode shapes they serve; log the startup report.
+
+        Fused layers cover the contiguous layers with MXFP4 experts; the
+        layers before and after them stay regular. Runs once, before the KV
+        cache is sized and before capture.
+        """
+        from tokenspeed_kernel.ops.decoder_layer import (
+            prepare_decoder_layer,
+            prepare_decoder_layer_state,
+        )
+
+        if self.fused_state is not None:
+            return
+        indices = [
+            i for i, layer in enumerate(self.layers) if layer.mlp.quantized_experts
+        ]
+        if (
+            not indices
+            or indices[0] == 0
+            or indices[-1] + 1 >= len(self.layers)
+            or indices != list(range(indices[0], indices[-1] + 1))
+        ):
+            return
+        args = global_server_args_dict
+        width = (
+            int(args["speculative_num_draft_tokens"])
+            if args["speculative_algorithm"]
+            else 1
+        )
+        mapping = self.mapping
+        group = mapping.attn.tp_group
+        state = prepare_decoder_layer_state(
+            recipe="muse_spark",
+            group=process_group_manager.get_device_process_group(group),
+            rank_in_group=rank_in_group,
+            max_requests=max(_FUSED_REQUESTS),
+            failure_record_path=rank_record_path("decoder-layer", dist.get_rank()),
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+        )
+        if state is None:
+            # No leaf serves this platform: nothing was allocated.
+            return
+        self.fused_state = state
+        shapes = [(requests, width) for requests in _FUSED_REQUESTS]
+        deployment = deployment_decline_reasons(
+            current_deployment(args, forward_side_stream=self.alt_stream is not None)
+        )
+        reasons = {shape: dict.fromkeys(deployment) for shape in shapes}
+        traits = {
+            "verify_width": width,
+            "tp_size": mapping.attn.tp_size,
+            "ep_size": mapping.moe.ep_size,
+            "kv_cache_dtype": args["kv_cache_dtype"],
+        }
+        prepared = []
+        for index in indices:
+            layer, next_layer = self.layers[index], self.layers[index + 1]
+            next_kind = (
+                next_layer.layer_kind if next_layer.mlp.quantized_experts else "regular"
+            )
+            fused = prepare_decoder_layer(
+                recipe="muse_spark",
+                plan_keys=[
+                    PlanKey(requests, layer.layer_kind, next_kind)
+                    for requests in _FUSED_REQUESTS
+                ],
+                traits=traits,
+                weights=layer.fused_weights(next_layer),
+                state=state,
+            )
+            prepared.append(fused)
+            for shape in shapes:
+                if fused is None:
+                    reasons[shape]["no fused decoder layer kernel"] = None
+                    continue
+                for reason in fused.decline_reasons(shape[0]):
+                    reasons[shape][f"layer {index}: {reason}"] = None
+        process_group_manager.init_process_group(group, backend="gloo")
+        served = agree_served_shapes(
+            shapes,
+            {shape: list(lines) for shape, lines in reasons.items()},
+            process_group_manager.get_process_group("gloo", group),
+        )
+        if rank_in_group == 0:
+            logger.info(served.report("fused decoder layers"))
+        if served.shapes:
+            for index, fused in zip(indices, prepared):
+                self.layers[index].fused = fused
+        self.fused_shapes = served.shapes
+
+    def _uses_fused_layers(self, rows: int, ctx: ForwardContext) -> bool:
+        """Whether this forward runs its fused layers: a decode forward whose
+        padded shape every rank agreed to serve. It reads nothing rank-local,
+        so a captured graph records the same choice on every rank."""
+        if not self.fused_shapes or ctx.bs <= 0 or rows % ctx.bs:
+            return False
+        first = next(layer for layer in self.layers if layer.fused is not None)
+        return (ctx.bs, rows // ctx.bs) in self.fused_shapes and (
+            # Fused layers read the decode metadata; an extend forward of the
+            # same shape has none.
+            first.self_attn.attn.decode_kv_view(ctx)
+            is not None
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2420,6 +2659,8 @@ class MuseSparkModel(BaseTransformerModel):
         )
         rows, width = hidden_states.shape
         owned_global_rows = rows if self._can_use_owned_rows(rows, ctx) else None
+        fused = owned_global_rows is None and self._uses_fused_layers(rows, ctx)
+        prepared_query = None
         attention_input = None
         if owned_global_rows is not None:
             local_rows = (
@@ -2448,6 +2689,19 @@ class MuseSparkModel(BaseTransformerModel):
                     aux_hidden_states,
                     ctx,
                 )
+            if fused and layer.fused is not None:
+                if prepared_query is None:
+                    prepared_query = layer.prepare_fused_query(
+                        positions, attention_input, ctx
+                    )
+                hidden_states, prepared_query, attention_input = layer.forward_fused(
+                    positions,
+                    prepared_query,
+                    hidden_states,
+                    ctx,
+                    self.layers[layer_index + 1],
+                )
+                continue
             # Each FFN boundary emits the next layer's attention input rows.
             next_input_layernorm = (
                 self.layers[layer_index + 1].input_layernorm
@@ -2844,6 +3098,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 "Muse communication was prepared below the requested capacity"
             )
         self.model.iris_state = state
+        self.model.prepare_fused_layers(group.index(dist.get_rank()))
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state

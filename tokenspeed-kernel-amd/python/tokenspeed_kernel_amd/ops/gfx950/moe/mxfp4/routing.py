@@ -575,6 +575,77 @@ def sigmoid_bias_topk_row_gfx950(
 
 
 @gluon.jit
+def sigmoid_bias_topk_keys_gfx950(
+    logits,
+    bias_ptr,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    TKP: gl.constexpr,
+    NORMALIZE_TOPK_WEIGHTS: gl.constexpr,
+    ROUTED_SCALING_FACTOR: gl.constexpr,
+    X_DTYPE: gl.constexpr,
+    OUT_LAYOUT: gl.constexpr,
+):
+    """Biased-sigmoid top-k of several rows at once, one wave per row.
+
+    ``logits`` is FP32 ``[rows, EP]`` (``EP >= E`` a power of two) in a
+    layout that puts a row's experts across one wave's lanes (each lane a
+    few in-thread). Each pick is one 64-bit max per row: the biased score's
+    bits made order-preserving as an integer, high, and ``EP - 1 - expert``
+    low, so the largest key is the largest score and, among equal scores,
+    the lowest expert, as in :func:`sigmoid_bias_topk_row_gfx950` (whose
+    three reductions per pick this replaces with two). The selected weight,
+    normalization and scaling are that function's, in its order.
+
+    Returns ``(ids, weights)``: int32 and FP32 ``[rows, TKP]`` in
+    ``OUT_LAYOUT`` (a row's TKP picks across one wave's lanes); picks past
+    ``TOPK`` hold expert 0 and weight 0.
+    """
+    layout: gl.constexpr = logits.type.layout
+    EP: gl.constexpr = logits.shape[1]
+    expert = gl.arange(0, EP, gl.SliceLayout(0, layout))[None, :]
+    expert_mask = expert < E
+    scores = gl.fdiv(1.0, 1.0 + gl.exp(-logits)).to(X_DTYPE)
+    bias = cdna4.buffer_load(bias_ptr, expert, mask=expert_mask, other=0.0).to(
+        gl.float32
+    )
+    choice = gl.where(expert_mask, scores.to(gl.float32) + bias, -float("inf"))
+    # Order-preserving integer of an FP32: flip the magnitude bits of
+    # negative values. -0.0 sorts below +0.0, which differs from the float
+    # compare only between two zero choices (a zero sigmoid plus a zero bias).
+    bits = choice.to(gl.int32, bitcast=True)
+    ordered = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+    keys = (ordered.to(gl.int64) << 32) | (EP - 1 - expert).to(gl.int64)
+    # A masked expert never wins: its key is below every real one.
+    keys = gl.where(expert_mask, keys, -(2**63))
+
+    pick = gl.arange(0, TKP, gl.SliceLayout(0, OUT_LAYOUT))[None, :]
+    ids = gl.zeros([logits.shape[0], TKP], gl.int32, OUT_LAYOUT)
+    weights = gl.zeros([logits.shape[0], TKP], gl.float32, OUT_LAYOUT)
+    for rank in gl.static_range(TOPK):
+        best = gl.max(keys, axis=1)
+        selected = (EP - 1 - (best & 0xFFFFFFFF)).to(gl.int32)
+        hit = expert == selected[:, None]
+        weight = gl.sum(gl.where(hit, scores, 0.0), axis=1)
+        selected = gl.convert_layout(selected, gl.SliceLayout(1, OUT_LAYOUT))
+        weight = gl.convert_layout(weight, gl.SliceLayout(1, OUT_LAYOUT))
+        ids = gl.where(pick == rank, selected[:, None], ids)
+        weights = gl.where(pick == rank, weight[:, None], weights)
+        keys = gl.where(hit, -(2**63), keys)
+
+    if NORMALIZE_TOPK_WEIGHTS:
+        weights = weights.to(X_DTYPE)
+        denominator = gl.sum(weights, axis=1)
+        denominator = gl.where(denominator != 0.0, denominator, 1.0)
+        weights = (
+            weights.to(gl.float32) * (ROUTED_SCALING_FACTOR / denominator)[:, None]
+        )
+    else:
+        weights *= ROUTED_SCALING_FACTOR
+    return ids, weights
+
+
+@gluon.jit
 def gluon_sigmoid_bias_topk_gfx950(
     logits_ptr,
     bias_ptr,

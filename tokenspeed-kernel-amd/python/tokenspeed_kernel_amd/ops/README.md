@@ -94,6 +94,12 @@ through memory instead of kernel boundaries.
   (`gl.atomic_poll`, no barrier in its loop); its closing workgroup barrier
   orders the loads after it. It checks the deadline and the abort word every
   50 us of polling.
+- `wave.py` holds the per-wave facts Gluon cannot state (inline asm, each in
+  the compiler TODO): per-wave SGPR values, an opaque index that keeps LDS
+  reads in a loop, a value ordered after a load (to publish after the wave's
+  stores retire), and an LDS exchange among the waves of a workgroup without
+  a barrier (its spin has no deadline: only same-workgroup waves that never
+  wait back may be waited for).
 
 ## GEMM
 
@@ -281,6 +287,14 @@ persistent kernel calls with explicit task ids, plus a standalone launcher
   offsets (one vote per wave per retry, no barrier) and sums them in part
   order, stopping at a `Launch` deadline through the caller's `on_expiry`.
 - Results are deterministic but not bit-equal to a full-K GEMV.
+- For roles that build or hold their own operands:
+  `gemv_a16w16_splitk_x_gfx950` loads a task's x slice as the B operand;
+  `gemv_a16w16_splitk_wave_sums_gfx950` (one MFMA per tile) and
+  `gemv_a16w16_splitk_hi_lo_sums_gfx950` (an FP32 weight and x as BF16
+  hi + lo, three MFMAs per tile, the lo x lo term dropped) return the
+  wave-summed `[16, rows]` FP32 in the caller's layout;
+  `gemv_a16w16_splitk_publish_gfx950` stores such sums as the finish's
+  tagged words.
 
 #### Algorithm
 
@@ -288,7 +302,52 @@ Weights and the task's x slice load straight into the 16x16x32 MFMA operand
 layouts, so nothing passes through LDS before the MFMAs. A task reads only
 its K slice of x, which keeps the GEMV flat in N at 8-16 rows where a full-K
 GEMV rereads all of x per program. The eight waves' accumulators meet in LDS
-behind one barrier.
+behind one barrier. In `gemv_a16w16_splitk_exchange_gfx950` they are stored
+rows fastest, so each thread reads its contiguous rows of every wave with
+wide LDS reads (a 64-row sender: 4 `ds_read2st64_b64`, not 32 4-byte reads)
+and adds the waves in wave order in registers.
+
+### gfx950 deferred residual norms
+
+`layernorm/deferred.py` folds a residual boundary's post-norm and the next
+pre-norm into their consumers.
+
+#### Contract
+
+- Producers publish four FP32 sums per row and column block: `sum b^2`,
+  `B = sum (alpha h)(beta b)`, `A = sum (alpha h)^2`, `C = sum (beta b)^2`.
+- `deferred_norm_scales_gfx950` takes them as `[rows, producers, 4]` with the
+  producers across one wave's lanes and returns `inv1`, `inv2` per row.
+- `deferred_norm_rows_gfx950` returns `h' = fma(beta, b post inv1, alpha h)`
+  and `x = h' inv2 pre` elementwise; `post` / `pre` are weight plus offset
+  rounded to BF16, as FP32 or BF16 operands.
+
+#### Algorithm
+
+`inv1 = rsqrt(sum b^2 / W + eps_post)` and `inv2 = rsqrt((A + 2 inv1 B +
+inv1^2 C) / W + eps_pre)`, the attention tail finisher's operations in its
+order, so a consumer builds its own columns of x without waiting for the
+normalized row.
+
+### gfx950 sigmoid-bias routing top-k
+
+`moe/mxfp4/routing.py` selects each row's top-k experts by
+`sigmoid(logit) + bias`, with weights normalized and scaled.
+
+#### Contract
+
+- `sigmoid_bias_topk_row_gfx950` routes one row per call (its kernel,
+  `gluon_sigmoid_bias_topk_gfx950`, one row per program).
+- `sigmoid_bias_topk_keys_gfx950` routes several rows of a `[rows, EP]` FP32
+  tensor, one wave per row, and returns ids and weights `[rows, TKP]` bitwise
+  equal to the row function's.
+
+#### Algorithm
+
+The row function takes three reductions per pick (the maximum, the lowest
+expert at it, its weight). The keyed form takes two: one 64-bit maximum of
+the score's order-preserving integer bits (high) and `EP - 1 - expert` (low),
+which is the largest score with ties to the lowest expert, then the weight.
 
 ### gfx950 dense BF16 decode GEMV
 
@@ -1421,6 +1480,22 @@ masked to the rows' windows.
 Every split stores its partial and LSE (-inf for rows without keys in it), so
 the reduce does not read cache lengths.
 
+#### Split bodies for persistent kernels
+
+`mha_decode_sliding_split_gfx950(program, ...)` streams one sliding split of
+an `AttentionProgram` built from caller-chosen (request, head block, split),
+and stores its partial. Two merges follow it:
+
+- `finalize_splits`: the last arriver on an acq_rel counter merges (the
+  standalone kernel).
+- `publish_split_record` / `merge_split_records`: each wave waits for its own
+  partial stores (`release_drain`), then stores an int32 tag record; a
+  designated merger waits for all `NUM_KV_SPLITS * NUM_WARPS` records through
+  a caller-supplied poll (the scalar `poll_tags16` in a persistent layer) and
+  merges with `.cg` partial loads, all splits' loads issued before the fold.
+  Same split boundaries and fold order, so the rows are bitwise the
+  last arriver's.
+
 #### Balanced split schedule
 
 Under a captured graph the split count above follows the padded batch, so a
@@ -2099,6 +2174,45 @@ rounds is one wave max reduction followed by clearing the winning key. The
 selected logits come back exactly from the key bits, so no second gather is
 needed. The ids and weights collect in registers and leave with one buffer
 store each.
+
+### gfx950 native MXFP4 MoE stream
+
+`moe/mxfp4/native_stream.py`: the MoE phase of a persistent decode layer
+(EP1 slice, up to 16 rows), as device functions `prefetch_moe` /
+`run_moe` and a standalone launch for tests.
+
+#### Contract
+
+- Inputs: the routed ids `(rows, top_k)`, the MXFP4 activations and their
+  swizzled scales, and the direct decode's gdot128 weights with swizzled
+  scales (optionally the gate/up scales lane-major from
+  `pack_cdna4_mxfp4_scale_lanes`).
+- Every down unit's fp32 `[16, 128]` result goes to a sink function with
+  its per-token routes and columns; the layer passes its H4 push, the
+  standalone launch stores `out[route, :]` in bf16.
+- Bitwise equal to the direct decode: the same per-column MFMA chain,
+  SwiGLU, 32-value MXFP4 mids and down chain.
+- Plan fields (constexpr): `RING`, `QUAD_MAP`, `DN_ORDER`, `ADDR_SOFFSET`,
+  `TAG_GLC`, `SCALE_LANES`, `TAIL_NUM` / `TAIL_DEN`.
+
+#### Algorithm
+
+- Every token is an A row (MFMA M = 16), so each touched expert's weights
+  are read once. A gate/up strip is (expert, 16 columns, all K); a quad of 4
+  waves runs the 4 strips of one 32-value mids group. A down unit is
+  (expert, 64 output columns) per wave.
+- Each wave keeps `RING` 1 KB weight chunks in flight and refills the slot
+  it consumed `RING` steps ahead, into the next strip or unit past the
+  current one's end, so the ring does not drain between items. Item
+  metadata comes from LDS and readiness from scalar polls: a vector load the
+  wave waits on would wait for every weight load before it.
+- The quad exchanges its SwiGLU values through LDS (no barrier), each wave
+  quantizes 4 rows of the group, stores them per route, and publishes its
+  tag after a later load of its own has been waited for.
+- The plan is closed-form from the ids in every workgroup: whole experts per
+  XCD, the `E % 8` leftovers split by group; the 16 tail-role workgroups of
+  an XCD (slots 0, 16-30) take half a full share of gate/up only, the others
+  the rest, then the down units, earliest-ready expert first.
 
 ### MXFP4 sorted experts
 

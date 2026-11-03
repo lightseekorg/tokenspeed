@@ -107,6 +107,44 @@ def gemv_a16w16_splitk_weights_gfx950(
 
 
 @gluon.jit
+def gemv_a16w16_splitk_x_gfx950(
+    x_ptr,
+    x_stride,
+    task,
+    M,
+    K: gl.constexpr,
+    PARTS: gl.constexpr,
+    GROUPS: gl.constexpr,
+    X_CACHE: gl.constexpr,
+):
+    """Load task ``task``'s slice of x as the MFMA B operand.
+
+    Returns ``[waves, K / PARTS / waves, 16]`` BF16: wave w's contiguous K
+    range of the task's part, for 16 token slots; slots past ``M`` reread
+    token ``M - 1``. ``X_CACHE`` as in :func:`gemv_a16w16_splitk_finish_gfx950`.
+    """
+    WAVES: gl.constexpr = gl.num_warps()
+    KP: gl.constexpr = K // PARTS
+    KW: gl.constexpr = KP // WAVES
+    b_l: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=_mfma(WAVES), k_width=8
+    )
+    part = task // GROUPS
+    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, b_l)))
+    k = gl.arange(0, KW, gl.SliceLayout(0, gl.SliceLayout(2, b_l)))
+    token = gl.minimum(
+        gl.arange(0, _BLOCK_T, gl.SliceLayout(0, gl.SliceLayout(1, b_l))), M - 1
+    )
+    return cdna4.buffer_load(
+        x_ptr,
+        token[None, None, :] * x_stride
+        + (part * KP + wave * KW)[:, None, None]
+        + k[None, :, None],
+        cache=X_CACHE,
+    )
+
+
+@gluon.jit
 def gemv_a16w16_splitk_finish_gfx950(
     tiles,
     x_ptr,
@@ -132,25 +170,11 @@ def gemv_a16w16_splitk_finish_gfx950(
     and the partials are read within the same launch on other XCDs.
     """
     WAVES: gl.constexpr = gl.num_warps()
-    KP: gl.constexpr = K // PARTS
-    KW: gl.constexpr = KP // WAVES
     TILES: gl.constexpr = ROWS_PER_TASK // 16
     mfma: gl.constexpr = _mfma(WAVES)
-    b_l: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
     group = task % GROUPS
     part = task // GROUPS
-    wave = gl.arange(0, WAVES, gl.SliceLayout(1, gl.SliceLayout(2, b_l)))
-    k = gl.arange(0, KW, gl.SliceLayout(0, gl.SliceLayout(2, b_l)))
-    token = gl.minimum(
-        gl.arange(0, _BLOCK_T, gl.SliceLayout(0, gl.SliceLayout(1, b_l))), M - 1
-    )
-    x = cdna4.buffer_load(
-        x_ptr,
-        token[None, None, :] * x_stride
-        + (part * KP + wave * KW)[:, None, None]
-        + k[None, :, None],
-        cache=X_CACHE,
-    )
+    x = gemv_a16w16_splitk_x_gfx950(x_ptr, x_stride, task, M, K, PARTS, GROUPS, X_CACHE)
     # Every wave's accumulator of every tile to LDS, one barrier, then each
     # thread sums its (row, token) outputs over the waves.
     bufs = ()
@@ -184,6 +208,103 @@ def gemv_a16w16_splitk_finish_gfx950(
             mask=(c < M)[None, :] & (rows < N)[:, None],
             cache=PART_CACHE,
         )
+
+
+@gluon.jit
+def gemv_a16w16_splitk_exchange_gfx950(accs, OUT_LAYOUT: gl.constexpr):
+    """Sum the waves' MFMA accumulators of a task's tiles.
+
+    ``accs`` holds one ``[waves, 16 rows, 16 tokens]`` FP32 accumulator per
+    16-row tile (a power-of-two count), each wave's over its own K range.
+    They go to one LDS buffer ``[waves, 16 tokens, rows]`` with the rows
+    fastest, so after one barrier a thread of ``OUT_LAYOUT`` reads its
+    contiguous rows of every wave with wide LDS reads and adds the waves in
+    wave order in its own registers.
+
+    ``OUT_LAYOUT`` is a rank-3 ``[waves, 16, rows]`` blocked layout holding
+    every wave in-thread (``size_per_thread[0] == waves``). Returns the FP32
+    sums ``[16 tokens, rows]`` in ``gl.SliceLayout(0, OUT_LAYOUT)``.
+    """
+    WAVES: gl.constexpr = gl.num_warps()
+    TILES: gl.constexpr = len(accs)
+    partials = gl.allocate_shared_memory(
+        gl.float32,
+        [WAVES, _BLOCK_T, 16 * TILES],
+        gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0]),
+    )
+    for t in gl.static_range(TILES):
+        partials.slice(16 * t, 16, 2).store(gl.permute(accs[t], [0, 2, 1]))
+    gl.barrier()
+    return gl.sum(partials.load(OUT_LAYOUT), axis=0)
+
+
+@gluon.jit
+def gemv_a16w16_splitk_wave_sums_gfx950(tiles, x, OUT_LAYOUT: gl.constexpr):
+    """Multiply resident ``tiles`` (:func:`gemv_a16w16_splitk_weights_gfx950`)
+    by their B operand ``x`` and sum the waves
+    (:func:`gemv_a16w16_splitk_exchange_gfx950`): ``[16 tokens, rows]`` FP32
+    in ``gl.SliceLayout(0, OUT_LAYOUT)``."""
+    mfma: gl.constexpr = _mfma(gl.num_warps())
+    accs = ()
+    for t in gl.static_range(len(tiles)):
+        accs += (
+            cdna4.mfma(
+                tiles[t], x, gl.zeros((gl.num_warps(), 16, _BLOCK_T), gl.float32, mfma)
+            ),
+        )
+    return gemv_a16w16_splitk_exchange_gfx950(accs, OUT_LAYOUT)
+
+
+@gluon.jit
+def gemv_a16w16_splitk_hi_lo_sums_gfx950(hi, lo, x, OUT_LAYOUT: gl.constexpr):
+    """As :func:`gemv_a16w16_splitk_wave_sums_gfx950` for an FP32 weight
+    stored as BF16 ``hi`` + ``lo`` tiles and an FP32 B operand ``x``: each
+    tile accumulates ``hi xh + lo xh + hi xl`` on BF16 MFMAs, with ``xh =
+    bf16(x)`` and ``xl = bf16(x - xh)`` (the ``lo xl`` term, ~2^-16 of the
+    product, is dropped)."""
+    mfma: gl.constexpr = _mfma(gl.num_warps())
+    xh = x.to(gl.bfloat16)
+    xl = (x - xh.to(gl.float32)).to(gl.bfloat16)
+    accs = ()
+    for t in gl.static_range(len(hi)):
+        acc = cdna4.mfma(
+            hi[t], xh, gl.zeros((gl.num_warps(), 16, _BLOCK_T), gl.float32, mfma)
+        )
+        acc = cdna4.mfma(lo[t], xh, acc)
+        accs += (cdna4.mfma(hi[t], xl, acc),)
+    return gemv_a16w16_splitk_exchange_gfx950(accs, OUT_LAYOUT)
+
+
+@gluon.jit
+def gemv_a16w16_splitk_publish_gfx950(
+    sums,
+    part_ptr,
+    tag,
+    row0,
+    part,
+    M,
+    N: gl.constexpr,
+    PART_CACHE: gl.constexpr,
+):
+    """Publish ``sums`` (``[16 tokens, R]`` FP32, rows ``row0 ..``) as K part
+    ``part``'s partials: the 64-bit words of
+    :func:`gemv_a16w16_splitk_finish_gfx950` (value low, ``tag`` high, one
+    store each) at ``[part, token, row]`` of ``part_ptr`` ``[PARTS, M, N]``;
+    tokens past ``M`` are dropped. :func:`gemv_a16w16_splitk_sum_gfx950`
+    reads them."""
+    layout: gl.constexpr = sums.type.layout
+    c = gl.arange(0, sums.shape[0], gl.SliceLayout(1, layout))
+    rows = row0 + gl.arange(0, sums.shape[1], gl.SliceLayout(0, layout))
+    word = (tag.to(gl.int64) << 32) | (
+        sums.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF
+    )
+    cdna4.buffer_store(
+        word,
+        part_ptr,
+        (part * M + c[:, None]) * N + rows[None, :],
+        mask=(c < M)[:, None] & (rows < N)[None, :],
+        cache=PART_CACHE,
+    )
 
 
 @gluon.jit
@@ -363,9 +484,14 @@ def launch_gluon_gemv_a16w16_splitk_gfx950(
 
 
 __all__ = [
+    "gemv_a16w16_splitk_exchange_gfx950",
     "gemv_a16w16_splitk_finish_gfx950",
+    "gemv_a16w16_splitk_hi_lo_sums_gfx950",
+    "gemv_a16w16_splitk_publish_gfx950",
     "gemv_a16w16_splitk_sum_gfx950",
+    "gemv_a16w16_splitk_wave_sums_gfx950",
     "gemv_a16w16_splitk_weights_gfx950",
+    "gemv_a16w16_splitk_x_gfx950",
     "gluon_gemv_a16w16_splitk_gfx950",
     "gluon_gemv_a16w16_splitk_reduce_gfx950",
     "launch_gluon_gemv_a16w16_splitk_gfx950",
