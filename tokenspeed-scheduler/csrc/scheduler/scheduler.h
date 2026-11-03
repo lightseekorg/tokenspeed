@@ -259,13 +259,20 @@ private:
         bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
     };
+    // `yield_tokens`: what a chunk that cannot finish gives up for whole
+    // prompts behind it (YieldingChunkBudget). `must_complete`: admit only a
+    // first chunk that completes the prompt -- a whole prompt carried in such
+    // a chunk's forward; one that would not is skipped (no capacity failure),
+    // and one whose in-forward checkpoint block does not fit fails for
+    // capacity rather than ending at the checkpoint.
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
                                                 std::int32_t remaining, std::int32_t decode_input_tokens,
-                                                std::int64_t kv_token_limit);
+                                                std::int64_t kv_token_limit, std::int32_t yield_tokens,
+                                                bool must_complete);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
-                                                             std::int64_t kv_token_limit);
+                                                             std::int64_t kv_token_limit, std::int32_t yield_tokens);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            Request* request);
 
@@ -465,12 +472,59 @@ private:
     }
 
     // A resumed chunk or a new prompt's first chunk. Waiting for storage
-    // returns nullopt without reporting a capacity failure.
+    // returns nullopt without reporting a capacity failure. `yield_tokens`
+    // and `must_complete` as for schedulePrefillFirstChunk (the yield applies
+    // to a resumed chunk too).
     std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
                                                              std::vector<LoadBackOperation>& load_backs,
-                                                             std::int32_t kv_page_budget);
+                                                             std::int32_t kv_page_budget, std::int32_t yield_tokens,
+                                                             bool must_complete);
+
+    // SchedulerConfig::prefill_chunk_yield_tokens (docs/design/scheduler.md
+    // §1.1): a Submitted prompt a chunk that cannot finish may carry in its
+    // forward -- its position in the round's candidates, and the tokens
+    // (replay included) and KV pages the whole prompt takes.
+    struct WholePrompt {
+        std::size_t index{0};
+        Request* request{nullptr};
+        std::int32_t tokens{0};
+        std::int32_t pages{0};
+    };
+    // The tokens a Submitted request's first chunk takes to complete its
+    // prompt, replay included; nullopt when that chunk could not complete it
+    // whatever the budget -- its prefix waits for an eviction store, a
+    // junction cuts it, or it spans its in-forward checkpoint from inside a
+    // page -- and, on a model with a State group (`has_state_group`), when it
+    // shares the first page its KV lacks with the pages `resident_holder`'s
+    // admission is about to publish. A probe only: no KV event is registered
+    // and nothing is admitted.
+    std::optional<std::int32_t> wholePromptTokens(Request& request, Request* resident_holder, bool has_state_group);
+    // The round's whole prompts, probed once: the Submitted candidates from
+    // position `from` on that no phase scheduled yet and whose whole prompt
+    // takes at most prefill_chunk_yield_tokens, in candidate order, after at
+    // most kMaxYieldProbesPerRound probes; `resident_holder` is the resident
+    // chunk they are probed for, null for a new prompt's.
+    std::vector<WholePrompt> wholePromptsAfter(std::span<Request* const> candidates, std::size_t from,
+                                               const PlanBuild& build, Request* resident_holder);
+    // The whole prompts a holder carries: from the round's list, those from
+    // position `from` on still Submitted and unscheduled, in order, while
+    // their tokens fit prefill_chunk_yield_tokens and they and the holder fit
+    // the batch, the free request slots (one more for a new holder,
+    // `holder_is_new`) and, with max_kv_page_num, the KV page budget beside
+    // the holder's most pages (`holder_max_pages`).
+    std::vector<WholePrompt> carriedPrompts(std::span<const WholePrompt> whole_prompts, std::size_t from,
+                                            const PlanBuild& build, bool holder_is_new,
+                                            std::int32_t holder_max_pages) const;
+    // Admits the carried prompts behind a holder that kept the head of line
+    // (its operation the last pushed), each only if its first chunk completes
+    // it on the budget left; stops at the first capacity failure. Nothing it
+    // admits holds the head of line, and the holder's operation then moves
+    // behind theirs: the completing prefills run first, the incomplete one
+    // last.
+    void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<const WholePrompt> carried,
+                           std::int32_t decode_reserve);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
