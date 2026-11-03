@@ -20,7 +20,9 @@
 
 """Offline gfx950 codegen checks of the native decoder layer's device bodies.
 
-These compile without a GPU, so they run on any host with the AMD backend.
+These compile without a GPU, so they run on any host with the AMD backend;
+the test tree's conftest needs a device, so on a GPU-less host run them with
+``pytest --noconftest``.
 Each test names the instruction-level contract its body promises
 (NATIVE-DESIGN P-ISA): waits, cache bits, and what may not drain a stream.
 """

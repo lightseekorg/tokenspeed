@@ -61,7 +61,11 @@ def test_sender_matches_fp32_reference(rows: int) -> None:
     )
     actual = out.view(blocks, 16, outputs)[:, :rows].permute(1, 0, 2).reshape(rows, n)
     expected = x.float() @ w.float().T
-    torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=2**-7)
+    # FP32 accumulation then one BF16 rounding: one BF16 ULP (2**-8 relative,
+    # rtol 2**-7 for the rounding plus FP32 order); atol for sums near zero,
+    # whose ~1e-6 FP32 order noise is far below a BF16 ULP of the |out| ~ 1
+    # terms (K 1024 products of N(0,1) x 0.03).
+    torch.testing.assert_close(actual.float(), expected, atol=2**-10, rtol=2**-7)
     again = torch.empty_like(out)
     sender_kernel[(blocks,)](
         w, x, again, rows, K=k, OUTPUTS=outputs, VECTOR=2, num_warps=8
@@ -110,8 +114,12 @@ def test_kpart_pooler_matches_fp32_reference(rows: int) -> None:
     words = parts.view(PARTS, rows, outputs)
     assert bool(((words >> 32) == 5).all())
     actual = (words & 0xFFFFFFFF).to(torch.int32).view(torch.float32).sum(0)
+    # x rounds to BF16 on both sides, but the kernel's x differs from the
+    # reference's in the last FP32 bits (block-summed norms), which flips a
+    # BF16 rounding now and then: one BF16 ULP (2**-8) of an x element times
+    # its weight (0.02) is ~1e-4 per flip; the FP32 sums agree to 1e-6.
     expected = inputs["x"].to(torch.bfloat16).float() @ w.float().T
-    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-3)
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-4)
 
 
 @pytest.mark.parametrize("rows", [8, 16])
@@ -132,8 +140,11 @@ def test_kpart_router_matches_fp32_reference(rows: int) -> None:
     words = parts.view(PARTS, rows, experts)
     assert bool(((words >> 32) == 9).all())
     actual = (words & 0xFFFFFFFF).to(torch.int32).view(torch.float32).sum(0)
+    # hi + lo carries ~16 bits of the weight and of x; the dropped lo x lo
+    # term is ~2**-16 of each product, so over K 8192 terms of |x w| ~ 0.02
+    # the error stays under ~1e-5 absolute; FP32 accumulation adds ~1e-6.
     expected = (inputs["x"].double() @ router.double().T).float()
-    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("rows", [8, 16])
