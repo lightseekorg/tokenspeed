@@ -80,6 +80,21 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.pd.utils import StepCounter
 
 
+@dataclass(frozen=True)
+class DecodeKVView:
+    """The paged cache and decode metadata one layer's decode attention reads.
+
+    For a kernel that runs this layer's decode attention inside a larger
+    launch instead of through the backend's ``forward``.
+    """
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    page_table: torch.Tensor
+    seq_lens: torch.Tensor
+    max_seqlen_k: int
+
+
 @dataclass
 class SparseTopKShare:
     """The sparse indexer's selection shared across one forward's layers.
@@ -149,6 +164,14 @@ class CachePoolBinding:
 
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
         """Return logical-slot ownership, or None for local/replicated storage."""
+        return None
+
+    def decode_kv_view(
+        self, layer: PagedAttention, token_to_kv_pool
+    ) -> DecodeKVView | None:
+        """``layer``'s decode cache view (:class:`DecodeKVView`), or None when
+        this backend's decode needs more than the cache and metadata (block
+        or per-tensor scales, a split schedule, another kernel family)."""
         return None
 
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
