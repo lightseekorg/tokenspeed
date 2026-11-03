@@ -1077,7 +1077,8 @@ def test_routed_pull_stores_reach_l2_before_release():
     release run by one thread waits only for its own subgroup's stores.
     Compile without launching and check that, on every path, each subgroup
     runs s_waitcnt vmcnt(0) before the barrier preceding the release. The
-    later completion release only reports returned peer reads.
+    later completion release only reports returned peer reads, so it needs
+    just a barrier after them.
     """
     from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -1116,6 +1117,7 @@ def test_routed_pull_stores_reach_l2_before_release():
     )
     assert len(releases) == 2, releases
     assert releases[0][1], releases
+    assert releases[1][2], releases
 
 
 def test_attntail_lamport_polling_codegen():

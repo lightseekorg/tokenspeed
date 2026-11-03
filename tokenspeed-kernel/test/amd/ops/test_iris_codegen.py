@@ -255,10 +255,11 @@ def test_iris_pull_twoshot_stores_reach_l2_before_release(exit_barrier):
     releases = vmcnt_zero_before_barrier(
         kernel.asm["amdgcn"], "iris_pull_twoshot", r"\bglobal_atomic_add\b.*sc0 sc1"
     )
-    # The exit release only reports returned peer reads, which each subgroup
-    # consumed before the barrier; its local output stores need not reach L2.
+    # The exit release only reports returned peer reads, so it needs a barrier
+    # after them; its local output stores need not reach L2.
     assert len(releases) == 2 + exit_barrier, releases
-    assert all(waited for _, waited in releases[:2]), releases
+    assert all(waited for _, waited, _ in releases[:2]), releases
+    assert all(barrier for _, _, barrier in releases), releases
 
 
 @pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 codegen")
@@ -269,7 +270,8 @@ def test_iris_allgather_rmsnorm_mxfp4_stores_reach_l2_before_release():
     release run by one thread waits only for its own subgroup's stores.
     Compile without launching and check that, on every path, each subgroup
     runs s_waitcnt vmcnt(0) before the barrier preceding the release. The
-    later completion release only reports returned peer reads.
+    later completion release only reports returned peer reads, so it needs
+    just a barrier after them.
     """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_gather import (
@@ -315,3 +317,4 @@ def test_iris_allgather_rmsnorm_mxfp4_stores_reach_l2_before_release():
     )
     assert len(releases) == 2, releases
     assert releases[0][1], releases
+    assert releases[1][2], releases
