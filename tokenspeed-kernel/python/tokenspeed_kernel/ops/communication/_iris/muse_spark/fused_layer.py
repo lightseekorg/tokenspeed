@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_group_heap_base,
     _iris_lamport_push,
     _iris_sanitize_lamport_bf16,
+    _iris_sanitize_lamport_bf16x2,
     _iris_subgroup_any,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
@@ -58,6 +59,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_column_routes_combine,
     iris_column_routes_complete,
+    iris_column_routes_push_words,
     iris_column_routes_wait,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -69,6 +71,7 @@ if current_platform().is_cdna4:
         ERROR_WORDS,
         FIRST_KERNEL_SITE,
         SITE_ABORTED,
+        Launch,
         fail_stop,
         poll_check,
         poll_pairs,
@@ -79,6 +82,7 @@ if current_platform().is_cdna4:
 else:  # host-side sizes only
     ERROR_ABORT, ERROR_CALLER, ERROR_WORDS, FIRST_KERNEL_SITE = 32, 64, 128, 16
     SITE_ABORTED = 3
+    Launch = None  # a device type; H4SinkArgs only names it on the host
 
 WORLD_SIZE = 8
 # Failure sites of the hop waits (fail_stop records them).
@@ -242,6 +246,23 @@ class MuseNativeView:
         self.h6 = h6
         self.red_in = red_in
         self.h6_sums = h6_sums
+
+
+@aggregate
+class H4SinkArgs:
+    """h4_sink's arguments, as the MoE stream hands them over: the view, the
+    launch and this rank at compile time (a tuple would turn it into a
+    runtime value)."""
+
+    view: MuseNativeView
+    launch: Launch
+    RANK: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, view, launch, RANK):
+        self.view = view
+        self.launch = launch
+        self.RANK = gl.constexpr(RANK)
 
 
 @gluon.jit
@@ -422,9 +443,9 @@ def _whole_pairs(layout):
 @gluon.jit
 def h4_sink(args, y, route, cols):
     """The MoE down unit's output pushed to its route's column owner (H4):
-    the MoE stream's ``sink(args, y, route, cols)`` with ``args = (view,
-    launch)``. Called from per-wave code, so it moves no data between lanes
-    (no layout conversion, LDS or barrier).
+    the MoE stream's ``sink(args, y, route, cols)`` with ``args`` an
+    H4SinkArgs. Called from per-wave code, so it moves no data between
+    lanes (no layout conversion, LDS or barrier).
 
     ``y``: FP32 partial [R, C] in a BlockedLayout whose lanes each hold
     whole adjacent column pairs (an even run of columns, such as
@@ -433,58 +454,44 @@ def h4_sink(args, y, route, cols):
     skip; ``cols``: [1, C] output columns (0-4095, the first of each pair
     even), both slices of y's layout. Each pair goes out as one 32-bit word
     (receivers test a word's high half). Columns this rank owns go to the
-    local own slices (read by own4_complete), the rest to slot (7 -
-    distance) of the owner's mailbox: device scope locally, system scope to
-    peers, no wait."""
+    local own slices (read by own4_complete), the rest to the owner's
+    mailbox (iris_column_routes_push_words, copy ``launch.copy``), no
+    wait."""
     gl.static_assert(
         _whole_pairs(y.type.layout), "h4_sink: lanes must hold whole pairs"
     )
-    view, launch = args
-    rank = view.rank
+    view = args.view
+    launch = args.launch
+    RANK: gl.constexpr = args.RANK
     R: gl.constexpr = y.shape[0]
     C: gl.constexpr = y.shape[1]
-    values = _iris_sanitize_lamport_bf16(y.to(gl.bfloat16))
+    halves = y.to(gl.bfloat16).to(gl.uint16, bitcast=True)
     zeros = gl.zeros([R, C], gl.int32, y.type.layout)
-    columns = cols + zeros
-    routes = route + zeros
-    low, high = gl.split(gl.reshape(values, [R, C // 2, 2]))
-    words = low.to(gl.uint16, bitcast=True).to(gl.uint32) | (
-        high.to(gl.uint16, bitcast=True).to(gl.uint32) << 16
-    )
-    column, _ = gl.split(gl.reshape(columns, [R, C // 2, 2]))
-    route_row, _ = gl.split(gl.reshape(routes, [R, C // 2, 2]))
+    low, high = gl.split(gl.reshape(halves, [R, C // 2, 2]))
+    words = low.to(gl.uint32) | (high.to(gl.uint32) << 16)
+    column, _ = gl.split(gl.reshape(cols + zeros, [R, C // 2, 2]))
+    route_row, _ = gl.split(gl.reshape(route + zeros, [R, C // 2, 2]))
     owner = column // 512
-    within = route_row * _SLICE + (column % 512) // 2
+    slice_words = (column % 512) // 2
     valid = route_row >= 0
     own = view.h4_own.to(gl.pointer_type(gl.uint32), bitcast=True)
     gl.atomic_store(
-        own + launch.copy * _H4_OWN_WORDS + within,
-        words,
-        mask=valid & (owner == rank),
+        own + launch.copy * _H4_OWN_WORDS + route_row * _SLICE + slice_words,
+        _iris_sanitize_lamport_bf16x2(words),
+        mask=valid & (owner == RANK),
         sem="relaxed",
         scope="gpu",
     )
-    distance = (owner - rank + _WORLD) % _WORLD
-    offset = view.routes.to(gl.int64, bitcast=True) - _iris_group_heap_base(
-        rank, view.heaps
-    )
-    target = (
-        _iris_group_heap_base(owner, view.heaps)
-        + offset
-        + 4
-        * (
-            launch.copy * _ROUTES_WORDS
-            + (_WORLD - 1 - distance) * (_MAX_ROWS * 2 * 1024)
-            + within
-        ).to(gl.int64)
-    )
-    gl.atomic_store(
-        target.to(gl.pointer_type(gl.uint32)),
-        words,
-        mask=valid & (owner != rank),
-        sem="relaxed",
-        scope="sys",
-    )
+    # The push body takes one owner per call (its mailbox base is a scalar
+    # buffer address), so each peer owner gets its own store, masked to the
+    # words holding its columns: exactly one of them writes each word.
+    regions = _peer_addresses(view.routes, view.heaps, RANK)
+    for distance in gl.static_range(1, _WORLD):
+        iris_column_routes_push_words(
+            words, route_row, slice_words, (RANK + distance) % _WORLD,
+            launch.copy, valid & (owner == (RANK + distance) % _WORLD),
+            regions, RANK, _WORLD, _MAX_ROWS, _ROUTES_WORDS, ".wt",
+        )  # fmt: skip
 
 
 @gluon.jit

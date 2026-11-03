@@ -1353,6 +1353,7 @@ class MuseSparkMoE(nn.Module):
                     norm.weight,
                     norm.eps,
                     norm.weight_offset,
+                    False,
                 )
             if (
                 not owned_rows
