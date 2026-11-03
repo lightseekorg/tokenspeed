@@ -4,8 +4,10 @@ This document records the invariants of fused decoder layers: decode steps
 where one kernel launch runs a whole decoder layer, its cross-GPU exchanges
 included, with one workgroup resident on every compute unit. A deviation from
 the rules here is a bug unless this document is updated in the same change.
-Kernel structure (roles, phases, exchanges) is documented with the kernel in
-`tokenspeed-kernel`.
+The kernel op's interface is in
+[decoder_layer/README.md](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/decoder_layer/README.md);
+the gfx950 implementation (roles, hand-offs, plan fields) in
+[decoder_layer/_gluon/README.md](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/decoder_layer/_gluon/README.md).
 
 ## The problem this solves
 
@@ -18,30 +20,54 @@ them are resident at once, and its exchanges are correct only when every rank
 of the group runs the same launches in the same order. The rules below keep
 both true without a second execution path.
 
+## The layer-stack hook
+
+A model's forward hands its layer loop to a layer stack
+(`runtime/models/base/layer_stack.py`), chosen at construction through the
+model class's `layer_stack_cls`:
+
+* The model owns everything around the loop (embedding, row layout, final
+  norm, logits); the stack owns which implementation runs each layer for a
+  step. The default `DecoderLayerStack` runs every layer in order, exactly as
+  `BaseTransformerModel` was written; a model with its own forward defines
+  the stack its forward calls, with the boundary values its layers pass.
+* `prepare(model)` runs once at startup, after the weights are loaded and
+  the communication heap exists, before the KV cache is sized or a graph is
+  captured. A stack with fused layers selects and prepares them there; the
+  default does nothing.
+* `run(model, ...)` runs the layers for one step. A stack with fused layers
+  decides in one method, from the step's padded shape and the served set
+  alone, which contiguous range of layers runs fused; an empty range is the
+  explicit fallback, and every layer then runs as written. Within a range the
+  first fused layer takes its query from its attention's regular prologue,
+  and the last ends with the next layer's input norm, so the layers before
+  and after the range and the model around the stack are unchanged.
+* A fused range may span several layers (each launch prepares the next
+  layer's query), so the stack, not a layer, owns the prepared fused layers.
+
 ## Invariants
 
 ### One execution path
 
-* A fused layer is another implementation of a decoder layer, chosen with the
-  model's existing per-forward layout. The model loop is unchanged: the layer
-  calls its prepared kernel, and the value passed to the next fused layer is
-  that layer's prepared query (its K/V rows already in the cache).
+* A fused layer is another implementation of a decoder layer, chosen per
+  step by the model's layer stack. The model's forward is the same for every
+  step; only the stack's range differs.
 * The choice depends only on the forward's padded row shape, (requests,
-  tokens per request), and on the served set agreed at startup. Row count
-  alone is not a shape: a one-request verify of 8 tokens and a plain decode
-  of 8 requests differ. Capture records it, eager decode makes the same
-  choice for the same shape, and every rank decides alike.
-* Everything else runs the regular layer, unchanged: prefill, extend, MIXED
+  tokens per request), on whether the forward carries decode metadata, and on
+  the served set agreed at startup. Row count alone is not a shape: a
+  one-request verify of 8 tokens and a plain decode of 8 requests differ.
+  Capture records the choice, eager decode makes the same choice for the same
+  shape, and every rank decides alike.
+* Everything else runs the regular layers, unchanged: prefill, extend, MIXED
   and IDLE forwards, row shapes outside the served set, and layers the kernel
   does not cover. There is no server flag, and no retry on the regular path
   once a fused launch started.
 
 ### Selection and agreement before capture
 
-* The model selects the kernel through the registry
-  (`("decoder_layer", "prepare")`) during startup, once per candidate row
-  shape, and the prepare compiles every plan variant. Nothing compiles or
-  checks inside a captured graph.
+* The stack selects the kernel through the registry
+  (`("decoder_layer", "prepare")`) during `prepare`, and the prepare compiles
+  every plan variant. Nothing compiles or checks inside a captured graph.
 * Each rank's refusals (deployment settings, a variant that does not fit one
   workgroup per compute unit, state the kernel cannot allocate) go through
   `agree_served_shapes` (`runtime/layers/fused_decoder_layer.py`) over the
@@ -49,29 +75,30 @@ both true without a second execution path.
   rank. The startup report lists every declined shape with its rank and
   reason.
 * Communication buffers are allocated whenever static selection (platform,
-  traits) picks the kernel, identically on every rank; later refusals only
-  shrink the served set.
+  traits) picks the kernel, identically on every rank, and the communication
+  heap is created with room for them; later refusals only shrink the served
+  set.
 
 ### Residency
 
 All workgroups of a fused launch must be resident together. Anything that can
 hold a compute unit while the launch dispatches turns into a fail-stop of the
-group. `deployment_decline_reasons` declines the known sources: host KV store
-copies run as kernels, `HSA_ENABLE_SDMA=0`, CU masks, a model forward that
-forks a side stream, and the settings whose state the fused path cannot keep
-(the expert-load recorder, the memory saver). A change that adds kernels on
-another stream during decode must extend that list in the same change.
-Production declines on these known sources rather than inspecting each
-captured graph, which would need graphs kept for inspection on the serving
-path; a GPU runtime test checks that the captured graph is a chain around
-every fused node.
+group. `deployment_decline_reasons` declines the known sources: copies that
+run as kernels on other streams (the host KV store's kernel copies, a
+platform setting that turns asynchronous copies into kernels), compute-unit
+masks, a model forward that forks a side stream, and the settings whose
+state the fused path cannot keep (the expert-load recorder, the memory
+saver). A change that adds kernels on another stream during decode must
+extend that list in the same change. Production declines on these known
+sources rather than inspecting each captured graph, which would need graphs
+kept for inspection on the serving path.
 
 ### Fail-stop
 
-* Every wait inside a fused launch has a deadline (60 s), checked on the
-  device clock. It is chosen from the longest legal stall of one rank between
-  two graph launches, not from the measured skew: the regular path tolerates
-  such stalls, and the fused path must not turn them into a crash.
+* Every wait inside a fused launch has a deadline, checked on the device
+  clock. It is set from the longest legal stall of one rank between two graph
+  launches: the regular path tolerates such stalls, and the fused path must
+  not turn them into a crash.
 * On expiry the waiting workgroup writes a failure record, copies it to a
   host-mapped page that outlives the process, sets a sticky abort word in
   every peer, and traps. A wait that sees an abort word stops the same way and
@@ -94,28 +121,22 @@ every fused node.
 
 ### Hand-offs inside a launch
 
-Workgroups hand data to each other through memory; the kernel's module
-docstring lists each hand-off. Every one follows these rules:
+Workgroups hand data to each other through memory; the implementation's
+README lists each hand-off. Every one follows these rules:
 
 * A producer's payload stores complete before the flag or tag that publishes
-  them: each storing wave waits for its own stores, and a workgroup barrier
-  precedes a flag that covers several waves' stores. Single 64-bit stores
-  that carry the value and its tag together need no flag.
-* A consumer on another XCD reads the payload so that no cached copy of an
-  earlier launch can answer: loads that bypass the XCD's cache (`.cv`), or
-  memory allocated uncached (`UncachedBuffer`). Flags in uncached memory can
-  be polled with scalar loads, which do not wait behind the wave's vector
-  loads.
-* Tags derive from the epoch and repeat after 2**32 - 1 launches, about a week
-  of serving. Every slot a launch polls is rewritten (or zeroed) in every
-  launch, or lives in two copies by epoch parity with the other copy zeroed
-  each launch, so no slot keeps a tag old enough to repeat.
-* A wave's vector memory operations complete in issue order. A vector poll or
-  read issued behind the workgroup's own weight loads waits for them, so a
-  role polls only after its weights have landed, or the plan states why they
-  land first (`plan.py` checks every such wait).
-* Per-wave loops (the MoE stream, per-wave polls) hold no workgroup barrier
-  and no cross-wave layout change: their trip counts differ by wave.
+  them. A single store that carries the value and its tag together needs no
+  flag.
+* A consumer that may sit behind a different cache from its producer reads
+  the payload so that no cached copy of an earlier launch can answer: loads
+  that bypass caches the writer cannot update, or memory no cache keeps.
+* Tags derive from the epoch and repeat after a bounded number of launches.
+  Every slot a launch polls is rewritten (or zeroed) in every launch, or lives
+  in two copies by epoch parity with the other copy cleared each launch, so
+  no slot keeps a tag old enough to repeat.
+* A poll never waits behind loads its own wave issued for later work unless
+  the implementation's plan states why they land first; the plan checker
+  checks every such wait.
 
 ### Caches and request state
 
@@ -130,8 +151,8 @@ docstring lists each hand-off. Every one follows these rules:
 ## Deployment contract
 
 * Exclusive GPUs: no other process runs kernels on the group's GPUs.
-* No kernels on side streams during decode (the host KV store with the
-  `direct` backend or off; SDMA copies on).
+* No kernels on side streams during decode (the host KV store with direct
+  copies or off).
 * Profiling: kernel tracing only. Counter collection serializes kernels, and
   instrumentation changes a kernel's resources, so an instrumented build must
   pass the same startup checks.
