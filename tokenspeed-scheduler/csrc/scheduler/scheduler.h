@@ -123,6 +123,10 @@ public:
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
     std::int32_t AvailableLcmBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    std::int32_t FreeRequestSlots() const { return req_pool_allocator_.AvailableSlots(); }
+    std::int32_t TotalRequestSlots() const { return req_pool_allocator_.Size(); }
+    std::int32_t TotalLcmBlocks() const { return block_pool_.NumLcmBlocks(); }
+    std::vector<std::int64_t> AdmissionCapacityCurve(std::int32_t token_step) const;
     // Per-step gauges: empty parents are O(1), active parents walk the live
     // requests' block tables. Parents resident only as cache are
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
@@ -152,6 +156,11 @@ public:
     std::int32_t HostPoolTotalBlocks() const { return host_pool_.NumLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
+    std::size_t DemoteSession(const std::string& id, bool ended) { return coordinator_.DemoteSession(id, ended); }
+    std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended) {
+        return coordinator_.DemoteSessions(ids, ended);
+    }
+
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
@@ -185,10 +194,6 @@ private:
         std::span<const std::string> candidate_prefix_hashes;
         std::span<const std::string> extension_hashes;
         std::span<const std::string> prefix_hashes;
-    };
-
-    struct KvEventHashProgress {
-        std::vector<std::uint64_t> block_hashes;
     };
 
     // What the per-request admission layer reports back to the role
@@ -265,12 +270,12 @@ private:
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, fsm::CacheProgress& cache_progress,
         std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
-    void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+    void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,
     // at a tail, the partial page under its tail hash (token_ids = the rows
     // below T, parent = the last full page).
-    void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+    void registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     // Finished requests whose forwards have all landed: publish the frontier
@@ -524,7 +529,6 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).

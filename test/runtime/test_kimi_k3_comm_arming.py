@@ -108,6 +108,8 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
         value.iris_state = None
         value.comm = None
         value.shared_experts = SimpleNamespace(shared_parallel=None)
+        # As on CDNA4: the execution plan leaves the decode chain off.
+        value.execution_plan = SimpleNamespace(decode_chain=False)
         return value
 
     layers = []
