@@ -1041,14 +1041,21 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
+def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=(), options=None):
     """Compile a Gluon kernel for gfx950 without launching it.
 
     Arguments named in unspecialized get no 16-byte divisibility, as when a
     caller passes them in do_not_specialize or compiles ahead of time.
+    Pointers the kernel annotates ``tl.const`` compile as const pointers, as
+    at launch. ``options`` adds compile options (such as extern libraries).
     """
     from tokenspeed_kernel._triton import gluon, triton
 
+    types = dict(types)
+    for param in fn.params:
+        kind = types.get(param.name)
+        if param.is_const and isinstance(kind, str) and kind.startswith("*"):
+            types[param.name] = "*k" + kind[1:]
     attrs = {}
     for index, name in enumerate(fn.arg_names):
         if isinstance(types.get(name), tuple):
@@ -1069,7 +1076,7 @@ def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": num_warps},
+        options={"num_warps": num_warps, **(options or {})},
     )
 
 
@@ -1256,6 +1263,113 @@ def test_attntail_lamport_polling_codegen():
         votes_with_subgroup_mask(cycle) for cycle in polls
     ), "a retry must branch on one subgroup lane mask"
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+@pytest.mark.parametrize("rows", [8, 16])
+def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
+    """The fused sliding tail's page-index loads do not drain the KV copies.
+
+    The split loads each page index two pages ahead with a volatile load, so
+    the next pages' K/V copies stay in flight. LLVM follows a volatile load
+    from global memory with `s_waitcnt vmcnt(0)`, which would wait for every
+    copy issued before it; from a const page table it does not.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_sliding_attention_twoshot_muse_attntail as fn,
+    )
+    from tokenspeed_kernel_amd._scheduling import sched_compile_options
+
+    types = {
+        "q_ptr": "*fp8e4nv",
+        "k_cache_ptr": "*fp8e4nv",
+        "v_cache_ptr": "*fp8e4nv",
+        "page_table_ptr": "*i32",
+        "cache_seqlens_ptr": "*i32",
+        "mid_o_ptr": "*fp32",
+        "mid_lse_ptr": "*fp32",
+        "counters_ptr": "*i32",
+        "gate_ptr": "*bf16",
+        "gate_stride": "i32",
+        "weight_ptr": "*bf16",
+        "att_box": "*bf16",
+        "epochs": "*i32",
+        "region": "*bf16",
+        "rs_peers": ("i64",) * 8,
+        "sums": "*i64",
+        "sums_peers": ("i64",) * 8,
+        "stream_ptr": "*fp32",
+        "post_weight_ptr": "*bf16",
+        "alpha_ptr": "*fp32",
+        "beta_ptr": "*fp32",
+        "pre_weight_ptr": "*bf16",
+        "out_stream_ptr": "*fp32",
+        "pre_fp32_ptr": "*fp32",
+        "pre_bf16_ptr": "*bf16",
+        "rows": "i32",
+    }
+    # The 4-wave sliding split of 8 or 16 verify rows over a 2048-token
+    # window of 64-token FP8 pages, as sliding_attention_boundary selects it.
+    kernel = _compile_gfx950(
+        fn,
+        types,
+        {
+            "Q_STRIDE_B": 1024,
+            "Q_STRIDE_H": 64,
+            "Q_STRIDE_D": 1,
+            "SM_SCALE": 0.125,
+            "PAGE_TABLE_STRIDE": 4096,
+            "PAGE_SIZE": 64,
+            "NUM_KV_SPLITS": 8,
+            "MAX_SEQLEN_Q": 8,
+            "NUM_Q_HEADS": 16,
+            "NUM_KV_HEADS": 2,
+            "HEAD_DIM": 64,
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "WINDOW_LEFT": 2047,
+            "IS_FP8": True,
+            "NUM_REQUESTS": rows // 8,
+            "WIDTH": 8192,
+            "RANK": 5,
+            "WORLD_SIZE": 8,
+            "MAX_SHARD_ELEMENTS": 16 * 1024,
+            "MAX_ROWS": 16,
+            "PARTS": 8 if rows <= 8 else 4,
+            "GATE_EPS": 1e-6,
+            "POST_EPS": 1e-6,
+            "POST_WEIGHT_OFFSET": 1.0,
+            "PRE_EPS": 1e-6,
+            "PRE_WEIGHT_OFFSET": 1.0,
+            "POST_HAS_WEIGHT": True,
+            "RESERVED_LDS": 128 * 1024,
+            "NUM_STAGES": 2,
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        num_warps=4,
+        unspecialized=("rows", "gate_stride"),
+        options=sched_compile_options(),
+    )
+    lines = [
+        line.strip()
+        for line in kernel.asm["amdgcn"].splitlines()
+        if line.strip() and not line.strip().startswith((".", ";"))
+    ]
+    memory = re.compile(r"^(?:global|buffer)_(?:load|store|atomic)")
+    page_loads = 0
+    for index, line in enumerate(lines):
+        if not (line.startswith("global_load_dword ") and "sc0 sc1" in line):
+            continue
+        page_loads += 1
+        for after in lines[index + 1 :]:
+            if memory.match(after):
+                break
+            assert not (
+                after.startswith("s_waitcnt") and "vmcnt(0)" in after
+            ), f"a page-index load drains the KV copies in flight: {line}"
+    assert page_loads >= 2, "the split no longer loads page indices ahead"
 
 
 def test_gather_lamport_polling_codegen():
