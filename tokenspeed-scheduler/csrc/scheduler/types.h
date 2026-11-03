@@ -28,6 +28,7 @@
 
 #include "cache/core/cache_config.h"
 #include "utils.h"
+#include "scheduler/prefill_compute.h"
 
 namespace tokenspeed {
 
@@ -83,6 +84,7 @@ struct SchedulerConfig {
     }
 
     std::int32_t max_scheduled_tokens{};
+    std::optional<PrefillComputeConfig> prefill_compute;
     // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
     // all local prefill requests in one batch. Zero leaves this unbounded.
     std::int32_t max_kv_page_num{0};

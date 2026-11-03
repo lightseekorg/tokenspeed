@@ -427,7 +427,8 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens,
-                                                                  std::int64_t kv_token_limit) {
+                                                                  std::int64_t kv_token_limit,
+                                                                  double compute_spent_ns) {
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
@@ -460,10 +461,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - hit_tokens)));
     // A remote landing completes the prompt in one transfer; no junction cut
     // can shorten it.
-    std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                         ? unscheduled
-                                         : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                              unscheduled, remaining, junction_tokens);
+    std::int32_t tokens_this_round =
+        source == fsm::PrefillSource::kRemote
+            ? unscheduled
+            : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
+                                 junction_tokens, config_.prefill_compute, compute_spent_ns);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -636,14 +638,15 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
-    std::int32_t reserve_num_tokens_in_next_schedule_event, std::int64_t kv_token_limit) {
+    std::int32_t reserve_num_tokens_in_next_schedule_event, std::int64_t kv_token_limit, double compute_spent_ns) {
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     remaining = static_cast<std::int32_t>(
         std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                     remaining, cache_progress.junction_tokens);
+    std::int32_t prefill_tokens =
+        PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled, remaining,
+                           cache_progress.junction_tokens, config_.prefill_compute, compute_spent_ns);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
@@ -857,18 +860,20 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
                                                                     Request* request, std::int32_t token_budget,
                                                                     std::int32_t decode_reserve,
                                                                     std::vector<LoadBackOperation>& load_backs,
-                                                                    std::int32_t kv_page_budget) {
+                                                                    std::int32_t kv_page_budget,
+                                                                    double compute_spent_ns) {
     const std::int64_t kv_token_limit = config_.max_kv_page_num == 0 || config_.role == Role::kD
                                             ? std::numeric_limits<std::int64_t>::max()
                                             : static_cast<std::int64_t>(kv_page_budget) * config_.prefix_granularity;
     if (request->Is<fsm::Prefilling>()) {
-        if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve, kv_token_limit)) {
+        if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve, kv_token_limit,
+                                         compute_spent_ns)) {
             return applyEventAndBuildOperation(request, std::move(*event));
         }
         return std::nullopt;
     }
-    FirstChunkOutcome outcome =
-        schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve, kv_token_limit);
+    FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve,
+                                                          kv_token_limit, compute_spent_ns);
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
@@ -1334,7 +1339,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             const std::int32_t budget = remote_grant ? blocker->PrefillSize() : build.token_budget;
             if (auto admitted =
                     schedulePrefillCandidate(build.plan, feedback, blocker, budget, config_.decode_input_tokens,
-                                             build.load_backs, build.kv_page_budget)) {
+                                             build.load_backs, build.kv_page_budget, build.prefill_compute_spent_ns)) {
                 if (remote_grant) {
                     // The blocker is now RemotePrefilling: the peer's prefill
                     // is out against its pages (pdTransferInFlight).
@@ -1524,7 +1529,8 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             return;
         }
         for (Request* request : candidates) {
-            if (build.Full(config_.max_batch_size)) {
+            if (build.Full(config_.max_batch_size) ||
+                (config_.prefill_compute && build.prefill_compute_spent_ns >= config_.prefill_compute->budget_ns)) {
                 return;
             }
             if ((resident ? !request->Is<fsm::Prefilling>() : !request->Is<fsm::Submitted>()) ||
@@ -1532,8 +1538,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
-                                                         decode_reserve, build.load_backs, build.kv_page_budget)) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, request, build.token_budget, decode_reserve,
+                                             build.load_backs, build.kv_page_budget, build.prefill_compute_spent_ns)) {
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
@@ -1641,9 +1648,9 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto admitted =
-                    schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
-                                             config_.decode_input_tokens, build.load_backs, build.kv_page_budget)) {
+            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
+                                                         config_.decode_input_tokens, build.load_backs,
+                                                         build.kv_page_budget, build.prefill_compute_spent_ns)) {
                 build.scheduled.insert(request);
                 build.remote_prefill.emplace_back(std::move(*admitted));
                 break;

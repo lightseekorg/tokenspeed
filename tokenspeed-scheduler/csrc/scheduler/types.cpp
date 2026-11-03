@@ -60,6 +60,7 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
 
 void SchedulerConfig::Validate() const {
     ValidateCapacityInputs();
+    if (prefill_compute) prefill_compute->Validate();
     if (max_kv_page_num < 0) {
         throw std::invalid_argument("Scheduler: max_kv_page_num must be >= 0");
     }
