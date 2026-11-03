@@ -62,6 +62,9 @@ from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
     TritonSamplingBackend,
 )
+from tokenspeed.runtime.sampling.backends.triton_full import (  # noqa: E402
+    TritonFullSamplingBackend,
+)
 from tokenspeed.runtime.sampling.sampling_batch_info import (  # noqa: E402
     SamplingBatchInfo,
 )
@@ -82,23 +85,25 @@ N = 8
 POOL = 8
 
 
-def _backend() -> TritonSamplingBackend:
-    return TritonSamplingBackend(
-        SamplingBackendConfig(
-            synthetic_acceptance_length=None,
-            enable_speculative_sampling=True,
-            sampling_stream="batch",
-            logprob_order="torch",
-            max_bs=BS,
-            max_draft_tokens_per_req=N,
-            max_req_pool_size=POOL,
-            vocab_size=VOCAB,
-            device="cuda",
-            tp_group=tuple(range(RANKS)),
-            # One process stands in for the group: nothing to broadcast.
-            enable_tp_sync=False,
-        )
+def _config() -> SamplingBackendConfig:
+    return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
+        enable_speculative_sampling=True,
+        sampling_stream="batch",
+        logprob_order="torch",
+        max_bs=BS,
+        max_draft_tokens_per_req=N,
+        max_req_pool_size=POOL,
+        vocab_size=VOCAB,
+        device="cuda",
+        tp_group=tuple(range(RANKS)),
+        # One process stands in for the group: nothing to broadcast.
+        enable_tp_sync=False,
     )
+
+
+def _backend() -> TritonSamplingBackend:
+    return TritonSamplingBackend(_config())
 
 
 def _prepare(backend, top_k, top_p, num_tokens_per_req) -> torch.Tensor:
@@ -289,3 +294,11 @@ def test_other_routes_gather_whole_rows(monkeypatch) -> None:
     )
     assert gathered == [(BS, SHARD)]
     assert bool(((sampled >= 0) & (sampled < VOCAB)).all())
+
+
+@requires_cuda
+def test_full_backend_keeps_whole_rows_under_tp() -> None:
+    # Its sample() and verify() read next_token_logits; shard selection would
+    # leave the processor's whole rows unset.
+    assert TritonSamplingBackend(_config()).vocab_shard_top_k() is not None
+    assert TritonFullSamplingBackend(_config()).vocab_shard_top_k() is None
