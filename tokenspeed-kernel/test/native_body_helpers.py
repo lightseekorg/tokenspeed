@@ -32,7 +32,12 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import InputStrides
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionConfig,
     AttentionProgram,
+    merge_balanced_rows_gfx950,
+    mha_decode_balanced_item_gfx950,
+    mha_decode_balanced_split_gfx950,
     mha_decode_sliding_split_gfx950,
+    publish_balanced_record_gfx950,
+    store_balanced_partial_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.prologue.gqa import (
     gqa_prologue_key_gfx950,
@@ -69,6 +74,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     Launch,
     fail_stop,
     poll_tags16,
+    poll_until_all,
 )
 
 _ERROR_ABORT = gl.constexpr(ERROR_ABORT)
@@ -210,6 +216,153 @@ def split_records_kernel(
             record_ptr, launch.tag, q_ptr, False, wait_records_tags16, launch
         )
         program.store_merged(out_ptr, merged)
+
+
+@gluon.jit
+def wait_records_sc1(record_ptr, first, count, tag, launch):
+    """The full-attention record poll: ``count`` int32 records from ``first``
+    (written on any XCD), one per lane, relaxed device-scope loads
+    (``poll_until_all`` ``"sc1"``); on expiry the launch's ``fail_stop``."""
+    lanes = gl.arange(
+        0,
+        64 * gl.num_warps(),
+        layout=gl.BlockedLayout([1], [64], [gl.num_warps()], [0]),
+    )
+    for chunk in range(0, count, 64 * gl.num_warps()):
+        index = chunk + lanes
+        valid = index < count
+        if not poll_until_all(record_ptr + first + index, valid, tag, launch, "sc1"):
+            fail_stop(launch, _RECORD_SITE, chunk)
+
+
+@gluon.jit
+def full_records_kernel(
+    q_ptr,
+    cache_seqlens_ptr,
+    num_requests,
+    schedule_ptr: tl.const,
+    page_table_ptr: tl.const,
+    k_cache_ptr,
+    v_cache_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    out_ptr,
+    sink_ptr,
+    record_ptr,
+    hook_ptr,
+    error_ptr,
+    tag,
+    deadline_ticks,
+    program_indices,
+    Q_STRIDE_B: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    PAGE_TABLE_STRIDE: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    MAX_SEQLEN_Q: gl.constexpr,
+    NUM_Q_HEADS: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    HAS_SINK: gl.constexpr,
+    HOOK_LOADS: gl.constexpr,
+):
+    """Full attention as a persistent layer runs it: each workgroup streams
+    the balanced items of program indices ``pid, pid + grid, ...`` (below
+    ``program_indices``, the standalone kernel's grid), stores each partial
+    for a merger on any XCD, issues ``HOOK_LOADS`` 16-byte loads per wave
+    from ``hook_ptr`` (the next role's weights; their sum lands past them, at
+    the workgroup's index) and publishes its records;
+    then the workgroups merge one row per wave and store the BF16 output.
+    All programs must be co-resident."""
+    cfg = AttentionConfig(
+        SM_SCALE,
+        PAGE_TABLE_STRIDE,
+        PAGE_SIZE,
+        1,
+        MAX_SEQLEN_Q,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        NUM_WARPS,
+        False,
+        -1,
+        IS_FP8,
+        k_cache_ptr.dtype.element_ty,
+        InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
+    )
+    launch = test_launch(error_ptr, tag, deadline_ticks)
+    pid = gl.program_id(0)
+    grid = gl.num_programs(0)
+    hook_l: gl.constexpr = gl.BlockedLayout([4], [64], [NUM_WARPS], [0])
+    for index in range(pid, program_indices, grid):
+        program, live, block_item, splits = mha_decode_balanced_item_gfx950(
+            cfg,
+            q_ptr,
+            cache_seqlens_ptr,
+            num_requests,
+            schedule_ptr,
+            page_table_ptr,
+            k_cache_ptr,
+            v_cache_ptr,
+            mid_o_ptr,
+            mid_lse_ptr,
+            index,
+        )
+        if live:
+            m_i, l_i, acc = mha_decode_balanced_split_gfx950(
+                program, k_cache_ptr, v_cache_ptr, NUM_STAGES
+            )
+            token = store_balanced_partial_gfx950(
+                program, acc, l_i, m_i, block_item, splits, record_ptr
+            )
+            if HOOK_LOADS > 0:
+                hook = gl.amd.cdna4.buffer_load(
+                    hook_ptr, gl.arange(0, HOOK_LOADS * 256 * NUM_WARPS, hook_l)
+                )
+            publish_balanced_record_gfx950(
+                program, record_ptr, block_item, launch.tag, token
+            )
+            if HOOK_LOADS > 0:
+                gl.store(
+                    hook_ptr + HOOK_LOADS * 256 * NUM_WARPS + pid, gl.sum(hook, axis=0)
+                )
+    rows: gl.constexpr = MAX_SEQLEN_Q * (NUM_Q_HEADS // NUM_KV_HEADS)
+    tasks_per_head: gl.constexpr = rows // NUM_WARPS
+    for task in range(pid, num_requests * NUM_KV_HEADS * tasks_per_head, grid):
+        block = task // tasks_per_head
+        request = block // NUM_KV_HEADS
+        out, q_index, q_head = merge_balanced_rows_gfx950(
+            cfg,
+            schedule_ptr,
+            mid_o_ptr,
+            mid_lse_ptr,
+            record_ptr,
+            launch.tag,
+            launch,
+            sink_ptr,
+            request,
+            block - request * NUM_KV_HEADS,
+            (task - block * tasks_per_head) * NUM_WARPS,
+            HAS_SINK,
+            wait_records_sc1,
+        )
+        out_l: gl.constexpr = out.type.layout
+        d = gl.arange(0, HEAD_DIM, gl.SliceLayout(0, out_l))
+        q_index = gl.convert_layout(q_index, gl.SliceLayout(1, out_l))
+        q_head = gl.convert_layout(q_head, gl.SliceLayout(1, out_l))
+        gl.amd.cdna4.buffer_store(
+            out.to(out_ptr.dtype.element_ty),
+            out_ptr,
+            ((q_index * NUM_Q_HEADS + q_head) * HEAD_DIM)[:, None] + d[None, :],
+        )
 
 
 @gluon.constexpr_function

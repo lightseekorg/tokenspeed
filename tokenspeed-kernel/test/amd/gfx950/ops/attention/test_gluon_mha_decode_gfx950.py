@@ -949,3 +949,130 @@ def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool) -> None:
         torch.cuda.synchronize()
         assert int(errors.abs().sum()) == 0
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+# The native layer's full-attention grid: one workgroup per CU.
+_NATIVE_GRID = 256
+
+
+@pytest.mark.parametrize(
+    "cache_lens",
+    [
+        # 123 splits per KV head, one item per workgroup: two merge tiles of 64.
+        pytest.param([141000], id="one-item-per-workgroup"),
+        # Twice the items of the grid: each workgroup runs two.
+        pytest.param([141000, 120000], id="two-items-per-workgroup"),
+        # 16 splits: the one-tile merge.
+        pytest.param([2048], id="one-tile"),
+    ],
+)
+@pytest.mark.parametrize("with_sinks", [False, True], ids=["no-sinks", "sinks"])
+def test_full_records_merge_is_bitwise_the_balanced_decode(
+    cache_lens: list[int], with_sinks: bool
+) -> None:
+    """Full attention as the native layer runs it (each workgroup streams its
+    balanced items, writes the partials through, issues weight loads and
+    publishes per-wave records; then one row per wave merges the partials
+    read ``.cv``) streams the same splits and folds them in the same order as
+    the balanced decode and its reduce, so the rows are bitwise equal."""
+    from native_body_helpers import full_records_kernel
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+        ERROR_WORDS,
+        persistent_compile_options,
+    )
+
+    inputs = _verify_inputs(
+        cache_lens, VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 20261103
+    )
+    for name in ("q", "k_cache", "v_cache"):
+        inputs[name] = inputs[name].to(torch.float8_e4m3fn)
+    sinks = (
+        torch.randn(
+            VERIFY_Q_HEADS,
+            dtype=torch.float32,
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(17),
+        )
+        if with_sinks
+        else None
+    )
+    q = inputs["q"]
+    schedule = decode.launch_gluon_mha_decode_schedule_gfx950(
+        q,
+        inputs["k_cache"],
+        inputs["cache_seqlens"],
+        max_seqlen_q=VERIFY_TOKENS,
+        window_left=-1,
+        out=None,
+    )
+    expected = decode.launch_gluon_mha_decode_balanced_gfx950(
+        **inputs, sinks=sinks, schedule=schedule
+    )
+    block_m, num_warps = decode._row_tile(
+        VERIFY_TOKENS, VERIFY_Q_HEADS // VERIFY_KV_HEADS
+    )
+    num_requests = len(cache_lens)
+    # The balanced decode's grid: its program indices.
+    program_indices = max(
+        decode._BALANCED_TARGET_PROGRAMS,
+        num_requests
+        * decode._balanced_row_blocks_of(
+            VERIFY_Q_HEADS, VERIFY_KV_HEADS, VERIFY_TOKENS
+        ),
+    )
+    mid_o = torch.empty(
+        (program_indices, block_m, HEAD_DIM), device="cuda", dtype=torch.float32
+    )
+    mid_lse = torch.empty(
+        (program_indices, block_m), device="cuda", dtype=torch.float32
+    )
+    records = torch.zeros(program_indices * num_warps, device="cuda", dtype=torch.int32)
+    hook_loads = 8
+    hook = torch.zeros(
+        hook_loads * 256 * num_warps + _NATIVE_GRID, device="cuda", dtype=torch.int32
+    )
+    errors = torch.zeros(ERROR_WORDS, device="cuda", dtype=torch.int32)
+    actual = torch.empty_like(expected)
+    for tag in (7, 8):  # a second use of the records with a new tag
+        actual.fill_(float("nan"))
+        full_records_kernel[(_NATIVE_GRID,)](
+            q,
+            inputs["cache_seqlens"],
+            num_requests,
+            schedule,
+            inputs["page_table"],
+            inputs["k_cache"],
+            inputs["v_cache"],
+            mid_o,
+            mid_lse,
+            actual,
+            sinks if with_sinks else q,
+            records,
+            hook,
+            errors,
+            tag,
+            2_000_000_000,
+            program_indices,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            (1.0 / HEAD_DIM**0.5) * decode._INV_LN2_VALUE,
+            inputs["page_table"].stride(0),
+            PAGE_SIZE,
+            VERIFY_TOKENS,
+            VERIFY_Q_HEADS,
+            VERIFY_KV_HEADS,
+            HEAD_DIM,
+            block_m,
+            64,
+            num_warps,
+            True,
+            decode._BALANCED_STAGES,
+            with_sinks,
+            hook_loads,
+            num_warps=num_warps,
+            **persistent_compile_options(),
+        )
+        torch.cuda.synchronize()
+        assert int(errors.abs().sum()) == 0
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

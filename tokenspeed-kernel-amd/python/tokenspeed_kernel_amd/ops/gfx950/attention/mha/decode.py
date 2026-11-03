@@ -43,6 +43,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     select_kv_splits,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import release_drain
+from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import after, issue_order
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
@@ -1797,6 +1798,7 @@ def launch_gluon_mha_decode_gfx950(
 _BALANCED_TARGET_PROGRAMS = 2 * _GFX950_SM_COUNT
 _BALANCED_MIN_SPLIT_PAGES = 2
 _BALANCED_MAX_SPLITS = 128
+_BALANCED_MAX_SPLITS_C = gl.constexpr(_BALANCED_MAX_SPLITS)
 # Two LDS buffers: with one round of work-groups, deeper pipelines did not
 # help while address translation dominated the load latency (MI350X).
 _BALANCED_STAGES = 2
@@ -2197,6 +2199,58 @@ def mha_decode_balanced_split_gfx950(
     )
 
 
+@gluon.jit
+def _balanced_record_lanes(program, block_item):
+    """One lane per lane of the workgroup, and its wave's record index:
+    ``NUM_WARPS`` int32 records per item, a row block's from ``block_item``
+    on, so they are contiguous as its partials are."""
+    cfg = program.cfg
+    lanes = gl.arange(
+        0, 64 * cfg.NUM_WARPS, layout=gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
+    )
+    return lanes, (block_item + program.split_id) * cfg.NUM_WARPS + lanes // 64
+
+
+@gluon.jit
+def store_balanced_partial_gfx950(
+    program, acc, l_i, m_i, block_item, splits, record_ptr
+):
+    """Store a balanced split's partial for a merger on any XCD: written
+    through (``.wt``), then one ``.cv`` load per wave of its own record word,
+    the token :func:`publish_balanced_record_gfx950` waits for.
+
+    The token load is issued after the stores and before anything later
+    (``issue_order`` on both sides). One wave's vector memory operations
+    complete in issue order, so waiting for the token covers the stores but
+    none of the loads the caller issues after this call: a persistent kernel
+    issues its next role's weights here, between the store and the record.
+
+    Returns:
+        The token, int32 ``[64 * NUM_WARPS]`` (one lane per lane).
+    """
+    _store_balanced(program, acc, l_i, m_i, block_item, splits, ".wt")
+    issue_order()
+    lanes, records = _balanced_record_lanes(program, block_item)
+    token = cdna4.buffer_load(record_ptr, records, cache=".cv")
+    issue_order()
+    return token
+
+
+@gluon.jit
+def publish_balanced_record_gfx950(program, record_ptr, block_item, tag, token):
+    """Vouch for this wave's stored partial: once the wave's ``token`` (from
+    :func:`store_balanced_partial_gfx950`) has arrived, lane 0 stores ``tag``
+    in the wave's record with a relaxed device-scope store (``sc1``), so a
+    merger on another XCD sees it. ``tag`` is a nonzero int32 that differs
+    from the buffer's previous use (the launch tag). The record vouches for
+    this wave's stores only; the merger waits for every wave's."""
+    lanes, records = _balanced_record_lanes(program, block_item)
+    word = after(gl.full(lanes.shape, 0, gl.int32, lanes.type.layout) + tag, token)
+    gl.atomic_store(
+        record_ptr + records, word, mask=lanes % 64 == 0, sem="relaxed", scope="gpu"
+    )
+
+
 @gluon.jit(do_not_specialize=("num_requests",))
 def gluon_mha_decode_balanced_gfx950(
     # The compiler (LLVM AMDGPU kernel-argument preloading) preloads the
@@ -2323,6 +2377,167 @@ def _merge_tiles(
         acc = acc * alpha + gl.sum(o_c * beta_c[:, None], axis=0)
         m_i = next_m
     return m_i, l_i, acc
+
+
+@gluon.jit
+def _per_row(values, rows):
+    """``values`` ``[rows]`` (one per wave) as a column of ``rows``' layout."""
+    return gl.convert_layout(values, gl.SliceLayout(1, rows.type.layout))[:, None]
+
+
+@gluon.jit
+def _merge_rows_first(part_lse, part_o, live):
+    """``_merge_tiles``' first tile, per row: ``part_lse`` ``[rows, TILE]``,
+    ``part_o`` ``[rows, TILE, HEAD_DIM]``, the same operations in the same
+    order."""
+    part_lse = gl.where(live, part_lse, -float("inf"))
+    m_i = max(part_lse, axis=1)
+    beta = gl.exp2(part_lse - gl.where(m_i == -float("inf"), 0.0, m_i)[:, None])
+    l_i = gl.sum(beta, axis=1)
+    acc = gl.sum(part_o * beta[:, :, None], axis=1)
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def _merge_rows_next(m_i, l_i, acc, lse_c, o_c, live_c):
+    """``_merge_tiles``' fold of a later tile, per row."""
+    lse_c = gl.where(live_c, lse_c, -float("inf"))
+    next_m = maximum(m_i, max(lse_c, axis=1))
+    shift = gl.where(next_m == -float("inf"), 0.0, next_m)
+    alpha = gl.exp2(m_i - shift)
+    beta_c = gl.exp2(lse_c - shift[:, None])
+    l_i = l_i * alpha + gl.sum(beta_c, axis=1)
+    acc = acc * _per_row(alpha, acc) + gl.sum(o_c * beta_c[:, :, None], axis=1)
+    return next_m, l_i, acc
+
+
+@gluon.jit
+def _merge_rows_issue_first(
+    mid_o_ptr,
+    mid_lse_ptr,
+    first_part,
+    splits,
+    HEAD_DIM: gl.constexpr,
+    layout: gl.constexpr,
+    TILE: gl.constexpr,
+    TILES: gl.constexpr,
+):
+    """``_merge_tiles`` for one row per wave (``first_part`` ``[waves]``),
+    issuing all ``TILES`` tiles' ``.cv`` loads before the first fold; a tile
+    past ``splits`` changes nothing, as the loop there never reaches it."""
+    offs_t = gl.arange(0, TILE, layout=gl.SliceLayout(0, gl.SliceLayout(2, layout)))
+    offs_e = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout)))
+    lses = ()
+    outs = ()
+    lives = ()
+    for t in gl.static_range(TILES):
+        split = (first_part * 0)[:, None] + (t * TILE + offs_t)[None, :]
+        live = split < splits
+        rows = first_part[:, None] + split
+        lses += (
+            cdna4.buffer_load(mid_lse_ptr, rows, mask=live, other=0.0, cache=".cv"),
+        )
+        outs += (
+            cdna4.buffer_load(
+                mid_o_ptr,
+                rows[:, :, None] * HEAD_DIM + offs_e[None, None, :],
+                mask=live[:, :, None],
+                other=0.0,
+                cache=".cv",
+            ),
+        )
+        lives += (live,)
+    # Every tile's loads issue before the folds: they read the first tile's
+    # lse bits plus an opaque zero from behind the point (the scheduler would
+    # otherwise hold the last tile's loads until the first fold had drained).
+    zero = issue_order()
+    first_lse = (lses[0].to(gl.int32, bitcast=True) + zero).to(gl.float32, bitcast=True)
+    m_i, l_i, acc = _merge_rows_first(first_lse, outs[0], lives[0])
+    for t in gl.static_range(1, TILES):
+        # Fold, then keep the fold only where the reduce's loop reaches the
+        # tile: a branch would let the compiler sink the tile's loads into it.
+        more = splits > t * TILE
+        next_m, next_l, next_acc = _merge_rows_next(
+            m_i, l_i, acc, lses[t], outs[t], lives[t]
+        )
+        m_i = gl.where(more, next_m, m_i)
+        l_i = gl.where(more, next_l, l_i)
+        acc = gl.where(more, next_acc, acc)
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def merge_balanced_rows_gfx950(
+    cfg: gl.constexpr,
+    schedule_ptr: tl.const,
+    mid_o_ptr,
+    mid_lse_ptr,
+    record_ptr,
+    tag,
+    launch,
+    sink_ptr,
+    request,
+    kv_head,
+    first_row,
+    HAS_SINK: gl.constexpr,
+    WAIT_RECORDS: gl.constexpr,
+):
+    """Merge one row per wave of a balanced split's partials, bitwise
+    ``gluon_mha_decode_balanced_reduce_gfx950``'s output rows before their
+    rounding.
+
+    The workgroup's waves take rows ``first_row + wave`` of ``request``'s
+    ``kv_head`` (rows run over query positions, then the KV head's query
+    heads), all in one row block (``first_row`` a multiple of ``NUM_WARPS``).
+    ``WAIT_RECORDS(record_ptr, first, count, tag, launch)`` (constexpr)
+    returns in every wave once the row block's ``count`` records from
+    ``first`` (see :func:`publish_balanced_record_gfx950`) equal ``tag``, or
+    stops the launch at its deadline. Each wave then issues its row's partial
+    loads (``.cv``, written through on any XCD) for up to
+    ``2 * 64`` splits before it folds them, in ``_merge_tiles``' tiles and
+    order.
+
+    Returns:
+        ``(out, q_index, q_head)``: FP32 ``[NUM_WARPS, HEAD_DIM]``, and each
+        wave's query token and head ``[NUM_WARPS]``.
+    """
+    W: gl.constexpr = cfg.NUM_WARPS
+    HEAD_DIM: gl.constexpr = cfg.HEAD_DIM
+    gl.static_assert(cfg.BLOCK_M % W == 0 and _BALANCED_MAX_SPLITS_C <= 2 * 64)
+    # The reduce's layout, one row per wave: four partial values per lane.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 4], [1, 256 // HEAD_DIM, HEAD_DIM // 4], [W, 1, 1], [2, 1, 0]
+    )
+    row_l: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, layout))
+    row = first_row + gl.arange(0, W, layout=row_l)
+    row_block = first_row // cfg.BLOCK_M
+    head_block = kv_head * cfg.NUM_ROW_BLOCKS + row_block
+    first_slot = gl.load(schedule_ptr + 2 * (1 + request))
+    splits = gl.load(schedule_ptr + 2 * (1 + request) + 1)
+    block_item = (
+        first_slot * (cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS) + head_block * splits
+    )
+    WAIT_RECORDS(record_ptr, block_item * W, splits * W, tag, launch)
+    first_part = block_item * cfg.BLOCK_M + (row - row_block * cfg.BLOCK_M) * splits
+    if splits <= 16:
+        m_i, l_i, acc = _merge_rows_issue_first(
+            mid_o_ptr, mid_lse_ptr, first_part, splits, HEAD_DIM, layout, 16, 1
+        )
+    else:
+        m_i, l_i, acc = _merge_rows_issue_first(
+            mid_o_ptr, mid_lse_ptr, first_part, splits, HEAD_DIM, layout, 64, 2
+        )
+    position = row // cfg.GROUP_SIZE
+    q_index = request * cfg.MAX_SEQLEN_Q + position
+    q_head = kv_head * cfg.GROUP_SIZE + (row - position * cfg.GROUP_SIZE)
+    if HAS_SINK:
+        sink = cdna4.buffer_load(sink_ptr, q_head).to(gl.float32) * _INV_LN2
+        next_m = maximum(m_i, sink)
+        alpha = gl.exp2(m_i - next_m)
+        l_i = l_i * alpha + gl.exp2(sink - next_m)
+        acc = acc * _per_row(alpha, acc)
+    out = acc * _per_row(gl.where(l_i > 0.0, 1.0 / l_i, 0.0), acc)
+    return out, q_index, q_head
 
 
 @gluon.jit

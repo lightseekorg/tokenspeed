@@ -39,6 +39,7 @@ from asm_checks import instruction_lines  # noqa: E402
 from native_body_helpers import (  # noqa: E402
     column_relay_kernel,
     compile_gfx950,
+    full_records_kernel,
     head_task_kernel,
     kpart_pooler_kernel,
     kpart_router_kernel,
@@ -73,6 +74,10 @@ _MUSE_SLIDING = dict(
     IS_FP8=True,
     NUM_STAGES=2,
 )
+
+
+# The sliding-only constants the full-attention kernels do not take.
+_SPLIT_ONLY = ("NUM_KV_SPLITS", "WINDOW_LEFT")
 
 
 def test_split_record_follows_the_wave_drain_of_its_partial():
@@ -387,3 +392,65 @@ def test_sender_sums_add_their_columns_in_each_thread():
     ]
     assert not [line for line in tail if "dpp" in line or line == "s_barrier"]
     assert [line for line in tail if line.startswith("buffer_store_dwordx4")]
+
+
+def test_full_records_wait_only_for_the_partial_and_merge_issue_first():
+    """Full attention's split publishes its record once its own partial
+    stores (``sc0 sc1``, written through) are done while the next role's 8
+    weight loads stay in flight (``vmcnt(8)``, no ``vmcnt(0)``); the merger
+    reads both 64-split tiles' partials ``sc0 sc1`` back to back before its
+    first wait, with no scratch."""
+    assembly = compile_gfx950(
+        full_records_kernel,
+        {
+            "q_ptr": "*fp8e4nv",
+            "cache_seqlens_ptr": "*i32",
+            "num_requests": "i32",
+            "schedule_ptr": "*i32",
+            "page_table_ptr": "*i32",
+            "k_cache_ptr": "*fp8e4nv",
+            "v_cache_ptr": "*fp8e4nv",
+            "mid_o_ptr": "*fp32",
+            "mid_lse_ptr": "*fp32",
+            "out_ptr": "*bf16",
+            "sink_ptr": "*fp32",
+            "record_ptr": "*i32",
+            "hook_ptr": "*i32",
+            "error_ptr": "*i32",
+            "tag": "i32",
+            "deadline_ticks": "i64",
+            "program_indices": "i32",
+        },
+        dict(
+            {k: v for k, v in _MUSE_SLIDING.items() if k not in _SPLIT_ONLY},
+            HAS_SINK=True,
+            HOOK_LOADS=8,
+        ),
+        num_warps=4,
+        **persistent_compile_options(),
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    code = instruction_lines(assembly)
+    partials = [
+        i
+        for i, line in enumerate(code)
+        if line.startswith("buffer_store_dword") and line.endswith("sc0 sc1")
+    ]
+    assert len(partials) == 6  # 4 x 16 B of the 64 x 64 FP32 tile, 2 lse
+    record = next(
+        i
+        for i, line in enumerate(code)
+        if line.startswith("global_store_dword") and line.endswith("sc1")
+    )
+    waits = [line for line in code[partials[-1] : record] if "vmcnt" in line]
+    assert waits == ["s_waitcnt vmcnt(8)"], waits
+    reads = [
+        i
+        for i, line in enumerate(code)
+        if line.startswith("buffer_load") and line.endswith("sc0 sc1") and i > record
+    ]
+    # The merge's two-tile branch: per lane 16 lse words and 16 x 16 B of
+    # partial rows for each of the two tiles.
+    run = reads[: 2 * (16 + 16)]
+    assert sum(code[i].startswith("buffer_load_dwordx4") for i in run) == 32
+    assert not [line for line in code[run[0] : run[-1]] if "vmcnt" in line]

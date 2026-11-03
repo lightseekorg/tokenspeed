@@ -1573,6 +1573,17 @@ to `mha_decode_with_kvcache`, which then selects
   ~20% on uniform batches of 4 or more requests and keep the split grid.
   Batch sizes and lengths are runtime values: the kernels compile once per
   layer shape.
+- For persistent kernels: `mha_decode_balanced_item_gfx950` locates the item
+  of a program index of the balanced grid (a workgroup may run several, e.g.
+  indices `pid, pid + 256`) and `mha_decode_balanced_split_gfx950` streams
+  it. `store_balanced_partial_gfx950` writes the partial through (`.wt`) and
+  loads a per-wave token behind it; the caller may issue its next role's
+  weights there, and `publish_balanced_record_gfx950` then stores a
+  device-scope tag record once the token arrived, so the wait covers the
+  partial but not the weights. `merge_balanced_rows_gfx950` merges one row
+  per wave after a caller-supplied poll of the row block's records, issuing
+  both 64-split tiles' `.cv` loads before the fold. Same items, split bounds
+  and fold order, so the rows are bitwise the reduce's.
 
 ### gfx950 MHA prefill
 
