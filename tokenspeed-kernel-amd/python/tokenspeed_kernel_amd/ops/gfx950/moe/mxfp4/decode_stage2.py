@@ -478,7 +478,18 @@ __all__ = [
 
 
 def _route_tile_launch_metadata(grid, kernel, args):
-    return {"name": f"{kernel.name} (routes={args['out'].shape[0]})"}
+    return {"name": f"{kernel.name} (routes={args['SINK_ARGS'][0].shape[0]})"}
+
+
+@gluon.jit
+def store_route_rows(
+    values, rows, columns, valid, SINK_ARGS, SINK_CONSTS: gl.constexpr
+):
+    """The route-tile stage 2's default sink: row r of ``values`` to route row
+    ``rows[r]`` of the output ``SINK_ARGS[0]``, whose rows are
+    ``SINK_CONSTS[0]`` elements apart."""
+    out = SINK_ARGS[0]
+    gl.store(out + rows.to(gl.int64) * SINK_CONSTS[0] + columns, values, valid)
 
 
 @gluon.jit
@@ -501,7 +512,7 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     descriptors,
     group_count,
     descriptor_rows,
-    out,
+    SINK_ARGS,
     INTERMEDIATE: gl.constexpr,
     OUTPUT: gl.constexpr,
     XS0: gl.constexpr,
@@ -514,13 +525,20 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     BLOCK_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     PREFETCH_TILES: gl.constexpr,
+    SINK: gl.constexpr,
+    SINK_CONSTS: gl.constexpr,
 ):
     """Read expert route tiles and return separate token/slot outputs.
 
     ``sorted_routes``, ``descriptors`` and ``group_count`` hold the routes
     grouped by expert, from the route-descriptor kernels or from stage 1
     (``gluon_mxfp4_moe_stage1_route_tiles_gfx950`` with ``ROUTES_FROM_IDS``);
-    ``descriptor_rows`` is the descriptor table's row count.
+    ``descriptor_rows`` is the descriptor table's row count. Each job's
+    BF16 rows go to ``SINK(values, rows, columns, valid, SINK_ARGS,
+    SINK_CONSTS)``: ``rows`` are route rows (token * TOPK + slot),
+    ``columns`` output columns, and ``SINK_ARGS`` (runtime) and
+    ``SINK_CONSTS`` (constexpr) tuples are the sink's own arguments;
+    ``store_route_rows`` stores into a ``[routes, OUTPUT]`` tensor.
     """
     gl.static_assert(
         INTERMEDIATE % BLOCK_K == 0, "route tiles require complete K tiles"
@@ -613,8 +631,11 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
         sm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfma))[:, None]
         sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma))[None, :]
         destinations = gl.load(sorted_routes + start + gl.minimum(sm, count - 1))
-        gl.store(
-            out + destinations.to(gl.int64) * OUTPUT + n * BLOCK_N + sn,
+        SINK(
             acc.to(gl.bfloat16),
+            destinations,
+            n * BLOCK_N + sn,
             sm < count,
+            SINK_ARGS,
+            SINK_CONSTS,
         )

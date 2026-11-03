@@ -963,6 +963,7 @@ def _launch_mxfp4_route_tiles(
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
         gluon_mxfp4_moe_stage2_route_tiles_gfx950,
+        store_route_rows,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
         gluon_mxfp4_moe_route_pack_gfx950,
@@ -1085,7 +1086,7 @@ def _launch_mxfp4_route_tiles(
         descriptors,
         group_count,
         descriptors.shape[0],
-        out,
+        (out,),
         INTERMEDIATE=inter_dim,
         OUTPUT=out_dim,
         XS0=q_inter_scale.stride(0),
@@ -1098,6 +1099,8 @@ def _launch_mxfp4_route_tiles(
         BLOCK_K=config.stage2.block_k,
         BLOCK_M=block_m,
         PREFETCH_TILES=config.stage2.prefetch_tiles,
+        SINK=store_route_rows,
+        SINK_CONSTS=(out_dim,),
         num_warps=config.stage2.num_warps,
     )
     return out, None, expanded_idx

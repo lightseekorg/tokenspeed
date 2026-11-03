@@ -44,6 +44,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (  # noqa: 
     _stage2_mxfp4_direct_mfma_gluon,
     gluon_mxfp4_moe_stage2_route_tiles_gfx950,
     invoke_stage2_mxfp4_mfma_decode_gluon,
+    store_route_rows,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _extract_gluon_raw_s,
@@ -664,7 +665,7 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         descriptors,
         group_count,
         descriptors.shape[0],
-        output,
+        (output,),
         INTERMEDIATE=INTERMEDIATE,
         OUTPUT=HIDDEN,
         XS0=intermediate_scales.stride(0),
@@ -677,6 +678,8 @@ def test_route_tiled_gemms_preserve_route_slots() -> None:
         BLOCK_K=128,
         BLOCK_M=16,
         PREFETCH_TILES=1,
+        SINK=store_route_rows,
+        SINK_CONSTS=(HIDDEN,),
         num_warps=1,
     )
     owned = (ids.flatten() >= expert_start) & (
