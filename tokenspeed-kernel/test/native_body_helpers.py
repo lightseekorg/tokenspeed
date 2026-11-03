@@ -34,6 +34,11 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionProgram,
     mha_decode_sliding_split_gfx950,
 )
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
+    gemv_a16w16_splitk_wave_sums_gfx950,
+    gemv_a16w16_splitk_weights_gfx950,
+    gemv_a16w16_splitk_x_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     ERROR_ABORT,
     FIRST_KERNEL_SITE,
@@ -180,3 +185,44 @@ def split_records_kernel(
             record_ptr, launch.tag, q_ptr, False, wait_records_tags16, launch
         )
         program.store_merged(out_ptr, merged)
+
+
+@gluon.constexpr_function
+def sums_layout(waves: int, rows: int, vector: int):
+    """``gemv_a16w16_splitk_wave_sums_gfx950``'s ``OUT_LAYOUT`` for 16 tokens
+    by ``rows`` columns: ``vector`` contiguous columns per thread."""
+    lanes = rows // vector
+    return gl.BlockedLayout(
+        [waves, 1, vector], [1, 64 // lanes, lanes], [1, waves, 1], [2, 1, 0]
+    )
+
+
+@gluon.jit
+def sender_kernel(
+    w_ptr,
+    x_ptr,
+    out_ptr,
+    M,
+    K: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    VECTOR: gl.constexpr,
+):
+    """The native layer's o_proj sender (SND) on a plain x: program b issues
+    weight rows ``[b * OUTPUTS, ...)`` over the whole K, multiplies them by
+    the first 16 rows of x (rows past ``M`` reread row ``M - 1``) and stores
+    the BF16 sums ``[16, OUTPUTS]`` at ``out_ptr`` row-major per program."""
+    block = gl.program_id(0)
+    tiles = gemv_a16w16_splitk_weights_gfx950(
+        w_ptr, block, K, OUTPUTS, 1, gl.num_programs(0)
+    )
+    x = gemv_a16w16_splitk_x_gfx950(x_ptr, K, block, M, K, 1, gl.num_programs(0), "")
+    layout: gl.constexpr = sums_layout(gl.num_warps(), OUTPUTS, VECTOR)
+    sums = gemv_a16w16_splitk_wave_sums_gfx950(tiles, x, layout)
+    out_l: gl.constexpr = gl.SliceLayout(0, layout)
+    token = gl.arange(0, 16, gl.SliceLayout(1, out_l))
+    column = gl.arange(0, OUTPUTS, gl.SliceLayout(0, out_l))
+    gl.amd.cdna4.buffer_store(
+        sums.to(gl.bfloat16),
+        out_ptr,
+        (block * 16 + token[:, None]) * OUTPUTS + column[None, :],
+    )

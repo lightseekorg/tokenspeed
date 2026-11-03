@@ -34,7 +34,11 @@ import pytest
 pytest.importorskip("tokenspeed_kernel_amd")
 
 from asm_checks import instruction_lines  # noqa: E402
-from native_body_helpers import compile_gfx950, split_records_kernel  # noqa: E402
+from native_body_helpers import (  # noqa: E402
+    compile_gfx950,
+    sender_kernel,
+    split_records_kernel,
+)
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     persistent_compile_options,
 )
@@ -129,3 +133,30 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
     assert (
         sum(1 for i in loads if i < first_wait) >= 16
     ), "every split's partial load is issued before the first wait"
+
+
+def _metadata(assembly: str, key: str) -> int:
+    return int(re.search(rf"\.{key}:\s+(\d+)", assembly).group(1))
+
+
+def test_sender_sums_waves_with_wide_lds_reads():
+    """The o_proj sender (64 columns x K 1024, 8 waves) multiplies resident
+    weights with no cross-wave traffic before one LDS exchange, and reads the
+    exchange as whole 8-byte runs per wave (the columns are stored fastest),
+    not as scattered 4-byte reads."""
+    kernel = compile_gfx950(
+        sender_kernel,
+        {"w_ptr": "*bf16", "x_ptr": "*bf16", "out_ptr": "*bf16", "M": "i32"},
+        dict(K=1024, OUTPUTS=64, VECTOR=2),
+        num_warps=8,
+    )
+    assembly = kernel.asm["amdgcn"]
+    code = instruction_lines(assembly)
+    reads = [line.split()[0] for line in code if line.startswith("ds_read")]
+    assert reads and not [
+        r for r in reads if r in ("ds_read_b32", "ds_read2_b32")
+    ], reads
+    assert len(reads) <= 4, reads
+    assert sum(1 for line in code if line.startswith("v_mfma")) == 16
+    assert sum(1 for line in code if line == "s_barrier") == 1
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
