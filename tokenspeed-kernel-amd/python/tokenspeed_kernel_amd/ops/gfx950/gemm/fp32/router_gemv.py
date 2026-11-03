@@ -48,11 +48,13 @@ def _launch_metadata(grid, kernel, args):
 @gluon.jit
 def _load_x_step(x_ptr, x_offs, row_mask, k, step, K: gl.constexpr, STEP: gl.constexpr):
     """Load K step ``step`` of every row's activations, zero past ``K``."""
+    # No ``other``: a masked lane's buffer load gets an out-of-range offset
+    # and reads zero (CDNA4 ISA 9.1.5.1), while ``other`` would add a
+    # v_cndmask per loaded register.
     return gl.amd.cdna4.buffer_load(
         x_ptr,
         x_offs + step * STEP,
         mask=row_mask & (k + step * STEP < K)[None, :],
-        other=0.0,
     )
 
 
