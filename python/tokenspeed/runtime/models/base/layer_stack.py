@@ -76,8 +76,15 @@ def notify_target_capture(
 class DecoderLayerStack:
     """Run every decoder layer in order: ``BaseTransformerModel``'s loop."""
 
+    def heap_bytes(self, model: BaseTransformerModel, world_size: int) -> int:
+        """Communication-heap bytes ``prepare`` will allocate, reserved when
+        the heap is created; none here."""
+        return 0
+
     def prepare(self, model: BaseTransformerModel) -> None:
-        """Prepare other implementations of the model's layers; none here."""
+        """Prepare other implementations of the model's layers, once at
+        startup before the KV cache is sized or a graph is captured; none
+        here."""
 
     def run(
         self,
@@ -88,7 +95,8 @@ class DecoderLayerStack:
         residual: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the model's layers on one step.
+        """Run the model's layers on one step. A model with its own forward
+        overrides ``run`` with the boundary values its layers pass.
 
         Args:
             model: The model whose layers run.
