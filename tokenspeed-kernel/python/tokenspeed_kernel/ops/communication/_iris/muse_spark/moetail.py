@@ -83,10 +83,13 @@ def iris_muse_moetail_project(
     BLOCK_K: gl.constexpr,
     WAVES_PER_OUTPUT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    X_CACHE: gl.constexpr,
 ):
     """Project outputs [first_output, first_output + OUTPUTS) of every row.
 
     Each (row, output) keeps the replicated single-row GEMV's reduction.
+    ``X_CACHE`` is the row loads' cache modifier (".cv" when this launch
+    wrote x).
 
     Returns:
         BF16 [BLOCK_M, OUTPUTS] in the send layout.
@@ -102,6 +105,7 @@ def iris_muse_moetail_project(
         WAVES_PER_OUTPUT,
         1,
         NUM_WARPS,
+        X_CACHE,
     )
     return gl.convert_layout(values.to(gl.bfloat16), _send_layout(OUTPUTS, NUM_WARPS))
 
@@ -133,11 +137,38 @@ def iris_muse_moetail_load_columns(
 
 
 @gluon.jit
+def iris_muse_moetail_send_stage(
+    epochs,
+    first_output,
+    M,
+    LOCAL_WIDTH: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Mailbox stage of each row's outputs from ``first_output``, from the stage words.
+
+    ``epochs`` holds one stage word per 512-element tile, advanced by the
+    row's reducer (iris_muse_moetail_release). OUTPUTS divides the tile, so a
+    row's outputs share one stage.
+
+    Returns:
+        uint32 [BLOCK_M, OUTPUTS] stages in the send layout.
+    """
+    layout: gl.constexpr = _send_layout(OUTPUTS, NUM_WARPS)
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
+    outputs = first_output + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(0, layout))
+    elements = rows[:, None] * LOCAL_WIDTH + outputs[None, :]
+    valid = (rows < M)[:, None] & (outputs >= 0)[None, :]
+    return gl.load(epochs + elements // 512, mask=valid, other=0).to(gl.uint32) % 3
+
+
+@gluon.jit
 def iris_muse_moetail_send(
     values,
     first_output,
     program,
-    epochs,
+    stage,
     regions,
     M,
     sink: gl.constexpr,
@@ -153,7 +184,9 @@ def iris_muse_moetail_send(
 ):
     """Store ``values`` (outputs from ``first_output`` of every row) in slot RANK of every mailbox.
 
-    Row m lands at elements [m * LOCAL_WIDTH, (m + 1) * LOCAL_WIDTH).
+    Row m lands at elements [m * LOCAL_WIDTH, (m + 1) * LOCAL_WIDTH) of
+    ``stage``'s copy (a scalar, or iris_muse_moetail_send_stage's per-row
+    stages); a copy holds WORLD_SIZE slots of MAX_ELEMENTS.
     ``sink(published, regions, offset, offsets, mask, program, RANK,
     WORLD_SIZE, PEER_STORE_CACHE)`` stores the peers' copies, ``published[d -
     1]`` for peer RANK + d (``_iris_lamport_push``'s signature); ``program``
@@ -165,8 +198,6 @@ def iris_muse_moetail_send(
     outputs = first_output + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(0, layout))
     elements = rows[:, None] * LOCAL_WIDTH + outputs[None, :]
     valid = (rows < M)[:, None] & (outputs >= 0)[None, :]
-    # OUTPUTS divides the 512-element tile, so a row's outputs share one stage.
-    stage = gl.load(epochs + elements // 512, mask=valid, other=0).to(gl.uint32) % 3
     # Many lanes may hold each value; the store lowering masks the duplicates,
     # so one lane writes each 8-byte packet.
     values = _iris_sanitize_lamport_bf16(gl.convert_layout(values, layout))
@@ -383,7 +414,9 @@ def iris_muse_moetail_release(
 
     Call after iris_muse_moetail_reduce (and, to publish sooner, after
     iris_muse_moetail_publish): the next use of these words is a later
-    launch at least three stages on, so clearing late is safe.
+    launch on another stage, so clearing late is safe. With ``epochs`` None
+    (the caller picks stages itself, such as a persistent launch's epoch
+    parity) no stage word advances.
     """
     TILES: gl.constexpr = LOCAL_WIDTH // 512
     mailbox = _iris_muse_moetail_mailbox(
@@ -396,12 +429,14 @@ def iris_muse_moetail_release(
         mailbox,
         cache=CLEAR_CACHE,
     )
-    # Every subgroup has left its poll, so every local sender has read this
-    # row's stages before pushing a polled own-slot word. The next use of
-    # these tiles is a later launch, which also sees the restored markers.
-    gl.barrier()
-    for tile in gl.static_range(TILES):
-        gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
+    if epochs is not None:
+        # Every subgroup has left its poll, so every local sender has read
+        # this row's stages before pushing a polled own-slot word. The next
+        # use of these tiles is a later launch, which also sees the restored
+        # markers.
+        gl.barrier()
+        for tile in gl.static_range(TILES):
+            gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
 
 
 @gluon.jit
@@ -515,10 +550,13 @@ def iris_fused_gemv_lamport_allgather_muse_moetail(
     else:
         values = iris_muse_moetail_project(
             x_ptr, weight_ptr, program * OUTPUTS, M, K, BLOCK_M, OUTPUTS, BLOCK_K,
-            WAVES_PER_OUTPUT, NUM_WARPS
+            WAVES_PER_OUTPUT, NUM_WARPS, ""
         )  # fmt: skip
+        stage = iris_muse_moetail_send_stage(
+            epochs, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS
+        )
         iris_muse_moetail_send(
-            values, program * OUTPUTS, program, epochs, regions, M, _iris_lamport_push,
+            values, program * OUTPUTS, program, stage, regions, M, _iris_lamport_push,
             RANK, WORLD_SIZE, LOCAL_WIDTH, MAX_ELEMENTS, BLOCK_M, OUTPUTS, NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE, ".wt"
         )  # fmt: skip
@@ -577,8 +615,11 @@ def iris_columns_lamport_allgather_muse_moetail(
         values = iris_muse_moetail_load_columns(
             y_ptr, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS, ""
         )
+        stage = iris_muse_moetail_send_stage(
+            epochs, program * OUTPUTS, M, LOCAL_WIDTH, BLOCK_M, OUTPUTS, NUM_WARPS
+        )
         iris_muse_moetail_send(
-            values, program * OUTPUTS, program, epochs, regions, M, _iris_lamport_push,
+            values, program * OUTPUTS, program, stage, regions, M, _iris_lamport_push,
             RANK, WORLD_SIZE, LOCAL_WIDTH, MAX_ELEMENTS, BLOCK_M, OUTPUTS, NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE, ".wt"
         )  # fmt: skip
