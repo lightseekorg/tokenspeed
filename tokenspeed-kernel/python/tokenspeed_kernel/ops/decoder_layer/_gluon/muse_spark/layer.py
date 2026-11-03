@@ -59,6 +59,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     iris_wait_lamport_slots,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+    muse_attntail_gated_rows,
     muse_attntail_publish_attention,
     muse_attntail_read_box,
 )
@@ -88,7 +89,12 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import InputStrides
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionConfig,
     AttentionProgram,
+    merge_balanced_rows_gfx950,
+    mha_decode_balanced_item_gfx950,
+    mha_decode_balanced_split_gfx950,
     mha_decode_sliding_split_gfx950,
+    publish_balanced_record_gfx950,
+    store_balanced_partial_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.prologue.gqa import (
     gqa_prologue_key_gfx950,
@@ -126,11 +132,13 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     FIRST_KERNEL_SITE,
+    GRID,
     enter_check,
     enter_issue,
     fail_stop,
     persistent_compile_options,
     poll_tags16,
+    poll_until_all,
     release_drain,
 )
 
@@ -164,6 +172,11 @@ POOL_TILE = 64
 POOL_TILES = POOLED_LOCAL // POOL_TILE
 # Sliding attention: 8 splits per (request, KV head) block, on the block's XCD.
 SLIDING_SPLITS = 8
+# Full attention: the balanced decode's items (its grid: at least 512
+# program indices), two per workgroup at most; one merge task per 8 rows of
+# a (request, KV head) block (one row per wave).
+FULL_PROGRAMS = 512
+FULL_MERGE_TASKS_PER_BLOCK = 64 // 8
 ATT_FIRST_SLOT = 24
 # One 16-row MFMA tile per wave tiles the attention rows.
 ATT_BLOCK_M = 16 * NUM_WARPS
@@ -230,6 +243,9 @@ _POOL_TILE = gl.constexpr(POOL_TILE)
 _POOL_TILES = gl.constexpr(POOL_TILES)
 _ATT_FIRST_SLOT = gl.constexpr(ATT_FIRST_SLOT)
 _ATT_BLOCK_M = gl.constexpr(ATT_BLOCK_M)
+_FULL_PROGRAMS = gl.constexpr(FULL_PROGRAMS)
+_FULL_MERGE_TASKS = gl.constexpr(FULL_MERGE_TASKS_PER_BLOCK)
+_GRID = gl.constexpr(GRID)
 _MAX_ROWS = gl.constexpr(MAX_ROWS)
 _BOX_WORDS = gl.constexpr(BOX_WORDS)
 _H1_WORDS = gl.constexpr(H1_WORDS)
@@ -387,6 +403,167 @@ def _attention_split(
         muse_attntail_publish_attention(
             program, merged, gate, view.box + launch.copy * _BOX_WORDS, GATE_EPS
         )
+
+
+# ---------------------------------------------------------------------------
+# Front: full attention (S1-S3 of full layers)
+# ---------------------------------------------------------------------------
+
+
+@gluon.jit
+def _wait_records_gpu(record_ptr, first, count, tag, launch):
+    """S2 consumer of full layers: ``count`` int32 records from ``first``,
+    published on any XCD with device-scope stores; one per lane, relaxed
+    device-scope polls (``poll_until_all`` ``"sc1"``)."""
+    lanes = gl.arange(
+        0,
+        64 * gl.num_warps(),
+        layout=gl.BlockedLayout([1], [64], [gl.num_warps()], [0]),
+    )
+    for chunk in range(0, count, 64 * gl.num_warps()):
+        index = chunk + lanes
+        if not poll_until_all(
+            record_ptr + first + index, index < count, tag, launch, "sc1"
+        ):
+            iris_fail_stop(launch, _SITE_RECORDS, chunk)
+
+
+@gluon.jit
+def _no_weights(args):
+    return ()
+
+
+@gluon.jit
+def _sender_weights(args):
+    """SND + RTR's resident weights: o_proj rows of sender, the router's
+    hi / lo tiles of its K-part task."""
+    o_proj_ptr, sender, router_hi_ptr, router_lo_ptr, task = args
+    o_tiles = gemv_a16w16_splitk_weights_gfx950(
+        o_proj_ptr, sender, _Q_WIDTH, 64, 1, 128
+    )
+    hi = gemv_a16w16_splitk_weights_gfx950(
+        router_hi_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS
+    )
+    lo = gemv_a16w16_splitk_weights_gfx950(
+        router_lo_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS
+    )
+    return o_tiles, hi, lo
+
+
+@gluon.jit
+def _pooler_weights(args):
+    """POOL's resident weights: its K-part task's pooler tiles."""
+    pooler_ptr, task = args
+    return gemv_a16w16_splitk_weights_gfx950(
+        pooler_ptr, task, _HIDDEN, _POOL_TILE, _KPARTS, _POOL_TILES
+    )
+
+
+@gluon.jit
+def _full_items(
+    launch,
+    cfg: gl.constexpr,
+    q_ptr,
+    cache_seqlens_ptr,
+    schedule_ptr,
+    page_table_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    record_ptr,
+    REQUESTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    ISSUE: gl.constexpr,
+    issue_args,
+):
+    """S1-S2 of a full layer: this workgroup's balanced decode items
+    (program indices ``cta`` and ``cta + GRID``). Each partial is written
+    through; its record (device scope) waits only for the partial's stores.
+    The role's weights (``ISSUE(issue_args)``) issue after the first item's
+    partial store, so they hold up neither its stores nor its record.
+
+    Returns:
+        ``ISSUE``'s weights.
+    """
+    gl.static_assert(_FULL_PROGRAMS <= 2 * _GRID)
+    program, live, block_item, splits = mha_decode_balanced_item_gfx950(
+        cfg, q_ptr, cache_seqlens_ptr, REQUESTS, schedule_ptr, page_table_ptr,
+        k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, launch.cta,
+    )  # fmt: skip
+    lanes_l: gl.constexpr = gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
+    token = gl.zeros([64 * cfg.NUM_WARPS], gl.int32, lanes_l)
+    if live:
+        m_i, l_i, acc = mha_decode_balanced_split_gfx950(
+            program, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
+        token = store_balanced_partial_gfx950(
+            program, acc, l_i, m_i, block_item, splits, record_ptr
+        )
+    issued = ISSUE(issue_args)
+    if live:
+        publish_balanced_record_gfx950(
+            program, record_ptr, block_item, launch.tag, token
+        )
+    program, live, block_item, splits = mha_decode_balanced_item_gfx950(
+        cfg, q_ptr, cache_seqlens_ptr, REQUESTS, schedule_ptr, page_table_ptr,
+        k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, launch.cta + _GRID,
+    )  # fmt: skip
+    if live:
+        m_i, l_i, acc = mha_decode_balanced_split_gfx950(
+            program, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
+        token = store_balanced_partial_gfx950(
+            program, acc, l_i, m_i, block_item, splits, record_ptr
+        )
+        publish_balanced_record_gfx950(
+            program, record_ptr, block_item, launch.tag, token
+        )
+    return issued
+
+
+@gluon.jit
+def _full_merge(
+    launch,
+    task,
+    view,
+    cfg: gl.constexpr,
+    schedule_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    record_ptr,
+    q_ptr,
+    gate_ptr,
+    gate_stride,
+    GATE_EPS: gl.constexpr,
+):
+    """S3 of a full layer: merge task ``task`` (8 rows of one (request, KV
+    head) block, one per wave) polls the block's records, merges bitwise
+    the balanced reduce's way, then gates, normalizes and publishes its rows
+    to the attention box (written through), as the sliding merger does."""
+    block = task // _FULL_MERGE_TASKS
+    out, q_index, q_head = merge_balanced_rows_gfx950(
+        cfg, schedule_ptr, mid_o_ptr, mid_lse_ptr, record_ptr, launch.tag, launch,
+        q_ptr, block // cfg.NUM_KV_HEADS, block % cfg.NUM_KV_HEADS,
+        (task % _FULL_MERGE_TASKS) * cfg.NUM_WARPS, False, _wait_records_gpu,
+    )  # fmt: skip
+    out_l: gl.constexpr = out.type.layout
+    d = gl.arange(0, cfg.HEAD_DIM, gl.SliceLayout(0, out_l))
+    q_index = gl.convert_layout(q_index, gl.SliceLayout(1, out_l))
+    q_head = gl.convert_layout(q_head, gl.SliceLayout(1, out_l))
+    gate = gl.load(
+        gate_ptr + (q_index * gate_stride + q_head * cfg.HEAD_DIM)[:, None] + d[None, :]
+    )
+    rows = muse_attntail_gated_rows(out, gate, GATE_EPS)
+    box = (view.box + launch.copy * _BOX_WORDS).to(
+        gl.pointer_type(gl.bfloat16), bitcast=True
+    )
+    gl.amd.cdna4.buffer_store(
+        rows,
+        box,
+        (q_index * _Q_WIDTH + q_head * cfg.HEAD_DIM)[:, None] + d[None, :],
+        cache=".wt",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1217,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     v_cache_ptr,
     page_table_ptr: tl.const,
     cache_seqlens_ptr,
+    schedule_ptr: tl.const,
     mid_o_ptr,
     mid_lse_ptr,
     att_records,
@@ -1122,6 +1300,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
     # Norms.
     POST_ATTN_EPS: gl.constexpr,
     POST_ATTN_OFFSET: gl.constexpr,
+    POST_ATTN_HAS_WEIGHT: gl.constexpr,
     PRE_FFN_EPS: gl.constexpr,
     POOLED_EPS: gl.constexpr,
     POOLED_OFFSET: gl.constexpr,
@@ -1150,15 +1329,16 @@ def gluon_decoder_layer_muse_spark_gfx950(
 ):
     """One fused Muse Spark decoder layer (see the module docstring)."""
     ROWS: gl.constexpr = REQUESTS * 8
-    gl.static_assert(SLIDING, "full-attention layers are not composed yet")
     rows = gl.to_tensor(ROWS)
     view = MuseNativeView(
         heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
     )
+    # Sliding layers: 8 splits per block; full layers: the balanced decode's
+    # items (its schedule picks the splits).
     cfg: gl.constexpr = AttentionConfig(
-        SM_SCALE, PAGE_TABLE_STRIDE, PAGE_SIZE, 8, 8, 16, 2, 64, _ATT_BLOCK_M,
-        PAGE_SIZE, _NUM_WARPS, True, WINDOW_LEFT, True,
-        k_cache_ptr.dtype.element_ty, InputStrides(_Q_WIDTH, 64, 1),
+        SM_SCALE, PAGE_TABLE_STRIDE, PAGE_SIZE, 8 if SLIDING else 1, 8, 16, 2, 64,
+        _ATT_BLOCK_M, PAGE_SIZE, _NUM_WARPS, SLIDING, WINDOW_LEFT if SLIDING else -1,
+        True, k_cache_ptr.dtype.element_ty, InputStrides(_Q_WIDTH, 64, 1),
     )  # fmt: skip
 
     _reserve_lds()
@@ -1169,22 +1349,25 @@ def gluon_decoder_layer_muse_spark_gfx950(
     if slot < 16:
         # SND (S4-S5) -> OWN1 on slot 0 (S6-S7) -> RTR (S8-S9).
         sender = xcd * 16 + slot
-        o_tiles = gemv_a16w16_splitk_weights_gfx950(
-            o_proj_ptr, sender, _Q_WIDTH, 64, 1, 128
-        )
         task = xcd * _ROUTER_GROUPS + slot
-        hi = gemv_a16w16_splitk_weights_gfx950(
-            router_hi_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS
-        )
-        lo = gemv_a16w16_splitk_weights_gfx950(
-            router_lo_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS
-        )
-        launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+        weights = (o_proj_ptr, sender, router_hi_ptr, router_lo_ptr, task)
+        if SLIDING:
+            # The weights go out before the entry check (no attention here).
+            o_tiles, hi, lo = _sender_weights(weights)
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+        else:
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+            o_tiles, hi, lo = _full_items(
+                launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
+                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
+                REQUESTS, NUM_STAGES, _sender_weights, weights,
+            )  # fmt: skip
         _send(launch, view, sender, o_tiles, rows, RANK, PEER_CACHE)
         if slot == 0:
             own1(
                 view, launch, xcd, rows, residual_ptr, post_attn_norm_ptr, alpha_ptr,
-                beta_ptr, iris_fail_stop, RANK, POST_ATTN_OFFSET, True, PEER_CACHE,
+                beta_ptr, iris_fail_stop, RANK, POST_ATTN_OFFSET, POST_ATTN_HAS_WEIGHT,
+                PEER_CACHE,
             )  # fmt: skip
         hp, x = _kpart_x(
             launch, view, xcd, task, rows, residual_ptr, alpha_ptr, beta_ptr,
@@ -1201,10 +1384,16 @@ def gluon_decoder_layer_muse_spark_gfx950(
         # POOL (S8-S9); slot 16 + T on XCD T reduces tile T and pushes H3.
         tile = slot - 16
         task = xcd * _POOL_TILES + tile
-        p_tiles = gemv_a16w16_splitk_weights_gfx950(
-            pooler_ptr, task, _HIDDEN, _POOL_TILE, _KPARTS, _POOL_TILES
-        )
-        launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+        if SLIDING:
+            p_tiles = _pooler_weights((pooler_ptr, task))
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+        else:
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+            p_tiles = _full_items(
+                launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
+                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
+                REQUESTS, NUM_STAGES, _pooler_weights, (pooler_ptr, task),
+            )  # fmt: skip
         _, x = _kpart_x(
             launch, view, xcd, task, rows, residual_ptr, alpha_ptr, beta_ptr,
             post_attn_bf16_ptr, pre_ffn_bf16_ptr, _POOL_TILES, POST_ATTN_EPS,
@@ -1236,13 +1425,28 @@ def gluon_decoder_layer_muse_spark_gfx950(
             )  # fmt: skip
     else:
         launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
-        if xcd < 2 * REQUESTS:
-            # S1-S3: split (slot - 24) of block xcd.
-            _attention_split(
-                launch, xcd, slot - _ATT_FIRST_SLOT, view, q_ptr, gate_ptr, gate_stride,
-                k_cache_ptr, v_cache_ptr, page_table_ptr, cache_seqlens_ptr, mid_o_ptr,
-                mid_lse_ptr, att_records, cfg, GATE_EPS, NUM_STAGES,
+        if SLIDING:
+            if xcd < 2 * REQUESTS:
+                # S1-S3: split (slot - 24) of block xcd.
+                _attention_split(
+                    launch, xcd, slot - _ATT_FIRST_SLOT, view, q_ptr, gate_ptr,
+                    gate_stride, k_cache_ptr, v_cache_ptr, page_table_ptr,
+                    cache_seqlens_ptr, mid_o_ptr, mid_lse_ptr, att_records, cfg,
+                    GATE_EPS, NUM_STAGES,
+                )  # fmt: skip
+        else:
+            _full_items(
+                launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
+                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, att_records,
+                REQUESTS, NUM_STAGES, _no_weights, (),
             )  # fmt: skip
+            # Merge tasks on slots 24.. (no weights in flight), 8 per XCD row.
+            merge = (slot - _ATT_FIRST_SLOT) * 8 + xcd
+            if merge < REQUESTS * 2 * _FULL_MERGE_TASKS:
+                _full_merge(
+                    launch, merge, view, cfg, schedule_ptr, mid_o_ptr, mid_lse_ptr,
+                    att_records, q_ptr, gate_ptr, gate_stride, GATE_EPS,
+                )  # fmt: skip
         if (slot == _ATT_FIRST_SLOT) & (xcd >= 8 - REQUESTS):
             _topk(
                 launch, 7 - xcd, rows, logits_parts, router_multiplier, router_bias_ptr,
@@ -1386,6 +1590,7 @@ _POINTER_TYPES = dict(
     v_cache_ptr="*fp8e4nv",
     page_table_ptr="*i32",
     cache_seqlens_ptr="*i32",
+    schedule_ptr="*i32",
     mid_o_ptr="*fp32",
     mid_lse_ptr="*fp32",
     att_records="*i32",
@@ -1449,6 +1654,7 @@ class ModelConstants:
     gate_eps: float
     post_attn_eps: float
     post_attn_offset: float
+    post_attn_has_weight: bool
     pre_ffn_eps: float
     pooled_eps: float
     pooled_offset: float
@@ -1498,6 +1704,7 @@ def kernel_constexprs(
         GATE_EPS=model.gate_eps,
         POST_ATTN_EPS=model.post_attn_eps,
         POST_ATTN_OFFSET=model.post_attn_offset,
+        POST_ATTN_HAS_WEIGHT=model.post_attn_has_weight,
         PRE_FFN_EPS=model.pre_ffn_eps,
         POOLED_EPS=model.pooled_eps,
         POOLED_OFFSET=model.pooled_offset,
@@ -1533,7 +1740,8 @@ MUSE_SPARK_CONSTANTS = ModelConstants(
     window_left=2047,
     gate_eps=1e-5,
     post_attn_eps=1e-8,
-    post_attn_offset=0.0,
+    post_attn_offset=1.0,
+    post_attn_has_weight=False,
     pre_ffn_eps=1e-5,
     pooled_eps=1e-5,
     pooled_offset=0.0,
