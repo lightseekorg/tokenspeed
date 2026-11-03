@@ -67,12 +67,6 @@ else:
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
         fused_add_rmsnorm as _fused_add_rmsnorm,
     )
-    from tokenspeed_kernel.ops.layernorm.flashinfer import (
-        gemma_fused_add_rmsnorm as _gemma_fused_add_rmsnorm,
-    )
-    from tokenspeed_kernel.ops.layernorm.flashinfer import (
-        gemma_rmsnorm as _gemma_rmsnorm,
-    )
     from tokenspeed_kernel.ops.layernorm.flashinfer import rmsnorm as _rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm as _qk_rmsnorm
 
@@ -120,21 +114,14 @@ def rmsnorm(
     return _rmsnorm(x, weight, eps, out=out)
 
 
-def _rows(t: torch.Tensor) -> torch.Tensor:
-    # [M, N] rows with dense columns as they are (a column slice of a fused
-    # projection stays a view); other layouts as a [rows, N] view or copy.
-    if t.ndim == 2 and t.stride(-1) == 1:
-        return t
-    return t.reshape(-1, t.shape[-1])
-
-
 def gemma_rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     residual: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Apply Gemma RMSNorm (multiplier ``1 + weight``) over the last dimension.
+    """Apply Gemma RMSNorm (multiplier ``1 + weight``) over the last dimension
+    through kernel selection.
 
     Args:
         x: GPU input shaped ``[..., hidden_size]``.
@@ -148,28 +135,12 @@ def gemma_rmsnorm(
     Returns:
         The normalized tensor, or ``(normalized, new_residual)`` with ``residual``.
     """
-    if _platform.is_amd:
-        if residual is None:
-            return _grouped_gemma_rmsnorm(x, weight, int(x.shape[-1]), eps, out=None)
-        x_rows, residual_rows = _rows(x), _rows(residual)
-        add_rmsnorm(
-            x_rows,
-            residual_rows,
-            weight,
-            eps,
-            x2=None,
-            out=x_rows,
-            out_fp8=None,
-            fp8_scale=None,
-            out_fp4=None,
-            fp4_scale=None,
-            gemma=True,
-        )
-        return x_rows.view(x.shape), residual_rows.view(residual.shape)
-    if residual is not None:
-        _gemma_fused_add_rmsnorm(x, residual, weight, eps)
-        return x, residual
-    return _gemma_rmsnorm(x, weight, eps)
+    kernel = select_kernel(
+        "layernorm",
+        "gemma_rmsnorm",
+        format_signature(x=dense_tensor_format(x.dtype)),
+    )
+    return kernel(x, weight, eps, residual)
 
 
 def qk_rmsnorm(
