@@ -40,6 +40,7 @@ from native_body_helpers import (  # noqa: E402
     kpart_router_kernel,
     sender_kernel,
     split_records_kernel,
+    topk_keys_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
     persistent_compile_options,
@@ -210,3 +211,24 @@ def test_kpart_consumers_fit_their_register_budget(
     code = instruction_lines(assembly)
     stores = [line for line in code if line.startswith("buffer_store")]
     assert stores and all(line.endswith("sc0 sc1") for line in stores), stores
+
+
+def test_topk_keys_stay_in_one_wave():
+    """The top-8 of a row runs on its wave alone: no LDS, no barrier, no
+    scratch, 64-bit key compares."""
+    assembly = compile_gfx950(
+        topk_keys_kernel,
+        {
+            "logits_ptr": "*fp32",
+            "bias_ptr": "*fp32",
+            "ids_ptr": "*i32",
+            "weights_ptr": "*fp32",
+            "M": "i32",
+        },
+        dict(E=256, TOPK=8, ROUTED_SCALING_FACTOR=2.5),
+        num_warps=8,
+    ).asm["amdgcn"]
+    code = instruction_lines(assembly)
+    assert not [line for line in code if line.startswith("ds_") or line == "s_barrier"]
+    assert any(line.startswith("v_cmp_gt_i64") for line in code)
+    assert _metadata(assembly, "private_segment_fixed_size") == 0

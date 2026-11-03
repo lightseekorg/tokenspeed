@@ -45,6 +45,9 @@ from tokenspeed_kernel_amd.ops.gfx950.layernorm.deferred import (
     deferred_norm_rows_gfx950,
     deferred_norm_scales_gfx950,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+    sigmoid_bias_topk_keys_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     ERROR_ABORT,
     FIRST_KERNEL_SITE,
@@ -353,3 +356,36 @@ def kpart_pooler_kernel(
     gemv_a16w16_splitk_publish_gfx950(
         pooled, part_ptr, tag, (task % GROUPS) * ROWS, task // GROUPS, M, OUTPUTS, ".wt"
     )
+
+
+@gluon.jit
+def topk_keys_kernel(
+    logits_ptr,
+    bias_ptr,
+    ids_ptr,
+    weights_ptr,
+    M,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    ROUTED_SCALING_FACTOR: gl.constexpr,
+):
+    """The native layer's TOPK role: one wave per row, rows ``program *
+    num_warps ..`` of FP32 logits ``[M, E]``; normalized weights."""
+    WAVES: gl.constexpr = gl.num_warps()
+    layout: gl.constexpr = gl.BlockedLayout([1, E // 64], [1, 64], [WAVES, 1], [1, 0])
+    out_l: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [WAVES, 1], [1, 0])
+    row = gl.program_id(0) * WAVES + gl.arange(0, WAVES, gl.SliceLayout(1, layout))
+    expert = gl.arange(0, E, gl.SliceLayout(0, layout))
+    logits = gl.amd.cdna4.buffer_load(
+        logits_ptr,
+        gl.minimum(row, M - 1)[:, None] * E + expert[None, :],
+    )
+    ids, weights = sigmoid_bias_topk_keys_gfx950(
+        logits, bias_ptr, E, TOPK, TOPK, True, ROUTED_SCALING_FACTOR, gl.float32, out_l
+    )
+    out_row = gl.program_id(0) * WAVES + gl.arange(0, WAVES, gl.SliceLayout(1, out_l))
+    pick = gl.arange(0, TOPK, gl.SliceLayout(0, out_l))
+    offsets = out_row[:, None] * TOPK + pick[None, :]
+    mask = (out_row < M)[:, None] & (pick >= 0)[None, :]
+    gl.amd.cdna4.buffer_store(ids, ids_ptr, offsets, mask=mask)
+    gl.amd.cdna4.buffer_store(weights, weights_ptr, offsets, mask=mask)

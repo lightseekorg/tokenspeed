@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel_amd._triton import gl, triton
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -35,6 +36,7 @@ from native_body_helpers import (  # noqa: E402
     kpart_pooler_kernel,
     kpart_router_kernel,
     sender_kernel,
+    topk_keys_kernel,
 )
 
 WIDTH = 8192
@@ -132,3 +134,35 @@ def test_kpart_router_matches_fp32_reference(rows: int) -> None:
     actual = (words & 0xFFFFFFFF).to(torch.int32).view(torch.float32).sum(0)
     expected = (inputs["x"].double() @ router.double().T).float()
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize("rows", [8, 16])
+def test_topk_keys_match_the_row_topk_bitwise(rows: int) -> None:
+    """The one-wave-per-row 64-bit-key top-8 picks the same experts in the
+    same order with the same weights as the per-row top-k the layer uses
+    today, ties (equal logits) included."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+        gluon_sigmoid_bias_topk_gfx950,
+    )
+
+    torch.manual_seed(rows)
+    experts, topk, scale = 256, 8, 2.5
+    logits = torch.randn(rows, experts, device="cuda")
+    logits[:, 100:110] = logits[:, 3:4]  # equal scores: the lower expert wins
+    bias = torch.randn(experts, device="cuda") * 0.1
+    bias[100:110] = bias[3]
+    ids = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    weights = torch.empty(rows, topk, device="cuda")
+    gluon_sigmoid_bias_topk_gfx950[(rows,)](
+        logits, bias, ids, weights, experts, 1, 1, topk, 1, topk, 1, E=experts,
+        TOPK=topk, EP=experts, TKP=topk, NORMALIZE_TOPK_WEIGHTS=True,
+        ROUTED_SCALING_FACTOR=scale, X_DTYPE=gl.float32, NUM_WARPS=1, num_warps=1,
+    )  # fmt: skip
+    keys_ids = torch.empty_like(ids)
+    keys_weights = torch.empty_like(weights)
+    topk_keys_kernel[(triton.cdiv(rows, 8),)](
+        logits, bias, keys_ids, keys_weights, rows, E=experts, TOPK=topk,
+        ROUTED_SCALING_FACTOR=scale, num_warps=8,
+    )  # fmt: skip
+    assert torch.equal(keys_ids, ids)
+    assert torch.equal(keys_weights.view(torch.int32), weights.view(torch.int32))
