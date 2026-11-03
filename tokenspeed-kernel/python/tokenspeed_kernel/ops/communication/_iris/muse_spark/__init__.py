@@ -222,12 +222,12 @@ class MuseIrisState:
         """Symmetric buffers of the fused attention tail, in allocation order:
         the two-shot region [stage][reduce-scatter, all-gather][source][shard]
         (column shards of [rows, 8192 / world_size]) and the tagged norm sums
-        [row][column owner][4]."""
+        [column owner][row][4]."""
         shard = _MUSE_ATTNTAIL_MAX_ROWS * _MUSE_BOUNDARY_WIDTH // world_size
         owners = _MUSE_BOUNDARY_WIDTH // _MUSE_ATTNTAIL_OWNER_COLUMNS
         return (
             ((3, 2, world_size, shard), torch.bfloat16),
-            ((_MUSE_ATTNTAIL_MAX_ROWS, owners, 4), torch.int64),
+            ((owners, _MUSE_ATTNTAIL_MAX_ROWS, 4), torch.int64),
         )
 
     @staticmethod
