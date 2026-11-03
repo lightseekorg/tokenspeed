@@ -54,10 +54,12 @@ VARIANTS = [
 
 
 @gluon.jit
-def _pair_word_sink(args, y, route, cols):
+def _pair_word_sink(args, y, route, cols, col0):
     """A Lamport-style sink like the layer's H4 push: whole bf16 pairs as
-    32-bit words, one relaxed system-scope store each, all in the lane."""
-    words_ptr = args[0].to(gl.pointer_type(gl.int32), bitcast=True)
+    32-bit words, one relaxed system-scope store each, all in the lane, to a
+    per-wave owner slice picked by the scalar first column."""
+    words_ptr = args[0].to(gl.pointer_type(gl.int32), bitcast=True) + (col0 // 512) * 8
+
     zeros = gl.zeros(y.shape, gl.int32, y.type.layout)
     low, high = gl.split(gl.reshape(y.to(gl.bfloat16), [16, 64, 2]))
     column, _ = gl.split(gl.reshape(cols + zeros, [16, 64, 2]))

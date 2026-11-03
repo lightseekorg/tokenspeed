@@ -243,6 +243,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  
 )
 from tokenspeed_kernel_amd._scheduling import wave_uniform_i32  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.persistent import Launch, vote  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import wave_scalar  # noqa: E402
 
 _VIEW = {
     "heaps": ("i64",) * 8, "rank": "i32", "box": "*i32", "h1": "*bf16", "h1_sums": "*i64",
@@ -291,7 +292,13 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
         c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
         y = gl.load(floats + r[:, None] * 128 + c[None, :])
         route = gl.load(words + r)[:, None]
-        h4_sink(H4SinkArgs(view, launch, 3), y, route, (1024 + c)[None, :])
+        # Each wave's first column, as the MoE stream hands it (per wave).
+        wave = wave_scalar(
+            gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0])) // 64
+        )
+        h4_sink(
+            H4SinkArgs(view, launch, 3), y, route, (1024 + c)[None, :], 1024 + 16 * wave
+        )
     elif ROLE == "own4":
         own4_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
                       bitcast=True), iris_fail_stop, 3, 0.0, ".wt")  # fmt: skip
@@ -392,7 +399,10 @@ def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, r
     for unit in range(units):
         y = gl.load(floats + unit * 2048 + r[:, None] * 128 + c[None, :])
         route = gl.load(words + unit * 16 + r)[:, None]
-        h4_sink(H4SinkArgs(view, launch, 3), y, route, (unit * 128 + c)[None, :])
+        h4_sink(
+            H4SinkArgs(view, launch, 3), y, route, (unit * 128 + c)[None, :],
+            unit * 128 + 16 * wave_scalar(lane // 64),
+        )  # fmt: skip
 
 
 def test_h4_sink_moves_no_data_between_lanes():
