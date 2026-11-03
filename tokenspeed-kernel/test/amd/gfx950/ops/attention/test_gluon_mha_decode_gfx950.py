@@ -857,3 +857,95 @@ def test_balanced_schedule_buffer_at_capacity_ignores_its_stale_tail() -> None:
     _check_verify(
         _balanced(inputs, schedule=buffer), _verify_reference(inputs, -1, None)
     )
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_split_records_merge_is_bitwise_the_atomic_merge(fp8: bool) -> None:
+    """The designated merger polling per-wave split records (the native
+    layer's attention hand-off) merges the same partials in the same order as
+    the last-arriver merge, so the rows are bitwise equal."""
+    from native_body_helpers import split_records_kernel
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+        ERROR_WORDS,
+        persistent_compile_options,
+    )
+
+    inputs = _verify_inputs(
+        [2048 + VERIFY_TOKENS + 37, 300 * PAGE_SIZE + 5, 700],
+        VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        HEAD_DIM,
+        20261105,
+    )
+    if fp8:
+        for name in ("q", "k_cache", "v_cache"):
+            inputs[name] = inputs[name].to(torch.float8_e4m3fn)
+    expected = gluon_mha_decode_gfx950(**inputs, window_left=2047)
+
+    q = inputs["q"]
+    config = decode.get_config(
+        q=q,
+        k_cache=inputs["k_cache"],
+        max_seqlen_k=inputs["max_seqlen_k"],
+        max_seqlen_q=inputs["max_seqlen_q"],
+        window_left=2047,
+        softmax_scale=None,
+    )
+    assert config.is_sliding and config.num_kv_splits > 1
+    head_blocks = config.num_kv_heads * config.num_row_blocks
+    total_q = q.shape[0]
+    mid_o = torch.empty(
+        (total_q, config.num_q_heads, config.num_kv_splits, config.head_dim),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    mid_lse = torch.empty(
+        (total_q, config.num_q_heads, config.num_kv_splits),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    records = torch.zeros(
+        config.num_requests * head_blocks * config.num_kv_splits * config.num_warps,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    errors = torch.zeros(ERROR_WORDS, device="cuda", dtype=torch.int32)
+    actual = torch.empty_like(expected)
+    for tag in (7, 8):  # a second use of the records with a new tag
+        split_records_kernel[(config.num_requests, head_blocks, config.num_kv_splits)](
+            q,
+            inputs["k_cache"],
+            inputs["v_cache"],
+            inputs["page_table"],
+            inputs["cache_seqlens"],
+            mid_o,
+            mid_lse,
+            actual,
+            records,
+            errors,
+            tag,
+            2_000_000_000,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            config.sm_scale,
+            inputs["page_table"].stride(0),
+            config.page_size,
+            config.num_kv_splits,
+            inputs["max_seqlen_q"],
+            config.num_q_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.block_m,
+            config.block_n,
+            config.num_warps,
+            2047,
+            q.dtype == torch.float8_e4m3fn,
+            config.num_stages,
+            num_warps=config.num_warps,
+            **persistent_compile_options(),
+        )
+        torch.cuda.synchronize()
+        assert int(errors.abs().sum()) == 0
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

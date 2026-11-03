@@ -42,6 +42,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     reject_block_scales,
     select_kv_splits,
 )
+from tokenspeed_kernel_amd.ops.gfx950.persistent import release_drain
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
@@ -717,15 +718,88 @@ class AttentionProgram:
         return old
 
     @gluon.jit
+    def split_record_offset(self):
+        """Index of this split's first record: one int32 tag per wave,
+        ``NUM_WARPS`` per split, ``NUM_KV_SPLITS`` splits per row block. A row
+        block's records fill ``NUM_KV_SPLITS * NUM_WARPS * 4`` bytes, whole
+        64-byte lines when the record buffer is 64-byte aligned."""
+        cfg = self.cfg
+        return (
+            self.split_counter_offset() * cfg.NUM_KV_SPLITS + self.split_id
+        ) * cfg.NUM_WARPS
+
+    @gluon.jit
+    def publish_split_record(self, record_ptr, tag):
+        """Vouch for this split's stored partial (``store_split``): every wave
+        waits for its own stores (``release_drain``: ``vmcnt(0)``), then lane 0
+        of the wave stores ``tag`` (an int32 record) at
+        ``split_record_offset() + wave``.
+
+        A record vouches only for its own wave's stores: a wave's stores
+        retire in order but reach the L2 channels in any order, so its record
+        must follow the wait that covers them, and no barrier is needed. The
+        wait also covers any loads the wave still has in flight, so the
+        caller should hold none (attention workgroups carry no weights).
+        ``tag`` is a nonzero int32 that differs from the buffer's previous
+        use (the launch tag). ``merge_split_records`` reads the records on the
+        same XCD.
+        """
+        cfg = self.cfg
+        release_drain()
+        lanes = gl.arange(
+            0,
+            64 * cfg.NUM_WARPS,
+            layout=gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0]),
+        )
+        cdna4.buffer_store(
+            gl.full(lanes.shape, 0, gl.int32, lanes.type.layout) + tag,
+            record_ptr,
+            self.split_record_offset() + lanes // 64,
+            mask=lanes % 64 == 0,
+        )
+
+    @gluon.jit
+    def merge_split_records(
+        self,
+        record_ptr,
+        tag,
+        sink_ptr,
+        has_sink: gl.constexpr,
+        WAIT_RECORDS: gl.constexpr,
+        launch,
+    ):
+        """Merge the row block's splits once every record carries ``tag``:
+        the designated merger's alternative to ``finalize_splits``.
+
+        ``WAIT_RECORDS(record_ptr, first, count, tag, launch)`` (constexpr)
+        returns once the ``count`` int32 records from ``first`` equal ``tag``,
+        behind a workgroup barrier, or stops the launch at its deadline. In
+        the layer it is the scalar 16-tag poll (``poll_tags16``) over the
+        block's 64-byte record lines. The splits merge in split order, as
+        ``finalize_splits`` merges them, so the rows are bitwise the same; the
+        partials are read ``.cg``.
+
+        Returns:
+            The FP32 rows ``[BLOCK_M, HEAD_DIM]`` in ``cfg.store_layout``
+            (see ``merge_splits``); ``store_merged`` stores them.
+        """
+        cfg = self.cfg
+        first = self.split_counter_offset() * cfg.NUM_KV_SPLITS * cfg.NUM_WARPS
+        WAIT_RECORDS(record_ptr, first, cfg.NUM_KV_SPLITS * cfg.NUM_WARPS, tag, launch)
+        return self.merge_splits(sink_ptr, has_sink, ".cg")
+
+    @gluon.jit
     def merge_splits(
         self, sink_ptr, has_sink: gl.constexpr, PARTIAL_CACHE: gl.constexpr
     ):
         """Merge the row block's split partials (and the sink) into its FP32
         output rows, ``[BLOCK_M, HEAD_DIM]`` in ``cfg.store_layout``. Only the
-        last arriver (see ``arrive``) may call it. ``PARTIAL_CACHE`` is the cache
+        last arriver (see ``arrive``) or the designated merger (see
+        ``merge_split_records``) may call it. ``PARTIAL_CACHE`` is the cache
         modifier of the partial loads: ``""`` (plain pointer loads) after the
-        acq_rel arrival, which invalidates the CU's L1; otherwise buffer loads
-        with that modifier."""
+        acq_rel arrival, which invalidates the CU's L1; ``".cg"`` (buffer loads,
+        ``sc0 nt``) after polled records, so the loads skip a CU cache that may
+        still hold the previous launch's lines."""
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
