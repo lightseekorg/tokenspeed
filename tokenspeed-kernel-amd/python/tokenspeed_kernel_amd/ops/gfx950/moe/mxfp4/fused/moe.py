@@ -955,6 +955,7 @@ def _launch_mxfp4_route_tiles(
     expert_start: int,
     top_k: int,
     config: _RouteTileConfig,
+    stage2_sink: tuple | None,
 ) -> tuple[torch.Tensor, None, torch.Tensor]:
     """Run the route-tiled A4W4 experts and return deferred token/slot rows.
 
@@ -968,6 +969,9 @@ def _launch_mxfp4_route_tiles(
         expert_start: First global expert ID owned by these weights.
         top_k: Routes per token.
         config: Schedule from ``_select_route_tile_config``.
+        stage2_sink: ``(SINK, SINK_ARGS, SINK_CONSTS)`` for stage 2's rows
+            (see ``gluon_mxfp4_moe_stage2_route_tiles_gfx950``), or None to
+            store them into ``out``.
 
     Returns:
         Unweighted route rows, no bias, and the route map (``-1`` marks routes
@@ -1092,6 +1096,10 @@ def _launch_mxfp4_route_tiles(
         NUM_EXPERTS=num_local_experts,
         num_warps=config.stage1.num_warps,
     )
+    if stage2_sink is None:
+        sink, sink_args, sink_consts = store_route_rows, (out,), (out_dim,)
+    else:
+        sink, sink_args, sink_consts = stage2_sink
     gluon_mxfp4_moe_stage2_route_tiles_gfx950[(2048,)](
         q_inter,
         q_inter_scale,
@@ -1101,7 +1109,7 @@ def _launch_mxfp4_route_tiles(
         descriptors,
         group_count,
         descriptors.shape[0],
-        (out,),
+        sink_args,
         INTERMEDIATE=inter_dim,
         OUTPUT=out_dim,
         XS0=q_inter_scale.stride(0),
@@ -1114,11 +1122,58 @@ def _launch_mxfp4_route_tiles(
         BLOCK_K=config.stage2.block_k,
         BLOCK_M=block_m,
         PREFETCH_TILES=config.stage2.prefetch_tiles,
-        SINK=store_route_rows,
-        SINK_CONSTS=(out_dim,),
+        SINK=sink,
+        SINK_CONSTS=sink_consts,
         num_warps=config.stage2.num_warps,
     )
     return out, None, expanded_idx
+
+
+def supports_mxfp4_route_tile_stage2_sink(
+    num_tokens: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    do_finalize: bool,
+    swiglu_alpha: float,
+    swiglu_limit: float,
+    swiglu_beta: float,
+) -> bool:
+    """Whether ``gluon_mxfp_precomputed_mxfp4_fused_moe`` takes the
+    route-tiled path, the one that honors ``stage2_sink``, for this shape.
+
+    Pure in its arguments (no tensors), so every rank decides alike. Assumes
+    gdot128-shuffled weights whose W2 is not padded past the output width
+    and contiguous top-k IDs, as the model's MXFP4 experts are.
+    """
+    return (
+        not do_finalize
+        and (swiglu_alpha, swiglu_limit, swiglu_beta) == (1.0, 0.0, 0.0)
+        and num_tokens <= _ROUTE_TILE_MAX_M
+        and _select_route_tile_config(
+            num_tokens,
+            hidden_dim=hidden_dim,
+            inter_dim=inter_dim,
+            num_local_experts=num_local_experts,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+        is not None
+    )
+
+
+def _without_stage2_sink(stage2_sink: tuple | None) -> None:
+    """Return None for a decode call that does not take the route-tiled path;
+    raise if it was given a stage 2 sink, which only that path honors."""
+    if stage2_sink is not None:
+        raise ValueError(
+            "_maybe_precomputed_mxfp4_direct_mfma_decode: a stage 2 sink needs the "
+            "route-tiled path, which this call does not take"
+        )
+    return None
 
 
 def _maybe_precomputed_mxfp4_direct_mfma_decode(
@@ -1143,9 +1198,14 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     global_num_experts: int | None,
     do_finalize: bool,
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None,
+    stage2_sink: tuple | None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor] | None:
     """Select direct or route-tiled MFMA with token/slot intermediates.
+
+    ``stage2_sink`` (``(SINK, SINK_ARGS, SINK_CONSTS)``, or None) takes the
+    route-tiled stage 2's rows instead of ``out``; a call that selects
+    another path with a sink raises, so the rows are never silently stored.
 
     ``max_m`` bounds direct execution; ``route_tile_max_m`` caps the
     route-tiled schedule, whose rows and tiles come from
@@ -1185,7 +1245,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
             )
         )
     ):
-        return None
+        return _without_stage2_sink(stage2_sink)
 
     w13_runtime = _extract_gluon_raw_w(w13_weight)
     w2_runtime = _extract_gluon_raw_w(w2_weight)
@@ -1203,7 +1263,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         or w13_runtime.ndim != 3
         or w2_runtime.ndim != 3
     ):
-        return None
+        return _without_stage2_sink(stage2_sink)
     if (
         not bool(getattr(w13_runtime, "is_shuffled_for_gluon_dot", False))
         or not bool(getattr(w2_runtime, "is_shuffled_for_gluon_dot", False))
@@ -1214,20 +1274,20 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         or w13_scale.stride(-2) != 1
         or w2_scale.stride(-2) != 1
     ):
-        return None
+        return _without_stage2_sink(stage2_sink)
 
     if hidden_dim % MXFP4_BLOCK != 0:
-        return None
+        return _without_stage2_sink(stage2_sink)
     w13_k_pk = int(getattr(w13_runtime, "original_k_pk", int(w13_runtime.shape[1])))
     if w13_k_pk * 2 != hidden_dim:
-        return None
+        return _without_stage2_sink(stage2_sink)
     inter_dim = int(w13_runtime.shape[2]) // 2
     if int(w13_runtime.shape[2]) != 2 * inter_dim or inter_dim % MXFP4_BLOCK != 0:
-        return None
+        return _without_stage2_sink(stage2_sink)
     w2_k_pk = int(getattr(w2_runtime, "original_k_pk", int(w2_runtime.shape[1])))
     out_dim = int(getattr(w2_runtime, "original_n", int(w2_runtime.shape[2])))
     if w2_k_pk * 2 != inter_dim or out_dim != hidden_dim:
-        return None
+        return _without_stage2_sink(stage2_sink)
 
     local_experts = int(w13_runtime.shape[0])
     is_ep_deferred = not do_finalize and (
@@ -1261,6 +1321,8 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         and swiglu_beta == 0.0
         and precomputed_topk_ids.is_contiguous()
     )
+    if stage2_sink is not None and not use_route_tiles:
+        _without_stage2_sink(stage2_sink)
     slot_parallel = do_finalize and n_tokens <= _SLOT_PARALLEL_DIRECT_DECODE_MAX_M.get(
         (hidden_dim, inter_dim, global_num_experts, top_k), 0
     )
@@ -1269,7 +1331,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         and not use_route_tiles
         and not slot_parallel
     ):
-        return None
+        return _without_stage2_sink(stage2_sink)
 
     topk_ids = (
         precomputed_topk_ids
@@ -1319,6 +1381,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
             expert_start=expert_start,
             top_k=top_k,
             config=route_tile_config,
+            stage2_sink=stage2_sink,
         )
 
     stage1_block_n = 64
@@ -1667,6 +1730,7 @@ def _maybe_route_owned_mxfp4_mfma_decode(
         expert_start=0,
         global_num_experts=None,
         x_quantized=None,
+        stage2_sink=None,
     )
     if out is not None:
         return out
@@ -2434,6 +2498,7 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
                 global_num_experts=None,
                 do_finalize=True,
                 x_quantized=None,
+                stage2_sink=None,
             )
             if decode_out is not None:
                 return decode_out
@@ -2546,6 +2611,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    stage2_sink: tuple | None,
     out: torch.Tensor | None = None,
     deferred_out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
@@ -2559,6 +2625,10 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     ``out`` is the finalized ``[tokens, hidden]`` destination; with
     ``do_finalize=False``, ``deferred_out`` may be a contiguous BF16
     ``[tokens * top_k, hidden]`` route destination that overlaps no input.
+    ``stage2_sink`` (``(SINK, SINK_ARGS, SINK_CONSTS)``) takes the deferred
+    rows of a route-tiled call in place of ``deferred_out`` (see
+    ``gluon_mxfp4_moe_stage2_route_tiles_gfx950``); a call that takes another
+    path raises. None stores them.
     """
     if do_finalize and deferred_out is not None:
         raise ValueError("deferred_out requires do_finalize=False")
@@ -2653,6 +2723,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         global_num_experts=global_num_experts,
         do_finalize=do_finalize,
         x_quantized=x_quantized,
+        stage2_sink=stage2_sink,
         out=out if do_finalize else deferred_out,
     )
     if direct_out is not None:

@@ -425,6 +425,7 @@ def test_dynamic_mxfp4_deferred_ep(
             global_num_experts=global_num_experts,
             do_finalize=False,
             x_quantized=x_quantized,
+            stage2_sink=None,
             w13_bias=None,
             w2_bias=None,
             out_dtype=torch.bfloat16,
@@ -447,6 +448,7 @@ def test_dynamic_mxfp4_deferred_ep(
         global_num_experts=global_num_experts,
         do_finalize=False,
         x_quantized=None if input_kind == "packed" else x_quantized,
+        stage2_sink=None,
         swiglu_alpha=1.0,
         swiglu_limit=0.0,
         swiglu_beta=0.0,
@@ -483,6 +485,7 @@ def test_dynamic_mxfp4_deferred_ep(
                 global_num_experts=global_num_experts,
                 do_finalize=False,
                 x_quantized=None,
+                stage2_sink=None,
                 deferred_out=overlapping,
             )
         torch.testing.assert_close(shared, before, atol=0, rtol=0)

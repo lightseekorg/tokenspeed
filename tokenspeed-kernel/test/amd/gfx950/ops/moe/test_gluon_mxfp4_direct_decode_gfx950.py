@@ -35,6 +35,7 @@ if not is_cdna4():
 
 
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_warmup  # noqa: E402
+from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (  # noqa: E402
     _stage1_mxfp4_direct_mfma_gluon,
     gluon_mxfp4_moe_stage1_route_tiles_gfx950,
@@ -53,6 +54,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (  # noqa: E402
     _launch_mxfp4_route_tiles,
+    _maybe_precomputed_mxfp4_direct_mfma_decode,
+    supports_mxfp4_route_tile_stage2_sink,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (  # noqa: E402
     _ROUTE_TILE_CONFIGS,
@@ -802,6 +805,7 @@ def test_route_tile_schedules_match_direct_reference(
         expert_start=expert_start,
         top_k=TOPK,
         config=config,
+        stage2_sink=None,
     )
     assert bias is None
     assert actual.data_ptr() == output.data_ptr()
@@ -922,6 +926,7 @@ def test_id_grouped_route_tiles_match_direct_under_replay(rows: int) -> None:
             expert_start=expert_start,
             top_k=TOPK,
             config=config,
+            stage2_sink=None,
         )
 
     def check(mapping):
@@ -1233,3 +1238,129 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
             torch.testing.assert_close(
                 guarded[-1], torch.full_like(guarded[-1], 17), rtol=0, atol=0
             )
+
+
+@gluon.jit
+def _store_doubled_rows(
+    values, rows, columns, valid, SINK_ARGS, SINK_CONSTS: gl.constexpr
+):
+    out = SINK_ARGS[0]
+    gl.store(
+        out + rows.to(gl.int64) * SINK_CONSTS[0] + columns,
+        values.to(gl.float32) * 2.0,
+        valid,
+    )
+
+
+def test_route_tile_stage2_rows_reach_the_given_sink() -> None:
+    """A stage 2 sink receives exactly the rows the default sink stores, and a
+    sink on a call that does not take route tiles raises instead of being
+    dropped."""
+    rows = 16
+    config = next(
+        config
+        for entries in _ROUTE_TILE_CONFIGS.values()
+        for min_rows, max_rows, config in entries
+        if config.route_capacity == 16 and min_rows <= rows <= max_rows
+    )
+    generator = torch.Generator(device="cuda").manual_seed(321)
+    _, _, _, _, w13, s13, w2, s2 = _make_runtime_weights(generator, scale=120)
+    packed, scales = _quantize_mxfp4_activation(
+        _exact_mxfp4_activation(rows, HIDDEN, generator)
+    )
+    ids = _random_route_ids(rows, generator)
+    intermediate = torch.empty(
+        (rows * TOPK, INTERMEDIATE // 2), dtype=torch.uint8, device="cuda"
+    )
+    intermediate_scales = empty_swizzled_cdna4_mxfp4_scale(
+        rows * TOPK, INTERMEDIATE // 32, device="cuda"
+    )
+    stored = torch.zeros((rows * TOPK, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    sunk = torch.zeros((rows * TOPK, HIDDEN), dtype=torch.float32, device="cuda")
+    _, _, mapping = _launch_mxfp4_route_tiles(
+        packed,
+        scales,
+        w13,
+        s13,
+        w2,
+        s2,
+        ids,
+        intermediate,
+        intermediate_scales,
+        stored,
+        expert_start=NUM_EXPERTS,
+        top_k=TOPK,
+        config=config,
+        stage2_sink=None,
+    )
+    _launch_mxfp4_route_tiles(
+        packed,
+        scales,
+        w13,
+        s13,
+        w2,
+        s2,
+        ids,
+        intermediate,
+        intermediate_scales,
+        None,
+        expert_start=NUM_EXPERTS,
+        top_k=TOPK,
+        config=config,
+        stage2_sink=(_store_doubled_rows, (sunk,), (HIDDEN,)),
+    )
+    owned = mapping >= 0
+    assert bool(owned.any())
+    assert torch.equal(sunk[owned], stored[owned].float() * 2.0)
+    with pytest.raises(ValueError, match="stage 2 sink"):
+        _maybe_precomputed_mxfp4_direct_mfma_decode(
+            (packed, scales),
+            w13,
+            w2,
+            w13_mx_scale=s13,
+            w2_mx_scale=s2,
+            top_k=TOPK,
+            w13_bias=None,
+            w2_bias=None,
+            out_dtype=torch.bfloat16,
+            max_m=16,
+            route_tile_max_m=0,
+            precomputed_topk_weights=torch.ones_like(ids, dtype=torch.float32),
+            precomputed_topk_ids=ids,
+            swiglu_alpha=1.0,
+            swiglu_limit=0.0,
+            swiglu_beta=0.0,
+            expert_start=NUM_EXPERTS,
+            global_num_experts=4 * NUM_EXPERTS,
+            do_finalize=False,
+            x_quantized=None,
+            stage2_sink=(_store_doubled_rows, (sunk,), (HIDDEN,)),
+        )
+
+
+def test_route_tile_stage2_sink_support_follows_the_route_tile_rows() -> None:
+    """The sink predicate is true exactly for the rows and shape that select
+    route tiles, and false for finalized calls or other SwiGLU parameters."""
+    shape, entries = next(iter(_ROUTE_TILE_CONFIGS.items()))
+    hidden, inter, local, experts, top_k = shape
+
+    def supports(rows, do_finalize=False, swiglu=(1.0, 0.0, 0.0)):
+        return supports_mxfp4_route_tile_stage2_sink(
+            rows,
+            hidden_dim=hidden,
+            inter_dim=inter,
+            num_local_experts=local,
+            num_experts=experts,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            swiglu_alpha=swiglu[0],
+            swiglu_limit=swiglu[1],
+            swiglu_beta=swiglu[2],
+        )
+
+    min_rows = min(lo for lo, _, _ in entries)
+    max_rows = max(hi for _, hi, _ in entries)
+    assert supports(min_rows) and supports(max_rows)
+    assert not supports(min_rows - 1)
+    assert not supports(max_rows, do_finalize=True)
+    assert not supports(max_rows, swiglu=(1.702, 7.0, 1.0))
