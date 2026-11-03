@@ -27,8 +27,10 @@ projection, attention prologue and KV write in one plain launch that keeps one
 workgroup on every CU. The kernel boundary between two launches orders the KV
 write before the next layer's attention.
 
-The registry entry is ``("decoder_layer", "prepare")``. A leaf compiles every
-plan variant it serves at prepare time and returns a :class:`FusedDecoderLayer`;
+The registry entry is ``("decoder_layer", "prepare")``, traited by
+``recipe``. A leaf is a class: its static ``prepare_state(...)`` allocates the
+group's shared state, and its constructor ``(plan_keys=, weights=, state=)``
+compiles every plan variant it serves and returns a :class:`FusedDecoderLayer`;
 per-step calls go to that object. Vendor bodies live in private,
 solution-named packages (``_gluon/`` for gfx950).
 """
@@ -36,7 +38,15 @@ solution-named packages (``_gluon/`` for gfx950).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
+
+import torch
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
 
 LAYER_KINDS = ("sliding", "full")
 
@@ -68,24 +78,107 @@ class PlanKey:
             )
 
 
+# BF16 dense weights and activations, MXFP4 experts read in place from the
+# MoE banks, FP8 KV cache.
+DECODER_LAYER_SIGNATURE = format_signature(
+    dense=dense_tensor_format(torch.bfloat16),
+    experts=tensor_format("mxfp4", torch.uint8),
+    kv_cache=dense_tensor_format(torch.float8_e4m3fn),
+)
+
+
 class FusedDecoderLayer(Protocol):
     """A prepared fused decoder layer (one per decoder layer of a model)."""
 
-    def decline_reasons(self) -> list[str]:
-        """Rank-local reasons this layer cannot serve (compile, residency,
-        memory checks); empty when it can. The caller agrees on them across the
-        group before capture."""
+    def decline_reasons(self, requests: int) -> list[str]:
+        """Rank-local reasons this layer cannot serve ``requests`` requests
+        (compile, residency, memory checks); empty when it can. The caller
+        agrees on them across the group before capture."""
 
-    def forward(self, prepared_query, residual, ctx):
-        """Run this layer and the next layer's prologue.
+    def forward(self, prepared_query, residual, *, positions, cache, next_prologue):
+        """Run this layer and the next layer's QKV projection and prologue.
+
+        Args:
+            prepared_query: ``(q, output_gate)`` from the attention prologue.
+            residual: FP32 residual rows, updated in place.
+            positions: Positions of the step's rows.
+            cache: This layer's decode KV view.
+            next_prologue: The next layer's prologue target (KV cache, norms,
+                rotary, query dtype).
 
         Returns:
             ``(next_prepared_query, residual)``.
         """
 
-    def forward_last(self, prepared_query, residual, ctx):
+    def forward_last(self, prepared_query, residual, *, positions, cache, next_norm):
         """Run the last fused layer, whose next layer is regular.
+
+        Args:
+            next_norm: ``(weight, eps, weight_offset)`` of the next layer's
+                input norm.
 
         Returns:
             ``(normed_rows, residual)`` in the regular boundary layout.
         """
+
+
+def _select(recipe: str, traits: dict[str, Any]):
+    try:
+        return select_kernel(
+            "decoder_layer",
+            "prepare",
+            DECODER_LAYER_SIGNATURE,
+            traits={"recipe": recipe, **traits},
+        )
+    except NoKernelFoundError:
+        return None
+
+
+def prepare_decoder_layer_state(
+    *, recipe, group, rank_in_group, max_requests, failure_record_path, device
+):
+    """Allocate the per-group state the fused layers of one model share.
+
+    It holds the launch state (per-workgroup epochs, role claims, the uncached
+    flag arena, the host-mirrored failure record) and the cross-GPU regions,
+    so call it once per group before capture, on every rank alike.
+
+    Selection uses the recipe alone, since the state is shared by layers whose
+    shape traits differ.
+
+    Returns:
+        The state, or ``None`` when no leaf serves ``recipe`` on this platform.
+    """
+    kernel = _select(recipe, {})
+    if kernel is None:
+        return None
+    return kernel.impl.prepare_state(
+        group=group,
+        rank_in_group=rank_in_group,
+        max_requests=max_requests,
+        failure_record_path=failure_record_path,
+        device=device,
+    )
+
+
+def prepare_decoder_layer(
+    *, recipe, plan_keys, traits, weights, state
+) -> FusedDecoderLayer | None:
+    """Prepare one fused decoder layer: compile every plan variant in
+    ``plan_keys`` and check it before capture.
+
+    Args:
+        recipe: Model recipe, such as ``"muse_spark"``.
+        plan_keys: The :class:`PlanKey` values this layer may serve.
+        traits: Shape traits for selection (verify width, TP and EP sizes,
+            KV cache dtype).
+        weights: The layer's weights, read in place (a recipe-defined dict).
+        state: From :func:`prepare_decoder_layer_state`.
+
+    Returns:
+        The prepared layer, or ``None`` when no leaf serves the recipe.
+    """
+    kernel = _select(recipe, traits)
+    if kernel is None or state is None:
+        return None
+    return kernel.impl(plan_keys=plan_keys, weights=weights, state=state)
