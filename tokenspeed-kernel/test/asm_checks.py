@@ -411,7 +411,6 @@ def instruction_lines(assembly: str) -> list[str]:
     return [
         line.strip()
         for line in assembly.splitlines()
-        if line.strip()
-        and not line.lstrip().startswith((";", "."))
-        or re.match(r"^\.LBB", line)
+        if re.match(r"^\.LBB", line)
+        or (line.strip() and not line.lstrip().startswith((";", ".")))
     ]
