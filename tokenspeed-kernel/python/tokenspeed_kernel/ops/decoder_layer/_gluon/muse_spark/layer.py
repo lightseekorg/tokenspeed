@@ -62,6 +62,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     muse_attntail_gated_rows,
     muse_attntail_publish_attention,
+    muse_attntail_publish_rows,
     muse_attntail_read_box,
     muse_attntail_read_box_rows,
 )
@@ -428,9 +429,15 @@ def _attention_split(
     cfg: gl.constexpr,
     GATE_EPS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    ATT_MERGE: gl.constexpr,
 ):
-    """One sliding split of block ``block`` = (request, KV head); split 0 is
-    the block's merger.
+    """One sliding split of block ``block`` = (request, KV head).
+
+    ``ATT_MERGE`` picks who merges: ``"designated"`` (split 0 merges the
+    block's rows) or ``"spread"`` (split ``s`` merges block rows ``[s R, (s +
+    1) R)``, ``R = ROWS / NUM_KV_SPLITS``, one row per wave; every split
+    then reads 1/NUM_KV_SPLITS of the partials). Either way the rows are
+    bitwise the same.
 
     The split streams its pages and stores its partial (plain, read on
     this XCD); each wave drains its stores, then stores its record
@@ -455,7 +462,30 @@ def _attention_split(
         program, q_ptr, k_cache_ptr, v_cache_ptr, NUM_STAGES
     )
     program.publish_split_record(record_ptr, launch.tag)
-    if split == 0:
+    box = view.box + launch.copy * _BOX_WORDS
+    if ATT_MERGE == "spread":
+        SHARE: gl.constexpr = cfg.ROWS // cfg.NUM_KV_SPLITS
+        gl.static_assert(SHARE * cfg.NUM_KV_SPLITS == cfg.ROWS)
+        gl.static_assert(cfg.NUM_ROW_BLOCKS == 1)
+        rows_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [cfg.NUM_WARPS, 1], [1, 0]
+        )
+        m = split * SHARE + gl.arange(0, SHARE, layout=gl.SliceLayout(1, rows_layout))
+        d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, rows_layout))
+        gate = gl.amd.cdna4.buffer_load(
+            gate_ptr,
+            (program.row_tokens(m) * gate_stride + program.row_heads(m) * cfg.HEAD_DIM)[
+                :, None
+            ]
+            + d[None, :],
+            mask=program.row_valid(m)[:, None] & (d >= 0)[None, :],
+        )
+        merged = program.merge_split_records_rows(
+            record_ptr, launch.tag, m, d, _wait_records, launch
+        )
+        muse_attntail_publish_rows(program, m, merged, gate, box, GATE_EPS)
+    elif split == 0:
+        gl.static_assert(ATT_MERGE == "designated")
         m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
         gate = gl.amd.cdna4.buffer_load(
@@ -469,9 +499,7 @@ def _attention_split(
         merged = program.merge_split_records(
             record_ptr, launch.tag, q_ptr, False, _wait_records, launch
         )
-        muse_attntail_publish_attention(
-            program, merged, gate, view.box + launch.copy * _BOX_WORDS, GATE_EPS
-        )
+        muse_attntail_publish_attention(program, merged, gate, box, GATE_EPS)
 
 
 # ---------------------------------------------------------------------------
@@ -1604,7 +1632,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                     launch, xcd, slot - _ATT_FIRST_SLOT, view, q_ptr, gate_ptr,
                     gate_stride, k_cache_ptr, v_cache_ptr, page_table_ptr,
                     cache_seqlens_ptr, mid_o_ptr, mid_lse_ptr, records, cfg,
-                    GATE_EPS, NUM_STAGES,
+                    GATE_EPS, NUM_STAGES, "designated",
                 )  # fmt: skip
         else:
             _full_items(

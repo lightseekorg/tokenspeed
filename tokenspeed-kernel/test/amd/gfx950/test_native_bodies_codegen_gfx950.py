@@ -105,7 +105,7 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
             "tag": "i32",
             "deadline_ticks": "i64",
         },
-        _MUSE_SLIDING,
+        dict(_MUSE_SLIDING, MERGE="designated"),
         num_warps=_MUSE_SLIDING["NUM_WARPS"],
         **persistent_compile_options(),
     )
@@ -150,6 +150,52 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
     assert (
         sum(1 for i in loads if i < first_wait) >= 16
     ), "every split's partial load is issued before the first wait"
+
+
+def test_spread_merge_issues_its_rows_partials_before_the_fold():
+    """In the spread merge each split reads only its share of the rows: after
+    the record poll, every split's partial and LSE loads for those rows
+    (``sc0 nt``) issue back to back before the first wait, with no full drain
+    among them and no L2 writeback or invalidate."""
+    kernel = compile_gfx950(
+        split_records_kernel,
+        {
+            "q_ptr": "*fp8e4nv",
+            "k_cache_ptr": "*fp8e4nv",
+            "v_cache_ptr": "*fp8e4nv",
+            "page_table_ptr": "*i32",
+            "cache_seqlens_ptr": "*i32",
+            "mid_o_ptr": "*fp32",
+            "mid_lse_ptr": "*fp32",
+            "out_ptr": "*bf16",
+            "record_ptr": "*i32",
+            "error_ptr": "*i32",
+            "tag": "i32",
+            "deadline_ticks": "i64",
+        },
+        dict(_MUSE_SLIDING, MERGE="spread"),
+        num_warps=_MUSE_SLIDING["NUM_WARPS"],
+        **persistent_compile_options(),
+    )
+    code = instruction_lines(kernel.asm["amdgcn"])
+    assert not [line for line in code if re.match(r"buffer_(wbl2|inv)", line)]
+    poll = max(i for i, line in enumerate(code) if line.startswith("s_load_dwordx16"))
+    loads = [
+        i for i, line in enumerate(code) if i > poll and line.startswith("buffer_load")
+    ]
+    assert loads and all(code[i].endswith("sc0 nt") for i in loads), [
+        code[i] for i in loads
+    ]
+    assert not [
+        line
+        for line in code[loads[0] : loads[-1]]
+        if line.startswith("s_waitcnt") and "vmcnt(0)" in line
+    ]
+    first_wait = next(
+        i for i in range(loads[0], len(code)) if code[i].startswith("s_waitcnt vmcnt")
+    )
+    issued = sum(1 for i in loads if i < first_wait)
+    assert issued >= 2 * _MUSE_SLIDING["NUM_KV_SPLITS"], issued
 
 
 def _metadata(assembly: str, key: str) -> int:

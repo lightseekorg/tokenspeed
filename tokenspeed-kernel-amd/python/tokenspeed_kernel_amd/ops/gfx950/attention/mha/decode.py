@@ -792,6 +792,100 @@ class AttentionProgram:
         return self.merge_splits(sink_ptr, has_sink, ".cg")
 
     @gluon.jit
+    def _merge_issued_splits(
+        self,
+        tokens,
+        q_heads,
+        valid,
+        offs_d,
+        final_m,
+        final_l,
+        final_acc,
+        PARTIAL_CACHE: gl.constexpr,
+    ):
+        """Fold the splits' partials of the given rows into the running merge:
+        every split's partial is in flight at once, then the fold runs in split
+        order (a per-split load-then-fold loop would wait one memory round
+        trip per split). The rows' layout is ``final_acc``'s."""
+        cfg = self.cfg
+        parts_o = ()
+        parts_lse = ()
+        for split in gl.static_range(cfg.NUM_KV_SPLITS):
+            base = (
+                (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
+                * cfg.NUM_KV_SPLITS
+                + split
+            ) * cfg.HEAD_DIM + offs_d[None, :]
+            parts_o += (
+                cdna4.buffer_load(
+                    self.mid_o_ptr,
+                    base,
+                    mask=valid[:, None],
+                    other=0.0,
+                    cache=PARTIAL_CACHE,
+                ),
+            )
+            lse_offset = (
+                tokens * cfg.NUM_Q_HEADS + q_heads
+            ) * cfg.NUM_KV_SPLITS + split
+            parts_lse += (
+                cdna4.buffer_load(
+                    self.mid_lse_ptr,
+                    lse_offset,
+                    mask=valid,
+                    other=-float("inf"),
+                    cache=PARTIAL_CACHE,
+                ),
+            )
+        for split in gl.static_range(cfg.NUM_KV_SPLITS):
+            final_m, final_l, final_acc = _merge_split_step(
+                cfg,
+                final_m,
+                final_l,
+                final_acc,
+                parts_o[split].to(gl.float32),
+                parts_lse[split].to(gl.float32),
+            )
+        return final_m, final_l, final_acc
+
+    @gluon.jit
+    def merge_split_records_rows(
+        self,
+        record_ptr,
+        tag,
+        offs_m,
+        offs_d,
+        WAIT_RECORDS: gl.constexpr,
+        launch,
+    ):
+        """``merge_split_records`` for block rows ``offs_m`` only: the spread
+        merge, in which every split of the block merges its own share of the
+        rows once every record carries ``tag``.
+
+        ``offs_m`` / ``offs_d`` are the rows and the head-dimension offsets,
+        slices of one 2-D layout, which is the result's (such as one row per
+        wave). The rows' partials are all issued before the fold (``.cg``,
+        same XCD as in ``merge_split_records``) and fold in split order, so
+        each row is bitwise the designated merger's. No sink.
+
+        Returns:
+            The FP32 rows ``[len(offs_m), HEAD_DIM]``.
+        """
+        cfg = self.cfg
+        first = self.split_counter_offset() * cfg.NUM_KV_SPLITS * cfg.NUM_WARPS
+        WAIT_RECORDS(record_ptr, first, cfg.NUM_KV_SPLITS * cfg.NUM_WARPS, tag, launch)
+        rows: gl.constexpr = offs_m.shape[0]
+        layout: gl.constexpr = offs_m.type.layout.parent
+        final_m = gl.full([rows], -float("inf"), gl.float32, offs_m.type.layout)
+        final_l = gl.zeros([rows], gl.float32, offs_m.type.layout)
+        final_acc = gl.zeros([rows, cfg.HEAD_DIM], gl.float32, layout)
+        final_m, final_l, final_acc = self._merge_issued_splits(
+            self.row_tokens(offs_m), self.row_heads(offs_m), self.row_valid(offs_m),
+            offs_d, final_m, final_l, final_acc, ".cg",
+        )  # fmt: skip
+        return final_acc / final_l[:, None]
+
+    @gluon.jit
     def merge_splits(
         self, sink_ptr, has_sink: gl.constexpr, PARTIAL_CACHE: gl.constexpr
     ):
@@ -858,47 +952,10 @@ class AttentionProgram:
                     cfg, final_m, final_l, final_acc, part_o, part_lse
                 )
         else:
-            # Every split's partial in flight at once, then the fold in split
-            # order: a per-split load-then-fold loop would wait one memory
-            # round trip per split.
-            parts_o = ()
-            parts_lse = ()
-            for split in gl.static_range(cfg.NUM_KV_SPLITS):
-                base = (
-                    (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
-                    * cfg.NUM_KV_SPLITS
-                    + split
-                ) * cfg.HEAD_DIM + offs_d[None, :]
-                parts_o += (
-                    cdna4.buffer_load(
-                        self.mid_o_ptr,
-                        base,
-                        mask=valid[:, None],
-                        other=0.0,
-                        cache=PARTIAL_CACHE,
-                    ),
-                )
-                lse_offset = (
-                    tokens * cfg.NUM_Q_HEADS + q_heads
-                ) * cfg.NUM_KV_SPLITS + split
-                parts_lse += (
-                    cdna4.buffer_load(
-                        self.mid_lse_ptr,
-                        lse_offset,
-                        mask=valid,
-                        other=-float("inf"),
-                        cache=PARTIAL_CACHE,
-                    ),
-                )
-            for split in gl.static_range(cfg.NUM_KV_SPLITS):
-                final_m, final_l, final_acc = _merge_split_step(
-                    cfg,
-                    final_m,
-                    final_l,
-                    final_acc,
-                    parts_o[split].to(gl.float32),
-                    parts_lse[split].to(gl.float32),
-                )
+            final_m, final_l, final_acc = self._merge_issued_splits(
+                tokens, q_heads, valid, offs_d, final_m, final_l, final_acc,
+                PARTIAL_CACHE,
+            )  # fmt: skip
         if has_sink:
             sink_log2 = (
                 gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)

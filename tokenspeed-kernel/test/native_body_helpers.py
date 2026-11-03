@@ -178,10 +178,13 @@ def split_records_kernel(
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    MERGE: gl.constexpr,
 ):
     """The sliding split decode with records: every program streams its split
-    and publishes its record; split 0 merges once all records carry ``tag``.
-    The grid is ``_mha_decode_sliding_split_atomic``'s; all programs must be
+    and publishes its record; once all records carry ``tag``, split 0 merges
+    the block (``MERGE`` ``"designated"``) or every split merges its share of
+    the rows, one row per wave (``"spread"``). The grid is
+    ``_mha_decode_sliding_split_atomic``'s; all programs must be
     co-resident."""
     cfg = AttentionConfig(
         SM_SCALE,
@@ -219,7 +222,27 @@ def split_records_kernel(
         program, q_ptr, k_cache_ptr, v_cache_ptr, NUM_STAGES
     )
     program.publish_split_record(record_ptr, launch.tag)
-    if program.split_id == 0:
+    if MERGE == "spread":
+        SHARE: gl.constexpr = cfg.ROWS // cfg.NUM_KV_SPLITS
+        rows_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [cfg.NUM_WARPS, 1], [1, 0]
+        )
+        m = program.split_id * SHARE + gl.arange(
+            0, SHARE, layout=gl.SliceLayout(1, rows_layout)
+        )
+        d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, rows_layout))
+        merged = program.merge_split_records_rows(
+            record_ptr, launch.tag, m, d, wait_records_tags16, launch
+        )
+        gl.amd.cdna4.buffer_store(
+            merged.to(out_ptr.dtype.element_ty),
+            out_ptr,
+            (program.row_tokens(m) * cfg.NUM_Q_HEADS + program.row_heads(m))[:, None]
+            * cfg.HEAD_DIM
+            + d[None, :],
+            mask=program.row_valid(m)[:, None] & (d >= 0)[None, :],
+        )
+    elif program.split_id == 0:
         merged = program.merge_split_records(
             record_ptr, launch.tag, q_ptr, False, wait_records_tags16, launch
         )
