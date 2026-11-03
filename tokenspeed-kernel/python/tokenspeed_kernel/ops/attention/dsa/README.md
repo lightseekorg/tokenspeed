@@ -293,3 +293,60 @@ or independent graphs can overwrite each other's queries. Cross-stream users
 must still follow PyTorch's normal tensor synchronization/lifetime rules.
 Padding remains an exact copy of the original heads plus zero-filled extra
 heads; this changes neither arithmetic nor the supported numerics envelopes.
+
+### Hopper BF16 MQA scoring
+
+`_cute_dsl/bf16_indexer.py:index_scores` scores BF16 queries and index keys
+for paged decode/verify or contiguous prefill workspaces. For each query and
+key it computes `scale * sum_h(weights[h] * relu(dot(q[h], k)))`, with FP32
+dot-product accumulation, weights, head reduction and output.
+
+The two WGMMA implementations live in separate files:
+
+| Strategy | Implementation | WGMMA axes |
+| --- | --- | --- |
+| `normal` | `_cute_dsl/bf16_indexer_normal.py` | M packs query heads; N covers 64 keys |
+| `swap_ab` | `_cute_dsl/bf16_indexer_swapAB.py` | M covers 64 keys; N packs query heads |
+
+Callers must explicitly pass `strategy="normal"`, `"swap_ab"` or `"auto"`.
+Automatic dispatch uses normal for workspaces and when queries sharing a
+history can fill M=64; smaller paged M uses swapAB. Normal prefers one full
+warp-group M tile before increasing query reuse. Queries from different
+requests are never grouped to fill M. The grouping and history split use
+static heuristics, not runtime autotuning or a claim of optimal performance.
+
+Head count and dimension come from Q, with no model-specific preset. Heads
+must be multiples of 8 in [8, 256]; dimensions must be multiples of 64 in
+[64, 256]. The explicit `page_size` argument must be 64. Weights may be FP32
+or BF16 and are promoted to FP32. K rows require unit column stride, a
+16-byte-aligned base and a row stride divisible by eight BF16 values. The
+launcher normalizes Q, weights and integer metadata and rejects unsupported
+geometry, operand dtypes and alignment.
+
+For paged input, callers provide compact physical page IDs, logical page
+positions, compact-row counts and causal lengths per query. Physical page
+zero is reserved. For workspace input, `starts` gives each query's first key
+row and `valid` masks physical workspace rows. `query_group` names the number
+of consecutive queries per request; grouped queries must share their ordered
+key prefix (and workspace start) and have nondecreasing causal lengths.
+An incomplete request group executes without query sharing. Each query keeps
+its own weights, causal mask and output scores.
+
+Output is FP32 `[queries, round_up(width, 4)]`. With `clear_padding=True`,
+unscored columns are negative infinity; otherwise callers consume only valid
+columns. Forced initial/recent windows score positive infinity. Normal
+reduces head stripes within each warp before combining shared partial sums.
+For heads divisible by 16, adjacent stripes are combined before shuffling.
+Both paths release K buffers after WGMMA consumption so TMA can overlap the
+epilogue, while metadata and reduction lifetimes remain synchronized.
+
+Head geometry, forced-window settings and bounded query-sharing factors
+specialize the JIT. Query counts, history lengths, metadata widths, strides
+and key split counts stay runtime values. Host scheduling thresholds use
+named `Final[int]` constants rather than per-batch `Constexpr` parameters.
+
+This addition provides internal score kernels and does not register a DSA
+runtime provider or change top-k selection. No `rl-bitwise`, batch-invariance
+or trainer-alignment capability is claimed. The paired NVIDIA tests cover
+both strategies and automatic dispatch, paged and workspace keys, FP32
+reference scores, CUDA Graph refresh, input validation and binary reuse.
