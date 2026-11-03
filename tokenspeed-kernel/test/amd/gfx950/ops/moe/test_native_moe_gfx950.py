@@ -52,6 +52,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (  # noqa: 
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E402
     empty_swizzled_cdna4_mxfp4_scale,
+    pack_cdna4_mxfp4_scale_lanes,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx950_moe_weights,
@@ -62,9 +63,10 @@ SWIGLU = dict(swiglu_alpha=1.0, swiglu_limit=0.0, swiglu_beta=0.0)
 DEADLINE_TICKS = 200_000_000  # 2 s
 
 VARIANTS = [
-    dict(ring=8, quad_map=0, dn_order=0, addr_soffset=0),
-    dict(ring=8, quad_map=1, dn_order=1, addr_soffset=1),
-    dict(ring=16, quad_map=0, dn_order=0, addr_soffset=0),
+    dict(ring=8, quad_map=0, dn_order=0, addr_soffset=0, lanes=False),
+    dict(ring=8, quad_map=0, dn_order=0, addr_soffset=0, lanes=True),
+    dict(ring=8, quad_map=1, dn_order=1, addr_soffset=1, lanes=False),
+    dict(ring=16, quad_map=0, dn_order=0, addr_soffset=0, lanes=True),
 ]
 
 
@@ -92,6 +94,8 @@ def weights():
     module.w13_weight_scale = torch.nn.Parameter(
         scales(EXPERTS, 2 * INTER, HIDDEN // 32), requires_grad=False
     )
+    # Interleaved input: the scales' rows are already the physical columns.
+    w13_lanes = pack_cdna4_mxfp4_scale_lanes(module.w13_weight_scale.data)
     module.w2_weight = torch.nn.Parameter(
         payload(EXPERTS, HIDDEN, INTER // 2), requires_grad=False
     )
@@ -104,6 +108,7 @@ def weights():
         _extract_gluon_raw_s(module.w13_precision_config.b_mx_scale),
         _extract_gluon_raw_w(module.w2_weight_triton_tensor),
         _extract_gluon_raw_s(module.w2_precision_config.b_mx_scale),
+        w13_lanes,
     )
 
 
@@ -140,7 +145,9 @@ def _direct_decode(xq, xs, w13, w13_scale, w2, w2_scale, ids):
 )
 @pytest.mark.parametrize("rows", [8, 16])
 def test_native_stream_is_bitwise_direct_decode(weights, variant, rows):
-    w13, w13_scale, w2, w2_scale = weights
+    w13, w13_scale, w2, w2_scale, w13_lanes = weights
+    variant = dict(variant)
+    lanes = w13_lanes if variant.pop("lanes") else None
     generator = torch.Generator(device="cuda").manual_seed(rows)
     state = NativeMoeState("cuda", rows, TOPK)
     for step, routing in enumerate(RECORDED_ROUTINGS[rows]):
@@ -163,6 +170,7 @@ def test_native_stream_is_bitwise_direct_decode(weights, variant, rows):
                 ids,
                 out,
                 state,
+                lanes,
                 tag_glc=1,
                 tail_num=1,
                 tail_den=2,

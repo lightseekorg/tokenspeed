@@ -31,12 +31,16 @@ finish early enough to be drained before the layer's tail polls.
 from collections import Counter
 
 import pytest
+import torch
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
     GROUP_BYTES,
     GROUPS_PER_EXPERT,
     UNIT_BYTES,
     UNITS_PER_EXPERT,
     native_moe_plan,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+    pack_cdna4_mxfp4_scale_lanes,
 )
 
 # Recorded verify routings of Muse Spark at EP1: 4 decode steps each at 8 and 16
@@ -254,3 +258,19 @@ def test_plan_balances_bytes_and_drains_tail_roles_early(rows, step):
         span = max(finish) + TAIL_US
         tail = max(f for c, f in enumerate(finish) if c // XCDS in TAIL_SLOTS)
         assert tail <= 0.70 * span, (peak, tail, span)
+
+
+def test_lane_major_scales_follow_the_mfma_lanes():
+    generator = torch.Generator().manual_seed(7)
+    scale = torch.randint(0, 256, (3, 64, 32), dtype=torch.uint8, generator=generator)
+    packed = pack_cdna4_mxfp4_scale_lanes(scale)
+    assert packed.shape == (3, 4, 64, 8) and packed.is_contiguous()
+    for e in range(3):
+        for strip in range(4):
+            for lane in range(64):
+                for step in range(8):
+                    n, quad = lane % 16, lane // 16
+                    assert (
+                        packed[e, strip, lane, step]
+                        == scale[e, 16 * strip + n, 4 * step + quad]
+                    )

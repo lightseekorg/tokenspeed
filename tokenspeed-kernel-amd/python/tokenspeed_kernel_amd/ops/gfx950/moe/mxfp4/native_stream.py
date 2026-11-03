@@ -479,6 +479,7 @@ class MoeBuffers:
     xs: gl.tensor
     w13: gl.tensor
     s13: gl.tensor
+    s13_lanes: gl.tensor  # lane-major gate/up scales (SCALE_LANES), int32 words
     w2: gl.tensor
     s2: gl.tensor
     mids: gl.tensor
@@ -502,6 +503,7 @@ class MoeBuffers:
         xs,
         w13,
         s13,
+        s13_lanes,
         w2,
         s2,
         mids,
@@ -522,6 +524,7 @@ class MoeBuffers:
         self.xs = xs
         self.w13 = w13
         self.s13 = s13
+        self.s13_lanes = s13_lanes
         self.w2 = w2
         self.s2 = s2
         self.mids = mids
@@ -642,6 +645,51 @@ def _scale_byte(dword, base, kt: gl.constexpr):
     return ((dword >> shift) & 255).to(gl.uint8)
 
 
+@gluon.constexpr_function
+def _lanes_layout():
+    """The B-scale layout of the MFMA (a lane holds one (column, K quad)) with
+    4 consecutive dwords per lane added as the last dimension."""
+    return gl.DistributedLinearLayout(
+        reg_bases=[[0, 0, 1], [0, 0, 2]],
+        lane_bases=[[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 1, 0], [0, 2, 0]],
+        warp_bases=[[16, 0, 0], [32, 0, 0], [64, 0, 0]],
+        block_bases=[],
+        shape=[128, 4, 4],
+    )
+
+
+@gluon.jit
+def _lanes_base(expert, column, N_PHYS: gl.constexpr, K_STEPS: gl.constexpr):
+    """Dword offsets of a 16-column strip's lane-major E8M0 scales (see
+    ``scale_layout.pack_cdna4_mxfp4_scale_lanes``): lane (k quad, column)
+    holds its K steps' bytes contiguously, 16 steps per dwordx4."""
+    L: gl.constexpr = _lanes_layout()
+    n = gl.arange(0, 128, layout=gl.SliceLayout(1, gl.SliceLayout(2, L)))[:, None, None]
+    kq = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, L)))[None, :, None]
+    j = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, L)))[None, None, :]
+    strip = expert * (N_PHYS // 16) + gl.multiple_of(column, 16) // 16
+    return (strip * 64 + kq * 16 + n % 16) * (K_STEPS // 4) + j
+
+
+@gluon.jit
+def _load_lanes(desc, base, half: gl.constexpr, live):
+    """Steps 16 half .. 16 half + 15 of a strip's lane-major scales: one
+    dwordx4 per lane."""
+    mask = None if live is None else (base == base) & live
+    return gl.amd.cdna3.buffer.load(desc, base + half * 4, mask=mask)
+
+
+@gluon.jit
+def _lanes_byte(quad, kt: gl.constexpr):
+    """Step ``kt``'s E8M0 byte (B-scale layout) out of its half's dwordx4."""
+    pairs = quad.reshape([128, 4, 2, 2])
+    lo, hi = gl.split(pairs)
+    pick = hi if ((kt % 16) // 4) % 2 else lo
+    d0, d1 = gl.split(pick)
+    dword = d1 if ((kt % 16) // 4) // 2 else d0
+    return ((dword >> ((kt % 4) * 8)) & 255).to(gl.uint8)
+
+
 @gluon.jit
 def _group_of(plan, k, rank_smem):
     """This wave's k-th group: (expert id, rank, group index, leftover?)."""
@@ -690,6 +738,7 @@ def prefetch_moe(
     TAIL_NUM: gl.constexpr,
     TAIL_DEN: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
+    SCALE_LANES: gl.constexpr,
 ):
     """Plan this workgroup's MoE work and issue its first weights.
 
@@ -734,10 +783,21 @@ def prefetch_moe(
     sdesc = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.s13, 0x7FFFFFF0)
     ring = ()
     sring = ()
+    if SCALE_LANES:
+        # Steps 0-15's scales; steps 16-31 go out mid-strip (slot 1 starts as
+        # a copy, not a load).
+        ldesc = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.s13_lanes, 0x7FFFFFF0)
+        half0 = _load_lanes(
+            ldesc,
+            _lanes_base(expert, group * 64 + plan.strip * 16, N_PHYS1, _K_STEPS),
+            0,
+            live,
+        )
+        sring = (half0, half0)
     for j in gl.static_range(RING):
         # Ring order (slot 0 first): the loop's first wait is the minimum
         # over this entry and its back edge.
-        if j % 2 == 0:
+        if not SCALE_LANES and j % 2 == 0:
             sring = sring + (_load_scale_dword(sdesc, s, s_pair, j // 2, live),)
         ring = ring + (_load_chunk(wdesc, w, w_pair, w_odd, j, live, ADDR_SOFFSET),)
         gl.amd.hint.sched_barrier()
@@ -926,6 +986,7 @@ def run_moe(
     DN_ORDER: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
     TAG_GLC: gl.constexpr,
+    SCALE_LANES: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
@@ -944,7 +1005,9 @@ def run_moe(
     runs a group's 4 strips on waves 4q..4q+3, 1 on waves q, q+2, q+4, q+6;
     ``DN_ORDER`` 0 runs a down unit K-step-major, 1 strip-major;
     ``ADDR_SOFFSET`` advances weight addresses in the scalar offset;
-    ``TAG_GLC`` sets the readiness poll's GLC bit.
+    ``TAG_GLC`` sets the readiness poll's GLC bit; ``SCALE_LANES`` reads the
+    gate/up scales lane-major (``bufs.s13_lanes``, one dwordx4 per lane per
+    16 steps) instead of one swizzled dword per 2 steps.
     """
     mfma: gl.constexpr = _layouts()[0]
     la: gl.constexpr = _layouts()[1]
@@ -1001,6 +1064,7 @@ def run_moe(
 
     w13d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.w13, 0x7FFFFFF0)
     s13d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.s13, 0x7FFFFFF0)
+    l13d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.s13_lanes, 0x7FFFFFF0)
     w2d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.w2, 0x7FFFFFF0)
     s2d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.s2, 0x7FFFFFF0)
     mids_d = gl.amd.cdna3.buffer.make_buffer_descriptor(bufs.mids, 0x7FFFFFF0)
@@ -1019,6 +1083,7 @@ def run_moe(
         bufs.stride_s13nb,
         N_PHYS1,
     )
+    lscale = _lanes_base(expert, group * 64 + plan.strip * 16, N_PHYS1, _K_STEPS)
     pend_word = rank * 0 - 1
     pend_left = left
     for k in range(plan.n_ug):
@@ -1035,6 +1100,7 @@ def run_moe(
             bufs.stride_s13nb,
             N_PHYS1,
         )
+        nlscale = _lanes_base(nexpert, ngroup * 64 + plan.strip * 16, N_PHYS1, _K_STEPS)
         # An opaque index keeps the 32 steps' A reads in the loop (hoisted,
         # they would hold 160 VGPRs).
         z = opaque_zero()
@@ -1042,7 +1108,10 @@ def run_moe(
         xsa = xs_all.index(z)
         acc = gl.zeros((16, 128), gl.float32, mfma)
         for kt in gl.static_range(_K_STEPS):
-            b_scale = _scale_byte(sring[(kt // 2) % (RING // 2)], s, kt)
+            if SCALE_LANES:
+                b_scale = _lanes_byte(sring[kt // 16], kt)
+            else:
+                b_scale = _scale_byte(sring[(kt // 2) % (RING // 2)], s, kt)
             a = xa.slice(kt * 64, 64, dim=1).load(la)
             a_scale = xsa.slice(kt * 4, 4, dim=1).load(lsa)
             acc = _direct_mxfp4_mfma(acc, a, ring[kt % RING], a_scale, b_scale)
@@ -1054,7 +1123,14 @@ def run_moe(
                     w13d, nw, nw_pair, nw_odd, kt + RING - _K_STEPS, nlive, ADDR_SOFFSET
                 )
             ring = ring[: kt % RING] + (nb,) + ring[kt % RING + 1 :]
-            if kt % 2 == 1:
+            if SCALE_LANES:
+                # Each half is refilled once its last step was used: steps
+                # 16-31 of this strip, then steps 0-15 of the next one.
+                if kt == 16 - RING:
+                    sring = (sring[0], _load_lanes(l13d, lscale, 1, None))
+                if kt == _K_STEPS - RING:
+                    sring = (_load_lanes(l13d, nlscale, 0, nlive), sring[1])
+            elif kt % 2 == 1:
                 if (kt - 1 + RING) // 2 < _K_STEPS // 2:
                     nsd = _load_scale_dword(s13d, s, s_pair, (kt - 1 + RING) // 2, None)
                 else:
@@ -1113,6 +1189,7 @@ def run_moe(
         pend_left = left
         expert, rank, group, left = nexpert, nrank, ngroup, nleft
         w, w_pair, w_odd, s, s_pair = nw, nw_pair, nw_odd, ns, ns_pair
+        lscale = nlscale
 
     # ---- gate/up -> down: publish the last strip's tag after a drain (once
     # per wave; its next loads would wait on this wave's own tag otherwise)
@@ -1269,6 +1346,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     xs,
     w13,
     s13,
+    s13_lanes,
     w2,
     s2,
     mids,
@@ -1295,6 +1373,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     DN_ORDER: gl.constexpr,
     ADDR_SOFFSET: gl.constexpr,
     TAG_GLC: gl.constexpr,
+    SCALE_LANES: gl.constexpr,
     TAIL_NUM: gl.constexpr,
     TAIL_DEN: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
@@ -1311,6 +1390,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         xs,
         w13,
         s13,
+        s13_lanes,
         w2,
         s2,
         mids,
@@ -1339,6 +1419,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         TAIL_NUM,
         TAIL_DEN,
         ADDR_SOFFSET,
+        SCALE_LANES,
     )
     ctx = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
     run_moe(
@@ -1356,6 +1437,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         DN_ORDER,
         ADDR_SOFFSET,
         TAG_GLC,
+        SCALE_LANES,
         SWIGLU_ALPHA,
         SWIGLU_LIMIT,
         SWIGLU_BETA,
@@ -1406,6 +1488,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
     topk_ids,
     out,
     state,
+    w13_scale_lanes,
     *,
     ring: int,
     quad_map: int,
@@ -1426,6 +1509,9 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
             E8M0 scales (``_quantize_mxfp4_activation``).
         w13, w13_scale, w2, w2_scale: gdot128-shuffled weights and
             CDNA4-swizzled scales (the direct decode's raw tensors).
+        w13_scale_lanes: The gate/up scales lane-major
+            (``pack_cdna4_mxfp4_scale_lanes``), or None to read the
+            swizzled ones.
         topk_ids: ``(rows, top_k)`` int32 global expert ids (EP1: all local).
         out: ``(rows * top_k, 4096)`` bf16, written per route.
         state: :class:`NativeMoeState`.
@@ -1459,6 +1545,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         xs,
         w13,
         _int32_words(w13_scale),
+        _int32_words(w13_scale if w13_scale_lanes is None else w13_scale_lanes),
         w2,
         _int32_words(w2_scale),
         state.mids,
@@ -1485,6 +1572,7 @@ def launch_gluon_mxfp4_moe_native_stream_gfx950(
         DN_ORDER=dn_order,
         ADDR_SOFFSET=addr_soffset,
         TAG_GLC=tag_glc,
+        SCALE_LANES=int(w13_scale_lanes is not None),
         TAIL_NUM=tail_num,
         TAIL_DEN=tail_den,
         SWIGLU_ALPHA=swiglu_alpha,

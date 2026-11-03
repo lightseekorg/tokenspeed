@@ -54,9 +54,10 @@ _DIVISIBLE = {
 }
 
 VARIANTS = [
-    dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0),
-    dict(ROWS=16, RING=8, QUAD_MAP=1, DN_ORDER=1, ADDR_SOFFSET=1),
-    dict(ROWS=16, RING=16, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0),
+    dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=1),
+    dict(ROWS=8, RING=8, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=0),
+    dict(ROWS=16, RING=8, QUAD_MAP=1, DN_ORDER=1, ADDR_SOFFSET=1, SCALE_LANES=0),
+    dict(ROWS=16, RING=16, QUAD_MAP=0, DN_ORDER=0, ADDR_SOFFSET=0, SCALE_LANES=0),
 ]
 
 
@@ -83,6 +84,7 @@ def _compile(fields):
         xq="*u8",
         xs="*u8",
         w13="*u8",
+        s13_lanes="*i32",
         s13="*i32",
         w2="*u8",
         s2="*i32",
@@ -203,3 +205,15 @@ def test_item_loops_keep_the_ring(fields):
         if mfma == 32:
             # S-MOE2: each wave's group tag follows a wait covering its mids stores.
             assert tags and all(tags), tags
+            # Gate/up scales: two lane-major dwordx4 per strip, or one
+            # swizzled dword per two steps.
+            body = [s for s, _ in ins[start:end]]
+            if fields["SCALE_LANES"]:
+                scales = [
+                    s
+                    for s in body
+                    if s.startswith("buffer_load_dwordx4") and not s.endswith(" nt")
+                ]
+                assert len(scales) == 2, scales
+            else:
+                assert sum(s.startswith("buffer_load_dword ") for s in body) == 16
