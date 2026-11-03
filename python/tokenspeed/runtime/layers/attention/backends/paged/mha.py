@@ -206,6 +206,8 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> DecodeKVView | None:
         # A sliding window reads the cache through the page table alone; full
         # layers' verify decode takes a split schedule, and scaled caches more.
+        # A bound draft tree attends through its mask (forward_decode's tree
+        # cascade), which the view does not carry.
         metadata = self.forward_decode_metadata
         if (
             metadata is None
@@ -213,6 +215,8 @@ class MHAAttnBackend(PagedAttentionBackend):
             or layer.fp8_kv_scales is not None
             or layer.sliding_window_size < 0
             or self.draft_block_decode
+            or self.tree_verify is not None
+            or self.tree_lane_step_active
         ):
             return None
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
