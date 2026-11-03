@@ -237,6 +237,61 @@ def test_launches_cross_the_32_bit_epoch_boundary():
     assert copy[:, 0].tolist() == [(start + n) & 1 for n in range(1, 7)]
 
 
+@gluon.jit(do_not_specialize=["deadline_ticks"])
+def _wave_epochs_kernel(
+    epochs, claims, errors, seen, deadline_ticks, LAUNCHES: gl.constexpr
+):
+    """Each wave of each workgroup records the epoch it entered with in
+    ``seen[epoch % LAUNCHES, pid, wave]`` (one lane per wave stores)."""
+    entry = enter_issue(epochs, claims)
+    launch = enter_check(entry, errors, errors, deadline_ticks, 0, _record_and_return)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    lane = gl.arange(0, 64 * gl.num_warps(), lanes)
+    row = (launch.epoch % LAUNCHES).to(gl.int32)
+    slot = (row * _GRID + gl.program_id(0)) * gl.num_warps() + lane // 64
+    value = gl.zeros([64 * gl.num_warps()], gl.int64, lanes) + launch.epoch
+    gl.store(seen + slot, value, mask=lane % 64 == 0)
+
+
+def test_every_wave_enters_with_the_same_epoch_advancing_by_one():
+    """Each wave keeps its own epoch and claim counter words (no wave waits
+    for another at entry), so the counters must stay in step: in every
+    launch all 8 waves of all workgroups see the same epoch, it grows by
+    exactly 1 per launch, eager or replayed, wherever dispatch starts, and
+    afterwards every wave's word of every line holds the same count."""
+    state = _State()
+    launches = 6
+    seen = torch.zeros((launches, GRID, 8), dtype=torch.int64, device="cuda")
+    scratch = torch.zeros(1024, dtype=torch.int32, device="cuda")
+
+    def launch():
+        _wave_epochs_kernel[(GRID,)](
+            state.epochs, state.claims, state.errors, seen, _DEADLINE_TICKS,
+            LAUNCHES=launches, num_warps=8, **persistent_compile_options(),
+        )  # fmt: skip
+
+    for n in range(3):
+        _rotate_dispatch(scratch, 1 + 5 * n)
+        launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for n in range(3):
+        _rotate_dispatch(scratch, 3 + 7 * n)
+        graph.replay()
+    torch.cuda.synchronize()
+    assert state.errors.count_nonzero().item() == 0
+    # Graph capture does not run the kernel: 6 launches, epochs 1..6.
+    by_launch = seen.cpu()
+    for epoch in range(1, launches + 1):
+        assert bool((by_launch[epoch % launches] == epoch).all()), epoch
+    words = LINE_WORDS // 2
+    for counters in (state.epochs, state.claims):
+        waves = counters.view(GRID, words)[:, :8].cpu()
+        assert bool((waves == launches).all())
+        assert bool((counters.view(GRID, words)[:, 8:] == 0).all())
+
+
 _TRAP_CHILD = textwrap.dedent("""
     import sys
     sys.path.insert(0, sys.argv[1])
