@@ -148,6 +148,7 @@ class CausalConv1dPrefill:
         self,
         *,
         channels: int,
+        partition_channels: int,
         input_stride: int,
         pointer_alignment: int,
         weight_alignment: int,
@@ -173,7 +174,11 @@ class CausalConv1dPrefill:
         vector_width = block_n // threads
         if vector_width & (vector_width - 1):
             raise ValueError("channels per thread must be a power of two")
+        if partition_channels <= 0 or channels % partition_channels:
+            raise ValueError("output partitions must split the channels equally")
         self.channels = channels
+        self.partition_channels = partition_channels
+        self.partitions = channels // partition_channels
         self.input_stride = input_stride
         self.state_strides = state_strides
         self.weight_strides = weight_strides
@@ -189,7 +194,9 @@ class CausalConv1dPrefill:
         self.input_align = math.gcd(
             pointer_alignment, 2 * self.vector, 2 * input_stride
         )
-        self.output_align = math.gcd(pointer_alignment, 2 * self.vector, 2 * channels)
+        self.output_align = math.gcd(
+            pointer_alignment, 2 * self.vector, 2 * partition_channels
+        )
         self.weight_align = math.gcd(weight_alignment, 8 * self.vector)
 
     @cute.jit
@@ -206,6 +213,7 @@ class CausalConv1dPrefill:
         offsets: cute.Pointer,
         out: cute.Pointer,
         programs: Int32,
+        out_partition_stride: Int64,
         stream: cuda.CUstream,
     ):
         flat = cute.make_layout(9223372036854775807)
@@ -223,6 +231,7 @@ class CausalConv1dPrefill:
             cute.make_tensor(batches, flat),
             cute.make_tensor(offsets, flat),
             cute.make_tensor(out, flat),
+            out_partition_stride,
         ).launch(
             grid=grid,
             block=(self.threads, 1, 1),
@@ -288,24 +297,36 @@ class CausalConv1dPrefill:
         return values.load()
 
     @cute.jit
-    def _store_row(self, out, row, channel, acc):
+    def _output_offset(self, partition_stride, row, channel):
+        # Output is [partitions, tokens, partition_channels]; packed rows are
+        # the single-partition case.
+        offset = row * self.partition_channels + channel
+        if cutlass.const_expr(self.partitions > 1):
+            partition = channel // self.partition_channels
+            offset = offset + partition * (partition_stride - self.partition_channels)
+        return offset
+
+    @cute.jit
+    def _store_row(self, out, partition_stride, row, channel, acc):
         result = cute.make_rmem_tensor((self.vector,), BFloat16)
         for v in cutlass.range_constexpr(self.vector):
             value = acc[v]
             if cutlass.const_expr(self.silu):
                 value = _silu(value)
             result[v] = value.to(BFloat16)
-        if cutlass.const_expr(self.channels % self.block_n == 0):
-            offset = cute.assume(
-                row * self.channels + channel, divby=self.output_align // 2
-            )
-            address = out.iterator + offset
-            dest = cute.make_tensor(address, cute.make_layout(self.vector))
-            cute.autovec_copy(result, dest)
-        elif cutlass.const_expr(self.channels % self.vector == 0):
-            if channel < self.channels:
+        if cutlass.const_expr(self.partition_channels % self.vector == 0):
+            if cutlass.const_expr(self.channels % self.block_n == 0):
                 offset = cute.assume(
-                    row * self.channels + channel, divby=self.output_align // 2
+                    self._output_offset(partition_stride, row, channel),
+                    divby=self.output_align // 2,
+                )
+                address = out.iterator + offset
+                dest = cute.make_tensor(address, cute.make_layout(self.vector))
+                cute.autovec_copy(result, dest)
+            elif channel < self.channels:
+                offset = cute.assume(
+                    self._output_offset(partition_stride, row, channel),
+                    divby=self.output_align // 2,
                 )
                 address = out.iterator + offset
                 dest = cute.make_tensor(address, cute.make_layout(self.vector))
@@ -313,7 +334,9 @@ class CausalConv1dPrefill:
         else:
             for v in cutlass.range_constexpr(self.vector):
                 if channel + v < self.channels:
-                    out[row * self.channels + channel + v] = result[v]
+                    out[self._output_offset(partition_stride, row, channel + v)] = (
+                        result[v]
+                    )
 
     @cute.jit
     def _body(
@@ -323,6 +346,7 @@ class CausalConv1dPrefill:
         bias,
         state,
         out,
+        out_partition_stride,
         start,
         token,
         length,
@@ -389,7 +413,9 @@ class CausalConv1dPrefill:
                     w = weights[tap, None].load()
                     product = _multiply_bf16(value, w)
                     acc = self._add(acc, product)
-                self._store_row(out, start + token + row, channel, acc)
+                self._store_row(
+                    out, out_partition_stride, start + token + row, channel, acc
+                )
 
         if cutlass.const_expr(first):
             # The request's last three inputs (or old history when it is
@@ -423,7 +449,18 @@ class CausalConv1dPrefill:
 
     @cute.kernel
     def causal_conv1d_prefill(
-        self, x, weight, bias, state, slots, history, boundaries, batches, offsets, out
+        self,
+        x,
+        weight,
+        bias,
+        state,
+        slots,
+        history,
+        boundaries,
+        batches,
+        offsets,
+        out,
+        out_partition_stride: Int64,
     ):
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
@@ -446,6 +483,7 @@ class CausalConv1dPrefill:
                         bias,
                         state,
                         out,
+                        out_partition_stride,
                         start,
                         token,
                         length,
@@ -462,6 +500,7 @@ class CausalConv1dPrefill:
                         bias,
                         state,
                         out,
+                        out_partition_stride,
                         start,
                         token,
                         length,
@@ -478,6 +517,7 @@ class CausalConv1dPrefill:
                         bias,
                         state,
                         out,
+                        out_partition_stride,
                         start,
                         token,
                         length,

@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from contextlib import contextmanager
+from unittest.mock import patch
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.gdn.triton import (
@@ -25,6 +28,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
 )
 from tokenspeed_kernel.ops.conv import causal_conv1d_fn
 from tokenspeed_kernel.ops.conv._triton.causal_conv1d import _causal_conv1d_fwd_kernel
+from tokenspeed_kernel.selection import kernel_override
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
@@ -101,7 +105,74 @@ def test_partitioned_conv_preserves_values_and_state(
     torch.testing.assert_close(state[-1], original[-1], atol=0, rtol=0)
 
 
-def test_partitioned_conv_reuses_compilation():
+@pytest.mark.parametrize("lengths", [[1, 2, 3], [7, 8, 9], [129, 17], [8192]])
+@pytest.mark.parametrize(
+    "channels, partitions",
+    [(96, None), (96, 1), (96, 3), (1536, 3), (1540, 2), (1542, 3), (36864, 3)],
+)
+def test_cute_dsl_conv_matches_triton(lengths, channels, partitions):
+    pytest.importorskip("cutlass.cute")
+    total = sum(lengths)
+    torch.manual_seed(total + channels)
+    projected = torch.randn(
+        total + 5, channels + 128, device="cuda", dtype=torch.bfloat16
+    )
+    x = projected[:, :channels].T
+    original = torch.randn(len(lengths) + 2, channels, 3, device="cuda", dtype=x.dtype)
+    state, reference_state = original.clone(), original.clone()
+    slots = torch.arange(1, len(lengths) + 1, device="cuda", dtype=torch.int32)
+    sizes = torch.tensor(lengths, dtype=torch.int32)
+    bounds = torch.tensor(
+        [0, *sizes.cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    kwargs = dict(
+        weight=torch.randn(channels, 4, device="cuda", dtype=x.dtype) * 0.1,
+        bias=torch.randn(channels, device="cuda", dtype=x.dtype),
+        query_start_loc=bounds,
+        cache_indices=slots,
+        has_initial_state=slots % 2 == 0,
+        activation="silu",
+        prefill_metadata=build_causal_conv1d_prefill_metadata(bounds, sizes, 8),
+    )
+    with kernel_override(
+        "conv", "causal_conv1d_prefill", "triton_causal_conv1d_prefill"
+    ):
+        expected = causal_conv1d_fn(x, conv_states=reference_state, **kwargs).T[:total]
+    output = None
+    if partitions is not None:
+        output = torch.full(
+            (partitions, total + 5, channels // partitions),
+            13,
+            device="cuda",
+            dtype=x.dtype,
+        )
+    with kernel_override(
+        "conv", "causal_conv1d_prefill", "cute_dsl_causal_conv1d_prefill"
+    ):
+        actual = causal_conv1d_fn(x, conv_states=state, out=output, **kwargs)
+    if output is None:
+        actual = actual.T[:total]
+    else:
+        assert actual.data_ptr() == output.data_ptr()
+        assert bool((output[:, total:] == 13).all())
+        expected = expected.view(total, partitions, -1).permute(1, 0, 2)
+        actual = actual[:, :total]
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(state, reference_state, atol=0, rtol=0)
+
+
+@contextmanager
+def _assert_no_cute_compile():
+    cute = pytest.importorskip("cutlass.cute")
+    with patch.object(cute, "compile", wraps=cute.compile) as compile:
+        yield
+    assert not compile.called
+
+
+@pytest.mark.parametrize(
+    "kernel", ["triton_causal_conv1d_prefill", "cute_dsl_causal_conv1d_prefill"]
+)
+def test_partitioned_conv_reuses_compilation(kernel):
     channels = 384
     weight = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16)
     state = torch.zeros(2, channels, 3, device="cuda", dtype=weight.dtype)
@@ -128,7 +199,9 @@ def test_partitioned_conv_reuses_compilation():
             out=output,
         )
 
-    run(32)
-    with assert_no_triton_compile(_causal_conv1d_fwd_kernel):
-        for tokens in (1, 3, 17, 33, 65, 129, 257):
-            run(tokens)
+    with kernel_override("conv", "causal_conv1d_prefill", kernel):
+        run(32)
+        with assert_no_triton_compile(_causal_conv1d_fwd_kernel):
+            with _assert_no_cute_compile():
+                for tokens in (1, 3, 17, 33, 65, 129, 257):
+                    run(tokens)

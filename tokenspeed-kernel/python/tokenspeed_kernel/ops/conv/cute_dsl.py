@@ -83,8 +83,22 @@ def _prepare_causal_conv1d_prefill(
     channels = x.shape[0]
     if x.ndim != 2 or x.stride(0) != 1:
         raise ValueError("convolution input must have contiguous channels")
-    if out.shape != x.shape or out.stride() != (1, channels):
-        raise ValueError("convolution output must use packed token rows")
+    if out.ndim == 2:
+        if out.shape != x.shape or out.stride() != (1, channels):
+            raise ValueError("convolution output must use packed token rows")
+        partition_channels, partition_stride = channels, 0
+    else:
+        if (
+            out.ndim != 3
+            or out.shape[1] != x.shape[1]
+            or out.shape[0] * out.shape[2] != channels
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "convolution output must be contiguous "
+                "[partitions, tokens, channels / partitions]"
+            )
+        partition_channels, partition_stride = out.shape[2], out.stride(0)
     if weight.shape != (channels, 4):
         raise ValueError("convolution requires four taps per channel")
     if state.ndim != 3 or state.shape[1] != channels or state.shape[2] < 3:
@@ -145,7 +159,10 @@ def _prepare_causal_conv1d_prefill(
         )
         for i, t in enumerate(tensors)
     )
-    args += (cutlass.Int32(metadata.batch_indices.numel()),)
+    args += (
+        cutlass.Int32(metadata.batch_indices.numel()),
+        cutlass.Int64(partition_stride),
+    )
     # All entries describe fixed model and tile layouts. No token count, request
     # count or boundary value enters this cache key.
     key = (
@@ -153,6 +170,7 @@ def _prepare_causal_conv1d_prefill(
         torch.cuda.get_device_capability(x.device),
         config,
         channels,
+        partition_channels,
         x.stride(1),
         alignment,
         weight_alignment,
@@ -176,6 +194,7 @@ def _prepare_causal_conv1d_prefill(
                 if compiled is None:
                     kernel = CausalConv1dPrefill(
                         channels=channels,
+                        partition_channels=partition_channels,
                         input_stride=x.stride(1),
                         pointer_alignment=alignment,
                         weight_alignment=weight_alignment,
@@ -213,8 +232,9 @@ def launch_causal_conv1d_prefill(
 ):
     """Run four-tap BF16 convolution and update each non-padding request's state.
 
-    Input and output have shape [channels, tokens] with contiguous channels.
-    Weight has shape [channels, 4]. State has shape [slots, channels, history]
+    Input has shape [channels, tokens] with contiguous channels. Output has the
+    input shape with packed token rows, or is a contiguous [partitions, tokens,
+    channels / partitions] buffer. Weight has shape [channels, 4]. State has shape [slots, channels, history]
     with at least three history values. Slots use -1 for padding. Metadata must
     use config.block_m. Output must not alias input. Output and state are
     caller-owned and updated in place. Returns the compiled executor, or None
@@ -278,6 +298,7 @@ if _AVAILABLE:
         validate_data: bool,
         *,
         prefill_metadata: CausalConv1dPrefillMetadata,
+        out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Convolve prefill tokens through the common convolution facade.
 
@@ -295,10 +316,12 @@ if _AVAILABLE:
             pad_slot_id: Padding sentinel; this solution requires -1.
             validate_data: Check matching request-vector lengths.
             prefill_metadata: Eight-token maps shared by all layers this forward.
+            out: Optional contiguous BF16 [partitions, tokens, channels /
+                partitions] buffer to write; None allocates packed token rows.
 
         Returns:
-            BF16 output with the input shape and packed token rows. Padding
-            rows are untouched. Exact and capacity metadata run the same
+            ``out`` when given, else BF16 output with the input shape and
+            packed token rows. Padding rows are untouched. Exact and capacity metadata run the same
             tile; token and request counts are runtime values.
         """
         if pad_slot_id != -1:
@@ -312,7 +335,10 @@ if _AVAILABLE:
             or has_initial_state.numel() != cache_indices.numel()
         ):
             raise ValueError("convolution request vectors must have matching lengths")
-        out = torch.empty((x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device).T
+        if out is None:
+            out = torch.empty(
+                (x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device
+            ).T
         silu = activation is True or activation in ("silu", "swish")
         enable_pdl = pdl_enabled()
         args = (
