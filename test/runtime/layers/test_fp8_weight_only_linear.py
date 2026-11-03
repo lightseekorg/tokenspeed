@@ -39,6 +39,7 @@ from tokenspeed.runtime.layers.quantization import get_quantization_config
 from tokenspeed.runtime.layers.quantization.fp8_weight_only import (
     Fp8WeightOnlyConfig,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
@@ -134,3 +135,8 @@ def test_loaded_mlp_projections_match_their_dequantized_weights(rows):
     )
     y, _ = down(out[:, :intermediate])
     assert y.shape == (rows, hidden)
+
+
+def test_targets_refuse_fp8_weight_only():
+    with pytest.raises(ValueError, match="--speculative-draft-model-quantization"):
+        ServerArgs(model="x", max_num_seqs=8, quantization="fp8_weight_only")

@@ -2475,6 +2475,14 @@ class ServerArgs:
 
         self.validate_model_update_options()
 
+        if self.quantization == "fp8_weight_only":
+            # A draft-weight format: its GEMV is decode-shaped, so a target's
+            # prefill rows would re-read every weight per 32-row chunk.
+            raise ValueError(
+                "fp8_weight_only quantizes draft weights only; pass it as "
+                "--speculative-draft-model-quantization"
+            )
+
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
                 raise ValueError(
