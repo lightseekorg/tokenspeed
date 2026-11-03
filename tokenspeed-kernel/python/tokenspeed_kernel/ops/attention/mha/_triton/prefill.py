@@ -93,7 +93,10 @@ def _fwd_kernel(
         cur_seq_len = tl.load(cache_seqlens + cur_seq)
     else:
         cur_seq_len = cur_seq_len_extend
-    cur_q_start = tl.maximum(cur_seq_len - cur_seq_len_extend, 0)
+    # Unclamped: a causal query run longer than its keys keeps query i at key
+    # cur_seq_len - len + i, so its leading rows see fewer keys or none (the
+    # tree cascade's prefix half). Without a cache this is 0.
+    cur_q_start = cur_seq_len - cur_seq_len_extend
 
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(cu_seqlens_q + cur_seq)

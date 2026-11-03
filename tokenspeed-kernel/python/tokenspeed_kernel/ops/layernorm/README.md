@@ -38,7 +38,7 @@ CUDA-graph capture).
 | kernel | solution / band | admits | body |
 | --- | --- | --- | --- |
 | `torch_qk_rmsnorm_ssmax` | `torch`, PORTABLE | every shape of the BF16 q/k/weights x int32/int64 positions signatures, any device the shared kernel runs on | `BeamRMSNorm.forward` for `residual=None, out=None` on the q heads and on the k heads (the same `rmsnorm(...)` call with the module's weight and eps), then the three statements of `apply_ssmax_root10` with Beam's constants -- the NoPE branch transcribed; 2-D views of the fresh 3-D tensors |
-| `triton_fused_qk_rmsnorm_ssmax` | `triton`, SPECIALIZED, NVIDIA SM100 to SM103 | traits `tokens_min {1}`, `head_dim {128}`, `heads {(48, 8), (6, 1)}`, `ndim {2}`, `unit_stride`, `rows_disjoint`, `weights_contiguous`, `positions_contiguous`, `eps_ok`, `is_cuda`: BF16 rank-2 `q`/`k` with a contiguous last axis and token strides covering the row (Beam's `qkv.split` column views or contiguous), the pair `(48, 8)` or `(6, 1)`, contiguous BF16 `[128]` weights, contiguous int32/int64 `[tokens]` positions, a finite positive `eps`, `tokens > 0`, every tensor on one CUDA device; a by-name call outside them raises (`qk_rmsnorm_ssmax_rejection`) | `qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=0.0, ssmax_positions=positions)`: one launch of `_fused_qk_rmsnorm_kernel` with `ROUND_AFTER_AFFINE=True, SSMAX_INKERNEL=True` |
+| `triton_fused_qk_rmsnorm_ssmax` | `triton`, SPECIALIZED, NVIDIA SM90 to SM103 | traits `tokens_min {1}`, `head_dim {128}`, `heads {(48, 8), (6, 1)}`, `ndim {2}`, `unit_stride`, `rows_disjoint`, `weights_contiguous`, `positions_contiguous`, `eps_ok`, `is_cuda`: BF16 rank-2 `q`/`k` with a contiguous last axis and token strides covering the row (Beam's `qkv.split` column views or contiguous), the pair `(48, 8)` or `(6, 1)`, contiguous BF16 `[128]` weights, contiguous int32/int64 `[tokens]` positions, a finite positive `eps`, `tokens > 0`, every tensor on one CUDA device; a by-name call outside them raises (`qk_rmsnorm_ssmax_rejection`) | `qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=0.0, ssmax_positions=positions)`: one launch of `_fused_qk_rmsnorm_kernel` with `ROUND_AFTER_AFFINE=True, SSMAX_INKERNEL=True` |
 
 The keyword `ssmax_positions` of `triton.qk_rmsnorm` (default `None`) maps to
 the two kernel constexprs `ROUND_AFTER_AFFINE` and `SSMAX_INKERNEL` (last,
@@ -66,6 +66,6 @@ The fused kernel's scale equals Torch's CUDA result bit for bit on every positio
 of `[0, 2^20]` for int32 and int64 positions (measured, zero mismatches), and the
 two kernels agree byte for byte on `q_out` and `k_out`. Tests:
 `test/ops/layernorm/test_beam_norms.py` (CPU: the selection) and
-`test/nvidia/ops/layernorm/test_beam_norms_cuda.py` (NVIDIA SM100 to SM103: the
+`test/nvidia/ops/layernorm/test_beam_norms_cuda.py` (NVIDIA SM90 to SM103: the
 bytes). No
 timing claim is made for the fused kernel in this record.

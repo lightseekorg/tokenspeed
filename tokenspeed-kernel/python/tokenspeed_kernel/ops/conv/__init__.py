@@ -359,7 +359,11 @@ def inkling_commit_tables(
             raise ValueError(f"layer {layer}'s stream runs past the ring channels")
 
     def device(values: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        return torch.tensor(values, dtype=dtype, device=ring.device)
+        # The caller may build the tables on the first verify round, while
+        # serving: stage through pinned memory so the upload does not wait
+        # for the step in flight (a pageable copy would).
+        host = torch.tensor(values, dtype=dtype, pin_memory=True)
+        return host.to(ring.device, non_blocking=True)
 
     tables = []
     for dtype, rows in entries.items():

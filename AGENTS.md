@@ -141,6 +141,19 @@ change.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
 
+## tokenspeed-scheduler
+
+Inside the root `tokenspeed-scheduler/` directory:
+
+* Prefer RAII to manual bookkeeping in the C++ scheduler. Tie each resource
+  or registration that a request or an in-flight operation holds (cache
+  blocks, pool slots, transfer or storage tickets, side-table entries keyed
+  by an id) to an owning handle whose destructor releases it, and keep that
+  handle in the object whose lifetime it shares, usually an FSM state or the
+  request itself. Avoid paired acquire/release calls, hand-kept counters and
+  erase-on-teardown code spread across call sites. `CacheBlockRef`,
+  `ReqPoolIndex` and `StorageLease` are the models to follow.
+
 ## tokenspeed-scheduler releases
 
 Prefer separate PRs for scheduler code changes and version bumps. A scheduler

@@ -723,8 +723,8 @@ the image as the split planned:
   already canonical on Host (an L3 prefetch of the same page by another prompt
   landed first), `PrefixCacheIndex::Register` redirects the ticket to that
   entry, and `CompleteWriteBack` hands the entries as published to every
-  `Retracted` request waiting for the op (`StoreLandedEvent`,
-  `RetractionImage::FollowPublished`), which re-points its slot to the
+  `Retracted` request that waited for the op
+  (`RetractionImage::FollowPublished`), which re-points its slot to the
   canonical block and lets its own unindexed block return to the pool. An image
   therefore never pins a Host block the index does not know, and the restore's
   L2 rows always come from published entries.
@@ -741,9 +741,9 @@ the image as the split planned:
 The split plans the L2 leg before anything is acquired or evicted for it. The
 slots to copy are grouped by boundary (a content hash, with every group's slot
 at it), the shallowest first, and the Host takes the leading boundaries that
-fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, planned in
-`AcquireHostBlocks`' order and with its victim ranking against a shadow of the
-Host); the retraction (`AcquireHostBoundaries`) evicts exactly the planned
+fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, using the shared
+eviction planner). All rows fit jointly against shadow capacity before any
+placement is committed; the retraction (`AcquireHostBoundaries`) evicts exactly the planned
 victims and places exactly those rows. The first boundary the Host cannot take
 whole goes to the pool with every later one, even where the Host has room for
 some of their rows. Under the write-back policy the plan takes Host room for
@@ -751,10 +751,9 @@ every boundary as an eviction write-back does, by whole segments first
 (`AcquireHostSegments`' plan: whole victims, none above a page an eviction
 write-back is still bringing, boundaries dropped from the deepest), then block
 by block, as above, for the boundaries the segment step dropped, against the
-Host less its victims. Where the two steps place fewer boundaries than block
-by block alone, the block-by-block plan stands, so the Host takes at least as
-many boundaries as the block-by-block plan would on the same Host, and
-sometimes more, since its victims differ. Placing block by block may take the
+Host less its victims. Both policies can use all eligible capacity: the
+segment step changes victim preference, while the shared block planner fits
+the remaining rows jointly. Placing block by block may take the
 Host page above an eviction write-back in flight. The write-back still
 publishes at its ACK — the settlement reads the tail hint and the checkpoint
 boundaries under its node, not the gap above — and the next dead-entry
@@ -1192,12 +1191,14 @@ the bytes — an L2 entry with its `CacheKey`, or a snapshot-pool block with
 none) — the blob slot, the `ResumeShape` that names the state it resumes
 (`ResumePrefilling{window, reserve}`, `ResumePrefillDone{window, reserve}` or
 `ResumeDecoding{reserve}`), its `retraction_epoch` and `resumes_generation`
-stamp, and `pending_store_ops`: every op the image waits for — both legs' own
-ops and any earlier in-flight store carrying one of its keys. The image is
-**landed** (`ImageLanded()`) when all of them have been acknowledged
-(`cache::WriteBackDone`, `cache::SnapshotDone`); until then the request is
-not a readmission candidate, because a restore started earlier would copy
-bytes that have not arrived.
+stamp, and `image_stores`: a `StoreWait` on every op the image waits for —
+both legs' own ops and any earlier in-flight store carrying one of its keys.
+Each wait is a weak reference to the op's in-flight record, which the
+transfer manager drops at the op's ACK (`cache::WriteBackDone`,
+`cache::SnapshotDone`). The image is **landed** (`ImageLanded()`) when every
+wait has expired; nothing records the ACKs on the request. Until then the
+request is not a readmission candidate, because a restore started earlier
+would copy bytes that have not arrived.
 
 **Readmission order** (`rankedReadmissions`) is derived, not stored: among
 this round's candidates whose image landed, victims with generated output

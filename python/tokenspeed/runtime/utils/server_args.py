@@ -42,6 +42,7 @@ from tokenspeed.runtime.configs.numerics import (
     RL_BITWISE_SAMPLING_BACKENDS,
     ROUTER_TOPKS,
     SAMPLING_STREAMS,
+    YARN_FREQUENCY_DEVICES,
     YARN_RAMP_MASK_DEVICES,
     resolve_numerics_envelope,
 )
@@ -256,11 +257,11 @@ def validate_context_parallel_roles(
                 "rank (the drafter's steps only), which no engine serving "
                 "steady-state decode should pay"
             )
-        if qcp_size != kvp_size:
+        if kvp_size not in (1, qcp_size):
             raise ValueError(
                 "--query-context-parallel-size must equal --kv-parallel-size "
-                f"(got qcp={qcp_size}, kvp={kvp_size}): the history gather "
-                "splits by the page owners of the whole shard group"
+                f"when KVP is enabled (got qcp={qcp_size}, kvp={kvp_size}): "
+                "page owners must span the whole query shard group"
             )
     if dcp_size > 1:
         if disaggregation_mode not in ("null", "decode"):
@@ -410,6 +411,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    enable_async_logging: bool = False
     enable_log_request_stats: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
@@ -654,9 +656,10 @@ class ServerArgs:
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
-    # Device that computes the deepseek_yarn RoPE inverse frequencies (the
-    # position frequencies, both divisions and the YaRN linear ramp mask).
+    # Device that computes the deepseek_yarn linear ramp mask.
     yarn_ramp_mask_device: str = "cuda"
+    # Device that computes deepseek_yarn powers, divisions and interpolation.
+    yarn_frequency_device: str = "cuda"
     # Where LongCat-style MLA applies its sqrt(hidden / lora_rank) norm scales:
     # folded into the q_a/kv_a layernorm weights at load, or multiplied at
     # runtime after q_b_proj / kv_a_layernorm as the trainer does.
@@ -1028,6 +1031,11 @@ class ServerArgs:
                 "--yarn-ramp-mask-device",
                 self.yarn_ramp_mask_device,
                 YARN_RAMP_MASK_DEVICES,
+            ),
+            (
+                "--yarn-frequency-device",
+                self.yarn_frequency_device,
+                YARN_FREQUENCY_DEVICES,
             ),
             ("--mla-lora-scale", self.mla_lora_scale, MLA_LORA_SCALES),
             ("--layer-boundary-norm", self.layer_boundary_norm, LAYER_BOUNDARY_NORMS),
@@ -1922,16 +1930,16 @@ class ServerArgs:
                 f"{self.sampling_backend} resolves exact ties in reduction order"
             )
         self.sampling_stream = "per-request"
-        # Sparse attention: the tuned top-k kernels' tie order moves with the
-        # batch shape, so the cores reduce the selected slots sorted; the
-        # batch-invariant cores the envelope pins declare the trait.
-        self.dsa_slot_order = "sorted"
+        # Keep the trainer's selection order. The envelope still requires
+        # batch-invariant top-k and attention leaves.
+        self.dsa_slot_order = "selection"
         # Trainer alignment: the training framework's operation order wherever
         # the two engines are known to differ. Each switch is documented in
         # ``docs/design/numerics.md`` under "alignment.trainer".
-        # The trainer builds its RoPE inverse frequencies on the host; CPU and
-        # CUDA division round each of them differently at ulp level.
+        # The trainer constructs the ramp on CPU, then computes powers,
+        # divisions and interpolation on CUDA. Both choices affect rounding.
         self.yarn_ramp_mask_device = "cpu"
+        self.yarn_frequency_device = "cuda"
         # The trainer multiplies the LoRA norm scales as separate bf16 ops.
         self.mla_lora_scale = "runtime"
         # The trainer materializes each layer's bf16 output before the next
@@ -2449,6 +2457,24 @@ class ServerArgs:
 
         self.validate_model_update_options()
 
+        if (
+            self.speculative_algorithm is not None
+            and self.disaggregation_mode != "prefill"
+            and self.max_num_seqs is not None
+        ):
+            dp_size = self.mapping.attn.dp_size
+            tp_size = self.mapping.attn.tp_size
+            # Draft startup uses one request per TP peer, even when tactic
+            # profiling is disabled. Clamping would leave empty tuning peers;
+            # exceeding this capacity would overrun per-request decode state.
+            if self.max_num_seqs // dp_size < tp_size:
+                raise ValueError(
+                    "Speculative decode warmup requires max_num_seqs // "
+                    "data_parallel_size >= attn_tp_size, got "
+                    f"{self.max_num_seqs} // {dp_size} < {tp_size}. "
+                    f"Set --max-num-seqs to at least {dp_size * tp_size}."
+                )
+
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
                 raise ValueError(
@@ -2921,6 +2947,16 @@ class ServerArgs:
         )
 
         # Logging
+        parser.add_argument(
+            "--enable-async-logging",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_async_logging,
+            help=(
+                "Write Rust host and default Python root logs on background "
+                "threads. Bounded queues drop new records when full. Disabled "
+                "by default; incompatible with TOKENSPEED_LOGGING_CONFIG_PATH."
+            ),
+        )
         parser.add_argument(
             "--log-level",
             type=str,
@@ -3956,11 +3992,14 @@ class ServerArgs:
             "every extend forward's query rows over the attention TP group, rank "
             "r computing a contiguous slice of the chunk's rows against the "
             "gathered KV history of its requests. Requires --disaggregation-mode "
-            "prefill and must equal both --attn-tp-size and --kv-parallel-size; "
-            "needs GPU DSA attention with a bf16 KV cache and keeps the prefill "
-            "eager. The attention weights are head-replicated unless "
-            "--attn-head-tp-size equals it, which shards them over the shard "
-            "group.",
+            "prefill, must equal --attn-tp-size and keeps the prefill eager. "
+            "--kv-parallel-size must be 1 or equal to it. GPU DSA attention "
+            "needs it equal to --kv-parallel-size and a bf16 KV cache; its "
+            "attention weights are head-replicated unless --attn-head-tp-size "
+            "equals it, which shards them over the shard group. DeepSeek V4.1 "
+            "keeps its attention weights head-replicated; this model-wide layout "
+            "is separate from its operator-level "
+            "--deepseek-v41-*-query-parallel-size options.",
         )
         parser.add_argument(
             "--dense-tp-size",
@@ -4041,12 +4080,20 @@ class ServerArgs:
             type=str,
             choices=list(YARN_RAMP_MASK_DEVICES),
             default=ServerArgs.yarn_ramp_mask_device,
-            help="Device that computes the deepseek_yarn RoPE inverse "
-            "frequencies (the position frequencies, both divisions and the "
-            "YaRN linear ramp mask) before the table is moved to the model "
-            "device once. The trainer builds it on the host, and CPU and CUDA "
-            "division round differently at ulp level. Folded to cpu by "
-            "--numerics rl-bitwise.",
+            help="Device that computes the deepseek_yarn linear ramp mask. "
+            "Defaults to cuda, independently of --yarn-frequency-device. "
+            "Folded to cpu by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--yarn-frequency-device",
+            type=str,
+            choices=list(YARN_FREQUENCY_DEVICES),
+            default=ServerArgs.yarn_frequency_device,
+            help="Device that computes deepseek_yarn powers, divisions and "
+            "interpolation. Defaults to cuda, independently of --yarn-ramp-mask-device. "
+            "Folded to cuda by --numerics rl-bitwise, overriding explicit cpu. "
+            "Use cuda with --yarn-ramp-mask-device cpu for CUDA frequencies "
+            "with a CPU-built ramp. CPU and CUDA arithmetic can round differently.",
         )
         parser.add_argument(
             "--mla-lora-scale",
@@ -4093,7 +4140,7 @@ class ServerArgs:
             "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
             "trainer's vocab-parallel cross-entropy order (row max, shift, "
             "sum(exp) over fixed 32768-wide vocab blocks folded in block "
-            "order, logp = -(log(sum_exp) - target)); requests asking for "
+            "order, logp = target - log(sum_exp)); requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
             "logprobs only, never the sampled tokens. Folded to megatron by "
             "--numerics rl-bitwise.",
@@ -4122,10 +4169,10 @@ class ServerArgs:
             default=ServerArgs.dsa_slot_order,
             help="The order the sparse (DSA) attention cores reduce a token's "
             "selected KV slots in. 'selection': as the top-k leaf emitted "
-            "them (every core). 'sorted': ascending slot order, so the "
+            "them (every core). 'sorted': ascending token position, so the "
             "reduction is batch-invariant whenever the selected set is; "
             "served only by cores declaring the slot_order trait (the "
-            "registered batch-invariant leaves). Folded to sorted by --numerics "
+            "registered batch-invariant leaves). Folded to selection by --numerics "
             "rl-bitwise.",
         )
         parser.add_argument(

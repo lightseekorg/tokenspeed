@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
-#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -159,6 +158,8 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
 
     explicit AbortEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
+    // A pre-admission state's L3 lease -- on the operation it waits for, or
+    // on its Ready data -- goes with it.
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
     Finished operator()(Prefetching&&);
@@ -193,21 +194,21 @@ private:
 //
 // `resumes_generation` is Request::HasGeneratedOutput() at retraction time: a
 // victim with generated tokens a client is reading resumes ahead of one that
-// had produced nothing. `pending_store_ops` are the store ops whose ACKs make
-// the image landed. PrefillAwaitingResult exists only on the P role, which
-// never retracts, and RemotePrefilling is PD-pinned: neither overload exists.
+// had produced nothing. `image_stores` are the store ops whose ACKs make the
+// image landed. PrefillAwaitingResult exists only on the P role, which never
+// retracts, and RemotePrefilling is PD-pinned: neither overload exists.
 struct SnapshotRetractEvent : InvalidTransitionHandler<SnapshotRetractEvent> {
     using InvalidTransitionHandler<SnapshotRetractEvent>::operator();
 
     SnapshotRetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool resumes_generation,
                          RetractionImage image, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-                         std::vector<std::uint32_t> pending_store_ops)
+                         std::vector<StoreWait> image_stores)
         : coordinator_{coordinator},
           epoch_{epoch},
           resumes_generation_{resumes_generation},
           image_{std::move(image)},
           blob_slot_{std::move(blob_slot)},
-          pending_store_ops_{std::move(pending_store_ops)} {}
+          image_stores_{std::move(image_stores)} {}
 
     Retracted operator()(Prefilling&& state);
     Retracted operator()(PrefillDone&& state);
@@ -222,28 +223,7 @@ private:
     bool resumes_generation_{false};
     RetractionImage image_;
     std::shared_ptr<SnapshotSlotIndex> blob_slot_;
-    std::vector<std::uint32_t> pending_store_ops_;
-};
-
-// One of the image's store ops was acknowledged (WriteBackDone for the L2
-// leg, with the Host entries it published; SnapshotDone for the tail leg,
-// with none); once none is pending the image has landed and the request may
-// be restored. The published entries let the image follow a publication the
-// Host index redirected to an existing canonical block.
-struct StoreLandedEvent : InvalidTransitionHandler<StoreLandedEvent> {
-    using InvalidTransitionHandler<StoreLandedEvent>::operator();
-
-    StoreLandedEvent(std::uint32_t op_id, std::span<const HostPublication> published)
-        : op_id_{op_id}, published_{published} {}
-
-    Retracted operator()(Retracted&& state) {
-        state.NoteStoreLanded(op_id_, published_);
-        return std::move(state);
-    }
-
-private:
-    std::uint32_t op_id_{0};
-    std::span<const HostPublication> published_;
+    std::vector<StoreWait> image_stores_;
 };
 
 // The restore was admitted: fresh Device pages for the whole image (the

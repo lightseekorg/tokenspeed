@@ -120,7 +120,17 @@ def combine_attention_partials(
             output_dtype=local_output.dtype,
             sink=sink,
         )
-    gathered_lse = all_gather(local_lse.float().unsqueeze(0).contiguous(), group, dim=0)
+    # Gather FP32 bits as 16-bit rows so the shared backend can use its
+    # low-latency inner gather. This is a view, never a BF16 conversion:
+    # infinities and NaN payloads retain their bits. Other backends fall back.
+    tokens, gathered_heads = local_lse.shape
+    packed_lse = local_lse.float().contiguous().view(torch.bfloat16)
+    gathered_lse = all_gather(packed_lse, group, dim=-1)
+    gathered_lse = (
+        gathered_lse.view(torch.float32)
+        .reshape(tokens, degree, gathered_heads)
+        .permute(1, 0, 2)
+    )
     weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
     if keep_all_heads:
         # Every head's partial is weighted; the sum over owners is the full

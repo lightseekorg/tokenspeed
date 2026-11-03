@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -139,10 +140,9 @@ public:
             }
         }
         if (plan.suffix_start < 0) {
-            table.blocks_.reserve(table.blocks_.size() + block_refs.size());
-            for (CacheBlockRef& block_ref : block_refs) {
-                table.blocks_.push_back(std::move(block_ref));
-            }
+            // Insert the batch together so allocation failure cannot leave a partial append.
+            table.blocks_.insert(table.blocks_.end(), std::make_move_iterator(block_refs.begin()),
+                                 std::make_move_iterator(block_refs.end()));
         } else {
             _assert(table.NumBlocks() <= plan.suffix_start, "sparse suffix overlaps the existing block table");
             _assert(plan.suffix_start + plan.num_blocks <= plan.table_blocks_after,
