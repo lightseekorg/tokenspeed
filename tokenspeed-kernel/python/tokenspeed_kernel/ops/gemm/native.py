@@ -28,6 +28,7 @@ from tokenspeed_kernel.signature import (
     dense_tensor_format,
     format_signature,
     format_signatures,
+    tensor_format,
 )
 
 # ===-----------------------------------------------------------------------===#
@@ -145,3 +146,70 @@ def torch_decode_gemv(
     if out is not None:
         return torch.mm(x, weight.t(), out=out)
     return x @ weight.t()
+
+
+# ===-----------------------------------------------------------------------===#
+# Weight-only FP8 decode GEMV: PyTorch
+# ===-----------------------------------------------------------------------===#
+
+
+# 16-bit activations against an E4M3 weight with one FP32 scale per output row.
+MV_FP8_WEIGHT_SIGNATURES = frozenset(
+    format_signature(
+        x=dense_tensor_format(x_dtype),
+        weight=tensor_format(
+            "scaled-fp8", torch.float8_e4m3fn, scale=_FP8_CHANNEL_SCALE
+        ),
+    )
+    for x_dtype in (torch.bfloat16, torch.float16)
+)
+
+
+def mv_fp8_weight_signature(x_dtype: torch.dtype):
+    """The ``mv_fp8_weight`` signature of ``x_dtype`` activations."""
+    for signature in MV_FP8_WEIGHT_SIGNATURES:
+        if signature.format_for("x").storage_dtype == x_dtype:
+            return signature
+    raise ValueError(f"no weight-only FP8 GEMV takes {x_dtype} activations")
+
+
+# Weight rows the reference upcasts at a time (64 MB of FP32 at K = 8192).
+_MV_FP8_WEIGHT_CHUNK_ROWS = 2048
+
+
+@register_kernel(
+    "gemm",
+    "mv_fp8_weight",
+    name="torch_mv_fp8_weight",
+    solution="torch",
+    signatures=MV_FP8_WEIGHT_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def torch_mv_fp8_weight(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``out = (x @ weight.T) * weight_scale`` with an E4M3 weight.
+
+    Upcasts a chunk of weight rows at a time to FP32, so any row count works
+    at the cost of reading each chunk twice; sums in FP32 and rounds once.
+
+    Args:
+        x: ``[M, K]`` 16-bit activations.
+        weight: ``[N, K]`` ``float8_e4m3fn`` weight.
+        weight_scale: FP32 scale of each weight row, ``N`` elements.
+        out: ``[M, N]`` destination in ``x``'s dtype.
+
+    Returns:
+        ``out``.
+    """
+    x32 = x.float()
+    scale = weight_scale.reshape(-1)
+    for start in range(0, weight.shape[0], _MV_FP8_WEIGHT_CHUNK_ROWS):
+        stop = min(start + _MV_FP8_WEIGHT_CHUNK_ROWS, weight.shape[0])
+        part = x32 @ weight[start:stop].float().T
+        out[:, start:stop].copy_(part * scale[start:stop])
+    return out
