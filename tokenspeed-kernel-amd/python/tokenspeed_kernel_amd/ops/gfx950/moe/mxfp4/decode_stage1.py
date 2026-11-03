@@ -32,8 +32,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _direct_mxfp4_k_loop,
-    _direct_mxfp4_load_tile,
-    _direct_mxfp4_mfma,
     _direct_mxfp4_mfma_layouts,
     _group_routes,
     _route_groups_from_ids,
@@ -119,6 +117,7 @@ def _stage1_mxfp4_direct_mfma_gluon(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    PREFETCH_TILES: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -167,45 +166,43 @@ def _stage1_mxfp4_direct_mfma_gluon(
     x_row_off = token.to(gl.int64) * stride_xm
     w_expert_off = expert.to(gl.int64) * stride_we
     s_expert_off = expert.to(gl.int64) * stride_se
-    # Keep the trip count compile-time.  With runtime ``D`` Gluon emitted one
-    # load/wait/MFMA group per K tile; the constexpr bound lets the backend
-    # overlap adjacent groups and cuts the 56-tile Kimi stage1 wait chain.
-    TOTAL_KT: gl.constexpr = gl.cdiv(K_PACKED, BLOCK_K_PACKED)
+    # The K loop's trip count is compile-time (K_PACKED). With runtime ``D``
+    # Gluon emitted one load/wait/MFMA group per K tile; the constexpr bound
+    # lets the backend overlap adjacent groups.
     acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
     if token < M and owned:
-        for kt in range(0, TOTAL_KT):
-            a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
-                kt,
-                ak,
-                bk,
-                ask,
-                bsk,
-                am,
-                asm,
-                hidden_ptr,
-                hidden_scale_ptr,
-                w1_ptr,
-                w1s_ptr,
-                x_row_off,
-                w_expert_off,
-                s_expert_off,
-                n_cols,
-                n_cols_s,
-                token,
-                stride_xk,
-                stride_xslin,
-                stride_xsnb,
-                stride_slin,
-                stride_snb,
-                N_PHYS,
-                D,
-                TWO_I,
-                K_PACKED,
-                BLOCK_K_PACKED,
-                BLOCK_K_SCALE,
-            )
-            acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
+        acc = _direct_mxfp4_k_loop(
+            acc,
+            ak,
+            bk,
+            ask,
+            bsk,
+            am,
+            asm,
+            hidden_ptr,
+            hidden_scale_ptr,
+            w1_ptr,
+            w1s_ptr,
+            x_row_off,
+            w_expert_off,
+            s_expert_off,
+            n_cols,
+            n_cols_s,
+            token,
+            stride_xk,
+            stride_xslin,
+            stride_xsnb,
+            stride_slin,
+            stride_snb,
+            N_PHYS,
+            D,
+            TWO_I,
+            K_PACKED,
+            BLOCK_K_PACKED,
+            BLOCK_K_SCALE,
+            PREFETCH_TILES,
+        )
 
         out_tile = _direct_swiglu_reduce(
             acc,
@@ -293,6 +290,8 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
     topk: int,
     expert_start: int,
     out_scale: torch.Tensor | None,
+    *,
+    prefetch_tiles: int,
     BLOCK_N: int = 32,
     BLOCK_K: int = 128,
     M_DUP: int = 4,
@@ -366,6 +365,7 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
         SWIGLU_ALPHA=float(swiglu_alpha),
         SWIGLU_LIMIT=float(swiglu_limit),
         SWIGLU_BETA=float(swiglu_beta),
+        PREFETCH_TILES=prefetch_tiles,
         num_warps=4 if BLOCK_N == 64 else 1,
     )
     return out
