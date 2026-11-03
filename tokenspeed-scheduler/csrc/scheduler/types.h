@@ -126,9 +126,9 @@ struct SchedulerConfig {
     // unused for longer leave first. 0 ranks every entry by its own use. Unset
     // means 16 * max_batch_size; at most kMaxCheckpointRetentionRequests.
     std::optional<std::int64_t> checkpoint_retention_requests;
-    // Checkpoints within this distance of the newest on their branch rank as
-    // it does: 0 only the newest, 1 the one before it too. Below
-    // CheckpointTree::kMaxDistance.
+    // Checkpoints within this many later requests of the newest on their
+    // branch rank as it does: 0 only the newest request's, 1 the previous
+    // turn's too. Below CheckpointTree::kMaxDistance.
     std::int32_t checkpoint_retention_leaf_distance{0};
     std::int64_t CheckpointRetentionRequests() const {
         return checkpoint_retention_requests.value_or(

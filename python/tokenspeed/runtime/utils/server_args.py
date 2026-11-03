@@ -387,12 +387,12 @@ class ServerArgs:
     # the recurrent state there, where hybrid models publish a checkpoint;
     # no chunk is cut for it.
     enable_state_checkpoint_in_forward: bool = False
-    # Hybrid models: a State checkpoint with a newer checkpoint after it ranks,
-    # under cache pressure, as if last used this many new requests ago. None
+    # Hybrid models: a State checkpoint a later request's checkpoint extends
+    # ranks, under cache pressure, as if last used this many new requests ago. None
     # is the scheduler's default, 16 times the per-rank batch size.
     checkpoint_retention_requests: int | None = None
-    # Checkpoints within this many of the newest on their branch rank as it
-    # does. None is the scheduler's default, 0.
+    # Checkpoints within this many later requests of the newest on their
+    # branch rank as it does. None is the scheduler's default, 0.
     checkpoint_retention_leaf_distance: int | None = None
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
@@ -2714,11 +2714,12 @@ class ServerArgs:
             dest="checkpoint_retention_requests",
             default=ServerArgs.checkpoint_retention_requests,
             help="Hybrid (recurrent-state) models: under cache pressure, a State "
-            "checkpoint with a newer checkpoint after it is evicted before cache "
-            "entries used within this many new requests on its attention-DP "
-            "rank, while entries unused for longer are evicted first. 0 evicts "
-            "every entry by its own last use (plain LRU). Set it to about 16 "
-            "times the expected concurrent requests per attention-DP rank. "
+            "checkpoint that a later request's checkpoint extends is evicted "
+            "before cache entries used within this many new requests on its "
+            "attention-DP rank, while entries unused for longer are evicted "
+            "first. 0 evicts every entry by its own last use (plain LRU). Set "
+            "it to about 16 times the expected concurrent requests per "
+            "attention-DP rank. "
             "Default: 16 times --max-num-seqs per attention-DP rank. See "
             "docs/design/cache-concepts.md.",
         )
@@ -2728,9 +2729,10 @@ class ServerArgs:
             dest="checkpoint_retention_leaf_distance",
             default=ServerArgs.checkpoint_retention_leaf_distance,
             help="Hybrid (recurrent-state) models: State checkpoints within this "
-            "many checkpoints of the newest on their branch rank as the newest "
+            "many later requests of the newest on their branch rank as the newest "
             "does under --checkpoint-retention-requests. 0 protects only the "
-            "newest; 1 also the one before it. From 0 to 4. Default: 0.",
+            "newest request's checkpoints; 1 also the previous turn's. From 0 "
+            "to 4. Default: 0.",
         )
 
         # KVStore

@@ -1123,7 +1123,7 @@ private:
     // is bringing (a gap).
     void syncTreeNode(const ContentHash& hash);
     // The checkpoint tree follows the State entries each tier holds.
-    void recordCheckpoints(const CompletedPages& completed);
+    void recordCheckpoints(const CompletedPages& completed, std::uint64_t access_epoch);
     void syncCheckpoint(const ContentHash& hash);
     void recordAdmission(std::uint64_t access_epoch);
     void recordResumeGap(std::uint64_t last_used_epoch);

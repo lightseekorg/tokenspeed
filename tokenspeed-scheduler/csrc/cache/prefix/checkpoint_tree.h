@@ -39,14 +39,16 @@ namespace tokenspeed {
 
 // State checkpoints ordered by token prefix, including checkpoints inside a
 // page, with each checkpoint's distance to the nearest leaf below it: the
-// newest checkpoint on that branch. Distance counts checkpoints present on
-// either tier. A checkpoint more than leaf_distance from a leaf is aged
-// (CheckpointAging); one within it ranks as a leaf does. The tree holds
-// metadata only, never a cache block.
+// newest checkpoint on that branch. Distance counts the later requests that
+// published checkpoints present on either tier: the checkpoints one request
+// publishes (in-forward, prompt end, end state) are no step apart. A
+// checkpoint more than leaf_distance from a leaf is aged (CheckpointAging);
+// one within it ranks as a leaf does. The tree holds metadata only, never a
+// cache block.
 class CheckpointTree {
 public:
-    // Distances from here on rank alike, which bounds every update to this
-    // many present ancestors.
+    // Distances from here on rank alike, which bounds every update to the
+    // checkpoints of this many earlier requests above it.
     static constexpr std::int32_t kMaxDistance = kMaxCheckpointDistance;
 
     struct Residency {
@@ -67,10 +69,11 @@ public:
     CheckpointTree& operator=(CheckpointTree&&) = default;
 
     // Records the checkpoint at the end of `tokens`, whose full pages are
-    // `prefix_hashes` and partial page `tail`. Its residency starts empty
-    // until Update. False when the checkpoint is already known.
+    // `prefix_hashes` and partial page `tail`, published by the request of
+    // `access_epoch`. Its residency starts empty until Update. False when the
+    // checkpoint is already known.
     bool Observe(std::span<const std::int32_t> tokens, std::span<const std::string> prefix_hashes,
-                 const std::optional<TailPublication>& tail) {
+                 const std::optional<TailPublication>& tail, std::uint64_t access_epoch) {
         const std::size_t full_tokens = prefix_hashes.size() * static_cast<std::size_t>(prefix_granularity_);
         _assert(
             !tokens.empty() && tokens.size() == full_tokens + static_cast<std::size_t>(tail ? tail->tail_tokens : 0),
@@ -89,6 +92,7 @@ public:
             ++full_prefix->references;
         }
         node.num_tokens = static_cast<std::int32_t>(tokens.size());
+        node.access_epoch = access_epoch;
         node.tail.assign(tokens.begin() + static_cast<std::ptrdiff_t>(full_tokens), tokens.end());
         // A shorter checkpoint published after longer ones on its path takes
         // them as children. Only an already interned prefix can have them.
@@ -118,9 +122,16 @@ public:
         if (it == nodes_.end()) {
             return;
         }
-        it->second.residency = residency;
+        Node& node = it->second;
+        const bool was_present = present(node);
+        node.residency = residency;
         if (residency.held) {
-            refresh(&it->second);
+            if (present(node) != was_present) {
+                for (Node* child : node.children) {
+                    reanchor(*child);
+                }
+            }
+            refresh(&node);
         } else {
             remove(it);
         }
@@ -193,6 +204,8 @@ private:
         const ContentHash* hash{nullptr};
         PrefixSegment* full_prefix{nullptr};
         std::int32_t num_tokens{0};
+        // The publishing request's access epoch.
+        std::uint64_t access_epoch{0};
         std::vector<std::int32_t> tail;
         Node* parent{nullptr};
         std::vector<Node*> children;
@@ -201,8 +214,10 @@ private:
         Residency residency{};
         // How many children report each value (index 0 unused).
         std::array<std::uint32_t, kMaxDistance + 2> child_values{};
-        // What the parent sees: a present checkpoint reports its distance + 1,
-        // an absent one passes on its children's smallest value, 0 for none.
+        // What the parent sees, 0 for no checkpoint: a present checkpoint
+        // reports 1 + its distance as seen from its nearest present ancestor
+        // (one step more unless that ancestor's request published it); an
+        // absent one passes on its children's smallest value.
         std::uint8_t value{0};
         std::array<std::int32_t, 2> aged_distance{};
     };
@@ -229,11 +244,26 @@ private:
     }
 
     static std::int32_t distanceOf(const Node& node) {
-        return std::min<std::int32_t>(kMaxDistance, smallestChildValue(node));
+        const std::uint8_t smallest = smallestChildValue(node);
+        return smallest == 0 ? 0 : smallest - 1;
+    }
+
+    // Whether `node` is a step from its nearest present ancestor: another
+    // request published it, or it has no such ancestor.
+    static bool stepsFromAnchor(const Node& node) {
+        const Node* anchor = node.parent;
+        while (anchor != nullptr && !present(*anchor)) {
+            anchor = anchor->parent;
+        }
+        return anchor == nullptr || anchor->access_epoch != node.access_epoch;
     }
 
     static std::uint8_t valueOf(const Node& node) {
-        return present(node) ? static_cast<std::uint8_t>(distanceOf(node) + 1) : smallestChildValue(node);
+        if (!present(node)) {
+            return smallestChildValue(node);
+        }
+        const std::int32_t seen = distanceOf(node) + (stepsFromAnchor(node) ? 1 : 0);
+        return static_cast<std::uint8_t>(std::min(kMaxDistance, seen) + 1);
     }
 
     static ContentHash prior(const Node& node) {
@@ -259,9 +289,9 @@ private:
         }
     }
 
-    // Whether a leaf lies within `hops` checkpoints below `node`, `node`
-    // itself at 0, counting the checkpoints present once `removed` ones leave
-    // `tier`.
+    // Whether a leaf lies within `hops` steps below `node`, `node` itself at
+    // 0, counting the checkpoints present once `removed` ones leave `tier`.
+    // A checkpoint `node`'s own request published is no step.
     template <typename Removed>
     static bool leafWithin(const Node& node, std::int32_t hops, std::size_t tier, const Removed& removed) {
         std::vector<const Node*> nearest;
@@ -280,8 +310,10 @@ private:
         if (nearest.empty()) {
             return true;
         }
-        return hops > 0 && std::ranges::any_of(
-                               nearest, [&](const Node* below) { return leafWithin(*below, hops - 1, tier, removed); });
+        return std::ranges::any_of(nearest, [&](const Node* below) {
+            const std::int32_t left = hops - (below->access_epoch != node.access_epoch ? 1 : 0);
+            return left >= 0 && leafWithin(*below, left, tier, removed);
+        });
     }
 
     // Recomputes a node and its ancestors until a reported value holds.
@@ -303,6 +335,17 @@ private:
             node->value = value;
             node = node->parent;
         }
+    }
+
+    // Recomputes the present checkpoints at and below `node` whose nearest
+    // present ancestor may have changed, and the absent nodes above them.
+    void reanchor(Node& node) {
+        if (!present(node)) {
+            for (Node* child : node.children) {
+                reanchor(*child);
+            }
+        }
+        refresh(&node);
     }
 
     void attach(Node& node, Node* parent) {
@@ -332,6 +375,9 @@ private:
         detach(node);
         for (Node* child : node.children) {
             attach(*child, parent);
+        }
+        for (Node* child : node.children) {
+            reanchor(*child);
         }
         node.children.clear();
         node.child_values = {};

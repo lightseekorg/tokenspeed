@@ -1067,14 +1067,16 @@ Its responsibilities:
   Retention (`ExpiredBlocksAt`/`ReclaimExpired`) still slides their
   request-private pages out.
 * **Checkpoint retention.** A request resumes from the newest checkpoint on
-  its path, so a State checkpoint with a newer one after it (not a leaf)
+  its path, so a State checkpoint a later request's checkpoint extends
   serves only a retry or a new fork. `CheckpointTree` orders the checkpoints
   every State group holds on either tier by token prefix, including
   checkpoints inside a page, and keeps each one's distance to the nearest
-  leaf below it, capped at 5 so that a publication or eviction updates at
-  most five ancestors. A checkpoint more than K =
-  `SchedulerConfig::checkpoint_retention_leaf_distance` (default 0; 1 also
-  keeps the checkpoint before the newest) from that leaf is aged. With N =
+  leaf below it. Distance counts the later requests whose checkpoints lie
+  on the way, capped at 5: the checkpoints one request publishes (its
+  in-forward checkpoint, prompt end and end state) are no step apart, so
+  they rank level until a later turn extends them. A checkpoint more than
+  K = `SchedulerConfig::checkpoint_retention_leaf_distance` (default 0; 1
+  also keeps the previous turn's checkpoints) from that leaf is aged. With N =
   `SchedulerConfig::checkpoint_retention_requests` (default 16 ×
   `--max-num-seqs` per attention-DP rank, the scheduler's `max_batch_size`; 0
   is plain LRU), an aged checkpoint used within the last N

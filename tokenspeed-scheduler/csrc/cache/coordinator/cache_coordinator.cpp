@@ -1468,7 +1468,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
     // A model without a prefix-closed group may register nothing under the
     // deepest boundary linked (a chunk end of State groups alone).
     syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
-    recordCheckpoints(completed);
+    recordCheckpoints(completed, access_epoch);
     recordPublishedTail(completed);
 }
 
@@ -2316,7 +2316,7 @@ void CacheCoordinator::MarkSupersededStateInput(const ContentHash& resumed_tail_
                        });
 }
 
-void CacheCoordinator::recordCheckpoints(const CompletedPages& completed) {
+void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::uint64_t access_epoch) {
     if (num_state_groups_ == 0 || completed.tokens.empty()) {
         return;
     }
@@ -2324,11 +2324,12 @@ void CacheCoordinator::recordCheckpoints(const CompletedPages& completed) {
     if (completed.state_checkpoint_pages > 0) {
         const auto pages = static_cast<std::size_t>(completed.state_checkpoint_pages);
         if (checkpoints_.Observe(completed.tokens.first(pages * static_cast<std::size_t>(prefix_granularity_)),
-                                 completed.prefix_hashes.first(pages), std::nullopt)) {
+                                 completed.prefix_hashes.first(pages), std::nullopt, access_epoch)) {
             syncCheckpoint(completed.prefix_hashes[pages - 1]);
         }
     }
-    if (completed.publish_state && checkpoints_.Observe(completed.tokens, completed.prefix_hashes, completed.tail)) {
+    if (completed.publish_state &&
+        checkpoints_.Observe(completed.tokens, completed.prefix_hashes, completed.tail, access_epoch)) {
         syncCheckpoint(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
     }
 }

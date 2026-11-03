@@ -1184,7 +1184,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         // A model without a prefix-closed group may register nothing under
         // the deepest boundary linked (a chunk end of State groups alone).
         syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
-        recordCheckpoints(completed);
+        recordCheckpoints(completed, access_epoch);
         recordPublishedTail(completed);
     }
     for (const auto& [group_id, location, reason, segment] : prospective_victims) {

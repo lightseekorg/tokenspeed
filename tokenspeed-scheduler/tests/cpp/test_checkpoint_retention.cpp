@@ -83,9 +83,17 @@ constexpr CheckpointTree::Residency kOnBoth{.complete = {true, true}, .held = tr
 constexpr CheckpointTree::Residency kIncomplete{.held = true};
 constexpr CheckpointTree::Residency kGone{};
 
-void Record(CheckpointTree& tree, const Checkpoint& point, CheckpointTree::Residency residency) {
-    tree.Observe(point.tokens, point.hashes, point.tail);
+// Publishes `point` from the request of `access_epoch`.
+void RecordFor(CheckpointTree& tree, const Checkpoint& point, CheckpointTree::Residency residency,
+               std::uint64_t access_epoch) {
+    tree.Observe(point.tokens, point.hashes, point.tail, access_epoch);
     tree.Update(point.Hash(), residency);
+}
+
+// Publishes `point` from a new request.
+void Record(CheckpointTree& tree, const Checkpoint& point, CheckpointTree::Residency residency) {
+    static std::uint64_t last_epoch = 0;
+    RecordFor(tree, point, residency, ++last_epoch);
 }
 
 TEST(CheckpointTree, DistanceCountsCheckpointsToTheNearestLeaf) {
@@ -216,6 +224,71 @@ TEST(CheckpointTree, LeafDistanceRanksNearbyCheckpointsAsLeaves) {
     const auto d_taken = [&](const ContentHash& hash) { return hash == d.Hash(); };
     EXPECT_FALSE(tree.StaysAged(b.Hash(), CacheTier::kDevice, d_taken));
     EXPECT_TRUE(tree.StaysAged(a.Hash(), CacheTier::kDevice, d_taken));
+}
+
+// One turn publishes an in-forward checkpoint, its prompt end and its end
+// state; the next turn extends the end state.
+TEST(CheckpointTree, OneRequestsCheckpointsAreNoStepApart) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
+    const Checkpoint in_forward{Sequence(8)}, prompt_end{Sequence(10)}, end_state{Sequence(14)};
+    for (const Checkpoint* point : {&in_forward, &prompt_end, &end_state}) RecordFor(tree, *point, kOnDevice, 1);
+    for (const Checkpoint* point : {&in_forward, &prompt_end, &end_state}) {
+        EXPECT_EQ(tree.Distance(point->Hash()), 0);
+        EXPECT_EQ(tree.AgedDistance(point->Hash(), CacheTier::kDevice), 0);
+    }
+    const Checkpoint next_prompt_end{Sequence(18)}, next_end_state{Sequence(22)};
+    RecordFor(tree, next_prompt_end, kOnDevice, 2);
+    RecordFor(tree, next_end_state, kOnDevice, 2);
+    for (const Checkpoint* point : {&in_forward, &prompt_end, &end_state}) {
+        EXPECT_EQ(tree.AgedDistance(point->Hash(), CacheTier::kDevice), 1);
+    }
+    EXPECT_EQ(tree.Distance(next_prompt_end.Hash()), 0);
+}
+
+// An aligned in-forward checkpoint on the Host, below the same request's
+// prompt end on the Device, keeps its rank on the Host.
+TEST(CheckpointTree, AHostCheckpointBelowItsOwnRequestsDeviceCheckpointKeepsItsRank) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
+    const Checkpoint in_forward{Sequence(8)}, prompt_end{Sequence(16)};
+    RecordFor(tree, in_forward, kOnHost, 1);
+    RecordFor(tree, prompt_end, kOnDevice, 1);
+    EXPECT_EQ(tree.AgedDistance(in_forward.Hash(), CacheTier::kHost), 0);
+}
+
+// A checkpoint compares its request with the nearest present checkpoint
+// above it, which changes as checkpoints between them come and go.
+TEST(CheckpointTree, ACheckpointBetweenTwoOfOneRequestsSplitsThem) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
+    const Checkpoint first{Sequence(4)}, between{Sequence(8)}, last{Sequence(12)};
+    RecordFor(tree, first, kOnDevice, 1);
+    RecordFor(tree, last, kOnDevice, 1);
+    EXPECT_EQ(tree.Distance(first.Hash()), 0);
+    RecordFor(tree, between, kIncomplete, 2);
+    EXPECT_EQ(tree.Distance(first.Hash()), 0);
+    tree.Update(between.Hash(), kOnDevice);
+    EXPECT_EQ(tree.Distance(between.Hash()), 1);
+    EXPECT_EQ(tree.Distance(first.Hash()), 2);
+    tree.Update(between.Hash(), kIncomplete);
+    EXPECT_EQ(tree.Distance(first.Hash()), 0);
+    tree.Update(between.Hash(), kOnDevice);
+    tree.Update(between.Hash(), kGone);
+    EXPECT_EQ(tree.Distance(first.Hash()), 0);
+    EXPECT_EQ(tree.AgedDistance(first.Hash(), CacheTier::kDevice), 0);
+}
+
+TEST(CheckpointTree, StaysAgedCountsRequestsNotCheckpoints) {
+    CheckpointTree tree{kPage, /*leaf_distance=*/0};
+    const Checkpoint a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
+    RecordFor(tree, a, kOnDevice, 1);
+    RecordFor(tree, b, kOnDevice, 1);
+    RecordFor(tree, c, kOnDevice, 2);
+    EXPECT_EQ(tree.AgedDistance(a.Hash(), CacheTier::kDevice), 1);
+    const auto b_taken = [&](const ContentHash& hash) { return hash == b.Hash(); };
+    const auto c_taken = [&](const ContentHash& hash) { return hash == c.Hash(); };
+    // Without C, A and B are the newest request's: neither stays aged.
+    EXPECT_FALSE(tree.StaysAged(a.Hash(), CacheTier::kDevice, c_taken));
+    // Without B, C is still a later request than A.
+    EXPECT_TRUE(tree.StaysAged(a.Hash(), CacheTier::kDevice, b_taken));
 }
 
 TEST(CheckpointTree, LeavingCheckpointsReleaseSharedPrefixPages) {

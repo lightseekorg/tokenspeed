@@ -2456,16 +2456,13 @@ TEST_F(StateCheckpointFusedHostSuite, TheFusedRoleMarksTheInputAheadOfBothTailsO
 }
 
 // As above, with the reply rendered anew, under write-through and the default
-// checkpoint retention. h resumes at s1's prompt end at 22, which then has two
-// branches -- s1's end state at 23 and h's turn -- and keeps its own rank as a
-// junction, while h's prompt end at 28, which h's end state at 29 extends, is
-// no leaf. Storing h's end state, the Host drops h's prompt end; f1's first
-// chunk takes the input as h's reclaim and then the Device's copy of h's
-// prompt end, ahead of s1's older end state. h's next turn resumes at 29 and a
-// prompt that continues s1's end state at 23, both on the Device; a prompt
-// that leaves h's turn at its prompt end resumes at the junction, loading it
-// from the Host.
-TEST_F(StateCheckpointFusedHostSuite, ATurnsPromptEndLeavesBeforeAnOlderEndState) {
+// checkpoint retention. h's prompt end at 28 and its end state at 29 are one
+// request's, so neither ages the other: f1's first chunk takes the input as
+// h's reclaim and then s1's end state at 23, the least recently used, as plain
+// LRU does. h's next turn resumes at 29 and a prompt that leaves h's turn at
+// its prompt end at 28, both on the Device; a prompt that continues s1's end
+// state resumes at s1's prompt end at 22, loading it from the Host.
+TEST_F(StateCheckpointFusedHostSuite, ATurnsPromptEndRanksLevelWithItsEndState) {
     device_pages_ = 20;
     write_policy_ = SchedulerConfig::HostWritePolicy::kWriteThrough;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
@@ -2487,11 +2484,11 @@ TEST_F(StateCheckpointFusedHostSuite, ATurnsPromptEndLeavesBeforeAnOlderEndState
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     const ExecutionPlan plan = PlanOnce();
     ASSERT_NE(FindForwardBatch(plan), nullptr);
-    // The input's tail block and three checkpoints, then h's page-aligned
-    // prompt end's three checkpoints.
+    // Each tail leaves with its KV block and three checkpoints: the input as
+    // h's reclaim, s1's end state as an admission victim.
     const HostCacheStats stats = scheduler_->GetHostCacheStats();
     EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, 4u);
-    EXPECT_EQ(stats.device_evictions.admission.blocks, 3u);
+    EXPECT_EQ(stats.device_evictions.admission.blocks, 4u);
     AckWriteBacks(plan);
     SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
@@ -2506,13 +2503,13 @@ TEST_F(StateCheckpointFusedHostSuite, ATurnsPromptEndLeavesBeforeAnOlderEndState
     other.push_back(900);
     other.push_back(77);
     const Resume left = Probe("other", other);
-    EXPECT_EQ(left.prefix_tokens, 23);
-    EXPECT_EQ(left.load_rows, 0);
+    EXPECT_EQ(left.prefix_tokens, 22);
+    EXPECT_EQ(left.load_rows, 4) << "the tail block and three checkpoints";
     std::vector<std::int32_t> branch = h;
     branch.push_back(555);
     const Resume branched = Probe("branch", branch);
-    EXPECT_EQ(branched.prefix_tokens, 22);
-    EXPECT_EQ(branched.load_rows, 4) << "the tail block and three checkpoints";
+    EXPECT_EQ(branched.prefix_tokens, 28);
+    EXPECT_EQ(branched.load_rows, 0);
 }
 
 // Only an admission's eviction counts a superseded input as the reclaim of
