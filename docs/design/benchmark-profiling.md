@@ -353,6 +353,10 @@ Visible labels are short (`gemm.mm`, `L7`). A process-local monotonic numeric
 NVTX payload joins each range to its full metadata identity, including repeated
 calls and iterations. Process and thread IDs prevent cross-rank joins. The C
 bridge records ordinary NVTX ranges; it does not submit invented timestamps.
+Wrappers supply the display name separately from the serialized identity; the
+collector does not parse identity strings to decide what to show. Offline analysis
+reads the projection CSV and this process/thread's native ranges separately,
+then joins payload IDs to Nsight range IDs before calculating metrics.
 
 At context exit, the collector evaluates costs and writes the sidecar with
 `device_analysis.timing_kind="pending_nsight"`. It synchronizes only when explicit

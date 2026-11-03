@@ -101,15 +101,15 @@ class _Nvtx:
         self.handle = None
 
 
-@dataclass
-class _Pending:
+@dataclass(frozen=True)
+class _RecordedScope:
     trace_label: str
     nvtx_label: str
     nvtx_id: int
 
 
 @dataclass
-class _PendingValues:
+class _IntegerSnapshot:
     target: dict[str, tuple[int, ...] | None]
     name: str
     host: torch.Tensor
@@ -161,11 +161,10 @@ class NvtxTimeline:
         self.max_metadata_bytes = max_metadata_bytes
         self._nvtx: _Nvtx | None = None
         self._thread: int | None = None
-        self._pending: list[_Pending] = []
-        self._pending_values: list[_PendingValues] = []
+        self._scopes: list[_RecordedScope] = []
+        self._snapshots: list[_IntegerSnapshot] = []
         self._metadata_buffer: torch.Tensor | None = None
         self._metadata_used = 0
-        self._count = 0
         self._entered = False
         self._finished = False
 
@@ -218,27 +217,21 @@ class NvtxTimeline:
         host.copy_(source, non_blocking=True)
         source.record_stream(self.stream)
         self._metadata_used = end
-        self._pending_values.append(_PendingValues(target, name, host))
+        self._snapshots.append(_IntegerSnapshot(target, name, host))
 
     @contextmanager
-    def record_func(self, label: str) -> Iterator[None]:
+    def record_func(self, label: str, *, display_name: str) -> Iterator[None]:
         """Record one scope without synchronizing or calculating costs."""
         self._check_context()
         if self._finished or self._nvtx is None:
             raise RuntimeError("Native timeline is not collecting")
-        if self._count == self.max_scopes:
+        if len(self._scopes) >= self.max_scopes:
             raise RuntimeError("Native timeline max_scopes exhausted")
         # A native numeric payload joins to the full identity in the sidecar;
         # repeated calls need no extra text on the visible timeline.
-        display = label.split(" | ", 1)[0]
-        if " | op=" in label:
-            display = label.split(" | op=", 1)[1].split(" | ", 1)[0]
-        else:
-            display = display.replace("layer=", "L", 1)
         scope_id = next(_scope_ids)
-        self._count += 1
-        self._nvtx.push(display, scope_id)
-        self._pending.append(_Pending(label, display, scope_id))
+        self._nvtx.push(display_name, scope_id)
+        self._scopes.append(_RecordedScope(label, display_name, scope_id))
         error = None
         try:
             yield
@@ -268,15 +261,15 @@ class NvtxTimeline:
                 "Finish outside iteration windows while capture is active"
             )
         self._check_context()
-        if not self._pending:
+        if not self._scopes:
             raise RuntimeError(
                 "No op/layer scopes were recorded; native timeline is empty"
             )
-        if self._pending_values:
+        if self._snapshots:
             self.stream.synchronize()
-        for pending in self._pending_values:
-            pending.target[pending.name] = tuple(pending.host.tolist())
-        self._pending_values.clear()
+        for snapshot in self._snapshots:
+            snapshot.target[snapshot.name] = tuple(snapshot.host.tolist())
+        self._snapshots.clear()
         report = self.session.report(costs=self.costs)
         report["hardware"] = asdict(self.hardware)
         report["device_analysis"] = {
@@ -287,7 +280,7 @@ class NvtxTimeline:
             "device_name": torch.cuda.get_device_name(self.stream.device),
             "stream": self.stream.cuda_stream,
             "metadata_snapshot_bytes": self._metadata_used,
-            "scopes": [asdict(pending) for pending in self._pending],
+            "scopes": [asdict(scope) for scope in self._scopes],
         }
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
@@ -302,7 +295,7 @@ class NvtxTimeline:
             exc.add_note(f"Native timeline finalization failed: {error}")
         finally:
             self.session._timeline = None
-            self._pending_values.clear()
+            self._snapshots.clear()
             self._metadata_buffer = None
             if self._nvtx is not None:
                 self._nvtx.close()

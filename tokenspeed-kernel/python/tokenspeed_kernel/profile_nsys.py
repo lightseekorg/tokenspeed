@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cost and timing aggregation shared by metadata export and NVTX labels."""
+"""Join recorded op costs to GPU timestamps exported by Nsight Systems."""
 
 from __future__ import annotations
 
@@ -38,6 +38,60 @@ from tokenspeed_kernel.profile_utilization import (
 )
 
 
+def _read_projection(path: Path) -> dict[int, dict[str, str]]:
+    """Index the official projection CSV by its Nsight range ID."""
+    projected = {}
+    with path.open(newline="") as source:
+        for row in csv.DictReader(source):
+            range_id = int(row["RangeId"])
+            if range_id in projected:
+                raise ValueError("Duplicate Nsight projection range")
+            projected[range_id] = row
+    return projected
+
+
+def _read_nvtx_ranges(
+    database: Path,
+    *,
+    capture: dict[str, Any],
+    scope_ids: set[int | str],
+    identity_field: str,
+) -> dict[int | str, sqlite3.Row]:
+    """Read this session's ranges, excluding other processes and threads."""
+    ranges = {}
+    labels = {scope["nvtx_label"] for scope in capture["scopes"]}
+    process_id = capture.get("process_id")
+    with sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True) as db:
+        db.row_factory = sqlite3.Row
+        # Nsight packs PID/TID into 24-bit fields within globalTid.
+        for row in db.execute(
+            """
+            SELECT n.rowid AS range_id, n.start, n.end, n.globalTid, n.endGlobalTid,
+                   ((n.globalTid >> 24) & 0xFFFFFF) AS pid,
+                   COALESCE(s.value, n.text) AS nvtx_label,
+                   n.uint64Value AS nvtx_id
+            FROM NVTX_EVENTS n LEFT JOIN StringIds s ON n.textId = s.id
+            WHERE (n.globalTid & 0xFFFFFF) = ?
+              AND (? IS NULL OR ((n.globalTid >> 24) & 0xFFFFFF) = ?)
+            """,
+            (capture["thread_id"], process_id, process_id),
+        ):
+            scope_id = row[identity_field]
+            if scope_id not in scope_ids or row["nvtx_label"] not in labels:
+                continue
+            label = row["nvtx_label"]
+            if scope_id in ranges:
+                raise ValueError(f"Ambiguous NVTX range for {label}")
+            if (
+                row["end"] is None
+                or row["end"] < row["start"]
+                or row["endGlobalTid"] not in (None, row["globalTid"])
+            ):
+                raise ValueError(f"Incomplete or cross-thread NVTX range for {label}")
+            ranges[scope_id] = row
+    return ranges
+
+
 def analyze_nsight(
     report: dict[str, Any], *, database: Path, projection: Path
 ) -> dict[str, Any]:
@@ -50,58 +104,32 @@ def analyze_nsight(
     No Event, CPU duration or previously calculated metric is a fallback.
     """
     capture = report["device_analysis"]
-    scopes = {scope["trace_label"]: scope for scope in capture["scopes"]}
-    if len(scopes) != len(capture["scopes"]):
+    recorded = capture["scopes"]
+    if len({scope["trace_label"] for scope in recorded}) != len(recorded):
         raise ValueError("Duplicate metadata scope identity")
-    labels = {scope["nvtx_label"] for scope in scopes.values()}
-    use_payload = all("nvtx_id" in scope for scope in scopes.values())
-    identities = {
-        scope["nvtx_id"] if use_payload else scope["nvtx_label"]
-        for scope in scopes.values()
-    }
-    if len(identities) != len(scopes):
+    # New captures carry payload IDs; historical captures used unique labels.
+    identity_field = (
+        "nvtx_id" if all("nvtx_id" in scope for scope in recorded) else "nvtx_label"
+    )
+    scopes = {scope[identity_field]: scope for scope in recorded}
+    if len(scopes) != len(recorded):
         raise ValueError("NVTX identities must uniquely identify calls in this session")
-    with projection.open(newline="") as source:
-        projected = {}
-        for row in csv.DictReader(source):
-            identity = int(row["RangeId"])
-            if identity in projected:
-                raise ValueError("Duplicate Nsight projection range")
-            projected[identity] = row
-    ranges = {}
-    with sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True) as db:
-        for identity, start, end, tid, end_tid, label, payload in db.execute(
-            "SELECT n.rowid,n.start,n.end,n.globalTid,n.endGlobalTid,"
-            "COALESCE(s.value,n.text),n.uint64Value FROM NVTX_EVENTS n "
-            "LEFT JOIN StringIds s ON n.textId=s.id"
-        ):
-            if label not in labels or tid is None:
-                continue
-            key = payload if use_payload else label
-            if key not in identities:
-                continue
-            pid = (tid >> 24) & 0xFFFFFF
-            if tid & 0xFFFFFF != capture["thread_id"]:
-                continue
-            if capture.get("process_id") is not None and pid != capture["process_id"]:
-                continue
-            if key in ranges:
-                raise ValueError(f"Ambiguous NVTX range for {label}")
-            if end is None or end < start or end_tid not in (None, tid):
-                raise ValueError(f"Incomplete or cross-thread NVTX range for {label}")
-            ranges[key] = (identity, start, end, pid, label)
+    projected = _read_projection(projection)
+    ranges = _read_nvtx_ranges(
+        database, capture=capture, scope_ids=set(scopes), identity_field=identity_field
+    )
     timings = []
     evidence = {}
     ops = {op["trace_label"]: op for op in report["ops"]}
-    for trace_label, scope in scopes.items():
-        label = scope["nvtx_label"]
-        key = scope["nvtx_id"] if use_payload else label
-        if key not in ranges:
+    for scope_id, scope in scopes.items():
+        trace_label, label = scope["trace_label"], scope["nvtx_label"]
+        if scope_id not in ranges:
             raise ValueError(f"NVTX range missing from Nsight capture: {label}")
-        identity, start, end, pid, native_label = ranges[key]
-        if native_label != label:
+        native = ranges[scope_id]
+        if native["nvtx_label"] != label:
             raise ValueError("NVTX payload identity has an unexpected label")
-        gpu = projected.get(identity)
+        start, end = native["start"], native["end"]
+        gpu = projected.get(native["range_id"])
         duration = 0
         gpu_start = None
         count = 0
@@ -110,7 +138,7 @@ def analyze_nsight(
             if (
                 int(gpu["Orig Start (ns)"]) != start
                 or int(gpu["Orig Duration (ns)"]) != end - start
-                or int(gpu["PID"]) != pid
+                or int(gpu["PID"]) != native["pid"]
                 or int(gpu["TID"]) != capture["thread_id"]
                 or gpu["Name"].split(":", 1)[-1] != label
             ):
@@ -133,7 +161,7 @@ def analyze_nsight(
         timings.append(ScopeTiming(trace_label, start, end, duration, reason))
         evidence[trace_label] = {
             "native_nvtx_label": label,
-            "nsight_range_id": identity,
+            "nsight_range_id": native["range_id"],
             "cpu_start_ns": start,
             "cpu_end_ns": end,
             "gpu_start_ns": gpu_start,

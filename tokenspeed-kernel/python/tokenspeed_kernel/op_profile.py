@@ -169,10 +169,16 @@ class ProfileSession:
         self._occurrences: dict[tuple[int, int], int] = {}
         self._timeline: NvtxTimeline | None = None
 
-    def record_func(self, label: str):
-        """Return the selected annotation scope; collector lifetime stays external."""
+    def record_func(self, label: str, *, display_name: str | None = None):
+        """Annotate an identity; native NVTX may display a shorter name.
+
+        Omitting display_name displays the full identity. Collector lifetime
+        stays external; this method does not measure GPU time.
+        """
         if self._timeline is not None:
-            return self._timeline.record_func(label)
+            return self._timeline.record_func(
+                label, display_name=label if display_name is None else display_name
+            )
         if self.backend == "nvtx":
             return torch.cuda.nvtx.range(label)
         if self.backend == "torch":
@@ -300,7 +306,7 @@ def profiled(*, level: str) -> Callable:
             start = time.perf_counter_ns()
             error = None
             try:
-                with session.record_func(label):
+                with session.record_func(label, display_name=f"L{layer_id}"):
                     return fn(*args, **kwargs)
             except BaseException as exc:
                 error = type(exc).__name__
@@ -427,7 +433,7 @@ def wrap_op_for_profiling(
         )
         token = _recording_op.set(scalar_args)
         try:
-            with session.record_func(label):
+            with session.record_func(label, display_name=op_name):
                 result = fn(*args, **kwargs)
         except BaseException as exc:
             error = type(exc).__name__

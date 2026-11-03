@@ -1272,6 +1272,11 @@ def test_nsight_timestamps_are_the_only_gpu_denominator(
             "INSERT INTO NVTX_EVENTS VALUES(1,2,?,NULL,'gemm.mm',NULL,1)",
             ((18 << 24) | 23,),
         )
+        # Other annotations may reuse the numeric payload on our own thread.
+        db.execute(
+            "INSERT INTO NVTX_EVENTS VALUES(1,2,?,NULL,'unrelated',NULL,1)",
+            ((17 << 24) | 23,),
+        )
     with projection.open("w", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=list(rows[0]))
         writer.writeheader()

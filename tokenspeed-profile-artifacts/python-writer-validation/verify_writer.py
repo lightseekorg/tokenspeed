@@ -18,28 +18,87 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Isolated experiment using the installed official Python Writer API."""
+"""Compare Writer scopes and experimental PID/TID schemas against a real capture.
 
+Native scope probes use a version-specific Python metadata adapter for the
+PID/TID types declared in nvToolsExtPayload.h. They are diagnostics, not a
+supported replacement for the active-capture NVTX bridge.
+"""
+
+import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+from enum import Enum
 from pathlib import Path
 
+import numpy as np
 import nvtx
 
-root = Path(__file__).resolve().parent
-nsys = Path(sys.argv[1]).resolve()
+
+class NativeScopeType(Enum):
+    # Official NVTX C schema types missing from Python PayloadEntryType 0.2.16.
+    PID_UINT32 = 71
+    TID_UINT32 = 73
+    TID_UINT64 = 74
+
+
+def native_dtype(mode):
+    if importlib.metadata.version("nvtx") != "0.2.16":
+        raise RuntimeError("The experimental metadata adapter requires nvtx 0.2.16")
+    from nvtx._metadata import NVTX_DTYPE_METADATA_KEY_NAME, _PayloadMetadata
+
+    def scope_dtype(storage, entry_type):
+        return np.dtype(
+            storage,
+            metadata={
+                NVTX_DTYPE_METADATA_KEY_NAME: _PayloadMetadata(entry_type=entry_type)
+            },
+        )
+
+    fields = [
+        ("start", nvtx.numpy_dtype("i8", entry_kind=nvtx.EntryKind.RANGE_BEGIN)),
+        ("end", nvtx.numpy_dtype("i8", entry_kind=nvtx.EntryKind.RANGE_END)),
+    ]
+    if mode == "native_pid_tid32":
+        fields += [
+            ("pid", scope_dtype("u4", NativeScopeType.PID_UINT32)),
+            ("tid", scope_dtype("u4", NativeScopeType.TID_UINT32)),
+        ]
+    else:
+        fields.append(("tid", scope_dtype("u8", NativeScopeType.TID_UINT64)))
+    fields.append(
+        ("message", nvtx.numpy_dtype("U512", entry_kind=nvtx.EntryKind.MESSAGE))
+    )
+    return np.dtype(fields)
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--nsys", type=Path, required=True)
+parser.add_argument("--source-report", type=Path, required=True)
+parser.add_argument("--output-dir", type=Path, required=True)
+parser.add_argument(
+    "--modes",
+    nargs="+",
+    choices=("default_scope", "custom_scope", "native_pid_tid32", "native_tid64"),
+    required=True,
+)
+args = parser.parse_args()
+root = args.output_dir.resolve()
+root.mkdir(parents=True, exist_ok=False)
+nsys = args.nsys.resolve()
 sys.path.insert(0, str(nsys.parent / "python/packages"))
 os.environ["NSYS_WRITER_BACKEND"] = str(
     nsys.parent.parent / "host-linux-x64/libNvtxwBackend.so"
 )
 from nsys_writer import Session, TimeBase
 
-source = root.parent / "native-timeline/timeline.nsys-rep"
+source = args.source_report.resolve()
 original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
 with sqlite3.connect(f"file:{source.with_suffix('.sqlite')}?mode=ro", uri=True) as db:
     events = db.execute(
@@ -49,7 +108,7 @@ with sqlite3.connect(f"file:{source.with_suffix('.sqlite')}?mode=ro", uri=True) 
 assert len(events) == 9
 
 results = {"source_sha256": original_hash, "source_ranges": len(events)}
-for mode in ("default_scope", "custom_scope"):
+for mode in args.modes:
     output = root / mode
     if output.with_suffix(".nsys-rep").exists():
         raise FileExistsError(f"Use a fresh experiment directory: {output}")
@@ -68,13 +127,31 @@ for mode in ("default_scope", "custom_scope"):
         else:
             results["current_thread_scope_error"] = None
         scope = domain.get_scope("Derived Analysis") if mode == "custom_scope" else None
+        schema = (
+            domain.get_schema(native_dtype(mode), kind=nvtx.EventKind.RANGE_PUSHPOP)
+            if mode.startswith("native_")
+            else None
+        )
         with session.create_stream(
             "Python metrics", domain=domain, scope=scope
         ) as stream:
-            for start, end, _, label in events:
-                stream.write_pushpop(
-                    start=start, end=end, message=f"PYTHON_WRITER | {label}"
-                )
+            for start, end, global_tid, label in events:
+                message = f"PYTHON_WRITER | {label}"
+                if schema is None:
+                    stream.write_pushpop(start=start, end=end, message=message)
+                else:
+                    # Nsight exports VM, process and thread identifiers together.
+                    # Probe both OS PID/TID and the full 64-bit exported ID.
+                    ids = (
+                        ((global_tid >> 24) & 0xFFFFFF, global_tid & 0xFFFFFF)
+                        if mode == "native_pid_tid32"
+                        else (global_tid,)
+                    )
+                    if len(message) >= 512:
+                        raise ValueError(
+                            "Label exceeds the experimental schema capacity"
+                        )
+                    stream.write_event(schema, (start, end, *ids, message))
     report = output.with_suffix(".nsys-rep")
     subprocess.run(
         [
@@ -95,6 +172,9 @@ for mode in ("default_scope", "custom_scope"):
     with sqlite3.connect(
         f"file:{output.with_suffix('.sqlite')}?mode=ro", uri=True
     ) as db:
+        writer_domain = db.execute(
+            "SELECT domainId FROM NVTX_EVENTS WHERE eventType=75 AND text='PythonWriter'"
+        ).fetchone()[0]
         tables = [
             row[0]
             for row in db.execute(
@@ -111,8 +191,8 @@ for mode in ("default_scope", "custom_scope"):
                 written = [
                     dict(row)
                     for row in db.execute(
-                        f'SELECT * FROM "{table}" WHERE text LIKE ?',
-                        ("PYTHON_WRITER%",),
+                        f'SELECT * FROM "{table}" WHERE domainId=? AND end IS NOT NULL',
+                        (writer_domain,),
                     )
                 ]
                 db.row_factory = None
@@ -120,15 +200,34 @@ for mode in ("default_scope", "custom_scope"):
                     summary[table]["writer_events"] = written
         original_ranges = db.execute(
             "SELECT count(*) FROM NVTX_EVENTS WHERE text LIKE '%MFU=%' "
-            "AND text NOT LIKE 'PYTHON_WRITER%'"
+            "AND domainId!=?",
+            (writer_domain,),
         ).fetchone()[0]
+        original_tids = {
+            row[0]
+            for row in db.execute(
+                "SELECT DISTINCT globalTid FROM NVTX_EVENTS WHERE text LIKE '%MFU=%' "
+                "AND domainId!=?",
+                (writer_domain,),
+            )
+        }
     writer_events = summary["NVTX_EVENTS"]["writer_events"]
     expected = sorted((start, end, label) for start, end, _, label in events)
     actual = sorted(
-        (row["start"], row["end"], row["text"].removeprefix("PYTHON_WRITER | "))
+        (
+            row["start"],
+            row["end"],
+            (
+                row["text"].removeprefix("PYTHON_WRITER | ")
+                if row["text"] is not None
+                else None
+            ),
+        )
         for row in writer_events
     )
-    assert actual == expected
+    assert len(writer_events) == len(events) == original_ranges
+    if not mode.startswith("native_"):
+        assert actual == expected
     # Identical intervals and labels preserve the same containment relationships.
     depths = sorted(
         sum(
@@ -145,7 +244,10 @@ for mode in ("default_scope", "custom_scope"):
         "timestamps_and_labels_match": actual == expected,
         "nesting_depths": depths,
         "source_global_tids": sorted({event[2] for event in events}),
+        "merged_original_global_tids": sorted(original_tids),
         "writer_global_tids": sorted({event["globalTid"] for event in writer_events}),
+        "same_execution_threads": {event["globalTid"] for event in writer_events}
+        == original_tids,
         "projection_rows": len(projections),
         "writer_projection_rows": sum(
             "PYTHON_WRITER" in row["Name"] for row in projections
@@ -155,6 +257,11 @@ for mode in ("default_scope", "custom_scope"):
         ),
         "tables": summary,
     }
+    results[mode]["native_thread_target_met"] = (
+        results[mode]["timestamps_and_labels_match"]
+        and results[mode]["same_execution_threads"]
+        and results[mode]["writer_projection_rows"] == len(events)
+    )
 results["source_unchanged"] = (
     hashlib.sha256(source.read_bytes()).hexdigest() == original_hash
 )
