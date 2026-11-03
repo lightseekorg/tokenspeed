@@ -493,6 +493,33 @@ def test_verify_rows_match_reference_and_replay(
     _check_verify(invoke(), expected)
 
 
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("window_left", [-1, 2047], ids=["full", "window-2047"])
+def test_verify_is_deterministic_across_runs(window_left: int, fp8: bool) -> None:
+    """Repeated launches give bitwise-identical rows.
+
+    The four waves of a verify block share every K/V page they copy into LDS,
+    so a missing barrier between one wave's reads of a buffer and another
+    wave's next copy into it shows up as run-to-run differences, often too
+    small for the reference tolerance.
+    """
+    inputs = _verify_inputs(
+        [2048 + VERIFY_TOKENS + 37, 300 * PAGE_SIZE + 5, 9000, 700],
+        VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        HEAD_DIM,
+        20261103,
+    )
+    if fp8:
+        for name in ("q", "k_cache", "v_cache"):
+            inputs[name] = inputs[name].to(torch.float8_e4m3fn)
+    first = gluon_mha_decode_gfx950(**inputs, window_left=window_left)
+    for _ in range(20):
+        again = gluon_mha_decode_gfx950(**inputs, window_left=window_left)
+        assert torch.equal(again.view(torch.int16), first.view(torch.int16))
+
+
 def test_short_window_verify_compiles_once_per_request_bucket() -> None:
     """A short window's split count changes with the request count only
     between at most 4 and more requests, so one warm-up on each side covers
