@@ -1257,6 +1257,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         limits: IngressLimits {
             vocab_size: 100_000,
             eos_token_ids: Vec::new(),
+            top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
             max_model_len: 4096,
             max_req_input_len: 4000,
             enable_output_logprobs: setup.logprobs,

@@ -961,6 +961,13 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
+Admission uses the selected sampling backend's finite top-k bound. GPU
+backends retain the exclusive 128 bound. `ascend_full` accepts positive
+finite values and caps them at 4096 when populating its per-request scalar
+pool, before the int32 write. The normalized disabled sentinel (`top_k=-1`)
+keeps whole-vocabulary sampling. The captured graph reads that same pool
+for single-step sampling and chain verification.
+
 Synthetic acceptance length shares executor scheduling, logit processing,
 persistent output buffers and downstream state updates with ordinary
 verification. Only the greedy sampler supports this benchmark mode. It runs

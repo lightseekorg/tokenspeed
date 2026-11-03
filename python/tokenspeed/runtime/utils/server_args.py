@@ -3288,7 +3288,8 @@ class ServerArgs:
             "with Triton Gumbel-Max for single-step sampling. "
             "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
-            "Finite top_k values must be < 128 or -1.",
+            "ascend_full caps finite top_k at 4096; larger values use 4096. "
+            "Other backends require finite top_k < 128. -1 disables top-k.",
         )
         parser.add_argument(
             "--sampling-stream",

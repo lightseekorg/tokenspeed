@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 from tokenspeed_kernel.ops.sampling.ascend import (
     SamplingWorkspace,
@@ -42,12 +43,14 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.backends.full_base import FullSamplingBackendBase
 from tokenspeed.runtime.sampling.dp_sampling_config import slice_dp_vocab_mask
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.sampling_params import _TOP_K_DISABLED
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
@@ -63,6 +66,15 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
     _SUPPORTS_DP_VERIFY = True
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = False
+    top_k_exclusive_max = None
+    _MAX_TOP_K = 4096
+
+    def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
+        # Clamp before the int32 pool write, including values larger than
+        # int32. The disabled sentinel must retain whole-vocabulary sampling.
+        if sp.top_k != _TOP_K_DISABLED and sp.top_k > self._MAX_TOP_K:
+            sp = msgspec.structs.replace(sp, top_k=self._MAX_TOP_K)
+        super()._reset_slot(pool_idx, sp)
 
     def _create_capture_generator(
         self, config: SamplingBackendConfig
