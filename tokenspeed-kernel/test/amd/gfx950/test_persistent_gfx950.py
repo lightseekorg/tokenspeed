@@ -30,7 +30,7 @@ import time
 import pytest
 import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
-from utils import is_cdna4, polling_cycles
+from utils import is_cdna4, persistent_codegen_problems
 
 if not is_cdna4():
     pytest.skip("Persistent helpers target gfx950", allow_module_level=True)
@@ -190,10 +190,10 @@ def test_duplicate_claim_is_reported():
     values = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     seen = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     placement = torch.zeros((2, GRID), dtype=torch.int32, device="cuda")
-    # Plant this launch's tag (epoch 1) in role (xcd 3, slot 5), as a second
-    # workgroup taking that role would have left it.
+    # Plant this launch's tag (epoch 1, tag 2) in role (xcd 3, slot 5), as a
+    # second workgroup taking that role would have left it.
     claims = state.claims.view(GRID, LINE_WORDS // 2)
-    claims[3 * 32 + 5, 0] = (1 << 32) | 77
+    claims[3 * 32 + 5, 0] = (2 << 32) | 77
     _launch_rounds(state, values, seen, placement, 1)
     torch.cuda.synchronize()
     assert state.errors[0].item() == SITE_CLAIM
@@ -249,57 +249,6 @@ def _compile(fn, signature, constexprs, num_warps):
     )
 
 
-def entry_and_join_codegen_problems(assembly: str) -> list[str]:
-    """Return the ordering rules a persistent kernel's assembly breaks.
-
-    - Nothing invalidates or writes back L2.
-    - Only the epoch store precedes the claim exchange, and the claim's
-      compare-and-branch completes before any other store or atomic.
-    - Every join arrival follows a full drain and a workgroup barrier.
-    - Every poll reloads with ``sc1`` inside its loop, exits on one
-      lane-mask vote, and holds no workgroup barrier.
-    """
-    problems = []
-    if "buffer_inv" in assembly or "buffer_wbl2" in assembly:
-        problems.append("L2 invalidate or write-back")
-    lines = [
-        line
-        for line in assembly.splitlines()
-        if not line.lstrip().startswith((";", ".loc"))
-    ]
-    writes = [
-        index
-        for index, line in enumerate(lines)
-        if re.search(r"\b(global|buffer)_(store|atomic)\w*", line)
-    ]
-    swap = next(i for i in writes if "atomic_swap_x2" in lines[i])
-    if sum(1 for i in writes if i < swap) != 1:
-        problems.append("a store or atomic other than the epoch precedes the claim")
-    after = next(i for i in writes if i > swap)
-    between = "\n".join(lines[swap:after])
-    if "s_waitcnt vmcnt(0)" not in between or "s_cbranch" not in between:
-        problems.append(
-            "the claim's compare-and-branch does not precede the next store"
-        )
-    for index in writes:
-        if "global_atomic_add" in lines[index] and " sc0" in lines[index]:
-            # A returning add is a join arrival.
-            before = "\n".join(lines[max(0, index - 40) : index])
-            if "s_waitcnt vmcnt(0)" not in before or "s_barrier" not in before:
-                problems.append(f"arrival without drain and barrier: {lines[index]}")
-    for cycle in polling_cycles("\n".join(lines)):
-        if not any(re.search(r"global_load_dword .* sc1$", l) for l in cycle):
-            continue
-        text = "\n".join(cycle)
-        if re.search(r"s_barrier|\bds_|_dpp", text):
-            problems.append("workgroup barrier or LDS exchange inside a poll loop")
-        # One lane-mask vote per retry. (The deadline and abort check every
-        # 64 retries reads one lane of the abort word.)
-        if len(re.findall(r"v_cmp_ne_u32_e64 s\[\d+:\d+\], 0, v\d+", text)) != 1:
-            problems.append("poll loop without a one-instruction vote")
-    return problems
-
-
 def test_entry_and_join_codegen():
     kernel = _compile(
         _join_rounds_kernel,
@@ -316,4 +265,4 @@ def test_entry_and_join_codegen():
         {"ROUNDS": 2, "LAUNCHES": 4},
         num_warps=8,
     )
-    assert entry_and_join_codegen_problems(kernel.asm["amdgcn"]) == []
+    assert persistent_codegen_problems(kernel.asm["amdgcn"]) == []

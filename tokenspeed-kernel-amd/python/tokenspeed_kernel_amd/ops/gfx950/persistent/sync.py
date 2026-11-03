@@ -41,10 +41,8 @@ pass handlers that do not return.
 """
 
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import (
-    realtime_ticks,
-    xcc_id,
-)
+from tokenspeed_kernel_amd.ops.gfx950._xcd import xcc_id
+from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
 
 # Workgroups per launch, XCDs per GPU, and workgroups per XCD.
 GRID = 256
@@ -58,10 +56,12 @@ _SLOTS = gl.constexpr(SLOTS)
 
 # Error words (int32), local to one GPU. The first line holds the record of a
 # failure (site, logical workgroup, detail, epoch, the kernel's label such as
-# a layer index); peers set the second line to stop this GPU's waits.
+# a layer index); peers set the second line to stop this GPU's waits; the
+# caller owns the last two lines (for example, where to reach its peers).
 ERROR_RECORD = 0
 ERROR_ABORT = LINE_WORDS
-ERROR_WORDS = 2 * LINE_WORDS
+ERROR_CALLER = 2 * LINE_WORDS
+ERROR_WORDS = 4 * LINE_WORDS
 _ERROR_RECORD = gl.constexpr(ERROR_RECORD)
 _ERROR_ABORT = gl.constexpr(ERROR_ABORT)
 

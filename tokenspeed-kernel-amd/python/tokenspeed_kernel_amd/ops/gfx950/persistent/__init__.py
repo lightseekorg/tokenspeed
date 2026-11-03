@@ -27,6 +27,7 @@ boundaries. These helpers carry no model or operation knowledge.
 
 from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
     ERROR_ABORT,
+    ERROR_CALLER,
     ERROR_RECORD,
     ERROR_WORDS,
     FIRST_KERNEL_SITE,
@@ -54,11 +55,11 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import (
     REALTIME_TICK_NS,
     realtime_ticks,
     trace_stamp,
-    xcc_id,
 )
 
 __all__ = [
     "ERROR_ABORT",
+    "ERROR_CALLER",
     "ERROR_RECORD",
     "ERROR_WORDS",
     "FIRST_KERNEL_SITE",
@@ -84,5 +85,4 @@ __all__ = [
     "trap",
     "wait_vector_memory",
     "wait_word",
-    "xcc_id",
 ]

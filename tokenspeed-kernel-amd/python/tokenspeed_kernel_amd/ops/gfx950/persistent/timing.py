@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Clock, placement and stage-stamp helpers for persistent gfx950 kernels."""
+"""Clock and stage-stamp helpers for persistent gfx950 kernels."""
 
 from tokenspeed_kernel_amd._triton import gl, gluon
 
@@ -37,23 +37,6 @@ def realtime_ticks():
         "=s,~{memory}",
         [],
         gl.int64,
-        is_pure=False,
-    )
-
-
-@gluon.jit
-def xcc_id():
-    """Return the XCD (accelerator complex die) running this workgroup, 0-7.
-
-    The hardware does not dispatch workgroup i to XCD i % 8 in general: the
-    round-robin start depends on the kernels before. Callers that need the
-    XCD read it here instead of deriving it from the program id.
-    """
-    return gl.inline_asm(
-        "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)",
-        "=s,~{memory}",
-        [],
-        gl.int32,
         is_pure=False,
     )
 
