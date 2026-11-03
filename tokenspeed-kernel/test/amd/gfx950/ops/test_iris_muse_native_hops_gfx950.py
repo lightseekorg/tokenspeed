@@ -33,7 +33,18 @@ import pytest
 from asm_checks import innermost_loops, instruction_lines
 
 triton = pytest.importorskip("tokenspeed_triton")
-from tokenspeed_kernel._triton import gl, gluon  # noqa: E402
+from tokenspeed_kernel._triton import gl, gluon, tl  # noqa: E402
+from tokenspeed_kernel.ops.communication._iris.all_gather import (  # noqa: E402
+    iris_lamport_allgather_push,
+    iris_lamport_allgather_wait,
+    iris_rmsnorm_mxfp4_row,
+)
+from tokenspeed_kernel.ops.communication._iris.all_reduce import (  # noqa: E402
+    _iris_lamport_push,
+)
+from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (  # noqa: E402
+    iris_muse_moetail_push,
+)
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (  # noqa: E402
     iris_column_routes_combine,
     iris_column_routes_complete,
@@ -51,12 +62,16 @@ def _compile(fn, signature, constexprs, num_warps=8):
     for index, name in enumerate(fn.arg_names):
         kind = signature.get(name)
         if isinstance(kind, tuple):
-            attrs.update({(index, p): [["tt.divisibility", 16]] for p in range(len(kind))})
+            attrs.update(
+                {(index, p): [["tt.divisibility", 16]] for p in range(len(kind))}
+            )
         elif isinstance(kind, str) and kind.startswith("*"):
             attrs[(index,)] = [["tt.divisibility", 16]]
     signature = dict(signature)
     signature.update({name: "constexpr" for name in constexprs})
-    source = gluon._runtime.GluonASTSource(fn, signature, constexprs=constexprs, attrs=attrs)
+    source = gluon._runtime.GluonASTSource(
+        fn, signature, constexprs=constexprs, attrs=attrs
+    )
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
@@ -67,14 +82,14 @@ def _compile(fn, signature, constexprs, num_warps=8):
 @gluon.jit
 def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.constexpr):
     """H4 push of one route slice, then OWN4: complete + H5, as in the layer."""
-    layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [gl.num_warps(), 1], [1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
     lane = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
     words = lane[:, None] * 4 + word[None, :]
     partial = gl.load(routes.to(gl.pointer_type(gl.uint32), bitcast=True) + words)
-    iris_column_routes_push(
-        partial, row, 1, copy, regions, RANK, 8, 256, _STAGE, ".wt"
-    )
+    iris_column_routes_push(partial, row, 1, copy, regions, RANK, 8, 256, _STAGE, ".wt")
     iris_column_routes_complete(
         partial, copy, norm_weight, region, regions, row, RANK, 8, 256,
         _STAGE, 0.0, ".wt", False,
@@ -102,11 +117,19 @@ def test_column_route_owner_compiles_at_8_waves():
         {"RANK": 3},
     )  # fmt: skip
     lines = instruction_lines(assembly)
-    pushes = [l for l in lines if l.startswith("buffer_store") and l.endswith("sc0 sc1")]
-    assert pushes and all("dwordx4" in l or "dwordx2" in l or "dword " in l for l in pushes)
+    pushes = [
+        l for l in lines if l.startswith("buffer_store") and l.endswith("sc0 sc1")
+    ]
+    assert pushes and all(
+        "dwordx4" in l or "dwordx2" in l or "dword " in l for l in pushes
+    )
     # With the entry clear, the owner stores no empty markers (0x80000000).
     assert "0x80000000" not in assembly
-    polls = [l for l in innermost_loops(assembly) if re.search(r"buffer_load_dword\w* .*sc0 sc1", l)]
+    polls = [
+        l
+        for l in innermost_loops(assembly)
+        if re.search(r"buffer_load_dword\w* .*sc0 sc1", l)
+    ]
     assert polls, "the peer slot loads left the poll loop"
 
 
@@ -118,5 +141,79 @@ def test_column_route_finisher_compiles_at_8_waves():
         {},
     )  # fmt: skip
     assert "0x80000000" not in assembly
-    polls = [l for l in innermost_loops(assembly) if re.search(r"buffer_load_dword\w* .*sc0 sc1", l)]
+    polls = [
+        l
+        for l in innermost_loops(assembly)
+        if re.search(r"buffer_load_dword\w* .*sc0 sc1", l)
+    ]
     assert polls
+
+
+@gluon.jit
+def _xn_kernel(local_input, weight, packed, scales, region, regions, row, copy,RANK: gl.constexpr):  # fmt: skip
+    """H3 push of one row's 512 reduced columns, then XN: wait, RMSNorm, MXFP4."""
+    STAGE_WORDS: gl.constexpr = 8 * 16384 // 2
+    stages = (copy.to(gl.uint32),)
+    local_words = tl.cast(local_input, gl.pointer_type(gl.uint32)) + row * 256
+    iris_lamport_allgather_push(
+        local_words, row * 256, stages, regions, RANK, 8, 512, STAGE_WORDS, 8192, ".wt"
+    )
+    words = iris_lamport_allgather_wait(
+        region, local_words, row * 256, stages, RANK, 8, 512, 4096, STAGE_WORDS, 8192,
+        False,
+    )  # fmt: skip
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 16], [1, 64], [gl.num_warps(), 1], [1, 0]
+    )
+    columns = gl.arange(0, 1024, layout=gl.SliceLayout(0, layout))
+    norm_weights = ()
+    for rep in gl.static_range(4):
+        norm_weights += (gl.load(weight + rep * 1024 + columns).to(gl.float32),)
+    iris_rmsnorm_mxfp4_row(
+        words, row, norm_weights, packed, scales, 4096, 1e-6, 0.0, 128, 4096
+    )
+
+
+def test_h3_push_and_xn_compile_at_8_waves():
+    assembly = _compile(
+        _xn_kernel,
+        {"local_input": "*bf16", "weight": "*bf16", "packed": "*u8", "scales": "*u8",
+         "region": "*bf16", "regions": ("i64",) * 8, "row": "i32", "copy": "i32"},
+        {"RANK": 3},
+    )  # fmt: skip
+    assert "0x80000000" not in assembly
+    polls = [
+        l
+        for l in innermost_loops(assembly)
+        if re.search(r"buffer_load_dword\w* .*sc0 sc1", l)
+    ]
+    assert polls
+
+
+@gluon.jit
+def _h6_kernel(values_ptr, regions, copy, RANK: gl.constexpr):
+    """H6: one UNP sender's 16 columns of 8 rows pushed to every rank."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 16], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
+    rows = gl.arange(0, 8, layout=gl.SliceLayout(1, layout))
+    cols = gl.arange(0, 16, layout=gl.SliceLayout(0, layout))
+    values = gl.load(values_ptr + rows[:, None] * 16 + cols[None, :])
+    iris_muse_moetail_push(
+        values, copy.to(gl.uint32), 32, 5, regions, 8, _iris_lamport_push, RANK, 8,
+        1024, 32768, 8, 16, gl.num_warps(), ".wt", ".wt",
+    )  # fmt: skip
+
+
+def test_h6_push_compiles_at_8_waves():
+    assembly = _compile(
+        _h6_kernel, {"values_ptr": "*bf16", "regions": ("i64",) * 8, "copy": "i32"},
+        {"RANK": 3},
+    )  # fmt: skip
+    lines = instruction_lines(assembly)
+    pushes = [
+        l for l in lines if l.startswith("buffer_store") and l.endswith("sc0 sc1")
+    ]
+    assert len(pushes) >= 8  # 7 peers + the own copy
+    first, last = lines.index(pushes[0]), lines.index(pushes[-1])
+    assert not any("vmcnt" in l for l in lines[first:last])
