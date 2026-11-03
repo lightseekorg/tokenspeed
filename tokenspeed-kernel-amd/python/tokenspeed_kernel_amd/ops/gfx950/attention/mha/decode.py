@@ -54,6 +54,10 @@ _GFX950_SM_COUNT = 256
 # for a one-wave work-group; with more waves, each wave issues its share. The
 # loop is either this deep or single-buffered.
 _FULL_DECODE_STAGES = 4
+# Pipeline depth of the long-window sliding split decode (four-wave
+# work-groups): a split streams several pages (5 for a 2048-token window in
+# 8 splits), each a full load round trip when single-buffered.
+_SLIDING_DECODE_STAGES = 2
 # s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
 # 63 of its outstanding vector memory loads.
 _GFX950_MAX_VMCNT = 63
@@ -862,8 +866,9 @@ def _stream_split_pipelined(
             k = program.shared_load_k(k_smem.index(stage))
             qk = program.compute_qk(q, k)
             # Full attention starts at token 0; only pages reaching past the
-            # split's end or the block's first causal end need a mask.
-            if start_n + cfg.BLOCK_N > program.mask_start:
+            # split's end or the block's first causal end need a mask. A
+            # sliding window also masks keys before each row's window start.
+            if cfg.IS_SLIDING or start_n + cfg.BLOCK_N > program.mask_start:
                 qk = program.apply_kv_mask(qk, start_n)
             p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
             v = program.shared_load_v(v_smem.index(stage))
@@ -1065,6 +1070,7 @@ def _mha_decode_sliding_split_atomic(
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -1094,34 +1100,22 @@ def _mha_decode_sliding_split_atomic(
         mid_o_ptr,
         mid_lse_ptr,
     )
-    k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-    )
-    v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-    )
-
     q = program.load_q()
     m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
-    physical_page = program.load_page(program.split_start)
-
-    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
-        with gl.amd.warp_pipeline_stage("load", priority=1):
-            program.issue_load_k(physical_page, k_smem)
-            program.issue_load_v(physical_page, v_smem)
-            physical_page = program.load_page(start_n + cfg.BLOCK_N)
-
-        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
-            async_copy.wait_group(1)
-            k = program.shared_load_k(k_smem)
-            qk = program.compute_qk(q, k)
-            qk = program.apply_kv_mask(qk, start_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-        with gl.amd.warp_pipeline_stage("pv", priority=1):
-            async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem)
-            acc = program.compute_pv(p, v, acc)
+    if NUM_STAGES == 1:
+        k_smem = gl.allocate_shared_memory(
+            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+        )
+        v_smem = gl.allocate_shared_memory(
+            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+        )
+        m_i, l_i, acc = _stream_split_single_buffer(
+            program, q, m_i, l_i, acc, k_smem, v_smem
+        )
+    else:
+        m_i, l_i, acc = _stream_split_pipelined(
+            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
 
     program.store_split(acc, l_i, m_i)
     program.finalize_splits(out_ptr, sink_ptr, counters_ptr, HAS_SINK)
@@ -1354,8 +1348,12 @@ def get_config(
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=num_kv_splits,
-        num_stages=_full_decode_stages(
-            num_kv_splits, page_size, head_dim, k_cache.element_size(), num_warps
+        num_stages=(
+            _SLIDING_DECODE_STAGES
+            if is_sliding and not short_window
+            else _full_decode_stages(
+                num_kv_splits, page_size, head_dim, k_cache.element_size(), num_warps
+            )
         ),
         block_m=block_m,
         block_n=block_n,
@@ -1475,7 +1473,9 @@ def launch_gluon_mha_decode_gfx950(
             config.window_left,
             has_sink,
             is_fp8,
+            config.num_stages,
             num_warps=config.num_warps,
+            **sched_compile_options(),
         )
     else:
         # Always use split-k for full attention
