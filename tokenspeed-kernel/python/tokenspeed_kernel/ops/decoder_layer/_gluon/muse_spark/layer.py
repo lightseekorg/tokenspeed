@@ -228,6 +228,15 @@ STAMP_MOE = 5
 STAMP_TAIL = 6
 STAMP_QKV = 7
 STAMP_END = 8
+# The tail's hand-offs: OWN4, FIN and S published (last row of the
+# workgroup), UNP's S rows seen and H6 pushed, RED done, QKV x'' ready.
+STAMP_OWN4 = 9
+STAMP_FIN = 10
+STAMP_S = 11
+STAMP_UNP_S = 12
+STAMP_H6 = 13
+STAMP_RED = 14
+STAMP_QKV_X = 15
 STAMP_STRIDE = 16
 
 # The uncached exchange (int32 words): routed ids, route weights, the ids
@@ -308,6 +317,13 @@ _QKV_TASK_ROWS = gl.constexpr(QKV_TASK_ROWS)
 _HEAD_TASKS = gl.constexpr(HEAD_TASKS)
 _UNP_COLUMNS = gl.constexpr(UNP_COLUMNS)
 _STAMP_STRIDE = gl.constexpr(STAMP_STRIDE)
+_STAMP_OWN4 = gl.constexpr(STAMP_OWN4)
+_STAMP_FIN = gl.constexpr(STAMP_FIN)
+_STAMP_S = gl.constexpr(STAMP_S)
+_STAMP_UNP_S = gl.constexpr(STAMP_UNP_S)
+_STAMP_H6 = gl.constexpr(STAMP_H6)
+_STAMP_RED = gl.constexpr(STAMP_RED)
+_STAMP_QKV_X = gl.constexpr(STAMP_QKV_X)
 _PART_ROWS = gl.constexpr(PART_ROWS)
 _RECORD_WORDS = gl.constexpr(RECORD_WORDS)
 _STAMP_ENTRY = gl.constexpr(STAMP_ENTRY)
@@ -1138,8 +1154,10 @@ def _unp(
     alpha2_ptr,
     beta2_ptr,
     post2_ptr,
+    stamps_ptr,
     RANK: gl.constexpr,
     PEER_CACHE: gl.constexpr,
+    STAMPS: gl.constexpr,
 ):
     """UNP ``sender`` (0-63 of this rank, 8 per XCD): its 16 hidden columns
     of the post-expert projection, bitwise the column GEMM's, relayed across
@@ -1150,6 +1168,7 @@ def _unp(
     WAVES: gl.constexpr = gl.num_warps()
     for p in gl.static_range(_KPARTS):
         _wait_line(launch, exchange_ptr + _EX_S_TAGS + p * _MAX_ROWS, _SITE_S)
+    _stamp(stamps_ptr, launch.cta, _STAMP_UNP_S, STAMPS)
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 32], transposed=True,
         warps_per_cta=[WAVES, 1, 1],
@@ -1182,6 +1201,7 @@ def _unp(
     h6_sink(
         view, launch, b, sender * _UNP_COLUMNS, rows, 16, _UNP_COLUMNS, RANK, PEER_CACHE
     )
+    _stamp(stamps_ptr, launch.cta, _STAMP_H6, STAMPS)
     # The four norm-sum partials of these columns (h' from part RANK).
     _wait_line(launch, exchange_ptr + _EX_HP_TAGS + RANK * 16, _SITE_HPRIME)
     t = gl.minimum(gl.arange(0, 16, gl.SliceLayout(1, out_l)), rows - 1)
@@ -1758,10 +1778,11 @@ def gluon_decoder_layer_muse_spark_gfx950(
             )  # fmt: skip
         _unp(
             launch, view, sender, rows, w, s_rows, hprime, exchange, alpha2_ptr,
-            beta2_ptr, post2_bf16_ptr, RANK, PEER_CACHE,
+            beta2_ptr, post2_bf16_ptr, stamps_ptr, RANK, PEER_CACHE, STAMPS,
         )  # fmt: skip
         if slot == 16:
             red_sums(view, launch, rows, iris_fail_stop, RANK, PEER_CACHE)
+            _stamp(stamps_ptr, launch.cta, _STAMP_RED, STAMPS)
         if NEXT_KIND != 2:
             # The rest once the relay's weights are dead and UNP's (and the
             # reducer's) pushes and polls are issued: loads complete in issue
@@ -1785,12 +1806,15 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 view, launch, token * _TOPK + xcd, route_norm_ptr, iris_fail_stop,
                 RANK, ROUTE_OFFSET, PEER_CACHE,
             )  # fmt: skip
+            _stamp(stamps_ptr, launch.cta, _STAMP_OWN4, STAMPS)
             s = fin(
                 view, launch, token, xcd,
                 (exchange + _EX_WEIGHTS).to(gl.pointer_type(gl.float32), bitcast=True),
                 route_norm_ptr, iris_fail_stop, ROUTE_EPS, ROUTE_OFFSET,
             )  # fmt: skip
+            _stamp(stamps_ptr, launch.cta, _STAMP_FIN, STAMPS)
             _publish_s(launch, s, token, xcd, rows, s_rows, exchange)
+            _stamp(stamps_ptr, launch.cta, _STAMP_S, STAMPS)
     else:
         if NEXT_KIND != 2:
             # The other workgroups stream their task while the tail's
@@ -1808,6 +1832,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
             post2_bf16_ptr, pre2_bf16_ptr, residual_ptr, group == 0, POST2_EPS,
             PRE2_EPS,
         )  # fmt: skip
+        _stamp(stamps_ptr, launch.cta, _STAMP_QKV_X, STAMPS)
         gemv_a16w16_splitk_finish_steps_gfx950(
             qkv_tiles, _x_step_bf16, qkv_x, qkv_parts, launch.tag, task, _PART_ROWS,
             _QKV_WIDTH, _QKV_TASK_ROWS, _QKV_GROUPS, ".wt",
