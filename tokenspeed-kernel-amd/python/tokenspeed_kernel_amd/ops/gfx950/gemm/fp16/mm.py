@@ -1921,8 +1921,16 @@ def launch_gluon_mm_a16w16_column_shard_gfx950(
     """
     M, K = A.shape
     shard_n = B.shape[0]
-    assert A.is_contiguous() and B.is_contiguous() and B.shape[1] == K
-    assert out.shape == (M, shard_n) and out.dtype == A.dtype and out.stride(1) == 1
+    if not A.is_contiguous() or not B.is_contiguous() or B.shape[1] != K:
+        raise ValueError(
+            f"column-shard GEMM needs contiguous A [M, K] and B [shard_n, K], got "
+            f"{tuple(A.shape)=} {tuple(B.shape)=}"
+        )
+    if out.shape != (M, shard_n) or out.dtype != A.dtype or out.stride(1) != 1:
+        raise ValueError(
+            f"column-shard GEMM needs a unit-stride [{M}, {shard_n}] {A.dtype} out, "
+            f"got {tuple(out.shape)} {out.dtype} stride {out.stride()}"
+        )
     gluon_mm_a16w16_medium_gfx950[(triton.cdiv(M, 16) * triton.cdiv(shard_n, 16),)](
         A,
         B,

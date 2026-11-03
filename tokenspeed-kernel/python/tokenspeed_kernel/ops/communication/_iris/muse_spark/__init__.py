@@ -1314,8 +1314,9 @@ class MuseIrisState:
     ) -> tuple[int, int] | None:
         """Return the senders' geometry if the fused tail applies, else None.
 
-        The geometry is the column GEMV's (BLOCK_K, WAVES_PER_OUTPUT), or (0, 0)
-        when a column-shard decode GEMM projects the rows first.
+        The geometry is the column GEMV's (BLOCK_K, WAVES_PER_OUTPUT); above
+        ``_MUSE_MOETAIL_MAX_ROWS`` rows a column-shard decode GEMM projects the
+        rows instead and the geometry is unused.
         """
         reduction = self.reduction
         # TP4 takes one row: more rows were not measured there.
@@ -1428,7 +1429,7 @@ class MuseIrisState:
             else None
         )
         local_weight = weight[rank * local_width : (rank + 1) * local_width]
-        if waves == 0:
+        if rows > _MUSE_MOETAIL_MAX_ROWS:
             columns = torch.empty(
                 rows, local_width, dtype=torch.bfloat16, device=x.device
             )

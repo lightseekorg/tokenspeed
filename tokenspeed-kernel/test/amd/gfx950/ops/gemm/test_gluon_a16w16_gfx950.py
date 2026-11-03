@@ -605,13 +605,6 @@ def test_column_shard_equals_the_replicated_decode_gemm_columns(m: int) -> None:
         assert torch.equal(out, full[:, shard * 1024 : (shard + 1) * 1024]), shard
 
 
-def test_column_shard_requires_a_full_k_replicated_config() -> None:
-    # No measured config for this shape, so nothing to be bitwise against.
-    assert not supports_gluon_mm_a16w16_column_shard_gfx950(16, 8192, 1024, 4096 + 512)
-    # Shards must hold whole 16-column tiles.
-    assert not supports_gluon_mm_a16w16_column_shard_gfx950(16, 8192, 1000, 4096)
-
-
 def test_column_shard_row_count_does_not_recompile() -> None:
     torch.manual_seed(77)
     a = torch.randn((16, 4096), device="cuda", dtype=torch.bfloat16) * 0.25

@@ -221,7 +221,12 @@ def iris_muse_moetail_boundary_operands(
 
 @gluon.jit
 def _iris_muse_moetail_mailbox(
-    stages, row, WORLD_SIZE, LOCAL_WIDTH, MAX_ELEMENTS, NUM_WARPS: gl.constexpr
+    stages,
+    row,
+    WORLD_SIZE: gl.constexpr,
+    LOCAL_WIDTH: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
     """32-bit word offsets of every slot's part of ``row``, [THREADS, WORDS]."""
     WIDTH: gl.constexpr = LOCAL_WIDTH * WORLD_SIZE
