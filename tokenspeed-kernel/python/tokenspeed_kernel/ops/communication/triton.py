@@ -110,6 +110,7 @@ __all__ = [
     "dp_sampling_gather",
     "dp_sampling_swap",
     "multicast_publish",
+    "rank_ordered_fold",
 ]
 
 
@@ -438,7 +439,8 @@ def send_signal_to_peers(
     for peer in tl.static_range(0, world_size):
         remote_signal = tl.load(signal_ptrs + peer).to(tl.pointer_type(tl.uint32))
         send_addr = remote_signal + block_id * world_size + rank
-        send_old = tl.full((), 1, tl.int32)
+        # The CAS returns the signal's own type, uint32.
+        send_old = tl.full((), 1, tl.uint32)
         while send_old != 0:
             send_old = tl.atomic_cas(send_addr, 0, 1, sem="release", scope="sys")
 
@@ -451,7 +453,7 @@ def wait_signal_from_peers(
 ):
     for peer in tl.static_range(0, world_size):
         wait_addr = local_signal + block_id * world_size + peer
-        wait_old = tl.full((), 0, tl.int32)
+        wait_old = tl.full((), 0, tl.uint32)
         while wait_old != 1:
             wait_old = tl.atomic_cas(wait_addr, 1, 0, sem="acquire", scope="sys")
 
@@ -1084,7 +1086,8 @@ def nvidia_create_rsag_state(
     # we never shrink one another module enlarged. Must precede symm_mem.empty()
     # below, which bakes the pad size into the allocation.
     pad_bytes = _RSAG_MAX_BLOCKS * group.size() * 4
-    symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
+    if hasattr(symm_mem, "set_signal_pad_size"):
+        symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
     free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
     # Allocate outside inference_mode so the persistent comm buffer is not
     # an inference tensor; this class is often lazily constructed during
@@ -1098,7 +1101,14 @@ def nvidia_create_rsag_state(
     logger.info(
         f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
-    symm_mem.rendezvous(comm_buff, group=group)
+    handle = symm_mem.rendezvous(comm_buff, group=group)
+    # Torch 2.9 has a fixed signal pad. Verify its actual capacity before
+    # launching the same kernels; never silently run past the allocation.
+    if handle.signal_pad_size < pad_bytes:
+        raise RuntimeError(
+            f"RSAG requires {pad_bytes} signal-pad bytes, "
+            f"but Torch allocated {handle.signal_pad_size}"
+        )
     return TritonRSAGState(
         group=group,
         rank_in_group=rank_in_group,
@@ -2225,3 +2235,61 @@ def multicast_publish(block: torch.Tensor, destination: torch.Tensor) -> None:
         BLOCK=_PUBLISH_BLOCK,
         num_warps=4,
     )
+
+
+@triton.jit(do_not_specialize=["cols", "stride_world", "stride_row", "stride_out"])
+def _rank_ordered_fold_kernel(
+    parts_ptr,
+    out_ptr,
+    cols,
+    stride_world,
+    stride_row,
+    stride_out,
+    WORLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < cols
+    source = parts_ptr + row * stride_row + col
+    acc = tl.load(source, mask=mask).to(tl.float32)
+    for rank in tl.static_range(1, WORLD):
+        acc = acc + tl.load(source + rank * stride_world, mask=mask).to(tl.float32)
+    # A -0.0 sum leaves as +0.0, as the lamport all-reduce kernels send it.
+    acc = acc + 0.0
+    tl.store(out_ptr + row * stride_out + col, acc.to(out_ptr.dtype.element_ty), mask)
+
+
+def rank_ordered_fold(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Fold ``[world, rows, cols]`` partials left to right in fp32 into ``out``.
+
+    Every element starts from rank 0 and adds ranks 1..world-1 in order, with
+    one final rounding to ``out``'s dtype, so its value depends only on the
+    rank axis. A zero sum is stored as +0.0. ``parts`` may be any strided
+    view whose last axis is contiguous, such as a last-dim all-gather viewed
+    as ``[rows, world, cols]`` and transposed.
+
+    Args:
+        parts: ``[world, rows, cols]`` partials.
+        out: ``[rows, cols]`` destination with a contiguous last axis.
+
+    Returns:
+        ``out``.
+    """
+    world, rows, cols = parts.shape
+    if parts.stride(-1) != 1 or out.stride(-1) != 1 or out.shape != (rows, cols):
+        raise ValueError("rank_ordered_fold needs [world, rows, cols] partials")
+    if rows and cols:
+        block = 1024
+        _rank_ordered_fold_kernel[(rows, triton.cdiv(cols, block))](
+            parts,
+            out,
+            cols,
+            parts.stride(0),
+            parts.stride(1),
+            out.stride(0),
+            WORLD=world,
+            BLOCK=block,
+            num_warps=4,
+        )
+    return out

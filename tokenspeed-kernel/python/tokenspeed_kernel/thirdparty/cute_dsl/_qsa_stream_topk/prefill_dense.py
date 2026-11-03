@@ -27,9 +27,6 @@ import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.common import (
-    _copy_u128 as _copy_gmem_to_smem_u128,
-)
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.prefill import PrefillTopK
 
 _QUERY_GROUP = 8
@@ -51,9 +48,10 @@ _SELECTOR_END_WARP = _TOPK_FIRST_WARP + _QUERY_GROUP * _SELECTOR_WARPS_PER_ROW
 
 
 class DensePrefillTopK(PrefillTopK):
-    def __init__(self, enable_pdl: bool, splits: int):
+    def __init__(self, enable_pdl: bool, splits: int, group_layout: str):
         self.splits = splits
         self.enable_pdl = enable_pdl
+        self.group_layout = group_layout
         self.query_group = _QUERY_GROUP
         self.stream_tile = _STREAM_TILE
         self.selector_warps_per_row = _SELECTOR_WARPS_PER_ROW
@@ -78,6 +76,7 @@ class DensePrefillTopK(PrefillTopK):
         selected: cute.Tensor,
         q_stride_row: cutlass.Int32,
         q_stride_head: cutlass.Int32,
+        queries_per_request: cutlass.Int32,
         page_size: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
@@ -142,9 +141,14 @@ class DensePrefillTopK(PrefillTopK):
             selected,
             q_stride_row,
             q_stride_head,
+            queries_per_request,
             page_size,
         ).launch(
-            grid=(query.shape[0] // self.query_group * self.splits, 1, 1),
+            grid=(
+                self._group_count(query.shape[0], queries_per_request) * self.splits,
+                1,
+                1,
+            ),
             block=(self.threads, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -184,6 +188,60 @@ class DensePrefillTopK(PrefillTopK):
         selected: cute.Tensor,
         q_stride_row: cutlass.Int32,
         q_stride_head: cutlass.Int32,
+        queries_per_request: cutlass.Int32,
+        page_size: cutlass.Constexpr[int],
+    ):
+        block_idx, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.enable_pdl and self.group_layout == "ragged"):
+            cute.arch.griddepcontrol_wait()
+        row_base, valid_rows = self._query_group(
+            request_indices,
+            query.shape[0],
+            queries_per_request,
+            block_idx // self.splits,
+        )
+        if valid_rows > 0:
+            self._run_group(
+                tiled_mma,
+                load_mma,
+                smem_layout_k,
+                smem_layout_q,
+                tma_atom,
+                tma_tensor,
+                page_layout,
+                query,
+                keys,
+                page_table,
+                request_indices,
+                complete_blocks,
+                selected,
+                q_stride_row,
+                q_stride_head,
+                row_base,
+                valid_rows,
+                page_size,
+            )
+
+    @cute.jit
+    def _run_group(
+        self,
+        tiled_mma: cute.TiledMma,
+        load_mma: cute.TiledMma,
+        smem_layout_k: cute.ComposedLayout,
+        smem_layout_q: cute.ComposedLayout,
+        tma_atom: cute.CopyAtom,
+        tma_tensor: cute.Tensor,
+        page_layout: cute.ComposedLayout,
+        query: cute.Tensor,
+        keys: cute.Tensor,
+        page_table: cute.Tensor,
+        request_indices: cute.Tensor,
+        complete_blocks: cute.Tensor,
+        selected: cute.Tensor,
+        q_stride_row: cutlass.Int32,
+        q_stride_head: cutlass.Int32,
+        row_base: cutlass.Int32,
+        valid_rows: cutlass.Int32,
         page_size: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -192,16 +250,18 @@ class DensePrefillTopK(PrefillTopK):
         warp_idx = cute.arch.make_warp_uniform(tidx // 32)
         warpgroup_idx = cute.arch.make_warp_uniform(tidx // 128)
         warpgroup_tidx = tidx % 128
-        row_base = (block_idx // self.splits) * self.query_group
+        # Preserve the aligned row arithmetic through the grouped helper.
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            row_base = (block_idx // self.splits) * self.query_group
         split = block_idx % self.splits
         split_base = split * self.stream_tile
         num_blocks = page_table.shape[1] * page_size
 
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.enable_pdl and self.group_layout != "ragged"):
             cute.arch.griddepcontrol_wait()
         maximum_complete = cutlass.Int32(0)
         for query_row in cutlass.range_constexpr(_QUERY_GROUP):
-            count = complete_blocks[row_base + query_row]
+            count = self._row_complete(complete_blocks, row_base, query_row, valid_rows)
             if count > maximum_complete:
                 maximum_complete = count
         if maximum_complete > num_blocks:
@@ -216,13 +276,17 @@ class DensePrefillTopK(PrefillTopK):
                 if offset < _QUERY_GROUP * _TOPK:
                     row = row_base + offset // _TOPK
                     index = offset % _TOPK
-                    count = complete_blocks[row]
+                    count = self._row_complete(
+                        complete_blocks, row_base, row - row_base, valid_rows
+                    )
                     if count > num_blocks:
                         count = cutlass.Int32(num_blocks)
                     value = cutlass.Int32(-1)
                     if index < count:
                         value = index
-                    selected[row, index] = value
+                    self._store_selected(
+                        selected, row, index, value, row_base, valid_rows
+                    )
         else:
             smem = utils.SmemAllocator()
             tmem_ptr_smem = smem.allocate_array(cutlass.Int32)
@@ -357,7 +421,7 @@ class DensePrefillTopK(PrefillTopK):
                         cute.AddressSpace.smem,
                         assumed_align=16,
                     )
-                    _copy_gmem_to_smem_u128(destination, source)
+                    self._copy_query(destination, source, q_row, valid_rows)
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.fence_view_async_shared()
@@ -381,7 +445,9 @@ class DensePrefillTopK(PrefillTopK):
                     if thread_in_row == 0:
                         for item in cutlass.range_constexpr(6):
                             scalars[row_in_group, item] = cutlass.Int32(0)
-                        row_complete = complete_blocks[row_base + row_in_group]
+                        row_complete = self._row_complete(
+                            complete_blocks, row_base, row_in_group, valid_rows
+                        )
                         if row_complete > num_blocks:
                             row_complete = cutlass.Int32(num_blocks)
                         row_complete -= split_base
@@ -398,7 +464,9 @@ class DensePrefillTopK(PrefillTopK):
             request = request_indices[row_base]
             group_complete = cutlass.Int32(0)
             for query_row in cutlass.range_constexpr(self.query_group):
-                count = complete_blocks[row_base + query_row]
+                count = self._row_complete(
+                    complete_blocks, row_base, query_row, valid_rows
+                )
                 if count > group_complete:  # noqa: PLR1730
                     group_complete = count
             if group_complete > num_blocks:
@@ -661,4 +729,6 @@ class DensePrefillTopK(PrefillTopK):
                                 value = cutlass.Int32(
                                     compacted_row[index] & cutlass.Int64(0xFFFFFFFF)
                                 )
-                        selected_row[index] = value
+                        self._store_row(
+                            selected_row, index, value, row_in_group, valid_rows
+                        )

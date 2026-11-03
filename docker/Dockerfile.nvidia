@@ -6,7 +6,7 @@ FROM lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.6.18
 USER root
 
 ARG MAX_JOBS=16
-ARG CUDA_ARCH_LIST="9.0a 10.0a"
+ARG CUDA_ARCH_LIST="9.0a 10.0a 10.3a"
 
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
@@ -32,6 +32,7 @@ RUN python3 -m pip install cmake ninja && \
     TOKENSPEED_KERNEL_BACKEND=cuda \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
     python3 -m pip install tokenspeed-scheduler/ && \
+    WORKSPACE=/workspace bash test/ci_system/install_tokenspeed_engine.sh && \
     python3 -m pip install ./python --no-build-isolation
 
 CMD ["/bin/bash"]

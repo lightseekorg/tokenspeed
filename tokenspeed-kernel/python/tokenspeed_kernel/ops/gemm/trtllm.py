@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -39,7 +41,11 @@ from tokenspeed_kernel.signature import (
     tensor_format,
 )
 
-if current_platform().is_nvidia:
+_HAS_TRTLLM_KERNEL = (
+    current_platform().is_nvidia
+    and importlib.util.find_spec("trtllm_kernel") is not None
+)
+if _HAS_TRTLLM_KERNEL:
     # DeepEP must initialize before TRT-LLM's static CUDA runtime.
     import deep_ep  # noqa: F401
     import trtllm_kernel  # noqa: F401
@@ -52,6 +58,8 @@ if current_platform().is_nvidia:
 
 def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     """Run TRT-LLM's shape-specialized DeepSeek V3 fused-A projection."""
+    if not _HAS_TRTLLM_KERNEL:
+        raise RuntimeError("Fused-A GEMM requires a compatible trtllm_kernel package")
     return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
 
 
@@ -100,44 +108,46 @@ def _get_runner(out_dtype: torch.dtype):
     return runner
 
 
-@register_kernel(
-    "gemm",
-    "mm",
-    name="cublaslt_mm_nvfp4",
-    solution="cublaslt",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=_NVFP4_FORMAT_SIGNATURES,
-    traits={},
-    priority=Priority.SPECIALIZED + 3,
-)
-def cublaslt_mm_nvfp4(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scales: torch.Tensor,
-    B_scales: torch.Tensor,
-    out_dtype: torch.dtype,
-    *,
-    alpha: torch.Tensor,
-    block_size: list[int] | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    runner = _get_runner(out_dtype)
-    output = runner.run_gemm(
-        A,
-        B.T,
-        A_scales,
-        B_scales.T,
-        alpha,
-        False,
-        _CUBLASLT_HEURISTIC_ALGO,
+if _HAS_TRTLLM_KERNEL:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="cublaslt_mm_nvfp4",
+        solution="cublaslt",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_NVFP4_FORMAT_SIGNATURES,
+        traits={},
+        priority=Priority.SPECIALIZED + 3,
     )
-    if out is not None:
-        out.copy_(output)
-        return out
-    return output
+    def cublaslt_mm_nvfp4(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor,
+        B_scales: torch.Tensor,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        runner = _get_runner(out_dtype)
+        output = runner.run_gemm(
+            A,
+            B.T,
+            A_scales,
+            B_scales.T,
+            alpha,
+            False,
+            _CUBLASLT_HEURISTIC_ALGO,
+        )
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output
 
 
 # ===-----------------------------------------------------------------------===#
@@ -145,32 +155,56 @@ def cublaslt_mm_nvfp4(
 # ===-----------------------------------------------------------------------===#
 
 
-# Opt-in TRT-LLM CuTe-DSL FP8 GEMM with unmodified FP32 block scales.
+# TRT-LLM CuTe-DSL FP8 GEMM with unmodified FP32 block scales.
+
+_BLOCK_FP8_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(10, 0),
+    max_arch_version=ArchVersion(10, 9),
+    vendors=frozenset({"nvidia"}),
+)
+_BLOCK_FP8_SIGNATURES = format_signatures(
+    ("a", "b"),
+    "mxfp8",
+    {torch.float8_e4m3fn},
+    scale=ScaleFormat(
+        storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
+    ),
+)
+_BLOCK_FP8_TRAITS = {
+    "n_align": frozenset({128}),
+    "k_align": frozenset({128}),
+    "a_contiguous": frozenset({True}),
+    "b_contiguous": frozenset({True}),
+    "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+    "has_alpha": frozenset({False}),
+    "operands_aligned_16": frozenset({True}),
+    "out_aligned_16": frozenset({True}),
+    "out_contiguous": frozenset({True}),
+    "out_dtype": frozenset({torch.bfloat16}),
+    "scales_aligned_16": frozenset({True}),
+}
 
 
+# Both registrations use one implementation. Keep the low-priority entry for
+# explicit solution selection below the automatic M=17 threshold.
+@register_kernel(
+    "gemm",
+    "mm",
+    name="trtllm_cutedsl_mm_fp8_blockscale_large_m",
+    solution="trtllm_cutedsl",
+    capability=_BLOCK_FP8_CAPABILITY,
+    signatures=_BLOCK_FP8_SIGNATURES,
+    traits={"m_min": frozenset({17}), **_BLOCK_FP8_TRAITS},
+    priority=Priority.SPECIALIZED + 3,
+)
 @register_kernel(
     "gemm",
     "mm",
     name="trtllm_cutedsl_mm_fp8_blockscale",
     solution="trtllm_cutedsl",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 9),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=format_signatures(
-        ("a", "b"),
-        "mxfp8",
-        {torch.float8_e4m3fn},
-        scale=ScaleFormat(
-            storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
-        ),
-    ),
-    traits={
-        "n_align": frozenset({128}),
-        "k_align": frozenset({128}),
-        "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
-    },
+    capability=_BLOCK_FP8_CAPABILITY,
+    signatures=_BLOCK_FP8_SIGNATURES,
+    traits=_BLOCK_FP8_TRAITS,
     priority=Priority.REFERENCE,
 )
 def trtllm_cutedsl_mm_fp8_blockscale(

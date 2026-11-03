@@ -349,11 +349,3 @@ def test_graph_buffers_are_unexpanded_without_block_decode() -> None:
     backend.init_cuda_graph_state(max_bs=4)
     assert backend.page_table_buf.shape == (4, 4)
     assert backend.seq_lens_buf.shape == (4,)
-
-
-def test_attn_config_carries_the_block_decode_flag_defaulting_off() -> None:
-    """AttnConfig must carry the flag so generate() can set it for the draft."""
-    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-
-    field = AttnConfig.__dataclass_fields__["draft_block_decode"]
-    assert field.default is False

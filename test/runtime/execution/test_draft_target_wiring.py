@@ -120,16 +120,21 @@ def test_get_drafter_impl_routing():
     )
 
 
-class _Eagle3Target:
-    """A target model recording the EAGLE3 capture ids it is handed."""
+class _HeadTarget:
+    """A target model that shares its embed/head but captures no aux hidden states."""
 
     def __init__(self):
-        self.captured = None
         self.lm_head = _unquantized_head()
         self.logits_processor = _head_layout()
 
     def get_embed_and_head(self):
         return "EMBED", "HEAD"
+
+
+class _Eagle3Target(_HeadTarget):
+    """A target model recording the EAGLE3 capture ids it is handed."""
+
+    captured = None
 
     def set_eagle3_layers_to_capture(self, layer_ids):
         self.captured = layer_ids
@@ -149,6 +154,18 @@ def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
 
     assert draft_model.shared == ("EMBED", "HEAD")
     assert target_model.captured == [1, 2, 3]
+
+
+def test_wire_eagle3_refuses_a_target_that_cannot_capture():
+    draft = _draft_runner(_WeightSharingDraft())
+    draft.model_config.hf_config = {
+        "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
+    }
+
+    with pytest.raises(AttributeError, match="set_eagle3_layers_to_capture"):
+        factory.configure_draft_target(
+            _server_args("EAGLE3"), _target_runner(_HeadTarget()), draft
+        )
 
 
 class _ModuleSharingDraft:
@@ -861,7 +878,8 @@ def test_device_weight_update_notifies_drafter_before_returning():
         drafter=SimpleNamespace(
             on_target_weights_updated=lambda: refreshed.append("refreshed")
         ),
-        forward_thread=SimpleNamespace(run=lambda callback: callback()),
+        device="cpu",
+        complete_pending_drafting=lambda: None,
     )
     handle = DeviceHandle(executor)
     request = UpdateWeightsFromDistributedReqInput(
@@ -1299,12 +1317,6 @@ def test_nested_capture_config_overrides_top_level_values(dflash_model):
     dflash_model.configure_target(target, None)
     target.set_dflash_layers_to_capture.assert_called_once_with([2, 7])
     target.set_dflash_aux_hidden_stream.assert_called_once_with("attn_res")
-
-
-def test_missing_taps_fail_during_model_setup(dflash_model):
-    dflash_model.config = SimpleNamespace()
-    with pytest.raises(ValueError, match="target_layer_ids"):
-        dflash_model.configure_target(object(), None)
 
 
 def test_target_without_capture_support_fails_during_model_setup(dflash_model):

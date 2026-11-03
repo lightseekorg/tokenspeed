@@ -24,6 +24,35 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## DCP local candidate selection
+
+`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. On
+Hopper, its local top-k uses the in-tree CuTe DSL DeepSelect selector with
+the original compact lengths, so selection excludes the unused logits
+tail. Empty shards keep length zero for selection even though DeepGEMM's
+scoring scheduler needs a nonzero dummy length.
+
+This selector serves `topk <= 2048` on CUDA FP32 matrices with unit column
+stride, a 16-byte aligned base, and rows padded to four elements. Aligned
+non-contiguous rows need no copy. Other architectures, unsupported layouts
+or top-k sizes, and installations without CuTe DSL retain the existing
+`torch.topk` selection. The first eager call compiles every cluster variant
+of its survivor capacity before CUDA-graph capture; later batch shapes use
+those compiled variants.
+
+Scoring and logits capacity are unchanged. Length-aware selection masks only
+the valid prefix and reuses DeepSelect's returned values; the full-width
+fallback still initializes the entire logits tail. The mask preserves mandatory
+global windows as `+inf`; do not apply the ordinary decode non-finite cleanup
+after those markings. Gathering bounds every selected offset before reading
+positions or logits, then emits interleaved int32 position/FP32-score-bit views
+that runtime can exchange without repacking. Tie order remains unspecified,
+and gathering drops candidates scoring `-inf`. Attention-core selection and
+cache ownership are unchanged.
+
+Candidate exchange retains global `torch.topk`. Its gather kernel processes
+selected entries in bounded blocks; the block size does not restrict `topk`.
+
 ## Materialized Triton row top-k
 
 `triton_topk_from_logits(logits, topk, seq_lens=..., enable_pdl=...)` selects
@@ -225,6 +254,17 @@ quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
 metadata supports CUDA graph replay without host reads.
 
+The portable selected-slot kernel groups query heads into tensor-core tiles
+and gathers each latent KV tile for both scoring and value accumulation.
+Small grids split the selected keys across programs and combine their FP32
+partial outputs using base-2 log-sum-exp weights. The public `return_lse`
+result remains FP32 in natural-log units for both split and unsplit launches.
+Empty selections produce zero output and negative-infinity LSE. Negative slots
+inside the live prefix are ignored; live lengths are clamped to the slot width.
+Packed FP8 keys retain a BF16 residual when scoring so dequantization rounding
+does not reduce LSE accuracy. FP16 and FP32 dense keys retain the same residual.
+Value tiles and probabilities use BF16 with FP32 accumulation.
+
 The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
 owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
@@ -241,3 +281,15 @@ For non-cluster PDL grids with no more rows than SMs, the launcher selects a
 one-block register budget to reduce packing of waiting CTAs. Larger grids keep
 the two-block budget. Launch bounds guide register allocation; they are not a
 hard limit on resident CTAs. Both variants use the same radix algorithm.
+
+### FlashMLA query padding lifetime
+
+Sparse FlashMLA pads small query head counts to the kernel's supported width.
+Prefill and decode padding tensors are call-local: PyTorch's CUDA allocator
+reuses released storage with stream ordering, and allocations made during graph
+capture belong to the graph's private pool. Do not cache these writable tensors
+by shape: variable prefill lengths retain every allocation, and concurrent calls
+or independent graphs can overwrite each other's queries. Cross-stream users
+must still follow PyTorch's normal tensor synchronization/lifetime rules.
+Padding remains an exact copy of the original heads plus zero-filled extra
+heads; this changes neither arithmetic nor the supported numerics envelopes.

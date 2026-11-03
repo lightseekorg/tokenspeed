@@ -32,7 +32,10 @@ from tokenspeed_kernel.numerics.torch.moe import (
     DequantizedExperts,
     torch_moe_experts,
 )
-from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
+from tokenspeed_kernel.numerics.torch.quantization import (
+    dequantize_mxfp4,
+    fake_quantize_mxfp4_even,
+)
 from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from utils import (
     assert_no_triton_compile,
@@ -87,6 +90,29 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # n
 def _dequantize_dynamic_mxfp4(x: torch.Tensor) -> torch.Tensor:
     packed, scale = kernel_quantize_mxfp4(x, scale_layout="linear", solution="triton")
     return dequantize_mxfp4(packed, scale).to(torch.bfloat16)
+
+
+def _quantize_fp32_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize FP32 rows to MXFP4 with linear scales, without BF16 rounding."""
+    x = x.float().contiguous()
+    rows, k_scale = x.shape[0], x.shape[1] // 32
+    packed = torch.empty((rows, x.shape[1] // 2), dtype=torch.uint8, device=x.device)
+    scale = torch.empty((rows, k_scale), dtype=torch.uint8, device=x.device)
+    # The launcher takes BF16/FP16 only; the kernel loads any float as FP32.
+    triton_quantize_mxfp4_activation_gfx1250[((rows + 31) // 32, (k_scale + 31) // 32)](
+        x,
+        packed,
+        scale,
+        x.stride(0),
+        packed.stride(0),
+        scale.stride(0),
+        rows,
+        K_SCALE=k_scale,
+        BLOCK_M=32,
+        BLOCK_K_SCALE=32,
+        num_warps=4,
+    )
+    return packed, scale
 
 
 def _fp8_mxfp4_swiglu_moe_reference(
@@ -291,6 +317,8 @@ def test_dynamic_mxfp4_activation_moe(
 @pytest.mark.parametrize(
     ("num_tokens", "global_num_experts", "input_kind"),
     (
+        (0, 8, "tensor"),
+        (0, 8, "packed"),
         (1, 8, "tensor"),
         (8, 8, "tensor"),
         (16, 8, "tensor"),
@@ -329,6 +357,14 @@ def test_dynamic_mxfp4_deferred_ep(
         device="cuda",
         generator=generator,
     )
+    # Inputs and output occupy disjoint slices of one allocation, as with an
+    # Iris heap. Guard rows also expose stores beyond the supplied destination.
+    storage = hidden_states.new_full(
+        (num_tokens + num_tokens * top_k + 2, hidden_size), 17
+    )
+    storage[1 : num_tokens + 1].copy_(hidden_states)
+    hidden_states = storage[1 : num_tokens + 1]
+    destination = storage[num_tokens + 1 : -1]
     local_ids = expert_start + torch.arange(num_tokens, device="cuda") % 2
     remote_ids = torch.arange(num_tokens, device="cuda") % 2
     topk_ids = torch.stack((local_ids, remote_ids), dim=1).to(torch.int32)
@@ -398,6 +434,58 @@ def test_dynamic_mxfp4_deferred_ep(
             out=None,
         )
     torch.cuda.synchronize()
+
+    supplied, _, supplied_map = gluon_mxfp_precomputed_mxfp4_fused_moe(
+        x_quantized if input_kind == "packed" else hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        expert_start=expert_start,
+        global_num_experts=global_num_experts,
+        do_finalize=False,
+        x_quantized=None if input_kind == "packed" else x_quantized,
+        swiglu_alpha=1.0,
+        swiglu_limit=0.0,
+        swiglu_beta=0.0,
+        deferred_out=destination,
+    )
+    assert supplied.data_ptr() == destination.data_ptr()
+    torch.testing.assert_close(supplied_map, expanded_idx, atol=0, rtol=0)
+    valid = expanded_idx >= 0
+    torch.testing.assert_close(supplied[valid], route_output[valid], atol=0, rtol=0)
+    torch.testing.assert_close(
+        storage[0], torch.full_like(storage[0], 17), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        storage[-1], torch.full_like(storage[-1], 17), atol=0, rtol=0
+    )
+    if num_tokens == 17 and input_kind == "tensor":
+        # The output starts beyond input.numel(), but still aliases later
+        # strided rows. Rejection must leave those unread inputs intact.
+        shared = hidden_states.new_full((num_tokens * (4 + top_k), hidden_size), 17)
+        strided = shared[: num_tokens * 4 : 4]
+        strided.copy_(hidden_states)
+        overlapping = shared[num_tokens : num_tokens * (1 + top_k)]
+        before = shared.clone()
+        with pytest.raises(ValueError, match="must not overlap"):
+            gluon_mxfp_precomputed_mxfp4_fused_moe(
+                strided,
+                topk_weights,
+                topk_ids,
+                module.w13_weight_triton_tensor,
+                module.w2_weight_triton_tensor,
+                w13_mx_scale=module.w13_precision_config.b_mx_scale,
+                w2_mx_scale=module.w2_precision_config.b_mx_scale,
+                expert_start=expert_start,
+                global_num_experts=global_num_experts,
+                do_finalize=False,
+                x_quantized=None,
+                deferred_out=overlapping,
+            )
+        torch.testing.assert_close(shared, before, atol=0, rtol=0)
 
     route_output = route_output.view(num_tokens, top_k, hidden_size)
     expected_map = torch.stack(
@@ -1089,7 +1177,7 @@ def _dynamic_mxfp4_swiglu_moe_reference(
         w13_bias=w13_bias,
         w2_bias=w2_bias,
         quantize_input=_dequantize_dynamic_mxfp4,
-        quantize_intermediate=lambda t: _dequantize_dynamic_mxfp4(t.bfloat16()),
+        quantize_intermediate=fake_quantize_mxfp4_even,
         round_expert_output=torch.Tensor.bfloat16,
         first_expert=0,
     ).to(torch.bfloat16)
@@ -1241,6 +1329,127 @@ def test_dynamic_mxfp4_activation_moe_gfx1250_dsv41_shapes(
     assert actual.shape == hidden_states.shape
     assert torch.count_nonzero(expected).item() > 0
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,decode",
+    [
+        # DeepSeek-V4.1-Flash TP4 gate-up: 1- and 16-request decode steps of
+        # six tokens, and a prefill chunk.
+        pytest.param(6, True, id="decode-m6"),
+        pytest.param(96, True, id="decode-m96"),
+        pytest.param(2048, False, id="prefill-m2048"),
+    ],
+)
+def test_gfx1250_gate_up_mxfp4_output_matches_quantized_fp32(
+    num_tokens: int, decode: bool
+) -> None:
+    """The MXFP4 epilogue must equal quantizing the FP32 gate-up output."""
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    hidden_size, intermediate_size, num_experts, top_k = 5120, 576, 384, 6
+    generator = torch.Generator(device="cuda").manual_seed(20261020 + num_tokens)
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_mxfp4_moe_module(raw)
+    preprocess_gluon_mxfp4_gfx1250_moe_weights({}, module)
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    scores = torch.rand(num_tokens, num_experts, device="cuda", generator=generator)
+    topk_weights, topk_ids = scores.topk(top_k, dim=-1)
+    ragged_metadata, gather_indx, _scatter, _gate = (
+        gfx1250_fused._precomputed_topk_route(
+            topk_weights.contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
+            num_experts,
+        )
+    )
+    x, x_scale = launch_triton_quantize_mxfp4_activation_gfx1250(hidden_states)
+    kwargs = dict(
+        w_mx_scale=module.w13_precision_config.b_mx_scale,
+        x_mx_scale=x_scale,
+        x_format="e2m1",
+        a_ragged_metadata=ragged_metadata,
+        gather_indx=gather_indx,
+        fused_activation=gfx1250_fused.FusedActivation(
+            gfx1250_fused.FnSpecs(
+                "swiglu",
+                gfx1250_fused.swiglu_fn,
+                ("alpha", "limit", "beta"),
+                reduction_n=2,
+            ),
+            (1.0, 10.0, 0.0),
+        ),
+        scale_preshuffle=True,
+        decode=decode,
+        partial_tdm=False,
+        **(
+            decode_tile_config(hidden_size)
+            if decode
+            else gfx1250_fused._PREFILL_MXFP4_ACTIVATION_TILES
+        ),
+    )
+    w13 = module.w13_weight_triton_tensor
+
+    expected_packed, expected_scale = _quantize_fp32_mxfp4(
+        gfx1250_fused.gluon_mxfp_ragged_matmul(
+            x, w13, None, out_dtype=torch.float32, **kwargs
+        )
+    )
+    packed, scale = gfx1250_fused.gluon_mxfp_ragged_matmul(
+        x, w13, None, mxfp4_output=True, **kwargs
+    )
+    torch.cuda.synchronize()
+
+    assert packed.shape == (num_tokens * top_k, intermediate_size // 2)
+    assert scale.shape == (num_tokens * top_k, intermediate_size // 32)
+    assert scale.stride(0) % 16 == 0
+    assert torch.count_nonzero(expected_packed).item() > 0
+    assert torch.equal(packed, expected_packed)
+    assert torch.equal(scale, expected_scale)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 6, 96, 342, 512, 601, 8192])
+def test_gfx1250_route_mxfp4_matches_route_then_quantize(num_tokens: int) -> None:
+    """Quantizing on the routing launch must match the standalone quantizer."""
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    hidden_size, num_experts, top_k = 5120, 384, 6
+    generator = torch.Generator(device="cuda").manual_seed(20261021 + num_tokens)
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device="cuda", generator=generator) * 4
+    ).to(torch.bfloat16)
+    scores = torch.rand(num_tokens, num_experts, device="cuda", generator=generator)
+    topk_weights, topk_ids = scores.topk(top_k, dim=-1)
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_weights = topk_weights.contiguous()
+
+    *route, packed, scale = gfx1250_fused._precomputed_topk_route_mxfp4(
+        topk_weights, topk_ids, num_experts, hidden_states
+    )
+    expected_route = gfx1250_fused._precomputed_topk_route(
+        topk_weights, topk_ids, num_experts
+    )
+    expected_packed, expected_scale = launch_triton_quantize_mxfp4_activation_gfx1250(
+        hidden_states
+    )
+    torch.cuda.synchronize()
+
+    for name in ("slice_sizes", "slice_offs", "block_offs_data", "block_schedule_data"):
+        assert torch.equal(
+            getattr(route[0], name), getattr(expected_route[0], name)
+        ), name
+    for actual, expected in zip(route[1:], expected_route[1:]):
+        assert torch.equal(actual, expected)
+    assert scale.stride(0) % 16 == 0
+    assert torch.equal(packed, expected_packed)
+    assert torch.equal(scale, expected_scale)
 
 
 def test_gfx1250_prefill_xcd_swizzle_covers_every_tile(

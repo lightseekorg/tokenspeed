@@ -21,6 +21,7 @@
 """Fixed hot reservation and the existing scheduler admission gate."""
 
 from dataclasses import replace
+from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
 import tokenspeed_scheduler as ts
@@ -35,6 +36,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
     compute_offload_capacity,
     plan_cache_storage,
 )
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def geometry():

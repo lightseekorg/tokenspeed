@@ -145,6 +145,7 @@ def finish_mla_tree(
         prefix_lse.view(-1, heads),
         rows_per_req=tree.rows,
         window=tree.window,
+        causal_prefix=True,
         page_size=page_size,
         sm_scale=layer.scaling,
     )

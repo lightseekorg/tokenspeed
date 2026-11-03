@@ -67,8 +67,9 @@ public:
     }
 
     // A StateStep costs one fresh block when it rotates or lands (the new
-    // slot 1); the zero-state block of a first rotation is costed by the
-    // admission planner, which knows whether a checkpoint was matched.
+    // slot 1), plus one for an in-forward checkpoint; the zero-state block of
+    // a first rotation is costed by the admission planner, which knows
+    // whether a checkpoint was matched.
     std::int32_t BlocksNeededFor(const BlockTable& table, const GroupDemand& demand) const {
         return std::visit(
             Overloaded{
@@ -78,7 +79,8 @@ public:
                 [&](const SparseSuffix& sparse) { return sparseSuffixBlocks(table, sparse, demand.reserve_tokens); },
                 [&](const StateStep& step) {
                     _assert(!HasTokenSpan() && demand.reserve_tokens == 0, "a StateStep shapes a State group");
-                    return step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand ? 1 : 0;
+                    return (step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand ? 1 : 0) +
+                           (step.checkpoint ? 1 : 0);
                 },
             },
             demand.extent);

@@ -39,10 +39,10 @@ namespace tokenspeed {
 namespace fsm {
 struct Bootstrapping {
     Bootstrapping(TokenContainer* _token_container, std::int32_t _prefix_granularity)
-        : token_container{_token_container}, prefix_granularity{_prefix_granularity} {}
+        : admission{_token_container, _prefix_granularity} {}
+    explicit Bootstrapping(AdmissionResources resources) : admission{std::move(resources)} {}
 
-    TokenContainer* token_container{};
-    std::int32_t prefix_granularity{};
+    AdmissionResources admission;
 };
 
 // The peer node is prefilling this prompt: this engine admitted and holds

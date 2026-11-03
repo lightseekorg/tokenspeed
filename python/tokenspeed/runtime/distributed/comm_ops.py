@@ -299,6 +299,39 @@ def all_reduce(
     return backend.all_reduce(tensor, group, op=op)
 
 
+def supports_all_reduce_mhc_norm(
+    x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+) -> bool:
+    """Select fusion before scheduling the producer's ordinary all-reduce.
+
+    x describes the producer's anticipated output shape, dtype, device and
+    layout, including CED narrowing and graph padding. The producer must honor
+    that spec; HC residual/coefficient formats follow all_reduce_mhc_norm's
+    contract. Backend configuration and the prepared workspace remain fixed
+    between this query and execution. Only the shape, dtype, device and
+    contiguity of norm_weight are inspected. It may be a producer norm with
+    equivalent storage; execution uses the consumer's own weight and epsilon.
+    This query does not read tensor values, retain tensors or launch GPU work.
+    """
+    return get_global_backend().supports_all_reduce_mhc_norm(x, norm_weight, group)
+
+
+def all_reduce_mhc_norm(
+    x, residual, post, comb, pre, weight, eps, group: Group
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute fusion selected by supports_all_reduce_mhc_norm.
+
+    x is BF16 [T,H], residual BF16 [T,4,H], post/pre FP32 [T,4], comb
+    FP32 [T,4,4], and weight BF16 [H]. All tensors are contiguous and on the
+    same CUDA device; eps is positive and group is the admitted prepared group.
+    Returns updated residual and normalized input. Contract violations and
+    execution errors propagate; this operation never requests a fallback.
+    """
+    return get_global_backend().all_reduce_mhc_norm(
+        x, residual, post, comb, pre, weight, eps, group
+    )
+
+
 def all_reduce_mhc_post(
     tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -331,6 +364,35 @@ def prepare_all_reduce_lane(
     # on one rank while peers succeed would leave the group disagreeing on
     # the lane width. Let real failures propagate loudly.
     return backend.prepare_all_reduce_lane(group, hidden_dim)
+
+
+def prepare_shard_exchange(
+    group: Group,
+    channels: int,
+    max_rows: int,
+    dtype: torch.dtype,
+    backend: CommBackend | None = None,
+) -> bool:
+    """Prepare a backend-owned exchange for even ``all_to_all_transpose`` /
+    ``all_to_all_head_scatter`` calls before graph capture.
+
+    Collective: every rank of ``group`` calls in the same order with the same
+    arguments (layers do it at build time, like ``prepare_all_reduce_lane``).
+
+    Args:
+        group: Global ranks of the exchange.
+        channels: The full feature width ``W * F_local`` of the exchanged rows.
+        max_rows: Rows per rank the prepared exchange serves; larger calls
+            and uneven row counts take the generic all-to-all.
+        dtype: Element type of the exchanged rows.
+        backend: Backend to prepare, or ``None`` for the global backend.
+
+    Returns:
+        Whether the backend prepared a dedicated exchange.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_shard_exchange(group, channels, max_rows, dtype)
 
 
 def prepare_all_reduce_buffers(
@@ -543,6 +605,12 @@ def all_to_all_transpose(
         # Nothing to move for the whole group (every rank reads the same
         # counts, so every rank skips the collective together).
         return x.new_empty(0, world_size * width)
+    if backend is None:
+        backend = get_global_backend()
+    if all(count == rows for count in input_split_sizes):
+        exchanged = backend.try_shard_exchange(x, group, inverse=True)
+        if exchanged is not None:
+            return exchanged
     received = x.new_empty(world_size * rows, width)
     all_to_all_single(
         received,
@@ -599,6 +667,14 @@ def all_to_all_head_scatter(
     if rows_full == 0:
         # Nothing to move for the whole group; every rank skips together.
         return x.new_empty(0, heads_local, dim)
+    if backend is None:
+        backend = get_global_backend()
+    if all(count == rows_own for count in output_split_sizes):
+        exchanged = backend.try_shard_exchange(
+            x.reshape(rows_own, heads * dim), group, inverse=False
+        )
+        if exchanged is not None:
+            return exchanged.view(rows_full, heads_local, dim)
     # Head block i (destined for rank i) becomes send chunk i.
     sent = (
         x.view(rows_own, world_size, heads_local * dim)

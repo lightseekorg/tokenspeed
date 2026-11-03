@@ -718,6 +718,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
     pools = SpeculativeSamplingPools(
         temperature=torch.tensor(temperatures, dtype=torch.float32),
         top_k=torch.tensor(top_k_rows, dtype=torch.int32),
+        top_p=torch.ones(POOL + 1),
         seed=torch.arange(POOL + 1, dtype=torch.int64) * 11,
     )
     monkeypatch.setattr(
@@ -1040,6 +1041,7 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     pools = SpeculativeSamplingPools(
         temperature=torch.ones(POOL + 1),
         top_k=torch.ones(POOL + 1, dtype=torch.int32),
+        top_p=torch.ones(POOL + 1),
         seed=torch.zeros(POOL + 1, dtype=torch.int64),
     )
     backend = SimpleNamespace(speculative_sampling_pools=lambda: pools)

@@ -2,13 +2,13 @@
 
 from typing import NamedTuple
 
-import triton.experimental.gluon as g
 from lib.gemm.rocm.intrinsics import BufferResource
 from lib.moe.rocm.memory_ops import MakeBufferResource
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.host_device import host_device
 from lib.tal.tensor.layout import Layout, Shape, Stride, make_coord
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 def MxFp4BiasLayout(kGroupM, kGroupN):

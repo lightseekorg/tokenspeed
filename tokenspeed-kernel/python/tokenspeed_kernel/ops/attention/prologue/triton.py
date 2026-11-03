@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 # Above this the one-launch write loses to the composite (measured at 16-64 heads).
 _MLA_MAX_TOKEN_HEADS = 2048 * 16
@@ -417,9 +418,10 @@ def triton_gqa_prologue(
         s0, s1, s2 = mrope.section if mrope_rows else (0, 0, 0)
         block_t = _block_tokens(num_tokens, triton.next_power_of_2(head_dim))
         scales = cache.scales if cache.format is KVCacheFormat.FP8_PER_TENSOR else None
-        _gqa_prologue_kernel[
-            (triton.cdiv(num_tokens, block_t), num_q_heads + num_kv_heads)
-        ](
+        kernel_launcher(
+            _gqa_prologue_kernel,
+            (triton.cdiv(num_tokens, block_t), num_q_heads + num_kv_heads),
+        )(
             q,
             k,
             v,
@@ -535,3 +537,14 @@ def triton_mla_prologue(
         enable_pdl=enable_pdl,
     )
     return MLAPrologueOutput(query=out, key=None, value=None)
+
+
+def _gqa_warmup_variants(args):
+    """BLOCK_T warmup buckets mirroring _block_tokens' element sizes, for both RETURN_K values."""
+    block_tokens = tuple(
+        sorted({max(4, elements // args["BLOCK"]) for elements in (512, 1024, 2048)})
+    )
+    return ({"BLOCK_T": block_tokens, "RETURN_K": (False, True)},)
+
+
+register_triton_warmup(_gqa_prologue_kernel, variants=_gqa_warmup_variants)

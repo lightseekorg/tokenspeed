@@ -28,6 +28,7 @@ from tokenspeed_kernel.numerics.torch.sampling import (
     torch_topk_topp_renorm,
 )
 from tokenspeed_kernel.ops.sampling.cuda import (
+    fused_topk_topp_prepare,
     fused_topk_topp_renorm,
     fused_topk_topp_workspace_size,
 )
@@ -233,7 +234,7 @@ def test_fused_topk_topp_matches_pipeline(
     top_ps = torch.tensor(ps, dtype=torch.float32, device=device)
 
     ref = torch_topk_topp_renorm(probs, top_ks, top_ps)
-    ours = fused_topk_topp_renorm(probs.clone(), top_ks, top_ps)
+    ours = fused_topk_topp_renorm(probs.clone(), top_ks, top_ps, in_place_skip=False)
 
     # Each kept row should renormalize to 1 within fp32 ulp tolerance.
     torch.testing.assert_close(
@@ -315,7 +316,9 @@ def test_fused_topk_topp_unaligned_rows(
     if probs_off:
         assert probs_in.data_ptr() % 16 != 0, "offset lost; probs got re-aligned"
 
-    ours = fused_topk_topp_renorm(probs_in, top_ks, top_ps, out=out)
+    ours = fused_topk_topp_renorm(
+        probs_in, top_ks, top_ps, out=out, in_place_skip=False
+    )
     torch.cuda.synchronize()  # surface an async misaligned-address fault here
 
     torch.testing.assert_close(
@@ -358,14 +361,21 @@ def test_fused_topk_topp_external_workspace(device: str) -> None:
     )
     top_ps = torch.tensor([0.9, 0.85, 0.95, 0.8], dtype=torch.float32, device=device)
 
-    auto = fused_topk_topp_renorm(probs, top_ks, top_ps)
+    auto = fused_topk_topp_renorm(probs, top_ks, top_ps, in_place_skip=False)
     ws = torch.empty(
         fused_topk_topp_workspace_size(bs, V), dtype=torch.uint8, device=device
     )
-    manual = fused_topk_topp_renorm(probs, top_ks, top_ps, workspace=ws)
+    manual = fused_topk_topp_renorm(
+        probs, top_ks, top_ps, workspace=ws, in_place_skip=False
+    )
     ws_no_pdl = torch.empty_like(ws)
     no_pdl = fused_topk_topp_renorm(
-        probs, top_ks, top_ps, workspace=ws_no_pdl, enable_pdl=False
+        probs,
+        top_ks,
+        top_ps,
+        workspace=ws_no_pdl,
+        enable_pdl=False,
+        in_place_skip=False,
     )
     torch.testing.assert_close(auto, manual, atol=0.0, rtol=0.0)
     torch.testing.assert_close(auto, no_pdl, atol=0.0, rtol=0.0)
@@ -415,10 +425,68 @@ def test_fused_topk_topp_keeps_sub_ulp_tail_at_top_p_one(
     top_ps = torch.ones(bs, dtype=torch.float32, device=device)
 
     ref = torch_topk_topp_renorm(probs, top_ks, top_ps)
-    ours = fused_topk_topp_renorm(probs, top_ks, top_ps)
+    ours = fused_topk_topp_renorm(probs, top_ks, top_ps, in_place_skip=False)
 
     assert int((ours != 0).sum().item()) == bs * kept
     torch.testing.assert_close(ours, ref, atol=0.0, rtol=1e-5)
+
+
+@requires_nvidia
+@pytest.mark.parametrize(
+    "V,probs_off,graph",
+    [(8192, 0, False), (8192, 0, True), (8190, 0, False), (8192, 1, True)],
+    ids=["aligned", "aligned-graph", "odd-vocab", "view-off-4B-graph"],
+)
+def test_fused_topk_topp_in_place_skip(
+    device: str, V: int, probs_off: int, graph: bool
+) -> None:
+    """In-place skip mode: rows that cut come out bitwise as from the
+    out-of-place call; greedy rows (top-k 1) and rows that cut nothing (top-k
+    off, top-p 1) are neither read nor written."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_renorm test")
+    torch.manual_seed(2)
+    ks = [1, _TOP_K_DISABLED, 20, _TOP_K_DISABLED, 127, 1, 2, _TOP_K_DISABLED, 64]
+    ps = [1.0, 1.0, 0.95, 0.9, 1.0, 0.5, 0.8, 0.5, 1.0]
+    bs = len(ks)
+    probs = torch.softmax(
+        torch.randn(bs, V, device=device, dtype=torch.float32) * 3.0, dim=-1
+    )
+    top_ks = torch.tensor(ks, dtype=torch.int32, device=device)
+    top_ps = torch.tensor(ps, dtype=torch.float32, device=device)
+    expected = fused_topk_topp_renorm(probs, top_ks, top_ps, in_place_skip=False)
+
+    greedy = top_ks == 1
+    uncut = (top_ks == _TOP_K_DISABLED) & (top_ps >= 1.0)
+    cut = ~(greedy | uncut)
+    inputs = probs.clone()
+    inputs[greedy] = float("nan")  # never read
+    buf = _offset_view(inputs, probs_off) if probs_off else inputs.clone()
+    if probs_off:
+        assert buf.data_ptr() % 16 != 0, "offset lost; probs got re-aligned"
+
+    def run() -> torch.Tensor:
+        return fused_topk_topp_renorm(buf, top_ks, top_ps, in_place_skip=True)
+
+    if graph:
+        fused_topk_topp_prepare(device)
+        stream = torch.cuda.Stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            run()  # Load the kernels before the capture.
+            graph_obj = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph_obj, stream=stream):
+                run()
+            buf.copy_(inputs)
+            graph_obj.replay()
+        stream.synchronize()
+    else:
+        run()
+        torch.cuda.synchronize()
+
+    assert torch.equal(buf[cut], expected[cut])
+    assert torch.equal(buf[uncut], probs[uncut])
+    assert buf[greedy].isnan().all()
 
 
 def test_gather_empty_batch(device: str) -> None:

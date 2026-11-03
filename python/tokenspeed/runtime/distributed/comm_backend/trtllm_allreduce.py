@@ -114,6 +114,30 @@ class TrtllmAllReduceBackend(CommBackend):
         except Exception:
             return False
 
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        resource = self._resources.get(group)
+        if resource is None:
+            return False
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            supports_allreduce_mhc_post_norm,
+        )
+
+        return supports_allreduce_mhc_post_norm(
+            x, norm_weight, resource["device_group"]
+        )
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        resource = self._resources[group]
+        from tokenspeed_kernel.ops.communication.trtllm import allreduce_mhc_post_norm
+
+        return allreduce_mhc_post_norm(
+            x, residual, post, comb, pre, weight, eps, resource["device_group"]
+        )
+
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
 
@@ -186,11 +210,57 @@ class TrtllmAllReduceBackend(CommBackend):
                 trtllm_workspace_allreduce,
             )
 
-            result = trtllm_workspace_allreduce(tensor, res["device_group"])
+            result = trtllm_workspace_allreduce(
+                tensor, res["device_group"], fp32_acc=False
+            )
             if result is not None:
                 return result
 
         return self._fallback.all_reduce(tensor, group, op=op)
+
+    def ordered_all_reduce(
+        self, tensor: torch.Tensor, group: Group
+    ) -> torch.Tensor | None:
+        """SUM all-reduce folding ranks 0..n-1 in fp32 with one rounding.
+
+        The workspace kernels sum in this order on every strategy, so the
+        result is the rank-ordered fold bit for bit. Rows beyond what the
+        fold serves (the armed capacity, at most the two-shot range) fold in
+        near-equal chunks: a row's fold does not depend on the rows around
+        it. None when no armed workspace serves the call.
+        """
+        res = self._resources.get(group)
+        if res is None:
+            return None
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_TWOSHOT_MAX_TOKEN,
+            trtllm_workspace_allreduce,
+        )
+
+        if tensor.dim() == 0 or tensor.numel() == 0:
+            return None
+        rows = tensor.numel() // tensor.shape[-1]
+        capacity = min(res["max_token_num"], MNNVL_TWOSHOT_MAX_TOKEN)
+        if rows <= capacity:
+            return trtllm_workspace_allreduce(
+                tensor, res["device_group"], fp32_acc=True
+            )
+        chunks = -(-rows // capacity)
+        step = -(-rows // chunks)
+        source = tensor.reshape(rows, tensor.shape[-1])
+        out = torch.empty(source.shape, dtype=source.dtype, device=source.device)
+        for start in range(0, rows, step):
+            if (
+                trtllm_workspace_allreduce(
+                    source[start : start + step],
+                    res["device_group"],
+                    fp32_acc=True,
+                    out=out[start : start + step],
+                )
+                is None
+            ):
+                return None
+        return out.view(tensor.shape)
 
     def lamport_all_gather(
         self, tensor: torch.Tensor, group: Group

@@ -696,8 +696,9 @@ class CacheGroupRouter(AttentionBackend):
         expands the device tables), so a leaf that gathers history by page
         owner can split the gather without a device sync. A page-sharded
         group's leaf gets the mirror for an extend with a prefix too, to split
-        its prefix-chunk gathers the same way; any other forward reads nothing
-        from the mirror.
+        its prefix-chunk gathers the same way. Bounded native prefill also uses
+        it for cold batches to keep the receive pages within the scheduler's
+        budget; other forwards read nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
@@ -744,6 +745,7 @@ class CacheGroupRouter(AttentionBackend):
                     self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
                     if sharded
                     or (extend_with_prefix and gid in self._page_sharded_groups)
+                    or (num_extends > 0 and leaf.prefill_needs_host_page_table)
                     else None
                 ),
             )
@@ -784,13 +786,24 @@ class CacheGroupRouter(AttentionBackend):
         }
         batched = [gid for gid, pair in targets.items() if pair is not None]
         if batched:
-            # One launch fills every such leaf; two stream copies per leaf cost ~4 us each at bs=1.
+            # One launch fills every such leaf (plus one clamp per seq_lens
+            # floor); two stream copies per leaf cost ~4 us each at bs=1.
+            floored = {}
+            for gid in batched:
+                floor = self.leaves[gid].decode_seq_lens_floor
+                if floor not in floored:
+                    floored[floor] = (
+                        seq_lens[:bs] if floor <= 1 else seq_lens[:bs].clamp_min(floor)
+                    )
             torch._foreach_copy_(
                 [buf for gid in batched for buf in targets[gid]],
                 [
                     src
                     for gid in batched
-                    for src in (seq_lens[:bs], self.stacks.table(gid, bs))
+                    for src in (
+                        floored[self.leaves[gid].decode_seq_lens_floor],
+                        self.stacks.table(gid, bs),
+                    )
                 ],
             )
         for gid, leaf in self.leaves.items():

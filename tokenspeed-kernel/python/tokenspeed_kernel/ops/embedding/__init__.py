@@ -428,7 +428,9 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
     Args:
         weight: FP8 E4M3 codes [local_capacity,D], with contiguous columns.
         scales: E8M0 exponent bytes [local_capacity,D/32].
-        indices: Contiguous integer IDs of any shape, on the table's GPU.
+        indices: Integer IDs on the table's GPU. Contiguous tensors may have
+            any shape; two-dimensional tensors may also have strided rows
+            and columns, including a slice of a larger hash table.
         row_start: Global ID of the first locally owned row.
         row_end: Exclusive end of locally owned rows, before capacity padding.
 
@@ -450,14 +452,15 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
     if (
         not indices.is_cuda
         or indices.dtype not in (torch.int32, torch.int64)
-        or not indices.is_contiguous()
+        or (not indices.is_contiguous() and indices.ndim != 2)
         or weight.stride(1) != 1
         or scales.stride(1) != 1
         or weight.device != indices.device
         or scales.device != indices.device
     ):
         raise ValueError(
-            "MXFP8 embedding requires colocated GPU tensors and contiguous IDs/columns"
+            "MXFP8 embedding requires colocated GPU tensors, contiguous table "
+            "columns, and contiguous or two-dimensional IDs"
         )
     kernel = select_kernel(
         "embedding",

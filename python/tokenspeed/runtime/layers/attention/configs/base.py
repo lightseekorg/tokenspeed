@@ -173,11 +173,11 @@ class AttnConfig:
     kv_cache_quant_method: str
     # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
     kv_cache_mxfp8: bool = False
-    # Scheduler prefix granularity (CLI --block-size): the identity axis.
-    prefix_granularity: int
     # Tokens covered by one attention-kernel page. None picks the backend's
-    # per-kernel default (flexible kernels use the prefix granularity;
-    # fixed-page kernels use their own constant).
+    # per-kernel default (flexible kernels use their group's block
+    # granularity; fixed-page kernels use their own constant). For the
+    # ordinary families the registry pins a fixed-page leaf's constant here
+    # before planning, so the recipe sizes its block span to hold whole pages.
     kernel_page_size: int | None = None
     # Physical per-request KV extent: the model's logical context_len plus
     # ServerArgs.spec_context_pad (spec verify overshoot for a finished request
@@ -222,18 +222,25 @@ class AttnConfig:
             raise ValueError("INT8 KV cache is not supported by the runtime")
         if self.qcp_size > 1:
             softmax = softmax_components[0]
-            # The gathered-history extend arm exists on the GPU DSA leaf only;
-            # every other leaf rejects a query shard at its metadata build.
-            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+            # DSA gathers paged history; V4.1 publishes its packed KV from
+            # gathered projections and keeps full logical metadata.
+            is_v41 = softmax.backend_name == "deepseek_v41"
+            if not (
+                is_v41 or (softmax.is_dsa and softmax.backend_name in (None, "dsa"))
+            ):
                 raise ValueError(
-                    "query context parallelism requires GPU DSA attention; "
+                    "query context parallelism requires GPU DSA or V4.1 attention; "
                     f"got {softmax.backend_name!r}"
                 )
+            if not is_v41 and self.qcp_size != self.kvp_size:
+                raise ValueError(
+                    "DSA query context parallelism requires KVP equal to QCP"
+                )
             if torch.device(self.device).type != "cuda":
-                raise ValueError("GPU DSA query context parallelism requires CUDA")
+                raise ValueError("GPU query context parallelism requires CUDA")
             # The sharded KV write gathers the rotated latent and stores it
             # with latent_store, which writes native (bf16) rows only.
-            if (
+            if not is_v41 and (
                 self.kv_cache_dtype is not torch.bfloat16
                 or self.kv_cache_mxfp8
                 or self.kv_cache_quant_method != "none"
@@ -310,7 +317,6 @@ def model_wide_kwargs(
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_mxfp8=kv_cache_mxfp8,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
-        prefix_granularity=server_args.prefix_granularity,
         context_len=model_config.context_len + server_args.spec_context_pad,
         max_bs=server_args.max_num_seqs
         // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),

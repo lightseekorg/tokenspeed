@@ -62,6 +62,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        input_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -131,7 +133,7 @@ class MoELayer(torch.nn.Module):
             self.swiglu_arg = SwigluArg(alpha=activation_alpha, limit=swiglu_limit)
         # Per-model knobs the MoE backend reads in process_weights_after_loading.
         # ``swiglu_beta``: gpt-oss uses silu(α·gate)·(up + 1) and sets 1.0;
-        # standard SwiGLU (e.g. deepseek-v4) leaves it None.
+        # standard SwiGLU (e.g. DeepSeek V4.1) leaves it None.
         # ``w13_input_layout``: "interleaved" for HF gpt-oss-style row layout
         # ([w1_0, w3_0, w1_1, w3_1, ...]); "concatenated" (default) for the
         # shared MoE checkpoint loader's [w1_all | w3_all] block layout.
@@ -228,8 +230,13 @@ class MoELayer(torch.nn.Module):
         internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+            # The loader slices each rank's block scales at ceil(ispp / block)
+            # rows, which follow its weight rows only for a block-aligned
+            # ispp, whatever kernel then runs the layer: pad for every backend.
             self._apply_trtllm_ispp_padding(
-                fp8_scale_block_shape[0], "FP8 block scales tile it"
+                fp8_scale_block_shape[0],
+                "FP8 block scales tile it",
+                every_backend=True,
             )
         if self._quant_kind == "unquant":
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
@@ -337,9 +344,12 @@ class MoELayer(torch.nn.Module):
                 )
             internal_activation_dtype = "mxfp4"
 
-        input_dtype = torch.get_default_dtype()
-        if input_dtype not in {torch.float16, torch.bfloat16}:
-            input_dtype = torch.float16
+        if input_dtype is None:
+            input_dtype = torch.get_default_dtype()
+            if input_dtype not in {torch.float16, torch.bfloat16}:
+                input_dtype = torch.float16
+        elif input_dtype not in {torch.float16, torch.bfloat16}:
+            raise ValueError("MoE input dtype must be FP16 or BF16")
         # The activation dtype the plan is signed for; callers that feed the
         # layer synthetic inputs (kernel tuning) must match it.
         self.input_dtype = input_dtype
@@ -373,7 +383,9 @@ class MoELayer(torch.nn.Module):
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         # --moe-combine-order: how a token's routed contributions meet across
         # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
-        # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".
+        # ServerArgs already refused MoE TP > 1 under "slot"; over DeepEP the
+        # plan admits only a leaf that owns the exchange and folds in slot
+        # order (supports_all_to_all_ep with the slot combine).
         combine_order = global_server_args_dict["moe_combine_order"]
         self.combine_order: str = combine_order
         if combine_order == "slot" and self.ep_size > 1:
@@ -525,6 +537,9 @@ class MoELayer(torch.nn.Module):
             combine_order=combine_order,
             fp32_correction_bias=self._fp32_correction_bias,
         )
+        self.plan["cutlass_fused_finalize"] = global_server_args_dict[
+            "moe_cutlass_fused_finalize"
+        ]
         if precision_policy == "bf16_route_accum_fp32":
             if self.plan["apply_kernel_name"] != "triton_bf16_precomputed_moe_apply":
                 raise ValueError(
@@ -568,7 +583,9 @@ class MoELayer(torch.nn.Module):
             return "standard"
         return "generalized"
 
-    def _apply_trtllm_ispp_padding(self, alignment: int, reason: str) -> None:
+    def _apply_trtllm_ispp_padding(
+        self, alignment: int, reason: str, *, every_backend: bool = False
+    ) -> None:
         """Round the intermediate size up when the trtllm backend needs it.
 
         Args:
@@ -576,11 +593,13 @@ class MoELayer(torch.nn.Module):
                 (the FP8 scale block size, or the kernel's declared
                 ``ispp_alignment``).
             reason: Log fragment describing why the padding is required.
+            every_backend: Pad whatever ``--moe-backend`` is, for a layout
+                that every kernel needs aligned (FP8 block scales).
         """
         backend = get_moe_backend().value
         # Only the trtllm kernels run non-gated experts, so ``auto`` selects them.
         trtllm_only = backend == "auto" and not self._spec.gated
-        if backend != "flashinfer_trtllm" and not trtllm_only:
+        if not every_backend and backend != "flashinfer_trtllm" and not trtllm_only:
             return
         ispp = self.intermediate_size // self.tp_size
         if ispp % alignment == 0:
@@ -599,7 +618,9 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
-        kernel_moe_process_weights(self.plan, module)
+        kernel_moe_process_weights(
+            self.plan, module, communication_initializer=initialize_communication
+        )
         self._weights_processed = True
 
     @property
@@ -625,6 +646,19 @@ class MoELayer(torch.nn.Module):
     @property
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
+
+    @property
+    def deferred_output_is_token_order(self) -> bool:
+        """Whether deferred row ``token * topk + slot`` holds that route.
+
+        Only owned routes are written; with EP > 1 the other rows are stale.
+        """
+        return self.plan["deferred_output_is_token_order"]
+
+    @property
+    def supports_deferred_out(self) -> bool:
+        """Whether the kernel accepts a caller-owned deferred destination."""
+        return self.plan["supports_deferred_out"]
 
     @property
     def supports_deferred_cuda_finalize(self) -> bool:
@@ -660,6 +694,8 @@ class MoELayer(torch.nn.Module):
         shared_out: torch.Tensor | None = None,
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
         routing_prepared: object | None = None,
+        deferred_out: torch.Tensor | None = None,
+        valid_token_mask: torch.Tensor | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -686,6 +722,10 @@ class MoELayer(torch.nn.Module):
             routing_prepared: Routing metadata already populated from the
                 precomputed top-k, so the kernel skips its routing launch.
                 Only kernels advertising prepared routing accept it.
+            deferred_out: Optional caller-owned route destination for
+                ``do_finalize=False``; requires ``supports_deferred_out``.
+            valid_token_mask: Optional live-row mask for a kernel that declares
+                ``valid_token_mask`` support. It is never silently discarded.
 
         Returns:
             Finalized ``[tokens, hidden]`` hidden states, or with
@@ -736,6 +776,8 @@ class MoELayer(torch.nn.Module):
                 **shared_kwargs,
                 x_quantized=x_quantized,
                 routing_prepared=routing_prepared,
+                deferred_out=deferred_out,
+                valid_token_mask=valid_token_mask,
             )
             output_scale = topk_output.output_scale
             if isinstance(output_scale, torch.Tensor):
@@ -762,6 +804,8 @@ class MoELayer(torch.nn.Module):
             **shared_kwargs,
             x_quantized=x_quantized,
             routing_prepared=routing_prepared,
+            deferred_out=deferred_out,
+            valid_token_mask=valid_token_mask,
         )
         if not do_finalize and output[1] is None:
             # Some precomputed-route kernels (Triton MXFP4) return no route

@@ -1,0 +1,1094 @@
+{
+  "tp16-axis0-padding256": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 9472,
+          "plane_id": "test.0.0.layer.0.conv_state",
+          "shape": [
+            1536,
+            3
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            4,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 9472,
+          "plane_id": "test.0.0.layer.0.conv_state"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp16-axis0-padding384": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 9600,
+          "plane_id": "test.0.0.layer.0.conv_state",
+          "shape": [
+            1536,
+            3
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            4,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 9600,
+          "plane_id": "test.0.0.layer.0.conv_state"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp16-axis1-padding256": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state_channels_last",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 9472,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last",
+          "shape": [
+            3,
+            1536
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            4,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 9472,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state_channels_last",
+          "partition": {
+            "axis": 1,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp16-axis1-padding384": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state_channels_last",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 9600,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last",
+          "shape": [
+            3,
+            1536
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            4,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 9600,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 262144,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state_channels_last",
+          "partition": {
+            "axis": 1,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp4-axis0-padding256": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 37120,
+          "plane_id": "test.0.0.layer.0.conv_state",
+          "shape": [
+            6144,
+            3
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            16,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 37120,
+          "plane_id": "test.0.0.layer.0.conv_state"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp4-axis0-padding384": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 37248,
+          "plane_id": "test.0.0.layer.0.conv_state",
+          "shape": [
+            6144,
+            3
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            16,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 37248,
+          "plane_id": "test.0.0.layer.0.conv_state"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp4-axis1-padding256": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state_channels_last",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 37120,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last",
+          "shape": [
+            3,
+            6144
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            16,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 37120,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state_channels_last",
+          "partition": {
+            "axis": 1,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp4-axis1-padding384": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state_channels_last",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 37248,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last",
+          "shape": [
+            3,
+            6144
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            16,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 37248,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 1048576,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state_channels_last",
+          "partition": {
+            "axis": 1,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp8-axis0-padding256": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 18688,
+          "plane_id": "test.0.0.layer.0.conv_state",
+          "shape": [
+            3072,
+            3
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            8,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 18688,
+          "plane_id": "test.0.0.layer.0.conv_state"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp8-axis0-padding384": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 18816,
+          "plane_id": "test.0.0.layer.0.conv_state",
+          "shape": [
+            3072,
+            3
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            8,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 18816,
+          "plane_id": "test.0.0.layer.0.conv_state"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp8-axis1-padding256": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state_channels_last",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 18688,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last",
+          "shape": [
+            3,
+            3072
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            8,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 18688,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state_channels_last",
+          "partition": {
+            "axis": 1,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  },
+  "tp8-axis1-padding384": {
+    "field_addresses": null,
+    "group_specs": [
+      {
+        "attn_kind": "state",
+        "entry_stride_tokens": null,
+        "group_id": "state",
+        "replayable": false,
+        "rows_per_page": null,
+        "shard_count": 1,
+        "sliding_window_tokens": null,
+        "transfer_policy": "latest_snapshot"
+      }
+    ],
+    "plan": {
+      "fields": [
+        {
+          "dtype": "bfloat16",
+          "field_id": "layer.0.conv_state_channels_last",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 18816,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last",
+          "shape": [
+            3,
+            3072
+          ]
+        },
+        {
+          "dtype": "float32",
+          "field_id": "layer.0.recurrent_state",
+          "field_offset_bytes": 0,
+          "group_id": "state",
+          "page_stride_bytes": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state",
+          "shape": [
+            8,
+            128,
+            128
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "cache_blocks_per_lcm_block": 1,
+          "group_id": "state",
+          "page_count": 16
+        }
+      ],
+      "lcm_block_bytes": 1048576,
+      "num_lcm_blocks": 15,
+      "planes": [
+        {
+          "arena_offset_bytes": 0,
+          "bytes_per_lcm_block": 18816,
+          "plane_id": "test.0.0.layer.0.conv_state_channels_last"
+        },
+        {
+          "arena_offset_bytes": 16777216,
+          "bytes_per_lcm_block": 524288,
+          "plane_id": "test.0.1.layer.0.recurrent_state"
+        }
+      ],
+      "prefix_granularity": 2,
+      "resident_block_bytes": null
+    },
+    "transfer_schema": {
+      "fields": [
+        {
+          "field_id": "layer.0.conv_state_channels_last",
+          "partition": {
+            "axis": 1,
+            "global_extent": 24576,
+            "global_parts": [
+              8192,
+              8192,
+              8192
+            ]
+          }
+        },
+        {
+          "field_id": "layer.0.recurrent_state",
+          "partition": {
+            "axis": 0,
+            "global_extent": 64,
+            "global_parts": []
+          }
+        }
+      ]
+    }
+  }
+}

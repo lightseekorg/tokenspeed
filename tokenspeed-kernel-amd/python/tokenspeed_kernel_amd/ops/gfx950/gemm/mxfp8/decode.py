@@ -20,17 +20,21 @@
 
 """Small-M (decode) MXFP8 GEMM for gfx950.
 
-Computes ``A @ B.T`` for E4M3 ``A [M, K]`` and ``B [N, K]`` with one uint8
-UE8M0 scale per 32 K values on each row, FP32 accumulation, and BF16/FP16
-output. Decode GEMMs stream the weight once while the activation stays in L2,
+Computes ``A @ B.T`` for E4M3 ``A [M, K]`` and ``B [N, K]`` with native
+UE8M0 K32 scales or arbitrary FP32 K128 block scales. Both use FP32
+accumulation; the FP32-scale contract produces BF16 output. Decode GEMMs
+stream the weight once while the activation stays in L2,
 so the kernel is organized around weight bandwidth: small N tiles, optional
 split-K to occupy every CU, and a multi-buffered async global-to-LDS pipeline.
 
-gfx950 FP8 MFMAs sum their products at reduced internal precision, so small
+For native UE8M0, gfx950 FP8 MFMAs sum their products at reduced internal
+precision, so small
 results of large cancelling terms miss the FP8 GEMM contract. Instead, each
 32-value scale group runs one BF16 MFMA on the exactly upcast E4M3 values
 (products exact, sums in FP32), and the group's power-of-two row and column
 scales multiply its partial exactly before it joins the FP32 accumulator.
+The FP32-scale specialization instead retains the existing FP8 K128 matrix
+arithmetic, applying activation then weight scales to each unscaled partial.
 """
 
 from __future__ import annotations
@@ -52,7 +56,11 @@ _partial_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 def _mxfp8_decode_launch_metadata(grid, kernel, args):
     """Expose algorithmic FLOPs and tensor traffic to Proton."""
     m, n, k = args["M"], args["N"], args["K"]
-    scale_values = (m + n) * (k // MXFP8_SCALE_GROUP)
+    scale_values = (
+        4 * (m + triton.cdiv(n, 128)) * triton.cdiv(k, 128)
+        if args.get("FP32_SCALES", False)
+        else (m + n) * (k // MXFP8_SCALE_GROUP)
+    )
     split_k = args["SPLIT_K"]
     partial_bytes = 0
     if split_k > 1:
@@ -169,6 +177,10 @@ def _issue_stage(
     K_TAIL: gl.constexpr,
     GROUPS_PER_TILE: gl.constexpr,
     PACKED: gl.constexpr,
+    FP32_SCALES: gl.constexpr,
+    ALIGNED_VALUES: gl.constexpr,
+    stride_ask,
+    stride_bsk,
 ):
     """Start loading one K tile: scales into registers, values into LDS.
 
@@ -179,15 +191,27 @@ def _issue_stage(
     """
     # Advance the scalar base pointers rather than the per-lane offsets, so a
     # runtime K loop adds nothing per lane and keeps no extra offset vectors.
-    kg = k0 // SCALE_GROUP
+    GROUP_SIZE: gl.constexpr = 128 if FP32_SCALES else SCALE_GROUP
+    kg = k0 // GROUP_SIZE
     a_s = ()
     b_s = ()
-    if PACKED:
+    if FP32_SCALES:
+        for g in gl.static_range(GROUPS_PER_TILE):
+            group = kg + g
+            if K_TAIL:
+                group = gl.minimum(group, (K - 1) // 128 - k_begin // 128)
+            a_s = a_s + (
+                cdna4.buffer_load(a_scales_ptr, as_offsets + group * stride_ask),
+            )
+            b_s = b_s + (
+                cdna4.buffer_load(b_scales_ptr, bs_offsets + group * stride_bsk),
+            )
+    elif PACKED:
         # Four consecutive groups are one dword of a scale row.
         for w in gl.static_range(GROUPS_PER_TILE // 4):
             a_s = a_s + (cdna4.buffer_load(a_scales_ptr + kg // 4 + w, as_offsets),)
             b_s = b_s + (cdna4.buffer_load(b_scales_ptr + kg // 4 + w, bs_offsets),)
-    for g in gl.static_range(0 if PACKED else GROUPS_PER_TILE):
+    for g in gl.static_range(0 if PACKED or FP32_SCALES else GROUPS_PER_TILE):
         group = kg + g
         if K_TAIL:
             # A group past K re-reads the last real group: its finite scale
@@ -195,7 +219,24 @@ def _issue_stage(
             group = gl.minimum(group, K // SCALE_GROUP - 1 - k_begin // SCALE_GROUP)
         a_s = a_s + (cdna4.buffer_load(a_scales_ptr + group, as_offsets),)
         b_s = b_s + (cdna4.buffer_load(b_scales_ptr + group, bs_offsets),)
-    if K_TAIL:
+    if not ALIGNED_VALUES:
+        smem_a.store(
+            cdna4.buffer_load(
+                a_ptr + k0,
+                a_offsets,
+                mask=a_row_mask & (a_k_offs + k0 < K)[None, :],
+                other=0.0,
+            )
+        )
+        smem_b.store(
+            cdna4.buffer_load(
+                b_ptr + k0,
+                b_offsets,
+                mask=(b_k_offs + k0 < K)[:, None],
+                other=0.0,
+            )
+        )
+    elif K_TAIL:
         # Zero both operands past K: an unmasked B tail would read the next
         # row, and zero times a NaN code would poison the accumulator.
         async_copy.buffer_load_to_shared(
@@ -228,10 +269,26 @@ def _mma_tile(
     BLOCK_N: gl.constexpr,
     GROUPS_PER_TILE: gl.constexpr,
     PACKED: gl.constexpr,
+    FP32_SCALES: gl.constexpr,
 ):
-    """Accumulate one K tile, one BF16 MFMA per 32-value scale group."""
+    """Accumulate one K tile with the arithmetic of its scale contract."""
     # Issue every group's MFMA before scaling any partial, so MFMA latency
     # overlaps instead of stalling each group's scaling.
+    if FP32_SCALES:
+        for g in gl.static_range(GROUPS_PER_TILE):
+            a = buf_a.slice(g * 128, 128, dim=1).load(dot_a)
+            b = buf_b.slice(g * 128, 128, dim=0).load(dot_b)
+            partial = cdna4.mfma_scaled(
+                a,
+                None,
+                "e4m3",
+                b,
+                None,
+                "e4m3",
+                gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma),
+            )
+            acc = gl.fma(partial * a_s[g][:, None], b_s[g][None, :], acc)
+        return acc
     parts = ()
     for g in gl.static_range(GROUPS_PER_TILE):
         # E4M3 values are exact in BF16, so the MFMA's products are exact and
@@ -275,6 +332,8 @@ def gluon_mm_mxfp8_decode_gfx950(
     stride_asm,
     stride_bsn,
     stride_cm,
+    stride_ask,
+    stride_bsk,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -284,8 +343,10 @@ def gluon_mm_mxfp8_decode_gfx950(
     SPLIT_K: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     PACKED_SCALES: gl.constexpr,
+    FP32_SCALES: gl.constexpr,
+    ALIGNED_VALUES: gl.constexpr,
 ):
-    """Multi-buffered exact-upcast MXFP8 GEMM for decode-sized ``M``.
+    """Multi-buffered FP8 GEMM for decode-sized ``M``.
 
     Program ids enumerate (split, n tile, m tile) with the M tile fastest, so
     programs that share a weight tile are adjacent and, after the XCD remap,
@@ -322,15 +383,15 @@ def gluon_mm_mxfp8_decode_gfx950(
     k_begin = split * (TILES_PER_SPLIT * BLOCK_K)
 
     # One 16x16x32 BF16 MFMA consumes exactly one 32-value scale group.
-    GROUPS_PER_TILE: gl.constexpr = BLOCK_K // SCALE_GROUP
+    GROUPS_PER_TILE: gl.constexpr = BLOCK_K // (128 if FP32_SCALES else SCALE_GROUP)
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, 128] if FP32_SCALES else [16, 16, 32],
         transposed=True,
         warps_per_cta=[WARPS_M, WARPS_N],
     )
-    dot_a: gl.constexpr = gl.DotOperandLayout(0, mfma, 8)
-    dot_b: gl.constexpr = gl.DotOperandLayout(1, mfma, 8)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, mfma, 32 if FP32_SCALES else 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, mfma, 32 if FP32_SCALES else 8)
     row_layout: gl.constexpr = gl.SliceLayout(1, mfma)
     col_layout: gl.constexpr = gl.SliceLayout(0, mfma)
 
@@ -356,20 +417,25 @@ def gluon_mm_mxfp8_decode_gfx950(
     a_rows = pid_m * BLOCK_M + offs_am
     a_row_mask = (a_rows < M)[:, None]
     a_offsets = a_rows[:, None] * stride_am + (k_begin + a_k_offs)[None, :]
-    a_offsets = gl.max_contiguous(gl.multiple_of(a_offsets, [1, 16]), [1, 16])
+    if ALIGNED_VALUES:
+        a_offsets = gl.max_contiguous(gl.multiple_of(a_offsets, [1, 16]), [1, 16])
 
     offs_bn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gload_b))
     b_k_offs = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gload_b))
     b_rows = gl.minimum(pid_n * BLOCK_N + offs_bn, N - 1)
     b_offsets = b_rows[None, :] * stride_bn + (k_begin + b_k_offs)[:, None]
-    b_offsets = gl.max_contiguous(gl.multiple_of(b_offsets, [16, 1]), [16, 1])
-    if K_TAIL:
+    if ALIGNED_VALUES:
+        b_offsets = gl.max_contiguous(gl.multiple_of(b_offsets, [16, 1]), [16, 1])
+    if K_TAIL or not ALIGNED_VALUES:
         a_k_offs = a_k_offs + k_begin
         b_k_offs = b_k_offs + k_begin
 
     as_rows = gl.minimum(pid_m * BLOCK_M + gl.arange(0, BLOCK_M, row_layout), M - 1)
     bs_rows = gl.minimum(pid_n * BLOCK_N + gl.arange(0, BLOCK_N, col_layout), N - 1)
-    if PACKED_SCALES:
+    if FP32_SCALES:
+        as_offsets = as_rows * stride_asm + (k_begin // 128) * stride_ask
+        bs_offsets = (bs_rows // 128) * stride_bsn + (k_begin // 128) * stride_bsk
+    elif PACKED_SCALES:
         # Scale pointers are int32 views and strides count dwords.
         as_offsets = as_rows * stride_asm + k_begin // (4 * SCALE_GROUP)
         bs_offsets = bs_rows * stride_bsn + k_begin // (4 * SCALE_GROUP)
@@ -404,6 +470,10 @@ def gluon_mm_mxfp8_decode_gfx950(
                 K_TAIL,
                 GROUPS_PER_TILE,
                 PACKED_SCALES,
+                FP32_SCALES,
+                ALIGNED_VALUES,
+                stride_ask,
+                stride_bsk,
             ),
         )
 
@@ -433,6 +503,10 @@ def gluon_mm_mxfp8_decode_gfx950(
             K_TAIL,
             GROUPS_PER_TILE,
             PACKED_SCALES,
+            FP32_SCALES,
+            ALIGNED_VALUES,
+            stride_ask,
+            stride_bsk,
         )
         acc = _mma_tile(
             smem_a.index(t % NUM_BUFFERS),
@@ -447,6 +521,7 @@ def gluon_mm_mxfp8_decode_gfx950(
             BLOCK_N,
             GROUPS_PER_TILE,
             PACKED_SCALES,
+            FP32_SCALES,
         )
         scales = scales[1:] + (next_scales,)
     for e in gl.static_range(NUM_BUFFERS - 1):
@@ -466,6 +541,7 @@ def gluon_mm_mxfp8_decode_gfx950(
             BLOCK_N,
             GROUPS_PER_TILE,
             PACKED_SCALES,
+            FP32_SCALES,
         )
 
     offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, mfma))
@@ -553,7 +629,14 @@ def _launch(A, B, A_scales, B_scales, C, config, counters):
         partial = counters = C
     # Four-group scale words need 4-byte aligned rows and whole words per tile.
     # A K tail would read the next row's scale bytes into the padded groups.
-    packed = (K % block_k == 0 and block_k % (4 * MXFP8_SCALE_GROUP) == 0) and all(
+    fp32_scales = A_scales.dtype == torch.float32
+    # K128 FP8 operands need more per-wave state than the native BF16 K32
+    # arithmetic; distribute a full 64-square tile over four waves.
+    if fp32_scales and block_m == 64 and block_n == 64 and warps_m * warps_n < 4:
+        warps_m, warps_n = 2, 2
+    packed = (
+        not fp32_scales and K % block_k == 0 and block_k % (4 * MXFP8_SCALE_GROUP) == 0
+    ) and all(
         scale.stride(0) % 4 == 0 and scale.data_ptr() % 4 == 0
         for scale in (A_scales, B_scales)
     )
@@ -576,6 +659,8 @@ def _launch(A, B, A_scales, B_scales, C, config, counters):
         A_scales.stride(0),
         B_scales.stride(0),
         C.stride(0),
+        A_scales.stride(1),
+        B_scales.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -585,6 +670,10 @@ def _launch(A, B, A_scales, B_scales, C, config, counters):
         SPLIT_K=split_k,
         NUM_XCDS=num_xcds,
         PACKED_SCALES=packed,
+        FP32_SCALES=fp32_scales,
+        ALIGNED_VALUES=all(
+            value.stride(0) % 16 == 0 and value.data_ptr() % 16 == 0 for value in (A, B)
+        ),
         num_warps=warps_m * warps_n,
     )
     return C
@@ -747,15 +836,18 @@ def launch_gluon_mm_mxfp8_decode_gfx950(
     """Compute a decode-sized MXFP8 ``A @ B.T`` on gfx950.
 
     Args:
-        A: E4M3 activation ``[M, K]`` with ``1 <= M <= 256``, unit inner
-            stride and a 16-byte-aligned row stride.
-        B: E4M3 weight ``[N, K]`` with unit inner stride and a 16-byte-aligned
-            row stride; ``K`` must be a multiple of 32.
-        A_scales: uint8 UE8M0 scales ``[M, K/32]`` with unit inner stride.
-        B_scales: uint8 UE8M0 scales ``[N, K/32]`` with unit inner stride.
+        A: E4M3 activation ``[M, K]`` with ``1 <= M <= 256`` and unit inner
+            stride. Native UE8M0 additionally requires 16-byte-aligned rows.
+        B: E4M3 weight ``[N, K]`` with the same value-stride contract;
+            ``K`` must be a multiple of 32.
+        A_scales: uint8 UE8M0 ``[M, K/32]`` with unit inner stride, or FP32
+            ``[M, ceil(K/128)]`` with arbitrary strides.
+        B_scales: uint8 UE8M0 ``[N, K/32]`` with unit inner stride, or FP32
+            ``[ceil(N/128), ceil(K/128)]`` with arbitrary strides.
         out_dtype: BF16 or FP16 output element type.
         alpha: Optional output multiplier applied after the GEMM.
-        block_size: Logical scale block; must be ``[1, 32]``.
+        block_size: ``[1, 32]`` for UE8M0 or ``[128, 128]`` for FP32 scales;
+            the latter requires BF16 output.
         counters: Zeroed int32 split-K arrival counters, at least
             ``gluon_mm_mxfp8_decode_num_counters_gfx950(M, N, K)`` of them;
             the launch leaves them zeroed (see ``splitk.py``).
@@ -770,12 +862,13 @@ def launch_gluon_mm_mxfp8_decode_gfx950(
         raise TypeError("gfx950 MXFP8 decode GEMM requires E4M3 A and B")
     if not A.is_cuda or B.device != A.device:
         raise ValueError("gfx950 MXFP8 decode GEMM requires colocated GPU operands")
-    if list(block_size) != [1, MXFP8_SCALE_GROUP]:
-        raise ValueError(
-            f"gfx950 MXFP8 decode GEMM requires block_size=[1, {MXFP8_SCALE_GROUP}]"
-        )
+    fp32_scales = list(block_size) == [128, 128]
+    if list(block_size) not in ([1, MXFP8_SCALE_GROUP], [128, 128]):
+        raise ValueError("gfx950 decode GEMM requires block_size=[1, 32] or [128, 128]")
     if out_dtype not in _SUPPORTED_OUTPUT_DTYPES:
         raise TypeError(f"gfx950 MXFP8 decode GEMM does not support {out_dtype}")
+    if fp32_scales and out_dtype != torch.bfloat16:
+        raise TypeError("FP32 block-scale decode GEMM requires BF16 output")
     M, K = A.shape
     N, b_k = B.shape
     if b_k != K:
@@ -785,8 +878,8 @@ def launch_gluon_mm_mxfp8_decode_gfx950(
     for name, tensor in (("A", A), ("B", B)):
         if (
             tensor.stride(1) != 1
-            or tensor.stride(0) % 16 != 0
-            or tensor.data_ptr() % 16 != 0
+            or (not fp32_scales and tensor.stride(0) % 16 != 0)
+            or (not fp32_scales and tensor.data_ptr() % 16 != 0)
         ):
             raise ValueError(
                 f"gfx950 MXFP8 decode GEMM requires {name} with unit inner "
@@ -794,8 +887,22 @@ def launch_gluon_mm_mxfp8_decode_gfx950(
             )
     if A_scales.device != A.device or B_scales.device != A.device:
         raise ValueError("gfx950 MXFP8 decode scales must share the operand device")
-    _validate_scale("A_scales", A_scales, M, K)
-    _validate_scale("B_scales", B_scales, N, K)
+    if fp32_scales:
+        for name, scale, rows in (
+            ("A_scales", A_scales, M),
+            ("B_scales", B_scales, triton.cdiv(N, 128)),
+        ):
+            if scale.dtype != torch.float32 or tuple(scale.shape) != (
+                rows,
+                triton.cdiv(K, 128),
+            ):
+                raise ValueError(
+                    f"{name} must be FP32 with shape {(rows, triton.cdiv(K, 128))}, "
+                    f"got dtype={scale.dtype}, shape={tuple(scale.shape)}"
+                )
+    else:
+        _validate_scale("A_scales", A_scales, M, K)
+        _validate_scale("B_scales", B_scales, N, K)
 
     if out is None:
         output = torch.empty((M, N), device=A.device, dtype=out_dtype)

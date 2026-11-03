@@ -22,8 +22,8 @@
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
 are dense and pin the smallest packing whose plane width covers one per-layer
-KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
-byte width so no parent is wasted.
+KDA state (12 at attn tp=8 with the default FP32 state, 6 with BF16); the state
+groups pack to match the MLA plane's byte width so no parent is wasted.
 """
 
 from __future__ import annotations
@@ -39,12 +39,12 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnCo
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
-    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_recurrent_state_dtype,
     kda_replay_supported,
     kda_verify_workspace_bytes,
 )
@@ -227,6 +227,10 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError("Kimi-K3 cache requires a linear-attention component")
         return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
 
+    @cached_property
+    def _recurrent_dtype(self) -> torch.dtype:
+        return kda_recurrent_state_dtype(self.server_args)
+
     @override
     def fields_for_layer(
         self, layer_id: int, group_id: str, occurrence: int
@@ -261,7 +265,7 @@ class KimiK3Recipe(CacheRecipe):
                 f"layer.{layer_id}.recurrent_state",
                 plane_id,
                 recurrent_shape,
-                cache_dtype_name(torch.float32),
+                cache_dtype_name(self._recurrent_dtype),
                 exact_page_stride=False,
             ),
         )
@@ -317,44 +321,33 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def replay_kda(self) -> bool:
-        """Whether verify commits by replaying from one conv checkpoint row."""
-        if self.server_args.speculative_algorithm is None:
-            return False
+        """Whether target decode uses replay, including the one-token window."""
         return kda_replay_supported(self.attn_config)
-
-    @override
-    def verify_scratch_in_pool(self) -> bool:
-        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
-        if (
-            self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-        ):
-            # Verify staging exists for the target's verify step; the prefill
-            # role only ever writes committed prompt state.
+        if self.server_args.disaggregation_mode == "prefill":
+            return 0
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        if width == 1 and not self.replay_kda:
             return 0
         return kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
-            draft_token_num=int(self.server_args.speculative_num_draft_tokens),
+            draft_token_num=width,
             replay_kda=self.replay_kda,
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
-        )
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
         if self.token_limit is None:
-            return budgeted
+            return max_lcm_blocks
         # A token limit caps history, not the unsharded KDA working set.
         # Use the same per-group demand as the inverse capacity calculation.
-        return min(budgeted, self.parents_needed(layout, self.token_limit))
+        return min(max_lcm_blocks, self.parents_needed(layout, self.token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

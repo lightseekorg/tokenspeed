@@ -913,6 +913,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """Multimodal Qwen4-Exp entry class using the Qwen3.5 vision tower."""
 
     model_cls = Qwen4ExpModel
+    # Its backbone returns its own HC-width state, not the taps ``layers_to_capture`` names.
+    supports_aux_capture = False
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         _configure_dspark_capture(self.model, layer_ids)

@@ -31,7 +31,10 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_topk,
     dsa_prefill_topk,
 )
-from tokenspeed_kernel.ops.attention.dsa.triton import workspace_topk_to_global_slots
+from tokenspeed_kernel.ops.attention.dsa.triton import (
+    local_topk_to_global_slots,
+    workspace_topk_to_global_slots,
+)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -54,6 +57,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.utils import get_layer_id
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
@@ -64,7 +68,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3MLP,
     DeepseekV3Model,
     DeepseekV3MoE,
-    get_layer_id,
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -596,7 +599,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 - (q_len_per_req - 1)
                 + torch.arange(q.shape[0], device=q.device) % q_len_per_req
             )
-            offsets, counts = select_dsa_topk(
+            offsets, _ = select_dsa_topk(
                 q,
                 weights,
                 index_k_cache,
@@ -611,13 +614,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 local_tokens=0,
                 max_logits_bytes=64 * 1024 * 1024,
             )
-            pages = page_table[
-                requests.long().unsqueeze(1), offsets.clamp_min(0).long() // page_size
-            ]
-            topk_slice.copy_(
-                torch.where(offsets >= 0, pages * page_size + offsets % page_size, -1)
+            local_topk_to_global_slots(
+                local_topk_offsets=offsets,
+                block_table=page_table,
+                block_size=page_size,
+                seq_lens=None,
+                q_len_per_req=q_len_per_req,
+                topk_layout="global_slots",
+                out=topk_slice,
+                lens_out=topk_lens_slice,
             )
-            topk_lens_slice.copy_(counts)
         else:
             dsa_decode_topk(
                 q,
@@ -840,7 +846,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     ) -> torch.Tensor:
         """GLM-5 DSA attention, one COARSE breakable-graph break point.
 
-        Like DeepSeek-V4 it does cache-group writes, a data-dependent indexer
+        Like DeepSeek V4.1 it does cache-group writes, a data-dependent indexer
         -> top-k stage and the FlashMLA sparse kernel (plus pre-attn
         collectives), none capturable. Under a prefill-graph capture the whole
         attention runs eager (reading the live ``ctx``) while the layer's
@@ -1263,7 +1269,6 @@ class GlmMoeDsaModel(DeepseekV3Model):
     ) -> None:
         nn.Module.__init__(self)
         self.mapping = mapping
-        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -1337,14 +1342,12 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
         self,
         config: PretrainedConfig,
         mapping: Mapping,
-        model: GlmMoeDsaModel | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
             config,
             mapping,
-            model=model,
             quant_config=quant_config,
             prefix=prefix,
         )

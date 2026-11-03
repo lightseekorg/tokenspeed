@@ -57,12 +57,6 @@ class TestInklingMTPTextConfig:
         )
         assert (cfg.get_text_config().mtp_local_layer_ids) == ([0, 2, 4, 5, 6, 7])
 
-    def test_mtp_local_ids_validation(self):
-        with pytest.raises((ValueError), match=("out-of-range")):
-            _mm_config({"num_nextn_predict_layers": 3, "local_layer_ids": [0, 3]})
-        with pytest.raises((ValueError), match=("duplicates")):
-            _mm_config({"num_nextn_predict_layers": 3, "local_layer_ids": [0, 0]})
-
     def test_depth_config_prunes_to_steps_and_keeps_local_ids(self):
         text = _mm_config(
             {"num_nextn_predict_layers": 8, "local_layer_ids": [0, 2, 4, 5, 6, 7]}

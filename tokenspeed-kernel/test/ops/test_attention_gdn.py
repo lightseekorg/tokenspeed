@@ -31,7 +31,9 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MIN_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    GdnStateCheckpoints,
     _qkv_rows_strided,
+    gdn_chain_verify,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -473,6 +475,103 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
 
     assert result.out.shape == v.shape
     assert result.final_state.shape == initial_state.shape
+
+
+def test_gdn_chunk_prefill_state_checkpoints_are_the_truncated_final_states(
+    device: str, require
+):
+    # A caller-owned checkpoint buffer at a 128-token interval: sequence i's
+    # j-th state is the final state of the same scan cut after (j + 1) * 128
+    # of its tokens, bit for bit.
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    lengths = (300, 520)
+    interval = 128
+    q, k, v, g, beta, initial_state, _ = _make_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        seq_len=sum(lengths),
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.float32,
+        nonzero_state=True,
+    )
+    initial_state = initial_state.repeat(len(lengths), 1, 1, 1)
+    initial_state[1] *= -1
+    starts = (0, lengths[0])
+    cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+    counts = [length // interval for length in lengths]
+    cu_starts = torch.tensor([0, counts[0], counts[0] + counts[1]], dtype=torch.int32)
+    states = torch.full(
+        (sum(counts), *initial_state.shape[1:]), float("nan"), device=device
+    )
+    scale = q.shape[-1] ** -0.5
+    gdn_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens.to(device=device, dtype=torch.int32),
+        qk_l2norm=True,
+        output_final_state=True,
+        state_checkpoints=GdnStateCheckpoints(
+            every_n_tokens=interval, states=states, cu_starts=cu_starts.to(device)
+        ),
+    )
+    for i, (start, count) in enumerate(zip(starts, counts)):
+        for j in range(count):
+            end = start + (j + 1) * interval
+            truncated = gdn_chunk_prefill(
+                q[:, start:end],
+                k[:, start:end],
+                v[:, start:end],
+                g[:, start:end],
+                beta[:, start:end],
+                scale=scale,
+                initial_state=initial_state[i : i + 1],
+                cu_seqlens=torch.tensor(
+                    [0, end - start], device=device, dtype=torch.int32
+                ),
+                qk_l2norm=True,
+                output_final_state=True,
+            )
+            assert torch.equal(
+                states[int(cu_starts[i]) + j], truncated.final_state[0]
+            ), (i, j)
+
+
+def test_gdn_chunk_prefill_state_checkpoints_exclude_output_h(device: str, require):
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        seq_len=128,
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.float32,
+        nonzero_state=False,
+    )
+    checkpoints = GdnStateCheckpoints(
+        every_n_tokens=64,
+        states=torch.empty((2, *initial_state.shape[1:]), device=device),
+        cu_starts=torch.tensor([0, 2], device=device, dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="exclusive"):
+        gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=None,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=True,
+            output_h=True,
+            state_checkpoints=checkpoints,
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1990,3 +2089,244 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
         ):
             for batch in (1, 2, 3, 5, 8, 17, 33):
                 run(batch, T, rows, payload)
+
+
+def _chain_verify(q, k, v, pool, read_idx, **common):
+    """The chunked chain verify, checking it leaves the pool untouched."""
+    before = pool.clone()
+    out = gdn_chain_verify(
+        q, k, v, initial_state=pool, initial_state_indices=read_idx, **common
+    )
+    assert torch.equal(pool, before)
+    return out
+
+
+@pytest.mark.parametrize("T", [1, 3, 4, 5, 8, 9, 13, 16])
+@pytest.mark.parametrize(
+    ("dtype", "num_v_heads", "batch"),
+    [
+        (torch.bfloat16, 12, 2),
+        (torch.bfloat16, 12, 8),
+        (torch.bfloat16, 12, 20),
+        (torch.bfloat16, 12, 40),
+        (torch.float16, 8, 4),
+    ],
+)
+def test_gdn_chain_verify_matches_float64_reference(
+    device: str, T: int, dtype: torch.dtype, num_v_heads: int, batch: int, require
+):
+    """Every row bucket and launch tier against float64, with a zero-output padding request."""
+    require("attention", "gdn_chain_verify", "triton", dtype, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=dtype,
+        T=T,
+        batch=batch,
+        num_v_heads=num_v_heads,
+        pool_size=batch + 1,
+    )
+    a, b = a.to(dtype), b.to(dtype)
+    read_idx = torch.randperm(batch, device=device).to(torch.int32) + 1
+    read_idx[1] = -1
+    scale = q.shape[-1] ** -0.5
+    common = dict(
+        A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True
+    )
+    out = _chain_verify(q, k, v, pool, read_idx, **common)
+    start = torch.where(
+        read_idx[:, None, None, None] >= 0, pool[read_idx.clamp(min=0).long()], 0.0
+    )
+    want, _ = _torch_gdn_tree_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        start,
+        scale,
+        [[t - 1 for t in range(T)]] * batch,
+        use_qk_l2norm=True,
+    )
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+    live = read_idx >= 0
+    # The products round q and the normalized key (with its residual) to the state dtype.
+    torch.testing.assert_close(out[live].double(), want[live], rtol=2**-7, atol=2e-4)
+
+
+@pytest.mark.parametrize("T", [4, 16])
+@pytest.mark.parametrize(
+    ("A_log_value", "state_value", "one_row"),
+    [(88.0, None, False), (89.0, None, False), (10.0, 3e38, False), (None, None, True)],
+)
+def test_gdn_chain_verify_keeps_extreme_gates_finite(
+    device: str,
+    T: int,
+    A_log_value: float | None,
+    state_value: float | None,
+    one_row: bool,
+    require,
+):
+    """Overflowing or infinite gates decay to zero, not NaN; later decays stay exact."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device, dtype=torch.bfloat16, T=T, pool_size=4
+    )
+    a, b = a.bfloat16(), b.bfloat16()
+    if A_log_value is not None:
+        A_log = torch.full_like(A_log, A_log_value)
+    if one_row:
+        a[:, T // 2] = 3e38
+    if state_value is not None:
+        pool.fill_(state_value)
+    read_idx = torch.arange(4, device=device, dtype=torch.int32)
+    scale = q.shape[-1] ** -0.5
+    common = dict(
+        A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True
+    )
+    out = _chain_verify(q, k, v, pool, read_idx, **common)
+    want, _ = _torch_gdn_tree_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[read_idx.long()],
+        scale,
+        [[t - 1 for t in range(T)]] * 4,
+        use_qk_l2norm=True,
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double(), want, rtol=2**-7, atol=2e-4)
+
+
+@pytest.mark.parametrize("T", [3, 13])
+def test_gdn_chain_verify_reads_strided_rows_and_gates(device: str, T: int, require):
+    """Strided q/k/v rows and unaligned gate views give bitwise the dense inputs' outputs."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    batch, num_v_heads = 5, 12
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        batch=batch,
+        num_v_heads=num_v_heads,
+        pool_size=batch,
+    )
+    a, b = a.bfloat16(), b.bfloat16()
+    rows = batch * T
+    common = dict(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=pool,
+        initial_state_indices=torch.arange(batch, device=device, dtype=torch.int32),
+        scale=None,
+        use_qk_l2norm=True,
+    )
+    dense = gdn_chain_verify(q, k, v, a=a, b=b, **common)
+    # [q | k | v] rows padded to a wider stride, gates at an odd column offset.
+    widths = [q[0, 0].numel(), k[0, 0].numel(), v[0, 0].numel()]
+    packed = torch.zeros(rows, sum(widths) + 64, device=device, dtype=torch.bfloat16)
+    projection = torch.zeros(
+        rows, 3 + 2 * num_v_heads, device=device, dtype=torch.bfloat16
+    )
+    views = []
+    start = 0
+    for tensor, width in zip((q, k, v), widths):
+        view = packed[:, start : start + width]
+        view.copy_(tensor.reshape(rows, width))
+        views.append(view.view(batch, T, -1, tensor.shape[-1]))
+        start += width
+    gates = []
+    for offset, tensor in ((3, a), (3 + num_v_heads, b)):
+        view = projection[:, offset : offset + num_v_heads]
+        view.copy_(tensor.reshape(rows, num_v_heads))
+        gates.append(view.view(batch, T, num_v_heads))
+    strided = gdn_chain_verify(*views, a=gates[0], b=gates[1], **common)
+    assert torch.equal(strided, dense)
+
+
+def test_gdn_chain_verify_without_qk_l2norm(device: str, require):
+    """Callers that normalize q and k themselves pass an explicit scale."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    T, batch = 4, 3
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device, dtype=torch.bfloat16, T=T, batch=batch, pool_size=batch
+    )
+    q, k = (F.normalize(x.float(), dim=-1).bfloat16() for x in (q, k))
+    a, b = a.bfloat16(), b.bfloat16()
+    read_idx = torch.arange(batch, device=device, dtype=torch.int32)
+    out = _chain_verify(
+        q,
+        k,
+        v,
+        pool,
+        read_idx,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=0.5,
+        use_qk_l2norm=False,
+    )
+    want, _ = _torch_gdn_tree_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[read_idx.long()],
+        0.5,
+        [[t - 1 for t in range(T)]] * batch,
+        use_qk_l2norm=False,
+    )
+    torch.testing.assert_close(out.double(), want, rtol=2**-7, atol=2e-4)
+
+
+def test_gdn_chain_verify_compiles_once_per_launch_tier(device: str, require):
+    """Launches at ``gdn_chain_verify_warm_batch_sizes`` compile every batch and row count."""
+    require("attention", "gdn_chain_verify", "triton", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.gdn._triton.chain_verify import (
+        gdn_chain_verify_kernel,
+    )
+    from tokenspeed_kernel.ops.attention.gdn.triton import (
+        gdn_chain_verify_warm_batch_sizes,
+    )
+
+    num_v_heads = 12
+
+    def run(batch: int, T: int) -> None:
+        q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+            device=device,
+            dtype=torch.bfloat16,
+            T=T,
+            batch=batch,
+            num_v_heads=num_v_heads,
+            pool_size=batch,
+        )
+        gdn_chain_verify(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a.bfloat16(),
+            dt_bias=dt_bias,
+            b=b.bfloat16(),
+            initial_state=pool,
+            initial_state_indices=torch.arange(batch, device=device, dtype=torch.int32),
+            scale=None,
+            use_qk_l2norm=True,
+        )
+
+    for T in (3, 8, 16):
+        for batch in gdn_chain_verify_warm_batch_sizes(range(1, 129), num_v_heads, T):
+            run(batch, T)
+    with assert_no_triton_compile(gdn_chain_verify_kernel):
+        for T in (3, 4, 5, 8, 13, 16):
+            for batch in (1, 5, 9, 20, 32, 40, 65, 90, 128):
+                run(batch, T)

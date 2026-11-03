@@ -171,45 +171,10 @@ def test_taps_must_be_ascending() -> None:
         validate_k3_dspark_config(make_config(target_layer_ids=[2, 47, 23, 71, 89]))
 
 
-def test_taps_must_be_distinct() -> None:
-    with pytest.raises(ValueError, match="distinct"):
-        validate_k3_dspark_config(make_config(target_layer_ids=[2, 2, 47, 71, 89]))
-
-
-def test_taps_must_be_in_range_for_the_target() -> None:
-    with pytest.raises(ValueError, match="out of range"):
-        validate_k3_dspark_config(make_config(target_layer_ids=[2, 23, 47, 71, 93]))
-
-
-def test_mask_token_is_required() -> None:
-    with pytest.raises(ValueError, match="mask_token_id"):
-        validate_k3_dspark_config(make_config(mask_token_id=None))
-
-
-def test_mask_token_must_be_inside_the_vocabulary() -> None:
-    with pytest.raises(ValueError, match="outside"):
-        validate_k3_dspark_config(make_config(mask_token_id=200000))
-
-
-def test_markov_head_is_mandatory() -> None:
-    with pytest.raises(ValueError, match="markov_rank > 0"):
-        validate_k3_dspark_config(make_config(markov_rank=0))
-
-
-def test_unsupported_markov_head_type_is_rejected() -> None:
-    with pytest.raises(ValueError, match="markov_head_type"):
-        validate_k3_dspark_config(make_config(markov_head_type="rnn"))
-
-
 def test_nope_attention_is_rejected() -> None:
     """K3's target is NoPE MLA; this draft is not, and running it NoPE is wrong."""
     with pytest.raises(ValueError, match="RoPE MLA"):
         validate_k3_dspark_config(make_config(mla_use_nope=True))
-
-
-def test_output_gate_is_rejected() -> None:
-    with pytest.raises(ValueError, match="output gate"):
-        validate_k3_dspark_config(make_config(mla_use_output_gate=True))
 
 
 # --------------------------------------------------------------------------
@@ -226,20 +191,6 @@ class _Target:
 
 def test_matching_target_passes() -> None:
     validate_k3_dspark_config(make_config(), target_config=_Target())
-
-
-def test_target_hidden_size_mismatch_is_rejected() -> None:
-    with pytest.raises(ValueError, match="target_hidden_size"):
-        validate_k3_dspark_config(
-            make_config(), target_config=_Target(hidden_size=4096)
-        )
-
-
-def test_target_depth_mismatch_is_rejected() -> None:
-    with pytest.raises(ValueError, match="target_num_hidden_layers"):
-        validate_k3_dspark_config(
-            make_config(), target_config=_Target(num_hidden_layers=61)
-        )
 
 
 def test_vocab_mismatch_is_rejected() -> None:

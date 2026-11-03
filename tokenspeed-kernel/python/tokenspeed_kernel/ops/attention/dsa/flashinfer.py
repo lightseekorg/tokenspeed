@@ -63,7 +63,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
     )
 
 if platform.is_blackwell or platform.is_hopper:
-    from flashinfer.mla import get_trtllm_gen_multi_ctas_kv_counter_bytes
+    from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
 
 def _resolve_enable_pdl(enable_pdl: bool | None) -> bool:

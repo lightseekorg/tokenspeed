@@ -148,9 +148,6 @@ class LlamaAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Dense Llama is consistently bias-free (`attention_bias=False` in every
         # upstream release). Still read it off the config so forks that flip
         # the flag load without surprises.
@@ -179,13 +176,7 @@ class LlamaAttention(nn.Module):
             tp_group=attn_tp_group,
             prefix=add_prefix("o_proj", prefix),
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
+        self.rotary_emb = self.resolve_rotary_emb(config)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
@@ -195,6 +186,16 @@ class LlamaAttention(nn.Module):
             sliding_window_size=sliding_window_size,
             rotary_emb=self.rotary_emb,
             qk_norm=None,
+        )
+
+    def resolve_rotary_emb(self, config: LlamaConfig) -> nn.Module | None:
+        """The rotary embedding of q and k, or None for attention without one."""
+        return get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=getattr(config, "max_position_embeddings", 8192),
+            base=get_rope_theta(config),
+            rope_scaling=getattr(config, "rope_scaling", None),
         )
 
     def forward(
@@ -260,25 +261,7 @@ class LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLM(BaseCausalLM):
     model_cls = LlamaModel
-
-    # BitsAndBytes target/stacked modules — kept in sync with the Qwen3 / MoE
-    # variants so a single quantization config works across the Llama family.
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+    supports_aux_capture = True
 
     def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
         return [

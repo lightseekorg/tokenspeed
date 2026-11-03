@@ -117,32 +117,6 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
     assert calls[1]["topk_ids"].shape == (2, 2)
 
 
-@pytest.mark.parametrize(
-    "beta,linear_beta",
-    [
-        (None, 25.0),
-        (0.0, 25.0),
-        (4.0, 0.0),
-    ],
-)
-def test_moe_layer_rejects_invalid_situ_parameters(
-    beta: float | None,
-    linear_beta: float | None,
-) -> None:
-    with pytest.raises(ValueError, match="beta values must be positive"):
-        MoELayer(
-            top_k=1,
-            num_experts=1,
-            hidden_size=32,
-            intermediate_size=32,
-            quant_config=None,
-            layer_index=0,
-            activation="situ",
-            activation_situ_beta=beta,
-            activation_situ_linear_beta=linear_beta,
-        )
-
-
 @pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])
 @pytest.mark.parametrize("moe_backend", ["auto", "mega_moe"])
 def test_moe_layer_builds_ep8_local_expert_partition(

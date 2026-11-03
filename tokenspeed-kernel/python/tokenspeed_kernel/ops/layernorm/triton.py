@@ -15,9 +15,10 @@ from tokenspeed_kernel.ops.quantization.triton import (
     fp8_token_multiplier,
     fp8_token_scale,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.warmup import kernel_launcher
 
 _FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
 
@@ -57,6 +58,7 @@ def _rmsnorm_kernel(
     x_scale,
     residual_scale,
     x_row_stride,
+    out_row_stride,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -99,7 +101,9 @@ def _rmsnorm_kernel(
     variance = tl.sum(x * x, axis=0) / n_cols
     x *= tl.rsqrt(variance + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    tl.store(
+        out_ptr + row.to(tl.int64) * out_row_stride + offsets, x * weight, mask=mask
+    )
     if TOKEN_FP8_OUT:
         # The stored row quantized per token (as fp8_quantize_per_token
         # quantizes it): FP8 E4M3 codes and one FP32 dequant scale.
@@ -313,8 +317,9 @@ def rmsnorm(
             f"residual shape {tuple(residual.shape)} does not match input shape {tuple(x.shape)}"
         )
 
-    # Without a residual the kernel reads strided rows (e.g. a column slice of
-    # a fused projection) in place; other layouts are made contiguous.
+    # Without a residual the kernel reads and writes strided rows (e.g. a
+    # column slice of a fused projection) in place; other layouts are made
+    # contiguous.
     strided_rows = residual is None and x.ndim == 2 and x.stride(-1) == 1
     if not x.is_contiguous() and not strided_rows:
         x = x.contiguous()
@@ -326,9 +331,10 @@ def rmsnorm(
     hidden_size = x.shape[-1]
     x_2d = x if strided_rows else x.view(-1, hidden_size)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device) if out is None else out
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    out_2d = out.view(-1, hidden_size)
+    strided_out = residual is None and out.ndim == 2 and out.stride(-1) == 1
+    if not out.is_contiguous() and not strided_out:
+        raise ValueError("out must be contiguous or 2-D rows with unit column stride")
+    out_2d = out if strided_out else out.view(-1, hidden_size)
 
     residual_out = torch.empty_like(x) if residual is not None else None
     if token_fp8_out is not None:
@@ -363,6 +369,7 @@ def rmsnorm(
         x_scale,
         residual_scale,
         x_2d.stride(0),
+        out_2d.stride(0),
         hidden_size,
         eps,
         BLOCK=block,
@@ -496,9 +503,10 @@ def _gated_residual_combine_norm_kernel(
     BLOCK: tl.constexpr,
     PRELOAD_RESIDUAL: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    GROUPS_FIRST: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    group = tl.program_id(1)
+    row = tl.program_id(1 if GROUPS_FIRST else 0)
+    group = tl.program_id(0 if GROUPS_FIRST else 1)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < GROUP_SIZE
     positions = row * WIDTH + group * GROUP_SIZE + offsets
@@ -585,11 +593,22 @@ def gated_residual_combine_norm(
     if block > 65536:
         raise ValueError("group_size is too large for the Triton reduction")
     rows = residual.numel() // width
+    groups_first = (
+        4096 <= rows <= 65535
+        and groups == 4
+        and group_size == 2560
+        and residual.dtype in (torch.bfloat16, torch.float16)
+        and current_platform().is_nvidia
+        and current_platform().arch_version == ArchVersion(10, 7)
+    )
+    # Reuse each row's block output without exceeding CUDA's grid-y limit.
+    grid = (groups, rows) if groups_first else (rows, groups)
+    # Both grid orders are fixed JIT configurations; warm each before serving.
     enable_pdl = pdl_enabled()
     launch_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
-    _gated_residual_combine_norm_kernel[(rows, groups)](
+    _gated_residual_combine_norm_kernel[grid](
         residual,
         block_output,
         inject_logits,
@@ -603,6 +622,7 @@ def gated_residual_combine_norm(
         BLOCK=block,
         PRELOAD_RESIDUAL=preload_residual,
         ENABLE_PDL=enable_pdl,
+        GROUPS_FIRST=groups_first,
         **launch_kwargs,
     )
     return combined, normalized
@@ -1479,7 +1499,9 @@ def triton_gated_rmsnorm(
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
     grid = (triton.cdiv(M, block_m), ngroups)
     with torch.cuda.device(x.device.index):
-        gated_rmsnorm_kernel[grid](
+        # Pass the heuristic explicitly so startup can retain and load each
+        # compiled binary; the heuristic wrapper discards that return value.
+        kernel_launcher(gated_rmsnorm_kernel.fn, grid)(
             x,
             out,
             weight,
@@ -1493,6 +1515,7 @@ def triton_gated_rmsnorm(
             eps,
             BLOCK_M=block_m,
             BLOCK_N=BLOCK_N,
+            HAS_Z=z is not None,
             NORM_BEFORE_GATE=norm_before_gate,
             SIGMOID_GATE=sigmoid_gate,
             num_warps=block_m * num_warps,

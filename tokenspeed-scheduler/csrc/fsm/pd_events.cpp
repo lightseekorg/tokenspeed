@@ -25,12 +25,20 @@
 
 #include "core/token_container.h"
 #include "fsm/pd_states.h"
+#include "fsm/storage_states.h"
 
 namespace tokenspeed {
 namespace fsm {
 
 Submitted BootstrappedEvent::operator()(Bootstrapping&& state) {
-    return Submitted{state.token_container, state.prefix_granularity};
+    return Submitted{std::move(state.admission)};
+}
+
+Prefetching BootstrappedEvent::operator()(Prefetching&& state) {
+    if (auto* pending = std::get_if<Bootstrapping>(&state.continuation)) {
+        state.continuation = Submitted{std::move(pending->admission)};
+    }
+    return std::move(state);
 }
 
 Finished SucceededEvent::operator()(Decoding&& /*state*/) {

@@ -1720,6 +1720,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     force_reduce: bool | None = None,
     input_sorted: bool = False,
     a_format: str = "e2m1",
+    deferred_out: torch.Tensor | None = None,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 2.
 
@@ -1761,6 +1762,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         w2_scale     : (E, D, K_physical // 32) uint8 e8m0; both scale
                        tensors retain physical CDNA4 panel pitches
         out          : (token_num, D) bf16 -- final per-token output
+        deferred_out : optional (token_num * topk, D) bf16 route destination
+                       for do_finalize=False
         sorted_*     : generated with ``sort_block_m`` when it differs
                        from compute ``block_m``; use 16/32/64/128 to mirror
                        FlyDSL sort_block_m
@@ -1788,6 +1791,18 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             f"got {inter_states.dtype}"
         )
     assert w2.dtype == torch.uint8
+    if deferred_out is not None:
+        # The public entry checks overlap; keep this per-launch check cheap.
+        if (
+            do_finalize
+            or deferred_out.dtype != torch.bfloat16
+            or deferred_out.shape != (out.shape[0] * topk, w2.shape[1])
+            or not deferred_out.is_contiguous()
+        ):
+            raise ValueError(
+                "stage2 deferred_out must be contiguous BF16 routes with "
+                "do_finalize=False"
+            )
     # Step 2: shuffle w2 to MFMA-tile layout if the caller didn't.
     if not b_preshuffled:
         w2 = _b_preshuffle_3d(w2)
@@ -1922,8 +1937,12 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         # a scratch tensor with plain stores (race-free, each cell has
         # exactly one writer CTA), then a small reduce kernel sums the
         # topk dim into `out` with fp32 accumulation.
-        partials = torch.empty(
-            (token_num, topk, N), dtype=torch.bfloat16, device=inter_states.device
+        partials = (
+            torch.empty(
+                (token_num, topk, N), dtype=torch.bfloat16, device=inter_states.device
+            )
+            if deferred_out is None
+            else deferred_out.view(token_num, topk, N)
         )
         if not do_finalize and initialize_unowned_routes:
             partials.zero_()

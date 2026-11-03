@@ -253,8 +253,7 @@ class FusedTPProjectionState:
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         self.compiled = {}
-        # Smaller TP2 buckets can begin reduction before their last GEMM wave.
-        # Larger buckets use all SMs; inactive CTA epoch slots advance in CTA zero.
+        # Prepared buckets can use fewer SMs; CTA zero advances inactive epochs.
         self.active_ctas = 152
         for rows in self.row_views:
             resident_ctas = (
@@ -266,6 +265,27 @@ class FusedTPProjectionState:
                 and rows < 512
                 else self.active_ctas
             )
+            # Keep eight GEMM waves at 384 rows; align the 512-row grid with
+            # its sixteen M tiles so each CTA retains the same input tile.
+            if (
+                not row_parallel
+                and self.world_size == 4
+                and input_size == 7168
+                and output_size == 49664
+            ):
+                if rows == 384:
+                    resident_ctas = 148
+                elif rows == 512:
+                    resident_ctas = 144
+            if (
+                row_parallel
+                and self.world_size == 4
+                and input_size == 12288
+                and output_size == 7168
+                and rows == 192
+            ):
+                # Keep each CTA on the same M tile and reduce idle grid work.
+                resident_ctas = 132
             inputs = torch.zeros(
                 (rows, input_size), dtype=torch.bfloat16, device=device
             )
@@ -288,7 +308,9 @@ class FusedTPProjectionState:
                 (tile_m, 128),
                 cluster_shape,
                 row_parallel=row_parallel,
-                accumulator_groups=2 if row_parallel and rows >= 128 else 1,
+                accumulator_groups=(
+                    2 if (row_parallel or self.world_size == 4) and rows >= 128 else 1
+                ),
                 use_input_multicast=bool(self.input_multicast_ptr),
             )
             input_dtypes = (

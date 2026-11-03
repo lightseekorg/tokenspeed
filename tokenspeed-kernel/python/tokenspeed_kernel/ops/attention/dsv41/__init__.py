@@ -89,10 +89,13 @@ __all__ = [
     "swa_rope_scatter",
     "global_rope_scatter",
     "rope_inplace",
+    "rope_weights_inplace",
     "rope_pad_query",
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
+    "dspark_workspace",
+    "history_pack",
 ]
 
 
@@ -771,6 +774,16 @@ def _validate_rope(values, positions, cos_sin_cache):
         raise ValueError("RoPE tensors must share a device")
 
 
+def _validate_writable_rope(values):
+    if any(
+        size > 1 and stride == 0
+        for size, stride in zip(values.shape[:-1], values.stride()[:-1])
+    ):
+        raise ValueError(
+            "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
+        )
+
+
 def rope_inplace(
     values: torch.Tensor,
     positions: torch.Tensor,
@@ -794,13 +807,7 @@ def rope_inplace(
         are separately rounded before the final low-precision store.
     """
     _validate_rope(values, positions, cos_sin_cache)
-    if any(
-        size > 1 and stride == 0
-        for size, stride in zip(values.shape[:-1], values.stride()[:-1])
-    ):
-        raise ValueError(
-            "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
-        )
+    _validate_writable_rope(values)
     kernel = select_kernel(
         "attention",
         "dsv41_rope_inplace",
@@ -809,6 +816,64 @@ def rope_inplace(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def rope_weights_inplace(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate owned index queries and scale owned projection weights.
+
+    Grids up to 4096 token-head pairs combine both operations in one launch.
+    Larger grids retain ordinary RoPE and separately scale weights in place.
+
+    Args:
+        values: Writable BF16/FP16 [tokens,heads,dim], dense in head channels.
+        positions: Int32/int64 [tokens]; negative padding positions use row0.
+        cos_sin_cache: FP32 [max_positions,rotary_dim], cosine then sine halves.
+        weights: Writable [tokens,heads] in values' dtype and device. Rows and
+            heads may be strided, but must not overlap each other or values.
+        weight_scale: FP32 scalar applied after the projection has rounded to
+            weights' dtype. The product rounds once back to that dtype.
+        solution: Optional registered implementation restriction.
+
+    Returns:
+        The same values and weights tensors, updated in place. Call only on
+        fresh projection outputs: neither input may have other live consumers.
+    """
+    _validate_rope(values, positions, cos_sin_cache)
+    _validate_writable_rope(values)
+    if (
+        values.ndim != 3
+        or weights.shape != values.shape[:2]
+        or weights.dtype != values.dtype
+        or weights.device != values.device
+    ):
+        raise ValueError(
+            "Indexer weights must match query tokens, heads, dtype and device"
+        )
+    # For two dimensions, nonoverlap follows when either axis spans the other.
+    n, h = weights.shape
+    w0, w1 = weights.stride()
+    if (
+        (n > 1 and w0 == 0)
+        or (h > 1 and w1 == 0)
+        or (n > 1 and h > 1 and w0 < h * w1 and w1 < n * w0)
+    ):
+        raise ValueError("Indexer weights require non-overlapping writable rows/heads")
+    kernel = select_kernel(
+        "attention",
+        "dsv41_rope_weights_inplace",
+        format_signature(values=dense_tensor_format(values.dtype)),
+        traits={},
+        solution=solution,
+    )
+    kernel(values, positions, cos_sin_cache, weights, weight_scale)
+    return values, weights
 
 
 def rope_pad_query(
@@ -869,6 +934,53 @@ def dspark_rows(
         values, norm_weight, norm_eps, positions, cos_sin_cache, window, slots, out
     )
     return out
+
+
+def dspark_workspace(
+    values: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+    positions: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor | None,
+    window: torch.Tensor,
+    page: torch.Tensor,
+    row: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather history and encode current rows directly into an attention workspace.
+
+    Args:
+        values: BF16 ``[batch * block_size, 512]`` current rows, with unit
+            column stride. Optional RoPE and the same all-channel FP8 round
+            trip as ``dspark_rows`` are applied before writing these rows.
+        norm_weight: Optional BF16 RMSNorm weight applied before RoPE.
+        norm_eps: RMSNorm epsilon, present exactly with norm_weight.
+        positions: Integer current-row positions, given exactly with a RoPE
+            table; negative positions use position zero.
+        cos_sin_cache: Optional FP32 interleaved-tail RoPE table.
+        window: BF16 ``[pages, page_rows, 512]`` history field with unit column
+            stride. Page and row strides may include other fields or padding.
+        page: Integer ``[batch, history_width]`` valid history page addresses.
+        row: Integer history row addresses shaped like ``page``. Dummy page
+            addresses are copied verbatim; attention's selection masks them.
+        block_size: Positive number of current rows per request.
+
+    Returns:
+        Fresh contiguous BF16 ``[batch, history_width + block_size, 512]``.
+        Each tile owns one complete output row; no temporary gather or current
+        row buffers are retained or shared with another invocation.
+    """
+    return _kernel("dspark_workspace", values)(
+        values,
+        norm_weight,
+        norm_eps,
+        positions,
+        cos_sin_cache,
+        window,
+        page,
+        row,
+        block_size,
+    )
 
 
 def dspark_anchors(
@@ -1257,10 +1369,29 @@ def merge_index_candidates(packed, rows, lengths):
     return _kernel("merge_index_candidates", packed)(packed, rows, lengths)
 
 
+def history_pack(cache, table, visible_rows, *, virtual_block_count, degree, rank):
+    """Copy this rank's packed history pages for a byte-wise MAX all-reduce.
+
+    cache is a possibly strided uint8 [local_pages,64,row_bytes] field and
+    table an integer [pages] row of virtual pages, possibly strided. Virtual
+    page v > 0 lives on rank (v - 1) % degree; ids at or past
+    virtual_block_count are invalid. visible_rows is an integer device
+    scalar. Returns contiguous uint8 [pages+1,64,row_bytes]: a zero null page,
+    then each owned, valid page that starts below visible_rows with all its
+    bytes (scales included), and zeros elsewhere. A MAX all-reduce of the
+    owners' results restores every visible page exactly, with shapes fixed
+    for graph replay.
+    """
+    return _kernel("history_pack", cache)(
+        cache, table, visible_rows, virtual_block_count, degree, rank
+    )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41._triton.kvp  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "num_heads": 16,
+    "head_dim": 64,
+    "gate_row_stride": 2304,
+    "eps": 1e-05,
+    "dtype": "bfloat16"
+  },
+  "cases": [
+    {
+      "id": "muse_spark.layernorm.weightless_rmsnorm_gated_sigmoid/tp8-decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "layernorm",
+        "mode": "weightless_rmsnorm_gated_sigmoid",
+        "parameters": {
+          "tokens": [
+            1,
+            16
+          ]
+        },
+        "cold_cache": true,
+        "seed": 5720
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.layernorm.weightless_rmsnorm_gated_sigmoid/tp8-prefill-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "layernorm",
+        "mode": "weightless_rmsnorm_gated_sigmoid",
+        "parameters": {
+          "tokens": [
+            8192
+          ]
+        },
+        "cold_cache": true,
+        "seed": 5721
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    }
+  ]
+}

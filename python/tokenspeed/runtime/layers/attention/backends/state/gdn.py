@@ -26,13 +26,11 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill_capturable,
+    gdn_chunk_prefill_stores_state_checkpoints,
     gdn_decode_supports,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    gdn_decode_solution,
-)
 from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
     CapacityPrefillBackend,
 )
@@ -59,42 +57,59 @@ class GdnAttnBackend(CapacityPrefillBackend):
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
     _verify_scan_writes_replay = True
+    _verify_scan_runs_chain_form = True
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)
         linear_attn = config.component(LinearAttnConfig)
+        self._scan_geometry: dict[str, int | bool] = {
+            "head_dim": linear_attn.head_k_dim,
+            "value_head_dim": linear_attn.head_v_dim,
+            "num_q_heads": linear_attn.num_k_heads // linear_attn.tp_size,
+            "num_v_heads": linear_attn.num_v_heads // linear_attn.tp_size,
+            "qk_l2norm": True,
+        }
         self._prefill_capturable = gdn_chunk_prefill_capturable(
-            config.dtype,
-            head_dim=linear_attn.head_k_dim,
-            value_head_dim=linear_attn.head_v_dim,
-            num_q_heads=linear_attn.num_k_heads // linear_attn.tp_size,
-            num_v_heads=linear_attn.num_v_heads // linear_attn.tp_size,
-            qk_l2norm=True,
+            config.dtype, **self._scan_geometry
         )
 
         self._head_k_dim = linear_attn.head_k_dim
-        # Resolved when a pool binds (its state dtype picks the verify kernel).
+        self._head_v_dim = linear_attn.head_v_dim
+        # Resolved when a pool binds: the pool's prefix granularity spaces the
+        # in-forward checkpoints, and its state dtype picks the verify kernel.
+        self._stores_in_forward_state_checkpoints = False
         self._verify_reads_committed_recurrent_state = False
         self._verify_packed_qkv_views = False
         self._decode_packed_qkv_views = False
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
+        # In-forward checkpoints sit at prefix-page multiples of a chunk start,
+        # so the scan must store at that granularity.
+        contract = cache_pool.arena.runtime_contract
+        self._stores_in_forward_state_checkpoints = (
+            gdn_chunk_prefill_stores_state_checkpoints(
+                self.dtype,
+                **self._scan_geometry,
+                interval_granularity=contract.prefix_granularity,
+            )
+        )
         # Where the verify kernel takes a separate destination pool, verify
         # reads the committed state in place instead of seeding the scratch
         # with a copy of it. Where a decode or verify kernel takes strided
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
         ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
-        solution = gdn_decode_solution(ssm_dtype)
 
         def supports(op: str, trait: str) -> bool:
             return gdn_decode_supports(
                 op,
                 self.dtype,
                 head_dim=self._head_k_dim,
+                value_head_dim=self._head_v_dim,
+                state_dtype=ssm_dtype,
                 trait=trait,
-                solution=solution,
+                solution=None,
             )
 
         self._verify_reads_committed_recurrent_state = not self.replay_ssm and supports(

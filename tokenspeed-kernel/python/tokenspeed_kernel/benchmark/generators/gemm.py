@@ -50,6 +50,7 @@ from tokenspeed_kernel.selection import (
 from tokenspeed_kernel.signature import (
     FormatSignature,
     ScaleFormat,
+    dense_format_signature,
     dense_tensor_format,
     format_signature,
     tensor_format,
@@ -66,6 +67,7 @@ __all__ = [
     "prepare_linear_attnres_partials",
     "prepare_mm",
     "prepare_mxfp8_mm",
+    "prepare_prepared_fp32_router_gemv",
 ]
 
 
@@ -84,6 +86,15 @@ _MXFP8_SCALE = ScaleFormat(
 _MXFP8_SIGNATURE = format_signature(
     a=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_MXFP8_SCALE),
     b=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_MXFP8_SCALE),
+)
+_FP32_BLOCK_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(128, 128),
+)
+_FP32_BLOCK_SIGNATURE = format_signature(
+    a=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_FP32_BLOCK_SCALE),
+    b=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_FP32_BLOCK_SCALE),
 )
 
 
@@ -506,6 +517,7 @@ def _mxfp8_mm_traits(
         "b_inner_stride_one": True,
         "block_scale_layout": "canonical",
         "out_dtype": out_dtype,
+        "out_inner_stride_one": True,
     }
 
 
@@ -513,7 +525,7 @@ def prepare_mxfp8_mm(
     request: BenchmarkRequest,
     platform: PlatformInfo,
 ) -> PreparedBenchmark:
-    """Prepare a canonical E4M3/UE8M0 MXFP8 GEMM benchmark."""
+    """Prepare canonical E4M3 GEMM with E8M0 K32 or FP32 block128 scales."""
 
     allowed = {
         "M",
@@ -539,10 +551,17 @@ def prepare_mxfp8_mm(
             BenchmarkStatus.INVALID_CASE,
             "MXFP8 gemm.mm requires quant='mxfp8'",
         )
-    if request.parameters.get("block_size") != list(_MXFP8_BLOCK_SIZE):
+    block_size = request.parameters.get("block_size")
+    if block_size == list(_MXFP8_BLOCK_SIZE):
+        signature = _MXFP8_SIGNATURE
+        scale_dtype = "uint8"
+    elif block_size == [128, 128]:
+        signature = _FP32_BLOCK_SIGNATURE
+        scale_dtype = "float32"
+    else:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
-            "MXFP8 gemm.mm requires block_size=[1, 32]",
+            "MXFP8 gemm.mm requires block_size=[1, 32] or [128, 128]",
         )
     out_dtype = _parse_dtype(request.parameters.get("out_dtype"))
     validation_config = _parse_validation(
@@ -551,14 +570,13 @@ def prepare_mxfp8_mm(
         K=K,
     )
 
-    block_size = list(_MXFP8_BLOCK_SIZE)
     normalized_parameters: dict[str, object] = {
         "M": M,
         "N": N,
         "K": K,
         "quant": "mxfp8",
         "value_dtype": "float8_e4m3fn",
-        "scale_dtype": "uint8",
+        "scale_dtype": scale_dtype,
         "block_size": block_size,
         "out_dtype": "bfloat16",
         "a_layout": "MK",
@@ -575,7 +593,7 @@ def prepare_mxfp8_mm(
     spec, selected = _select_registration(
         request,
         platform,
-        _MXFP8_SIGNATURE,
+        signature,
         traits,
         shape,
     )
@@ -586,18 +604,19 @@ def prepare_mxfp8_mm(
             request.mode,
             dtype=_MXFP8_DTYPE,
             traits={"a_layout": "MK", "b_layout": "NK"},
-            format_signature=_MXFP8_SIGNATURE,
+            format_signature=signature,
             device="cuda",
             seed=seed,
         )
         inputs = generator.generate(**shape)
-        # Match the quantized projection range used by the kernel's exact
-        # correctness tests. Full-scale random FP8 values combined with large
-        # UE8M0 exponents create unrealistic outputs near BF16 rounding ties.
-        inputs["A"] = (inputs["A"].float() * 0.05).to(_MXFP8_DTYPE)
-        inputs["B"] = (inputs["B"].float() * 0.05).to(_MXFP8_DTYPE)
-        inputs["A_scales"].clamp_max_(128)
-        inputs["B_scales"].clamp_max_(128)
+        if scale_dtype == "uint8":
+            # Match the quantized projection range used by the kernel's exact
+            # correctness tests. Full-scale random FP8 values combined with large
+            # UE8M0 exponents create unrealistic outputs near BF16 rounding ties.
+            inputs["A"] = (inputs["A"].float() * 0.05).to(_MXFP8_DTYPE)
+            inputs["B"] = (inputs["B"].float() * 0.05).to(_MXFP8_DTYPE)
+            inputs["A_scales"].clamp_max_(128)
+            inputs["B_scales"].clamp_max_(128)
         return inputs
 
     def prepare_invocation(
@@ -649,7 +668,7 @@ def prepare_mxfp8_mm(
     if validation_config is not None:
         reference_spec, reference = _select_reference_registration(
             spec,
-            _MXFP8_SIGNATURE,
+            signature,
             traits,
             platform,
         )
@@ -710,7 +729,8 @@ def prepare_mm(
     """Prepare a ``gemm.mm`` benchmark for the requested quantization.
 
     ``quant`` is required: ``"none"`` selects dense GEMM and ``"mxfp8"``
-    selects canonical E4M3/UE8M0 MXFP8 GEMM.
+    selects canonical E4M3 GEMM, with the explicit ``block_size`` choosing
+    E8M0 K32 or FP32 block128 scales.
     """
 
     quant = request.parameters.get("quant")
@@ -801,6 +821,93 @@ def prepare_mv(
             "dtype": "bfloat16",
             "x_layout": "MK",
             "weight_layout": "NK",
+            "out_layout": "MN",
+        },
+    )
+
+
+def prepare_prepared_fp32_router_gemv(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare an FP32 router GEMV computing ``(x @ weight) * multiplier``.
+
+    The router weight is stored ``[K, N]`` and converted once to the selected
+    kernel's persistent layout, as model loading does; each invocation runs
+    the planned kernel over ``x[M, K]``.
+    """
+
+    if request.registration is not None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.prepared_fp32_router_gemv selects through its plan; "
+            "use solution instead of registration",
+        )
+    _reject_unknown_parameters(request, {"M", "N", "K", "multiplier", "dtype"})
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    multiplier = request.parameters.get("multiplier")
+    if not isinstance(multiplier, float) or not math.isfinite(multiplier):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.prepared_fp32_router_gemv multiplier must be a finite float",
+        )
+    if request.parameters.get("dtype") != "float32":
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.prepared_fp32_router_gemv dtype must be float32",
+        )
+
+    from tokenspeed_kernel.ops import gemm as gemm_ops
+
+    load_builtin_kernels()
+    try:
+        # The plan's own selection, repeated to name the timed registration.
+        selected = select_kernel(
+            request.family,
+            request.mode,
+            dense_format_signature(("x", "weight"), (torch.float32, torch.float32)),
+            features=frozenset(),
+            platform=platform,
+            solution=request.solution,
+        )
+        plan = gemm_ops.fp32_router_gemv_plan(
+            hidden_size=K,
+            output_size=N,
+            dtype=torch.float32,
+            solution=request.solution,
+            batch_invariant=False,
+        )
+    except NoKernelFoundError as exc:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(exc)) from exc
+    spec = KernelRegistry.get().get_by_name(selected.name)
+    if spec is None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.REGISTRATION_MISSING,
+            f"Selected registration {selected.name!r} is not available",
+        )
+
+    x, weight = _random_tensors(request.seed, torch.float32, (M, K), (K, N))
+    prepared_weight = gemm_ops.fp32_router_gemv_process_weight(plan, weight)
+    counters = gemm_ops.fp32_router_gemv_counters(N, x.device)
+
+    def invoke() -> torch.Tensor:
+        return gemm_ops.fp32_router_gemv_execute(
+            plan, x, prepared_weight, multiplier, counters, False
+        )
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            "M": M,
+            "N": N,
+            "K": K,
+            "multiplier": multiplier,
+            "dtype": "float32",
+            "x_layout": "MK",
+            "weight_layout": "KN",
             "out_layout": "MN",
         },
     )

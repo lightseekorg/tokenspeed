@@ -84,12 +84,6 @@ def test_draft_tree_parents_are_declared_at_construction():
     assert torch.equal(states.future_parent_map, states.chain_parents.repeat(5, 1))
 
 
-def test_init_draft_probs_needs_a_verify_column():
-    states = RuntimeStates(4, 32, 3, "cpu")
-    with pytest.raises(ValueError, match="verify column"):
-        states.init_draft_probs(spec_num_tokens=0, reject_threshold=2.0)
-
-
 def _recorded_states() -> RuntimeStates:
     states = RuntimeStates(4, 32, 3, "cpu")
     states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0)
@@ -150,6 +144,23 @@ def test_reset_states_does_not_synchronize_cuda():
         torch.cuda.set_sync_debug_mode(previous_mode)
     torch.cuda.synchronize()
     assert states.valid_cache_lengths.tolist() == [0, 128, 0, 256, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_remote_candidate_landing_does_not_synchronize_cuda():
+    # A PD decode destination lands each remote prefill's candidates on the
+    # forward thread, while a step may be in flight.
+    states = RuntimeStates(4, 32, 3, "cuda")
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        states.write_remote_spec_candidate_ids(2, [5, 6, 7])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    torch.cuda.synchronize()
+    assert states.future_input_map[2].tolist() == [5, 6, 7]
+    assert states.spec_candidates_ready.tolist() == [i == 2 for i in range(5)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

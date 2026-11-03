@@ -21,6 +21,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+
+#include "cache/tier/storage.h"
 #include <vector>
 
 #include "cache/core/cache_config.h"
@@ -55,16 +58,34 @@ struct SchedulerConfig {
     std::int32_t debug_force_retraction_interval{0};
 
     std::vector<CacheGroupConfig> cache_groups{};
+    // Virtual children per compact Host parent, shared by L2 and snapshots.
+    // Required when either Host pool exists; no capacity is reserved by group.
+    std::vector<std::int32_t> host_group_packing{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
 
+    // What feeds Host L2 from ordinary Device prefix entries; required with a
+    // Host tier (Validate says where kWriteBack may run).
+    //   kWriteThrough  published entries stream to Host at chunk ends, the
+    //                  prompt end and finish.
+    //   kWriteBack     nothing streams at publication: what an admission
+    //                  or a restore evicts is written back to Host in the
+    //                  same plan, by whole segments.
+    enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
+    HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
+
     // The D role streams no ordinary Device cache entry to Host; its Host
     // cache holds only the published pages of retracted requests (the image's
     // L2 leg) until they are restored.
-    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
+    bool StreamsDeviceCacheToHost() const {
+        return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
+    }
 
     std::int32_t max_scheduled_tokens{};
+    // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
+    // all local prefill requests in one batch. Zero leaves this unbounded.
+    std::int32_t max_kv_page_num{0};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the
@@ -73,11 +94,7 @@ struct SchedulerConfig {
     std::int32_t overlap_schedule_depth{0};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
-    // L3 only: the fewest whole prefix pages an L3 hit must extend the Host
-    // hit by before the request waits for a pre-admission prefetch of them
-    // (fsm::Prefetching); a shorter extension is computed instead. Required
-    // (>= 1) with L3, and 0 without: no silent default.
-    std::int32_t l3_prefetch_min_pages{0};
+    std::optional<StorageConfig> storage_config;
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 
@@ -92,6 +109,15 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+    // Write a reusable State checkpoint inside the prefill forward that spans
+    // the page boundary before a long prompt's replay tail
+    // (PrefillStateCheckpointTokens), without cutting a chunk there: that
+    // forward holds one more block per State group, and the request's next
+    // publication point publishes it under the boundary's page hash. The
+    // runtime writes the state at ForwardBatch::extend_state_checkpoint_lens
+    // into the third entry of every State group's row. Requires prefix
+    // caching, except on the D role, which never computes a prompt.
+    bool state_checkpoint_in_forward{false};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

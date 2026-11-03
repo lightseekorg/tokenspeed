@@ -27,7 +27,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
     STATE_LAYER_TYPES,
 )
-from tokenspeed.runtime.utils.env import envs
 
 _QWEN_GDN_PREFIX_GRANULARITY = 128
 
@@ -181,13 +180,13 @@ class QwenGDNRecipe(CacheRecipe):
     def _state_shapes(self):
         """Per-rank GDN state shapes from the linear component.
 
-        Dtypes are the recipe's contract: conv bf16, SSM per the engine env.
+        Dtypes are the recipe's contract: conv bf16, SSM per ``--mamba-ssm-dtype``.
         """
         linear_attn = self.attn_config.component(LinearAttnConfig)
         ssm_dtype = {
             "float32": torch.float32,
             "bfloat16": torch.bfloat16,
-        }[envs.TOKENSPEED_MAMBA_SSM_DTYPE.get()]
+        }[self.server_args.mamba_ssm_dtype]
         return (
             linear_attn.conv_state_shape,
             cache_dtype_name(torch.bfloat16),
@@ -291,10 +290,8 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def draft_tree(self) -> bool:
-        """Whether verify windows are draft trees (--speculative-eagle-topk > 1)."""
-        return bool(self.num_draft_layers) and (
-            int(self.server_args.speculative_eagle_topk) > 1
-        )
+        """Whether verify windows are draft trees (``speculative_draft_tree``)."""
+        return bool(self.num_draft_layers) and self.server_args.speculative_draft_tree
 
     @cached_property
     def replay_ssm(self) -> bool:

@@ -23,8 +23,9 @@ GPQA_MODELSCOPE_DATASET_ARGS = (
     '{"gpqa_diamond":{"dataset_id":"AI-ModelScope/gpqa_diamond"}}'
 )
 MUSE_SPARK_AIME26_CONFIGS = {
-    4: "muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml",
-    8: "muse-spark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
+    (4, 4): "muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml",
+    (8, 8): "muse-spark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
+    (8, 1): "muse-spark-mxfp4-tp8ep1-evalscope-aime26-amd.yaml",
 }
 MUSE_SPARK_AIME26_PROMPT = (
     "Solve the following math problem. Show your reasoning step by step.\n"
@@ -46,11 +47,11 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 15,
+        "count": 16,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
-        "count": 2,
+        "count": 3,
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
@@ -175,34 +176,65 @@ def test_evalscope_configs_use_expected_dataset_sources():
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
 
 
-def test_gpt_oss_gpqa_uses_runner_specific_batch_sizes_and_retries():
-    path = EVAL_CONFIG_DIR / "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml"
-    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+@pytest.mark.parametrize(
+    "config,runner,model,batch_size,trigger",
+    [
+        (
+            "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml",
+            "b200-2gpu",
+            "openai/gpt-oss-120b",
+            "64",
+            "post-submit",
+        ),
+        # MI35x has hit GPU memory-access faults at eval batch size 64.
+        (
+            "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond-amd.yaml",
+            "amd-mi35x-2gpu-test",
+            "amd/gpt-oss-120b-w-mxfp4-a-fp8",
+            "16",
+            "post-submit",
+        ),
+    ],
+)
+def test_gpt_oss_gpqa_uses_runner_specific_configuration(
+    config, runner, model, batch_size, trigger
+):
+    task = yaml.safe_load((EVAL_CONFIG_DIR / config).read_text(encoding="utf-8"))
+    server = shlex.split(task["server"]["command"])
     command = shlex.split(task["eval"]["command"])
 
     assert task["retries"] == 1
-    assert task["runner"]["env"]["b200-2gpu"]["GPT_OSS_EVAL_BATCH_SIZE"] == "64"
-    assert (
-        task["runner"]["env"]["amd-mi35x-2gpu-test"]["GPT_OSS_EVAL_BATCH_SIZE"] == "16"
-    )
-    assert flag_value(command, "--eval-batch-size") == "${GPT_OSS_EVAL_BATCH_SIZE:-64}"
+    assert task["triggers"] == [trigger, "manual"]
+    assert task["runner"]["labels"] == [runner]
+    assert flag_value(server, "--model") == model
+    assert flag_value(command, "--model") == model
+    assert flag_value(command, "--eval-batch-size") == batch_size
 
 
-@pytest.mark.parametrize("world_size", MUSE_SPARK_AIME26_CONFIGS)
-def test_muse_spark_aime26_uses_validated_mxfp4_configuration(world_size):
-    path = EVAL_CONFIG_DIR / MUSE_SPARK_AIME26_CONFIGS[world_size]
+@pytest.mark.parametrize("tp_size,ep_size", MUSE_SPARK_AIME26_CONFIGS)
+def test_muse_spark_aime26_uses_validated_mxfp4_configuration(tp_size, ep_size):
+    path = EVAL_CONFIG_DIR / MUSE_SPARK_AIME26_CONFIGS[tp_size, ep_size]
     task = yaml.safe_load(path.read_text(encoding="utf-8"))
     server_tokens = shlex.split(task["server"]["command"])
     eval_tokens = shlex.split(task["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
 
-    assert task["runner"]["labels"] == [f"amd-mi35x-{world_size}gpu-test"]
+    expected_triggers = (
+        ["per-commit", "manual"] if (tp_size, ep_size) == (8, 1) else ["manual"]
+    )
+    assert task["triggers"] == expected_triggers
+    assert task["runner"]["labels"] == [f"amd-mi35x-{tp_size}gpu-test"]
     assert (
         flag_value(server_tokens, "--model")
         == "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4"
     )
-    assert flag_value(server_tokens, "--tp") == str(world_size)
-    assert flag_value(server_tokens, "--ep-size") == str(world_size)
+    assert flag_value(server_tokens, "--tp") == str(tp_size)
+    assert flag_value(server_tokens, "--ep-size") == str(ep_size)
+    moe_tp_size = tp_size // ep_size
+    if moe_tp_size > 1:
+        assert flag_value(server_tokens, "--moe-tp-size") == str(moe_tp_size)
+    else:
+        assert "--moe-tp-size" not in server_tokens
     assert flag_value(server_tokens, "--quantization") == "mxfp4"
     assert flag_value(server_tokens, "--moe-backend") == "gluon"
     assert flag_value(server_tokens, "--max-num-seqs") == "16"
@@ -365,7 +397,7 @@ def test_kimi_k3_amd_gates_use_eagle3():
     assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
     assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
     assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
-    assert tasks[1]["perf_reference"] == {16: [60, 15]}
+    assert tasks[1]["perf_reference"] == {16: [65, 16]}
     assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
     perf_tokens = shlex.split(tasks[1]["perf"]["command"])

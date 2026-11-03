@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Adapter for the Model Updater SDK behind ``/update_weights_from_mooncake``.
+"""Adapter for the Model Updater SDK behind the Mooncake weight update.
 
 The RL trainer publishes a checkpoint to a Mooncake weight store and names a
 committed version; each scheduler process reads its own shard of that version

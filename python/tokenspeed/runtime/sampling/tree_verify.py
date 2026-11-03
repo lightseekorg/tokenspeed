@@ -26,7 +26,46 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["TreeVerifyBatch", "accepted_path_rows"]
+__all__ = ["DraftTreeQ", "TreeVerifyBatch", "accepted_path_rows"]
+
+
+@dataclass(frozen=True)
+class DraftTreeQ:
+    """Each pool slot's draft distributions behind its next-round tree (sampled
+    trees): the q a sampled node's siblings were drawn from, for the verifier's
+    rejection sampling. Indexed by ``req_pool_idx``.
+
+    Attributes:
+        q: ``[rows, S, NC]`` fp32 q of each expanded row (slot) over its
+            candidates.
+        q_ids: ``[rows, S, NC]`` int32 the candidates' token ids.
+        slot: ``[rows, N]`` int32 per tree node, the slot its parent's q is in;
+            ``-1`` for the root and deterministic nodes.
+        pos: ``[rows, N]`` int32 per tree node, its position in that q.
+    """
+
+    q: torch.Tensor
+    q_ids: torch.Tensor
+    slot: torch.Tensor
+    pos: torch.Tensor
+
+    @classmethod
+    def zeros(
+        cls,
+        rows: int,
+        num_slots: int,
+        num_candidates: int,
+        num_nodes: int,
+        device: torch.device | str,
+    ) -> DraftTreeQ:
+        """Empty tables: every node deterministic (slot ``-1``)."""
+        shape = (rows, num_slots, num_candidates)
+        return cls(
+            q=torch.zeros(shape, dtype=torch.float32, device=device),
+            q_ids=torch.zeros(shape, dtype=torch.int32, device=device),
+            slot=torch.full((rows, num_nodes), -1, dtype=torch.int32, device=device),
+            pos=torch.zeros((rows, num_nodes), dtype=torch.int32, device=device),
+        )
 
 
 @dataclass(frozen=True)
@@ -37,10 +76,13 @@ class TreeVerifyBatch:
         parents: ``[bs, N]`` int32 parent node, ``-1`` for the root; a parent
             precedes its children.
         depths: ``[bs, N]`` int32 node depth, 0 for the root.
+        draft_q: The draft distributions of sampled trees (None: every node
+            deterministic), read at the requests' pool slots.
     """
 
     parents: torch.Tensor
     depths: torch.Tensor
+    draft_q: DraftTreeQ | None
 
 
 def accepted_path_rows(path: torch.Tensor) -> torch.Tensor:

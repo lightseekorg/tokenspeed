@@ -18,20 +18,50 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Factories for PD KV transfer helpers."""
+"""The PD transfer description of a rank's KV arena."""
+
+import dataclasses
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
     build_cache_transfer_schema,
 )
 from tokenspeed.runtime.pd.cache_protocol import (
+    CacheProducerSchedule,
+    CacheTransferContract,
     build_arena_cache_transfer_contract,
     build_cache_fields_by_producer_step,
 )
-from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
-from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
-from tokenspeed.runtime.pd.utils import TransferBackend
+
+
+@dataclasses.dataclass
+class KVArgs:
+    """A rank's KV arena as PD transfers it: the arena, its cache transfer
+    contract and the cache's placement over pipeline stages and producer
+    steps."""
+
+    engine_rank: int
+    kv_data_ptr: int
+    ib_device: str
+    gpu_id: int
+    cache_layout: CacheTransferContract
+    cache_fields_by_stage: tuple[tuple[str, ...], ...]
+    registration_regions: tuple[tuple[int, int], ...] = ()
+    cache_producer_schedule: CacheProducerSchedule | None = None
+    # Full-model logical contract for the PD wire when the local arena/plan
+    # is narrowed to a stage window; None means cache_layout is already it.
+    wire_cache_layout: CacheTransferContract | None = None
+
+    @property
+    def wire_layout(self) -> CacheTransferContract:
+        layout = (
+            self.wire_cache_layout
+            if self.wire_cache_layout is not None
+            else self.cache_layout
+        )
+        # Bootstrap compares the logical layout across ranks. Physical bindings
+        # are rank-local and belong only to the transfer endpoint contract.
+        return dataclasses.replace(layout, field_addresses=None)
 
 
 def get_kv_args(
@@ -74,8 +104,6 @@ def get_kv_args(
     # against the complete field set.
     wire_layout = None
     if logical_plan is not None:
-        from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
-
         wire_layout = CacheTransferContract(
             plan=logical_plan,
             group_specs=token_to_kv_pool.arena.cache_group_specs,
@@ -96,20 +124,3 @@ def get_kv_args(
         cache_fields_by_stage=cache_fields_by_stage,
         wire_cache_layout=wire_layout,
     )
-
-
-def create_kv_transfer(
-    mode: str,
-    backend: TransferBackend,
-    args: KVManagerArgs,
-    kv_args: KVArgs,
-    gloo_group,
-):
-    if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
-        raise NotImplementedError("CachePD supports only the Mooncake backend")
-    if mode == "prefill":
-        return DisaggPrefillExecutor(args, kv_args, gloo_group)
-    elif mode == "decode":
-        return DisaggDecodeExecutor(args, kv_args, gloo_group)
-    else:
-        raise NotImplementedError(f"Unsupported disaggregation mode: {mode}")

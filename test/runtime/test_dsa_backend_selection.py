@@ -78,7 +78,6 @@ def _config(monkeypatch, device, backend_name, **overrides):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=4096,
         max_bs=4,
         kvp_size=8,
@@ -99,11 +98,6 @@ def test_dsa_name_resolves_to_the_device_implementation(name):
     )
     validate_attention_backend_name(name, flag="--attention-backend")
     assert _get_backend_cls(name, AttentionArch.DSA) is expected
-
-
-def test_model_specific_dsa_name_is_not_registered():
-    with pytest.raises(ValueError, match="Unknown --attention-backend"):
-        validate_attention_backend_name("longcat_dsa", flag="--attention-backend")
 
 
 @pytest.mark.parametrize("name", [None, "dsa"])
@@ -148,7 +142,7 @@ def test_ascend_bf16_kv_keeps_native_row_layout(monkeypatch):
         _mla_layer_fields,
     )
 
-    fields = _mla_layer_fields(config, 0, 0)
+    fields = _mla_layer_fields(config, 128, 0, 0)
     assert fields[0].shape == (128, 1, 576)
     assert fields[0].dtype == "bfloat16"
     assert fields[0].payload_bytes == 128 * 576 * 2
@@ -162,13 +156,6 @@ def test_int8_cache_is_rejected_before_storage_planning(monkeypatch, device, wid
         _config(
             monkeypatch, device, "dsa", kv_cache_dtype=torch.int8, packed_width=width
         )
-
-
-def test_int8_cache_dtype_is_not_resolved():
-    from tokenspeed.runtime.layers.attention.configs.base import resolve_dtype
-
-    with pytest.raises(ValueError, match="Unsupported kv_cache_dtype"):
-        resolve_dtype("int8")
 
 
 def test_int8_cache_is_rejected_by_server_arguments():

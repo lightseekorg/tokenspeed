@@ -205,7 +205,6 @@ def _triton_kpool_prefill_write_impl(
 
 @triton.jit(
     do_not_specialize=["num_tokens"],
-    do_not_specialize_on_alignment=["num_tokens"],
 )
 def _kpool_prefill_tail_write_kernel(
     k_ptr,

@@ -70,6 +70,7 @@ class Pool:
     kv_lora_rank = 512
     qk_rope_head_dim = 64
     get_mla_kv_buffer = MLATokenToKVPool.get_mla_kv_buffer
+    read_latent_rows = MLATokenToKVPool.read_latent_rows
 
     def __init__(self, cache):
         self.cache = cache
@@ -181,12 +182,12 @@ def run(degree):
         )
         torch.testing.assert_close(qn, before_q, rtol=0, atol=0)
         backend._init_prefill_metadata(
-            torch.tensor(lengths, dtype=torch.int32).npu(),
-            torch.tensor(prefix, dtype=torch.int32).npu(),
-            torch.tensor(prefix, dtype=torch.int32),
-            torch.tensor(extend, dtype=torch.int32).npu(),
-            torch.tensor(extend, dtype=torch.int32),
-            table.npu(),
+            seq_lens=torch.tensor(lengths, dtype=torch.int32).npu(),
+            extend_prefix_lens=torch.tensor(prefix, dtype=torch.int32).npu(),
+            extend_prefix_lens_cpu=torch.tensor(prefix, dtype=torch.int32),
+            extend_seq_lens=torch.tensor(extend, dtype=torch.int32).npu(),
+            extend_seq_lens_cpu=torch.tensor(extend, dtype=torch.int32),
+            page_table=table.npu(),
         )
         output = torch.empty(rows, H * 128, dtype=torch.bfloat16, device="npu")
         if max(prefix):

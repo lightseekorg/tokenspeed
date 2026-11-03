@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_process_weight,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 pytestmark = pytest.mark.skipif(
     not (current_platform().is_amd or current_platform().is_nvidia),
@@ -80,12 +81,17 @@ def _tf32(t: torch.Tensor) -> torch.Tensor:
     + [(5, 1000, 100), (20, 4608, 80)],
 )
 def test_tf32_router_rounds_like_cublas_where_cublas_uses_tf32(
-    device: str, monkeypatch: pytest.MonkeyPatch, rows: int, hidden: int, columns: int
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    set_matmul_precision,
+    rows: int,
+    hidden: int,
+    columns: int,
 ) -> None:
     """Three to 32 rows run on tensor cores when cuBLAS would use TF32 anyway."""
     if not current_platform().is_nvidia:
         pytest.skip("the TF32 tensor-core path is NVIDIA-only")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "tf32")
+    set_matmul_precision("tf32")
     monkeypatch.delenv("NVIDIA_TF32_OVERRIDE", raising=False)
     torch.manual_seed(29)
     x = torch.randn(rows, hidden, dtype=torch.float32, device=device)
@@ -153,6 +159,7 @@ def test_planned_fp32_router_gemv_prepares_weight_and_replays(device: str) -> No
         output_size=columns,
         dtype=torch.float32,
         solution=None,
+        batch_invariant=False,
     )
     prepared_weight = fp32_router_gemv_process_weight(plan, weight)
     counters = fp32_router_gemv_counters(columns, torch.device(device))
@@ -185,3 +192,15 @@ def test_planned_fp32_router_gemv_prepares_weight_and_replays(device: str) -> No
         rtol=2e-5,
         atol=2e-5,
     )
+
+
+def test_bitwise_plan_needs_a_batch_invariant_provider() -> None:
+    """No router GEMV here declares batch invariance, so bitwise planning rejects them."""
+    with pytest.raises(NoKernelFoundError):
+        fp32_router_gemv_plan(
+            hidden_size=8192,
+            output_size=256,
+            dtype=torch.float32,
+            solution=None,
+            batch_invariant=True,
+        )

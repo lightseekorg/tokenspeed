@@ -58,8 +58,6 @@ class ModelProfile:
             model's linear layers, or None for a model without them.
         default_attention_backend: Attention backend used when the launch
             names none, or None to keep the architecture default.
-        default_prefix_granularity: Prefix granularity used when the launch
-            keeps the server default, or None to keep that default.
         request_token_history: Whether the model reads each request's
             committed token history (``ForwardContext.request_token_history``).
         is_multimodal: Whether this checkpoint has an active-capable media encoder.
@@ -80,7 +78,6 @@ class ModelProfile:
     cache_family: str
     linear_attention: str | None
     default_attention_backend: str | None
-    default_prefix_granularity: int | None
     request_token_history: bool
     is_multimodal: bool
     tokenizer_kwargs: Mapping[str, object]
@@ -105,13 +102,6 @@ class ModelProfile:
                 f"only {list(NUMERICS_ENVELOPES)}, got {sorted(envelopes)}"
             )
         object.__setattr__(self, "numerics_envelopes", envelopes)
-        if self.default_prefix_granularity is not None and (
-            self.default_prefix_granularity <= 0
-        ):
-            raise ValueError(
-                "ModelProfile.default_prefix_granularity must be positive, got "
-                f"{self.default_prefix_granularity}"
-            )
         # Profiles are shared by every ModelConfig of the model; keep the one
         # mutable field read-only so no consumer can edit it for the others.
         object.__setattr__(

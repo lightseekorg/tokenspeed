@@ -27,9 +27,9 @@ TP1, with the gateway round-robining requests across the two decode workers.
 Launches the EPD serve script (encode + prefill + decode workers behind the SMG
 gateway) and validates that the vision path works end to end via the
 /v1/chat/completions API: it posts a self-contained image (rendered with PIL, no
-network fixture) plus a prompt and asserts the model reads it correctly. This is
-the EPD analogue of test_qwen35_pd_1p1d.py -- a functional gate that the
-encode->prefill->decode embedding transfer does not silently corrupt the image.
+network fixture) plus a prompt and asserts the model reads it correctly: a
+functional gate that the encode->prefill->decode embedding transfer does not
+silently corrupt the image.
 The smoke requests disable thinking explicitly so their 32-token budget tests
 the vision result instead of reasoning length; the OCRBench eval remains native-think.
 
@@ -130,14 +130,21 @@ QUALITY_CHECKS = [
 
 
 def _wait_for_server(proc: subprocess.Popen, port: int, timeout: int) -> bool:
-    url = f"http://127.0.0.1:{port}/v1/models"
+    base = f"http://127.0.0.1:{port}"
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
             return False
         try:
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200 and "data" in resp.json():
+            # Ready once every engine registered with the gateway; require a
+            # real model list too, so a port squatter cannot fake readiness.
+            ready = requests.get(f"{base}/readiness", timeout=5)
+            models = requests.get(f"{base}/v1/models", timeout=5)
+            if (
+                ready.status_code == 200
+                and models.status_code == 200
+                and "data" in models.json()
+            ):
                 return True
         except Exception:
             pass

@@ -66,7 +66,45 @@ def ascend_dsa_kernels():
     return _kernels
 
 
+def ascend_prefill_cache_metadata(*args, **kwargs):
+    """Map owner pages and current receives without loading Indexer operators."""
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    return AscendDSAKernels.prefill_metadata(*args, **kwargs)
+
+
+def ascend_prepare_dsa_resources(*, group, rank):
+    """Bind operator-owned views of the existing HCCL windows before capture."""
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+
+    ascend_dsa_kernels()
+    window = torch.ops.custom.dsa_prepare_prolog_window(group, rank)
+    try:
+        prepared = {
+            rows: torch.ops.custom.dsa_prepare_lse_buffers(group, rows, rank)
+            for rows in (64, 128, 256, 512)
+        }
+    except BaseException:
+        torch.ops.custom.dsa_release_prolog_window(window)
+        raise
+    return DSAResources(
+        window,
+        {rows: values[:3] for rows, values in prepared.items()},
+        {rows: values[3] for rows, values in prepared.items()},
+        release=torch.ops.custom.dsa_release_prolog_window,
+    )
+
+
 if platform.is_npu:
+    register_kernel(
+        "attention",
+        "dsa_prepare_resources",
+        name="ascend_prepare_dsa_resources",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature()],
+        priority=Priority.PERFORMANT,
+    )(ascend_prepare_dsa_resources)
 
     @register_kernel(
         "attention",

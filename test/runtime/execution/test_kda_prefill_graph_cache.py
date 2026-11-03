@@ -23,13 +23,16 @@
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+# ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``).
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
@@ -299,6 +302,9 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         ForwardMode,
     )
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 
     if not cutedsl_kda_supported():
@@ -309,7 +315,11 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     conv = torch.randn(12, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
     states = torch.randn(12, heads, dim, dim, device="cuda", dtype=torch.float32)
     initial_conv, initial_states = conv.clone(), states.clone()
-    raw = torch.randn(bucket, 3 * channels, device="cuda", dtype=torch.bfloat16)
+    # The live input of the captured projection: merged rows [q|k|v|g|f_a|b],
+    # padded to the 128-row grid.
+    projection = torch.randn(
+        bucket, 4 * channels + 2 * dim, device="cuda", dtype=torch.bfloat16
+    )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
     backend.__dict__.update(
@@ -334,28 +344,43 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         attention_tp_size=1,
         head_k_dim=dim,
         head_v_dim=dim,
-        g_raw=torch.randn(bucket, channels, device="cuda", dtype=torch.bfloat16),
-        beta_raw=torch.randn(bucket, heads, device="cuda", dtype=torch.bfloat16),
+        f_b_weight=torch.randn(channels, dim, device="cuda", dtype=torch.bfloat16)
+        * 0.1,
         A_log=torch.zeros(heads, device="cuda"),
         dt_bias=torch.zeros(channels, device="cuda"),
         lower_bound=-5.0,
         layer_id=0,
         seq_len=bucket,
     )
+    # Layer 1 would be full attention; this forward has only the KDA layer 0.
+    full = object.__new__(KdaAttnBackend)
+    full.forward_metadata = None
+    full.device = torch.device("cuda")
+    hybrid = HybridLinearAttnBackend(full, backend, [1])
 
-    def forward():
-        return backend.forward_extend(
+    def forward(compact):
+        # As in the model: the captured projection writes fresh rows (the
+        # capacity scrub zeroes padded rows in place), the attention gets
+        # sibling views of them and the output gate is read after it.
+        # ``compact`` is the q|k|v copy the model used to make.
+        rows = projection.clone()
+        mixed_qkv = rows[:, : 3 * channels]
+        core = hybrid.forward(
             None,
             None,
             None,
             None,
             None,
-            backend.forward_metadata.extend_seq_lens_cpu.numel(),
             ForwardMode.EXTEND,
-            save_kv_cache=True,
-            mixed_qkv=raw.clone(),
+            backend.forward_metadata.extend_seq_lens_cpu.numel(),
+            True,
+            None,
+            mixed_qkv=mixed_qkv.contiguous() if compact else mixed_qkv,
+            f_a_out=rows[:, 4 * channels : 4 * channels + dim],
+            beta_raw=rows[:, 4 * channels + dim : 4 * channels + dim + heads],
             **kwargs,
         )
+        return core.flatten(1) * rows[: core.shape[0], 3 * channels : 4 * channels]
 
     def reset():
         conv.copy_(initial_conv)
@@ -434,8 +459,8 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
     owner._embed_tokens = lambda ids: ids
     owner._land_input_embeds = lambda *args: None
-    owner.attn_backend = backend
-    owner._run_inner = lambda bucket: (forward(), None)
+    owner.attn_backend = hybrid
+    owner._run_inner = lambda bucket: (forward(compact=False), None)
 
     def dummy(bucket, bs):
         backend.forward_metadata = live_metadata([bucket // bs] * bs, [0] * bs, 2)
@@ -451,6 +476,12 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     capture, captured = owner._captures[bucket, batch_size]
     output = captured.hidden_states
     assert capture.num_segments == 1
+    # The ordinary capture: projection graph, eager attention break, gate graph.
+    ordinary, ordinary_captured = owner._captures[bucket, None]
+    ordinary_output = ordinary_captured.hidden_states
+    assert ordinary.num_segments == 3
+    # Compared bytewise below; same dtypes make same-shape byte views.
+    assert output.dtype == ordinary_output.dtype == torch.bfloat16
     fixed = backend._prefill_metadata[bucket, batch_size]
     retained = {
         "query_start_loc": fixed.query_start_loc,
@@ -464,10 +495,13 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         forward_mode=ForwardMode.EXTEND, bs=batch_size, num_extends=batch_size
     )
     for index, (lengths, prefixes) in enumerate(cases * 2):
+        # New live input rows for every forward.
+        projection.normal_()
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         source = backend.forward_metadata
         reset()
-        expected = forward()[: sum(lengths)].clone()
+        expected = forward(compact=True)[: sum(lengths)].clone()
+        assert expected.dtype == torch.bfloat16
         expected_conv, expected_states = conv.clone(), states.clone()
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
@@ -475,27 +509,46 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
             source, bucket, None
         )
         reset()
-        fresh_eager = forward()[: sum(lengths)].clone()
-        torch.testing.assert_close(fresh_eager, expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        fresh_eager = forward(compact=False)[: sum(lengths)].clone()
+        assert torch.equal(fresh_eager.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
+        # The ordinary capture hands the eager break views of the projection
+        # its graph just wrote, on that transient metadata (an uncaptured
+        # request count) or on the plain one (forwards the capacity layout
+        # does not admit, such as MIXED batches).
+        for metadata in (backend.forward_metadata, source):
+            backend.forward_metadata = metadata
+            reset()
+            ordinary.replay(valid_rows=sum(lengths))
+            assert torch.equal(
+                ordinary_output[: sum(lengths)].view(torch.uint8),
+                expected.view(torch.uint8),
+            )
+            assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+            assert torch.equal(
+                states.view(torch.uint8), expected_states.view(torch.uint8)
+            )
+            assert torch.count_nonzero(ordinary_output[sum(lengths) :]) == 0
         backend.forward_metadata = source
         backend.prepare_prefill_metadata(
             bucket, batch_size, ctx.forward_mode, capture=False
         )
         reset()
-        eager = forward()[: sum(lengths)].clone()
-        torch.testing.assert_close(eager, expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        eager = forward(compact=False)[: sum(lengths)].clone()
+        assert torch.equal(eager.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
         reset()
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
             name: tensor.data_ptr() for name, tensor in retained.items()
         }
-        torch.testing.assert_close(output[: sum(lengths)], expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        assert torch.equal(
+            output[: sum(lengths)].view(torch.uint8), expected.view(torch.uint8)
+        )
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
         assert torch.count_nonzero(output[sum(lengths) :]) == 0
 
 
@@ -552,6 +605,8 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner.attn_backend = SimpleNamespace(
         step_counter=object() if transfer else None, prepare_prefill_metadata=prepare
     )
+    # No Host L2 tier: nothing to wait for before the replay.
+    owner.token_to_kv_pool = SimpleNamespace(layerwise_load_tracker=None)
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
     owner._embed_tokens = lambda ids: torch.zeros(8, 4)
@@ -754,6 +809,321 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
     assert events == (["prepare"] if prepared else []) + [
         "graph" if use_graph else "eager"
     ]
+
+
+_BUCKET = 8
+
+
+@pytest.fixture
+def kimi_host_cache():
+    """A Kimi-K3 TP8 pool with a Host L2 tier, the device handle that runs a
+    plan's cache ops on it, and a bare replay owner over the pool.
+
+    Page 1 of every cache group holds random bytes (finite floats in the first
+    KDA layer's recurrent state) and is stored to Host page 1, which a test
+    then loads back into another page, as a prefix hit does. The owner's
+    backend sends the first KDA layer to a stand-in KDA leaf that adds the
+    request's input state to its input. The leaf reads that state through the
+    pool, as KDA does, so the read waits for the layer's Host load when it
+    runs at an eager break. The ops stand in for ``Cache.WriteBackOp`` and
+    ``Cache.LoadBackOp``, which have no Python constructor.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    ts = pytest.importorskip("tokenspeed_scheduler")
+    from test.runtime.conftest import kda_layer_id, make_kimi_pool, mla_layer_id
+
+    from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+    from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.device import DeviceHandle
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+
+    class WriteBackOp:
+        # A stream-ordered store of page ``src`` of each group to ``dst``.
+        def __init__(self, op_id, groups, src, dst):
+            self.op_ids = [op_id]
+            self.group_ids = [list(groups)]
+            self.src_pages = [[src] * len(groups)]
+            self.dst_pages = [[dst] * len(groups)]
+            self.source_pinned = [False]
+
+    class LoadBackOp:
+        def __init__(self, op_id, groups, src, dst):
+            self.op_ids = [op_id]
+            self.group_ids = [list(groups)]
+            self.src_pages = [[src] * len(groups)]
+            self.dst_pages = [[dst] * len(groups)]
+
+    class Leaf(KdaAttnBackend):
+        def forward_extend(self, q, k, v, layer, pool, bs, **kwargs):
+            _, recurrent = self._state_components(layer.layer_id)
+            pages = self.forward_metadata.state_in_blocks_by_group["state"].long()
+            return q + recurrent[pages].reshape(-1)[: q.numel()].view_as(q)
+
+    pool = make_kimi_pool("cuda", usable_pages=3)
+    executor = HostCacheExecutor(
+        pool,
+        draft_pool=None,
+        l2_tier=True,
+        host_ratio=1.0,
+        host_size_gb=0,
+        snapshot_pool=RetractionPoolRequest(
+            host_gb=0.0,
+            ratio=0.0,
+            max_retracted_requests=0,
+            tail_lcm_blocks_per_request=0,
+        ),
+        slot_state_exporters=None,
+        io_backend="kernel",
+        attn_tp_rank=0,
+        kvp_rank=0,
+        nprocs_per_node=1,
+        world_cpu_group=None,
+    )
+    # A model executor without a model: the fields the handle reads.
+    model_executor = ModelExecutor.__new__(ModelExecutor)
+    model_executor.device = "cuda"
+    model_executor.device_module = torch.cuda
+    model_executor.default_stream = torch.cuda.default_stream()
+    model_executor.execution_stream = torch.cuda.Stream()
+    model_executor.token_to_kv_pool = pool
+    model_executor.draft_token_to_kv_pool = None
+    model_executor._cache_runtime_contract = pool.arena.runtime_contract
+    model_executor._cache_kvp_rank = 0
+    model_executor.drafter = None
+    handle = DeviceHandle(model_executor, host_cache_executor=executor)
+    handle.bind_forward_thread()
+
+    leaf = object.__new__(Leaf)
+    configure_prefill(leaf)
+    leaf.cache_pool = pool
+    full = object.__new__(Leaf)
+    full.forward_metadata = None
+    full.device = torch.device("cuda")
+    hybrid = HybridLinearAttnBackend(full, leaf, [mla_layer_id(pool)])
+    owner = object.__new__(PrefillGraph)
+    owner._narrowing = None
+    owner._expert_load_rows = None
+    owner._engaged_logged = set()
+    owner._captures = {}
+    owner.dp_size = 1
+    owner.attn_backend = hybrid
+    owner.token_to_kv_pool = pool
+    owner.config = SimpleNamespace(world_size=1, model_is_mrope=False)
+    owner._replay_bucket = lambda ctx: _BUCKET
+    owner._embed_tokens = lambda ids: ids
+    owner._land_input_embeds = lambda *args: None
+    owner.text_model = SimpleNamespace(
+        lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
+    )
+    groups = [group.group_id for group in executor.layout.groups]
+    try:
+        with (
+            patch.object(ts.Cache, "WriteBackOp", WriteBackOp),
+            patch.object(ts.Cache, "LoadBackOp", LoadBackOp),
+            patch(
+                "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata."
+                "from_forward_context",
+                return_value=None,
+            ),
+        ):
+            # A first load and layerwise wait, so a held-back load below sets
+            # up no transfer tables or kernels: either would wait for the
+            # device, the held-back copy included.
+            handle.execute(
+                ts.ExecutionPlan(),
+                None,
+                cache_ops=[LoadBackOp(1, range(len(groups)), 1, 3)],
+            )
+            pool.get_component(kda_layer_id(pool), "recurrent_state")
+            torch.manual_seed(37)
+            pool.arena.buffer.random_(0, 256)
+            pool.get_component(kda_layer_id(pool), "recurrent_state")[1].normal_()
+            # Its plan also points the layerwise waits at no load again, so
+            # the tests capture with none, as a server does.
+            handle.execute(
+                ts.ExecutionPlan(),
+                None,
+                cache_ops=[WriteBackOp(2, range(len(groups)), 1, 1)],
+            )
+            torch.cuda.synchronize()
+            acks = sorted(int(ack.op_id) for ack in handle.poll_cache_results())
+            assert acks == [1, 2]
+            yield SimpleNamespace(
+                ts=ts,
+                pool=pool,
+                executor=executor,
+                handle=handle,
+                groups=groups,
+                LoadBackOp=LoadBackOp,
+                leaf=leaf,
+                hybrid=hybrid,
+                owner=owner,
+                ctx=ForwardContext(
+                    attn_backend=hybrid,
+                    token_to_kv_pool=pool,
+                    bs=1,
+                    num_extends=1,
+                    output_layout=ForwardOutputLayout(1, 1, 0, 1),
+                    input_num_tokens=_BUCKET,
+                    forward_mode=ForwardMode.EXTEND,
+                ),
+            )
+    finally:
+        handle.shutdown_cache()
+
+
+def test_a_replay_writes_a_loaded_tail_page_after_the_load(kimi_host_cache):
+    """A Host tail hit loads the Host block into the hitter's own page, and
+    the chunk's MLA prologue writes its new rows into the rest of that page
+    inside a captured segment, with no layerwise wait there (the attention
+    break after it waits too late). With the page's H2D held back on the
+    load stream, a replay that did not wait for the load would have its rows
+    overwritten by the Host block; they survive. Under
+    --disable-kda-prefill-graph, as here, every captured segment is ordinary.
+    """
+    from test.runtime.conftest import MLA_LATENT_DIM, mla_layer_id
+
+    from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+    from tokenspeed.runtime.execution.prefill_graph import CapturedForward
+
+    cache = kimi_host_cache
+    pool, owner = cache.pool, cache.owner
+    cache.leaf._prefill_graph_enabled = False
+    layer = mla_layer_id(pool)
+    page_size = pool.arena.prefix_granularity
+    latent = (
+        pool.kv_buffer[layer].view(torch.uint8).view(-1, page_size, 1, MLA_LATENT_DIM)
+    )
+    # The hit covers the first half of page 2; the chunk writes the rest.
+    page, hit = 2, page_size // 2
+    host_rows = latent[1].clone()
+    slots = torch.arange(page * page_size + hit, (page + 1) * page_size, device="cuda")
+    rows = torch.randint(
+        0, 256, (page_size - hit, 1, MLA_LATENT_DIM), dtype=torch.uint8, device="cuda"
+    )
+    hidden = torch.ones(_BUCKET, 4, device="cuda")
+
+    def forward():
+        target = pool.kv_write_target(layer, slots, None)
+        target.kv_cache.view(torch.uint8)[target.slots] = rows
+        return hidden * 2
+
+    forward()
+    torch.cuda.synchronize()
+    capture = BreakableCapture()
+    with capture:
+        output = forward()
+    owner._captures = {(_BUCKET, None): (capture, CapturedForward(output, None))}
+
+    group = cache.groups.index("full_attention")
+    pool.arena.zero_blocks({"full_attention": np.asarray([page])})
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(200_000_000)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [group], 1, page)],
+    )
+    result = owner.replay(cache.ctx, torch.ones(_BUCKET, dtype=torch.int64), None)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    assert torch.equal(result, hidden * 2)
+    assert torch.equal(latent[page, :hit], host_rows[:hit])
+    assert torch.equal(latent[page, hit:], rows)
+
+    # A plan without cache ops points the layerwise waits at no load.
+    assert pool.layerwise_load_tracker.consumer_indices
+    cache.handle.execute(cache.ts.ExecutionPlan(), None, cache_ops=[])
+    assert pool.layerwise_load_tracker.consumer_indices == ()
+
+
+def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cache):
+    """A prefix hit loads the Host State checkpoint into the request's input
+    state page, which an inline KDA capture reads inside its segment, with no
+    layerwise wait there. With the H2D held back on the load stream, the
+    inline replay computes what the ordinary capture computes, whose KDA
+    layer reads at an eager break that waits for the load (the path
+    --disable-kda-prefill-graph takes): both see the Host state."""
+    from test.runtime.conftest import kda_layer_id
+
+    from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.prefill_graph import CapturedForward
+
+    cache = kimi_host_cache
+    pool, leaf, owner = cache.pool, cache.leaf, cache.owner
+    layer = kda_layer_id(pool)
+    group_id = pool.state_group_by_layer[layer]
+    page = 2
+    value = torch.ones(_BUCKET, 4, device="cuda")
+
+    def forward():
+        out = cache.hybrid.forward(
+            value * 2,
+            None,
+            None,
+            SimpleNamespace(layer_id=layer),
+            None,
+            ForwardMode.EXTEND,
+            1,
+            True,
+            None,
+        )
+        return out * 3
+
+    leaf.forward_metadata = metadata("cuda", page)
+    forward()
+    torch.cuda.synchronize()
+    ordinary = BreakableCapture()
+    with ordinary:
+        ordinary_output = forward()
+    assert ordinary.num_segments == 3
+    leaf.prepare_prefill_metadata(_BUCKET, 1, ForwardMode.EXTEND, capture=True)
+    forward()
+    torch.cuda.synchronize()
+    inline = BreakableCapture()
+    with inline:
+        inline_output = forward()
+    assert inline.num_segments == 1
+    owner._captures = {
+        (_BUCKET, None): (ordinary, CapturedForward(ordinary_output, None)),
+        (_BUCKET, 1): (inline, CapturedForward(inline_output, None)),
+    }
+
+    host_state = pool.get_component(layer, "recurrent_state")[1].clone()
+    results = {}
+    for op_id, inline_kda in ((3, False), (4, True)):
+        leaf._prefill_graph_enabled = inline_kda
+        leaf.forward_metadata = metadata("cuda", page)
+        pool.arena.zero_blocks({group_id: np.asarray([page])})
+        with torch.cuda.stream(cache.executor.load_stream):
+            torch.cuda._sleep(200_000_000)
+        cache.handle.execute(
+            cache.ts.ExecutionPlan(),
+            None,
+            cache_ops=[
+                cache.LoadBackOp(op_id, [cache.groups.index(group_id)], 1, page)
+            ],
+        )
+        results[inline_kda] = owner.replay(
+            cache.ctx, torch.ones(_BUCKET, dtype=torch.int64), None
+        ).clone()
+        assert not cache.executor.load_stream.query()
+        torch.cuda.synchronize()
+        assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [op_id]
+    expected = (value * 2 + host_state.reshape(-1)[: value.numel()].view_as(value)) * 3
+    assert torch.equal(results[False], expected)
+    assert torch.equal(results[True], results[False])
 
 
 if __name__ == "__main__":

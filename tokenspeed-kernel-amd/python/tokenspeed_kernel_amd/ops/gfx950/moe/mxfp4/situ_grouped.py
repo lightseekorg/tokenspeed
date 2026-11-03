@@ -805,10 +805,11 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         )
 
     num_routes = num_tokens * top_k
+    use_fused_align = (
+        activation == "swiglu" and 0 < num_routes <= 128 and num_tokens <= block_m
+    )
     align = (
-        moe_align_block_size_fused
-        if activation == "swiglu" and 0 < num_routes <= 128 and num_tokens <= block_m
-        else moe_align_block_size_device
+        moe_align_block_size_fused if use_fused_align else moe_align_block_size_device
     )
     sorted_ids, sorted_experts, sorted_weights, num_valid = align(
         local_topk_ids,
@@ -817,6 +818,15 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         block_m,
         expert_start=expert_start,
     )
+    # Keep the pre-bucketing GEMM grids while the shared sorter uses bucketed
+    # scratch internally. Views do not copy routes or add a GPU launch.
+    logical_rows = (
+        num_routes * block_m if use_fused_align else num_routes + num_experts * block_m
+    )
+    logical_blocks = num_routes if use_fused_align else logical_rows // block_m + 1
+    sorted_ids = sorted_ids[:logical_rows]
+    sorted_experts = sorted_experts[:logical_blocks]
+    sorted_weights = sorted_weights[:logical_rows]
     em = int(sorted_ids.shape[0])
     inter = torch.empty(
         (num_tokens * top_k, intermediate),

@@ -39,6 +39,7 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
 
 - Put the model path directly after `tokenspeed serve`.
 - Set `--host`, `--port`, and `--served-model-name` for the API surface.
+- Pass IPv6 host arguments as bare addresses, for example `--host ::1`. The launcher brackets IPv6 literals in HTTP URLs (`http://[::1]:8000`), including URLs printed for `--metrics-host`.
 - Set `--max-model-len`, `--kv-cache-dtype`, and `--gpu-memory-utilization` before tuning concurrency.
 - Set `--tensor-parallel-size`, `--data-parallel-size`, and `--enable-expert-parallel` to match the hardware topology.
 - Set model-family parsers such as `--reasoning-parser` and `--tool-call-parser` when the chat format needs them.
@@ -63,3 +64,4 @@ print(response.choices[0].message.content)
 - [Model Recipes](../recipes/models.md)
 - [Server Parameters](../configuration/server.md)
 - [Parallelism](../serving/parallelism.md)
+- [Disaggregated Serving](../serving/disaggregation.md)

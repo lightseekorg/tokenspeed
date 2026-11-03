@@ -96,6 +96,7 @@ class _AutotuneConfig:
 
     max_num_seqs: int = 8
     data_parallel_size: int = 1
+    attention_tp_size: int = 1
     chunked_prefill_size: int = -1
     context_len: int = 4
     world_size: int = 1
@@ -178,6 +179,7 @@ class _AutotuneExecutor:
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
 
     def _autotune_draft_experts(self, num_tokens):
+        assert tuning_module.is_warming_up()
         self._events.append(("draft_experts", num_tokens))
 
 
@@ -193,13 +195,21 @@ class _ProcessGroupManagerDouble:
         return self._group
 
 
+@pytest.mark.parametrize("attention_tp_size", [1, 2, 8])
 @pytest.mark.parametrize("chunk_size", [-1, 16, 17])
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize("prefill_only", [False, True])
 def test_startup_uses_native_buckets_without_reading_capture_sizes(
-    monkeypatch, tmp_path, chunk_size, speculative, disabled, failure, prefill_only
+    monkeypatch,
+    tmp_path,
+    chunk_size,
+    speculative,
+    disabled,
+    failure,
+    prefill_only,
+    attention_tp_size,
 ):
     events = []
     metadata = []
@@ -219,14 +229,22 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         assert not ngram_history.any() and not ngram_mask.any()
         assert not torch.is_grad_enabled()
         assert not torch.is_inference_mode_enabled()
+        assert tuning_module.is_warming_up()
+        assert tuning_module.is_autotuning() is (
+            not disabled and tuning_module._autotuner is not None
+        )
         events.append(("target", kwargs["input_ids"].numel()))
         metadata.append(torch.zeros(1))
         if failure:
             raise RuntimeError("profiling failed")
 
     def draft(*, batch_sizes, graph_phase):
-        assert batch_sizes == (1,)
+        assert batch_sizes == (attention_tp_size,)
+        assert tuning_module.is_autotuning() is (
+            not disabled and tuning_module._autotuner is not None
+        )
         assert graph_phase is False
+        assert tuning_module.is_warming_up()
         events.append("draft")
 
     def prefill_batch(num_tokens, batch_size):
@@ -237,6 +255,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     executor = _AutotuneExecutor(
         config=_AutotuneConfig(
             chunked_prefill_size=chunk_size,
+            attention_tp_size=attention_tp_size,
             autotune_cache_key={},
             disable_autotune=disabled,
             prefill_only=prefill_only,
@@ -282,15 +301,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         "set_autotune_process_group",
         lambda group: events.append(("group", group)),
     )
-    policy_kwargs = []
-    real_autotune_ctx = executor_module.autotune
-
-    def policy(*args, **kwargs):
-        policy_kwargs.append(kwargs)
-        return real_autotune_ctx(*args, **kwargs)
-
-    monkeypatch.setattr(executor_module, "autotune", policy)
-    if failure and not disabled:
+    if failure:
         with pytest.raises(RuntimeError, match="profiling failed"):
             ModelExecutor.autotune(executor)
         assert events == [
@@ -298,13 +309,10 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ("group", None),
             "scrub",
             ("target", (32 if chunk_size < 0 else chunk_size)),
+            ("group", None),
         ]
-        return
-    ModelExecutor.autotune(executor)
-    if disabled:
-        assert events == ["load"]
-        assert policy_kwargs == []
     else:
+        ModelExecutor.autotune(executor)
         assert events == [
             "load",
             ("group", None),
@@ -317,11 +325,10 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ),
             *(["draft"] if speculative and not prefill_only else []),
             ("group", None),
-            "save",
+            *(["save"] if not disabled else []),
         ]
-        assert policy_kwargs == [
-            dict(tune_mode=True, tuning_buckets=None, round_up=None)
-        ]
+    assert not tuning_module.is_warming_up()
+    assert not tuning_module.is_autotuning()
     for tensor in metadata:
         tensor.fill_(1)  # Capture must be able to mutate warmup metadata later.
 
@@ -399,8 +406,10 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
 
 
 @pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
 def test_decode_only_attention_tunes_on_a_decode_step(
-    monkeypatch, tmp_path, speculative
+    monkeypatch, tmp_path, speculative, disabled, failure
 ):
     """Head TP serves decode rows only: no extend-shaped dummy is built; the
     traversal is one decode step at the largest batch, draft experts included."""
@@ -412,7 +421,13 @@ def test_decode_only_attention_tunes_on_a_decode_step(
     def warmup(*, batch_sizes, graph_phase):
         assert batch_sizes == (8,)
         assert graph_phase is False
+        assert tuning_module.is_warming_up()
+        assert tuning_module.is_autotuning() is (
+            not disabled and tuning_module._autotuner is not None
+        )
         events.append("decode")
+        if failure:
+            raise RuntimeError("decode warmup failed")
 
     def prefill_batch(num_tokens, batch_size):
         raise AssertionError("no extend dummy batch on a decode-only layout")
@@ -421,7 +436,11 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         raise AssertionError("no extend inputs on a decode-only layout")
 
     executor = _AutotuneExecutor(
-        config=_AutotuneConfig(autotune_cache_key={}, decode_only_attention=True),
+        config=_AutotuneConfig(
+            autotune_cache_key={},
+            decode_only_attention=True,
+            disable_autotune=disabled,
+        ),
         forward=forward,
         input_buffers=_InputBuffersDouble(
             input_ids_buf=torch.ones(32),
@@ -466,8 +485,11 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         "save_autotune_cache",
         lambda *args: events.append("save"),
     )
-    _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
-    ModelExecutor.autotune(executor)
+    if failure:
+        with pytest.raises(RuntimeError, match="decode warmup failed"):
+            ModelExecutor.autotune(executor)
+    else:
+        ModelExecutor.autotune(executor)
     assert max_tokens == [8 * 3]
     assert events == [
         "load",
@@ -476,8 +498,40 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         *([("draft_experts", 24)] if speculative else []),
         "decode",
         ("group", None),
-        "save",
+        *(["save"] if not disabled and not failure else []),
     ]
+    assert not tuning_module.is_warming_up()
+    assert not tuning_module.is_autotuning()
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_pipeline_parallelism_does_not_run_unsupported_dummy_forward(
+    disabled,
+):
+    def unexpected_forward(**kwargs):
+        raise AssertionError("pipeline stages need transfers before a forward")
+
+    def unexpected_scrub(**kwargs):
+        raise AssertionError("pipeline stages must not prepare a dummy forward")
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(pp_size=2, disable_autotune=disabled),
+        forward=unexpected_forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=unexpected_scrub,
+        ),
+        prefill_graph=_PrefillGraphDouble(make_dummy_batch=unexpected_forward),
+        forward_step=_ForwardStepDouble(),
+        drafter=None,
+        model_input_kwargs=unexpected_forward,
+        events=[],
+    )
+    ModelExecutor.autotune(executor)
+    assert not tuning_module.is_warming_up()
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +660,59 @@ class _ModelConfigDouble:
     revision: str | None
     hf_config: _HfConfigDouble
     quantization: str | None
+
+
+@pytest.mark.parametrize("tp,dp,max_num_seqs", [(8, 1, 4), (2, 4, 4), (2, 4, 7)])
+@pytest.mark.parametrize("disable_autotune", [False, True])
+@pytest.mark.parametrize("role", ["null", "decode"])
+def test_speculative_warmup_rejects_capacity_below_attention_tp(
+    tp, dp, max_num_seqs, disable_autotune, role
+):
+    with pytest.raises(ValueError, match=f"Set --max-num-seqs to at least {tp * dp}"):
+        ServerArgs(
+            model="x",
+            dtype="bfloat16",
+            world_size=tp * dp,
+            attn_tp_size=tp,
+            data_parallel_size=dp,
+            ep_size=tp * dp,
+            max_num_seqs=max_num_seqs,
+            speculative_algorithm="MTP",
+            disable_autotune=disable_autotune,
+            disaggregation_mode=role,
+        )
+
+
+@pytest.mark.parametrize(
+    "tp,dp,max_num_seqs", [(8, 1, 8), (2, 4, 8), (2, 4, 9), (1, 8, 8)]
+)
+def test_speculative_warmup_accepts_capacity_covering_attention_tp(
+    tp, dp, max_num_seqs
+):
+    args = ServerArgs(
+        model="x",
+        dtype="bfloat16",
+        world_size=tp * dp,
+        attn_tp_size=tp,
+        data_parallel_size=dp,
+        ep_size=tp * dp,
+        max_num_seqs=max_num_seqs,
+        speculative_algorithm="MTP",
+    )
+    assert args.max_num_seqs == max_num_seqs
+
+
+@pytest.mark.parametrize("algorithm,role", [(None, "null"), ("MTP", "prefill")])
+def test_small_capacity_without_draft_decode_warmup_is_preserved(algorithm, role):
+    args = ServerArgs(
+        model="x",
+        dtype="bfloat16",
+        attn_tp_size=8,
+        max_num_seqs=4,
+        speculative_algorithm=algorithm,
+        disaggregation_mode=role,
+    )
+    assert args.max_num_seqs == 4
 
 
 def test_pipeline_stages_share_shape_keyed_cache_identity():

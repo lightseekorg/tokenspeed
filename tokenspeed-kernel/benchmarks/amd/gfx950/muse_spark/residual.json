@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "muse_spark_tp8",
+    "hidden_size": 8192,
+    "post_eps": 1e-08,
+    "pre_eps": 1e-05,
+    "gate_eps": 0.001,
+    "gate_temperature": 0.3,
+    "weight_offset": 1.0,
+    "dtype": "bfloat16"
+  },
+  "cases": [
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/ffn-decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "tokens": [
+            1,
+            16
+          ],
+          "post_weighted": true,
+          "pre_weighted": true,
+          "outputs": "bf16"
+        },
+        "cold_cache": true,
+        "seed": 5730
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/ffn-prefill-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "tokens": [
+            1024
+          ],
+          "post_weighted": true,
+          "pre_weighted": true,
+          "outputs": "bf16"
+        },
+        "cold_cache": true,
+        "seed": 5731
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/attention-prefill-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "tokens": [
+            1024
+          ],
+          "post_weighted": false,
+          "pre_weighted": true,
+          "outputs": "fp32_and_bf16"
+        },
+        "cold_cache": true,
+        "seed": 5732
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    }
+  ]
+}

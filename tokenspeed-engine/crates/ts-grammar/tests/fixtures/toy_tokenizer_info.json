@@ -1,0 +1,1 @@
+{"vocab_type":0,"vocab_size":9,"add_prefix_space":false,"stop_token_ids":[8],"special_token_ids":[],"decoded_vocab":["a","b","{","}","\"","x",":",",","</s>"],"sorted_decoded_vocab":[[4,"\""],[7,","],[6,":"],[0,"a"],[1,"b"],[5,"x"],[2,"{"],[3,"}"]],"trie_subtree_nodes_range":[1,2,3,4,5,6,7,8],"__VERSION__":"v16"}

@@ -20,9 +20,9 @@
 
 """Triton kernels for short causal convolution (sconv).
 
-Two kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`,
-split by forward family -- each hard-codes its state source so neither
-carries the other's paths. Both address the conv checkpoint cache through a
+Kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`. The two
+conv kernels are split by forward family -- each hard-codes its state source
+so neither carries the other's paths. All address the conv checkpoint cache through a
 two-slot block table per request: slot 0 is the input checkpoint (the conv
 window at the chunk start: a prefix hit, or the previous chunk's window the
 scheduler rotated there; a hole for the zero state), slot 1 the live block
@@ -40,6 +40,10 @@ that receives the window at the chunk end.
   asserts the uniform chunk fits ``R - (W - 1)``, so writes never alias
   another request's taps) and, when ``PUBLISH`` is set, publishes the
   chunk-end window to slot 1.
+- ``_inkling_ring_commit_kernel``: after a target verify, publishes the
+  window at each request's accepted frontier from the ring to slot 1, for
+  every layer's streams in one launch (a verify's decode kernel publishes
+  nothing: the frontier is known only after acceptance).
 
 The ring row of absolute position ``p`` is ``p % R``; positions derive from
 the through-chunk ``seq_lens``, there is no stored cursor, and rejected
@@ -536,6 +540,73 @@ def _inkling_ring_sconv_prefill_kernel(
                     val.to(ckpt_b_ptr.dtype.element_ty),
                     mask=pub[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
                 )
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit(do_not_specialize=["stride_live_g"])
+def _inkling_ring_commit_kernel(
+    ring_ptr,  # [L, num_slots, R, C] conv rings of every layer
+    src_offsets_ptr,  # int64 [E]: entry's first channel, layer * stride_l + channel
+    widths_ptr,  # int32 [E]: channels the entry's field holds
+    ckpt_addresses_ptr,  # uint64 [E]: the field's page-0 address
+    ckpt_page_strides_ptr,  # int64 [E], elements
+    ckpt_row_strides_ptr,  # int64 [E], elements
+    groups_ptr,  # int32 [E]: the entry's row in live_pages
+    live_pages_ptr,  # int32 [G, >= B]: live block per group and request
+    cache_indices_ptr,  # int32 [B]: ring slot, PAD_SLOT_ID for padded rows
+    seq_lens_ptr,  # [B]: lengths through the verify chunk
+    accepted_ptr,  # [B]: accepted tokens of the verify chunk
+    stride_ring_slot,
+    stride_ring_row,
+    stride_live_g,
+    CKPT_DTYPE: tl.constexpr,
+    STATE_ROWS: tl.constexpr,  # W - 1
+    R: tl.constexpr,
+    VERIFY_WIDTH: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    """Publish one entry's accepted window of one request to its live block.
+
+    The window is the ``STATE_ROWS`` ring rows ending at the committed
+    frontier ``seq_lens - VERIFY_WIDTH + clamp(accepted, 1, VERIFY_WIDTH)``;
+    positions before 0 are zeros. Padded rows and hole live blocks store
+    nothing.
+    """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    entry = tl.program_id(0)
+    req = tl.program_id(1)
+    cols = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
+    col_mask = cols < tl.load(widths_ptr + entry)
+    slot = tl.load(cache_indices_ptr + req).to(tl.int64)
+    group = tl.load(groups_ptr + entry).to(tl.int64)
+    page = tl.load(live_pages_ptr + group * stride_live_g + req).to(tl.int64)
+    if (slot >= 0) & (page > 0):
+        steps = tl.load(accepted_ptr + req).to(tl.int64)
+        steps = tl.minimum(tl.maximum(steps, 1), VERIFY_WIDTH)
+        frontier = tl.load(seq_lens_ptr + req).to(tl.int64) - VERIFY_WIDTH + steps
+        src = (
+            ring_ptr
+            + slot * stride_ring_slot
+            + tl.load(src_offsets_ptr + entry)
+            + cols.to(tl.int64)
+        )
+        dst = (
+            tl.cast(tl.load(ckpt_addresses_ptr + entry), tl.pointer_type(CKPT_DTYPE))
+            + page * tl.load(ckpt_page_strides_ptr + entry)
+            + cols.to(tl.int64)
+        )
+        row_stride = tl.load(ckpt_row_strides_ptr + entry)
+        for w in tl.static_range(STATE_ROWS):
+            pos = frontier - STATE_ROWS + w
+            row = (tl.maximum(pos, 0) % R).to(tl.int64)
+            val = tl.load(
+                src + row * stride_ring_row, mask=col_mask & (pos >= 0), other=0
+            )
+            tl.store(dst + w * row_stride, val.to(CKPT_DTYPE), mask=col_mask)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()

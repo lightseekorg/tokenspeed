@@ -57,7 +57,7 @@ def _compact(
     tl.store(Lengths + row, count)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["WIDTH", "STRIDE", "COL_STRIDE", "COLS"])
 def _mask_scores(
     Logits,
     Positions,
@@ -67,29 +67,37 @@ def _mask_scores(
     # shape shares one binary.
     WIDTH,
     STRIDE,
+    COL_STRIDE,
     COLS,
     PAGE: tl.constexpr,
     INITIAL: tl.constexpr,
     LOCAL: tl.constexpr,
+    MASK_TAIL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    start = tl.program_id(1) * BLOCK
     length = tl.load(Lengths + row)
-    valid = (col < WIDTH) & (col < length)
-    page = tl.load(Positions + row * COLS + col // PAGE, mask=valid, other=-1)
-    logical = page * PAGE + col % PAGE
-    causal = tl.load(Causal + row)
-    score = tl.load(Logits + row * STRIDE + col, mask=valid, other=-float("inf"))
-    finite = (score == score) & (tl.abs(score) != float("inf"))
-    score = tl.where(finite, score, -float("inf"))
-    forced = (logical < INITIAL) | (logical >= causal - LOCAL)
-    score = tl.where(valid & forced, float("inf"), score)
-    tl.store(
-        Logits + row * STRIDE + col,
-        tl.where(valid, score, -float("inf")),
-        mask=col < WIDTH,
-    )
+    # Length-aware selection never reads the tail. The full-width fallback
+    # still needs it initialized, including after an empty graph replay.
+    if MASK_TAIL or start < length:
+        col = start + tl.arange(0, BLOCK)
+        valid = (col < WIDTH) & (col < length)
+        page = tl.load(Positions + row * COLS + col // PAGE, mask=valid, other=-1)
+        logical = page * PAGE + col % PAGE
+        causal = tl.load(Causal + row)
+        score = tl.load(
+            Logits + row * STRIDE + col * COL_STRIDE, mask=valid, other=-float("inf")
+        )
+        finite = (score == score) & (tl.abs(score) != float("inf"))
+        score = tl.where(finite, score, -float("inf"))
+        forced = (logical < INITIAL) | (logical >= causal - LOCAL)
+        score = tl.where(valid & forced, float("inf"), score)
+        tl.store(
+            Logits + row * STRIDE + col * COL_STRIDE,
+            tl.where(valid, score, -float("inf")),
+            mask=(col < WIDTH) & (MASK_TAIL | valid),
+        )
 
 
 def compact_index_pages(
@@ -132,8 +140,10 @@ def mask_index_scores(
     page_size: int,
     initial_tokens: int,
     local_tokens: int,
+    *,
+    mask_tail: bool,
 ) -> None:
-    """Mask padding and mark mandatory global windows in compact logits in place."""
+    """Mark mandatory windows; mask the tail only for full-width consumers."""
     _mask_scores[(logits.shape[0], triton.cdiv(logits.shape[1], 256))](
         logits,
         positions,
@@ -141,43 +151,70 @@ def mask_index_scores(
         causal_lens,
         logits.shape[1],
         logits.stride(0),
+        logits.stride(1),
         positions.shape[1],
         page_size,
         initial_tokens,
         local_tokens,
+        mask_tail,
         256,
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "WIDTH",
+        "LOGIT_STRIDE",
+        "LOGIT_COL_STRIDE",
+        "COLS",
+        "OFFSET_STRIDE",
+        "VALUE_STRIDE",
+    ]
+)
 def _gather_candidates(
     Offsets,
     Logits,
     Positions,
-    Logical,
-    Scores,
+    Lengths,
+    Values,
+    Records,
     TOPK: tl.constexpr,
     # Table and logits geometry follows the batch; runtime so every batch
     # shape shares one binary.
     LOGIT_STRIDE,
+    LOGIT_COL_STRIDE,
+    WIDTH,
     COLS,
+    OFFSET_STRIDE,
+    VALUE_STRIDE,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    offset = tl.load(Offsets + row * TOPK + col, mask=col < TOPK, other=-1)
-    valid = (col < TOPK) & (offset >= 0)
-    score = tl.load(
-        Logits + row * LOGIT_STRIDE + offset, mask=valid, other=-float("inf")
-    )
+    offset = tl.load(Offsets + row * OFFSET_STRIDE + col, mask=col < TOPK, other=-1)
+    end = WIDTH
+    if Lengths is not None:
+        end = tl.minimum(end, tl.load(Lengths + row))
+    valid = (col < TOPK) & (offset >= 0) & (offset < end)
+    if Values is None:
+        score = tl.load(
+            Logits + row * LOGIT_STRIDE + offset * LOGIT_COL_STRIDE,
+            mask=valid,
+            other=-float("inf"),
+        )
+    else:
+        score = tl.load(
+            Values + row * VALUE_STRIDE + col, mask=valid, other=-float("inf")
+        )
     page = tl.load(Positions + row * COLS + offset // PAGE, mask=valid, other=-1)
     valid = valid & (score > -float("inf"))
     logical = page * PAGE + offset % PAGE
-    tl.store(Logical + row * TOPK + col, tl.where(valid, logical, -1), mask=col < TOPK)
+    base = (row * TOPK + col) * 2
+    tl.store(Records + base, tl.where(valid, logical, -1), mask=col < TOPK)
     tl.store(
-        Scores + row * TOPK + col,
-        tl.where(valid, score, -float("inf")),
+        Records + base + 1,
+        tl.where(valid, score, -float("inf")).to(tl.int32, bitcast=True),
         mask=col < TOPK,
     )
 
@@ -203,20 +240,32 @@ def gather_index_candidates(
     logits: torch.Tensor,
     positions: torch.Tensor,
     page_size: int,
+    *,
+    lengths: torch.Tensor | None = None,
+    selected_scores: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map compact Top-K offsets to logical positions and gather FP32 scores."""
-    logical = torch.empty(offsets.shape, device=offsets.device, dtype=torch.int32)
-    scores = torch.empty(offsets.shape, device=offsets.device, dtype=torch.float32)
+    """Map local offsets to interleaved logical-position/FP32-score views.
+
+    Optional lengths bound reads when the logits tail is uninitialized.
+    Optional selected_scores reuse values already returned by the selector.
+    The two outputs share contiguous int32 records for candidate exchange.
+    """
+    records = torch.empty((*offsets.shape, 2), device=offsets.device, dtype=torch.int32)
     _gather_candidates[(offsets.shape[0], triton.cdiv(offsets.shape[1], 256))](
         offsets,
         logits,
         positions,
-        logical,
-        scores,
+        lengths,
+        selected_scores,
+        records,
         offsets.shape[1],
         logits.stride(0),
+        logits.stride(1),
+        logits.shape[1],
         positions.shape[1],
+        offsets.stride(0),
+        0 if selected_scores is None else selected_scores.stride(0),
         page_size,
         256,
     )
-    return logical, scores
+    return records[..., 0], records[..., 1].view(torch.float32)

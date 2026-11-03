@@ -23,6 +23,12 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
+_PARTIAL_TYPES = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
 
 @triton.jit
 def _normalize_dcp_partials_kernel(
@@ -318,3 +324,233 @@ def dcp_apply_sink(
         num_warps=4,
     )
     return result
+
+
+@triton.jit(
+    do_not_specialize=[
+        "tokens",
+        "output_token_stride",
+        "output_head_stride",
+        "output_dim_stride",
+        "lse_token_stride",
+        "lse_head_stride",
+    ]
+)
+def _dispatch_dcp_attention_partials(
+    output,
+    lse,
+    records,
+    tokens,
+    output_token_stride,
+    output_head_stride,
+    output_dim_stride,
+    lse_token_stride,
+    lse_head_stride,
+    LOCAL_HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    PER_WORD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    destination, local_head = head // LOCAL_HEADS, head % LOCAL_HEADS
+    col = tl.arange(0, BLOCK)
+    words: tl.constexpr = triton.cdiv(DIM, PER_WORD)
+    base = token * output_token_stride + head * output_head_stride
+    # Pack two 16-bit outputs into each 32-bit word; FP32 uses one word per output.
+    if PER_WORD == 2:
+        low = tl.load(
+            output + base + 2 * col * output_dim_stride, 2 * col < DIM, other=0
+        )
+        high = tl.load(
+            output + base + (2 * col + 1) * output_dim_stride,
+            2 * col + 1 < DIM,
+            other=0,
+        )
+        bits = low.to(tl.uint16, bitcast=True).to(tl.uint32)
+        bits |= high.to(tl.uint16, bitcast=True).to(tl.uint32) << 16
+    else:
+        value = tl.load(output + base + col * output_dim_stride, col < DIM, other=0)
+        bits = value.to(tl.uint32, bitcast=True)
+    record = ((destination * tokens + token) * LOCAL_HEADS + local_head) * (words + 1)
+    tl.store(records + record + col, bits.to(tl.int32), col < words)
+    lse_value = tl.load(lse + token * lse_token_stride + head * lse_head_stride)
+    tl.store(records + record + words, lse_value.to(tl.int32, bitcast=True))
+
+
+@triton.jit(do_not_specialize=["tokens"])
+def _combine_dcp_attention_partials(
+    records,
+    output,
+    sink,
+    tokens,
+    DEGREE: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    PER_WORD: tl.constexpr,
+    PARTIAL_TYPE: tl.constexpr,
+    SHARDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    MIN_NORMAL: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    shards = tl.arange(0, SHARDS).to(tl.int64)
+    words: tl.constexpr = triton.cdiv(DIM, PER_WORD)
+    record = ((shards * tokens + token) * LOCAL_HEADS + head) * (words + 1)
+    lse_bits = tl.load(records + record + words, shards < DEGREE, other=0)
+    lse = lse_bits.to(tl.float32, bitcast=True)
+    lse = tl.where((shards < DEGREE) & (lse != float("inf")), lse, -float("inf"))
+    maximum = tl.max(lse, 0)
+    has_nan = tl.sum((lse != lse).to(tl.int32), 0) > 0
+    safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
+    denominator = tl.sum(tl.exp(lse - safe_max), 0)
+    col = tl.arange(0, BLOCK)
+    acc = tl.full((BLOCK,), 0.0, tl.float32)
+    for source in tl.static_range(DEGREE):
+        base = ((source * tokens + token) * LOCAL_HEADS + head) * (words + 1)
+        local_lse = tl.load(records + base + words).to(tl.float32, bitcast=True)
+        local_lse = tl.where(local_lse == float("inf"), -float("inf"), local_lse)
+        weight = tl.exp(local_lse - safe_max) / tl.maximum(denominator, MIN_NORMAL)
+        weight = tl.where(has_nan, float("nan"), weight)
+        bits = tl.load(records + base + col // PER_WORD, col < DIM, other=0).to(
+            tl.uint32
+        )
+        if PER_WORD == 2:
+            bits = ((bits >> ((col % 2) * 16)) & 0xFFFF).to(tl.uint16)
+        values = bits.to(PARTIAL_TYPE, bitcast=True).to(tl.float32)
+        # Empty partials may contain NaN; finite-LSE NaN values still propagate,
+        # even when their weight underflows to zero.
+        values = tl.where(local_lse == -float("inf"), 0.0, values)
+        acc = acc + values * weight
+    if sink is not None:
+        normalizer = tl.where(
+            denominator == 0.0, -float("inf"), maximum + tl.log(denominator)
+        )
+        normalizer = tl.where(has_nan, float("nan"), normalizer)
+        sink_logit = tl.load(sink + head).to(tl.float32)
+        factor = tl.where(
+            normalizer == -float("inf"),
+            0.0,
+            1.0 / (1.0 + tl.exp(sink_logit - normalizer)),
+        )
+        acc = acc * factor
+    tl.store(output + (token * LOCAL_HEADS + head) * DIM + col, acc, col < DIM)
+
+
+def dispatch_dcp_attention_partials(
+    output: torch.Tensor, lse: torch.Tensor, *, degree: int
+) -> torch.Tensor:
+    """Prepare O/LSE for dispatch to head owners, preserving their original bits.
+
+    The caller exchanges the returned records with all-to-all before passing
+    the received records to combine_dcp_attention_partials.
+
+    Args:
+        output: FP16/BF16/FP32 CUDA [tokens, heads, dim], possibly strided.
+        lse: FP32 natural-log [tokens, heads] on the same device.
+        degree: Number of head owners, dividing heads.
+
+    Returns:
+        Contiguous int32 [degree, tokens, heads / degree, words + 1].
+        Each record contains the output bits followed by one FP32 LSE word;
+        an odd 16-bit head dimension pads the last word with zero.
+    """
+    if output.ndim != 3 or lse.shape != output.shape[:2]:
+        raise ValueError("DCP partial shapes disagree")
+    if degree <= 0 or output.shape[1] % degree or output.shape[2] <= 0:
+        raise ValueError("DCP partial topology or head dimension is invalid")
+    if (
+        output.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or lse.dtype != torch.float32
+    ):
+        raise TypeError("DCP packing requires floating partials and FP32 LSE")
+    if not output.is_cuda or output.device != lse.device:
+        raise ValueError("DCP partials require one CUDA device")
+    tokens, heads, dim = output.shape
+    per_word = torch.int32.itemsize // output.element_size()
+    records = torch.empty(
+        (degree, tokens, heads // degree, triton.cdiv(dim, per_word) + 1),
+        dtype=torch.int32,
+        device=output.device,
+    )
+    if records.numel():
+        _dispatch_dcp_attention_partials[(tokens, heads)](
+            output,
+            lse,
+            records,
+            tokens,
+            *output.stride(),
+            *lse.stride(),
+            LOCAL_HEADS=heads // degree,
+            DIM=dim,
+            PER_WORD=per_word,
+            BLOCK=triton.next_power_of_2(triton.cdiv(dim, per_word)),
+        )
+    return records
+
+
+def combine_dcp_attention_partials(
+    records: torch.Tensor,
+    *,
+    head_dim: int,
+    partial_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    sink: torch.Tensor | None,
+) -> torch.Tensor:
+    """Weight and sum received O/LSE partials in FP32 on their head owner.
+
+    Args:
+        records: Contiguous int32 [shards, tokens, local_heads, words + 1]
+            received by all-to-all from dispatch_dcp_attention_partials.
+        head_dim: Unpadded partial head dimension.
+        partial_dtype: Original partial dtype (FP16, BF16 or FP32).
+        output_dtype: Desired output dtype; weighting and summation use FP32.
+        sink: Contiguous TP-local sink logits, or None.
+
+    Returns:
+        Contiguous [tokens, local_heads, head_dim]. Empty LSE (-inf or +inf)
+        contributes zero; unexpected NaNs propagate. Apply the sink once,
+        after merging all sources, and cast only at the final store.
+    """
+    if partial_dtype not in _PARTIAL_TYPES or output_dtype not in _PARTIAL_TYPES:
+        raise TypeError("DCP merge requires FP16, BF16 or FP32")
+    per_word = torch.int32.itemsize // partial_dtype.itemsize
+    if (
+        records.ndim != 4
+        or records.dtype != torch.int32
+        or not records.is_cuda
+        or not records.is_contiguous()
+        or head_dim <= 0
+        or records.shape[-1] != triton.cdiv(head_dim, per_word) + 1
+    ):
+        raise ValueError("DCP packed partial layout is invalid")
+    degree, tokens, heads, _ = records.shape
+    if degree <= 0:
+        raise ValueError("DCP merge needs at least one shard")
+    if sink is not None and (
+        sink.numel() < heads
+        or sink.device != records.device
+        or not sink.is_contiguous()
+    ):
+        raise ValueError("DCP sink must cover local heads on the same device")
+    output = torch.empty(
+        (tokens, heads, head_dim), device=records.device, dtype=output_dtype
+    )
+    if output.numel():
+        _combine_dcp_attention_partials[(tokens, heads)](
+            records,
+            output,
+            sink,
+            tokens,
+            DEGREE=degree,
+            LOCAL_HEADS=heads,
+            DIM=head_dim,
+            PER_WORD=per_word,
+            PARTIAL_TYPE=_PARTIAL_TYPES[partial_dtype],
+            SHARDS=triton.next_power_of_2(degree),
+            BLOCK=triton.next_power_of_2(head_dim),
+            MIN_NORMAL=torch.finfo(torch.float32).tiny,
+            enable_fp_fusion=False,
+        )
+    return output

@@ -39,12 +39,15 @@ def _make_wmma_layout(
     NUM_WARPS: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
     IS_KPOOL: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
 ):
     """Map Wave32 workgroups over 32 scoring heads and candidate columns.
 
     KPool warps split only columns, so each warp folds all 32 heads of its
     columns in registers. Standard scoring splits heads first, which measured
-    faster for its 64-head prefill.
+    faster for its 64-head prefill. The ordered fold gathers each column's
+    heads from a transposed tile; the balanced fold keeps eight heads of a
+    column per lane.
     """
     if IS_KPOOL:
         warp_bases = [[0, 1 << i] for i in range(NUM_WARPS.bit_length() - 1)]
@@ -58,7 +61,7 @@ def _make_wmma_layout(
         warp_bases = []
     return gl.amd.AMDWMMALayout(
         version=3,
-        transposed=True,
+        transposed=ORDERED_HEAD_FOLD,
         warp_bases=warp_bases,
         reg_bases=[],
         instr_shape=[16, 16, 64 if Q_IS_FP8 else 32],
@@ -150,8 +153,10 @@ def _score_head_tile(
     wmma_layout: gl.constexpr,
     fold_layout: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
 ):
-    """Add 32 weighted head scores to ``scores`` in logical head order."""
+    """Add 32 weighted head scores to ``scores``, in logical head order when
+    ``ORDERED_HEAD_FOLD`` is set."""
     accumulator = gl.zeros([32, BLOCK_N], gl.float32, layout=wmma_layout)
     head_scores = gl.amd.cdna5.wmma(query, key, accumulator)
     head_scores = gl.maximum(
@@ -160,18 +165,24 @@ def _score_head_tile(
         propagate_nan=tl.PropagateNan.ALL,
     )
     contributions = head_scores * head_weights[:, None]
-    # One layout conversion gives each lane all heads of its output column, so
-    # the ordered sum below is plain register adds. This is faster than the
-    # cross-lane tree reduction of gl.sum and keeps the result deterministic.
-    contributions = gl.convert_layout(contributions, fold_layout)
-    gather_indices = gl.zeros(
-        [BLOCK_N],
-        dtype=gl.int32,
-        layout=gl.SliceLayout(0, fold_layout),
-    )[None, :]
-    for head in gl.static_range(0, 32):
-        contribution = gl.gather(contributions, gather_indices + head, axis=0)
-        scores += gl.reshape(contribution, [BLOCK_N])
+    if ORDERED_HEAD_FOLD:
+        # One layout conversion gives each lane all heads of its output column,
+        # so the ordered sum below is plain register adds. This is faster than
+        # the cross-lane tree reduction of gl.sum and keeps the result
+        # deterministic.
+        contributions = gl.convert_layout(contributions, fold_layout)
+        gather_indices = gl.zeros(
+            [BLOCK_N],
+            dtype=gl.int32,
+            layout=gl.SliceLayout(0, fold_layout),
+        )[None, :]
+        for head in gl.static_range(0, 32):
+            contribution = gl.gather(contributions, gather_indices + head, axis=0)
+            scores += gl.reshape(contribution, [BLOCK_N])
+    else:
+        scores += gl.convert_layout(
+            gl.sum(contributions, axis=0), gl.SliceLayout(0, fold_layout)
+        )
     return scores
 
 
@@ -181,6 +192,8 @@ def _score_key_tile(
     weight_0,
     query_1,
     weight_1,
+    pair_query,
+    pair_weight,
     index_k_fp8,
     index_k_scale,
     kv_workspace_slots,
@@ -202,7 +215,11 @@ def _score_key_tile(
     Q_IS_FP8: gl.constexpr,
     IS_PREFILL: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
+    PAIR_ROWS: gl.constexpr,
 ):
+    """Score one key tile for a row, and for a second 32-head row sharing the
+    tile when ``PAIR_ROWS`` is set."""
     dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, key_memory_layout))[:, None]
     columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, key_memory_layout))[
         None, :
@@ -230,11 +247,10 @@ def _score_key_tile(
             other=0.0,
         )
     else:
-        raw_key = gl.load(
-            index_k_fp8 + key_offsets,
-            mask=valid,
-            other=0.0,
-        )
+        # Masked global loads serialize on their branches, so load every column:
+        # invalid columns read page 0 through their zero slot, and their scores,
+        # which no other column depends on, are never stored.
+        raw_key = gl.load(index_k_fp8 + key_offsets)
     raw_key = gl.convert_layout(raw_key, k_dot_layout)
     key = raw_key if Q_IS_FP8 else raw_key.to(gl.bfloat16)
     output_layout: gl.constexpr = gl.SliceLayout(0, fold_layout)
@@ -247,6 +263,7 @@ def _score_key_tile(
         wmma_layout,
         fold_layout,
         BLOCK_N,
+        ORDERED_HEAD_FOLD,
     )
     if NUM_HEADS == 64:
         scores = _score_head_tile(
@@ -257,7 +274,21 @@ def _score_key_tile(
             wmma_layout,
             fold_layout,
             BLOCK_N,
+            ORDERED_HEAD_FOLD,
         )
+    if PAIR_ROWS:
+        pair_scores = _score_head_tile(
+            pair_query,
+            key,
+            pair_weight,
+            gl.zeros([BLOCK_N], dtype=gl.float32, layout=output_layout),
+            wmma_layout,
+            fold_layout,
+            BLOCK_N,
+            ORDERED_HEAD_FOLD,
+        )
+    else:
+        pair_scores = scores
 
     scale_positions = candidate_start + gl.arange(0, BLOCK_N, layout=output_layout)
     scale_valid = scale_positions < candidate_end
@@ -286,16 +317,18 @@ def _score_key_tile(
             other=0.0,
         ).to(gl.float32)
     else:
-        key_scales = gl.load(
-            index_k_scale + scale_offsets,
-            mask=scale_valid,
-            other=0.0,
-        ).to(gl.float32)
-    return scores * key_scales * model_scale, scale_positions, scale_valid
+        key_scales = gl.load(index_k_scale + scale_offsets).to(gl.float32)
+    return (
+        scores * key_scales * model_scale,
+        pair_scores * key_scales * model_scale,
+        scale_positions,
+        scale_valid,
+    )
 
 
 @gluon.jit
 def _standard_cache_logits_body(
+    row_id,
     q,
     q_scales,
     index_k_fp8,
@@ -335,8 +368,9 @@ def _standard_cache_logits_body(
     IS_KPOOL: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
+    PAIR_ROWS: gl.constexpr,
 ):
-    row_id = gl.program_id(0)
     split_id = gl.program_id(1)
     # Prefill and KPool programs score the split_id-th split_cols-wide slice of
     # their row's columns; decode programs score one CHUNK_N slice. KPool rows
@@ -349,6 +383,16 @@ def _standard_cache_logits_body(
             workspace_end = gl.minimum(gl.load(row_ends + row_id), max_candidates)
             output_base = workspace_start + pool_offset
             window_end = gl.minimum(output_base + CHUNK_N, workspace_end)
+            if PAIR_ROWS:
+                # The caller pairs only rows with the same workspace start.
+                pair_window_end = gl.minimum(
+                    output_base + CHUNK_N,
+                    gl.minimum(gl.load(row_ends + row_id + 1), max_candidates),
+                )
+                joint_end = gl.maximum(window_end, pair_window_end)
+            else:
+                pair_window_end = window_end
+                joint_end = window_end
         else:
             request_id = gl.load(req_ids + row_id).to(gl.int32)
             num_pools = (
@@ -357,8 +401,10 @@ def _standard_cache_logits_body(
             output_base = pool_offset
             window_end = gl.minimum(num_pools, pool_offset + CHUNK_N)
             window_end = gl.minimum(window_end, max_candidates)
-        candidate_start = gl.minimum(output_base + split_start, window_end)
-        candidate_end = gl.minimum(candidate_start + split_cols, window_end)
+            pair_window_end = window_end
+            joint_end = window_end
+        candidate_start = gl.minimum(output_base + split_start, joint_end)
+        candidate_end = gl.minimum(candidate_start + split_cols, joint_end)
     elif IS_PREFILL:
         request_id = row_id
         output_base = 0
@@ -381,7 +427,9 @@ def _standard_cache_logits_body(
         candidate_end = gl.minimum(candidate_end, split_start + split_cols)
         candidate_end = gl.maximum(candidate_end, candidate_start)
 
-    wmma_layout: gl.constexpr = _make_wmma_layout(NUM_WARPS, Q_IS_FP8, IS_KPOOL)
+    wmma_layout: gl.constexpr = _make_wmma_layout(
+        NUM_WARPS, Q_IS_FP8, IS_KPOOL, ORDERED_HEAD_FOLD
+    )
     k_width: gl.constexpr = 16 if Q_IS_FP8 else 8
     q_dot_layout: gl.constexpr = gl.DotOperandLayout(
         0,
@@ -393,10 +441,14 @@ def _standard_cache_logits_body(
         wmma_layout,
         k_width=k_width,
     )
-    # Each lane owns one output column with all of its heads for the head fold.
-    fold_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1], [1, 32], [1, NUM_WARPS], [1, 0]
-    )
+    # The ordered fold gives each lane one output column with all of its heads;
+    # the balanced fold reduces heads in the WMMA layout.
+    if ORDERED_HEAD_FOLD:
+        fold_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 32], [1, NUM_WARPS], [1, 0]
+        )
+    else:
+        fold_layout: gl.constexpr = wmma_layout
     # Load adjacent key bytes together, then restore the WMMA operand layout.
     # Standard decode keeps the operand layout; the conversion did not pay off
     # there.
@@ -458,15 +510,40 @@ def _standard_cache_logits_body(
     else:
         query_1 = query_0
         weight_1 = weight_0
+    if PAIR_ROWS:
+        pair_query, pair_weight = _load_query(
+            q,
+            q_scales,
+            weights,
+            row_id + 1,
+            0,
+            stride_q_row,
+            stride_q_head,
+            stride_q_dim,
+            stride_qs_row,
+            stride_qs_head,
+            stride_w_row,
+            stride_w_head,
+            q_load_layout,
+            q_dot_layout,
+            wmma_layout,
+            HEAD_DIM,
+            Q_IS_FP8,
+        )
+    else:
+        pair_query = query_0
+        pair_weight = weight_0
 
     tile_count = tl.cdiv(candidate_end - candidate_start, BLOCK_N)
     for tile_id in tl.range(0, tile_count):
         tile_start = candidate_start + tile_id * BLOCK_N
-        scores, positions, valid = _score_key_tile(
+        scores, pair_scores, positions, valid = _score_key_tile(
             query_0,
             weight_0,
             query_1,
             weight_1,
+            pair_query,
+            pair_weight,
             index_k_fp8,
             index_k_scale,
             kv_workspace_slots,
@@ -488,20 +565,39 @@ def _standard_cache_logits_body(
             Q_IS_FP8,
             IS_PREFILL,
             USE_BUFFER_LOAD,
+            ORDERED_HEAD_FOLD,
+            PAIR_ROWS,
         )
         output_positions = positions - output_base if IS_KPOOL else positions
+        row_valid = valid
+        if PAIR_ROWS:
+            row_valid = valid & (positions < window_end)
         if USE_BUFFER_STORE:
             gl.amd.cdna5.buffer_store(
                 scores,
                 logits,
                 (row_id * logits_stride + output_positions).to(gl.int32),
-                mask=valid,
+                mask=row_valid,
             )
         else:
             output_offsets = row_id.to(gl.int64) * logits_stride + output_positions.to(
                 gl.int64
             )
-            gl.store(logits + output_offsets, scores, mask=valid)
+            gl.store(logits + output_offsets, scores, mask=row_valid)
+        if PAIR_ROWS:
+            pair_valid = valid & (positions < pair_window_end)
+            if USE_BUFFER_STORE:
+                gl.amd.cdna5.buffer_store(
+                    pair_scores,
+                    logits,
+                    ((row_id + 1) * logits_stride + output_positions).to(gl.int32),
+                    mask=pair_valid,
+                )
+            else:
+                output_offsets = (row_id + 1).to(
+                    gl.int64
+                ) * logits_stride + output_positions.to(gl.int64)
+                gl.store(logits + output_offsets, pair_scores, mask=pair_valid)
 
 
 @gluon.jit
@@ -538,6 +634,7 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
     USE_BUFFER_STORE: gl.constexpr,
 ):
     _standard_cache_logits_body(
+        gl.program_id(0),
         q,
         q_scales,
         index_k_fp8,
@@ -577,6 +674,8 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
         False,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
+        True,
+        False,
     )
 
 
@@ -615,6 +714,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
     NUM_WARPS: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
 ):
     row_id = gl.program_id(0)
     num_pools = gl.maximum(gl.load(causal_lens + row_id).to(gl.int32), 0) // POOL_SIZE
@@ -624,6 +724,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
     gl.store(row_ends + row_id, local_end, mask=gl.program_id(1) == 0)
 
     _standard_cache_logits_body(
+        gl.program_id(0),
         q,
         q_scales,
         index_k_fp8,
@@ -663,10 +764,29 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
         True,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
+        ORDERED_HEAD_FOLD,
+        False,
     )
 
 
 @gluon.jit
+def _store_kpool_plan_local_end(
+    row_starts,
+    row_ends,
+    local_row_ends,
+    row_id,
+    workspace_rows,
+    pool_offset,
+    WINDOW_COLS: gl.constexpr,
+):
+    workspace_start = gl.maximum(gl.load(row_starts + row_id), 0)
+    workspace_end = gl.minimum(gl.load(row_ends + row_id), workspace_rows)
+    row_pools = gl.maximum(workspace_end - workspace_start, 0)
+    local_end = gl.minimum(gl.maximum(row_pools - pool_offset, 0), WINDOW_COLS)
+    gl.store(local_row_ends + row_id, local_end, mask=gl.program_id(1) == 0)
+
+
+@gluon.jit(do_not_specialize=["num_rows"])
 def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     q,
     q_scales,
@@ -690,6 +810,7 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     workspace_rows,
     pool_offset,
     split_cols,
+    num_rows,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
@@ -700,55 +821,225 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     NUM_WARPS: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
+    PAIR_ROWS: gl.constexpr,
 ):
-    row_id = gl.program_id(0)
-    workspace_start = gl.maximum(gl.load(row_starts + row_id), 0)
-    workspace_end = gl.minimum(gl.load(row_ends + row_id), workspace_rows)
-    row_pools = gl.maximum(workspace_end - workspace_start, 0)
-    local_end = gl.minimum(gl.maximum(row_pools - pool_offset, 0), WINDOW_COLS)
-    gl.store(local_row_ends + row_id, local_end, mask=gl.program_id(1) == 0)
-
-    _standard_cache_logits_body(
-        q,
-        q_scales,
-        index_k_fp8,
-        index_k_scale,
-        weights,
-        pool_workspace_slots,
-        row_starts,
-        row_ends,
-        row_ends,
-        row_ends,
-        row_ends,
-        logits,
-        stride_q_row,
-        stride_q_head,
-        stride_q_dim,
-        stride_qs_row,
-        stride_qs_head,
-        stride_w_row,
-        stride_w_head,
-        0,
-        logits_stride,
-        model_scale,
-        workspace_rows,
-        1,
-        pool_offset,
-        split_cols,
-        PAGE_SIZE,
-        PAGE_STRIDE_BYTES,
-        POOL_SIZE,
-        NUM_HEADS,
-        HEAD_DIM,
-        BLOCK_N,
-        WINDOW_COLS,
-        NUM_WARPS,
-        False,
-        True,
-        True,
-        USE_BUFFER_LOAD,
-        USE_BUFFER_STORE,
-    )
+    """Score one row per program, or with ``PAIR_ROWS`` two adjacent rows that
+    share each key tile when they start at the same workspace row."""
+    if PAIR_ROWS:
+        row_id = 2 * gl.program_id(0)
+        has_pair = row_id + 1 < num_rows
+        _store_kpool_plan_local_end(
+            row_starts,
+            row_ends,
+            local_row_ends,
+            row_id,
+            workspace_rows,
+            pool_offset,
+            WINDOW_COLS,
+        )
+        if has_pair:
+            _store_kpool_plan_local_end(
+                row_starts,
+                row_ends,
+                local_row_ends,
+                row_id + 1,
+                workspace_rows,
+                pool_offset,
+                WINDOW_COLS,
+            )
+        pair_start = gl.load(row_starts + row_id + 1, mask=has_pair, other=0)
+        same_start = has_pair & (gl.load(row_starts + row_id) == pair_start)
+        if same_start:
+            _standard_cache_logits_body(
+                row_id,
+                q,
+                q_scales,
+                index_k_fp8,
+                index_k_scale,
+                weights,
+                pool_workspace_slots,
+                row_starts,
+                row_ends,
+                row_ends,
+                row_ends,
+                row_ends,
+                logits,
+                stride_q_row,
+                stride_q_head,
+                stride_q_dim,
+                stride_qs_row,
+                stride_qs_head,
+                stride_w_row,
+                stride_w_head,
+                0,
+                logits_stride,
+                model_scale,
+                workspace_rows,
+                1,
+                pool_offset,
+                split_cols,
+                PAGE_SIZE,
+                PAGE_STRIDE_BYTES,
+                POOL_SIZE,
+                NUM_HEADS,
+                HEAD_DIM,
+                BLOCK_N,
+                WINDOW_COLS,
+                NUM_WARPS,
+                False,
+                True,
+                True,
+                USE_BUFFER_LOAD,
+                USE_BUFFER_STORE,
+                ORDERED_HEAD_FOLD,
+                True,
+            )
+        else:
+            _standard_cache_logits_body(
+                row_id,
+                q,
+                q_scales,
+                index_k_fp8,
+                index_k_scale,
+                weights,
+                pool_workspace_slots,
+                row_starts,
+                row_ends,
+                row_ends,
+                row_ends,
+                row_ends,
+                logits,
+                stride_q_row,
+                stride_q_head,
+                stride_q_dim,
+                stride_qs_row,
+                stride_qs_head,
+                stride_w_row,
+                stride_w_head,
+                0,
+                logits_stride,
+                model_scale,
+                workspace_rows,
+                1,
+                pool_offset,
+                split_cols,
+                PAGE_SIZE,
+                PAGE_STRIDE_BYTES,
+                POOL_SIZE,
+                NUM_HEADS,
+                HEAD_DIM,
+                BLOCK_N,
+                WINDOW_COLS,
+                NUM_WARPS,
+                False,
+                True,
+                True,
+                USE_BUFFER_LOAD,
+                USE_BUFFER_STORE,
+                ORDERED_HEAD_FOLD,
+                False,
+            )
+            if has_pair:
+                _standard_cache_logits_body(
+                    row_id + 1,
+                    q,
+                    q_scales,
+                    index_k_fp8,
+                    index_k_scale,
+                    weights,
+                    pool_workspace_slots,
+                    row_starts,
+                    row_ends,
+                    row_ends,
+                    row_ends,
+                    row_ends,
+                    logits,
+                    stride_q_row,
+                    stride_q_head,
+                    stride_q_dim,
+                    stride_qs_row,
+                    stride_qs_head,
+                    stride_w_row,
+                    stride_w_head,
+                    0,
+                    logits_stride,
+                    model_scale,
+                    workspace_rows,
+                    1,
+                    pool_offset,
+                    split_cols,
+                    PAGE_SIZE,
+                    PAGE_STRIDE_BYTES,
+                    POOL_SIZE,
+                    NUM_HEADS,
+                    HEAD_DIM,
+                    BLOCK_N,
+                    WINDOW_COLS,
+                    NUM_WARPS,
+                    False,
+                    True,
+                    True,
+                    USE_BUFFER_LOAD,
+                    USE_BUFFER_STORE,
+                    ORDERED_HEAD_FOLD,
+                    False,
+                )
+    else:
+        row_id = gl.program_id(0)
+        _store_kpool_plan_local_end(
+            row_starts,
+            row_ends,
+            local_row_ends,
+            row_id,
+            workspace_rows,
+            pool_offset,
+            WINDOW_COLS,
+        )
+        _standard_cache_logits_body(
+            row_id,
+            q,
+            q_scales,
+            index_k_fp8,
+            index_k_scale,
+            weights,
+            pool_workspace_slots,
+            row_starts,
+            row_ends,
+            row_ends,
+            row_ends,
+            row_ends,
+            logits,
+            stride_q_row,
+            stride_q_head,
+            stride_q_dim,
+            stride_qs_row,
+            stride_qs_head,
+            stride_w_row,
+            stride_w_head,
+            0,
+            logits_stride,
+            model_scale,
+            workspace_rows,
+            1,
+            pool_offset,
+            split_cols,
+            PAGE_SIZE,
+            PAGE_STRIDE_BYTES,
+            POOL_SIZE,
+            NUM_HEADS,
+            HEAD_DIM,
+            BLOCK_N,
+            WINDOW_COLS,
+            NUM_WARPS,
+            False,
+            True,
+            True,
+            USE_BUFFER_LOAD,
+            USE_BUFFER_STORE,
+            ORDERED_HEAD_FOLD,
+            False,
+        )
 
 
 @gluon.jit
@@ -785,6 +1076,7 @@ def gluon_dsa_decode_topk_standard_gfx1250(
     USE_BUFFER_STORE: gl.constexpr,
 ):
     _standard_cache_logits_body(
+        gl.program_id(0),
         q,
         q_scales,
         index_k_fp8,
@@ -824,4 +1116,6 @@ def gluon_dsa_decode_topk_standard_gfx1250(
         False,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
+        True,
+        False,
     )

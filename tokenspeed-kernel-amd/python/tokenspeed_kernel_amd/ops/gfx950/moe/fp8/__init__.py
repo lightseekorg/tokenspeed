@@ -23,6 +23,9 @@
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.exact_mfma import (
     gluon_fp8_block_exact_mfma_moe,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.moe import (
+    launch_gluon_fp8_packed_moe_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.warp_decode import (
     gluon_fp8_block_dequantize,
     gluon_fp8_block_warp_decode_moe,
@@ -32,4 +35,5 @@ __all__ = [
     "gluon_fp8_block_dequantize",
     "gluon_fp8_block_exact_mfma_moe",
     "gluon_fp8_block_warp_decode_moe",
+    "launch_gluon_fp8_packed_moe_gfx950",
 ]

@@ -1,0 +1,29 @@
+[package]
+name = "tokenspeed-client"
+description = "Frontend client for TokenSpeed engines over the msgpack ZMQ wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lib]
+name = "ts_client"
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[[example]]
+name = "generate"
+
+[lints]
+workspace = true

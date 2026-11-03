@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,8 +36,12 @@ import torch
 
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.logits_processor_output import (
+    LogitsProcessorOutput as Output,
+)
 from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
+    request_vocab_mask,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,20 +78,6 @@ def load_symbol(path, name, *, owner=None, **bindings):
     )
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), scope)
     return scope[name]
-
-
-@dataclasses.dataclass
-class Output:
-    next_token_logits: torch.Tensor
-    next_token_ids: torch.Tensor | None = None
-    next_token_logprobs: torch.Tensor | None = None
-    hidden_states: torch.Tensor | None = None
-    logits_layout_plan: object = None
-    input_token_logprobs: torch.Tensor | None = None
-    input_top_logprobs_val: torch.Tensor | None = None
-    input_top_logprobs_idx: torch.Tensor | None = None
-    sampled_top_logprobs_val: torch.Tensor | None = None
-    sampled_top_logprobs_idx: torch.Tensor | None = None
 
 
 class SharedBufferSampler:
@@ -142,7 +131,9 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
         _sampling_info_for_requests=load_symbol(
-            RUNTIME + "execution/model_executor.py", "_sampling_info_for_requests"
+            RUNTIME + "execution/model_executor.py",
+            "_sampling_info_for_requests",
+            request_vocab_mask=request_vocab_mask,
         ),
     )
     backend = SharedBufferSampler()
@@ -230,62 +221,6 @@ def test_nan_and_oov_map_to_original_decode_rows():
     guard.reset(3)
     guard.merge_oov(torch.tensor([19, 2, 3]), ctx, 16)
     assert guard.flags.tolist() == [1, 0, 0]
-
-
-class Matcher:
-    finished = False
-
-    def __init__(self):
-        self.tokens = []
-
-    def is_terminated(self):
-        return False
-
-    def accept_token(self, token):
-        self.tokens.append(token)
-
-
-@pytest.mark.parametrize("hostfunc", [True, False])
-def test_grammar_consumers_share_compact_token_offsets(hostfunc):
-    grammars = [Matcher(), Matcher(), Matcher()]
-    completion = SimpleNamespace(
-        grammars=grammars,
-        bs=3,
-        advance_mask=[True, False, True],
-        output_layout=ForwardOutputLayout(2, 1, 1, 2),
-        lock=threading.Lock(),
-        event=threading.Event(),
-    )
-    tokens = torch.tensor([11, 21, 22])
-    lengths = torch.tensor([1, 0, 2])
-    if hostfunc:
-        method = load_symbol(
-            RUNTIME + "grammar/capturable_grammar.py",
-            "advance",
-            owner="GrammarHostBuffers",
-        )
-        method(
-            SimpleNamespace(output_tokens=tokens, accept_lengths=lengths),
-            dict(
-                completion=completion,
-                grammars=grammars,
-                bs=3,
-                advance_mask=completion.advance_mask,
-            ),
-        )
-        assert completion.event.is_set()
-    else:
-        method = load_symbol(
-            RUNTIME + "engine/generation_output_processor.py",
-            "_host_advance_matcher",
-            owner="OutputProcesser",
-        )
-        method(
-            None,
-            completion,
-            SimpleNamespace(output_tokens=tokens, output_lengths=lengths),
-        )
-    assert [g.tokens for g in grammars] == [[11], [], [21, 22]]
 
 
 def test_dspark_anchors_do_not_read_or_write_incomplete_prefill():
@@ -427,7 +362,11 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     full = SimpleNamespace(positions=positions, request_indices=requests)
     empty = SimpleNamespace(positions=positions[:0], request_indices=requests[:0])
     plan = SimpleNamespace(
-        source=full, query=empty, keep_rows=torch.empty(0, dtype=torch.int64)
+        source=full,
+        query=empty,
+        keep_rows=torch.empty(0, dtype=torch.int64),
+        source_shard=None,
+        query_shard=None,
     )
     forward = load_symbol(
         RUNTIME + "models/deepseek_v41.py",
@@ -440,7 +379,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     attention = SimpleNamespace(
         layer_id=20,
         ced_decoder_start=20,
-        _write_global_kv=lambda hidden, *args: writes.append(hidden.clone()),
+        _write_global_kv=lambda hidden, *args, **kwargs: writes.append(hidden.clone()),
     )
     hidden = torch.randn(4, 8)
     output = forward(
@@ -470,7 +409,7 @@ def test_zero_decoder_skips_layers_and_normalization():
         pre_mix=torch.empty(0, 4),
         captured=[torch.empty(0, 8)] * 2,
     )
-    hidden, captures = forward(model, state, None)
+    hidden, captures = forward(model, state, SimpleNamespace(query_shard=None))
     assert hidden.shape == (0, 8)
     assert [t.shape for t in captures] == [(0, 8)] * 3
 
@@ -513,26 +452,11 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     assert tokens.tolist() == [0, 1]
 
 
-@pytest.mark.parametrize("pending", [False, True])
-def test_idle_graph_grammar_enqueues_an_identity_completion(pending):
-    import queue
+def test_idle_graph_grammar_adds_an_identity_batch():
     from contextlib import nullcontext
 
-    add = load_symbol(
-        RUNTIME + "grammar/capturable_grammar.py",
-        "add_batch",
-        owner="CapturableGrammarExecutor",
-        GrammarStepCompletion=lambda **kwargs: SimpleNamespace(
-            event=threading.Event(), **kwargs
-        ),
-    )
-    decisions = []
-    grammar = SimpleNamespace(
-        queue=queue.Queue(),
-        gate=SimpleNamespace(push=decisions.append),
-        pending=pending,
-    )
-    grammar.add_batch = lambda **kwargs: add(grammar, **kwargs)
+    added = []
+    grammar = SimpleNamespace(add_batch=lambda **kwargs: added.append(kwargs))
     idle = load_symbol(
         RUNTIME + "execution/model_executor.py",
         "execute_idle_forward",
@@ -589,77 +513,22 @@ def test_idle_graph_grammar_enqueues_an_identity_completion(pending):
     idle(
         executor,
         SimpleNamespace(
-            global_num_tokens=[0, 1], global_batch_size=[0, 1], all_decode_or_idle=True
+            global_num_tokens=[0, 1],
+            global_batch_size=[0, 1],
+            global_num_decodes=[0, 1],
+            all_decode_or_idle=True,
         ),
     )
     assert step.called
-    # One gate decision per replay; it runs only to advance a pending batch.
-    assert decisions == [pending]
-    assert not grammar.pending
-    if pending:
-        completion = grammar.queue.get_nowait()["completion"]
-        assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
-        assert completion.event.is_set()
-    assert grammar.queue.empty()
-
-
-@pytest.mark.parametrize("prefill_outputs", [1, 2])
-def test_grammar_mask_producer_walks_only_original_decode_candidates(
-    prefill_outputs, monkeypatch
-):
-    class MaskMatcher(Matcher):
-        def __init__(self, tag):
-            super().__init__()
-            self.tag = tag
-
-        def fill_vocab_mask(self, mask, row):
-            mask[row, 0] = self.tag + sum(self.tokens)
-
-        def try_accept_token(self, token):
-            self.tokens.append(token)
-            return True
-
-        def rollback(self, count):
-            del self.tokens[-count:]
-
-    grammars = [MaskMatcher(100), MaskMatcher(200), MaskMatcher(300)]
-    layout = ForwardOutputLayout(2, prefill_outputs, 1, 3)
-    masks = torch.empty(9, 1, dtype=torch.int32)
-    candidates = torch.full((3, 3), -99, dtype=torch.int32)
-    fill = load_symbol(RUNTIME + "grammar/capturable_grammar.py", "_fill_eager_bitmask")
-    monkeypatch.setattr(
-        torch.cuda,
-        "Event",
-        lambda: SimpleNamespace(record=lambda: None, synchronize=lambda: None),
-    )
-    buffers = SimpleNamespace(
-        candidates_cpu_buf=candidates,
-        vocab_mask_spec_cpu_buf=masks,
-        vocab_mask_spec_buf=torch.empty_like(masks),
-    )
-    fill(
-        grammars,
-        3,
-        buffers,
-        3,
-        True,
-        torch.tensor([1, 2, 3, 4, 5, 20, 21, 22]),
-        layout,
-    )
-    torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
-    assert candidates[2].tolist() == [20, 21, 22]
-    assert masks[:, 0].tolist() == [
-        100,
-        -1,
-        -1,
-        200 if prefill_outputs == 2 else -1,
-        -1,
-        -1,
-        300,
-        321,
-        343,
+    # The captured host node pops one batch per replay.
+    assert added == [
+        dict(
+            grammars=[None],
+            bs=1,
+            has_candidates=False,
+            output_layout=ForwardOutputLayout(0, 0, 1, 1),
+        )
     ]
-    assert [g.tokens for g in grammars] == [[], [], []]
 
 
 def test_drafter_future_inputs_keep_original_request_rows():
@@ -682,8 +551,15 @@ def test_drafter_future_inputs_keep_original_request_rows():
         tree_spec=None,
         capturable_grammar=None,
         dspark_context_producer=None,
+        attn_backend=SimpleNamespace(
+            prepare_cache_batch=lambda *args, **kwargs: None,
+            writeback_accepted_kv=lambda *args: None,
+        ),
+        device_module=SimpleNamespace(current_stream=lambda: None),
         drafter=SimpleNamespace(
-            prepare_target_forward=lambda ctx: None, run=lambda **kwargs: draft_tokens
+            prepare_target_forward=lambda ctx: None,
+            rewrite_verify_outputs=lambda ctx, output_tokens, accept_lengths: None,
+            run=lambda **kwargs: draft_tokens,
         ),
         config=SimpleNamespace(pp_size=1),
         nan_guard=NanGuard(4, "cpu"),
@@ -758,6 +634,8 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
     )
     backend = SimpleNamespace(
         device="cpu",
+        kvp_size=1,
+        _local_decode_selections={},
         spec_num_tokens=2,
         spec=SimpleNamespace(sliding_window_tokens=2, max_query_tokens=32),
         _swa_plans={},
@@ -870,7 +748,11 @@ def test_decoder_swa_excludes_history_before_its_retained_window(
     view = methods["_build_decoder_view"](backend, metadata, [True], 128, mode)
     backend._decoder_view = view
     plan = methods["_swa_query_plan"](
-        backend, view.prefill.positions, view.prefill.request_indices, mode
+        backend,
+        view.prefill.positions,
+        view.prefill.request_indices,
+        mode,
+        query_shard=None,
     )
     request = plan.requests[0]
     # Even an unchanged row set must not inherit the encoder's older SWA keys.
@@ -892,6 +774,10 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         RUNTIME + "execution/forward_step.py",
         "__call__",
         owner="ForwardStepRunner",
+        nullcontext=nullcontext,
+        live_graph_outputs=load_symbol(
+            RUNTIME + "execution/forward_step.py", "live_graph_outputs"
+        ),
         nvtx_range=lambda *args, **kwargs: nullcontext(),
     )
     width, padded_bs = 3, 4
@@ -903,6 +789,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         forward_mode=SimpleNamespace(is_decode=lambda: True, is_idle=lambda: False),
     )
     observed = []
+    accepted_lengths = []
     runner = SimpleNamespace(
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
@@ -916,6 +803,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         _graph_debug=False,
         _expert_load_rows=None,
         device="cuda",
+        config=SimpleNamespace(spec_draft_tree=False),
+        attn_backend=SimpleNamespace(
+            commit_state_after_acceptance=lambda lengths, **kwargs: accepted_lengths.append(
+                lengths.clone()
+            )
+        ),
         max_tokens_per_req=width,
         drafter=None,
         deepep_adapter=SimpleNamespace(replay=lambda: None),
@@ -935,11 +828,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
                 torch.ones(padded_bs),
                 None,
                 None,
+                None,
             )
         },
     )
     empty = torch.empty(0, dtype=torch.int32)
-    tokens, lengths, _, _ = run(
+    tokens, lengths, _, _, _ = run(
         runner,
         live_bs,
         ctx,
@@ -952,9 +846,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         extend_replay_lens_cpu=empty,
         extend_prompt_lens_cpu=empty,
         block_tables_cpu={},
+        settle=lambda: None,
     )
     assert observed == [(padded_bs, ForwardOutputLayout(0, 0, padded_bs, width))]
     assert ctx.bs == live_bs
     assert ctx.output_layout is live_layout
     assert tokens.tolist() == list(range(live_bs * width))
     assert len(lengths) == live_bs
+    assert len(accepted_lengths) == 1
+    torch.testing.assert_close(accepted_lengths[0], lengths)

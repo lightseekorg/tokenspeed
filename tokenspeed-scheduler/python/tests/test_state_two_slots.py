@@ -218,3 +218,51 @@ class TestFusedStateTwoSlots:
         assert all(
             not pairs for pairs in dict(plan.pages_to_copy).values()
         ), "an aligned hit copies nothing"
+
+
+class TestStateCheckpointInForward:
+    """``SchedulerConfig.state_checkpoint_in_forward``: the forward that spans a
+    long prompt's last page boundary before its final token also writes the
+    state there, into a third block of its State rows, with no chunk cut; a
+    later prompt that changes only that last page resumes there."""
+
+    @pytest.mark.parametrize("in_forward", [False, True])
+    def test_a_changed_last_page_resumes_from_the_in_forward_checkpoint(
+        self, in_forward
+    ):
+        cfg = _fused_config(decode_input_tokens=1)
+        cfg.max_scheduled_tokens = 4
+        cfg.state_checkpoint_in_forward = in_forward
+        scheduler = ts.Scheduler(cfg)
+        prompt = [1, 2, 3, 4, 5, 6, 7]
+        scheduler.submit_requests([_spec("seed", prompt, MAX_NEW_TOKENS)])
+        chunks: list[int] = []
+        checkpoint_lens: list[int] = []
+        rows: list[dict[str, list[int]]] = []
+        while sum(chunks) < len(prompt) and len(chunks) < 8:
+            [batch] = _dispatched(scheduler.next_execution_plan())
+            chunks.append(list(batch.input_lengths)[0])
+            checkpoint_lens.append(list(batch.extend_state_checkpoint_lens)[0])
+            rows.append(_state_rows(batch, "seed"))
+            _advance(scheduler, "seed", [201] if sum(chunks) == len(prompt) else [])
+        # No extra round: the second chunk [4, 7) spans the boundary 6 and,
+        # with the option, writes the state after its first 2 tokens into a
+        # third block of every State row.
+        assert chunks == [4, 3]
+        assert checkpoint_lens == ([0, 2] if in_forward else [0, 0])
+        assert all(len(row) == 2 for row in rows[0].values())
+        assert all(len(row) == (3 if in_forward else 2) for row in rows[1].values())
+        _dispatched(scheduler.next_execution_plan())
+        _advance(scheduler, "seed", [202])
+        _finish(scheduler, "seed")
+        scheduler.next_execution_plan()
+
+        scheduler.submit_requests([_spec("second", prompt[:6] + [99], MAX_NEW_TOKENS)])
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        # By default no state was published at 6 and the request starts over.
+        assert list(batch.extend_prefix_lens) == [6 if in_forward else 0]
+        if in_forward:
+            second = _state_rows(batch, "second")
+            assert {g: row[0] for g, row in second.items()} == {
+                g: row[2] for g, row in rows[1].items()
+            }, "resumes from the in-forward checkpoint's blocks"

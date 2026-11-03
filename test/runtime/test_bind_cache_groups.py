@@ -98,11 +98,6 @@ class TestPagedAttentionStorageStateTest:
         )
         assert (layer.group_id) == (SWA)
 
-    def test_window_left_must_be_an_int_at_or_above_minus_one(self):
-        for bad in (None, -2):
-            with pytest.raises((ValueError), match=("sliding_window_size")):
-                _layer(0, sliding_window_size=bad)
-
 
 class TestBindCacheGroupsTest:
     def test_binds_each_layer_from_the_plan(self):

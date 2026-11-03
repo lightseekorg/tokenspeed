@@ -64,6 +64,7 @@ def _bare_mla_backend(
     paths touch — the full ctor JIT-compiles CuteDSL kernels (GPU only)."""
     backend = object.__new__(CuteDSLMLABackend)
     backend._dcp = None
+    backend.min_kv_split = 1
     backend._logged_block_layouts = set()
     backend.device = "cpu"
     backend.kernel_page_size = _PAGE_SIZE

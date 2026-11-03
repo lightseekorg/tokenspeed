@@ -49,13 +49,25 @@
 // Exchange of the warp sums (per norm): lane 0 of each warp stores its sum in
 // slot w of its own CTA (st.shared) and of every peer CTA of the cluster
 // (st.async, which completes bytes on that CTA's transaction mbarrier). Each
-// CTA arms its two barriers for the peers' bytes before cta_arrive, whose
-// cluster barrier orders the arming before any peer's store; the epilogue's
-// first statement closes the phase cta_arrive leaves open. A CTA reads the
-// slots after a CTA barrier (its own warps) and a wait on its own mbarrier
-// (the peers) followed by the shared::cluster acquire fence. No CTA reads a
-// peer's shared memory and no GPU-scope fence is issued; a CTA exits only
-// after both of its barriers completed, so every peer write into it landed.
+// CTA arms its barriers (one per exchange) for the peers' bytes before
+// cta_arrive, whose cluster barrier orders the arming before any peer's
+// store; the epilogue's first statement closes the phase cta_arrive leaves
+// open. A CTA reads the slots after a CTA barrier (its own warps) and a wait
+// on its own mbarrier (the peers) followed by the shared::cluster acquire
+// fence. No CTA reads a peer's shared memory and no GPU-scope fence is
+// issued; a CTA exits only after each of its barriers completed, so every
+// peer write into it landed.
+//
+// Per-token FP8 (kARSandwichResidualRMSNormTokenFP8): the same epilogue also
+// writes norm_out quantized per token, by the rule of
+// ops/quantization/triton.py's fp8_quantize_per_token applied to the stored
+// BF16 norm_out: amax = max |RN(norm_out)| over the token, codes =
+// E4M3_satfinite(clamp(RN(x) * min(448 / amax, 448 * 512), +-448)) into
+// quant_out, scale = max(amax / 448, 1 / (448 * 512)) into scale_out[token],
+// both divisions IEEE-rounded. The token's amax is a third exchange of warp
+// values (a maximum, so its order does not matter). norm_out may be null: only
+// the codes and the scales are stored then. The BF16 pattern instantiates the
+// epilogue without this stage and with its own two-exchange shared layout.
 //
 // Registers: the MNNVL kernels launch one cluster per token, so once the
 // tokens outnumber the SMs the launch runs in waves of resident CTAs, each
@@ -105,6 +117,26 @@ __device__ __forceinline__ float fma_rn(float a, float b, float c) {
 __device__ __forceinline__ float rcp_rn(float a) {
   float d;
   asm("rcp.rn.f32 %0, %1;" : "=f"(d) : "f"(a));
+  return d;
+}
+
+// The per-token FP8 stage's comparisons, without flush-to-zero (the package's
+// -use_fast_math would make the CUDA math functions flush subnormals).
+__device__ __forceinline__ float abs_f32(float a) {
+  float d;
+  asm("abs.f32 %0, %1;" : "=f"(d) : "f"(a));
+  return d;
+}
+
+__device__ __forceinline__ float max_f32(float a, float b) {
+  float d;
+  asm("max.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+  return d;
+}
+
+__device__ __forceinline__ float min_f32(float a, float b) {
+  float d;
+  asm("min.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
   return d;
 }
 
@@ -191,21 +223,26 @@ __device__ __forceinline__ void wait_barrier(uint64_t* bar) {
   asm volatile("fence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
 }
 
+// kExchanges cross-warp exchanges: the two sums of squares, and with
+// per-token FP8 the token's amax.
+template <int kExchanges>
 struct Shared {
-  uint4 gamma[2][kMaxBlock];      // post_norm_gamma and rms_gamma, by thread
-  float warp_sums[2][kMaxWarps];  // per norm, indexed by the token's warp
-  alignas(8) uint64_t bar[2];     // transaction barriers of the two exchanges
+  uint4 gamma[2][kMaxBlock];               // post_norm_gamma and rms_gamma, by thread
+  float warp_sums[kExchanges][kMaxWarps];  // per exchange, indexed by the token's warp
+  alignas(8) uint64_t bar[kExchanges];     // transaction barriers of the exchanges
 };
 
 // One instance per CTA (function-scope __shared__, like blockReduceSumV2).
-__device__ __forceinline__ Shared& shared() {
-  __shared__ Shared s;
+template <int kExchanges>
+__device__ __forceinline__ Shared<kExchanges>& shared() {
+  __shared__ Shared<kExchanges> s;
   return s;
 }
 
 // Lane 0 of each warp publishes the warp's sum to slot w of every CTA of the
 // cluster: st.shared into its own CTA, st.async into the peers (PTX defines
 // st.async for a peer CTA's shared memory only).
+template <int kExchanges>
 __device__ __forceinline__ void push_warp_sum(float s, int norm) {
   namespace cg = cooperative_groups;
   if ((threadIdx.x & 31) != 0) {
@@ -214,12 +251,12 @@ __device__ __forceinline__ void push_warp_sum(float s, int norm) {
   cg::cluster_group cluster = cg::this_cluster();
   uint32_t const ctas = cluster.num_blocks();
   uint32_t const w = cluster.thread_rank() >> 5;
-  float* slot = &shared().warp_sums[norm][w];
+  float* slot = &shared<kExchanges>().warp_sums[norm][w];
   *slot = s;
   if (ctas > 1) {
     uint32_t const self = cluster.block_rank();
     uint32_t const dst = smem_u32(slot);
-    uint32_t const bar = smem_u32(&shared().bar[norm]);
+    uint32_t const bar = smem_u32(&shared<kExchanges>().bar[norm]);
 #pragma unroll
     for (uint32_t c = 0; c < kMaxClusterCtas; ++c) {
       if (c != self && c < ctas) {
@@ -236,13 +273,14 @@ __device__ __forceinline__ void push_warp_sum(float s, int norm) {
 // The token's sum of squares, in every thread: the own warps' slots after a
 // CTA barrier, the peers' after the transaction barrier, then the canonical
 // lane-strided sum and a butterfly.
+template <int kExchanges>
 __device__ __forceinline__ float token_sumsq(int norm, int warps) {
   namespace cg = cooperative_groups;
   __syncthreads();
   if (cg::this_cluster().num_blocks() > 1) {
-    wait_barrier(&shared().bar[norm]);
+    wait_barrier(&shared<kExchanges>().bar[norm]);
   }
-  float const* slots = shared().warp_sums[norm];
+  float const* slots = shared<kExchanges>().warp_sums[norm];
   float s = 0.f;
 #pragma unroll 1
   for (int w = threadIdx.x & 31; w < warps; w += kWarpGroups) {
@@ -251,14 +289,67 @@ __device__ __forceinline__ float token_sumsq(int norm, int warps) {
   return warp_sum(s);
 }
 
+// Per-token FP8: the maximum over the warp, then over the token's warp
+// values exchanged as the sums are (exchange `slot`); exact in any order.
+__device__ __forceinline__ float warp_max(float m) {
+#pragma unroll
+  for (int k = 16; k > 0; k >>= 1) {
+    m = max_f32(m, __shfl_xor_sync(0xffffffffu, m, k));
+  }
+  return m;
+}
+
+template <int kExchanges>
+__device__ __forceinline__ float token_max(int slot, int warps) {
+  namespace cg = cooperative_groups;
+  __syncthreads();
+  if (cg::this_cluster().num_blocks() > 1) {
+    wait_barrier(&shared<kExchanges>().bar[slot]);
+  }
+  float const* slots = shared<kExchanges>().warp_sums[slot];
+  float m = 0.f;
+#pragma unroll 1
+  for (int w = threadIdx.x & 31; w < warps; w += kWarpGroups) {
+    m = max_f32(m, slots[w]);
+  }
+  return warp_max(m);
+}
+
+// The per-token FP8 rule of ops/quantization/triton.py (fp8_token_scale,
+// fp8_token_multiplier, fp8_quantize_by_multiplier); the constants are its
+// FP32 constexprs, 1 / (448 * 512) rounded from double as Triton rounds it.
+static constexpr float kE4m3Max = 448.f;
+static constexpr float kTokenMinScale = static_cast<float>(1.0 / (448.0 * 512.0));
+static constexpr float kTokenMaxMultiplier = 448.f * 512.f;
+
+__device__ __forceinline__ float div_rn(float a, float b) {
+  float d;
+  asm("div.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+  return d;
+}
+
+// E4M3 codes of lo (low byte) and hi (high byte), saturating to +-448.
+__device__ __forceinline__ uint32_t cvt_e4m3x2(float lo, float hi) {
+  uint16_t d;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(d) : "f"(hi), "f"(lo));
+  return static_cast<uint32_t>(d);
+}
+
+__device__ __forceinline__ float quantize_by_multiplier(float x, float multiplier) {
+  return min_f32(max_f32(mul_rn(x, multiplier), -kE4m3Max), kE4m3Max);
+}
+
 }  // namespace sandwich
 
 // The MNNVL kernels construct FusedOp from the launch params, call
 // load_upstream_inputs() after the grid dependency wait, and call operator()
 // once per thread with the reduced 8-element vector of its token.
+// kTokenFp8: kARSandwichResidualRMSNormTokenFP8 (the per-token FP8 stage).
+template <bool kTokenFp8>
 class SandwichNormFusedOp {
   using T = __nv_bfloat16;
   static constexpr int VEC_SIZE = sandwich::kVec;
+  static constexpr int kExchanges = kTokenFp8 ? 3 : 2;
   static_assert(VEC_SIZE == details::kBytesPerAccess / sizeof(T), "one 16 B access per thread");
 
  public:
@@ -267,13 +358,14 @@ class SandwichNormFusedOp {
       : m_params(params), m_access_id(access_id), m_access_id_in_token(access_id_in_token) {}
 
   __device__ __forceinline__ void load_upstream_inputs() {
-    sandwich::cp_async_16(&sandwich::shared().gamma[0][threadIdx.x],
+    sandwich::cp_async_16(&sandwich::shared<kExchanges>().gamma[0][threadIdx.x],
                           reinterpret_cast<uint4 const*>(m_params.post_norm_gamma) +
                               m_access_id_in_token);
-    sandwich::cp_async_16(&sandwich::shared().gamma[1][threadIdx.x],
-                          reinterpret_cast<uint4 const*>(m_params.rms_gamma) + m_access_id_in_token);
+    sandwich::cp_async_16(
+        &sandwich::shared<kExchanges>().gamma[1][threadIdx.x],
+        reinterpret_cast<uint4 const*>(m_params.rms_gamma) + m_access_id_in_token);
     m_residual.load(reinterpret_cast<T const*>(m_params.residual_in) + m_access_id * VEC_SIZE);
-    // Arm both exchanges before cta_arrive, whose cluster barrier (release,
+    // Arm the exchanges before cta_arrive, whose cluster barrier (release,
     // then the waits in cta_arrive and at the start of operator()) orders the
     // arming before any peer's st.async.
     namespace cg = cooperative_groups;
@@ -281,8 +373,11 @@ class SandwichNormFusedOp {
     if (threadIdx.x == 0 && ctas > 1) {
       uint32_t const warps = static_cast<uint32_t>(m_params.hidden_dim) >> 8;
       uint32_t const bytes = (warps - (blockDim.x >> 5)) * static_cast<uint32_t>(sizeof(float));
-      sandwich::arm_barrier(&sandwich::shared().bar[0], bytes);
-      sandwich::arm_barrier(&sandwich::shared().bar[1], bytes);
+      sandwich::arm_barrier(&sandwich::shared<kExchanges>().bar[0], bytes);
+      sandwich::arm_barrier(&sandwich::shared<kExchanges>().bar[1], bytes);
+      if constexpr (kTokenFp8) {
+        sandwich::arm_barrier(&sandwich::shared<kExchanges>().bar[2], bytes);
+      }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     // A launch that releases its PDL dependents right after this call must
@@ -292,7 +387,7 @@ class SandwichNormFusedOp {
     }
   }
 
-  __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int /*token_id*/,
+  __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id,
                                              bool /*skip_residual_add*/,
                                              bool /*skip_residual_store*/,
                                              bool /*skip_partial_store*/,
@@ -320,7 +415,7 @@ class SandwichNormFusedOp {
       x[2 * i] = sandwich::bf16_lo(val2[i]);
       x[2 * i + 1] = sandwich::bf16_hi(val2[i]);
     }
-    sandwich::push_warp_sum(sandwich::warp_sum(sandwich::group_sumsq(x)), 0);
+    sandwich::push_warp_sum<kExchanges>(sandwich::warp_sum(sandwich::group_sumsq(x)), 0);
     // While the sums travel: rp = RN(residual_scale * residual), in pairs.
     uint32_t rp[VEC_SIZE / 2];
     uint32_t const* res2 = reinterpret_cast<uint32_t const*>(&m_residual);
@@ -331,13 +426,14 @@ class SandwichNormFusedOp {
           sandwich::mul_rn(sandwich::bf16_hi(res2[i]), m_params.residual_scale));
     }
     float const rstd1 = sandwich::rsqrt_approx_ftz(
-        sandwich::fma_rn(sandwich::token_sumsq(0, warps), inv_hidden, m_params.rms_eps));
+        sandwich::fma_rn(sandwich::token_sumsq<kExchanges>(0, warps), inv_hidden,
+                         m_params.rms_eps));
 
     // a = RN((rstd1 * x) * post_gamma), xp = RN(x_scale * a), the sum
     // RN(xp + rp): the residual stream the next norm reads.
     vec_t<T, VEC_SIZE> sum;
     uint32_t* sum2 = reinterpret_cast<uint32_t*>(&sum);
-    uint4 const post_gamma = sandwich::shared().gamma[0][threadIdx.x];
+    uint4 const post_gamma = sandwich::shared<kExchanges>().gamma[0][threadIdx.x];
     uint32_t const* pg2 = reinterpret_cast<uint32_t const*>(&post_gamma);
 #pragma unroll
     for (int i = 0; i < VEC_SIZE / 2; ++i) {
@@ -358,13 +454,14 @@ class SandwichNormFusedOp {
 
     // The next norm of the new residual stream; residual_out is stored while
     // its sums travel.
-    sandwich::push_warp_sum(sandwich::warp_sum(sandwich::group_sumsq(x)), 1);
+    sandwich::push_warp_sum<kExchanges>(sandwich::warp_sum(sandwich::group_sumsq(x)), 1);
     sum.store(reinterpret_cast<T*>(m_params.residual_out) + m_access_id * VEC_SIZE);
     float const rstd2 = sandwich::rsqrt_approx_ftz(
-        sandwich::fma_rn(sandwich::token_sumsq(1, warps), inv_hidden, m_params.rms_eps));
+        sandwich::fma_rn(sandwich::token_sumsq<kExchanges>(1, warps), inv_hidden,
+                         m_params.rms_eps));
     vec_t<T, VEC_SIZE> h;
     uint32_t* h2 = reinterpret_cast<uint32_t*>(&h);
-    uint4 const gamma = sandwich::shared().gamma[1][threadIdx.x];
+    uint4 const gamma = sandwich::shared<kExchanges>().gamma[1][threadIdx.x];
     uint32_t const* g2 = reinterpret_cast<uint32_t const*>(&gamma);
 #pragma unroll
     for (int i = 0; i < VEC_SIZE / 2; ++i) {
@@ -372,9 +469,43 @@ class SandwichNormFusedOp {
           sandwich::mul_rn(sandwich::mul_rn(rstd2, x[2 * i]), sandwich::bf16_lo(g2[i])),
           sandwich::mul_rn(sandwich::mul_rn(rstd2, x[2 * i + 1]), sandwich::bf16_hi(g2[i])));
     }
-    h.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
+    if constexpr (kTokenFp8) {
+      // The token's amax of the BF16 output, exchanged while norm_out (if
+      // asked for) is stored; then this thread's eight codes and, from the
+      // token's first thread, its scale.
+      float hv[VEC_SIZE];
+      float m = 0.f;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE / 2; ++i) {
+        hv[2 * i] = sandwich::bf16_lo(h2[i]);
+        hv[2 * i + 1] = sandwich::bf16_hi(h2[i]);
+        m = sandwich::max_f32(m, sandwich::max_f32(sandwich::abs_f32(hv[2 * i]),
+                                                   sandwich::abs_f32(hv[2 * i + 1])));
+      }
+      sandwich::push_warp_sum<kExchanges>(sandwich::warp_max(m), 2);
+      if (m_params.norm_out != nullptr) {
+        h.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
+      }
+      float const amax = sandwich::token_max<kExchanges>(2, warps);
+      float const multiplier = sandwich::min_f32(sandwich::div_rn(sandwich::kE4m3Max, amax),
+                                                 sandwich::kTokenMaxMultiplier);
+      uint32_t c[VEC_SIZE / 2];
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE / 2; ++i) {
+        c[i] = sandwich::cvt_e4m3x2(sandwich::quantize_by_multiplier(hv[2 * i], multiplier),
+                                    sandwich::quantize_by_multiplier(hv[2 * i + 1], multiplier));
+      }
+      uint2 const codes = make_uint2(c[0] | (c[1] << 16), c[2] | (c[3] << 16));
+      reinterpret_cast<uint2*>(m_params.quant_out)[m_access_id] = codes;
+      if (m_access_id_in_token == 0) {
+        reinterpret_cast<float*>(m_params.scale_out)[token_id] =
+            sandwich::max_f32(sandwich::div_rn(amax, sandwich::kE4m3Max), sandwich::kTokenMinScale);
+      }
+    } else {
+      h.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
+    }
     // No closing cluster barrier: peers only write into this CTA (st.async),
-    // and both of its barriers completed above, so every such write landed.
+    // and each of its barriers completed above, so every such write landed.
   }
 
  private:
@@ -384,12 +515,19 @@ class SandwichNormFusedOp {
   vec_t<T, VEC_SIZE> m_residual;
 };
 
-// The MNNVL kernels name FusedOp<Pattern, T>: route the sandwich pattern here.
+// The MNNVL kernels name FusedOp<Pattern, T>: route the sandwich patterns here.
 template <>
 class FusedOp<AllReduceFusionPattern::kARSandwichResidualRMSNorm, __nv_bfloat16>
-    : public SandwichNormFusedOp {
+    : public SandwichNormFusedOp<false> {
  public:
-  using SandwichNormFusedOp::SandwichNormFusedOp;
+  using SandwichNormFusedOp<false>::SandwichNormFusedOp;
+};
+
+template <>
+class FusedOp<AllReduceFusionPattern::kARSandwichResidualRMSNormTokenFP8, __nv_bfloat16>
+    : public SandwichNormFusedOp<true> {
+ public:
+  using SandwichNormFusedOp<true>::SandwichNormFusedOp;
 };
 
 }  // namespace trtllm_allreduce_fusion

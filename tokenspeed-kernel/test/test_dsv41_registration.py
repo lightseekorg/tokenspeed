@@ -51,7 +51,8 @@ def log(phase):
         pass
 
 # Capture the child stack before the parent's 60-second timeout kills it.
-# Keep the watchdog armed through interpreter shutdown as well as imports.
+# The watchdog covers the import and check phases; a successful child skips
+# interpreter teardown through the os._exit below.
 faulthandler.enable()
 faulthandler.dump_traceback_later(45)
 
@@ -92,6 +93,7 @@ registrations = [
     ("triton_dsv41_index_query_rope_weights", "dsv41_index_query_rope_weights", "triton", "_triton.rope"),
     ("triton_dsv41_index_query_rope_quant", "dsv41_index_query_rope_quant", "triton", "_triton.rope"),
     ("triton_dsv41_index_key_norm_rope_scatter", "dsv41_index_key_norm_rope_scatter", "triton", "_triton.rope"),
+    ("triton_dsv41_history_pack", "dsv41_history_pack", "triton", "_triton.kvp"),
     ("flashmla_dsv41_selected_attention", "dsv41_selected_attention", "flashmla", "flash_mla"),
     ("deep_gemm_dsv41_index_topk", "dsv41_index_topk", "deep_gemm", "deep_gemm"),
     ("deepselect_dsv41_select_candidates", "dsv41_select_candidates", "deepselect", "deep_select"),
@@ -123,6 +125,11 @@ for round_index in range(2):
         assert implementation.__module__ == family + "." + module
     log(f"round {round_index + 1}: checks done")
 log("registration checks complete")
+# The registration contract is fully verified above, so skip interpreter
+# teardown: finalizing the imported native stacks has been seen to hang in
+# CI with the main thread outside Python, and teardown is not what this
+# subprocess verifies. os._exit keeps the exit status meaningful.
+os._exit(0)
 """
     try:
         result = subprocess.run(

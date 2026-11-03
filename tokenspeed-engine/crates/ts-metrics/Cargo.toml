@@ -1,0 +1,22 @@
+[package]
+name = "tokenspeed-metrics"
+description = "TokenSpeed's engine metrics: the metric definitions, Prometheus multiprocess export and the plugin relay feed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lib]
+name = "ts_metrics"
+
+[dependencies]
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
+
+[lints]
+workspace = true

@@ -18,24 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""L3 KV storage backends that sit below the compact Host (flat KV) pool."""
+"""The L3 storage tier below the compact Host (flat KV) pool, as the data
+plane resolves it at startup: the namespace identity and the settings the
+engine host starts its executor (``ts-l3``) from (``factory.l3_settings``)."""
 
-from tokenspeed.runtime.cache.l3.backend import (
-    KvStoreStorage,
-    MemoryKvStore,
+from tokenspeed.runtime.cache.l3.config import (
+    L3Settings,
+    MooncakeStoreSettings,
+    StorageRuntimeConfig,
+)
+from tokenspeed.runtime.cache.l3.identity import (
     l3_cache_quantization_id,
     l3_checkpoint_id,
-    storage_key_prefix,
-    storage_object_key,
+    storage_deployment_id,
 )
-from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
 
 __all__ = [
-    "KvStoreStorage",
-    "MemoryKvStore",
-    "create_kvstore_storage_backend",
+    "L3Settings",
+    "MooncakeStoreSettings",
+    "StorageRuntimeConfig",
     "l3_cache_quantization_id",
     "l3_checkpoint_id",
-    "storage_key_prefix",
-    "storage_object_key",
+    "storage_deployment_id",
 ]

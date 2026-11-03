@@ -1,5 +1,11 @@
 # FP8 quantization
 
+TRT-LLM providers are optional: their FP8 leaves are registered only when
+`trtllm_kernel` is installed. Importing the common operators remains possible
+without that extension, and directly requesting the TRT-LLM group quantizer
+reports the missing package. Providers that depend on this quantizer, including
+DeepGEMM DSA, follow the same availability requirement.
+
 `quantize_fp8` returns `(values, scales)`. A plain cast has no scales;
 static scaling returns the supplied scale. Dynamic `token` quantization
 uses one FP32 scale per row, and `token_group` uses canonical token-major

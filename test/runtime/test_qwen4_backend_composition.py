@@ -267,7 +267,7 @@ def test_hybrid_factory_selects_gdn_only_for_local_state(
         factory.assert_called_once_with(config, components[SoftmaxAttnConfig])
         gdn.set_kv_pool.assert_not_called()
         accepted = torch.tensor([1, 3], dtype=torch.int32)
-        backend.commit_speculative_state_after_verify(
+        backend.commit_state_after_acceptance(
             accepted, num_extends=0, accepted_path=None
         )
         gdn.commit_verified_state.assert_called_once_with(accepted, accepted_path=None)

@@ -31,6 +31,10 @@ CPU only, nothing is launched:
   emits for the Triton rmsnorm the unfused chain runs.
 * The pattern code, the launch parameters and the wrapper's admission: what
   it serves, what it hands back to the caller (None), what it refuses.
+* The per-token FP8 stage (kARSandwichResidualRMSNormTokenFP8): a NumPy model
+  of its warp / cluster amax exchange and its FP32 operations gives the codes
+  and scales of the per-token rule ``fp8_quantize_per_token`` applies to the
+  BF16 output, at every cluster partition; the wrapper's FP8 arguments.
 
 The multi-GPU checks are ``nvidia/thirdparty/test_trtllm_mnnvl_sandwich_norm.py``.
 """
@@ -313,9 +317,14 @@ def test_the_fused_order_does_not_depend_on_the_rows_around_a_row():
 
 def test_epilogue_arithmetic_is_inline_ptx_without_flush_to_zero():
     """The kernel package builds with -use_fast_math; the epilogue's FP32
-    operations are inline PTX, and only rsqrt flushes subnormals."""
+    operations are inline PTX, and only rsqrt flushes subnormals (the per-token
+    FP8 stage's comparisons, division and E4M3 conversion included)."""
     text = HEADER.read_text()
-    ops = set(re.findall(r'asm\("((?:mul|add|fma|rcp|rsqrt|cvt)\.[a-z0-9.]+)', text))
+    ops = set(
+        re.findall(
+            r'asm\("((?:mul|add|fma|rcp|rsqrt|cvt|div|abs|max|min)\.[a-z0-9.]+)', text
+        )
+    )
     assert ops == {
         "mul.rn.f32",
         "add.rn.f32",
@@ -323,7 +332,14 @@ def test_epilogue_arithmetic_is_inline_ptx_without_flush_to_zero():
         "rcp.rn.f32",
         "rsqrt.approx.ftz.f32",
         "cvt.rn.bf16x2.f32",
+        "div.rn.f32",
+        "abs.f32",
+        "max.f32",
+        "min.f32",
+        "cvt.rn.satfinite.e4m3x2.f32",
     }
+    for call in ("fmaxf(", "fminf(", "fabsf(", "__fdiv"):
+        assert call not in text
     assert "membar" not in text and "__threadfence" not in text
     assert "rcp_rn(static_cast<float>(m_params.hidden_dim))" in text
 
@@ -467,7 +483,8 @@ def test_two_shot_kernels_fit_two_ctas_of_21_warps_per_sm():
     """Past one cluster per SM the launch runs in waves of resident CTAs. Up
     to 8 ranks the two-shot kernels keep to 48 registers on sm_100a and
     sm_103a, so two CTAs of up to 21 warps share an SM as the plain
-    all-reduce's do; more registers halve the CTAs each wave holds."""
+    all-reduce's do; more registers halve the CTAs each wave holds. The
+    per-token FP8 pattern (12) keeps to the same budget."""
     so = (
         KERNEL_ROOT
         / "python/tokenspeed_kernel/thirdparty/cuda/objs/trtllm_comm/trtllm_comm.so"
@@ -481,7 +498,7 @@ def test_two_shot_kernels_fit_two_ctas_of_21_warps_per_sm():
         check=True,
     ).stdout
     kernel = re.compile(
-        r"kernel_twoshotI.*PatternE11E13__nv_bfloat16Li(\d+)E.*\n\s*REG:(\d+)"
+        r"kernel_twoshotI.*PatternE1[12]E13__nv_bfloat16Li(\d+)E.*\n\s*REG:(\d+)"
     )
     checked = 0
     for block in re.split(r"\narch = ", usage):
@@ -506,7 +523,9 @@ def test_pattern_code_parameters_and_build_agree():
 
     fusion = FUSION_HEADER.read_text()
     assert re.search(r"kARSandwichResidualRMSNorm = 11,", fusion)
+    assert re.search(r"kARSandwichResidualRMSNormTokenFP8 = 12,", fusion)
     assert AllReduceFusionPattern.kARSandwichResidualRMSNorm == 11
+    assert AllReduceFusionPattern.kARSandwichResidualRMSNormTokenFP8 == 12
     assert (
         AllReduceFusionPattern.kARSandwichResidualRMSNorm in _MNNVL_SUPPORTED_PATTERNS
     )
@@ -536,6 +555,17 @@ def test_pattern_code_parameters_and_build_agree():
     assert (
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mnnvl_sandwich_norm_allreduce," in binding
     )
+    assert (
+        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mnnvl_sandwich_norm_allreduce_token_fp8,"
+        in binding
+    )
+    # The FP8 constants are the Triton rule's FP32 constexprs.
+    assert "kE4m3Max = 448.f;" in HEADER.read_text()
+    assert (
+        "kTokenMinScale = static_cast<float>(1.0 / (448.0 * 512.0));"
+        in HEADER.read_text()
+    )
+    assert "kTokenMaxMultiplier = 448.f * 512.f;" in HEADER.read_text()
     setup = (KERNEL_ROOT / "python/setup.py").read_text()
     assert 'CUDA_CSRC_DIR / "trtllm_mnnvl_sandwich_norm.cu"' in setup
     header = HEADER.read_text()
@@ -559,6 +589,9 @@ class _Recorder:
 
     def trtllm_mnnvl_sandwich_norm_allreduce(self, *args):
         self.calls.append(args)
+
+    def trtllm_mnnvl_sandwich_norm_allreduce_token_fp8(self, *args):
+        self.calls.append(("token_fp8",) + args)
 
 
 def _workspace(world: int, hidden: int, *, cap: int = 64, buffer: int = 1 << 30):
@@ -611,7 +644,7 @@ def _call(state, tokens=4, hidden=4096, world=8, dtype=torch.bfloat16, **kwargs)
     residual = torch.zeros(tokens, hidden, dtype=dtype)
     post = torch.ones(hidden, dtype=dtype)
     weight = torch.ones(hidden, dtype=dtype)
-    args = dict(eps=1e-5, max_token_num=2048)
+    args = dict(eps=1e-5, max_token_num=2048, norm_out_bf16=True)
     args.update(kwargs)
     return state.op(x, residual, post, weight, 3, _Group(world), **args)
 
@@ -730,5 +763,159 @@ def test_mismatched_shapes_raise(wrapper):
         (torch.zeros(4096, 4, dtype=torch.bfloat16).t(), good),
     ):
         with pytest.raises(ValueError):
-            wrapper.op(x, residual, post, good, 0, _Group(8), eps=1e-6)
+            wrapper.op(
+                x, residual, post, good, 0, _Group(8), eps=1e-6, norm_out_bf16=True
+            )
     assert wrapper.module.calls == []
+
+
+def _fp8_buffers(tokens=4, hidden=4096):
+    return (
+        torch.empty(tokens, hidden, dtype=torch.float8_e4m3fn),
+        torch.empty(tokens, 1, dtype=torch.float32),
+    )
+
+
+@pytest.mark.parametrize("bf16_out", [True, False])
+def test_a_token_fp8_call_launches_the_fp8_entry(wrapper, bf16_out):
+    """token_fp8_out launches the per-token FP8 entry with the BF16 call's
+    arguments plus the codes and scales after residual_out; without the BF16
+    output its norm_out is None and so is the returned one."""
+    wrapper.manager.mnnvl_workspace = _workspace(8, 4096, cap=6)
+    codes, scales = _fp8_buffers()
+    out = _call(
+        wrapper,
+        x_scale=0.5,
+        residual_scale=0.75,
+        token_fp8_out=(codes, scales),
+        norm_out_bf16=bf16_out,
+    )
+    (args,) = wrapper.module.calls
+    assert args[0] == "token_fp8"
+    args = args[1:]
+    assert (args[4] is None) == (not bf16_out) and args[4] is out[0]
+    assert args[5] is out[1] and args[6] is codes and args[7] is scales
+    assert args[8:12] == (8, 3, 4, 4096)
+    assert args[12:14] == (0x1000, 0x2000)
+    assert args[17:] == (True, True, 1e-5, 0.5, 0.75)
+    # The BF16 call is unchanged: the BF16 entry, no FP8 arguments.
+    _call(wrapper, x_scale=0.5, residual_scale=0.75)
+    assert wrapper.module.calls[-1][0] != "token_fp8"
+    assert len(wrapper.module.calls[-1]) == 20
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(codes=torch.empty(4, 4096, dtype=torch.bfloat16)),
+        dict(codes=torch.empty(3, 4096, dtype=torch.float8_e4m3fn)),
+        dict(codes=torch.empty(4096, 4, dtype=torch.float8_e4m3fn).t()),
+        dict(scales=torch.empty(4, 1, dtype=torch.bfloat16)),
+        dict(scales=torch.empty(5, 1, dtype=torch.float32)),
+        dict(scales=torch.empty(4, 2, dtype=torch.float32)[:, :1]),
+        dict(no_fp8=True),
+    ],
+)
+def test_invalid_token_fp8_calls_raise_before_any_collective(wrapper, case):
+    wrapper.manager.mnnvl_workspace = _workspace(8, 4096)
+    codes, scales = _fp8_buffers()
+    codes, scales = case.get("codes", codes), case.get("scales", scales)
+    kwargs = (
+        dict(norm_out_bf16=False)
+        if case.get("no_fp8")
+        else dict(token_fp8_out=(codes, scales))
+    )
+    with pytest.raises(ValueError):
+        _call(wrapper, **kwargs)
+    assert wrapper.ensured == [] and wrapper.module.calls == []
+
+
+# --------------------------------------------------- the per-token FP8 stage
+
+
+def _e4m3(x: np.ndarray) -> np.ndarray:
+    """cvt.rn.satfinite.e4m3x2.f32 of already clamped FP32 values: RN to E4M3
+    (PyTorch's conversion), as raw bytes."""
+    t = torch.from_numpy(np.ascontiguousarray(x, dtype=F32))
+    return t.to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+
+
+def _fused_token_fp8(h: np.ndarray, cluster: int):
+    """The epilogue's per-token FP8 stage on BF16 rows ``h`` (as FP32), for a
+    cluster of ``cluster`` CTAs: each thread's max |x| over its 8 elements, a
+    warp butterfly, the warp values exchanged and folded lane-strided, then a
+    butterfly; div.rn, min / max and the clamp in FP32 (no flush), the E4M3
+    conversion of each element."""
+    rows, hidden = h.shape
+    warps = hidden // 256
+    assert warps % cluster == 0
+    absx = np.abs(h).astype(F32)
+    thread = absx.reshape(rows, hidden // 8, 8).max(-1)
+    warp = thread.reshape(rows, warps, 32)
+    lanes = np.arange(32)
+    for m in (16, 8, 4, 2, 1):
+        warp = np.maximum(warp, warp[..., lanes ^ m])
+    slots = warp[..., 0]
+    lane = np.zeros((rows, 32), F32)
+    for w in range(warps):
+        lane[:, w % 32] = np.maximum(lane[:, w % 32], slots[:, w])
+    for m in (16, 8, 4, 2, 1):
+        lane = np.maximum(lane, lane[..., lanes ^ m])
+    amax = lane[:, :1]
+    with np.errstate(divide="ignore", over="ignore"):
+        multiplier = np.minimum((F32(448.0) / amax).astype(F32), F32(448.0 * 512.0))
+    scale = np.maximum((amax / F32(448.0)).astype(F32), F32(1.0 / (448.0 * 512.0)))
+    q = np.clip((h * multiplier).astype(F32), F32(-448.0), F32(448.0))
+    return _e4m3(q), scale.astype(F32)
+
+
+def _triton_rule(h: np.ndarray):
+    """ops/quantization/triton.py's per-token rule on the same BF16 rows, in
+    PyTorch FP32: fp8_token_multiplier, fp8_quantize_by_multiplier,
+    fp8_token_scale."""
+    x = torch.from_numpy(h)
+    amax = x.abs().amax(-1, keepdim=True)
+    multiplier = torch.minimum(
+        torch.tensor(448.0) / amax, torch.tensor(448.0 * 512.0, dtype=torch.float32)
+    )
+    codes = (x * multiplier).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scale = torch.maximum(
+        amax / 448.0, torch.tensor(1.0 / (448.0 * 512.0), dtype=torch.float32)
+    )
+    return codes.view(torch.uint8).numpy(), scale.numpy()
+
+
+def _token_rows(hidden: int, kind: str, rows: int = 16, seed: int = 0) -> np.ndarray:
+    gen = np.random.default_rng(seed + hidden)
+    h = gen.standard_normal((rows, hidden)).astype(F32)
+    if kind == "heavy":
+        h *= np.exp(gen.standard_normal((rows, hidden))).astype(F32)
+    elif kind == "outlier":
+        h[:, :: hidden // 8] *= 300
+    elif kind == "edges":
+        h[0] = 0
+        h[1] = 2.0**-130  # BF16 subnormals: amax below the minimum scale
+        h[2] = -3.0e38
+        h[3, 5] = 1.0e30
+        h[4] *= 2.0**-120
+    return _bf16(h)
+
+
+@pytest.mark.parametrize("hidden", [2048, 4096, 7168])
+@pytest.mark.parametrize("kind", ["normal", "heavy", "outlier", "edges"])
+def test_the_token_fp8_stage_writes_the_per_token_rule(hidden, kind):
+    """Every cluster partition of the token gives the codes and scales the
+    per-token rule gives for the BF16 output, bit for bit (a maximum does not
+    depend on its order)."""
+    h = _token_rows(hidden, kind)
+    want_codes, want_scale = _triton_rule(h)
+    clusters = [c for c in (1, 2, 4, 8) if (hidden // 256) % c == 0]
+    for cluster in clusters:
+        codes, scale = _fused_token_fp8(h, cluster)
+        assert np.array_equal(codes, want_codes), cluster
+        assert np.array_equal(scale.view(np.int32), want_scale.view(np.int32)), cluster
+    if kind == "edges":
+        assert (want_codes[0] == 0).all() and want_scale[0, 0] == F32(
+            1.0 / (448.0 * 512.0)
+        )
+        assert want_scale[1, 0] == F32(1.0 / (448.0 * 512.0))

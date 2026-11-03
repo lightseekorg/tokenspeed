@@ -1,0 +1,68 @@
+name: TokenSpeed Engine Rust Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tokenspeed-engine/**"
+      - "tokenspeed-scheduler/**"
+      - ".github/workflows/tokenspeed-engine-test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "tokenspeed-engine/**"
+      - "tokenspeed-scheduler/**"
+      - ".github/workflows/tokenspeed-engine-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tokenspeed-engine-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tokenspeed-engine
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      # ts-scheduler compiles the scheduler and its nanobind module into the
+      # binary, as the scheduler wheel build does.
+      - name: Install the C++ build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev
+          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
+          echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # The wheel the engine installs: the extension module and ts-host.
+      - name: Build the wheel
+        run: |
+          python -m pip wheel . --no-deps -w dist
+          python -m pip install --no-deps dist/tokenspeed_engine-*.whl
+          cd /tmp && python -c 'import os, tokenspeed_engine; assert os.access(tokenspeed_engine.host_binary(), os.X_OK)'

@@ -42,12 +42,14 @@ from tokenspeed_kernel.ops.layernorm import (
 )
 from tokenspeed_kernel.ops.moe import bf16_moe_routes
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
+    _gather_moe_routes_kernel,
     _launch_routed_input_scale_sum,
 )
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
     triton_routed_input_scale_rmsnorm_sum_gathered as triton_routed_sum_gathered,
 )
 from tokenspeed_kernel.ops.moe.routed_norm import (
+    gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
 )
 from tokenspeed_kernel.ops.residual import (
@@ -232,9 +234,11 @@ def test_bf16_moe_routes_beyond_int32_expert_stride(device: str) -> None:
         [[experts, experts], [0, experts + 1]], device=device, dtype=torch.int32
     )
 
-    routes = bf16_moe_routes(x.contiguous(), w13, w2, ids, 1)
+    routes = bf16_moe_routes(x.contiguous(), w13, w2, ids, 1, batch_invariant=False)
 
-    assert torch.equal(routes, bf16_moe_routes(x.contiguous(), w13, w2, ids, 1))
+    assert torch.equal(
+        routes, bf16_moe_routes(x.contiguous(), w13, w2, ids, 1, batch_invariant=False)
+    )
     assert not torch.isnan(routes.float()).any()
     assert not routes[1].any()
     top = experts - 1
@@ -283,9 +287,9 @@ def test_portable_kernels_capture_and_replay_with_fresh_inputs(device: str) -> N
             None,
             1,
         )
-        routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1)
+        routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1, batch_invariant=False)
         combined = routed_input_scale_rmsnorm_sum(
-            routes, route_weights, norm_weight, 1e-8, 1.0, False
+            routes, route_weights, norm_weight, 1e-8, 1.0, False, None
         )
         return k_norm, stream, pre_fp32, combined
 
@@ -332,6 +336,149 @@ def test_fused_boundary_keeps_the_post_norm_in_fp32(
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_gathered_routes_replay_and_vary_token_count(device: str) -> None:
+    """Route alignment and destination storage survive capture and batch changes."""
+    from utils import assert_no_triton_compile
+
+    topk, width, padded_width = 8, 257, 288
+
+    def make_case(tokens: int):
+        routes = torch.randn(
+            tokens * topk + 7, padded_width, device=device, dtype=torch.bfloat16
+        )
+        mapping = torch.randperm(routes.shape[0], device=device)[: tokens * topk].int()
+        mapping[::3] = -1
+        output = torch.full(
+            (tokens, topk, width), torch.nan, device=device, dtype=routes.dtype
+        )
+        return routes, mapping, tokens, topk, width, output
+
+    def check(case):
+        routes, mapping, tokens, topk, width, output = case
+        actual = gather_moe_routes(*case)
+        assert actual is output
+        indices = mapping.long()
+        expected = routes[indices.clamp_min(0), :width]
+        expected[indices < 0] = 0
+        torch.testing.assert_close(
+            actual, expected.reshape(tokens, topk, width), atol=0, rtol=0
+        )
+
+    # Warm each runtime integer alignment class, including a partial workgroup.
+    for tokens in (1, 2):
+        check(make_case(tokens))
+    with assert_no_triton_compile(_gather_moe_routes_kernel):
+        for tokens in (3, 5, 16, 33):
+            check(make_case(tokens))
+    case = make_case(5)
+    gather_moe_routes(*case)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gather_moe_routes(*case)
+    routes, mapping, _, _, _, output = case
+    routes.neg_()
+    mapping.copy_(mapping.flip(0))
+    output.fill_(torch.nan)
+    graph.replay()
+    torch.cuda.synchronize()
+    indices = mapping.long()
+    expected = routes[indices.clamp_min(0), :width]
+    expected[indices < 0] = 0
+    torch.testing.assert_close(output, expected.reshape(output.shape), atol=0, rtol=0)
+
+    # Rejection must happen before a permuted gather can corrupt its source.
+    source = torch.randn(8, width, device=device, dtype=torch.bfloat16)
+    before = source.clone()
+    mapping = torch.arange(7, -1, -1, device=device, dtype=torch.int32)
+    with pytest.raises(ValueError, match="overlap"):
+        gather_moe_routes(source, mapping, 1, 8, width, source.view(1, 8, width))
+    torch.testing.assert_close(source, before, atol=0, rtol=0)
+
+    destination = torch.zeros(1, 8, width, device=device, dtype=torch.bfloat16)
+    mapping = destination.flatten().view(torch.int32)[:8]
+    mapping.copy_(torch.arange(7, -1, -1, device=device, dtype=torch.int32))
+    before_destination = destination.clone()
+    with pytest.raises(ValueError, match="overlap"):
+        gather_moe_routes(source, mapping, 1, 8, width, destination)
+    torch.testing.assert_close(
+        destination.view(torch.int16),
+        before_destination.view(torch.int16),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(source, before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_bf16_moe_routes_write_a_supplied_destination(device: str) -> None:
+    """A caller-owned destination holds the same routes, zeroing stale and remote rows."""
+    experts, width, inter, tokens, topk = 4, 256, 128, 5, 2
+    torch.manual_seed(3)
+    w13 = (torch.randn(experts, 2 * inter, width, device=device) * 0.05).bfloat16()
+    w2 = (torch.randn(experts, width, inter, device=device) * 0.05).bfloat16()
+    x = (torch.randn(tokens, width, device=device) * 0.5).bfloat16()
+    # Expert 5 is outside this rank's [1, 5) shard, so its route stays zero.
+    ids = torch.tensor(
+        [[1, 2], [3, 4], [5, 1], [2, 2], [4, 3]], device=device, dtype=torch.int32
+    )
+    expected = bf16_moe_routes(x, w13, w2, ids, 1, batch_invariant=False)
+
+    storage = torch.full(
+        (tokens * topk + 2, width), 7.0, device=device, dtype=torch.bfloat16
+    )
+    destination = storage[1:-1]
+    actual = bf16_moe_routes(
+        x, w13, w2, ids, 1, output=destination, batch_invariant=False
+    )
+
+    assert actual.data_ptr() == destination.data_ptr()
+    assert actual.shape == (tokens, topk, width)
+    assert torch.equal(actual, expected)
+    assert not actual[2, 0].any()
+    assert torch.equal(storage[[0, -1]], torch.full_like(storage[[0, -1]], 7.0))
+    with pytest.raises(ValueError, match="overlap"):
+        bf16_moe_routes(
+            x,
+            w13,
+            w2,
+            ids,
+            1,
+            output=w2.view(-1)[: tokens * topk * width].view(tokens * topk, width),
+            batch_invariant=False,
+        )
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_routed_sum_writes_a_supplied_output(device: str) -> None:
+    """The route sum stored into caller-owned storage equals the allocated result."""
+    torch.manual_seed(4)
+    tokens, topk, width = 3, 8, 4096
+    routes = (torch.randn(tokens, topk, width, device=device) * 0.5).bfloat16()
+    route_weights = torch.rand(tokens, topk, device=device).softmax(-1)
+    norm_weight = torch.randn(width, device=device, dtype=torch.bfloat16) * 0.1
+    expected = routed_input_scale_rmsnorm_sum(
+        routes, route_weights, norm_weight, 1e-8, 1.0, False, None
+    )
+    output = torch.full_like(expected, float("nan"))
+    actual = routed_input_scale_rmsnorm_sum(
+        routes, route_weights, norm_weight, 1e-8, 1.0, False, output
+    )
+    assert actual is output
+    assert torch.equal(actual, expected)
+    with pytest.raises(ValueError, match="overlap"):
+        routed_input_scale_rmsnorm_sum(
+            routes,
+            route_weights,
+            norm_weight,
+            1e-8,
+            1.0,
+            False,
+            routes.view(-1)[: tokens * width].view(tokens, width),
+        )
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_gathered_route_reduction_matches_materialized_routes(device: str) -> None:
     """Reading routes through the permute map must equal gathering them first."""
     torch.manual_seed(5)
@@ -349,8 +496,10 @@ def test_gathered_route_reduction_matches_materialized_routes(device: str) -> No
     routes = gemm2_out.index_select(0, permuted.clamp_min(0))[:, :width]
     routes = torch.where((permuted >= 0).unsqueeze(-1), routes, routes.new_zeros(()))
     routes = routes.view(tokens, topk, width)
+    gathered = gather_moe_routes(gemm2_out, permute_map, tokens, topk, width)
+    torch.testing.assert_close(gathered, routes, atol=0, rtol=0)
     expected = routed_input_scale_rmsnorm_sum(
-        routes, route_weights, norm_weight, 1e-8, 1.0, False
+        routes, route_weights, norm_weight, 1e-8, 1.0, False, None
     )
     actual = triton_routed_sum_gathered(
         gemm2_out,

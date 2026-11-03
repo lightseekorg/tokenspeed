@@ -48,6 +48,137 @@ def _copy_u128(destination: Pointer, source: Pointer, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _copy_u128_masked(
+    destination: Pointer, source: Pointer, valid: cutlass.Boolean, *, loc=None, ip=None
+):
+    # src-size=0 zero-fills without reading source, including past the Q tail.
+    size = cutlass.Int32(valid) * 16
+    _llvm.inline_asm(
+        None,
+        [
+            destination.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            source.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            size.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .u32 address; cvt.u32.u64 address, $0; cp.async.cg.shared.global [address], [$1], 16, $2; }",
+        "l,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+class QueryGroups:
+    """Resolve request-owned groups without a metadata allocation or host read.
+
+    Uniform runs use arithmetic. Ragged runs start a group at each eight-row
+    boundary and at each ownership change, splitting at the next boundary.
+    Inactive ragged CTAs stop before initializing the scoring pipelines.
+    """
+
+    @cute.jit
+    def _group_count(self, rows: cutlass.Int32, width: cutlass.Int32):
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            count = rows // 8
+        elif cutlass.const_expr(self.group_layout == "uniform"):
+            count = (rows // width) * cute.ceil_div(width, 8)
+        elif cutlass.const_expr(self.group_layout == "ragged"):
+            count = rows
+        return count
+
+    @cute.jit
+    def _query_group(
+        self,
+        requests: cute.Tensor,
+        rows: cutlass.Int32,
+        width: cutlass.Int32,
+        group: cutlass.Int32,
+    ):
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            start = group * 8
+            valid = cutlass.Int32(8)
+        elif cutlass.const_expr(self.group_layout == "uniform"):
+            groups_per_request = cute.ceil_div(width, 8)
+            offset = (group % groups_per_request) * 8
+            start = (group // groups_per_request) * width + offset
+            valid = cutlass.min(cutlass.Int32(8), width - offset)
+        elif cutlass.const_expr(self.group_layout == "ragged"):
+            start = group
+            valid = cutlass.Int32(0)
+            active = start % 8 == 0
+            if not active:
+                active = requests[start - 1] != requests[start]
+            if active:
+                valid = cutlass.Int32(1)
+                end = cutlass.min(rows, (start // 8 + 1) * 8)
+                owner = requests[start]
+                for offset in cutlass.range_constexpr(1, 8):
+                    if valid == offset and start + offset < end:
+                        if requests[start + offset] == owner:
+                            valid += 1
+        return start, valid
+
+    @cute.jit
+    def _row_complete(
+        self,
+        complete: cute.Tensor,
+        start: cutlass.Int32,
+        offset: cutlass.Int32,
+        valid: cutlass.Int32,
+    ):
+        count = cutlass.Int32(0)
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            count = complete[start + offset]
+        elif offset < valid:
+            count = complete[start + offset]
+        return count
+
+    @cute.jit
+    def _copy_query(
+        self,
+        destination: cute.Pointer,
+        source: cute.Pointer,
+        offset: cutlass.Int32,
+        valid: cutlass.Int32,
+    ):
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            _copy_u128(destination, source)
+        else:
+            _copy_u128_masked(destination, source, offset < valid)
+
+    @cute.jit
+    def _store_selected(
+        self,
+        selected: cute.Tensor,
+        row: cutlass.Int32,
+        column: cutlass.Int32,
+        value,
+        start: cutlass.Int32,
+        valid: cutlass.Int32,
+    ):
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            selected[row, column] = value
+        elif row < start + valid:
+            selected[row, column] = value
+
+    @cute.jit
+    def _store_row(
+        self,
+        selected_row: cute.Tensor,
+        column: cutlass.Int32,
+        value,
+        row_in_group: cutlass.Int32,
+        valid_rows: cutlass.Int32,
+    ):
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            selected_row[column] = value
+        elif row_in_group < valid_rows:
+            selected_row[column] = value
+
+
+@dsl_user_op
 def _match_any(value: cutlass.Int32, *, loc=None, ip=None):
     result = _llvm.inline_asm(
         cutlass.Uint32.mlir_type,

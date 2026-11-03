@@ -22,8 +22,12 @@
 
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
+from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
+    merge_packed_index_candidates,
+    pack_index_candidates,
+)
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_gather_single
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
@@ -40,15 +44,43 @@ def merge_index_candidates(
     """Merge disjoint local candidates with one global Top-K selection.
 
     Communicates only K candidate positions and scores per query and rank.
+    Int32 positions and FP32 scores share one all-gather as interleaved int32
+    records; scores are reinterpreted bitwise, including mandatory +inf.
     Returns global logical positions and valid counts, identical on every rank.
     Positive infinity marks mandatory candidates; negative infinity is padding.
     Equal-score candidates have no prescribed logical-position order.
     """
     if offsets.shape != scores.shape or offsets.ndim != 2 or topk <= 0:
         raise ValueError("Candidate offsets/scores must be matching matrices")
+    if (
+        offsets.is_cuda
+        and offsets.dtype == torch.int32
+        and scores.dtype == torch.float32
+    ):
+        packed = pack_index_candidates(offsets, scores)
+        if len(group) > 1:
+            records = torch.empty(
+                (len(group), *packed.shape), dtype=packed.dtype, device=packed.device
+            )
+            all_gather_single(records.flatten(), packed.flatten(), group)
+        else:
+            records = packed.unsqueeze(0)
+        return merge_packed_index_candidates(records, topk=topk)
     if len(group) > 1:
-        offsets = all_gather(offsets.contiguous(), group, dim=-1)
-        scores = all_gather(scores.contiguous(), group, dim=-1)
+        if offsets.dtype == torch.int32 and scores.dtype == torch.float32:
+            # Numeric conversion would lose large positions or score bits.
+            # Stack also packs strided producer views into contiguous records.
+            packed = torch.stack((offsets, scores.view(torch.int32)), dim=-1)
+            gathered = all_gather(packed.flatten(1), group, dim=-1)
+            candidates = gathered.reshape(
+                offsets.shape[0], offsets.shape[1] * len(group), packed.shape[-1]
+            )
+            offsets, score_bits = candidates.unbind(dim=-1)
+            scores = score_bits.view(torch.float32)
+        else:
+            # Keep the existing input domain for callers using other dtypes.
+            offsets = all_gather(offsets.contiguous(), group, dim=-1)
+            scores = all_gather(scores.contiguous(), group, dim=-1)
     valid = (offsets >= 0) & ~torch.isnan(scores) & (scores > -float("inf"))
     scores = torch.where(valid, scores, -float("inf"))
     selected_scores, order = torch.topk(scores, topk, dim=-1)
@@ -78,7 +110,8 @@ def select_dsa_topk(
 
     Metadata has global positions throughout. Only cache addresses are local;
     global Top-K precedes the attention-side ownership mask and LSE reduction.
-    Query tiling caps temporary logits for both prefill and decode.
+    Query tiling targets logical FP32 logits for both prefill and decode;
+    kernel padding and selection scratch require additional memory.
     """
     if q.shape[0] == 0:
         return (
@@ -111,4 +144,6 @@ def select_dsa_topk(
         )
         outputs.append(indices)
         lengths.append(lens)
+    if len(outputs) == 1:
+        return outputs[0], lengths[0]
     return torch.cat(outputs), torch.cat(lengths)

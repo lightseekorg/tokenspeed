@@ -48,7 +48,9 @@ __all__ = [
 ]
 
 #: Algorithms the in-tree resolution below serves.
-_IN_TREE_ALGORITHMS = frozenset({"EAGLE3", "MTP", "DFLASH", "DSPARK", "DUMMY"})
+_IN_TREE_ALGORITHMS = frozenset(
+    {"EAGLE3", "EAGLE4", "MTP", "DFLASH", "DSPARK", "DUMMY"}
+)
 
 
 @dataclass
@@ -225,12 +227,14 @@ def get_drafter_impl(
     from tokenspeed.runtime.execution.drafter.dspark import DSpark
     from tokenspeed.runtime.execution.drafter.dummy import DummyDrafter
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
+    from tokenspeed.runtime.execution.drafter.eagle_harness.drafter import Eagle4
     from tokenspeed.runtime.models.inkling_nextn import (
         InklingForConditionalGenerationNextN,
     )
 
     DRAFTER_MAPPING = {
         "EAGLE3": Eagle,
+        "EAGLE4": Eagle4,
         "MTP": Eagle,
         "DFLASH": DFlash,
         "DSPARK": DSpark,

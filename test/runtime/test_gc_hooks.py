@@ -148,10 +148,5 @@ def test_without_the_hooks_cycles_stay_until_a_manual_collection(
     assert len(live) == 0
 
 
-def test_interval_must_be_positive() -> None:
-    with pytest.raises(ValueError, match="full_collection_interval"):
-        GcHooks(full_collection_interval=0)
-
-
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

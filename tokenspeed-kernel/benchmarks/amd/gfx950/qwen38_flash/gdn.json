@@ -16,7 +16,8 @@
             1,
             16
           ],
-          "dtype": "bfloat16"
+          "dtype": "bfloat16",
+          "state_dtype": "float32"
         },
         "cold_cache": true,
         "seed": 5121
@@ -43,7 +44,8 @@
             "per_token",
             "none"
           ],
-          "dtype": "bfloat16"
+          "dtype": "bfloat16",
+          "state_dtype": "float32"
         },
         "cold_cache": true,
         "seed": 5122

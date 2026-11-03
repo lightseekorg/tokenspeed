@@ -242,6 +242,7 @@ def allreduce_sandwich_rmsnorm(
     x_scale: float | None = None,
     residual_scale: float | None = None,
     max_token_num: int = 2048,
+    token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """All-reduce a sublayer partial and run a pre/post ("sandwich") norm
     boundary on the sum in one launch.
@@ -252,11 +253,14 @@ def allreduce_sandwich_rmsnorm(
     BF16 rounding points as those unfused calls, the sums of squares reduced
     in another order. Returns ``(norm_out, residual_out)``, or None when no
     fused kernel serves the call (nothing is launched; the caller runs the
-    unfused calls).
+    unfused calls). ``token_fp8_out=(codes, scales)`` (contiguous FP8 E4M3
+    ``[T, H]``, FP32 ``[T, 1]``) also writes ``norm_out`` quantized per token
+    in the same launch, as ``rmsnorm``'s ``token_fp8_out`` does.
     """
 
     if not current_platform().is_nvidia:
         return None
+    fp8_kwargs = {} if token_fp8_out is None else {"token_fp8_out": token_fp8_out}
     return _allreduce_sandwich_rmsnorm(
         input_tensor,
         residual,
@@ -269,6 +273,8 @@ def allreduce_sandwich_rmsnorm(
         residual_scale=residual_scale,
         max_token_num=max_token_num,
         launch_with_pdl=pdl_enabled(),
+        **fp8_kwargs,
+        norm_out_bf16=True,
     )
 
 

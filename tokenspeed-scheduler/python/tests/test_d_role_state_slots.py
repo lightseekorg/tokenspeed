@@ -240,3 +240,30 @@ class TestDRoleStateSlots:
             assert _state_rows(batch, rid) == landed[rid], rid
             for row in landed[rid].values():
                 assert row[0] == 0 and row[1] > 0
+
+
+class TestFullRemoteAdmissionQueue:
+    def test_full_remote_queue_resumes_after_eager_resident_release(self):
+        """A full slot pool must retain queued remote work until release."""
+        config = _d_role_config(decode_input_tokens=1)
+        config.max_batch_size = 1
+        scheduler = ts.Scheduler(config)
+        _submit_and_bootstrap(scheduler, ["resident", "queued"])
+        first = scheduler.next_execution_plan().remote_prefill
+        assert list(first.request_ids) == ["resident"]
+        slot = int(first.request_pool_indices[0])
+        for _ in range(4):
+            plan = scheduler.next_execution_plan()
+            assert plan.remote_prefill is None
+            assert not plan.aborts
+        _land(scheduler, "resident")
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        assert list(batch.request_ids) == ["resident"]
+        _advance(scheduler, "resident", [201])
+        _finish(scheduler, "resident")
+        plan = scheduler.next_execution_plan()
+        assert list(plan.remote_prefill.request_ids) == ["queued"]
+        assert list(plan.remote_prefill.request_pool_indices) == [slot]
+        _land(scheduler, "queued")
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        assert list(batch.request_ids) == ["queued"]

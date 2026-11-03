@@ -353,6 +353,11 @@ def _ensure_cuda_compiler() -> None:
         raise RuntimeError(f"CUDA backend selected but nvcc was not found: {NVCC}")
 
 
+# Groups compiled without -use_fast_math, to match torch or Python bit for bit.
+PRECISE_MATH_GROUPS = frozenset(
+    {"eagle_harness_tree", "eagle_harness_policy", "eagle4_candidate"}
+)
+
 # Kernel groups: each entry produces one .so file.
 # Format: (name, [source_files], extra_ldflags) or
 #         (name, [source_files], extra_ldflags, extra_cflags)
@@ -370,7 +375,6 @@ KERNEL_GROUPS = [
     (
         "dsv4_attention",
         [
-            CUDA_CSRC_DIR / "dsv4_attention.cu",
             CUDA_CSRC_DIR / "dsv4_topk.cu",
             CUDA_CSRC_DIR / "dsv4_attention_binding.cu",
         ],
@@ -450,6 +454,36 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "eagle_harness_tree",
+        [
+            CUDA_CSRC_DIR / "eagle_harness_tree.cu",
+        ],
+        [],
+    ),
+    (
+        "eagle_harness_policy",
+        [
+            CUDA_CSRC_DIR / "eagle_harness_policy.cu",
+        ],
+        [],
+    ),
+    (
+        "eagle4_candidate",
+        [
+            CUDA_CSRC_DIR / "eagle4_candidate.cu",
+        ],
+        [],
+    ),
+    (
+        # Device-side CUDA graph launch needs relocatable device code linked with cudadevrt.
+        "eagle_harness_chain",
+        [
+            CUDA_CSRC_DIR / "eagle_harness_chain.cu",
+        ],
+        ["-lcudadevrt"],
+        ["-rdc=true"],
+    ),
+    (
         "mhc_big_fuse",
         [
             CUDA_CSRC_DIR / "mhc_big_fuse.cu",
@@ -501,6 +535,7 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    ("trtllm_mhc", [CUDA_CSRC_DIR / "trtllm_mnnvl_mhc.cu"], []),
     (
         "trtllm_comm",
         [
@@ -889,6 +924,7 @@ class CudaKernelBuilder:
                 | {
                     "extra_cflags": list(extra_cflags),
                     "extra_ldflags": list(extra_ldflags or []),
+                    "precise_math": name in PRECISE_MATH_GROUPS,
                 }
                 if build_identity is not None
                 else None
@@ -937,6 +973,11 @@ class CudaKernelBuilder:
             ) in stale_groups:
                 out_dir = so_path.parent
                 objects = []
+                group_nvcc_flags = (
+                    [flag for flag in nvcc_flags if flag != "-use_fast_math"]
+                    if name in PRECISE_MATH_GROUPS
+                    else nvcc_flags
+                )
                 for src in sources:
                     obj = out_dir / (src.stem + ".o")
                     objects.append(obj)
@@ -945,17 +986,28 @@ class CudaKernelBuilder:
                             self._compile_one,
                             str(src),
                             str(obj),
-                            nvcc_flags,
+                            group_nvcc_flags,
                             include_dirs,
                             extra_cflags,
                         )
                     )
-                group_meta.append((name, objects, extra_ldflags, so_path, identity))
+                group_meta.append(
+                    (name, objects, extra_ldflags, extra_cflags, so_path, identity)
+                )
 
             for future in as_completed(futures):
                 future.result()
 
-        for name, objects, extra_ldflags, so_path, identity in group_meta:
+        for name, objects, extra_ldflags, extra_cflags, so_path, identity in group_meta:
+            if "-rdc=true" in extra_cflags:
+                # Relocatable device code links its device side with nvcc first.
+                dlink = so_path.parent / f"{name}_dlink.o"
+                subprocess.check_call(
+                    [NVCC, *gencode_flags, "--compiler-options=-fPIC", "-dlink"]
+                    + [str(o) for o in objects]
+                    + [*extra_ldflags, "-o", str(dlink)]
+                )
+                objects = [*objects, dlink]
             extra_ldflags = [
                 self._resolve_library_ldflag(ldflag) for ldflag in (extra_ldflags or [])
             ]
@@ -1046,6 +1098,7 @@ setup(
         ],
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",
+            "csrc/kimi3_router.cu",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",
@@ -1071,6 +1124,7 @@ setup(
             "csrc/*.jinja",
             "csrc/include/*",
         ],
+        "tokenspeed_kernel.thirdparty.vllm_recoverssm": ["LICENSE"],
         # Petit Gluon compiles its small HIP VMM binding lazily on first use.
         "tokenspeed_kernel.thirdparty.gluon_petit": [
             "LICENSE.txt",

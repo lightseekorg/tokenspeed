@@ -20,6 +20,9 @@
 
 """gfx950 mixture-of-experts kernels."""
 
+from tokenspeed_kernel_amd.ops.gfx950.moe.router_gemv import (
+    launch_gluon_router_sqrt_softplus_topk_gemv_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.softmax_topk import (
     launch_gluon_softmax_topk_gfx950,
 )
@@ -28,6 +31,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.sqrt_softplus_topk import (
 )
 
 __all__ = [
+    "launch_gluon_router_sqrt_softplus_topk_gemv_gfx950",
     "launch_gluon_softmax_topk_gfx950",
     "launch_gluon_sqrt_softplus_topk_gfx950",
 ]

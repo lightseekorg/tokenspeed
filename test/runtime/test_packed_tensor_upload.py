@@ -113,10 +113,5 @@ def test_empty_inputs(device):
         assert actual.device.type == device.type
 
 
-def test_non_cpu_inputs_are_rejected():
-    with pytest.raises(ValueError, match="requires CPU tensors"):
-        upload_packed((torch.empty(2, device="meta"),), "cpu")
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -1,0 +1,19 @@
+[package]
+name = "tokenspeed-collective"
+description = "CPU collectives among the ranks of a TokenSpeed engine, over a TCP mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lib]
+name = "ts_collective"
+
+[dependencies]
+thiserror.workspace = true
+tracing = "0.1"
+
+[lints]
+workspace = true

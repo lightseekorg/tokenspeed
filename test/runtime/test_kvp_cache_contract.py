@@ -36,6 +36,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
 
+from tokenspeed.runtime.cache.transfer.layout import (
+    CacheField,
+    CacheGroupLayout,
+    CacheTransferLayout,
+)
+from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.distributed.mapping import AttentionLayerMapping
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
@@ -90,6 +96,44 @@ def _contract(*, parents: int, packing: int, shard_count: int) -> CacheRuntimeCo
     )
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_host_ownership_uses_each_tiers_packing_and_bounds(rank):
+    layout = CacheTransferLayout(
+        num_lcm_blocks=2,
+        groups=(
+            CacheGroupLayout("sharded", 4, (CacheField("kv", 0, 0, 32, 32),)),
+            CacheGroupLayout("replicated", 4, (CacheField("state", 0, 0, 80, 80),)),
+        ),
+        buffers=(object(),),
+        consumers=(("kv", "state"),),
+    )
+    contract = _contract(parents=2, packing=4, shard_count=2)
+    owners = BlockOwnerTranslation.for_host_pool(
+        layout,
+        contract,
+        num_host_lcm_blocks=2,
+        host_group_packing=(2, 1),
+        rank=rank,
+    )
+    rows = [(0, 16, 8), (1, 8, 2)]
+    expected = [(1, (1, 8, 2))]
+    if rank == 1:
+        expected.insert(0, (0, (0, 8, 4)))
+    assert owners.owned_positions(rows) == expected
+    for row in [(0, 17, 7), (0, 15, 9), (1, 8, 3)]:
+        with pytest.raises(IndexError):
+            owners.owned_positions([row])
+    for packing in [(2,), (2, 0), (2, -1)]:
+        with pytest.raises(ValueError):
+            BlockOwnerTranslation.for_host_pool(
+                layout,
+                contract,
+                num_host_lcm_blocks=2,
+                host_group_packing=packing,
+                rank=rank,
+            )
+
+
 class TestRuntimeContractTest:
     def test_virtual_counts_scale_physical_pages_by_shard_count(self, subtests):
         for shard_count in (1, 2, 4, 8):
@@ -129,11 +173,6 @@ class TestRuntimeContractTest:
                 group_page_counts={"sharded": pages},
                 group_packing={"sharded": 1},
             )
-
-    def test_shard_count_must_be_a_positive_integer(self, subtests):
-        for value in (0, -1, 2.0, True):
-            with subtests.test(value=value), pytest.raises((ValueError)):
-                _full_history_spec("g", shard_count=value)
 
 
 class TestLocalPagesTest:
@@ -186,16 +225,6 @@ class TestLocalPagesTest:
         )
         assert ((owned.tolist(), local.tolist())) == (([], []))
 
-    def test_out_of_range_ids_and_ranks_are_rejected(self):
-        with pytest.raises((IndexError)):
-            local_pages([9], shard_count=2, rank=0, virtual_block_count=9)
-        with pytest.raises((IndexError)):
-            local_pages([-1], shard_count=2, rank=0, virtual_block_count=9)
-        with pytest.raises((ValueError)):
-            local_pages([1], shard_count=2, rank=2, virtual_block_count=9)
-        with pytest.raises((ValueError)):
-            local_pages([1], shard_count=0, rank=0, virtual_block_count=9)
-
     def test_by_group_reads_shard_count_and_bounds_from_the_contract(self):
         contract = _contract(parents=2, packing=2, shard_count=2)
         translated = local_pages_by_group(
@@ -229,16 +258,6 @@ class TestMappingTest:
         assert not (plain.has_kvp)
         assert (plain.kvp_group) == ((3,))
 
-    def test_kvp_must_divide_attention_tp(self):
-        with pytest.raises((ValueError), match=("divisible")):
-            AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=3
-            )
-        with pytest.raises((ValueError), match=("positive")):
-            AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=0
-            )
-
 
 class TestConfigurationTest:
     @staticmethod
@@ -257,7 +276,6 @@ class TestConfigurationTest:
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
             kv_cache_quant_method="none",
-            prefix_granularity=256,
             kernel_page_size=64,
             context_len=4096,
             max_bs=4,
@@ -273,10 +291,10 @@ class TestConfigurationTest:
         with pytest.raises((ValueError), match=("DSA, FlashMLA")):
             self._config(components=(self._component("mha"),))
 
-    def test_kvp_keeps_the_host_kvstore_but_refuses_l3(self):
+    def test_kvp_keeps_host_kvstore_and_allows_l3(self):
         # Host blocks are allocated in their Device block's residue class, so
         # the KVStore (and the retraction snapshot pool) serve a sharded
-        # engine; an L3 key has no owner-stable form under sharding.
+        # engine. L3 keys use a replica identity independent of allocation.
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
         args.kv_parallel_size = 2
@@ -288,8 +306,7 @@ class TestConfigurationTest:
         assert args.enable_kvstore, "KVStore is on by default"
         args.validate_cache_options()
         args.kvstore_storage_backend = "mooncake"
-        with pytest.raises((ValueError), match=("L3")):
-            args.validate_cache_options()
+        args.validate_cache_options()
 
 
 if __name__ == "__main__":

@@ -95,6 +95,8 @@ def fused_topk_topp_renorm(
     workspace: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
+    *,
+    in_place_skip: bool,
 ) -> torch.Tensor:
     """Fused TopK + TopP renormalization.
 
@@ -109,6 +111,12 @@ def fused_topk_topp_renorm(
              fresh one is allocated.
         enable_pdl: whether to use Programmatic Dependent Launch attributes.
                     ``None`` uses the global platform default.
+        in_place_skip: renormalize ``probs`` in place (``out`` None or
+            ``probs``), neither reading nor writing greedy rows (top-k 1) and
+            rows that cut nothing (top-k off, top-p >= 1); False writes every
+            row to ``out``: greedy rows one-hot, uncut rows renormalized.
+            Uncut rows skip radix selection in both modes; False retains
+            the apply stage's FP32 reduction and normalization rounding.
 
     Returns:
         ``[bs, V]`` float32. Non-kept positions are 0; kept positions are
@@ -116,7 +124,7 @@ def fused_topk_topp_renorm(
     """
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if out is None:
-        out = torch.empty_like(probs)
+        out = probs if in_place_skip else torch.empty_like(probs)
     if workspace is None:
         ws_bytes = fused_topk_topp_workspace_size(probs.size(0), probs.size(1))
         workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=probs.device)
@@ -129,5 +137,6 @@ def fused_topk_topp_renorm(
         workspace,
         side_handle,
         enable_pdl,
+        in_place_skip,
     )
     return out

@@ -178,6 +178,7 @@ def _require_runner_rebinding(namespace: dict) -> None:
         "trtllm_fp4_block_scale_routed_moe",
         "get_trtllm_moe_sm100_module",
         "_get_trtllm_moe_sm100_module_impl",
+        "_build_trtllm_moe_namespace",
     )
     for name in names:
         if name in namespace:
@@ -234,6 +235,11 @@ def _entrypoints():
     namespace["TrtllmMoERunner"] = TokenSpeedFP4MoERunner
     for name in ("register_custom_op", "register_fake_op"):
         namespace[name] = functools.partial(_register_private, getattr(core, name))
+    # Newer FlashInfer separates the JIT spec factory from runner construction.
+    # Its nested operators must still resolve this private runner and registrar.
+    builder = "_build_trtllm_moe_namespace"
+    if builder in vars(core):
+        namespace[builder] = _clone(vars(core)[builder], namespace)
     # Rebind the public dispatch and cached module factory, retaining the
     # upstream operator signatures and fake implementations.
     factory = "_get_trtllm_moe_sm100_module_impl"

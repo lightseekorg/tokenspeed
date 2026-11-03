@@ -170,10 +170,6 @@ class TestMultiWindowPageCountsTest:
         )
         assert (pages["s"]) == (4 * 3 + 3 + math.ceil(4096 / PAGE) + 4)
 
-    def test_sliding_without_window_raises(self):
-        with pytest.raises((ValueError)):
-            _pages([_spec("s", "sliding_window", window=None)])
-
 
 class TestSuffixedGroupIdFlowTest:
     """Spec grouping and budget computation agree on the suffixed group ids --

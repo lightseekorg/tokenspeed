@@ -41,7 +41,6 @@ server:
     --drafter-attention-backend tokenspeed_mla
     --mm-encoder-tp-mode data
     --policy round_robin
-    --dp-aware
     --sticky-sessions
     --reasoning-parser passthrough
     --tool-call-parser passthrough

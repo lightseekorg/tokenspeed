@@ -72,7 +72,7 @@ def _bucket_scores(capacity: int, device: str) -> list[tuple[str, torch.Tensor]]
     return scores
 
 
-@pytest.mark.parametrize("enable_pdl", [False, True])
+# Bucket boundaries are score data; the PDL launch path is checked in test_qsa_pdl.
 @pytest.mark.parametrize(
     ("rows", "pages", "width"),
     [
@@ -84,6 +84,10 @@ def _bucket_scores(capacity: int, device: str) -> list[tuple[str, torch.Tensor]]
         pytest.param(136, 32, 136, id="grouped-prefill"),
         pytest.param(136, 64, 136, id="dense-prefill"),
         pytest.param(136, 128, 136, id="overlap-prefill"),
+        pytest.param(137, 32, 137, id="grouped-prefill-tail"),
+        pytest.param(139, 64, 139, id="dense-prefill-tail"),
+        pytest.param(143, 128, 143, id="overlap-prefill-tail"),
+        pytest.param(15, 256, 15, id="split-prefill-tail"),
         pytest.param(136, 2048, 136, id="overlap-second-window"),
     ],
 )
@@ -92,7 +96,6 @@ def test_stream_topk_exact_fp32_bucket_boundaries(
     rows: int,
     pages: int,
     width: int,
-    enable_pdl: bool,
 ) -> None:
     """Bucket filtering must preserve exact scores, including after graph replay."""
 
@@ -127,7 +130,7 @@ def test_stream_topk_exact_fp32_bucket_boundaries(
             max_logits_bytes=256 << 20,
             solution="cute_dsl",
             override=None,
-            enable_pdl=enable_pdl,
+            enable_pdl=False,
         )
 
     invoke()

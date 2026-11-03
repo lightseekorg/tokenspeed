@@ -1,0 +1,35 @@
+[package]
+name = "tokenspeed-scheduler"
+description = "The TokenSpeed C++ scheduler, embedded with its Python module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+links = "ts_scheduler"
+include = [
+    "src/**",
+    "cxx/**",
+    "build.rs",
+    "CMakeLists.txt",
+    "scheduler/CMakeLists.txt",
+    "scheduler/csrc/**",
+    "scheduler/bindings/**",
+    "scheduler/LICENSE",
+]
+
+[lib]
+name = "ts_scheduler"
+
+[dependencies]
+cxx = "1.0"
+pyo3 = "0.30"
+
+[build-dependencies]
+cmake = "0.1"
+cxx-build = "1.0"
+pyo3-build-config = "0.30"
+
+[lints]
+workspace = true

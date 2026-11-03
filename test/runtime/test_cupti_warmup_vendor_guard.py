@@ -51,7 +51,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-from tokenspeed.runtime.engine import event_loop  # noqa: E402
+from tokenspeed.runtime.engine import rank_setup  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
@@ -67,7 +67,7 @@ def _run(*, is_amd: bool, cuda_available: bool = True, enabled: bool = True) -> 
     fake_utils = SimpleNamespace(_init_for_cuda_graphs=_fake_init)
     with (
         mock.patch.object(
-            event_loop.torch.cuda, "is_available", return_value=cuda_available
+            rank_setup.torch.cuda, "is_available", return_value=cuda_available
         ),
         mock.patch(
             "tokenspeed_kernel.platform.current_platform",
@@ -75,10 +75,10 @@ def _run(*, is_amd: bool, cuda_available: bool = True, enabled: bool = True) -> 
         ),
         mock.patch.dict(sys.modules, {"torch.profiler._utils": fake_utils}),
         mock.patch.object(
-            event_loop.envs.TOKENSPEED_CUPTI_GRAPH_WARMUP, "get", return_value=enabled
+            rank_setup.envs.TOKENSPEED_CUPTI_GRAPH_WARMUP, "get", return_value=enabled
         ),
     ):
-        event_loop.maybe_warm_cupti_for_graph_capture()
+        rank_setup.maybe_warm_cupti_for_graph_capture()
     return called
 
 

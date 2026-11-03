@@ -42,9 +42,12 @@ Usage (one final report for multiple scheduler ranks):
 
 In all-ranks mode, the TP rank is encoded into each numeric Proton flow ID.
 This keeps CPU-to-GPU flow arrows within a rank while preventing matching
-launch IDs on different ranks from cross-linking. When TokenSpeed emits
-VizTracer scope-entry flows and Proton exports their scope IDs, the merger also
-links VizTracer Python slices to Proton CPU scopes.
+launch IDs on different ranks from cross-linking. Each rank's VizTracer
+process is also moved to its own synthetic pid, because ranks run on different
+hosts (or in different PID namespaces) and can report the same real pid, which
+would otherwise put two schedulers in one process of the merged report. When
+TokenSpeed emits VizTracer scope-entry flows and Proton exports their scope
+IDs, the merger also links VizTracer Python slices to Proton CPU scopes.
 
 Open the merged report in vizviewer or https://ui.perfetto.dev — Python
 frames and Proton's kernel/scope lanes share one time axis. Alignment
@@ -67,6 +70,9 @@ __all__ = ["merge_all_ranks", "merge_proton_viztracer", "main"]
 # the lanes are recognizable next to the VizTracer process in a merged view.
 _PROTON_PROCESS_NAME = "Proton"
 _PROTON_PID_BASE = 10_000
+# Above every Proton pid (``_PROTON_PID_BASE + rank``) so a real VizTracer pid
+# can never land on a synthetic Proton lane.
+_VIZTRACER_PID_BASE = 20_000
 _FLOW_PHASES = frozenset({"s", "t", "f"})
 _FLOW_ID_RANK_SHIFT = 32
 _FLOW_ID_LOCAL_MASK = (1 << _FLOW_ID_RANK_SHIFT) - 1
@@ -150,6 +156,20 @@ def _namespace_viztracer_proton_flow_id(scope_id: int, rank: int) -> int:
     if rank > _MAX_FLOW_RANK:
         raise ValueError(f"TP rank {rank} is too large to encode in a flow ID")
     return _VIZTRACER_PROTON_FLOW_TAG | (rank << _FLOW_ID_RANK_SHIFT) | scope_id
+
+
+def _namespace_viztracer_pids(
+    viztracer_events: list[dict[str, Any]], rank: int
+) -> None:
+    """Move one rank's VizTracer processes to their own pid in an all-ranks trace.
+
+    Every event of the report is rewritten, metadata events included, so a
+    ``process_name`` keeps naming the process its slices end up in.
+    """
+    for event in viztracer_events:
+        pid = event.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            event["pid"] = _VIZTRACER_PID_BASE + rank
 
 
 def _link_viztracer_to_proton_cpu(
@@ -289,7 +309,9 @@ def merge_all_ranks(rank_traces: Iterable[TracePair], output_path: str | Path) -
     the all-ranks output gives it a pid of ``10000 + rank`` and encodes its TP
     rank in each numeric flow ID. The latter preserves CPU-to-GPU arrows
     within a rank without allowing equal launch IDs from two ranks to
-    cross-link.
+    cross-link. The rank's VizTracer process moves to ``20000 + rank``, which
+    keeps ranks that recorded the same real pid on separate hosts apart and
+    keeps them clear of the synthetic Proton pids.
 
     Args:
         rank_traces: ``(rank, viztracer_path, proton_path)`` triples. Ranks
@@ -344,6 +366,7 @@ def merge_all_ranks(rank_traces: Iterable[TracePair], output_path: str | Path) -
             proton_json, proton_path, viztracer_base_ns, rank=rank
         )
         viztracer_events = viztracer_json.get("traceEvents", [])
+        _namespace_viztracer_pids(viztracer_events, rank)
         linked_flow_events = _link_viztracer_to_proton_cpu(
             viztracer_events, proton_events, rank
         )

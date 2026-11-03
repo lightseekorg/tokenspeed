@@ -24,8 +24,9 @@ import math
 
 import torch
 from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens, is_warming_up
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import resolve_kernel_override, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -90,6 +91,20 @@ LSE_LN = math.log2(math.e)
 # ===-----------------------------------------------------------------------===#
 
 
+def _warmup_uses_cute_dsl(
+    mode: str,
+    kernel_name: str,
+    *,
+    override: str | None,
+    solution: str | None,
+) -> bool:
+    """Apply dispatch precedence: a resolved override takes priority over solution."""
+    effective_override = resolve_kernel_override("attention", mode, override)
+    if effective_override is not None:
+        return effective_override in ("cute_dsl", kernel_name)
+    return solution in (None, "cute_dsl")
+
+
 def select_qsa_sparse_attention_kernel(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -112,6 +127,15 @@ def select_qsa_sparse_attention_kernel(
     """
 
     query_width = 1 if max_seqlen_q is None else max_seqlen_q
+    supported_tma_gather_layout = False
+    if max_seqlen_q is None and sparse_metadata is not None:
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+            can_use_cute_dsl_tma_gather_qsa,
+        )
+
+        supported_tma_gather_layout = can_use_cute_dsl_tma_gather_qsa(
+            q, k_cache, v_cache, sparse_metadata
+        )
     traits = {
         "batch_size": q.shape[0] // query_width,
         "q_len": query_width,
@@ -137,6 +161,8 @@ def select_qsa_sparse_attention_kernel(
         "page_size": None if sparse_metadata is None else sparse_metadata.page_size,
         "scalar_scales": not isinstance(k_scale, torch.Tensor)
         and not isinstance(v_scale, torch.Tensor),
+        "unscaled_kv": k_scale is None and v_scale is None,
+        "supported_tma_gather_layout": supported_tma_gather_layout,
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     return select_kernel(
@@ -197,9 +223,10 @@ def qsa_sparse_attention(
         Attention output shaped
         ``[tokens, query_heads, value_head_dim]`` with the query dtype.
 
-    The SM100/SM103 CuTe DSL implementation is preferred when its specialization
-    matches a uniform decode. Other supported Blackwell BF16 inputs with logical
-    metadata use FlashInfer PrimTS QSA. Other supported NVIDIA inputs retain FA2.
+    The CuTe DSL implementation is preferred for supported uniform decode on
+    SM100/SM103/SM107. SM107 BF16 prefill with compatible logical metadata uses
+    TMA gather; SM100/SM103 use FlashInfer PrimTS QSA for supported BF16 inputs
+    with logical metadata. Other supported NVIDIA inputs retain FA2.
     GFX950 uses the Gluon kernel and other AMD GPUs the portable Triton kernel.
     Selection preserves prefill versus decode before adapting ragged inputs to
     independent one-token query rows.
@@ -222,6 +249,23 @@ def qsa_sparse_attention(
         return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
     if k_cache.shape[0] < 2 or v_cache.shape[0] < 2:
         raise ValueError("QSA caches must include slot 1 for masked reads")
+    if is_warming_up() and _warmup_uses_cute_dsl(
+        "qsa_sparse_attention",
+        "cute_dsl_blackwell_qsa_sparse_attention",
+        override=override,
+        solution=solution,
+    ):
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+            _warmup_qsa_sparse_attention,
+        )
+
+        _warmup_qsa_sparse_attention(
+            q,
+            k_cache,
+            v_cache,
+            selected_slots,
+            max_rows=get_autotune_max_num_tokens(),
+        )
     kernel = select_qsa_sparse_attention_kernel(
         q,
         k_cache,
@@ -413,6 +457,25 @@ def qsa_block_topk_stream(
         queries_per_request=queries_per_request,
         max_partial_bytes=max_partial_bytes,
     )
+    if is_warming_up() and _warmup_uses_cute_dsl(
+        "qsa_block_topk_stream",
+        "cute_dsl_qwen4_exp_qsa_block_topk",
+        override=override,
+        solution=solution,
+    ):
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import _warmup_qsa_stream_topk
+
+        _warmup_qsa_stream_topk(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+            block_topk=block_topk,
+            max_partial_bytes=max_partial_bytes,
+            enable_pdl=enable_pdl,
+        )
     kernel = select_kernel(
         "attention",
         "qsa_block_topk_stream",
@@ -546,6 +609,33 @@ def qwen4_exp_qsa_block_topk(
         prefer_stream = supported_layout and rows >= min_stream_rows
         fits_logits = rows * num_blocks * 4 <= max_logits_bytes
         path = "stream" if prefer_stream or not fits_logits else "logits"
+        # A logits startup must still prepare later stream calls. Stream calls
+        # share the warmup in qsa_block_topk_stream below.
+        if (
+            path == "logits"
+            and is_warming_up()
+            and _warmup_uses_cute_dsl(
+                "qsa_block_topk_stream",
+                "cute_dsl_qwen4_exp_qsa_block_topk",
+                override=override,
+                solution=solution,
+            )
+        ):
+            from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+                _warmup_qsa_stream_topk,
+            )
+
+            _warmup_qsa_stream_topk(
+                query,
+                key_cache,
+                page_table,
+                request_indices,
+                complete_blocks,
+                page_size=page_size,
+                block_topk=block_topk,
+                max_partial_bytes=max_partial_bytes,
+                enable_pdl=enable_pdl,
+            )
 
     if path == "logits":
         scores = qsa_block_scores(

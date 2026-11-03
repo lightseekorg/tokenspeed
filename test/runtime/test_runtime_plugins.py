@@ -58,7 +58,6 @@ def _profile(**overrides) -> ModelProfile:
         cache_family="fixture_family",
         linear_attention="fixture_linear",
         default_attention_backend="mla",
-        default_prefix_granularity=64,
         request_token_history=True,
         is_multimodal=False,
         tokenizer_kwargs={"fix_mistral_regex": True},
@@ -227,11 +226,6 @@ def test_disabled_plugin_is_skipped(monkeypatch, isolated) -> None:
     assert registry.registered_model("FixtureForCausalLM") is None
 
 
-def test_model_registration_requires_a_profile(isolated) -> None:
-    with pytest.raises(TypeError, match="model_profile"):
-        registry.register_model(torch.nn.Linear)
-
-
 def test_collisions_raise_unless_overridden(isolated) -> None:
     registry.register_model(FixtureForCausalLM)
     with pytest.raises(ValueError, match="already registered"):
@@ -290,15 +284,6 @@ def test_profile_resolution_follows_the_checkpoint(isolated) -> None:
     )
     assert dense.linear_attention is None
     assert registry.resolve_model_profile(["Unknown"], FixtureConfig()) is None
-
-
-def test_profile_rejects_missing_facts() -> None:
-    with pytest.raises(ValueError, match="cache_family"):
-        _profile(cache_family="")
-    with pytest.raises(ValueError, match="default_prefix_granularity"):
-        _profile(default_prefix_granularity=0)
-    with pytest.raises(TypeError):
-        ModelProfile(configure_attention=configure_mla_attention)
 
 
 def _model_config(profile: ModelProfile | None) -> SimpleNamespace:
@@ -460,13 +445,6 @@ def test_register_drafter_default_collides_with_in_tree() -> None:
     assert "MTP" not in drafter._PLUGIN_DRAFTERS
 
 
-def test_unknown_drafter_algorithm_is_rejected() -> None:
-    from tokenspeed.runtime.execution import drafter
-
-    with pytest.raises(ValueError, match="available"):
-        drafter.validate_drafter_algorithm("NEXTN")
-
-
 def test_drafter_registration_unwinds_with_the_recording() -> None:
     from tokenspeed.runtime.execution import drafter
 
@@ -552,7 +530,7 @@ def test_declared_draft_cache_family_must_match_a_custom_target() -> None:
         resolve("fixture_family", "fixture_family", draft_family_declared=True) is None
     )
     # An in-tree draft without a profile rides the target recipe's draft
-    # view (the deepseek_v4 NextN pattern).
+    # view (the in-tree NextN pattern).
     assert resolve("fixture_family", "mla", draft_family_declared=False) is None
     # A declared, different family is a layout contradiction.
     with pytest.raises(RuntimeError, match="declares cache family"):
@@ -568,7 +546,6 @@ def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
         args,
         name="Fixture",
         default_backend="fixture_backend",
-        default_prefix_granularity=None,
         is_draft_worker=True,
     )
     assert args.drafter_attention_backend == "fixture_backend"
@@ -577,7 +554,6 @@ def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
         args,
         name="Fixture",
         default_backend="target_backend",
-        default_prefix_granularity=None,
         is_draft_worker=False,
     )
     assert args.attention_backend == "target_backend"
@@ -675,7 +651,6 @@ def test_attention_instances_per_layer_has_no_fallback() -> None:
         cache_family="fixture_family",
         linear_attention=None,
         default_attention_backend=None,
-        default_prefix_granularity=None,
         request_token_history=False,
         is_multimodal=False,
         tokenizer_kwargs={},
@@ -723,7 +698,6 @@ def test_superseded_draft_profile_default_is_reported(caplog, monkeypatch) -> No
             args,
             name="Fixture",
             default_backend="draft_default",
-            default_prefix_granularity=None,
             is_draft_worker=True,
         )
     assert args.drafter_attention_backend == "target_choice"

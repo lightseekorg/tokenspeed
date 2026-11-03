@@ -64,6 +64,7 @@ class MLAConfig(SoftmaxAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    min_kv_split: int | None = None
 
     @classmethod
     def _spec_kwargs(
@@ -95,6 +96,7 @@ class MLAConfig(SoftmaxAttnConfig):
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
             cache_layer_types=cache_layer_types,
+            min_kv_split=server_args.min_kv_split,
         )
 
     @classmethod

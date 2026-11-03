@@ -89,3 +89,16 @@ stride and payload-tile stride, including partial tiles and unselected pages.
 `copy_state_rows` uses the same conservative 65535-program cap. Large state copies
 split along logical rows while retaining global layer indices and physical row
 strides. CUDA keeps one launch. The start row is a runtime argument.
+
+### Ascend recurrent Prefill state
+
+The common `prepare_prefill_state_inputs` and `store_state_rows` entry points
+use Triton on Ascend as well as CUDA. They honor strided convolution and
+recurrent arena views, preserve shared input snapshots, and mask fresh
+recurrent rows to zero without reading the null page. Stores accept padded
+negative destinations and require contiguous integer destination indices.
+Model plugins use these common operations through the state backend.
+
+Prefill source/destination index slices are runtime metadata. Both gather and
+scatter kernels ignore their pointer alignment when choosing a specialization,
+so moving a slice within a request-index buffer does not compile another kernel.

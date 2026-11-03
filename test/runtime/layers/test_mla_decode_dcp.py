@@ -49,7 +49,12 @@ sys.path.insert(
 )
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=120,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the MLA decode kernel requires NVIDIA SM100",
+)
 
 _HAS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 pytestmark = pytest.mark.skipif(

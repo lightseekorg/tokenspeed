@@ -54,7 +54,6 @@ def _softmax_topk_launch_metadata(grid, kernel, args):
 @gluon.jit(
     launch_metadata=_softmax_topk_launch_metadata,
     do_not_specialize=("num_tokens",),
-    do_not_specialize_on_alignment=("num_tokens",),
 )
 def gluon_softmax_topk_gfx950(
     logits_ptr,

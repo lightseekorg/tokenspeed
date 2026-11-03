@@ -51,6 +51,49 @@ class TestAutoBackendTopology:
 
         monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
 
+    @pytest.mark.parametrize("deterministic", [False, True])
+    @pytest.mark.parametrize("batch_invariant", [False, True])
+    def test_mhc_fusion_honors_deterministic_backend(
+        self, backend, monkeypatch, deterministic, batch_invariant
+    ):
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        monkeypatch.setitem(
+            global_server_args_dict, "force_deterministic_rsag", deterministic
+        )
+        monkeypatch.setitem(
+            global_server_args_dict, "batch_invariant_collectives", batch_invariant
+        )
+        args = (Mock(),) * 6 + (1e-6, (0, 1, 2, 3))
+        norm_weight = torch.empty(5120, dtype=torch.bfloat16)
+        supported = backend.supports_all_reduce_mhc_norm(args[0], norm_weight, args[7])
+        if deterministic or batch_invariant:
+            assert supported is False
+            backend._trtllm_ar.supports_all_reduce_mhc_norm.assert_not_called()
+            backend._trtllm_ar.all_reduce_mhc_norm.assert_not_called()
+        else:
+            assert (
+                supported
+                is backend._trtllm_ar.supports_all_reduce_mhc_norm.return_value
+            )
+            backend._trtllm_ar.supports_all_reduce_mhc_norm.assert_called_once_with(
+                args[0], norm_weight, args[7]
+            )
+            result = backend.all_reduce_mhc_norm(*args)
+            assert result is backend._trtllm_ar.all_reduce_mhc_norm.return_value
+            backend._trtllm_ar.all_reduce_mhc_norm.assert_called_once_with(*args)
+
+    def test_mhc_execution_error_propagates_without_fallback(self, backend):
+        backend._trtllm_ar.all_reduce_mhc_norm.side_effect = RuntimeError(
+            "kernel failed"
+        )
+        with pytest.raises(RuntimeError, match="kernel failed"):
+            backend.all_reduce_mhc_norm(*(Mock(),) * 6, 1e-6, (0, 1))
+        backend._trtllm_ar.supports_all_reduce_mhc_norm.assert_not_called()
+        backend._nccl.all_reduce.assert_not_called()
+        backend._rsag.all_reduce.assert_not_called()
+        backend._iris.all_reduce.assert_not_called()
+
     def test_group_spans_nodes(self, backend):
         assert not backend._group_spans_nodes((0, 1, 2, 3))
         assert not backend._group_spans_nodes((4, 5, 6, 7))
@@ -218,6 +261,83 @@ class TestAutoBackendTopology:
         assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
         backend._iris.can_run.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("cdna5", "maps_world", "group", "expected"),
+        [
+            (True, True, tuple(range(8)), "iris"),
+            (True, False, tuple(range(8)), "nccl"),
+            (True, None, tuple(range(8)), "nccl"),
+            (False, True, tuple(range(8)), "nccl"),
+            (False, False, (0, 1, 2, 3), "nccl"),
+            (False, None, (0, 1, 2, 3), "iris"),
+        ],
+        ids=[
+            "gfx1250-mapped-world",
+            "gfx1250-unmapped-world",
+            "gfx1250-undecided",
+            "gfx950-across-nodes",
+            "unmapped-world-node-local",
+            "undecided-node-local",
+        ],
+    )
+    def test_all_reduce_uses_iris_only_where_the_heap_maps_the_group(
+        self, backend, monkeypatch, cdna5, maps_world, group, expected
+    ):
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto
+
+        monkeypatch.setattr(
+            auto,
+            "current_platform",
+            lambda: SimpleNamespace(is_amd=True, is_cdna5=cdna5),
+        )
+        # The verdict needs a process group spanning real hosts.
+        monkeypatch.setattr(backend, "_iris_maps_world", lambda: maps_world)
+        backend._iris.can_reduce_outputs.return_value = False
+        backend._iris.can_run.return_value = True
+        backend._iris.all_reduce.return_value = "iris"
+        backend._nccl.all_reduce.return_value = "nccl"
+
+        backend._iris.can_acquire_outputs.return_value = True
+        backend._iris.acquire_all_reduce_outputs.return_value = "iris"
+
+        assert backend.can_prepare_all_reduce_buffers(group, torch.bfloat16) is (
+            expected == "iris"
+        )
+        assert backend.all_reduce(torch.empty(1), group) == expected
+        # Producer-direct outputs create the heap on first use, and stay
+        # node-local even where Iris reduces across nodes.
+        acquires = expected == "iris" and group == (0, 1, 2, 3)
+        like = torch.empty(1)
+        assert backend.can_acquire_all_reduce_outputs(((1,),), like, group) is acquires
+        assert (
+            backend.acquire_all_reduce_outputs(((1,),), like, group) == "iris"
+        ) is acquires
+
+    def test_routing_off_amd_leaves_the_iris_module_unloaded(
+        self, backend, monkeypatch
+    ):
+        import sys
+
+        import tokenspeed_kernel.ops.communication.iris as kernel_iris
+
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto
+
+        monkeypatch.setattr(
+            auto,
+            "current_platform",
+            lambda: SimpleNamespace(is_amd=False, is_cdna5=False),
+        )
+        monkeypatch.delitem(sys.modules, kernel_iris.__name__)
+        backend._iris.can_reduce_outputs.return_value = False
+        backend._iris.can_run.return_value = True
+        backend._iris.all_reduce.return_value = "iris"
+        backend._nccl.all_reduce.return_value = "nccl"
+
+        # Node-local groups keep their path; groups spanning nodes stay on NCCL.
+        assert backend.all_reduce(torch.empty(1), (0, 1, 2, 3)) == "iris"
+        assert backend.all_reduce(torch.empty(1), tuple(range(8))) == "nccl"
+        assert kernel_iris.__name__ not in sys.modules
+
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
     import tokenspeed_kernel.ops.communication.fabric as fabric
@@ -272,8 +392,13 @@ def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
         fabric.group_has_fabric((0, 1))
 
 
-def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
+@pytest.mark.parametrize("amd", [True, False], ids=["amd", "not-amd"])
+def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch, amd):
+    import sys
+
     import tokenspeed_kernel.ops.communication.fabric as fabric
+    import tokenspeed_kernel.ops.communication.iris as kernel_iris
+    import tokenspeed_kernel.platform as kernel_platform
 
     import tokenspeed.runtime.execution.distributed_initializer as initializer
 
@@ -315,12 +440,26 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
         initializer.pg_manager, "get_process_group", lambda backend, group: "pg"
     )
     monkeypatch.setattr(fabric, "gather_fabric_map", lambda: events.append("fabric"))
+    monkeypatch.setattr(
+        kernel_platform, "current_platform", lambda: SimpleNamespace(is_amd=amd)
+    )
+    monkeypatch.setattr(
+        kernel_iris, "discover_iris_world", lambda: events.append("iris")
+    )
+    if not amd:
+        # NPU builds cannot import the Iris module, so it must stay unloaded.
+        monkeypatch.delitem(sys.modules, kernel_iris.__name__)
 
     initializer.DistributedInitializer.initialize(config)
 
     assert events[0] == "distributed"
-    assert events[-1] == "fabric"
-    assert events.count("fabric") == 1
+    if amd:
+        # Iris decides whether its heap maps the world once every group exists.
+        assert events[-2:] == ["fabric", "iris"]
+        assert events.count("fabric") == events.count("iris") == 1
+    else:
+        assert events[-1] == "fabric" and "iris" not in events
+        assert kernel_iris.__name__ not in sys.modules
 
 
 def get_open_port() -> int:

@@ -151,6 +151,36 @@ def worker_main(rank: int, world_size: int, port: int, attn_tp: int) -> None:
             moved = torch.cat([payload[:shift].flip(0), payload[: rows - shift]])
             all_reduce(moved, group)
             assert torch.equal(moved[shift:], full[: rows - shift]), shift
+
+        # The armed workspace folds the same bits (-0.0 as +0.0), chunked past capacity.
+        big, capacity = 512, 200
+        payload = ill_conditioned_payload(group.index(rank), len(group), big, device)
+        payload[:, :8] = -0.0
+        parts = [torch.empty_like(payload) for _ in mapping.world_group]
+        dist.all_gather(parts, payload, group=world_pg)
+        folded = torch.zeros(big, HIDDEN, dtype=torch.float32, device=device)
+        for peer in group:
+            folded += parts[peer].float()
+        expected = folded.to(torch.bfloat16)
+        if backend.trtllm_ar.configure_group(
+            rank=group.index(rank),
+            group=group,
+            max_token_num=capacity,
+            hidden_dim=HIDDEN,
+        ):
+            for row_count in (5, capacity, big):
+                folded_rows = backend.trtllm_ar.ordered_all_reduce(
+                    payload[:row_count].clone(), group
+                )
+                assert folded_rows is not None, row_count
+                assert torch.equal(
+                    folded_rows.view(torch.int16),
+                    expected[:row_count].view(torch.int16),
+                ), row_count
+            folded_rows = all_reduce(payload.clone(), group)
+            assert torch.equal(
+                folded_rows.view(torch.int16), expected.view(torch.int16)
+            )
     finally:
         dist.barrier()
         dist.destroy_process_group()

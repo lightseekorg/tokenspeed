@@ -188,7 +188,12 @@ def test_gdn_packed_prefixes_match_uniform_verify(state_dtype, replay):
     torch.testing.assert_close(actual[:, 3:4], want, atol=0, rtol=0)
 
 
-def test_packed_conv_stages_only_each_requests_prefix():
+@pytest.mark.parametrize("separate_output", [False, True])
+@pytest.mark.parametrize("save_replay", [False, True])
+@pytest.mark.parametrize("filler_rows", [0, 2])
+def test_packed_conv_stages_only_each_requests_prefix(
+    separate_output, save_replay, filler_rows
+):
     torch.manual_seed(25)
     batch, width, channels = 3, 4, 64
     original = torch.randn(batch, width, channels, dtype=torch.bfloat16, device="cuda")
@@ -208,10 +213,23 @@ def test_packed_conv_stages_only_each_requests_prefix():
         output_state_indices=destinations,
         parent_indices=None,
     ).transpose(1, 2)
-    selected = torch.tensor([0, 1, 2, 4, 0, 0], device="cuda")
+    selected = torch.tensor([0, 1, 2, 4] + [0] * filler_rows, device="cuda")
     packed = original.flatten(0, 1)[selected].clone()
+    raw_packed = packed.clone()
     packed_state = seed.clone()
     offsets = torch.tensor([0, 3, 4, 4], dtype=torch.int32, device="cuda")
+    output = torch.empty_like(packed) if separate_output else None
+    heads, first_channel = 4, 24
+    payload = torch.full(
+        (batch * width, channels - first_channel + 2 * heads),
+        float("nan"),
+        dtype=original.dtype,
+        device="cuda",
+    )
+    gates = tuple(
+        torch.randn(selected.numel(), heads, dtype=original.dtype, device="cuda")
+        for _ in range(2)
+    )
     actual = causal_conv1d_update(
         packed,
         packed_state,
@@ -221,6 +239,8 @@ def test_packed_conv_stages_only_each_requests_prefix():
         output_state_indices=destinations,
         parent_indices=None,
         query_start_loc=offsets,
+        out=output,
+        replay_payload=(payload, *gates) if save_replay else None,
     )
     torch.testing.assert_close(
         actual[:4], expected.flatten(0, 1)[selected[:4]], atol=0, rtol=0
@@ -234,6 +254,18 @@ def test_packed_conv_stages_only_each_requests_prefix():
         atol=0,
         rtol=0,
     )
+    if separate_output:
+        torch.testing.assert_close(packed, raw_packed, atol=0, rtol=0)
+    if save_replay:
+        expected_rows = torch.cat(
+            (
+                expected.flatten(0, 1)[selected[:4], first_channel:],
+                *(g[:4] for g in gates),
+            ),
+            dim=-1,
+        )
+        torch.testing.assert_close(payload[[0, 1, 2, 4]], expected_rows, atol=0, rtol=0)
+        assert payload[[3, 5, 6, 7, 8, 9, 10, 11]].isnan().all()
 
 
 def test_ple_packed_graph_replay_preserves_context_and_conv_windows():

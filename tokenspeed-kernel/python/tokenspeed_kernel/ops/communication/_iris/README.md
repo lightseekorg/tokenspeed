@@ -6,7 +6,8 @@ state. Allocate in the same order on participating ranks before graph capture;
 prepared capacities and addresses stay fixed.
 
 The first preparation sizes the shared heap. Later states allocate from that
-same fixed heap; Iris's allocator enforces capacity.
+same heap; the `torch` allocator enforces its capacity, while `vmem_chunked`
+rounds allocations up to powers of two and grows the heap on demand.
 
 - **State:** the persistent buffers and references needed by an operation.
 - **Epoch:** a GPU counter that distinguishes successive uses of synchronization
@@ -32,9 +33,17 @@ IDs cover different element ranges. Triton RSAG remains independent.
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
 `reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
-also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with
-model-specific head layouts, route packets, or normalization semantics stay in
-the model package, along with dispatch and capacities.
+also owns the width-parameterized RMSNorm/MXFP4 fusion, with a Lamport variant
+that shares the BF16 reduction's mailbox. Exchanges with model-specific head
+layouts, route packets, or normalization semantics stay in the model package,
+along with dispatch and capacities.
+
+Lamport reductions use data as the ready signal: peers push BF16 into
+mailboxes holding an empty marker (negative zero, so payloads send it as zero),
+and the receiver polls until no marker remains, restores the markers, and
+advances a three-stage counter. Fusions sharing the one-shot mailbox keep its
+per-512-element stage counters; the TP8 two-shot owns its mailboxes and
+counters.
 
 Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
@@ -50,6 +59,16 @@ from tokenspeed_kernel.ops.communication.iris import configure_iris
 configure_iris(heap_size=None, allocator_type="torch")
 ```
 
-`heap_size=None` sizes the heap automatically. `allocator_type=None` uses Iris's
-default (`torch` in the pinned version). Names pass through to Iris;
-`IRIS_ALLOCATOR` takes precedence. A live context cannot be reconfigured.
+`heap_size=None` sizes the heap automatically. `allocator_type=None` picks
+`vmem_chunked` when the world spans hosts and Iris's `torch` default otherwise.
+Names pass through to Iris; `IRIS_ALLOCATOR` takes precedence. A live context
+cannot be reconfigured.
+
+The heap spans the world. `discover_iris_world()`, called once during
+distributed initialization, decides whether one heap can map every rank: a
+world on one host can, and across hosts only gfx1250 with every GPU in one
+fabric domain. Hosts are told apart by boot id, and the hostnames Iris uses
+must group ranks the same way. Context creation refuses a world it cannot map.
+
+The heap is built on the caller's current GPU, not on Iris's rank % visible
+GPUs, so ranks may start past GPU 0.

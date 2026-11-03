@@ -469,6 +469,7 @@ if current_platform().is_amd:
         projection_rows: int,
         projection_scale: float,
         weights_independent: bool,
+        packed_up_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the split-K down projection and gated up projection launches.
 

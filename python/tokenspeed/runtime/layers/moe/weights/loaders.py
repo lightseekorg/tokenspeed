@@ -44,6 +44,7 @@ def copy_expert_shard(
     src: torch.Tensor,
     scale_dst: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     """Write one loaded expert shard into its destination buffer.
 
@@ -53,16 +54,24 @@ def copy_expert_shard(
         scale_dst: Destination view inside the block-scale buffer, or ``None``
             when the checkpoint values need no quantization.
         block_shape: ``(block_n, block_k)`` of one scale.
+        weight_copy: Optional destination copy for a backend weight layout,
+            applied after sharding and quantization.
     """
     if scale_dst is None or dst.dtype == src.dtype:
         src = preserve_e8m0_bytes_for_uint8_param(dst, src)
-        dst.copy_(src)
+        if weight_copy is None:
+            dst.copy_(src)
+        else:
+            weight_copy(dst, src)
         return
 
     quantized, scales = quantize_fp8(
         src.to(dst.device), granularity="block", block_size=block_shape
     )
-    dst.copy_(quantized)
+    if weight_copy is None:
+        dst.copy_(quantized)
+    else:
+        weight_copy(dst, quantized)
     scale_dst.copy_(scales)
 
 
@@ -95,6 +104,7 @@ def load_w13(
     load_up_proj_weight_first: bool = False,
     expert_scale: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     if shard_id not in {"w1", "w3", "w13"}:
         raise ValueError(f"Unexpected w13 shard_id: {shard_id}")
@@ -138,7 +148,7 @@ def load_w13(
             block_start,
             loaded_weight.shape[shard_dim],
         )
-    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape)
+    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape, weight_copy)
 
 
 def load_w2(
@@ -153,6 +163,7 @@ def load_w2(
     tp_size: int = 1,
     expert_scale: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     if not isinstance(expert_data, torch.Tensor) or not isinstance(
         loaded_weight, torch.Tensor
@@ -191,7 +202,7 @@ def load_w2(
             0,
             loaded_weight.shape[shard_dim],
         )
-    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape)
+    copy_expert_shard(dst, loaded_weight, scale_dst, block_shape, weight_copy)
 
 
 def get_shard_dim(param: torch.Tensor, shard_id: str, do_transpose: bool) -> int:
@@ -215,6 +226,7 @@ def load_model_weight(
     use_presharded_weights: bool,
     do_transpose: bool,
     tp_size: int = 1,
+    weight_copy: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
@@ -234,6 +246,7 @@ def load_model_weight(
             tp_size=tp_size,
             expert_scale=expert_scale,
             block_shape=block_shape,
+            weight_copy=weight_copy,
         )
     elif shard_id in {"w1", "w3", "w13"}:
         load_w13(
@@ -248,6 +261,7 @@ def load_model_weight(
             tp_size=tp_size,
             expert_scale=expert_scale,
             block_shape=block_shape,
+            weight_copy=weight_copy,
         )
     else:
         raise ValueError(f"Unknown shard_id: {shard_id}")

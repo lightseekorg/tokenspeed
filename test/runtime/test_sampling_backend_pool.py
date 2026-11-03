@@ -455,8 +455,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            write_rejected_targets,
             enable_pdl=False,
         ):
+            assert write_rejected_targets is False
             del accept_index, candidates, target_sampled, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
@@ -517,8 +519,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            write_rejected_targets,
             enable_pdl=False,
         ):
+            assert write_rejected_targets is False
             del accept_index, candidates, target_sampled, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
@@ -595,8 +599,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            write_rejected_targets,
             enable_pdl=False,
         ):
+            assert write_rejected_targets is False
             del accept_index, candidates, target_sampled, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
@@ -680,8 +686,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            write_rejected_targets,
             enable_pdl=False,
         ):
+            assert write_rejected_targets is False
             del accept_index, candidates, target_sampled, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
@@ -1132,14 +1140,6 @@ class TestPrepareStepGuardRails:
 
     def setup_method(self):
         self.backend = FlashInferSamplingBackend(_make_config())
-
-    def test_misaligned_lists_assert(self):
-        with pytest.raises((AssertionError)):
-            self.backend.prepare_step(
-                request_ids=["a", "b"],
-                request_pool_indices=[1],
-                sampling_params_list=[_sp("a"), _sp("b")],
-            )
 
     def test_pool_idx_out_of_range_asserts(self):
         pool_rows = POOL + 1

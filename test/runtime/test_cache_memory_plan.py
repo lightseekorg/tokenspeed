@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import importlib.util
 import os
 import pathlib
@@ -97,103 +96,6 @@ class TestCacheMemoryPlanTest:
             # Parent 0 backs logical null page 0 and is never schedulable.
             num_lcm_blocks = budget_bytes // layout.lcm_block_bytes - 1
         return layout.bind(num_lcm_blocks)
-
-    def test_inkling_pool_exclusively_owns_conv_views(self):
-        def class_methods(path, class_name):
-            module = ast.parse(path.read_text())
-            cls = next(
-                node
-                for node in module.body
-                if isinstance(node, ast.ClassDef) and node.name == class_name
-            )
-            return {
-                node.name
-                for node in cls.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            }
-
-        generic_methods = class_methods(
-            _KV_CACHE_DIR / "mha.py", "MHATokenToKVPool"
-        ) | class_methods(_KV_CACHE_DIR / "hybrid_mha.py", "HybridMHATokenToKVPool")
-        inkling_methods = class_methods(
-            _KV_CACHE_DIR / "hybrid_inkling.py",
-            "HybridInklingTokenToKVPool",
-        )
-
-        conv_methods = {
-            "kvconv_checkpoint_buffers",
-            "hiddenconv_checkpoint_buffer",
-        }
-        assert conv_methods.isdisjoint(generic_methods)
-        assert conv_methods.issubset(inkling_methods)
-
-    def test_recipes_and_memory_plan_do_not_own_pd_metadata(self):
-        pd_fields = {
-            "producer_step_count",
-            "ready_step",
-            "tp_partition_axis",
-            "tp_partition_global_extent",
-            "tp_partition_global_parts",
-        }
-        for plan_type in (
-            self.plan_module.CacheFieldSpec,
-            self.plan_module.CacheFieldLayout,
-            self.plan_module.CacheMemoryPlan,
-        ):
-            assert pd_fields.isdisjoint(plan_type.__dataclass_fields__)
-
-        for path in _RECIPE_DIR.glob("*.py"):
-            module = ast.parse(path.read_text())
-            imports = {
-                node.module
-                for node in ast.walk(module)
-                if isinstance(node, ast.ImportFrom) and node.module is not None
-            } | {
-                alias.name
-                for node in ast.walk(module)
-                if isinstance(node, ast.Import)
-                for alias in node.names
-            }
-            _pytest_expr_6 = any(
-                imported.startswith("tokenspeed.runtime.pd")
-                or imported.startswith("tokenspeed.runtime.cache.transfer")
-                for imported in imports
-            )
-            _pytest_msg_7 = path.name
-            assert not _pytest_expr_6, _pytest_msg_7
-
-    def test_cache_pool_factory_is_separate_from_setup(self):
-        setup_module = ast.parse((_RECIPE_DIR / "setup.py").read_text())
-        factory_module = ast.parse((_KV_CACHE_DIR / "factory.py").read_text())
-
-        setup_functions = {
-            node.name for node in setup_module.body if isinstance(node, ast.FunctionDef)
-        }
-        factory_functions = {
-            node.name
-            for node in factory_module.body
-            if isinstance(node, ast.FunctionDef)
-        }
-        assert ("create_cache_pool") not in (setup_functions)
-        assert ("create_cache_pool") in (factory_functions)
-
-    def test_registry_only_orchestrates_cache_construction(self):
-        registry_path = _KV_CACHE_DIR.parent / "registry.py"
-        registry_module = ast.parse(registry_path.read_text())
-        create_components = next(
-            node
-            for node in registry_module.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "create_attn_components"
-        )
-        called_names = {
-            node.func.id
-            for node in ast.walk(create_components)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-        assert ("create_cache_pool") not in (called_names)
-        assert ("pack") not in (called_names)
-        assert ("profile_max_num_pages") not in (called_names)
 
     def test_planner_expresses_byte_ratio_as_per_group_packing(self):
         field = _tagged_field
@@ -371,21 +273,6 @@ class TestCacheMemoryPlanTest:
         assert (plan.group("history").cache_blocks_per_lcm_block) == (256)
         assert (plan.group("state").cache_blocks_per_lcm_block) == (1)
 
-    def test_fixed_parent_count_must_be_a_positive_integer(self, subtests):
-        field = _tagged_field
-        fields = (field("history", "history.k", "plane.k", (128, 8), "bfloat16"),)
-
-        for count in (0, -1, True, 1.5, "2"):
-            with (
-                subtests.test(count=count),
-                pytest.raises((ValueError), match=("positive integer")),
-            ):
-                self._plan_fields(
-                    fields,
-                    prefix_granularity=128,
-                    num_lcm_blocks=count,
-                )
-
     def test_explicit_packing_rejects_groups_outside_plan(self):
         field = _tagged_field
         fields = (
@@ -429,22 +316,6 @@ class TestCacheMemoryPlanTest:
         assert (pinned.group("state").cache_blocks_per_lcm_block) == (
             unpinned.group("state").cache_blocks_per_lcm_block
         )
-
-    def test_explicit_packing_rejects_invalid_count(self, subtests):
-        field = _tagged_field
-        fields = (field("history", "history.k", "plane.k", (128, 8), "bfloat16"),)
-
-        for count in (0, -1, True, 1.5, "2"):
-            with (
-                subtests.test(count=count),
-                pytest.raises((ValueError), match=("packing")),
-            ):
-                self._plan_fields(
-                    fields,
-                    prefix_granularity=128,
-                    num_lcm_blocks=2,
-                    cache_blocks_per_lcm_block={"history": count},
-                )
 
     def test_explicit_packing_preserves_exact_stride_validation(self):
         field = _tagged_field

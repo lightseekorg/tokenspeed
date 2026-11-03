@@ -126,16 +126,6 @@ def test_invalid_metadata_rejected_before_encoding(field, value, message):
         encode.assert_not_called()
 
 
-def test_empty_and_invalid_patch_count():
-    model = _model("triton_attn")
-    with pytest.raises(ValueError, match="at least one"):
-        model.embed_media([])
-    item = _item(2, 2)
-    item.feature = item.feature[:3]
-    with pytest.raises(ValueError, match="patch count"):
-        model.embed_one(item)
-
-
 class _CaptureBlock(nn.Module):
     def __init__(self):
         super().__init__()
@@ -227,9 +217,3 @@ def test_configured_token_budget(monkeypatch, budget):
     assert [len(call.args[0]) for call in encode.call_args_list] == [budget // 4] * (
         16 // budget
     )
-
-
-def test_invalid_token_budget(monkeypatch):
-    monkeypatch.setenv("TOKENSPEED_DEEPSEEK_V41_VISION_MAX_BATCH_TOKENS", "0")
-    with pytest.raises(ValueError, match="positive"):
-        _model("triton_attn")

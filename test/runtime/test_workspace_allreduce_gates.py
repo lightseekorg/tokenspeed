@@ -35,7 +35,12 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the TRT-LLM workspace all-reduce is NVIDIA-only",
+)
 
 
 def _nvidia_cuda_available() -> bool:
@@ -62,7 +67,7 @@ class TestWorkspaceAllreduceGates(unittest.TestCase):
         with mock.patch.object(
             comm.dist, "get_process_group_ranks", return_value=[0, 1]
         ), mock.patch.dict(comm._workspace_managers, {(0, 1): manager}, clear=True):
-            return comm.trtllm_workspace_allreduce(tensor, mock.Mock())
+            return comm.trtllm_workspace_allreduce(tensor, mock.Mock(), fp32_acc=False)
 
     def test_fp32_payload_on_bf16_workspace_falls_back(self):
         tensor = torch.zeros(2, 256, dtype=torch.float32, device="cuda")

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cluster topology discovery from the launcher environment."""
+"""Launcher environment defaults and cluster topology discovery."""
 
 from __future__ import annotations
 
@@ -42,6 +42,55 @@ DIST_INIT_DEFAULT_PORT = 23456
 
 _BRACKET_RE = re.compile(r"\[([^\]]*)\]")
 _EPHEMERAL_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
+
+
+def set_pinned_allocator_default() -> None:
+    """Default large pinned buffers to exact sizes in fresh worker processes."""
+    # PyTorch reads the first defined variable in this order.
+    key = next(
+        (
+            name
+            for name in (
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "PYTORCH_HIP_ALLOC_CONF",
+                "PYTORCH_ALLOC_CONF",
+            )
+            if name in os.environ
+        ),
+        "PYTORCH_ALLOC_CONF",
+    )
+    config = os.environ.get(key, "").strip().rstrip(",")
+    if "pinned_max_round_threshold_mb" not in config:
+        default = "pinned_max_round_threshold_mb:1024"
+        os.environ[key] = f"{config},{default}" if config else default
+
+
+def set_rocm_tool_registration_default() -> None:
+    """Default ROCm worker processes to no profiler-tool registration with ROCr.
+
+    Once a profiler tool registers with ROCr -- PyTorch's kineto does on every
+    import -- ROCm 7.2 wraps each queue in an ``InterceptQueue`` whose staging
+    buffer holds 256 packets. A larger backlog that wraps the ring is copied
+    past that buffer and corrupts the host heap (fixed upstream after 7.2 by
+    ROCm/rocm-systems#4066). Serving builds such a backlog whenever the host
+    enqueues far ahead of a stalled stream, e.g. a forward that waits on a
+    large Host KV cache load, and then crashes inside the HIP runtime.
+
+    Unregistered, GPU profilers record no kernels. An explicit
+    ``HSA_TOOLS_DISABLE_REGISTER`` (``0`` keeps GPU profiling, and the bug) and
+    a tool attached at launch through ``ROCP_TOOL_LIBRARIES`` (``rocprofv3``)
+    are kept.
+    """
+    import torch
+
+    if not torch.version.hip:
+        return
+    if (
+        "HSA_TOOLS_DISABLE_REGISTER" in os.environ
+        or "ROCP_TOOL_LIBRARIES" in os.environ
+    ):
+        return
+    os.environ["HSA_TOOLS_DISABLE_REGISTER"] = "1"
 
 
 def _split_top_level(hostlist: str) -> list[str]:

@@ -27,8 +27,10 @@ import asyncio
 import pytest
 
 from tokenspeed.cli._proc import (
+    engine_argv,
     spawn_gateway,
     terminate_then_kill,
+    zmq_handshake_port,
 )
 
 
@@ -52,13 +54,10 @@ class _RecordingProcess:
         return self.returncode
 
 
-@pytest.mark.asyncio
-async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
-    """Single-worker mode: retries and circuit-breaker are disabled by default."""
-
+async def _gateway_command(monkeypatch, **kwargs) -> tuple:
     captured = {}
 
-    async def fake_exec(*cmd, **kwargs):
+    async def fake_exec(*cmd, **exec_kwargs):
         captured["cmd"] = cmd
 
         class _P:
@@ -68,10 +67,66 @@ async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
         return _P()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await spawn_gateway([], engine_host="127.0.0.1", engine_port=12345)
-    cmd = captured["cmd"]
+    await spawn_gateway(["--model", "/m"], **kwargs)
+    return captured["cmd"]
+
+
+def _value(cmd, flag):
+    return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+
+@pytest.mark.asyncio
+async def test_spawn_gateway_fronts_one_tokenspeed_zmq_worker(monkeypatch):
+    """Single-worker mode: one ipc:// TokenSpeed worker, with retries and the
+    circuit breaker off."""
+    cmd = await _gateway_command(
+        monkeypatch, worker_url="ipc:///tmp/smg-zmq/ts0.ipc", engine_count=1
+    )
+    assert cmd[1:4] == ("-m", "smg", "launch")
+    assert _value(cmd, "--worker-urls") == "ipc:///tmp/smg-zmq/ts0.ipc"
+    assert _value(cmd, "--backend") == "tokenspeed"
     assert "--disable-retries" in cmd
     assert "--disable-circuit-breaker" in cmd
+    # One engine is an ungrouped worker; the operator's args come last.
+    assert "--zmq-engine-count" not in cmd
+    assert cmd[-2:] == ("--model", "/m")
+
+
+@pytest.mark.asyncio
+async def test_spawn_gateway_awaits_every_attention_dp_rank(monkeypatch):
+    cmd = await _gateway_command(
+        monkeypatch, worker_url="ipc:///tmp/smg-zmq/ts0.ipc", engine_count=4
+    )
+    assert _value(cmd, "--zmq-engine-count") == "4"
+
+
+def test_handshake_port_matches_the_gateways_derivation():
+    # SMG's own pinned vectors for its derive_handshake_port.
+    assert zmq_handshake_port("ipc:///tmp/smg-zmq/ts0.ipc") == 25152
+    assert zmq_handshake_port("ipc:///tmp/smg-zmq/engine-31000") == 22714
+
+
+def test_engine_argv_dials_the_handshake_last(monkeypatch):
+    """The handshake flags come last, so they win over the operator's; a
+    follower node none of whose ranks registers gets none."""
+    monkeypatch.delenv("TS_SERVE_ENGINE_MODULE", raising=False)
+    argv = engine_argv(
+        ["--model", "/m", "--data-parallel-rpc-port", "30500"],
+        host="127.0.0.1",
+        port=31000,
+        handshake=("10.0.0.5", 23455),
+    )
+    assert argv[1:3] == ["-m", "tokenspeed.runtime.entrypoints.engine"]
+    assert argv[-6:] == [
+        "--data-parallel-address",
+        "10.0.0.5",
+        "--data-parallel-rpc-port",
+        "23455",
+        "--zmq-engine-index",
+        "0",
+    ]
+    follower = engine_argv(["--model", "/m"], host="0.0.0.0", port=8000, handshake=None)
+    assert follower[3:] == ["--host", "0.0.0.0", "--port", "8000", "--model", "/m"]
 
 
 @pytest.mark.asyncio

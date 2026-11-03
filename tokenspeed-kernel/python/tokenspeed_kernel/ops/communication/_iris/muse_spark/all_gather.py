@@ -23,7 +23,6 @@
 
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    _iris_drain_subgroup_vmem,
     _iris_peer_pointers,
     _iris_rendezvous,
 )
@@ -114,6 +113,7 @@ def iris_pull_allgather_moe_inputs(
     FLAG_ROWS: gl.constexpr,
     BLOCK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """All-gather packed MoE rows and restore their original token order.
 
@@ -134,7 +134,7 @@ def iris_pull_allgather_moe_inputs(
         )
         + 1
     )
-    _iris_drain_subgroup_vmem()
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     local_rows = gl.cdiv(rows, WORLD_SIZE)
@@ -174,7 +174,7 @@ def iris_pull_allgather_moe_inputs(
                 row * 32 + route_byte - 32,
                 valid & (route_byte >= 32) & (route_byte < 64),
             )
-    _iris_drain_subgroup_vmem()
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,

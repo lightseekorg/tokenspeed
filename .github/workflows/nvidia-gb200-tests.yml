@@ -8,6 +8,7 @@ on:
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
       - "tokenspeed-mla/**"
+      - "tokenspeed-engine/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/nvidia-gb200-tests.yml"
@@ -19,6 +20,7 @@ on:
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
       - "tokenspeed-mla/**"
+      - "tokenspeed-engine/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/nvidia-gb200-tests.yml"
@@ -30,7 +32,7 @@ permissions:
 
 concurrency:
   group: gb200-slurm-per-commit-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   scan:

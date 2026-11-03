@@ -38,6 +38,221 @@ _SCALE_BLOCK = gl.constexpr(128)
 
 
 @gluon.jit
+def _packed_weight_offsets(rows, columns, input_size):
+    offsets = (
+        (((rows // 16) * (input_size // 32) + columns // 32) * 2 + (columns % 32) // 16)
+        * 16
+        + rows % 16
+    ) * 16 + columns % 16
+    return gl.multiple_of(gl.max_contiguous(offsets, (1, 1, 16)), (1, 1, 16))
+
+
+@gluon.jit
+def _packed_stage1(
+    x_ptr,
+    weight_ptr,
+    scale_ptr,
+    out_ptr,
+    ids_ptr,
+    expert_start,
+    num_experts,
+    D,
+    I,
+    top_k,
+    stride_xm,
+    stride_xk,
+    stride_we,
+    stride_se,
+    stride_sn,
+    stride_sk,
+    stride_om,
+    stride_on,
+    stride_tit,
+    stride_tis,
+    SWIGLU_LIMIT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    blocks_n = gl.cdiv(I, BLOCK_N)
+    slot, block_n = pid // blocks_n, pid % blocks_n
+    token, route = slot // top_k, slot % top_k
+    expert = gl.load(ids_ptr + token * stride_tit + route * stride_tis) - expert_start
+    if (expert < 0) | (expert >= num_experts):
+        return
+
+    # Axes are wave, output row, and the wave's natural-order K segment.
+    # Keeping the wave axis in partial sums prevents cross-wave communication
+    # inside the K loop without retaining a full tile of FP32 accumulators.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 16], [1, 16, 4], [NUM_WARPS, 1, 1], [1, 2, 0]
+    )
+    partial_layout: gl.constexpr = gl.SliceLayout(2, layout)
+    n_layout: gl.constexpr = gl.SliceLayout(0, partial_layout)
+    wk_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    wave_k_layout: gl.constexpr = gl.SliceLayout(1, wk_layout)
+    k_layout: gl.constexpr = gl.SliceLayout(0, wk_layout)
+    wave_scale_layout: gl.constexpr = gl.SliceLayout(1, partial_layout)
+    wave_k = gl.arange(0, NUM_WARPS, layout=wave_k_layout)
+    wave_scale = gl.arange(0, NUM_WARPS, layout=wave_scale_layout)
+    local_k: gl.constexpr = BLOCK_K // NUM_WARPS
+    within_k = gl.arange(0, local_k, layout=k_layout)
+    rows = block_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
+    row_mask = rows < I
+    x_row = x_ptr + token.to(gl.int64) * stride_xm
+    expert_weight = weight_ptr + expert.to(gl.int64) * stride_we
+    expert_scale = scale_ptr + expert.to(gl.int64) * stride_se
+    gate_scale_row = (block_n * BLOCK_N) // 128
+    up_scale_row = (I + block_n * BLOCK_N) // 128
+    gate_partial = gl.zeros([NUM_WARPS, BLOCK_N], gl.float32, partial_layout)
+    up_partial = gl.zeros([NUM_WARPS, BLOCK_N], gl.float32, partial_layout)
+    for k0 in range(0, D, BLOCK_K):
+        columns = k0 + wave_k[:, None] * local_k + within_k[None, :]
+        k_mask = columns < D
+        activation = gl.load(x_row + columns * stride_xk, mask=k_mask, other=0.0).to(
+            gl.float32
+        )
+        # K128 per wave: one quantization block, independently of the CTA K.
+        scale_start = k0 + wave_scale * local_k
+        scale_k = (scale_start // 128).to(gl.int64) * stride_sk
+        gate_scale = gl.load(
+            expert_scale + gate_scale_row * stride_sn + scale_k,
+            mask=scale_start < D,
+            other=0.0,
+        )
+        up_scale = gl.load(
+            expert_scale + up_scale_row * stride_sn + scale_k,
+            mask=scale_start < D,
+            other=0.0,
+        )
+        mask = row_mask[None, :, None] & k_mask[:, None, :]
+        gate = gl.load(
+            expert_weight
+            + _packed_weight_offsets(rows[None, :, None], columns[:, None, :], D),
+            mask=mask,
+            other=0.0,
+        ).to(gl.float32)
+        up = gl.load(
+            expert_weight
+            + _packed_weight_offsets((I + rows)[None, :, None], columns[:, None, :], D),
+            mask=mask,
+            other=0.0,
+        ).to(gl.float32)
+        gate_partial += gl.sum(
+            gate * gate_scale[:, None, None] * activation[:, None, :], axis=2
+        )
+        up_partial += gl.sum(
+            up * up_scale[:, None, None] * activation[:, None, :], axis=2
+        )
+    gate = gl.sum(gate_partial, axis=0)
+    up = gl.sum(up_partial, axis=0)
+    if SWIGLU_LIMIT > 0.0:
+        gate = gl.minimum(gate, SWIGLU_LIMIT)
+        up = gl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+    value = gate * (1.0 / (1.0 + gl.exp(-gate))) * up
+    gl.store(
+        out_ptr + slot.to(gl.int64) * stride_om + rows * stride_on,
+        value.to(out_ptr.dtype.element_ty),
+        mask=row_mask,
+    )
+
+
+@gluon.jit
+def _packed_stage2(
+    inter_ptr,
+    weight_ptr,
+    scale_ptr,
+    out_ptr,
+    ids_ptr,
+    probabilities_ptr,
+    expert_start,
+    num_experts,
+    D,
+    I,
+    top_k,
+    stride_im,
+    stride_ik,
+    stride_we,
+    stride_se,
+    stride_sd,
+    stride_sk,
+    stride_om,
+    stride_od,
+    stride_tit,
+    stride_tis,
+    stride_twt,
+    stride_tws,
+    BLOCK_D: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    blocks_d = gl.cdiv(D, BLOCK_D)
+    token, block_d = pid // blocks_d, pid % blocks_d
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 16], [1, 16, 4], [NUM_WARPS, 1, 1], [1, 2, 0]
+    )
+    partial_layout: gl.constexpr = gl.SliceLayout(2, layout)
+    d_layout: gl.constexpr = gl.SliceLayout(0, partial_layout)
+    wk_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    wave_k_layout: gl.constexpr = gl.SliceLayout(1, wk_layout)
+    k_layout: gl.constexpr = gl.SliceLayout(0, wk_layout)
+    wave_scale_layout: gl.constexpr = gl.SliceLayout(1, partial_layout)
+    wave_k = gl.arange(0, NUM_WARPS, layout=wave_k_layout)
+    wave_scale = gl.arange(0, NUM_WARPS, layout=wave_scale_layout)
+    local_k: gl.constexpr = BLOCK_K // NUM_WARPS
+    within_k = gl.arange(0, local_k, layout=k_layout)
+    rows = block_d * BLOCK_D + gl.arange(0, BLOCK_D, layout=d_layout)
+    row_mask = rows < D
+    scale_d = (block_d * BLOCK_D) // 128
+    acc = gl.zeros([BLOCK_D], gl.float32, d_layout)
+    for slot in range(0, top_k):
+        expert = (
+            gl.load(ids_ptr + token * stride_tit + slot * stride_tis) - expert_start
+        )
+        valid = (expert >= 0) & (expert < num_experts)
+        probability = gl.load(
+            probabilities_ptr + token * stride_twt + slot * stride_tws
+        ).to(gl.float32)
+        probability = gl.where(valid, probability, 0.0)
+        inter_row = inter_ptr + (token * top_k + slot).to(gl.int64) * stride_im
+        expert_weight = weight_ptr + expert.to(gl.int64) * stride_we
+        expert_scale = scale_ptr + expert.to(gl.int64) * stride_se + scale_d * stride_sd
+        partial = gl.zeros([NUM_WARPS, BLOCK_D], gl.float32, partial_layout)
+        for k0 in range(0, I, BLOCK_K):
+            columns = k0 + wave_k[:, None] * local_k + within_k[None, :]
+            k_mask = columns < I
+            activation = gl.load(
+                inter_row + columns * stride_ik, mask=k_mask & valid, other=0.0
+            ).to(gl.float32)
+            # Each wave owns K64, so adjacent waves share a K128 scale.
+            scale_start = k0 + wave_scale * local_k
+            scale = gl.load(
+                expert_scale + (scale_start // 128).to(gl.int64) * stride_sk,
+                mask=(scale_start < I) & valid,
+                other=0.0,
+            )
+            weight = gl.load(
+                expert_weight
+                + _packed_weight_offsets(rows[None, :, None], columns[:, None, :], I),
+                mask=row_mask[None, :, None] & k_mask[:, None, :] & valid,
+                other=0.0,
+            ).to(gl.float32)
+            partial += gl.sum(
+                weight * scale[:, None, None] * activation[:, None, :], axis=2
+            )
+        # Reduce before weighting each route, retaining the original route order.
+        dot = gl.sum(partial, axis=0)
+        acc += probability * dot
+    gl.store(
+        out_ptr + token * stride_om + rows * stride_od,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=row_mask,
+    )
+
+
+@gluon.jit
 def _block_fp8_dequantize_kernel(
     weight_ptr,
     scale_ptr,
@@ -95,11 +310,40 @@ def _stage1_fp8_warp_gemv(
     stride_on,
     stride_tit,
     stride_tis,
+    PACKED_WEIGHTS: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
+    if PACKED_WEIGHTS:
+        _packed_stage1(
+            x_ptr,
+            w1_ptr,
+            w1_scale_ptr,
+            out_ptr,
+            topk_ids_ptr,
+            expert_start,
+            num_experts,
+            D,
+            I,
+            top_k,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_se,
+            stride_sn,
+            stride_sk,
+            stride_om,
+            stride_on,
+            stride_tit,
+            stride_tis,
+            SWIGLU_LIMIT,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_WARPS,
+        )
+        return
     pid = gl.program_id(0)
     num_pid_n = gl.cdiv(I, BLOCK_N)
     slot = pid // num_pid_n
@@ -154,8 +398,9 @@ def _stage1_fp8_warp_gemv(
             mask=k_mask,
             other=0.0,
         ).to(gl.float32)
-        gate = gl.load(gate_row + weight_k, mask=tile_mask, other=0.0).to(gl.float32)
-        up = gl.load(up_row + weight_k, mask=tile_mask, other=0.0).to(gl.float32)
+        gate_ptr, up_ptr = gate_row + weight_k, up_row + weight_k
+        gate = gl.load(gate_ptr, mask=tile_mask, other=0.0).to(gl.float32)
+        up = gl.load(up_ptr, mask=tile_mask, other=0.0).to(gl.float32)
         acc_gate += gl.sum(gate * gate_scale[None, :] * x[None, :], axis=1)
         acc_up += gl.sum(up * up_scale[None, :] * x[None, :], axis=1)
 
@@ -197,10 +442,41 @@ def _stage2_fp8_warp_gemv(
     stride_tis,
     stride_twt,
     stride_tws,
+    PACKED_WEIGHTS: gl.constexpr,
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
+    if PACKED_WEIGHTS:
+        _packed_stage2(
+            inter_ptr,
+            w2_ptr,
+            w2_scale_ptr,
+            out_ptr,
+            topk_ids_ptr,
+            topk_weights_ptr,
+            expert_start,
+            num_experts,
+            D,
+            I,
+            top_k,
+            stride_im,
+            stride_ik,
+            stride_we,
+            stride_se,
+            stride_sd,
+            stride_sk,
+            stride_om,
+            stride_od,
+            stride_tit,
+            stride_tis,
+            stride_twt,
+            stride_tws,
+            BLOCK_D,
+            BLOCK_K,
+            NUM_WARPS,
+        )
+        return
     pid = gl.program_id(0)
     num_pid_d = gl.cdiv(D, BLOCK_D)
     token = pid // num_pid_d
@@ -238,6 +514,7 @@ def _stage2_fp8_warp_gemv(
         for k0 in range(0, I, BLOCK_K):
             offs_k = k0 + gl.arange(0, BLOCK_K, layout=k_layout)
             k_mask = offs_k < I
+            scale_k = (offs_k // _SCALE_BLOCK).to(gl.int64) * stride_sk
             tile_mask = d_mask[:, None] & k_mask[None, :] & expert_valid
             activation = gl.load(
                 inter_row + offs_k * stride_ik,
@@ -245,12 +522,13 @@ def _stage2_fp8_warp_gemv(
                 other=0.0,
             ).to(gl.float32)
             scale = gl.load(
-                scale_row + (offs_k // _SCALE_BLOCK).to(gl.int64) * stride_sk,
+                scale_row + scale_k,
                 mask=k_mask & expert_valid,
                 other=0.0,
             ).to(gl.float32)
+            weight_ptr = weight_row + offs_k[None, :].to(gl.int64) * stride_wk
             weight = gl.load(
-                weight_row + offs_k[None, :].to(gl.int64) * stride_wk,
+                weight_ptr,
                 mask=tile_mask,
                 other=0.0,
             ).to(gl.float32)
@@ -317,6 +595,8 @@ def gluon_fp8_block_warp_decode_moe(
     swiglu_limit: float | None = None,
     expert_start: int = 0,
     expert_parallel: bool = False,
+    *,
+    packed_weights: bool,
 ) -> torch.Tensor:
     """Apply compact 128x128 block-E4M3 experts to a decode-shaped batch.
 
@@ -332,6 +612,7 @@ def gluon_fp8_block_warp_decode_moe(
         expert_start: First global expert ID owned by this rank. Routes outside
             the local expert range contribute zero for expert parallelism.
         expert_parallel: Whether top-k IDs span experts owned by multiple ranks.
+        packed_weights: Whether expert banks use the canonical N16/K32 layout.
 
     Returns:
         BF16 finalized states ``[tokens, hidden]``.
@@ -376,6 +657,8 @@ def gluon_fp8_block_warp_decode_moe(
         block_n, stage1_block_k, stage1_warps = 16, 512, 2
     if expert_parallel:
         block_n, stage1_block_k, stage1_warps = 32, 512, 4
+    if packed_weights:
+        block_n, stage1_block_k, stage1_warps = 16, 1024, 8
     stage1_grid = (num_tokens * top_k * triton.cdiv(intermediate_size, block_n),)
     _stage1_fp8_warp_gemv[stage1_grid](
         hidden_states,
@@ -400,6 +683,7 @@ def gluon_fp8_block_warp_decode_moe(
         intermediate.stride(1),
         topk_ids.stride(0),
         topk_ids.stride(1),
+        PACKED_WEIGHTS=packed_weights,
         SWIGLU_LIMIT=-1.0 if swiglu_limit is None else swiglu_limit,
         BLOCK_N=block_n,
         BLOCK_K=stage1_block_k,
@@ -432,6 +716,8 @@ def gluon_fp8_block_warp_decode_moe(
     else:
         block_d, stage2_warps = 8, 2
         stage2_block_k = 1024
+    if packed_weights:
+        block_d, stage2_block_k, stage2_warps = 16, 512, 8
     stage2_grid = (num_tokens * triton.cdiv(hidden_size, block_d),)
     _stage2_fp8_warp_gemv[stage2_grid](
         intermediate,
@@ -459,6 +745,7 @@ def gluon_fp8_block_warp_decode_moe(
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
+        PACKED_WEIGHTS=packed_weights,
         BLOCK_D=block_d,
         BLOCK_K=stage2_block_k,
         NUM_WARPS=stage2_warps,

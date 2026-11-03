@@ -12,9 +12,11 @@
   },
   "min_regression_absolute_us": 1.0,
   "case_files": [
+    "gfx950/glm53_flash/gemm.json",
     "gfx950/glm53_flash/kda.json",
     "gfx950/glm53_flash/dsa.json",
     "gfx950/glm53_flash/moe.json",
+    "gfx950/glm53_flash/residual.json",
     "gfx950/dsv41_flash/gemm.json",
     "gfx950/dsv41_flash/attention.json",
     "gfx950/dsv41_flash/moe.json",
@@ -30,7 +32,12 @@
     "gfx950/qwen38_flash/gemm.json",
     "gfx950/qwen38_flash/qsa.json",
     "gfx950/qwen38_flash/gdn.json",
-    "gfx950/beam/moe.json"
+    "gfx950/beam/moe.json",
+    "gfx950/muse_spark/gemm.json",
+    "gfx950/muse_spark/attention.json",
+    "gfx950/muse_spark/layernorm.json",
+    "gfx950/muse_spark/moe.json",
+    "gfx950/muse_spark/residual.json"
   ],
   "cases": []
 }

@@ -333,6 +333,14 @@ def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch, dty
     monkeypatch.setattr(
         comm, "reduce_scatter", lambda x, group: (x * len(group))[:4].contiguous()
     )
+
+    def exchange(receive, send, group):
+        head_owner = send.reshape(2, batch, 4, -1)[0]
+        receive.view(2, batch, 4, -1).copy_(
+            head_owner.unsqueeze(0).expand(2, -1, -1, -1)
+        )
+
+    monkeypatch.setattr(comm, "all_to_all_single", exchange)
     merged = comm.combine_attention_partials(
         output, lse, group=(0, 1), rank=0, sink=None, keep_all_heads=False
     )
@@ -860,7 +868,17 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("tied", [False, True])
-def test_global_index_candidate_merge_ties_and_empty_shards(monkeypatch, degree, tied):
+@pytest.mark.parametrize(
+    "offset_dtype,score_dtype",
+    [
+        (torch.int32, torch.float32),
+        (torch.int64, torch.float32),
+        (torch.int32, torch.float64),
+    ],
+)
+def test_global_index_candidate_merge_ties_and_empty_shards(
+    monkeypatch, degree, tied, offset_dtype, score_dtype
+):
     from tokenspeed.runtime.layers.attention.dcp import indexer
 
     offsets = torch.tensor([[9, 3, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32)
@@ -886,8 +904,22 @@ def test_global_index_candidate_merge_ties_and_empty_shards(monkeypatch, degree,
         for r in range(1, degree)
     ]
 
+    all_offsets = [part.to(offset_dtype) for part in all_offsets]
+    all_scores = [part.to(score_dtype) for part in all_scores]
+    offsets, scores = all_offsets[0], all_scores[0]
+
     def gather(x, group, dim):
-        return torch.cat(all_offsets if x.dtype == torch.int32 else all_scores, dim=dim)
+        if offset_dtype != torch.int32 or score_dtype != torch.float32:
+            return torch.cat(
+                all_offsets if x.dtype == offset_dtype else all_scores, dim=dim
+            )
+        return torch.cat(
+            [
+                torch.stack((ids, values.view(torch.int32)), dim=-1).flatten(1)
+                for ids, values in zip(all_offsets, all_scores)
+            ],
+            dim=dim,
+        )
 
     monkeypatch.setattr(indexer, "all_gather", gather)
     selected, counts = indexer.merge_index_candidates(

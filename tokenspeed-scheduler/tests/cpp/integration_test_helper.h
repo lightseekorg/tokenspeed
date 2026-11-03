@@ -62,6 +62,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -76,7 +77,7 @@ protected:
     }
 
     void SetUp() override {
-        config_ = MakeConfig();
+        config_ = WithHostPackingFromDevice(MakeConfig());
         scheduler_ = std::make_unique<Scheduler>(config_);
     }
 
@@ -142,25 +143,6 @@ protected:
         ExecutionEvent event;
         event.With(cache::LoadBackDone{.op_id = op_id});
         scheduler_->Advance(std::move(event));
-    }
-
-    // A pre-admission L3 prefetch finished with its first landed_pages prefix
-    // pages fetched.
-    void SendPrefetchDone(std::uint32_t op_id, std::int32_t landed_pages) {
-        ExecutionEvent event;
-        event.With(cache::PrefetchDone(op_id, landed_pages));
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const PrefetchBatch* FindPrefetch(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
-                if (const auto* prefetch = std::get_if<PrefetchBatch>(cache_op)) {
-                    return prefetch;
-                }
-            }
-        }
-        return nullptr;
     }
 
     // Send ExtendResult to the scheduler: the forward landed. `tokens` are

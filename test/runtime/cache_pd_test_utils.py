@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import prod
-from types import SimpleNamespace
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
@@ -37,8 +36,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheFieldPartition,
     CacheFieldTransferSpec,
-    CachePDBlockManifest,
-    CachePDGroupBlocks,
     CacheProducerSchedule,
     CacheTransferContract,
     CacheTransferSchema,
@@ -218,21 +215,3 @@ def producer_schedule(
     return CacheProducerSchedule(
         tuple(tuple(step_fields) for step_fields in fields_by_step)
     )
-
-
-def block_manifest(
-    *groups: tuple[str, tuple[int, ...]],
-    prefix: int = 0,
-    prompt: int = 2,
-    state_prefix_cached: bool = False,
-) -> CachePDBlockManifest:
-    return CachePDBlockManifest(
-        groups=tuple(CachePDGroupBlocks(*entry) for entry in groups),
-        prefix_len=prefix,
-        prompt_len=prompt,
-        state_prefix_cached=state_prefix_cached,
-    )
-
-
-def operation(tables: dict[str, np.ndarray], **attrs) -> SimpleNamespace:
-    return SimpleNamespace(block_tables_arrays=lambda: tables, **attrs)

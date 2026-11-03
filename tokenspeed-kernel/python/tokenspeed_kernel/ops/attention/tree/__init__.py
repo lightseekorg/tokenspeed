@@ -29,8 +29,9 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = ["tree_window_attention"]
 
-# Tree visibility is one 64-bit mask word per query row.
-MAX_TREE_SLOTS = 64
+# Tree visibility is up to two 64-bit mask words per query row; verify rows fit one.
+MAX_TREE_ROWS = 64
+MAX_TREE_SLOTS = 128
 
 
 def tree_window_attention(
@@ -45,18 +46,23 @@ def tree_window_attention(
     *,
     rows_per_req: int,
     window: int,
+    causal_prefix: bool,
     page_size: int,
     sm_scale: float,
 ) -> torch.Tensor:
     """Finish draft-tree attention from a causal prefix partial (cascade).
 
     Each request's last ``window`` keys are its tree window: query row ``r``
-    sees window key ``j`` when bit ``j`` of its mask is set, and every earlier
-    (prefix) key. The caller has run a causal ``q_len = rows_per_req`` decode
-    over the ``P`` prefix keys, so row ``r``'s partial covers keys
-    ``[0, P - rows_per_req + 1 + r)``; this attends the rest (the prefix tail
-    and the window) and merges it into that partial. A row whose partial covers
+    sees window key ``j`` when bit ``j % 64`` of its mask word ``j // 64`` is
+    set, and every earlier (prefix) key. The caller has run a causal
+    ``q_len = rows_per_req`` decode over the ``P`` prefix keys, so row ``r``'s
+    partial covers keys ``[0, P - rows_per_req + 1 + r)``; this attends the
+    rest (the prefix tail and the window) and merges it into that partial. A row whose partial covers
     no key ignores it.
+
+    Without ``causal_prefix`` each row was decoded alone, its partial covering
+    the prefix keys it sees (e.g. a sliding window frozen at the prefix end), so
+    this attends the window only.
 
     Args:
         q: ``[bs * rows_per_req, num_q_heads, key_dim]`` queries.
@@ -68,21 +74,25 @@ def tree_window_attention(
             ``key_dim - head_dim`` key channels are its rotary part).
         page_table: ``[bs, max_pages]`` int32 page ids; slot = page * page_size + offset.
         seq_lens: ``[bs]`` int32 keys per request, the window included (>= window).
-        mask: ``[bs * rows_per_req]`` int64 window visibility per query row.
+        mask: ``[bs * rows_per_req * cdiv(window, 64)]`` int64 window
+            visibility, each query row's words contiguous.
         prefix_out: ``[bs * rows_per_req, num_q_heads, head_dim]`` causal prefix output.
         prefix_lse: ``[bs * rows_per_req, num_q_heads]`` float32 base-2
             log-sum-exp of the prefix scores (scaled by ``sm_scale``).
         rows_per_req: query rows per request, at most 64.
-        window: tree window width in keys, at most 64.
+        window: tree window width in keys, at most 128.
+        causal_prefix: Whether the partial is the causal ``rows_per_req``
+            decode (else each row's covers its whole prefix).
         page_size: tokens per page.
         sm_scale: softmax scale applied to ``q . k``.
 
     Returns:
         ``[bs * rows_per_req, num_q_heads, head_dim]`` attention output in ``q.dtype``.
     """
-    if rows_per_req > MAX_TREE_SLOTS or window > MAX_TREE_SLOTS:
+    if rows_per_req > MAX_TREE_ROWS or window > MAX_TREE_SLOTS:
         raise ValueError(
-            f"{rows_per_req} rows over a {window}-key window; at most {MAX_TREE_SLOTS}"
+            f"{rows_per_req} rows over a {window}-key window; at most "
+            f"{MAX_TREE_ROWS} rows over {MAX_TREE_SLOTS} keys"
         )
     signature = format_signature(
         q=dense_tensor_format(q.dtype),
@@ -110,6 +120,7 @@ def tree_window_attention(
             prefix_lse,
             rows_per_req=rows_per_req,
             window=window,
+            causal_prefix=causal_prefix,
             page_size=page_size,
             sm_scale=sm_scale,
         )

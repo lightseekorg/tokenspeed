@@ -80,6 +80,7 @@ import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.cute_dsl as _gemm_cute_dsl
+import tokenspeed_kernel.ops.gemm.deepgemm as _gemm_deepgemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -189,6 +190,7 @@ _RELOAD_MODULES = [
     _gemm_reference,
     _gemm_cuda,
     _gemm_cute_dsl,
+    _gemm_deepgemm,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -306,6 +308,7 @@ def test_residual_family_exports_and_modes():
         "mhc_apply_pre",
         "mhc_apply_pre_quantize_fp8",
         "mhc_fused_hc",
+        "mhc_init",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -313,6 +316,7 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm",
         "post_norm_residual_pre_norm_bf16",
         "residual_gate_coefficients",
+        "try_mhc_shifted_post_pre_norm",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -326,9 +330,11 @@ def test_residual_family_exports_and_modes():
         "hyperconnection_mix",
         "mhc_apply_pre",
         *({"mhc_apply_pre_fp8_group32"} if Platform.get().is_amd else set()),
+        "mhc_init",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "mhc_shifted_post_pre_norm",
         "normalized_dot_gate",
     }
 
@@ -351,6 +357,9 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()
     expected_offsets = {
+        # Prefer packed FP8 experts over the overlapping block-FP8 Gluon plan.
+        "gluon_fp8_packed_ep1_precomputed_moe_apply": Priority.SPECIALIZED + 1,
+        "gluon_fp8_packed_ep4_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
         # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
@@ -435,20 +444,12 @@ def _is_hopper_plus(platform: PlatformInfo) -> bool:
     return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
 
 
-def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
-    return _is_hopper_plus(platform)
-
-
 def _is_hopper_plus_with_flashmla_prefill(platform: PlatformInfo) -> bool:
     return _is_hopper_plus(platform)
 
 
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
-
-
-def _is_nvidia_with_dsv4_cuda(platform: PlatformInfo) -> bool:
-    return platform.is_nvidia and _attention_cuda_dsv4.has_fused_qnorm_rope_kv_insert()
 
 
 def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
@@ -540,6 +541,375 @@ def _mm_mxfp8(m: int) -> torch.Tensor:
     )
 
 
+@pytest.mark.parametrize("platform_fixture", ["b200_platform", "b300_platform"])
+@pytest.mark.parametrize(
+    ("m", "layout", "out_dtype", "solution", "expected"),
+    [
+        (16, "contiguous", torch.bfloat16, None, "flashinfer_mm_fp8_blockscale"),
+        (
+            17,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            31,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            32,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            33,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            512,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (33, "contiguous", torch.float16, None, "flashinfer_mm_fp8_blockscale"),
+        (17, "contiguous", torch.float16, None, "triton_mm_fp8_blockscale"),
+        (16, "a_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (17, "a_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (17, "b_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (33, "a_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (33, "b_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (17, "out_rows", torch.bfloat16, None, "triton_mm_fp8_blockscale"),
+        (33, "out_rows", torch.bfloat16, None, "flashinfer_mm_fp8_blockscale"),
+        (
+            16,
+            "contiguous",
+            torch.bfloat16,
+            "trtllm_cutedsl",
+            "trtllm_cutedsl_mm_fp8_blockscale",
+        ),
+        (
+            33,
+            "contiguous",
+            torch.bfloat16,
+            "flashinfer",
+            "flashinfer_mm_fp8_blockscale",
+        ),
+        (33, "contiguous", torch.bfloat16, "triton", "triton_mm_fp8_blockscale"),
+    ],
+)
+def test_blackwell_block_fp8_auto_boundary(
+    platform_fixture,
+    m,
+    layout,
+    out_dtype,
+    solution,
+    expected,
+    request,
+    selected_kernel_spy,
+):
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(expected)
+    if expected_spec is None:
+        assert not _is_blackwell_plus(
+            host_platform
+        ), f"{expected!r} is not registered on {host_platform.device_name}"
+        pytest.skip(f"{expected!r} is not registered (optional backend missing)")
+    assert expected_spec.capability.satisfied_by(platform)
+    a = torch.empty((m * (2 if layout == "a_rows" else 1), 256), dtype=_fp8_dtype())
+    b = torch.empty((128 * (2 if layout == "b_rows" else 1), 256), dtype=_fp8_dtype())
+    out = torch.empty((m * (2 if layout == "out_rows" else 1), 128), dtype=out_dtype)
+    if layout == "a_rows":
+        a = a[::2]
+    if layout == "b_rows":
+        b = b[::2]
+    if layout == "out_rows":
+        out = out[::2]
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "gemm",
+        "mm",
+        expected,
+        lambda: None,
+    )
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        kernel_mm(
+            a,
+            b,
+            A_scales=torch.empty((m, 2), dtype=torch.float32),
+            B_scales=torch.empty((1, 2), dtype=torch.float32),
+            out_dtype=out_dtype,
+            out=out,
+            quant="mxfp8",
+            block_size=[128, 128],
+            solution=solution,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize(
+    ("operand", "large_m_fallback"),
+    [
+        ("a", "triton_mm_fp8_blockscale"),
+        ("b", "triton_mm_fp8_blockscale"),
+        ("a_scales", "flashinfer_mm_fp8_blockscale"),
+        ("b_scales", "flashinfer_mm_fp8_blockscale"),
+        ("out", "flashinfer_mm_fp8_blockscale"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("m", "solution"),
+    [(17, None), (33, None), (16, "trtllm_cutedsl"), (33, "trtllm_cutedsl")],
+)
+def test_block_fp8_unaligned_tensor_selection(
+    operand, large_m_fallback, m, solution, b200_platform, selected_kernel_spy
+):
+    """Offset views must not reach CuTe with unsupported pointer alignment."""
+    registry = KernelRegistry.get()
+    host_platform = Platform.get()
+    fallback = "triton_mm_fp8_blockscale" if m == 17 else large_m_fallback
+    if fallback is not None and registry.get_by_name(fallback) is None:
+        assert not _is_blackwell_plus(host_platform)
+        pytest.skip(f"{fallback!r} is not registered (optional backend missing)")
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_blackwell_plus, "blackwell-plus", "gemm", "mm", fallback, lambda: None
+    )
+    # K=128 makes both scale-layout normalizations no-ops, preserving offsets.
+    shapes = {
+        "a": (m, 128),
+        "b": (256, 128),
+        "a_scales": (m, 1),
+        "b_scales": (2, 1),
+        "out": (m, 256),
+    }
+    try:
+        Platform.override(b200_platform)
+        registry.clear_cache()
+        for offset in (16, 1):
+            tensors = {}
+            for name, shape in shapes.items():
+                dtype = _fp8_dtype() if name in ("a", "b") else torch.float32
+                if name == "out":
+                    dtype = torch.bfloat16
+                start = offset if name == operand else 0
+                storage = torch.empty(shape[0] * shape[1] + start, dtype=dtype)
+                tensors[name] = storage[start:].view(shape)
+            assert tensors[operand].is_contiguous()
+            assert (tensors[operand].data_ptr() % 16 == 0) == (offset == 16)
+            kwargs = dict(
+                A_scales=tensors["a_scales"],
+                B_scales=tensors["b_scales"],
+                out=tensors["out"],
+                out_dtype=torch.bfloat16,
+                quant="mxfp8",
+                block_size=[128, 128],
+                solution=solution,
+            )
+            if offset == 1 and solution is not None:
+                with pytest.raises(kernel_NoKernelFoundError):
+                    kernel_mm(tensors["a"], tensors["b"], **kwargs)
+            else:
+                kernel_mm(tensors["a"], tensors["b"], **kwargs)
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    aligned = (
+        "trtllm_cutedsl_mm_fp8_blockscale"
+        if m == 16
+        else "trtllm_cutedsl_mm_fp8_blockscale_large_m"
+    )
+    assert calls == ([aligned, fallback] if solution is None else [aligned])
+
+
+@pytest.mark.parametrize(
+    ("platform_fixture", "solution", "layout"),
+    [
+        ("b200_platform", "flashinfer", "a_rows"),
+        ("b200_platform", "flashinfer", "b_rows"),
+        ("b200_platform", "triton", "a_rows"),
+        ("b200_platform", "triton", "b_rows"),
+        ("h100_platform", "deepgemm", "a_rows"),
+        ("h100_platform", "deepgemm", "b_rows"),
+        ("h100_platform", "deepgemm", "out_rows"),
+        ("h100_platform", "deepgemm", "b_scales_rows"),
+    ],
+)
+def test_block_fp8_layout_rejected_before_launch(
+    platform_fixture,
+    solution,
+    layout,
+    request,
+    monkeypatch,
+):
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name(f"{solution}_mm_fp8_blockscale")
+    if spec is None:
+        native = {
+            "flashinfer": host_platform.is_blackwell,
+            "triton": host_platform.is_nvidia or host_platform.is_amd,
+            "deepgemm": host_platform.is_hopper,
+        }[solution]
+        assert not native
+        pytest.skip(f"{solution!r} is not registered (optional backend missing)")
+
+    def reject_launch(*args, **kwargs):
+        pytest.fail("Layout-incompatible kernel reached execution")
+
+    monkeypatch.setattr(SelectedKernel, "__call__", reject_launch)
+    a = torch.empty((66 if layout == "a_rows" else 33, 256), dtype=_fp8_dtype())
+    b = torch.empty((512 if layout == "b_rows" else 256, 256), dtype=_fp8_dtype())
+    out = torch.empty((66 if layout == "out_rows" else 33, 256), dtype=torch.bfloat16)
+    sb = torch.empty((4 if layout == "b_scales_rows" else 2, 2), dtype=torch.float32)
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        with pytest.raises(kernel_NoKernelFoundError):
+            kernel_mm(
+                a[::2] if layout == "a_rows" else a,
+                b[::2] if layout == "b_rows" else b,
+                A_scales=torch.empty((33, 2), dtype=torch.float32),
+                B_scales=sb[::2] if layout == "b_scales_rows" else sb,
+                out=out[::2] if layout == "out_rows" else out,
+                out_dtype=torch.bfloat16,
+                quant="mxfp8",
+                block_size=[128, 128],
+                solution=solution,
+            )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+def test_block_fp8_deepgemm_contiguous_layout(
+    h100_platform,
+    selected_kernel_spy,
+):
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected = "deepgemm_mm_fp8_blockscale"
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_hopper,
+        "hopper",
+        "gemm",
+        "mm",
+        expected,
+        lambda: None,
+    )
+    try:
+        Platform.override(h100_platform)
+        registry.clear_cache()
+        kernel_mm(
+            torch.empty((33, 256), dtype=_fp8_dtype()),
+            torch.empty((128, 256), dtype=_fp8_dtype()),
+            A_scales=torch.empty((33, 2), dtype=torch.float32),
+            B_scales=torch.empty((1, 2), dtype=torch.float32),
+            out=torch.empty((33, 128), dtype=torch.bfloat16),
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=[128, 128],
+            solution="deepgemm",
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["a_rows", "a_cols", "a_offset"])
+@pytest.mark.parametrize(
+    ("platform_fixture", "solution", "expected"),
+    [
+        ("b200_platform", "flashinfer", "flashinfer_mm_fp8_blockscale"),
+        ("b200_platform", "triton", "triton_mm_fp8_blockscale"),
+        ("b200_platform", "trtllm_cutedsl", "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+        ("h100_platform", "deepgemm", "deepgemm_mm_fp8_blockscale"),
+    ],
+)
+def test_block_fp8_online_quantization_layout(
+    input_dtype,
+    layout,
+    platform_fixture,
+    solution,
+    expected,
+    request,
+    monkeypatch,
+    selected_kernel_spy,
+):
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    if registry.get_by_name(expected) is None:
+        assert not _is_blackwell_plus(host_platform)
+        pytest.skip(f"{expected!r} is not registered (optional backend missing)")
+    if layout == "a_offset":
+        a = torch.empty(33 * 256 + 1, dtype=input_dtype)[1:].view(33, 256)
+    else:
+        a = torch.empty(
+            (66, 256) if layout == "a_rows" else (33, 512), dtype=input_dtype
+        )
+        a = a[::2] if layout == "a_rows" else a[:, ::2]
+    quantized = []
+
+    def fake_quantize(x, block_size, scale_encoding, *, enable_pdl, kernel_name):
+        assert x.data_ptr() % 16 != 0 if layout == "a_offset" else not x.is_contiguous()
+        assert block_size == [128, 128] and scale_encoding == "float32"
+        quantized.append(x)
+        return torch.empty(x.shape, dtype=_fp8_dtype()), torch.empty(
+            (33, 2), dtype=torch.float32
+        )
+
+    monkeypatch.setattr(_gemm_pkg, "_online_quantize_mxfp8", fake_quantize)
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_hopper if solution == "deepgemm" else _is_blackwell_plus,
+        "hopper" if solution == "deepgemm" else "blackwell-plus",
+        "gemm",
+        "mm",
+        expected,
+        lambda: None,
+    )
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        kernel_mm(
+            a,
+            torch.empty((128, 256), dtype=_fp8_dtype()),
+            B_scales=torch.empty((1, 2), dtype=torch.float32),
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=[128, 128],
+            solution=solution,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    assert calls == [expected]
+    assert len(quantized) == 1 and quantized[0] is a
+
+
 def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
     """True MXFP8: E4M3 operands with one UE8M0 scale byte per 32 K values."""
     a = torch.empty((m, k), dtype=_fp8_dtype())
@@ -553,6 +923,18 @@ def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
         B_scales=b_scales,
         out_dtype=torch.bfloat16,
         block_size=[1, 32],
+        quant="mxfp8",
+    )
+
+
+def _mm_fp32_blockscale(m: int, n: int, k: int, out_dtype: torch.dtype) -> torch.Tensor:
+    return kernel_mm(
+        torch.empty((m, k), dtype=_fp8_dtype()),
+        torch.empty((n, k), dtype=_fp8_dtype()),
+        A_scales=torch.empty((m, (k + 127) // 128), dtype=torch.float32),
+        B_scales=torch.empty(((n + 127) // 128, (k + 127) // 128), dtype=torch.float32),
+        out_dtype=out_dtype,
+        block_size=[128, 128],
         quant="mxfp8",
     )
 
@@ -612,6 +994,9 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
         ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", False, 64, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", False, 65, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", True, 4096, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", False, 8192, "gluon_mm_fp8_blockscale_largem_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
@@ -631,7 +1016,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(mi450_platform)
 
-    n, k = 128, 256
+    n, k = 128, 512
     a_dtype = torch.bfloat16 if online else _fp8_dtype()
     a = torch.empty((m, k), dtype=a_dtype)
     b = torch.empty((n, k), dtype=_fp8_dtype())
@@ -1667,150 +2052,6 @@ def _attention_dsv4_selected_i64() -> object:
         torch.empty((16,), dtype=torch.float32),
         512**-0.5,
     )
-
-
-def _attention_dsv4_paged_selected(with_extra: bool, heads: int) -> object:
-    q = torch.empty((2, heads, 512), dtype=torch.bfloat16)
-    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
-    swa_slots = torch.empty((2, 256), dtype=torch.int32)
-    swa_lens = torch.empty((2,), dtype=torch.int32)
-    attn_sink = torch.empty((heads,), dtype=torch.float32)
-    kwargs = {}
-    if with_extra:
-        kwargs = {
-            "extra_kv_cache": torch.empty((2, 64 * 584), dtype=torch.uint8),
-            "extra_slots": torch.empty((2, 1, 128), dtype=torch.int32),
-            "extra_lens": torch.empty((2,), dtype=torch.int32),
-            "extra_page_size": 64,
-        }
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=q,
-        swa_kv_cache=swa_cache,
-        swa_slots=swa_slots,
-        swa_lens=swa_lens,
-        swa_page_size=64,
-        attn_sink=attn_sink,
-        softmax_scale=512**-0.5,
-        **kwargs,
-    )
-
-
-def _attention_dsv4_paged_selected_swa_only() -> object:
-    return _attention_dsv4_paged_selected(with_extra=False, heads=16)
-
-
-def _attention_dsv4_paged_selected_pro_tp8() -> object:
-    tokens = 6
-    q = torch.empty((tokens, 16, 512), dtype=torch.bfloat16)
-    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
-    swa_slots = torch.empty((tokens, 128), dtype=torch.int32)
-    swa_lens = torch.empty((tokens,), dtype=torch.int32)
-    extra_cache = torch.empty((16, 64 * 584), dtype=torch.uint8)
-    extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
-    extra_lens = torch.empty((tokens,), dtype=torch.int32)
-    attn_sink = torch.empty((16,), dtype=torch.float32)
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=q,
-        swa_kv_cache=swa_cache,
-        swa_slots=swa_slots,
-        swa_lens=swa_lens,
-        swa_page_size=64,
-        attn_sink=attn_sink,
-        softmax_scale=512**-0.5,
-        extra_kv_cache=extra_cache,
-        extra_slots=extra_slots,
-        extra_lens=extra_lens,
-        extra_page_size=64,
-    )
-
-
-def _attention_dsv4_paged_selected_pro_tp8_i64() -> object:
-    tokens = 6
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
-        swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
-        swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
-        swa_lens=torch.empty((tokens,), dtype=torch.int32),
-        swa_page_size=64,
-        attn_sink=torch.empty((16,), dtype=torch.float32),
-        softmax_scale=512**-0.5,
-        extra_kv_cache=torch.empty((16, 64 * 584), dtype=torch.uint8),
-        extra_slots=torch.empty((tokens, 1024), dtype=torch.int32),
-        extra_lens=torch.empty((tokens,), dtype=torch.int64),
-        extra_page_size=64,
-    )
-
-
-def _attention_dsv4_swa_cache_insert() -> object:
-    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
-    kv = torch.empty((1, 512), dtype=torch.bfloat16)
-    cache = torch.empty((1, 64 * 584), dtype=torch.uint8)
-    slot_mapping = torch.zeros((1,), dtype=torch.int64)
-    positions = torch.zeros((1,), dtype=torch.int64)
-    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
-    q_out = torch.empty_like(q)
-    return _attention_dsv4_pkg.dsv4_swa_cache_insert(
-        q,
-        kv,
-        cache,
-        slot_mapping,
-        positions,
-        cos_sin_cache,
-        1e-6,
-        64,
-        q_out=q_out,
-        validate_positions=True,
-    )
-
-
-def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A runtime may skip only the redundant position check, not the insert."""
-    calls: list[dict[str, object]] = []
-
-    class _SelectedKernel:
-        name = "test_dsv4_swa_cache_insert"
-
-        def __call__(self, **kwargs):
-            calls.append(kwargs)
-
-    monkeypatch.setattr(
-        _attention_dsv4_pkg,
-        "select_kernel",
-        lambda *args, **kwargs: _SelectedKernel(),
-    )
-    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
-    kv = torch.empty((1, 512), dtype=torch.bfloat16)
-    cache = torch.empty((1, 584), dtype=torch.uint8)
-    slots = torch.zeros((1,), dtype=torch.int64)
-    positions = torch.ones((1,), dtype=torch.int64)
-    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
-
-    with pytest.raises(ValueError, match="positions entries must index"):
-        _attention_dsv4_pkg.dsv4_swa_cache_insert(
-            q,
-            kv,
-            cache,
-            slots,
-            positions,
-            cos_sin_cache,
-            1e-6,
-            1,
-            validate_positions=True,
-        )
-    _attention_dsv4_pkg.dsv4_swa_cache_insert(
-        q,
-        kv,
-        cache,
-        slots,
-        positions,
-        cos_sin_cache,
-        1e-6,
-        1,
-        validate_positions=False,
-    )
-    assert len(calls) == 1
 
 
 def _attention_dsa_decode_fp8_dense_rank128_q4(
@@ -4028,10 +4269,13 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
     assert plan["apply_kernel_name"] == kernel_name
 
 
-def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
+@pytest.mark.parametrize("ep_size,ispp", [(4, 4096), (8, 4096), (1, 512)])
+def test_gluon_mxfp4_a4w4_deferred_traits_select_matching_kernel(
     mi350_platform: PlatformInfo,
+    ep_size: int,
+    ispp: int,
 ) -> None:
-    """The deferred A4W4 route path is selected for EP4."""
+    """Both expert and tensor partitions retain deferred per-route outputs."""
     registry = KernelRegistry.get()
     kernel_name = "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
     if registry.get_by_name(kernel_name) is None:
@@ -4048,8 +4292,8 @@ def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
             requires_deferred_finalize=True,
             routing_mode="precomputed_topk",
             a2a_backend="none",
-            ep_size=4,
-            ispp=4096,
+            ep_size=ep_size,
+            ispp=ispp,
             internal_activation_dtype="mxfp4",
             with_bias=False,
             solution="gluon",
@@ -4067,6 +4311,7 @@ def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
 
     assert plan["apply_kernel_name"] == kernel_name
     assert plan["supports_prequantized_input"] is True
+    assert plan["deferred_output_is_token_order"] is True
 
 
 def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
@@ -5382,19 +5627,22 @@ _CASES = [
     ),
     *[
         _case(
-            _is_blackwell_sm100,
-            "blackwell-sm100",
+            _is_blackwell_plus,
+            "blackwell-plus",
             "gemm",
             "mm",
-            (
-                "triton_mm_fp8_blockscale"
-                if 17 <= m <= 32
-                else "flashinfer_mm_fp8_blockscale"
-            ),
+            expected,
             partial(_mm_mxfp8, m),
             id_suffix=f"fp8-rows-{m}",
         )
-        for m in (16, 17, 24, 32, 33)
+        for m, expected in (
+            (16, "flashinfer_mm_fp8_blockscale"),
+            (17, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (24, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (31, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (32, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (33, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+        )
     ],
     # Attention API x architecture golden cases.
     _case(
@@ -5413,33 +5661,6 @@ _CASES = [
         "gluon_dsv41_index_topk_gfx1250",
         partial(_attention_dsv41_index_topk, 32, None, 68),
     ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_gfx1250",
-        _attention_dsv4_paged_selected_pro_tp8,
-        id_suffix="pro-tp8",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_pro_tp8_i64,
-        id_suffix="pro-tp8-int64-metadata",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_gfx1250",
-        _attention_dsv4_paged_selected_swa_only,
-        id_suffix="swa-only",
-    ),
     *[
         _case(
             _is_hopper_plus_with_flashmla_prefill,
@@ -5449,23 +5670,6 @@ _CASES = [
             f"{solution}_dsv4_prefill",
             partial(_attention_dsv4_selected, width=640, heads=heads),
             id_suffix=f"heads{heads}",
-        )
-        for heads, solution in (
-            (16, "triton"),
-            (32, "triton"),
-            (64, "flashmla"),
-            (128, "flashmla"),
-        )
-    ],
-    *[
-        _case(
-            _is_hopper_plus_with_flashmla,
-            "hopper-plus",
-            "attention",
-            "dsv4_decode",
-            f"{solution}_dsv4_decode",
-            partial(_attention_dsv4_paged_selected, with_extra=True, heads=heads),
-            id_suffix=f"extra-segment-heads{heads}",
         )
         for heads, solution in (
             (16, "triton"),
@@ -5505,14 +5709,6 @@ _CASES = [
         "attn_merge_state",
         "cuda_attn_merge_state",
         _attention_merge_state,
-    ),
-    _case(
-        _is_nvidia_with_dsv4_cuda,
-        "hopper",
-        "attention",
-        "dsv4_swa_cache_insert",
-        "cuda_dsv4_swa_cache_insert",
-        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_blackwell_sm100,
@@ -5653,42 +5849,6 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_split_gfx950",
-        _attention_dsv4_paged_selected_pro_tp8,
-        id_suffix="pro-tp8",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_pro_tp8_i64,
-        id_suffix="pro-tp8-int64-metadata",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        partial(_attention_dsv4_paged_selected, with_extra=True, heads=16),
-        id_suffix="extra-segment",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_swa_only,
-        id_suffix="swa-only",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
         "dsv4_prefill",
         "gluon_dsv4_prefill_gfx950",
         partial(_attention_dsv4_selected, width=640, heads=16),
@@ -5738,14 +5898,6 @@ _CASES = [
         "gluon_dsv4_prefill_gfx1250",
         _attention_dsv4_selected_short,
         id_suffix="width128",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_swa_cache_insert",
-        "triton_dsv4_swa_cache_insert",
-        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_cdna4,
@@ -6502,9 +6654,26 @@ _CASES = [
         "cdna4",
         "gemm",
         "mm",
-        "triton_mm_fp8_blockscale",
+        "gluon_mm_fp8_blockscale_gfx950",
         lambda: _mm_mxfp8(4),
     ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "gemm",
+            "mm",
+            expected,
+            partial(_mm_fp32_blockscale, m, n, k, dtype),
+            id_suffix=f"fp32-blockscale-m{m}-n{n}-k{k}-{dtype}",
+        )
+        for m, n, k, dtype, expected in (
+            (17, 130, 3072, torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+            (896, 6144, 4096, torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+            (8192, 4096, 512, torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+            (4, 128, 512, torch.float16, "triton_mm_fp8_blockscale"),
+        )
+    ],
     # DeepSeek V4.1 MXFP8 projections on gfx950: the weight-streaming decode
     # kernel through 256 rows (ahead of the skinny kernel's 64-row range),
     # the large-tile kernel beyond, and from 64 rows on for 2**26-element
@@ -6611,18 +6780,18 @@ _CASES = [
             "cdna5",
             "moe",
             "topk",
-            "triton_sqrt_softplus_topk",
+            "gluon_sqrt_softplus_topk_gfx1250",
             partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
-        for tokens in (1, 2, 17)
+        for tokens in (1, 2, 17, 8192)
     ],
     _case(
         _is_cdna5,
         "cdna5",
         "moe",
         "topk",
-        "triton_sqrt_softplus_topk",
+        "gluon_sqrt_softplus_topk_gfx1250",
         _moe_topk_hash,
         id_suffix="hash",
     ),

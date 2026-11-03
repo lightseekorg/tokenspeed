@@ -34,8 +34,9 @@ namespace tokenspeed {
 // Why the scheduler finished a request on its own.
 enum class AbortReason : std::uint8_t {
     // A capacity retraction chose it and its KV image did not fit the host
-    // budgets (snapshot pool or blob slots), so its pages were freed by
-    // aborting it instead of imaging it (Scheduler::onImageDoesNotFit).
+    // budgets (snapshot pool, blob slots or Host L2), so its pages were freed
+    // by aborting it instead of imaging it (Scheduler::onImageDoesNotFit); or
+    // the debug knob's retraction was refused after publishing its pages.
     kImageDoesNotFit = 0,
 };
 
@@ -47,6 +48,8 @@ struct SchedulerAbort {
     std::string request_id;
     AbortReason reason{AbortReason::kImageDoesNotFit};
     std::string detail;
+
+    bool operator==(const SchedulerAbort&) const = default;
 };
 
 class ExecutionPlan {
@@ -95,9 +98,11 @@ public:
     std::optional<ForwardBatch> remote_prefill;
 
     // Requests the scheduler aborted while building this plan (none on most
-    // rounds): the last resort of a capacity retraction whose victim could
-    // not be imaged.
+    // rounds): the last resort of a retraction whose victim could not be
+    // imaged.
     std::vector<SchedulerAbort> aborts;
+
+    bool operator==(const ExecutionPlan&) const = default;
 
 private:
     std::vector<Operation> operations_;

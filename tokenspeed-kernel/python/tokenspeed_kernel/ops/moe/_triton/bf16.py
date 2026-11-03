@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.moe._triton.common import (
@@ -142,7 +144,6 @@ def _stage1_kernel(
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
     ROUND_GEMM_OUTPUTS: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -218,7 +219,7 @@ def _stage1_kernel(
                 + tl.arange(0, BLOCK_N)[None, :]
             )
             tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += tl.num_programs(0)
 
         problem_start += problem_tiles
 
@@ -235,7 +236,6 @@ def _stage2_kernel(
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -294,9 +294,53 @@ def _stage2_kernel(
                 + tl.arange(0, BLOCK_N)[None, :]
             )
             tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += tl.num_programs(0)
 
         problem_start += problem_tiles
+
+
+@dataclass(frozen=True)
+class _StageTiles:
+    """One route stage's launch: tile shape, pipeline depth and grid size."""
+
+    block_m: int
+    block_n: int
+    block_k: int
+    num_stages: int
+    num_warps: int
+    programs_per_sm: int
+
+
+def _hopper_tiles(
+    route_count: int, num_experts: int, hidden_size: int, intermediate_size: int
+) -> tuple[_StageTiles, _StageTiles]:
+    """Stage 1 and stage 2 tiles for SM90, measured on H200 with cold weights.
+
+    Measured on one TP8 rank of Beam's experts (256 experts, hidden 5120,
+    intermediate 320). The tiling changes neither a program's rows nor the K
+    accumulation order, so every choice gives bit-identical outputs. Up to
+    8 routes per local expert, short tiles with several programs per SM keep
+    more weight loads in flight; taller tiles take over as experts fill.
+    """
+    routes_per_expert = route_count / num_experts
+    gate_up_n = 64 if intermediate_size % 64 == 0 else 32
+    down_k = 64 if intermediate_size % 64 == 0 else 32
+    if routes_per_expert <= 8:
+        if intermediate_size % 128 == 0:
+            # 128-wide K slabs fit and still win for the down projection.
+            down = _StageTiles(16, 128, 128, 4, 8, 4)
+        else:
+            down = _StageTiles(16, 128, down_k, 4, 4, 4)
+        return _StageTiles(16, 32, 128, 6, 4, 2), down
+    if routes_per_expert < 32:
+        return (
+            _StageTiles(32, gate_up_n, 128, 3, 4, 2),
+            _StageTiles(32, 128, down_k, 3, 4, 4),
+        )
+    return (
+        _StageTiles(64, gate_up_n, 64, 3, 4, 2),
+        _StageTiles(64, 256 if hidden_size % 256 == 0 else 128, 32, 4, 4, 2),
+    )
 
 
 def _deep_pipeline(device: torch.device, block_m: int) -> bool:
@@ -321,12 +365,15 @@ def _route_outputs(
     situ_linear_beta: float | None,
     expert_start: int,
     round_intermediates: bool,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w13.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
     if num_tokens == 0:
+        if output is not None:
+            return output.view(0, top_k, hidden_size)
         return torch.empty((0, top_k, hidden_size), dtype=x.dtype, device=x.device)
 
     expert_route_ids, expert_counts = _routing(topk_ids, num_experts, expert_start)
@@ -335,29 +382,49 @@ def _route_outputs(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
     )
     # Invalid expert ids are absent from routing; zero their canonical rows.
-    route_output = torch.zeros(
-        (route_count, hidden_size), device=x.device, dtype=x.dtype
-    )
-    if intermediate_size % 128 == 0 and _deep_pipeline(x.device, 16):
-        # Cold B300: deep 16-row tiles win up to 32 routes (counted over every rank) per local expert.
-        block_m = 16 if route_count <= 32 * num_experts else 64
+    if output is None:
+        route_output = torch.zeros(
+            (route_count, hidden_size), device=x.device, dtype=x.dtype
+        )
     else:
-        block_m = 16 if num_tokens <= 16 else 64
-    stage1_block_n = 64 if intermediate_size % 64 == 0 else 32
-    stage2_block_n = 128
-    block_k = 64 if intermediate_size % 64 == 0 else 32
-    num_stages, num_warps, programs_per_sm = 3, 4 if block_m == 16 else 8, 1
-    if intermediate_size % 128 == 0 and _deep_pipeline(x.device, block_m):
-        # Wider K slabs keep cold decode weights in flight; K accumulation order is unchanged.
-        block_k, num_stages, num_warps, programs_per_sm = 128, 4, 8, 4
+        route_output = output.view(route_count, hidden_size)
+        route_output.zero_()
+    from tokenspeed_kernel.platform import current_platform
+
+    if current_platform().is_hopper:
+        stage1, stage2 = _hopper_tiles(
+            route_count, num_experts, hidden_size, intermediate_size
+        )
+    else:
+        if intermediate_size % 128 == 0 and _deep_pipeline(x.device, 16):
+            # Cold B300: deep 16-row tiles win up to 32 routes (counted over every rank) per local expert.
+            block_m = 16 if route_count <= 32 * num_experts else 64
+        else:
+            block_m = 16 if num_tokens <= 16 else 64
+        block_k = 64 if intermediate_size % 64 == 0 else 32
+        num_stages, num_warps, programs_per_sm = 3, 4 if block_m == 16 else 8, 1
+        if intermediate_size % 128 == 0 and _deep_pipeline(x.device, block_m):
+            # Wider K slabs keep cold decode weights in flight; K accumulation order is unchanged.
+            block_k, num_stages, num_warps, programs_per_sm = 128, 4, 8, 4
+        stage1 = _StageTiles(
+            block_m,
+            64 if intermediate_size % 64 == 0 else 32,
+            block_k,
+            num_stages,
+            num_warps,
+            programs_per_sm,
+        )
+        stage2 = _StageTiles(
+            block_m, 128, block_k, num_stages, num_warps, programs_per_sm
+        )
     num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     stage1_programs = min(
-        num_sms * programs_per_sm,
-        route_count * triton.cdiv(intermediate_size, stage1_block_n),
+        num_sms * stage1.programs_per_sm,
+        route_count * triton.cdiv(intermediate_size, stage1.block_n),
     )
     stage2_programs = min(
-        num_sms * programs_per_sm,
-        route_count * triton.cdiv(hidden_size, stage2_block_n),
+        num_sms * stage2.programs_per_sm,
+        route_count * triton.cdiv(hidden_size, stage2.block_n),
     )
     _stage1_kernel[(stage1_programs,)](
         x,
@@ -375,12 +442,11 @@ def _route_outputs(
         ACTIVATION=activation,
         HAS_LINEAR_BETA=situ_linear_beta is not None,
         ROUND_GEMM_OUTPUTS=round_intermediates,
-        NUM_PROGRAMS=stage1_programs,
-        BLOCK_M=block_m,
-        BLOCK_N=stage1_block_n,
-        BLOCK_K=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        BLOCK_M=stage1.block_m,
+        BLOCK_N=stage1.block_n,
+        BLOCK_K=stage1.block_k,
+        num_warps=stage1.num_warps,
+        num_stages=stage1.num_stages,
         enable_fp_fusion=not round_intermediates,
     )
     _stage2_kernel[(stage2_programs,)](
@@ -394,12 +460,11 @@ def _route_outputs(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
-        NUM_PROGRAMS=stage2_programs,
-        BLOCK_M=block_m,
-        BLOCK_N=stage2_block_n,
-        BLOCK_K=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        BLOCK_M=stage2.block_m,
+        BLOCK_N=stage2.block_n,
+        BLOCK_K=stage2.block_k,
+        num_warps=stage2.num_warps,
+        num_stages=stage2.num_stages,
     )
     return route_output.view(num_tokens, top_k, hidden_size)
 

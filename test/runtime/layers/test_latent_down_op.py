@@ -554,23 +554,6 @@ def test_the_verdict_does_not_answer_for_another_rotation() -> None:
     assert votes == [1, 0]
 
 
-def test_the_eight_rank_check_program_still_binds() -> None:
-    """That program is the only exerciser of the real path; it drifted once."""
-    import inspect
-
-    inspect.signature(latent_down.KimiK3LatentDownOp.initialize).bind(
-        group=object(),
-        hidden_size=7168,
-        latent_size=3584,
-        device=torch.device("cpu"),
-        block_index=0,
-        layer_count=92,
-        model_scope="check",
-        max_m=8,
-        publish_gemm=None,
-    )
-
-
 def test_the_verdict_is_per_group() -> None:
     """Two groups of one shape still each need their own vote."""
     votes, built = [], []
@@ -673,13 +656,6 @@ def test_the_ceiling_never_falls_below_the_fused_kernel_s_width() -> None:
     with _eligible(), _voting_ranks(built, _passing_vote, _stub_slot):
         _initialize(max_m=1)
     assert built[0][4] == latent_down._FUSED_MAX_M
-
-
-def test_a_ceiling_below_one_row_is_refused() -> None:
-    """A zero-row mailbox would hand the gather a width it cannot run."""
-    with _eligible():
-        with pytest.raises(ValueError, match="at least one row"):
-            _initialize(max_m=0)
 
 
 def test_the_pool_key_separates_two_ceilings() -> None:

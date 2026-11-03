@@ -1,68 +1,138 @@
 # Copyright (c) 2026 LightSeek Foundation
 #
-# msgpack wire format for the direct SMG <-> scheduler ZMQ path.
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
 #
-# The data plane carries the NATIVE tagged io_struct types (see io_struct):
-# a request frame decodes straight into ``TokenizedGenerateReqInput`` and a
-# per-step output is the slim ``BatchTokenIDOutSlim`` slice, so there is no
-# duplicate wire-struct layer to keep in sync. This module keeps only the
-# transport-level pieces of the contract:
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
 #
-#   * the single-byte request-type frame (ADD/ABORT) that lets the receiver
-#     dispatch without decoding the payload;
-#   * the map-encoded startup-handshake structs (HELLO/INIT/READY plus the
-#     engine's ready response), which match the frontend's
-#     ``rmp_serde::to_vec_named`` codec and must NOT be positional.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""The msgpack ZMQ wire's Python half.
+
+Requests and outputs are the native tagged io_struct types: a request frame
+decodes straight into ``TokenizedGenerateReqInput`` and a per-step output is
+the slim ``BatchTokenIDOutSlim`` slice. The sockets and the startup handshake
+are the Rust side's (``ts-client`` binds as the frontend, ``ts-host`` connects
+as the engine); Python encodes what the frontend submits, decodes what an
+engine rank hands its data plane, and builds the map-encoded ready response
+an engine registers with.
+"""
 
 from __future__ import annotations
+
+import functools
+import operator
 
 import msgspec
 
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
+    GetInternalStateReq,
+    GetInternalStateReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
+    IsSchedulerPausedReqInput,
+    IsSchedulerPausedReqOutput,
+    IsSleepingReqInput,
+    IsSleepingReqOutput,
     MsgpackDecoder,
+    PauseSchedulerReqInput,
+    PauseSchedulerReqOutput,
+    ProfileReq,
+    ProfileReqOutput,
+    RebalanceExpertsReqInput,
+    RebalanceExpertsReqOutput,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
+    ResumeSchedulerReqInput,
+    ResumeSchedulerReqOutput,
+    SetInternalStateReq,
+    SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightsFromMooncakeReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
 )
+from tokenspeed.runtime.multimodal.mrope_facts import mrope_facts
 
 # Single-byte request-type frame: sent as a raw ZMQ frame ahead of the msgpack
 # payload so the receiver can dispatch without decoding first.
 REQ_TYPE_ADD = b"\x00"
 REQ_TYPE_ABORT = b"\x01"
+REQ_TYPE_CONTROL = b"\x02"
+
+# The control operations a CONTROL message carries, as tagged structs, and
+# their replies, which share the output socket with the output batches (the
+# tag tells them apart). An engine answers each kind of operation in the
+# order it received them; the replies carry no request id.
+CONTROL_REQUESTS = (
+    FlushCacheReqInput,
+    PauseSchedulerReqInput,
+    ResumeSchedulerReqInput,
+    IsSchedulerPausedReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+    InitWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqInput,
+    UpdateWeightsFromMooncakeReqInput,
+    RebalanceExpertsReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    IsSleepingReqInput,
+    GetInternalStateReq,
+    SetInternalStateReq,
+    ProfileReq,
+)
+CONTROL_OUTPUTS = (
+    FlushCacheReqOutput,
+    PauseSchedulerReqOutput,
+    ResumeSchedulerReqOutput,
+    IsSchedulerPausedReqOutput,
+    UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromTensorReqOutput,
+    InitWeightsUpdateGroupReqOutput,
+    DestroyWeightsUpdateGroupReqOutput,
+    UpdateWeightsFromMooncakeReqOutput,
+    RebalanceExpertsReqOutput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqOutput,
+    IsSleepingReqOutput,
+    GetInternalStateReqOutput,
+    SetInternalStateReqOutput,
+    ProfileReqOutput,
+)
 
 
 # ----------------------------------------------------------------------------
-# Startup-handshake structs (SMG <-> engine), encoded as msgpack MAPS with named
-# keys (msgspec's default struct encoding), matching the Rust
-# `rmp_serde::to_vec_named` codec. Do NOT make these ``array_like``; only the
+# The engine's ready response, encoded as a msgpack MAP with named keys
+# (msgspec's default struct encoding), matching the frontend's
+# `rmp_serde::to_vec_named` codec. Do NOT make it ``array_like``; only the
 # request/output data-plane structs are positional tuples.
 # ----------------------------------------------------------------------------
-
-
-class WireReadyMessage(msgspec.Struct):
-    """Engine -> frontend handshake status frame (``status`` = HELLO | READY)."""
-
-    status: str | None = None
-    local: bool | None = None
-    headless: bool | None = None
-    parallel_config_hash: str | None = None
-
-
-class WireHandshakeAddresses(msgspec.Struct):
-    """Frontend-owned data-plane addresses delivered to the engine in INIT."""
-
-    inputs: list[str] = []
-    outputs: list[str] = []
-    coordinator_input: str | None = None
-    coordinator_output: str | None = None
-    frontend_stats_publish_address: str | None = None
-
-
-class WireHandshakeInitMessage(msgspec.Struct):
-    """Frontend -> engine INIT payload (sent in reply to HELLO)."""
-
-    addresses: WireHandshakeAddresses
-    # Opaque to the engine; decoded loosely so unknown keys are ignored.
-    parallel_config: dict = {}
 
 
 class WireEngineCoreReadyResponse(msgspec.Struct):
@@ -93,13 +163,35 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_events_config: dict | None = None
+    # The request types the engine takes and the field order of the
+    # positional structs it decodes and emits; the host fills both
+    # (``ts-wire``'s ``declare_scheduler`` / ``declare_encoder``).
+    request_types: list[str] = msgspec.field(default_factory=list)
+    positional_layouts: dict[str, list[str]] = msgspec.field(default_factory=dict)
+    # The engine's role, and where a prefill or encode engine's bootstrap
+    # server listens: the rendezvous a frontend puts on its requests.
+    disaggregation_mode: str | None = None
+    bootstrap_host: str | None = None
+    bootstrap_port: int | None = None
+    # Checkpoint facts a frontend computes multimodal items' MRoPE positions
+    # from (``multimodal/mrope_facts.py``'s ``mrope_facts``).
+    model_type: str | None = None
+    architectures: list[str] = msgspec.field(default_factory=list)
+    mrope_positions: bool | None = None
+    spatial_merge_size: int | None = None
+    image_token_id: int | None = None
+    video_token_id: int | None = None
 
 
 _ENC = msgspec.msgpack.Encoder()
 _DEC_ABORT = msgspec.msgpack.Decoder(list[str])
-_DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
 # Native tagged request decode, tensor/aux-frame aware for multimodal payloads.
 _DEC_ADD = MsgpackDecoder(TokenizedGenerateReqInput)
+# Tagged unions: the tag selects the struct.
+_DEC_CONTROL = msgspec.msgpack.Decoder(functools.reduce(operator.or_, CONTROL_REQUESTS))
+_DEC_CONTROL_OUTPUT = msgspec.msgpack.Decoder(
+    functools.reduce(operator.or_, CONTROL_OUTPUTS)
+)
 
 
 # SMG decodes the ready response's dtype into a fixed enum of these strings, so
@@ -144,25 +236,33 @@ def encode(obj: msgspec.Struct) -> bytes:
     return _ENC.encode(obj)
 
 
+def encode_control(obj: msgspec.Struct) -> bytes:
+    """Encode a control operation or its reply."""
+    if not isinstance(obj, CONTROL_REQUESTS + CONTROL_OUTPUTS):
+        raise TypeError(f"{type(obj).__name__} is not a control message")
+    return _ENC.encode(obj)
+
+
+def decode_control_output(payload: bytes):
+    """Decode a control reply from an engine's output socket."""
+    return _DEC_CONTROL_OUTPUT.decode(payload)
+
+
 def decode_abort(payload: bytes) -> list[str]:
     """Decode an ABORT payload (a msgpack array of request ids)."""
     return _DEC_ABORT.decode(payload)
 
 
-def decode_init(payload: bytes) -> WireHandshakeInitMessage:
-    return _DEC_INIT.decode(payload)
-
-
 def _finalize_generate_request(io: TokenizedGenerateReqInput) -> None:
-    """Run the request-materialization steps the in-process input processor
-    performs on the pickle-era path, which this transport bypasses.
+    """Run the request-materialization steps the frontend's input processor
+    performs for in-process requests, which this wire bypasses.
 
     ``resolve_seed`` derives a None seed deterministically from the rid so all
     TP/DP ranks agree on it; ``normalize`` fills the scheduler-required
     defaults (e.g. stop_strs). The frontend sends token ids and stop_token_ids
     (never stop strings), so no tokenizer is needed. ``verify(vocab_size)``
     is also part of that pipeline, but it needs vocab_size, which this pure
-    wire layer does not have; it runs in the transport (MsgpackRecvSocket).
+    wire layer does not have; the engine's admission checks the vocabulary.
     """
     sampling_params = io.sampling_params
     sampling_params.resolve_seed(io.rid)
@@ -197,4 +297,106 @@ def decode_request_frames(frames: list[bytes]) -> list:
         return [io]
     if type_byte == REQ_TYPE_ABORT:
         return [AbortReq(rid=rid) for rid in decode_abort(frames[1])]
+    if type_byte == REQ_TYPE_CONTROL:
+        return [_DEC_CONTROL.decode(frames[1])]
     raise ValueError(f"unknown msgpack request type byte: {type_byte!r}")
+
+
+def _tokenspeed_version() -> str:
+    try:
+        from tokenspeed.version import __version__
+
+        return __version__
+    except Exception:
+        return "unknown"
+
+
+def _model_facts(hf_config) -> dict:
+    """The ready response's checkpoint facts: what a frontend reads to
+    compute multimodal items' MRoPE positions."""
+    return {
+        "model_type": getattr(hf_config, "model_type", None),
+        "architectures": list(getattr(hf_config, "architectures", None) or []),
+        **mrope_facts(hf_config),
+    }
+
+
+def engine_ready_response(
+    *,
+    server_args,
+    model_config,
+    geometry,
+    multimodal_encoder_dtype,
+    world_size: int,
+    dp_size: int,
+    attn_tp_size: int,
+    dp_rank: int,
+    kv_cache_size_tokens: int,
+    bootstrap: tuple[str, int] | None,
+) -> WireEngineCoreReadyResponse:
+    """The ready response an engine rank registers with. The host declares
+    the request types and positional layouts on top.
+
+    Args:
+        server_args: The resolved server arguments.
+        model_config: The target model's config.
+        geometry: The scheduler's cache geometry.
+        multimodal_encoder_dtype: The vision tower's dtype, or None.
+        world_size: Ranks in the engine.
+        dp_size: Attention-DP ranks.
+        attn_tp_size: Attention-TP ranks.
+        dp_rank: This rank's attention-DP rank.
+        kv_cache_size_tokens: The tokens the cache admits.
+        bootstrap: A prefill engine's KV bootstrap server, ``(host, port)``;
+            None for the other roles.
+    """
+    host, port = bootstrap if bootstrap is not None else (None, None)
+    return WireEngineCoreReadyResponse(
+        max_model_len=model_config.context_len,
+        num_gpu_blocks=geometry.num_device_pages,
+        prefix_granularity=geometry.prefix_granularity,
+        dtype=wire_dtype(model_config.dtype),
+        multimodal_encoder_dtype=multimodal_encoder_dtype,
+        vllm_version=f"tokenspeed-{_tokenspeed_version()}",
+        world_size=world_size,
+        data_parallel_size=dp_size,
+        tensor_parallel_size=attn_tp_size,
+        decode_context_parallel_size=server_args.kv_parallel_size,
+        data_parallel_rank=dp_rank,
+        max_num_seqs=server_args.max_num_seqs,
+        # chunked_prefill_size=-1 means "disabled"; the wire field is a
+        # non-negative integer for the frontend, so clamp to 0 (= no cap).
+        max_num_batched_tokens=max(0, server_args.chunked_prefill_size),
+        instance_id=server_args.served_model_name or server_args.model,
+        kv_cache_size_tokens=kv_cache_size_tokens,
+        disaggregation_mode=server_args.disaggregation_mode,
+        bootstrap_host=host,
+        bootstrap_port=port,
+        **_model_facts(model_config.hf_config),
+    )
+
+
+def encode_ready_response(
+    *, server_args, hf_config, dtype, bootstrap: tuple[str, int]
+) -> WireEngineCoreReadyResponse:
+    """The ready response an EPD encode server's first rank registers with:
+    no scheduler, no KV cache. The host declares it an encoder.
+
+    Args:
+        server_args: The resolved server arguments.
+        hf_config: The checkpoint's config.
+        dtype: The vision tower's dtype.
+        bootstrap: The encode server's bootstrap server, ``(host, port)``,
+            which the prefill ranks ask for their embeddings.
+    """
+    host, port = bootstrap
+    return WireEngineCoreReadyResponse(
+        dtype=wire_dtype(dtype),
+        multimodal_encoder_dtype=wire_dtype(dtype),
+        vllm_version=f"tokenspeed-{_tokenspeed_version()}",
+        instance_id=server_args.served_model_name or server_args.model,
+        disaggregation_mode="encode",
+        bootstrap_host=host,
+        bootstrap_port=port,
+        **_model_facts(hf_config),
+    )

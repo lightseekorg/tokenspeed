@@ -74,6 +74,24 @@ class CommBackend(ABC):
         """Broadcast in place when prepared; otherwise let the caller fall back."""
         return False
 
+    def prepare_shard_exchange(
+        self, group: Group, channels: int, max_rows: int, dtype: torch.dtype
+    ) -> bool:
+        """Collectively prepare an even token/channel-shard exchange of
+        ``channels`` full width and up to ``max_rows`` rows per rank (see
+        ``try_shard_exchange``); False keeps the generic all-to-all."""
+        return False
+
+    def try_shard_exchange(
+        self, tensor: torch.Tensor, group: Group, inverse: bool
+    ) -> torch.Tensor | None:
+        """Run a prepared even shard exchange, or return None for the caller's
+        generic all-to-all. Forward: ``[M, K]`` (every channel shard of this
+        rank's rows) to ``[W * M, K / W]`` (this rank's shard of every rank's
+        rows, rank-major); inverse: back. Must decide identically on every
+        rank of ``group``."""
+        return None
+
     def prepare_projection(
         self, spec: "ProjectionSpec", scratch_pool: "WorkspacePool | None" = None
     ) -> "ProjectionWorkspace":
@@ -184,6 +202,20 @@ class CommBackend(ABC):
         if len(tensors) == 0:
             raise ValueError("all-reduce requires at least one tensor")
         return tuple(self.all_reduce(value, group, op=op) for value in tensors)
+
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        """Whether the prepared group can fuse the anticipated output spec of x."""
+        return False
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute admitted fusion; return residual/norm outputs or raise."""
+        raise NotImplementedError(
+            "This backend does not support mHC communication fusion"
+        )
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""

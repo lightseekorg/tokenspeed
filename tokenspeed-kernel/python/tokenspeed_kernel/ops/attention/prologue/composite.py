@@ -284,7 +284,7 @@ def _write_latent(
         "kv_convert": frozenset({False}),
         "rope_style": ROPE_STYLES,
         "sanitize": BOOLS,
-        "store": frozenset({True}),
+        "store": BOOLS,
     },
 )
 @register_kernel(

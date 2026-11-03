@@ -286,7 +286,7 @@ def ascend_bf16_precomputed_moe_apply(
         None,
         None,
         None,
-        topk_weights.to(hidden.dtype),
+        topk_weights,
         row_indices,
         ids,
         3,

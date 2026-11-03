@@ -99,7 +99,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
-        def forward(self, hidden, hashes, mask):
+        def forward(self, hidden, hashes, mask, *, query_shard=None):
+            assert query_shard is None
             events.append(("engram", self.layer_id))
             assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
@@ -111,12 +112,31 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
-        def forward(self, hidden, pre_mix, positions, image_mask, ctx):
+        def forward(
+            self,
+            hidden,
+            pre_mix,
+            positions,
+            image_mask,
+            ctx,
+            *,
+            pending_post,
+            allow_ffn_reduce_fusion,
+            capture_input,
+        ):
             events.append(("layer", self.layer_id))
+            assert allow_ffn_reduce_fusion == (
+                self.layer_id not in (19, 20) and self.layer_id < 36
+            )
             rows = v41._row_plan(self.layer_id, 20, ctx)
             assert rows.keep_rows is None and rows.source is rows.query
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
-            return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
+            return (
+                embeddings[:, None, :] + streams + 10 * self.layer_id,
+                pre_mix,
+                SimpleNamespace(finish=lambda residual: residual),
+                hidden.mean(dim=1) if capture_input else None,
+            )
 
     target = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(target)
@@ -404,6 +424,7 @@ def test_window_attention_matches_dense_reference():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        key_rows=None,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -481,11 +502,30 @@ def test_window_attention_kernel_matches_reference():
         swa_rope_cache=rotary.cos_sin_cache,
         swa_norm_weight=None,
         swa_norm_eps=config.rms_norm_eps,
+        key_rows=None,
     )
     actual = backend.forward_v41(q, swa, **kwargs)
     kv = backend._workspace(
         swa, positions, rotary.cos_sin_cache, None, config.rms_norm_eps
     )
+    current = dsv41.dspark_rows(
+        swa,
+        None,
+        None,
+        positions,
+        rotary.cos_sin_cache,
+        None,
+        None,
+        torch.empty_like(swa),
+    )
+    separate = torch.cat(
+        (
+            field[backend.selection.page, backend.selection.row],
+            current.reshape(batch, block, dim),
+        ),
+        dim=1,
+    )
+    torch.testing.assert_close(kv, separate, rtol=0, atol=0)
     expected = backend._reference_forward(q, kv, sink, dim**-0.5)
     # Both branches feed the kernel the very same quantized block rows.
     torch.testing.assert_close(
@@ -903,7 +943,6 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         _speculative_widths_explicit=False,
         attention_backend=None,
         drafter_attention_backend=None,
-        prefix_granularity=64,
         load_format="auto",
         disaggregation_mode="null",
         validate_tp_batch_invariant_weights=Mock(),

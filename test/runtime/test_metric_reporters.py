@@ -23,7 +23,6 @@
 import builtins
 import os
 import sys
-import time
 
 import pytest
 from prometheus_client import CollectorRegistry
@@ -37,13 +36,10 @@ from tokenspeed.runtime.metrics import reporter  # noqa: E402
 from tokenspeed.runtime.metrics.collector import (  # noqa: E402
     EngineMetrics,
     KVTransferMetrics,
-    RequestFinishStats,
-    RequestMetrics,
 )
 from tokenspeed.runtime.metrics.reporter import MetricFactory  # noqa: E402
 
 LABELS = {"model_name": "m", "app_key": "k"}
-MAX_MODEL_LEN = 100
 
 
 class Clock:
@@ -66,27 +62,6 @@ class ListSink:
         self.events.append(event)
 
 
-def test_external_output_preserves_weighted_observations():
-    sink = ListSink()
-    metrics = RequestMetrics(
-        LABELS,
-        max_model_len=MAX_MODEL_LEN,
-        enabled=True,
-        reporters=["external_reporter"],
-        event_sink=sink,
-    )
-    metrics.observe_time_to_first_token(0.25, stream=True)
-    metrics.observe_inter_token_latency(0.03, 3)
-    assert [(event.operation, event.value, event.weight) for event in sink.events] == [
-        ("observe", 0.25, 1),
-        ("observe", 0.01, 3),
-    ]
-    assert [event.labels for event in sink.events] == [
-        {**LABELS, "stream": "true"},
-        LABELS,
-    ]
-
-
 def test_plugin_only_does_not_load_prometheus(monkeypatch):
     original_import = builtins.__import__
 
@@ -97,108 +72,16 @@ def test_plugin_only_does_not_load_prometheus(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", reject_prometheus)
     sink = ListSink()
-    metrics = RequestMetrics(
+    metrics = EngineMetrics(
         LABELS,
-        max_model_len=MAX_MODEL_LEN,
         enabled=True,
         reporters=["test_reporter"],
         event_sink=sink,
     )
-    metrics.observe_time_to_first_token(0.25, stream=True)
+    metrics.observe_request_queue_time(0.25)
     assert [(e.metric, e.operation, e.value) for e in sink.events] == [
-        ("tokenspeed:time_to_first_token_seconds", "observe", 0.25)
+        ("tokenspeed:request_queue_time_seconds", "observe", 0.25)
     ]
-
-
-def test_dual_reporters_preserve_weighted_histogram():
-    registry = CollectorRegistry()
-    sink = ListSink()
-    metrics = RequestMetrics(
-        LABELS,
-        max_model_len=MAX_MODEL_LEN,
-        enabled=True,
-        reporters=["prometheus", "test_reporter"],
-        event_sink=sink,
-        registry=registry,
-    )
-    metrics.observe_inter_token_latency(0.030, 3)
-    metrics.observe_inter_token_latency(0.400, 4)
-    metrics.observe_scheduler_inter_token_latency(0.020, 2)
-    assert [(e.metric, e.value, e.weight) for e in sink.events] == [
-        ("tokenspeed:inter_token_latency_seconds", 0.01, 3),
-        ("tokenspeed:inter_token_latency_seconds", 0.1, 4),
-        ("tokenspeed:scheduler_inter_token_latency_seconds", 0.01, 2),
-    ]
-    name = "tokenspeed:inter_token_latency_seconds"
-    assert registry.get_sample_value(f"{name}_count", LABELS) == 7
-    assert registry.get_sample_value(f"{name}_sum", LABELS) == pytest.approx(0.43)
-    assert registry.get_sample_value(f"{name}_bucket", {**LABELS, "le": "0.01"}) == 3
-    metrics.observe_inter_token_latency(1.0, 0)
-    metrics.observe_scheduler_inter_token_latency(1.0, -1)
-    assert len(sink.events) == 3
-
-
-@pytest.mark.parametrize(
-    "reporters", [["test_reporter"], ["prometheus", "test_reporter"]]
-)
-def test_request_finish_keeps_counter_deltas_observations_and_labels(reporters):
-    sink = ListSink()
-    registry = CollectorRegistry()
-    labels = dict(LABELS)
-    metrics = RequestMetrics(
-        labels,
-        max_model_len=MAX_MODEL_LEN,
-        enabled=True,
-        reporters=reporters,
-        event_sink=sink,
-        registry=registry,
-    )
-    before = time.time_ns()
-    metrics.record_request_finish(
-        RequestFinishStats(20, 4, 0.8, 5, True, finish_reason="stop", stream=True)
-    )
-    after = time.time_ns()
-    labels["model_name"] = "mutated"
-    assert [(e.metric, e.operation, e.value, e.weight) for e in sink.events] == [
-        ("tokenspeed:prompt_tokens_total", "inc", 20, 1),
-        ("tokenspeed:generation_tokens_total", "inc", 4, 1),
-        ("tokenspeed:num_requests_total", "inc", 1, 1),
-        ("tokenspeed:prefix_cache_hits_total", "inc", 5, 1),
-        ("tokenspeed:request_success_total", "inc", 1, 1),
-        ("tokenspeed:e2e_request_latency_seconds", "observe", 0.8, 1),
-        ("tokenspeed:request_prompt_tokens", "observe", 20, 1),
-        ("tokenspeed:request_generation_tokens", "observe", 4, 1),
-        ("tokenspeed:request_time_per_output_token_seconds", "observe", 0.2, 1),
-    ]
-    stream_labels = {**LABELS, "stream": "true"}
-    finish_labels = {**stream_labels, "finish_reason": "stop"}
-    assert [event.labels for event in sink.events] == [
-        LABELS,
-        LABELS,
-        finish_labels,
-        LABELS,
-        finish_labels,
-        stream_labels,
-        stream_labels,
-        stream_labels,
-        LABELS,
-    ]
-    assert all(before <= e.timestamp_ns <= after for e in sink.events)
-    if "prometheus" in reporters:
-        for event in sink.events:
-            if event.operation == "inc":
-                assert (
-                    registry.get_sample_value(event.metric, event.labels) == event.value
-                )
-            else:
-                assert (
-                    registry.get_sample_value(f"{event.metric}_count", event.labels)
-                    == 1
-                )
-                assert (
-                    registry.get_sample_value(f"{event.metric}_sum", event.labels)
-                    == event.value
-                )
 
 
 @pytest.mark.parametrize(
@@ -404,36 +287,6 @@ def test_plugin_speculation_and_abort_counters():
     ]
 
 
-def test_aborted_zero_token_request_omits_success_and_tpot():
-    sink = ListSink()
-    metrics = RequestMetrics(
-        LABELS,
-        max_model_len=MAX_MODEL_LEN,
-        enabled=True,
-        reporters=["test_reporter"],
-        event_sink=sink,
-    )
-    metrics.record_request_finish(
-        RequestFinishStats(
-            20, 0, 0.4, 5, False, finish_reason="abort:capacity_abort", stream=False
-        )
-    )
-    assert [(e.metric, e.value) for e in sink.events] == [
-        ("tokenspeed:prompt_tokens_total", 20),
-        ("tokenspeed:generation_tokens_total", 0),
-        ("tokenspeed:num_requests_total", 1),
-        ("tokenspeed:prefix_cache_hits_total", 5),
-        ("tokenspeed:e2e_request_latency_seconds", 0.4),
-        ("tokenspeed:request_prompt_tokens", 20),
-        ("tokenspeed:request_generation_tokens", 0),
-    ]
-    assert sink.events[2].labels == {
-        **LABELS,
-        "finish_reason": "abort:capacity_abort",
-        "stream": "false",
-    }
-
-
 def test_transfer_reporters_preserve_dynamic_stage_labels():
     sink = ListSink()
     registry = CollectorRegistry()
@@ -477,14 +330,9 @@ def test_transfer_reporters_preserve_dynamic_stage_labels():
 def test_disabled_collectors_never_register_or_emit(reporters):
     sink = ListSink()
     registry = CollectorRegistry()
-    for cls, kwargs, call in (
-        (
-            RequestMetrics,
-            {"max_model_len": MAX_MODEL_LEN},
-            lambda m: m.observe_time_to_first_token(0.1, stream=True),
-        ),
-        (EngineMetrics, {}, lambda m: m.record_nan_abort()),
-        (KVTransferMetrics, {}, lambda m: m.record_kv_transfer_failure()),
+    for cls, call in (
+        (EngineMetrics, lambda m: m.record_nan_abort()),
+        (KVTransferMetrics, lambda m: m.record_kv_transfer_failure()),
     ):
         metrics = cls(
             LABELS,
@@ -492,7 +340,6 @@ def test_disabled_collectors_never_register_or_emit(reporters):
             reporters=reporters,
             event_sink=sink,
             registry=registry,
-            **kwargs,
         )
         call(metrics)
     assert list(registry.collect()) == []
@@ -501,33 +348,23 @@ def test_disabled_collectors_never_register_or_emit(reporters):
 
 def test_enabled_plugin_requires_a_sink():
     with pytest.raises(ValueError, match="sink"):
-        RequestMetrics(
-            LABELS,
-            max_model_len=MAX_MODEL_LEN,
-            enabled=True,
-            reporters=["test_reporter"],
-        )
-    RequestMetrics(
-        LABELS, max_model_len=MAX_MODEL_LEN, enabled=False, reporters=["test_reporter"]
-    )
+        EngineMetrics(LABELS, enabled=True, reporters=["test_reporter"])
+    EngineMetrics(LABELS, enabled=False, reporters=["test_reporter"])
 
 
 def test_prometheus_only_ignores_optional_plugin_sink():
     sink = ListSink()
     registry = CollectorRegistry()
-    metrics = RequestMetrics(
+    metrics = EngineMetrics(
         LABELS,
-        max_model_len=MAX_MODEL_LEN,
         enabled=True,
         reporters=["prometheus"],
         event_sink=sink,
         registry=registry,
     )
-    metrics.observe_time_to_first_token(0.2, stream=True)
+    metrics.observe_request_queue_time(0.2)
     assert sink.events == []
     assert (
-        registry.get_sample_value(
-            "tokenspeed:time_to_first_token_seconds_count", {**LABELS, "stream": "true"}
-        )
+        registry.get_sample_value("tokenspeed:request_queue_time_seconds_count", LABELS)
         == 1
     )
