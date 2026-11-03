@@ -1525,7 +1525,7 @@ TEST(CacheCoordinatorAdmissionTest, UnprovenStateCheckpointsLeadTheirOwnEpochSha
         CacheCoordinator coordinator =
             MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                             /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                            /*write_back_evictions=*/false);
+                            /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         coordinator.SetFrequentStateCheckpoints(frequent);
         const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1},
                                                                {2, 2, 2, 2},
@@ -1570,7 +1570,8 @@ TEST(CacheCoordinatorAdmissionTest, UnprovenStateCheckpointsLeadTheirOwnEpochSha
                 {.table = &tables[2]},
             };
             return coordinator
-                .Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt,
+                .Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
+                       /*copy_in_point=*/std::nullopt, std::nullopt,
                        /*evict_blocks_past_segments=*/false, /*session_id=*/{})
                 .has_value();
         };
@@ -1605,7 +1606,7 @@ TEST(CacheCoordinatorTrimTest, TrimUnprovenStateCheckpointsKeepsTheNewestDeepest
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     coordinator.SetFrequentStateCheckpoints(true);
     const std::vector<std::string> hashes =
         ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}, {6, 6, 6, 6}});
@@ -1669,7 +1670,7 @@ TEST(CacheCoordinatorTrimTest, AStateCheckpointIsPublishedAtItsPageDepth) {
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     coordinator.SetFrequentStateCheckpoints(true);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
     const std::uint64_t access_epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
@@ -1718,7 +1719,7 @@ TEST(CacheCoordinatorTrimTest, AStateKeyedByAnEarlierPageNeedsThatPagesKvOnTheDe
             MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                             /*snapshot_pool=*/nullptr,
                             /*stream_device_cache_to_host=*/false,
-                            /*write_back_evictions=*/false);
+                            /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         coordinator.SetFrequentStateCheckpoints(frequent);
         const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
         const std::uint64_t access_epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
@@ -1776,7 +1777,7 @@ TEST(CacheCoordinatorTrimTest, AStateKeyedByAnEarlierPageNeedsOnlyTheWindowOfASl
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     coordinator.SetFrequentStateCheckpoints(true);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     const std::uint64_t access_epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
@@ -1818,7 +1819,7 @@ TEST(CacheCoordinatorTrimTest, AProvenCheckpointIsImagedAsAnEndpoints) {
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     coordinator.SetFrequentStateCheckpoints(true);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -1854,9 +1855,9 @@ TEST(CacheCoordinatorTrimTest, AnUnprovenCheckpointHoldsNoStateForTheCoverCheck)
         {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, 4, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     for (const std::string& hash : hashes) {
         CacheBoundaryForGroup(coordinator, pool, hash, /*group_id=*/0, /*access_epoch=*/1, /*logical_block_index=*/0);
@@ -1962,7 +1963,7 @@ protected:
     BlockPool host_{32, {4, 1}};
     CacheCoordinator coordinator_ = MakeCoordinator(kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_,
                                                     /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                                    /*write_back_evictions=*/true);
+                                                    /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     // Declared after the coordinator, so released before the pools.
     std::vector<CacheBlockRef> held_;
 };
@@ -2108,9 +2109,9 @@ TEST(FrequentCheckpointPlanTest, ASelectedUnprovenCheckpointLetsItsOlderChainLea
             .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kFrequentPage},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, kFrequentPage, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, kFrequentPage, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     coordinator.SetFrequentStateCheckpoints(true);
     const auto publish = [&](const std::vector<std::int32_t>& tokens, CacheBoundaryKind state_kind) {
         std::vector<BlockTable> tables(2);
@@ -2170,9 +2171,10 @@ TEST(FrequentCheckpointPlanTest, ARunningRequestsDeepestUnprovenCheckpointLeaves
                 .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kFrequentPage},
             CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         };
-        CacheCoordinator coordinator = MakeCoordinator(specs, kFrequentPage, device, /*enable_l3_storage=*/false, &host,
-                                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                                       /*write_back_evictions=*/write_back);
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, kFrequentPage, device, /*enable_l3_storage=*/false, &host,
+                            /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                            /*write_back_evictions=*/write_back, /*checkpoint_retention_requests=*/0);
         coordinator.SetFrequentStateCheckpoints(true);
         const std::vector<std::int32_t> a_tokens = MakeTokens(16, 1);
         {

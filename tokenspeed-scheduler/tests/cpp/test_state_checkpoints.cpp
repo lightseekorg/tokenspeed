@@ -5323,8 +5323,9 @@ protected:
 // its established prompt end -- and then the second prompt's oldest, so its
 // shallowest checkpoints first. The second prompt's unproven checkpoints
 // thus outlive the older first prompt's prompt end, which without the mode
-// (nothing else to hold) stays already in 48 pages; the planner evicts them,
-// not the cap of eight.
+// (nothing else to hold) stays already in 49 pages, a running prompt holding
+// a copy-in block for its prompt end beside its tables; the planner evicts
+// them, not the cap of eight.
 TEST_F(FrequentStateCheckpointPressureSuite, UnprovenCheckpointsLeaveByTheirAccessEpochs) {
     const std::vector<std::int32_t> first = MakeTokens(34);
     const std::vector<std::int32_t> second = MakeTokens(34, 1000);
@@ -5342,7 +5343,7 @@ TEST_F(FrequentStateCheckpointPressureSuite, UnprovenCheckpointsLeaveByTheirAcce
         EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 0);
         return Probe("probe", Diverging(prompt, shared)).prefix_tokens;
     };
-    EXPECT_EQ(resume_after_three(/*frequent=*/false, 48, first, 34), 34) << "without the mode";
+    EXPECT_EQ(resume_after_three(/*frequent=*/false, 49, first, 34), 34) << "without the mode";
     for (const auto& [shared, checkpoint] :
          std::vector<std::pair<std::int32_t, std::int32_t>>{{13, 8}, {21, 16}, {29, 24}, {33, 32}, {34, 34}}) {
         SCOPED_TRACE(shared);
