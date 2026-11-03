@@ -40,13 +40,13 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5TextConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers import layernorm
+from tokenspeed.runtime.layers import mlp as gated_mlp
 from tokenspeed.runtime.layers.dense import fp8 as dense_fp8
 from tokenspeed.runtime.layers.dense import nvfp4 as dense_nvfp4
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
-from tokenspeed.runtime.models import qwen3_5_moe
 from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5LinearDecoderLayer,
@@ -330,7 +330,7 @@ def test_decoder_layer_hands_each_projection_its_own_quant(
     monkeypatch.setattr(layernorm, "add_rmsnorm", recording_add_rmsnorm)
     fp4_quantize = counting("nvfp4", dense_nvfp4.fp4_quantize)
     monkeypatch.setattr(dense_nvfp4, "fp4_quantize", fp4_quantize)
-    monkeypatch.setattr(qwen3_5_moe, "fp4_quantize", fp4_quantize)
+    monkeypatch.setattr(gated_mlp, "fp4_quantize", fp4_quantize)
     monkeypatch.setattr(
         dense_fp8, "quantize_fp8", counting("fp8", dense_fp8.quantize_fp8)
     )
