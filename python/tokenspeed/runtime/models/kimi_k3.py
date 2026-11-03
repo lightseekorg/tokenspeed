@@ -90,6 +90,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import multicast_backend_available
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
@@ -109,6 +110,8 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.forward_step import (
+    DecodeLadderArgs,
+    get_batch_sizes_to_capture,
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -157,7 +160,6 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import (
     Mxfp4Config,
     preprocess_mxfp4_checkpoint_weights,
 )
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.shared_expert_tp import (
     SharedExpertCommunication,
     initialize_shared_expert_group,
@@ -173,7 +175,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
-    _prepare_mla_kv_b_proj_weights,
+    absorb_mla_kv_b_proj,
 )
 from tokenspeed.runtime.models.kimi_k3_comm import (
     K3_SHARED_RS_MAX_TOKENS,
@@ -191,11 +193,9 @@ from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -203,6 +203,7 @@ from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoELayer
 
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.multimodal.encoder_cudagraph import (
@@ -694,7 +695,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
     ) -> bool:
         if self.qkv_parallel is not None:
             return False
-        projection = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        projection = self.fused_qkv_a_proj_with_mqa
         if projection is None:
             return False
         blocks, weight_a, weight_b, eps, scratch_a, scratch_b = args
@@ -838,6 +839,32 @@ def _apply_attn_res(
         num_valid_blocks=num_valid_blocks,
         block_write_idx=block_write_idx,
     )
+
+
+def _decode_verify_width() -> int:
+    """Token rows per request of every decode forward: the verify width under
+    speculative decoding, else 1."""
+    args = global_server_args_dict
+    if args["speculative_algorithm"]:
+        return int(args["speculative_num_draft_tokens"])
+    return 1
+
+
+def _decode_graph_rows() -> set[int]:
+    """Token rows of each decode graph the executor captures (its resolved batch
+    ladder); speculative verify runs the verify width per request."""
+    args = global_server_args_dict
+    per_request = _decode_verify_width()
+    ladder = get_batch_sizes_to_capture(
+        DecodeLadderArgs(
+            cudagraph_capture_sizes=args["cudagraph_capture_sizes"],
+            max_num_seqs=args["max_num_seqs"],
+            data_parallel_size=args["mapping"].attn.dp_size,
+            disable_cuda_graph_padding=args["disable_cuda_graph_padding"],
+            max_cudagraph_capture_size=args["max_cudagraph_capture_size"],
+        )
+    )
+    return {batch * per_request for batch in ladder}
 
 
 def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
@@ -2162,6 +2189,8 @@ class KimiLinearMoE(nn.Module):
             activation_situ_linear_beta=situ_linear_beta,
         )
         self.packed_input_projection_weight: torch.Tensor | None = None
+        # TP8 decode chain over Lamport mailboxes; bound by prepare_communication_runtime.
+        self.decode_moe: KimiK3DecodeMoELayer | None = None
 
         if mapping.attn.dp_size > 1:
             self.moe_alltoall = None
@@ -2594,7 +2623,9 @@ class KimiLinearMoE(nn.Module):
         if self.execution_plan.use_mega_moe:
             from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 
-            moe_runner = runner.get_runner(self.experts.plan, self.experts)
+            moe_runner = runner.get_runner(
+                self.experts.plan, self.experts, prequantized=True
+            )
             activation, scales, ids, weights = moe_runner.input_buffers(
                 num_tokens, max_tokens
             )
@@ -2823,6 +2854,14 @@ class KimiLinearMoE(nn.Module):
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
             return prefix_sum
+        if (
+            self.decode_moe is not None
+            and ctx is not None
+            and ctx.forward_mode.is_decode()
+            and not prefix_is_sharded
+            and num_tokens in self.decode_moe.owner.batches
+        ):
+            return self.decode_moe.run(hidden_states, prefix_sum)
 
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
@@ -3879,6 +3918,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
     """
 
     model_cls = KimiLinearModel
+    supports_aux_capture = True
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         shared_mlps = [
@@ -3931,10 +3971,112 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     moe_comm = moe.comm
         if moe_comm is not None:
             prepared = moe_comm.prepare(max_num_tokens) or prepared
+        prepared = self._prepare_decode_moe() or prepared
         return bool(shared_mlps) or prepared
+
+    def _prepare_decode_moe(self) -> bool:
+        """Bind the decode MoE chain where every MoE layer's execution plan allows it
+        and its kernels serve the layer; other layers keep their plan's path."""
+        config, args = self.config, global_server_args_dict
+        layers = [
+            layer
+            for layer in self.model.layers
+            if isinstance(layer, KimiLinearDecoderLayer) and layer.is_moe_layer
+        ]
+        moes = [layer.block_sparse_moe for layer in layers]
+        # A prefill-only role never decodes. The tail rotates three mailbox
+        # parities, which 3k + 1 MoE layers collide on.
+        if (
+            args["disaggregation_mode"] == "prefill"
+            or not moes
+            or len(moes) % 3 == 1
+            or not all(
+                isinstance(moe, KimiLinearMoE) and moe.execution_plan.decode_chain
+                for moe in moes
+            )
+        ):
+            return False
+        from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
+            BATCHES,
+            supports,
+        )
+
+        if not all(
+            # The chain reads narrowed latent shards, a routed norm and a local
+            # shared expert.
+            moe.routed_expert_down_proj.narrowed
+            and moe.routed_expert_up_proj.narrowed
+            and moe.routed_expert_norm is not None
+            and moe.shared_experts.shared_parallel is None
+            and supports(
+                tp_size=moe.mapping.moe.tp_size,
+                hidden_size=config.hidden_size,
+                latent_size=moe.routed_hidden,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_token,
+                num_groups=config.num_expert_group,
+                topk_groups=config.topk_group,
+                scoring_func=config.moe_router_activation_func,
+                linear_beta=config.activation_situ_linear_beta,
+                router_dtype=moe.gate.weight.dtype,
+                expert_dtype=moe.experts.plan["weight_dtype"],
+                pdl=pdl_enabled(),
+                batch_invariant=args["force_deterministic_rsag"]
+                or args["batch_invariant_collectives"],
+            )
+            for moe in moes
+        ):
+            return False
+        batches = tuple(sorted(_decode_graph_rows() & set(BATCHES)))
+        if not batches:
+            return False
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        group = pg_manager.get_device_process_group(self.mapping.moe.tp_ep_group)
+        if not multicast_backend_available(group):
+            return False
+        from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
+
+        beta, linear_beta = _situ_betas(self.config)
+        owner = KimiK3DecodeMoE(
+            group=group,
+            batches=batches,
+            verify_width=_decode_verify_width(),
+            moe_layers=len(layers),
+            beta=beta,
+            linear_beta=linear_beta,
+        )
+        for ordinal, layer in enumerate(layers):
+            moe = layer.block_sparse_moe
+            norm = moe.routed_expert_norm
+            moe.decode_moe = owner.layer(
+                ordinal=ordinal,
+                layer_idx=layer.layer_id,
+                router=moe.gate.weight,
+                correction_bias=moe.gate.e_score_correction_bias,
+                routed_scaling_factor=moe.routed_scaling_factor,
+                renormalize=self.config.moe_renormalize,
+                down_shard=moe.routed_expert_down_proj.weight,
+                shared_gate_up=moe.shared_experts.gate_up_proj.weight,
+                shared_down=moe.shared_experts.down_proj.weight,
+                w13=moe.experts.w13_weight,
+                w13_scale=moe.experts.w13_weight_scale,
+                w2=moe.experts.w2_weight,
+                w2_scale=moe.experts.w2_weight_scale,
+                norm_weight=norm.weight,
+                norm_eps=norm.variance_epsilon,
+                up_shard=moe.routed_expert_up_proj.weight,
+            )
+        logger.info(
+            f"K3 decode MoE chain bound to {len(layers)} layers for batches {batches}"
+        )
+        return True
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         selected = (
             [2, num_layers // 2, num_layers - 3]
@@ -3961,6 +4103,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         per-layer return has already accumulated the layer output into K3's
         prefix stream, matching vLLM's target-side capture contract.
         """
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
@@ -4267,7 +4410,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         With FP8_PB_WO checkpoints ``kv_b_proj.weight`` stays FP8 for the
         w8a8 prefill GEMM; the absorbed ``w_kc``/``w_vc`` copies follow the
         DeepSeek R1 precedent and block-dequantize to the activation dtype
-        (``DeepseekV3ForCausalLM.post_load_weights``). bf16 checkpoints (e.g.
+        (``absorb_mla_kv_b_proj``). bf16 checkpoints (e.g.
         moonshotai/Kimi-K3, whose MXFP4 config ignores ``self_attn.*``) skip
         the dequant. KDA layers have no ``kv_b_proj`` (not
         ``KimiLinearMLAAttention``) and are skipped.
@@ -4277,24 +4420,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
             if self_attn is None:
                 continue  # PPMissingLayer: another pipeline stage owns it
             if isinstance(self_attn, KimiLinearMLAAttention):
-                w = self_attn.kv_b_proj.weight
-                if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
-                        raise RuntimeError(
-                            "kv_b_proj.weight_scale_inv is required for block "
-                            "FP8 dequant of the absorbed MLA weights."
-                        )
-                    weight_block_size = (
-                        self_attn.kv_b_proj.quant_method.quant_config.weight_block_size
-                    )
-                    w = block_dequant(
-                        w,
-                        self_attn.kv_b_proj.weight_scale_inv,
-                        weight_block_size,
-                    ).to(torch.get_default_dtype())
-                self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                    w, self_attn
-                )
+                absorb_mla_kv_b_proj(self_attn)
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
                 merged = self_attn.qkvgb_proj
@@ -4486,11 +4612,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.vision is None:
             return {}
         return {"image_encoder": self.make_encoder_cudagraph_wrapper(mapping)}
-
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        return pad_input_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def multimodal_input_embeds(

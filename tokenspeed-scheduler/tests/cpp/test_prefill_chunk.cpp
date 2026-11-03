@@ -227,7 +227,7 @@ TEST(PrefillComputeTest, LargeTokenCountsDoNotOverflowIntegerArithmetic) {
 
 TEST(PrefillComputeTest, AHitStillFitsTheHardTokenBudgetWhenTimeBudgetIsTiny) {
     BlockPool pool(64, {1, 1, 1});
-    const CacheCoordinator coord = MakeCoordinator(ReplayableSpecs(), 4, pool, false, nullptr, nullptr, false);
+    const CacheCoordinator coord = MakeCoordinator(ReplayableSpecs(), 4, pool, false, nullptr, nullptr, false, false);
     const PrefillComputeConfig compute{.budget_ns = 1, .token_ns = 100, .pair_ns = 1, .request_ns = 0};
     EXPECT_EQ(PrefillChunkTokens(coord, 16, true, 100, 8, 0, compute, 0), 0);
     EXPECT_EQ(PrefillChunkTokens(coord, 16, true, 100, 16, 0, compute, 0), 8);

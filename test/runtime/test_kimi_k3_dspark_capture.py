@@ -24,6 +24,8 @@ def _make_model(num_layers: int = 8):
 class _CausalLM:
     """Minimal stand-in exposing set_dflash_layers_to_capture."""
 
+    supports_aux_capture = True
+    require_aux_capture = None  # replaced below
     set_dflash_layers_to_capture = None  # replaced below
 
     def __init__(self, model) -> None:
@@ -34,6 +36,7 @@ class _CausalLM:
 def _bind_setter():
     from tokenspeed.runtime.models.kimi_k3 import KimiLinearForCausalLM
 
+    _CausalLM.require_aux_capture = KimiLinearForCausalLM.require_aux_capture
     _CausalLM.set_dflash_layers_to_capture = (
         KimiLinearForCausalLM.set_dflash_layers_to_capture
     )

@@ -283,8 +283,7 @@ print("COMPLETED", flush=True)
 """
 
 
-@pytest.mark.parametrize("word", [0, 1, 2, 3])
-def test_the_gather_waits_for_every_word_of_a_fragment(word: int) -> None:
+def test_the_gather_waits_for_every_word_of_a_fragment() -> None:
     """A fragment missing any one word must not be treated as arrived."""
     import subprocess
     import sys
@@ -293,44 +292,57 @@ def test_the_gather_waits_for_every_word_of_a_fragment(word: int) -> None:
     from pathlib import Path
 
     with tempfile.TemporaryDirectory() as scratch:
-        marker = Path(scratch) / "reached-the-gather"
-        child = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                _WAITER.format(
-                    max_m=MAX_M,
-                    latent=LATENT,
-                    word=word,
-                    empty=DOWN_EMPTY,
-                    marker=str(marker),
-                ),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        # The marker separates the child's startup from the wait under test, so
-        # the window the gather is given need not cover import and compile time.
-        for _ in range(600):
-            if marker.exists() or child.poll() is not None:
-                break
-            time.sleep(0.1)
-        assert (
-            marker.exists() or child.poll() is not None
-        ), "the child never reached the gather"
+        markers = [Path(scratch) / f"reached-the-gather-{word}" for word in range(4)]
+        # One child per word, all at once, so their windows overlap.
+        children = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _WAITER.format(
+                        max_m=MAX_M,
+                        latent=LATENT,
+                        word=word,
+                        empty=DOWN_EMPTY,
+                        marker=str(marker),
+                    ),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for word, marker in enumerate(markers)
+        ]
         try:
-            out, err = child.communicate(timeout=6)
-        except subprocess.TimeoutExpired:
-            return  # still waiting on the missing word, which is the contract
+            # The markers keep import and compile time out of the window.
+            for _ in range(600):
+                if all(
+                    marker.exists() or child.poll() is not None
+                    for marker, child in zip(markers, children)
+                ):
+                    break
+                time.sleep(0.1)
+            deadline = time.monotonic() + 6
+            for word, (marker, child) in enumerate(zip(markers, children)):
+                assert (
+                    marker.exists() or child.poll() is not None
+                ), f"the child for word {word} never reached the gather"
+                # A floor, since a lapsed timeout raises before a finished child is read.
+                try:
+                    out, err = child.communicate(
+                        timeout=max(deadline - time.monotonic(), 0.5)
+                    )
+                except subprocess.TimeoutExpired:
+                    continue  # still waiting on the missing word, which is the contract
+                assert (
+                    "COMPLETED" not in out
+                ), f"the gather consumed a fragment whose word {word} had not arrived"
+                assert (
+                    child.returncode == 0
+                ), f"the waiter failed for another reason: {err[-2000:]}"
         finally:
-            child.kill()
-        assert (
-            "COMPLETED" not in out
-        ), f"the gather consumed a fragment whose word {word} had not arrived"
-        assert (
-            child.returncode == 0
-        ), f"the waiter failed for another reason: {err[-2000:]}"
+            for child in children:
+                child.kill()
 
 
 # Two mailboxes, two sentinels, one primitive: the words each spins on are the

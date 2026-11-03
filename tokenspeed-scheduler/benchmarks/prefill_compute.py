@@ -153,6 +153,21 @@ def plans(queue, compute, token_limit):
 
 
 def summarize(rank_costs):
+    """Summarize rank-local costs for synchronized prefill rounds.
+
+    Args:
+        rank_costs: One list of per-round costs in nanoseconds per rank.
+            Lists must contain nonnegative costs and at least one rank must
+            have positive cost in every round. Shorter lists are padded with
+            zero to represent idle ranks.
+
+    Returns:
+        A dict containing rounds (the longest rank schedule), critical_path_ms
+        (the sum of per-round maximum costs in milliseconds), compute_utilization
+        (total cost divided by rank count times the critical path), and
+        mean_round_max_over_mean (the mean across rounds of each round's maximum
+        cost divided by its mean cost across all ranks, including idle ranks).
+    """
     rounds = list(itertools.zip_longest(*rank_costs, fillvalue=0.0))
     critical = sum(max(row) for row in rounds)
     useful = sum(sum(row) for row in rounds)
@@ -168,6 +183,23 @@ def summarize(rank_costs):
 
 
 def nonnegative_fit(samples):
+    """Fit nonnegative coefficients for the prefill cost model.
+
+    Args:
+        samples: Rows of (query_tokens, cached_prefix_tokens, measured_ns),
+            with positive query lengths and measured durations.
+
+    Returns:
+        A tuple (weights, median_relative_error). Weights are
+        [token_ns, pair_ns, request_ns] for
+        token_ns*q + pair_ns*q*(c + (q+1)/2) + request_ns. The fit enumerates
+        subsets of the column-scaled least-squares design and selects the
+        nonnegative solution with the smallest residual. The error is the
+        median absolute prediction error divided by each measured duration.
+
+    Raises:
+        RuntimeError: The fitted cost has no length-dependent term.
+    """
     x = np.array([[q, q * (c + (q + 1) / 2), 1] for q, c, _ in samples], dtype=float)
     y = np.array([ns for _, _, ns in samples])
     scale = np.linalg.norm(x, axis=0)
@@ -190,6 +222,23 @@ def nonnegative_fit(samples):
 
 
 class CUDAAttention:
+    """Time an explicit-QKV MLA prefill kernel with reusable shape metadata.
+
+    Methods use (q, c) for query and cached-prefix token counts. Queries cover
+    positions [c, c+q), while keys and values cover [0, c+q).
+
+    Attributes:
+        torch: Lazily imported PyTorch module.
+        kernel: tokenspeed-kernel's tokenspeed_mla_prefill callable.
+        q: BF16 query buffer shaped (max_tokens, heads, qk_dim).
+        k: BF16 key buffer with the same shape as q.
+        v: BF16 value buffer shaped (max_tokens, heads, v_dim).
+        scale: Attention score multiplier, qk_dim**-0.5.
+        metadata: Maps (query_tokens, prefix_tokens) to CUDA int32 tensors
+            holding sequence lengths, cumulative KV lengths and cumulative
+            query lengths, prepared outside the timed kernel calls.
+    """
+
     def __init__(self, max_tokens, heads, qk_dim, v_dim, device):
         import torch
         from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
@@ -259,6 +308,23 @@ class CUDAAttention:
 
 
 def run_cuda(attention, schedules, iterations):
+    """Measure prefill schedules with one collective per synchronized round.
+
+    Args:
+        attention: CUDAAttention wrapper on this rank's CUDA device.
+        schedules: One ordered list of (query_tokens, prefix_tokens) per rank
+            in the initialized process group. Every rank receives the same
+            schedules; ranks with fewer rounds still join each all-reduce.
+        iterations: Positive number of trials after warming local shapes.
+
+    Returns:
+        Per-key medians across trials of summarize()'s metrics: rounds,
+        critical_path_ms, compute_utilization and mean_round_max_over_mean,
+        using gathered rank-local CUDA-event timings. Also includes wall_ms,
+        the median maximum rank elapsed time, including per-round all-reduces
+        and device synchronization but excluding warmup, the initial barrier,
+        scheduler planning and result gathering. All ranks receive the result.
+    """
     import torch
     import torch.distributed as dist
 

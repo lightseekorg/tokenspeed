@@ -2047,6 +2047,7 @@ def moe_plan(
         "apply_kernel": kernel,
         "input_dtype": input_dtype,
         "features": features,
+        "supports_valid_token_mask": "valid_token_mask" in apply_spec.features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "a2a_backend": a2a_backend,
@@ -2076,7 +2077,9 @@ def moe_plan(
     }
 
 
-def moe_process_weights(plan: dict, w: torch.nn.Module):
+def moe_process_weights(
+    plan: dict, w: torch.nn.Module, *, communication_initializer=None
+):
     """Process loaded MoE weights and prepare persistent communication storage.
 
     Args:
@@ -2085,6 +2088,9 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
             place to prepare solution-specific layouts and scales. DeepEP
             modules must declare hidden_size (the unquantized input width)
             and num_experts (the global expert count).
+        communication_initializer: Optional callback scheduler accepting a
+            zero-argument initializer. A managed allocator may defer it until
+            its weight region exits. None initializes immediately.
 
     Returns:
         The selected weight preprocessor's result, or None without one.
@@ -2105,7 +2111,8 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
         from tokenspeed_kernel.ops.communication.deep_ep import prepare_deepep_buffer
 
         hidden_size, num_experts = deepep_geometry
-        prepare_deepep_buffer(
+        initialize = functools.partial(
+            prepare_deepep_buffer,
             group=plan["process_group"],
             hidden_size=hidden_size,
             num_experts=num_experts,
@@ -2114,6 +2121,10 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
                 "deepep_low_latency_max_num_tokens_per_gpu"
             ],
         )
+        if communication_initializer is None:
+            initialize()
+        else:
+            communication_initializer(initialize)
     return result
 
 
@@ -2150,6 +2161,7 @@ def moe_apply(
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     routing_prepared: object | None = None,
     deferred_out: torch.Tensor | None = None,
+    valid_token_mask: torch.Tensor | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -2190,6 +2202,8 @@ def moe_apply(
         shared_out: Optional destination for the shared-expert down projection
             with shape [tokens, output_size]. Must be provided together with
             ``shared_input`` and ``shared_weight``.
+        valid_token_mask: Optional boolean live-row mask. The selected kernel
+            must declare this feature; shape/device mismatches are rejected.
         x_quantized: Optional ``x`` already quantized in the kernel's
             activation format, so the kernel skips its own quantize. Only
             forwarded when given; kernels that cannot consume it reject it.
@@ -2204,6 +2218,15 @@ def moe_apply(
     if deferred_out is not None and (do_finalize or not plan["supports_deferred_out"]):
         raise ValueError("selected MoE plan cannot write the supplied deferred output")
     data = x[0] if isinstance(x, tuple) else x
+    if valid_token_mask is not None:
+        if not plan["supports_valid_token_mask"]:
+            raise ValueError("Selected MoE kernel cannot consume a live-row mask")
+        if (
+            valid_token_mask.dtype != torch.bool
+            or valid_token_mask.shape != data.shape[:1]
+            or valid_token_mask.device != data.device
+        ):
+            raise ValueError("MoE live-row mask must match its input rows")
     kernel = plan["apply_kernel"]
     if "batch_invariant" in plan["features"] and data.dtype != plan["input_dtype"]:
         raise ValueError(
@@ -2235,6 +2258,8 @@ def moe_apply(
     if routing_prepared is not None:
         quantized_kwargs["routing_prepared"] = routing_prepared
     output_kwargs = {"deferred_out": deferred_out} if deferred_out is not None else {}
+    if valid_token_mask is not None:
+        output_kwargs["valid_token_mask"] = valid_token_mask
     return kernel(
         plan=plan,
         x=x,

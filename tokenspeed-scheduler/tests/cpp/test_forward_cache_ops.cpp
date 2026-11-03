@@ -482,7 +482,7 @@ SchedulerConfig MakeValidConfig() {
 // Every message naming a group must identify which one: a model mixes several.
 void ExpectRejectedNamingGroup(const SchedulerConfig& config, const std::string& group_id) {
     try {
-        config.Validate();
+        WithHostPackingFromDevice(config).Validate();
         FAIL() << "invalid config was accepted";
     } catch (const std::invalid_argument& error) {
         EXPECT_NE(std::string{error.what()}.find(group_id), std::string::npos) << error.what();
@@ -490,14 +490,31 @@ void ExpectRejectedNamingGroup(const SchedulerConfig& config, const std::string&
 }
 
 TEST(SchedulerConfigValidateTest, AcceptsAValidConfig) {
-    EXPECT_NO_THROW(MakeValidConfig().Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(MakeValidConfig()).Validate());
+}
+
+TEST(SchedulerConfigValidateTest, HostPackingIsExplicitAndMayDifferFromDevicePacking) {
+    auto config = MakeValidConfig();
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.host_group_packing = {3};
+    EXPECT_NO_THROW(config.Validate());
+    config.host_group_packing = {0};
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.host_group_packing = {3, 1};
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.cache_groups.front().shard_count = 2;
+    config.cache_groups.front().cache_blocks_per_lcm_block = 2;
+    config.host_group_packing = {3};
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.host_group_packing = {6};
+    EXPECT_NO_THROW(config.Validate());
 }
 
 TEST(SchedulerConfigValidateTest, RejectsNonPositiveGlobalP) {
     SchedulerConfig config = MakeValidConfig();
     for (const std::int32_t prefix_granularity : {0, -1}) {
         config.prefix_granularity = prefix_granularity;
-        EXPECT_THROW(config.Validate(), std::invalid_argument);
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
     }
 }
 
@@ -555,7 +572,7 @@ TEST(SchedulerConfigValidateTest, RejectsWindowOnNonSlidingGroupWithGroupId) {
     ExpectRejectedNamingGroup(config, "windowed");
 
     group.attn_kind = AttnKind::kSlidingWindow;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 }
 
 TEST(SchedulerConfigValidateTest, StateGroupHasNoTokenSpanAndNoChunkAlignmentRule) {
@@ -566,9 +583,9 @@ TEST(SchedulerConfigValidateTest, StateGroupHasNoTokenSpanAndNoChunkAlignmentRul
     config.cache_groups[0].attn_kind = AttnKind::kState;
     ExpectRejectedNamingGroup(config, "state");
     config.cache_groups[0].block_granularity = 0;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.max_scheduled_tokens = 1;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     // A full group still declares a positive span that divides P.
     config.cache_groups[0].attn_kind = AttnKind::kFull;
     ExpectRejectedNamingGroup(config, "state");
@@ -588,14 +605,14 @@ TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
     history.transfer_policy = CacheTransferPolicy::LatestSnapshot;
     ExpectRejectedNamingGroup(config, history.group_id);
     history.transfer_policy = CacheTransferPolicy::FullSuffix;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 
     // A State group is the mirror image.
     history.attn_kind = AttnKind::kState;
     history.block_granularity = 0;
     ExpectRejectedNamingGroup(config, history.group_id);
     history.transfer_policy = CacheTransferPolicy::LatestSnapshot;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 }
 
 TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingWindowGroup) {
@@ -605,7 +622,7 @@ TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingWindowGroup) {
     group.attn_kind = AttnKind::kSlidingWindow;
     group.sliding_window_tokens = 256;
     group.replayable = true;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 
     // Only a sliding-window group can be regenerated: a full group is
     // prefix-closed and shared, and a State group cannot slide at all.
@@ -630,17 +647,18 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     config.cache_groups.push_back(swa);
     // P = 128 = W: the hit chunk needs W plus max(W, P) = 256 tokens of budget.
     config.max_scheduled_tokens = 255;
-    EXPECT_THROW(config.Validate(), std::invalid_argument) << "a hit chunk needs replay plus a window or page";
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument)
+        << "a hit chunk needs replay plus a window or page";
     config.max_scheduled_tokens = 256;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     // A window smaller than the prefix page still needs replay plus a page:
     // W = 2 leaves 6 of an 8-token budget, which no page-aligned chunk fits.
     SchedulerConfig small = config;
     small.cache_groups[1].sliding_window_tokens = 2;
     small.max_scheduled_tokens = 129;
-    EXPECT_THROW(small.Validate(), std::invalid_argument);
+    EXPECT_THROW(WithHostPackingFromDevice(small).Validate(), std::invalid_argument);
     small.max_scheduled_tokens = 130;
-    EXPECT_NO_THROW(small.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(small).Validate());
 
     // A State group beside a replayable one adds no rule of its own: chunks
     // are cut by budget and the replay window alone.
@@ -651,7 +669,7 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     state.total_pages = config.device_allocator.total_pages;
     state.attn_kind = AttnKind::kState;
     with_state.cache_groups.push_back(state);
-    EXPECT_NO_THROW(with_state.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(with_state).Validate());
 
     // PD roles transfer a replayable group as any sliding window's retained
     // tail; the prefill role replays locally, the decode role never does.
@@ -662,7 +680,7 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
         SetTestSnapshotPool(pd);
-        EXPECT_NO_THROW(pd.Validate());
+        EXPECT_NO_THROW(WithHostPackingFromDevice(pd).Validate());
     }
 }
 
@@ -671,11 +689,11 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     // caching it would hold a State block for nothing.
     SchedulerConfig config = MakeValidConfig();
     config.state_checkpoint_in_forward = true;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.disable_prefix_cache = true;
-    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
     config.state_checkpoint_in_forward = false;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 
     // The D role computes no prompt, so it takes the flag without prefix
     // caching (PD launchers share one argument list between the roles); the
@@ -688,12 +706,12 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
         }
         SetTestSnapshotPool(pd);
         pd.disable_prefix_cache = true;
-        EXPECT_NO_THROW(pd.Validate());
+        EXPECT_NO_THROW(WithHostPackingFromDevice(pd).Validate());
         pd.state_checkpoint_in_forward = true;
         if (role == Role::kD) {
-            EXPECT_NO_THROW(pd.Validate());
+            EXPECT_NO_THROW(WithHostPackingFromDevice(pd).Validate());
         } else {
-            EXPECT_THROW(pd.Validate(), std::invalid_argument);
+            EXPECT_THROW(WithHostPackingFromDevice(pd).Validate(), std::invalid_argument);
         }
     }
 }
@@ -705,25 +723,25 @@ TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether
     SchedulerConfig config = MakeValidConfig();
     config.snapshot_allocator.total_pages = 0;
     config.max_retracted_requests = 0;
-    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
     config.snapshot_allocator.total_pages = 1;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.max_retracted_requests = 4;
-    EXPECT_THROW(config.Validate(), std::invalid_argument) << "slots without a pool";
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument) << "slots without a pool";
     config.snapshot_allocator.total_pages = 16;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.max_retracted_requests = 0;
-    EXPECT_THROW(config.Validate(), std::invalid_argument) << "a pool without slots";
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument) << "a pool without slots";
     config.max_retracted_requests = -1;
-    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
 
     config.max_retracted_requests = 4;
     config.role = Role::kP;
     config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
-    EXPECT_THROW(config.Validate(), std::invalid_argument) << "the P role never retracts";
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument) << "the P role never retracts";
     config.snapshot_allocator.total_pages = 1;
     config.max_retracted_requests = 0;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 }
 
 TEST(SchedulerConfigValidateTest, ForcedRetractionRequiresASnapshotPool) {
@@ -734,13 +752,14 @@ TEST(SchedulerConfigValidateTest, ForcedRetractionRequiresASnapshotPool) {
     config.max_retracted_requests = 0;
     for (const std::int32_t interval : {3, -3}) {
         config.debug_force_retraction_interval = interval;
-        EXPECT_THROW(config.Validate(), std::invalid_argument) << "interval " << interval << " without a pool";
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument)
+            << "interval " << interval << " without a pool";
     }
     config.snapshot_allocator.total_pages = 16;
     config.max_retracted_requests = 4;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.debug_force_retraction_interval = 0;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 }
 
 TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
@@ -750,7 +769,7 @@ TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
     config.snapshot_allocator.total_pages = 16;
     config.max_retracted_requests = 0;
     try {
-        config.Validate();
+        WithHostPackingFromDevice(config).Validate();
         FAIL() << "a pool without slots must be rejected";
     } catch (const std::invalid_argument& error) {
         EXPECT_NE(std::string(error.what()).find("--retraction-snapshot-max-requests"), std::string::npos)
@@ -760,7 +779,7 @@ TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
     config.snapshot_allocator.total_pages = 1;
     config.debug_force_retraction_interval = 2;
     try {
-        config.Validate();
+        WithHostPackingFromDevice(config).Validate();
         FAIL() << "the knob without a pool must be rejected";
     } catch (const std::invalid_argument& error) {
         EXPECT_NE(std::string(error.what()).find("--debug-force-retraction-interval"), std::string::npos)
@@ -777,9 +796,9 @@ TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
         8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
     config.cache_groups[0].cache_blocks_per_lcm_block = 2;
     config.cache_groups[0].shard_count = 2;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.cache_groups[0].shard_count = 1;
-    EXPECT_NO_THROW(config.Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 }
 
 TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
@@ -795,14 +814,14 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
         }
         SetTestSnapshotPool(config);
         config.host_allocator.total_pages = 1;
-        EXPECT_NO_THROW(config.Validate());
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
         config.host_allocator.total_pages = 2;
         ExpectRejectedNamingGroup(config, "explicit host_write_policy");
         config.disable_l2_cache = true;
-        EXPECT_NO_THROW(config.Validate());
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
         config.disable_l2_cache = false;
         config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-        EXPECT_NO_THROW(config.Validate());
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     }
 }
 
@@ -821,7 +840,7 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
         config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
         return config;
     };
-    EXPECT_NO_THROW(prefill().Validate());
+    EXPECT_NO_THROW(WithHostPackingFromDevice(prefill()).Validate());
     SchedulerConfig no_host = prefill();
     no_host.host_allocator.total_pages = 1;
     ExpectRejectedNamingGroup(no_host, "requires a Host L2 cache");
@@ -832,8 +851,8 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     fused.role = Role::kFused;
     SetTestSnapshotPool(fused);
     ASSERT_TRUE(fused.HasSnapshotPool());
-    EXPECT_NO_THROW(fused.Validate());
-    EXPECT_NO_THROW(Scheduler{fused});
+    EXPECT_NO_THROW(WithHostPackingFromDevice(fused).Validate());
+    EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(fused)});
     SchedulerConfig decode = prefill();
     decode.role = Role::kD;
     SetTestSnapshotPool(decode);
@@ -845,8 +864,8 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     SchedulerConfig sharded = prefill();
     sharded.cache_groups[0].cache_blocks_per_lcm_block = 2;
     sharded.cache_groups[0].shard_count = 2;
-    EXPECT_NO_THROW(sharded.Validate());
-    EXPECT_NO_THROW(Scheduler{sharded});
+    EXPECT_NO_THROW(WithHostPackingFromDevice(sharded).Validate());
+    EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(sharded)});
 
     // Both cached and replayable sliding windows share the write-back path.
     for (const bool replayable : {false, true}) {
@@ -860,9 +879,9 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
         sliding.cache_groups.push_back(swa);
         sliding.max_scheduled_tokens = 256;
         sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-        EXPECT_NO_THROW(sliding.Validate()) << "write-through takes it";
+        EXPECT_NO_THROW(WithHostPackingFromDevice(sliding).Validate()) << "write-through takes it";
         sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
-        EXPECT_NO_THROW(Scheduler{sliding});
+        EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(sliding)});
     }
 
     // 64 groups construct a write-back scheduler; a 65th is refused before
@@ -873,14 +892,14 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
         group.group_id = "full" + std::to_string(i);
         wide.cache_groups.push_back(group);
     }
-    EXPECT_NO_THROW(Scheduler{wide});
+    EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(wide)});
     CacheGroupConfig last = wide.cache_groups[0];
     last.group_id = "full64";
     wide.cache_groups.push_back(last);
     ExpectRejectedNamingGroup(wide, "at most 64 cache groups");
-    EXPECT_THROW(Scheduler{wide}, std::invalid_argument);
+    EXPECT_THROW(Scheduler{WithHostPackingFromDevice(wide)}, std::invalid_argument);
     wide.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
-    EXPECT_NO_THROW(wide.Validate()) << "write-through keeps no bit per group";
+    EXPECT_NO_THROW(WithHostPackingFromDevice(wide).Validate()) << "write-through keeps no bit per group";
 }
 
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
@@ -1032,14 +1051,16 @@ TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     ASSERT_EQ(tables[1].NumBlocks(), 2);
-    EXPECT_EQ(built.at("packed"), (std::vector<std::int32_t>{
-                                      coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[0]->Location()),
-                                      coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[1]->Location()),
-                                  }));
-    EXPECT_EQ(built.at("single"), (std::vector<std::int32_t>{
-                                      coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[0]->Location()),
-                                      coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[1]->Location()),
-                                  }));
+    EXPECT_EQ(built.at("packed"),
+              (std::vector<std::int32_t>{
+                  coordinator.Allocator(0).ResolveDeviceCacheBlockId(tables[0].Blocks()[0]->Location()),
+                  coordinator.Allocator(0).ResolveDeviceCacheBlockId(tables[0].Blocks()[1]->Location()),
+              }));
+    EXPECT_EQ(built.at("single"),
+              (std::vector<std::int32_t>{
+                  coordinator.Allocator(1).ResolveDeviceCacheBlockId(tables[1].Blocks()[0]->Location()),
+                  coordinator.Allocator(1).ResolveDeviceCacheBlockId(tables[1].Blocks()[1]->Location()),
+              }));
 }
 
 }  // namespace

@@ -168,6 +168,7 @@ def _generate_text() -> list[bytes]:
             input_ids_unpadded=[151644, 872, 198],
             validation_error="rejected",
             data_parallel_rank=1,
+            cache_session_id="cache-session",
         )
     )
 
@@ -358,6 +359,7 @@ def _output_slim_tail() -> list[bytes]:
         input_top_logprobs_idx=[[None, [9, 2], [4, 3]], []],
         output_top_logprobs_val=[[[-0.25, -3.0]], []],
         output_top_logprobs_idx=[[[7, 1]], []],
+        output_token_cumulative_probs_val=[[0.75], []],
     )
     return [bytes(f) for f in _ENCODER.encode(batch)]
 

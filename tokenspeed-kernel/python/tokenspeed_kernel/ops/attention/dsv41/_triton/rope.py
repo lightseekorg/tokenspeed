@@ -423,7 +423,7 @@ def triton_dsv41_index_key_norm_rope_scatter(
         )
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["POS"])
 def _index_query_rope_quant(
     Q,
     W,

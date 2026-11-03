@@ -9,8 +9,8 @@ license is reproduced in `LICENSE.txt`.
 TokenSpeed's package boundary adds the vendor root to Python's module search
 path so the upstream `lib` and `petit_kernel` imports resolve unchanged. The
 vendored runtime retains only the supported MegaMoE execution path.
-The package uses stock Triton 3.8.0 for the Gluon compiler contract used by the
-upstream kernels.
+The vendored sources import Triton through `tokenspeed_kernel._triton`, so they
+use `tokenspeed-triton` and no separate Triton package is installed.
 
 The retained runtime supports the registered GFX950 MegaMoE configurations,
 including GPT-OSS 120B (EP8, 128 experts, top-4, 2880x3072, biased OpenAI
@@ -23,14 +23,6 @@ registers this runtime as the `gluon` solution with `gluon_petit_*` function
 and kernel registration names. The serving options are `--moe-backend gluon_petit`
 and `--all2all-backend gluon_petit`; the runtime maps the MoE backend to `gluon`
 when selecting a kernel plan.
-
-## Integration status
-
-The runtime retains the upstream LDS memory contract. The currently pinned `tokenspeed-triton` compiler rejects two constructs used by
-that contract: numeric LDS pointer address space `3` and the 8196-word shared
-allocation used by MegaMoE. This port therefore uses stock Triton 3.8.0 until
-the separately reviewed compiler compatibility fix is available in
-`tokenspeed-triton`; the tensor conversion does not change either memory requirement.
 
 ## Runtime contract
 

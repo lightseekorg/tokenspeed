@@ -211,6 +211,88 @@ def test_large_time_budget_never_exceeds_hard_token_limit():
     assert forward(scheduler).input_lengths == [32]
 
 
+@pytest.mark.parametrize("budget,expected", [(100, [5, 4]), (7, [5, 2])])
+def test_compute_and_kv_page_budgets_both_limit_the_batch(budget, expected):
+    compute = PrefillComputeConfig(budget, 1, 0, 0)
+    cfg = config(compute, mixed=False, state=False, replay_window=0)
+    cfg.max_kv_page_num = 3
+    scheduler = Scheduler(cfg)
+    submit(scheduler, "a", list(range(5)))
+    submit(scheduler, "b", list(range(100, 105)))
+    batch = forward(scheduler)
+    assert batch.request_ids == ["a", "b"]
+    assert batch.input_lengths == expected
+    assert (
+        sum(
+            (c + q + 3) // 4
+            for c, q in zip(batch.extend_prefix_lens, batch.input_lengths)
+        )
+        <= cfg.max_kv_page_num
+    )
+    assert (
+        sum(
+            compute.cost(q, c)
+            for c, q in zip(batch.extend_prefix_lens, batch.input_lengths)
+        )
+        <= budget
+    )
+    complete(scheduler, "a", finish=True)
+    complete(scheduler, "b", finish=False)
+    batch = forward(scheduler)
+    assert batch.request_ids == ["b"]
+    assert batch.extend_prefix_lens == [expected[1]]
+    assert batch.input_lengths == [5 - expected[1]]
+
+
+@pytest.mark.parametrize("budget", [0.01, 10])
+def test_restricted_checkpoints_progress_under_a_small_compute_budget(budget):
+    compute = PrefillComputeConfig(budget, 1, 0, 0)
+    cfg = config(compute, mixed=False, state=True, replay_window=0)
+    cfg.state_checkpoint_in_forward = True
+    cfg.max_kv_page_num = 6
+    groups = cfg.cache_groups
+    groups[1].checkpoint_granularity = 8
+    cfg.cache_groups = groups
+    scheduler = Scheduler(cfg)
+    tokens = list(range(21))
+    submit(scheduler, "seed", tokens)
+    for c, q in [(0, 8), (8, 8), (16, 5)]:
+        batch = forward(scheduler)
+        assert batch.extend_prefix_lens == [c]
+        assert batch.input_lengths == [q]
+        assert batch.input_ids == tokens[c : c + q]
+        complete(scheduler, "seed", finish=c + q == len(tokens))
+    submit(scheduler, "hit", list(range(16)) + [100, 101, 102])
+    batch = forward(scheduler)
+    assert batch.extend_prefix_lens == [16]
+    assert batch.input_lengths == [3]
+    assert batch.input_ids == [100, 101, 102]
+
+
+@pytest.mark.parametrize("budget,kv_pages,first_length", [(10, 0, 8), (100, 4, 9)])
+def test_later_restricted_checkpoint_waits_for_the_next_budget(
+    budget, kv_pages, first_length
+):
+    cfg = config(
+        PrefillComputeConfig(budget, 1, 0, 0), mixed=False, state=True, replay_window=0
+    )
+    cfg.max_kv_page_num = kv_pages
+    cfg.state_checkpoint_in_forward = True
+    groups = cfg.cache_groups
+    groups[1].checkpoint_granularity = 8
+    cfg.cache_groups = groups
+    scheduler = Scheduler(cfg)
+    submit(scheduler, "a", list(range(first_length)))
+    submit(scheduler, "b", list(range(100, 116)))
+    batch = forward(scheduler)
+    assert batch.request_ids == ["a"]
+    assert batch.input_lengths == [first_length]
+    complete(scheduler, "a", finish=True)
+    batch = forward(scheduler)
+    assert batch.request_ids == ["b"]
+    assert batch.input_lengths == [8 if budget == 10 else 16]
+
+
 @pytest.mark.parametrize(
     "values",
     [

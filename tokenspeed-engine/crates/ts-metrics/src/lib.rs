@@ -470,13 +470,13 @@ impl EngineMetrics {
             jit_serving_compiles: Metric::counter(
                 exporter,
                 "tokenspeed:jit_serving_compiles",
-                "Triton kernel compilations after startup; each one stalls the forward thread.",
+                "Triton and CuTe DSL kernel compilations after startup; each one stalls the forward thread.",
                 names,
             ),
             jit_serving_compile_seconds: Metric::counter(
                 exporter,
                 "tokenspeed:jit_serving_compile_seconds",
-                "Wall time spent in Triton kernel compilations after startup.",
+                "Wall time spent in Triton and CuTe DSL kernel compilations after startup.",
                 names,
             ),
             num_nan_aborted_requests: Metric::counter(

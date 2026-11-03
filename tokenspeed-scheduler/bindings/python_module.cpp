@@ -128,17 +128,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
                std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
                std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
-               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable) {
+               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable,
+               std::int32_t checkpoint_granularity) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    attn_kind,           sliding_window_tokens, replayable,  transfer_policy,
-                    shard_count,
+                    std::move(group_id), block_granularity,      total_pages, cache_blocks_per_lcm_block,
+                    attn_kind,           sliding_window_tokens,  replayable,  transfer_policy,
+                    shard_count,         checkpoint_granularity,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
-            nb::arg("replayable") = false)
+            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -147,6 +148,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
+        .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
@@ -154,6 +156,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("prefill_compute", &tokenspeed::SchedulerConfig::prefill_compute)
+        .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
@@ -172,6 +175,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
+        .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("host_write_policy", &tokenspeed::SchedulerConfig::host_write_policy)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
@@ -285,13 +289,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("superseded", &tokenspeed::CacheCoordinator::HostEvictionStats::superseded)
         .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
-        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush);
+        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush)
+        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv);
     nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
         .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);
     nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionStats>(m, "DeviceEvictionStats")
         .def_ro("admission", &tokenspeed::CacheCoordinator::DeviceEvictionStats::admission)
         .def_ro("request_reclaim", &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim)
+        .def_ro("request_reclaim_for_write_back",
+                &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim_for_write_back)
         .def_ro("stranded_suffix", &tokenspeed::CacheCoordinator::DeviceEvictionStats::stranded_suffix)
         .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
         .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)

@@ -20,7 +20,7 @@
 
 """GFX1250 DeepSeek V4.1 CSA2 indexer.
 
-Scores page-planar MXFP4 index-K with the V4 ``wmma_scaled`` e2m1 tile.
+Scores page-planar MXFP4 index-K with a ``wmma_scaled`` e2m1 tile.
 The tokenspeed-kernel adapter owns query packing, bounded query tiling, and
 selection.
 """
@@ -28,18 +28,126 @@ selection.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.indexer import (
-    _BLOCK_N,
-    _PACKED_DIM,
-    _PAGE_SIZE,
-    _SCALE_DIM,
-    _indexer_wmma_layouts,
-    _load_query_group,
-    _score_query_group,
-)
+from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 __all__ = ["dsv41_index_logits_gfx1250"]
+
+_HEAD_DIM = 128
+_PACKED_DIM_VALUE = _HEAD_DIM // 2
+_SCALE_DIM_VALUE = _HEAD_DIM // 32
+_PACKED_DIM = gl.constexpr(_PACKED_DIM_VALUE)
+_SCALE_DIM = gl.constexpr(_SCALE_DIM_VALUE)
+_PAGE_SIZE = 64
+_BLOCK_N = gl.constexpr(64)
+_HEADS_PER_WMMA = gl.constexpr(32)
+
+
+@gluon.constexpr_function
+def _indexer_wmma_layouts(NUM_WARPS: gl.constexpr):
+    assert NUM_WARPS == 4
+    wmma = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        warp_bases=[[0, 1], [0, 2]],
+        reg_bases=[],
+        instr_shape=[32, 16, 128],
+    )
+    packed_wmma = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        warp_bases=[[0, 1], [0, 2]],
+        reg_bases=[],
+        instr_shape=[32, 16, 64],
+    )
+    dot_a = gl.DotOperandLayout(operand_index=0, parent=packed_wmma, k_width=16)
+    dot_b = gl.DotOperandLayout(operand_index=1, parent=packed_wmma, k_width=16)
+    a_scale = gl.amd.cdna5.get_wmma_scale_layout(dot_a, [_HEADS_PER_WMMA, _SCALE_DIM])
+    b_scale = gl.amd.cdna5.get_wmma_scale_layout(dot_b, [_BLOCK_N, _SCALE_DIM])
+    return wmma, dot_a, dot_b, a_scale, b_scale
+
+
+@gluon.jit
+def _load_query_group(
+    q,
+    q_scales,
+    weights,
+    token,
+    head_base: gl.constexpr,
+    stride_q_token,
+    stride_q_head,
+    stride_q_scale_token,
+    stride_q_scale_head,
+    stride_w_token,
+    stride_w_head,
+    wmma_layout: gl.constexpr,
+    dot_a_layout: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+):
+    heads = gl.arange(0, _HEADS_PER_WMMA, layout=gl.SliceLayout(1, dot_a_layout))[
+        :, None
+    ]
+    packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(0, dot_a_layout))[
+        None, :
+    ]
+    query = gl.amd.cdna5.buffer_load(
+        q,
+        (token * stride_q_token + (head_base + heads) * stride_q_head + packed_dims).to(
+            gl.int32
+        ),
+    )
+
+    scale_heads = gl.arange(
+        0, _HEADS_PER_WMMA, layout=gl.SliceLayout(1, a_scale_layout)
+    )[:, None]
+    scale_groups = gl.arange(0, _SCALE_DIM, layout=gl.SliceLayout(0, a_scale_layout))[
+        None, :
+    ]
+    scales = gl.amd.cdna5.buffer_load(
+        q_scales,
+        (
+            token * stride_q_scale_token
+            + (head_base + scale_heads) * stride_q_scale_head
+            + scale_groups
+        ).to(gl.int32),
+    )
+    weight_heads = gl.arange(0, _HEADS_PER_WMMA, layout=gl.SliceLayout(1, wmma_layout))
+    head_weights = gl.amd.cdna5.buffer_load(
+        weights,
+        (token * stride_w_token + (head_base + weight_heads) * stride_w_head).to(
+            gl.int32
+        ),
+    ).to(gl.float32)
+    return query, scales, head_weights
+
+
+@gluon.jit
+def _score_query_group(
+    query,
+    query_scales,
+    head_weights,
+    key,
+    key_scales,
+    wmma_layout: gl.constexpr,
+):
+    accumulator = gl.zeros(
+        [_HEADS_PER_WMMA, _BLOCK_N], dtype=gl.float32, layout=wmma_layout
+    )
+    head_scores = gl.amd.cdna5.wmma_scaled(
+        query,
+        query_scales,
+        "e2m1",
+        key,
+        key_scales,
+        "e2m1",
+        accumulator,
+    )
+    head_scores = gl.maximum(
+        head_scores,
+        0.0,
+        propagate_nan=tl.PropagateNan.ALL,
+    )
+    return gl.sum(head_scores * head_weights[:, None], axis=0)
+
 
 _WMMA_HEADS = 32
 _CHUNK_N = 256

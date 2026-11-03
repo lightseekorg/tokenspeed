@@ -231,6 +231,14 @@ Operators can prepare compilation variants during ordinary execution with
 `ops.tuning.kernel_warmup(enabled=True)` and `is_warming_up()`. FlashInfer
 profiling uses a separate `autotune` context.
 
+Triton operators can register finite launch variants with
+`warmup.register_triton_warmup` for scalar alignment classes and bounded tile
+choices that vary with request shapes. `warmup.kernel_launcher` prepares these
+variants during ordinary startup execution, then launches the original call.
+Fixed-geometry cache management operations retain lazy compilation on first
+use; they need no synthetic startup writes, transfers, or waits. Per-request
+sizes must still be runtime arguments, even when their variants are warmed.
+
 ### JIT compilation while serving
 
 Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`) key the
@@ -238,15 +246,28 @@ Triton compile cache. A per-batch value passed as one compiles a new binary
 on the forward thread for every new batch shape (100 ms to seconds each).
 
 `tokenspeed_kernel.compile_monitor` hooks Triton's JIT (Gluon shares it) and
-records every compilation. The runtime installs it in each scheduler process
-and marks the end of startup. After that, the monitor logs each compilation
-with its duration, what changed in the compile key, and the launching call
-site. When a compile-time parameter keeps taking new values from one call
-site, the monitor names it (`TOKENSPEED_JIT_COMPILE_CHECK=warn`, the
-default) or raises (`error`, which CI serving jobs use). Kernel tests guard
-batch-varying launches with `assert_no_triton_compile` in `test/utils.py`.
-The monitor does not observe JITs outside Triton, such as DeepGEMM's
-per-shape kernels; they need the same discipline at their call sites.
+CuTe DSL's, and records every compilation. The runtime installs it in each
+scheduler process and marks the end of startup. After that, the monitor logs
+each compilation with its duration, what changed in the compile key, and the
+launching call site. When a compile-time parameter keeps taking new values
+from one call site, the monitor names it (`TOKENSPEED_JIT_COMPILE_CHECK=warn`,
+the default) or raises (`error`, which CI serving jobs use). Kernel tests guard
+batch-varying launches with `assert_no_triton_compile` and
+`assert_no_cute_compile` in `test/utils.py`. The monitor does not observe
+other JITs, such as DeepGEMM's per-shape kernels; they need the same
+discipline at their call sites.
+
+CuTe DSL leaves the compile cache to the caller: `cute.compile` traces and
+compiles on every call, and the caller keeps the result under a key of its
+choosing. That key must hold only what the kernel specializes on: its
+`cutlass.Constexpr` arguments, the dtypes and static layouts of its tensors,
+and the kernel object's attributes. A per-batch size belongs in a dynamic
+dimension (`mark_layout_dynamic`, `cute.sym_int`) or an `Int32` argument, and
+then out of the key. A key that holds a value the kernel takes at runtime
+compiles the same kernel again for every new value; the monitor reports a call
+site that keeps doing so. Calling a `@cute.jit` function directly, instead of
+the compiled function, traces it in Python on every call even when CuTe DSL
+has cached its binary, so the monitor reports such a call while serving.
 
 A runtime argument still keys the cache: Triton specializes an integer on
 whether it is 1 or divisible by 16, and a pointer on 16-byte alignment.

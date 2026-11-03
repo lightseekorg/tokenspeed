@@ -26,14 +26,14 @@ from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import ClassVar
 
-import triton.experimental.gluon as g
 from lib.gemm.rocm.intrinsics import (
     HAS_AMD_SCHED_BARRIER,
     HAS_AMD_SCHED_GROUP_BARRIER,
     amdgcn_sched_barrier,
     amdgcn_sched_group_barrier,
 )
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 class FusedMoEDataType(IntEnum):

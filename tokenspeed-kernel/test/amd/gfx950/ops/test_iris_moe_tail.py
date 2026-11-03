@@ -45,9 +45,13 @@ def _require_iris():
 def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
     """Runtime row counts must retain vectorized payload loads and peer stores."""
     from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+    )
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3moe_push_gather,
     )
+    from tokenspeed_kernel.platform import ArchVersion
 
     fn = iris_k3moe_push_gather
     constants = {
@@ -56,6 +60,7 @@ def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
         "NUM_PROGRAMS": 128,
         "NUM_WARPS": 4,
         "PREFIX_IS_SHARDED": prefix_is_sharded,
+        "WAIT_STORES": iris_arch_policy(ArchVersion(9, 5)).wait_stores,
     }
     signature = {name: "*bf16" for name in fn.arg_names[:4]}
     signature["ready_flags"] = "*i32"

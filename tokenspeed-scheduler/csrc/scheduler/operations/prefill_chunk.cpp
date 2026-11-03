@@ -30,6 +30,10 @@ std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, s
                                           std::int32_t chunk_budget, std::int32_t prefix_replay_tokens) {
     _assert(prompt_tokens >= 0 && chunk_budget > 0 && prefix_replay_tokens >= 0,
             "prefill checkpoint inputs must be non-negative with a positive budget");
+    const std::int32_t grain = coordinator.CheckpointGranularity();
+    if (grain > 1) {
+        return prompt_tokens > 0 ? (prompt_tokens - 1) / grain * grain : 0;
+    }
     const std::int32_t tail = std::max({1, coordinator.ReplayWindowTokens(), prefix_replay_tokens});
     if (prompt_tokens <= chunk_budget || prompt_tokens <= tail) {
         return 0;
@@ -65,10 +69,11 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
         std::int32_t compute_limit = compute->TokenLimit(first_pos - replay, token_budget, compute_spent_ns);
         if (compute_spent_ns == 0) {
             // A soft time budget must not strand a request whose next valid
-            // chunk (including replay or the final window) costs more than
-            // a whole budget. Only the first prefill may exceed it, and the
-            // hard token/capacity limits still apply.
-            const std::int32_t minimum = replay + std::min(unscheduled, std::max(1, coordinator.ReplayWindowTokens()));
+            // chunk (including replay, a checkpoint segment or the final
+            // window) costs more than a whole budget. Only the first prefill
+            // may exceed it; the hard token, KV-page and capacity limits hold.
+            const std::int32_t minimum = replay + std::min(unscheduled, std::max(coordinator.CheckpointGranularity(),
+                                                                                 coordinator.ReplayWindowTokens()));
             compute_limit = std::max(compute_limit, minimum);
         }
         token_budget = std::min(token_budget, compute_limit);
@@ -76,6 +81,11 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
     const std::int32_t budget = token_budget - replay;
     if (budget <= 0) {
         return 0;
+    }
+    const std::int32_t grain = coordinator.CheckpointGranularity();
+    if (grain > 1) {
+        _assert(first_pos % grain == 0, "prefill must resume an aligned checkpoint");
+        return budget >= unscheduled ? unscheduled : budget / grain * grain;
     }
     const std::int32_t plain = std::min(budget, unscheduled);
     std::int32_t prefill_tokens = plain;
@@ -99,7 +109,8 @@ std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator) {
     // to carry the prompt's final window whole, or at least a prefix page of
     // new tokens when the window is smaller than a page.
     const std::int32_t window = coordinator.ReplayWindowTokens();
-    return window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0;
+    return std::max(coordinator.CheckpointGranularity() > 1 ? coordinator.CheckpointGranularity() : 0,
+                    window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0);
 }
 
 }  // namespace tokenspeed

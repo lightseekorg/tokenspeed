@@ -491,10 +491,6 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
-def decrypt(fn, key):
-    raise NotImplementedError()
-
-
 def safetensors_encrypted_weights_iterator(
     hf_weights_files: list[str],
     is_all_weights_sharded: bool = False,

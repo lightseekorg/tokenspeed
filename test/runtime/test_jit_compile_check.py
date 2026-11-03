@@ -43,7 +43,7 @@ def uninstall(monkeypatch):
 def test_install_follows_the_env(monkeypatch, uninstall, mode):
     monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", mode)
     jit_compile_check.install_jit_compile_check()
-    assert compile_monitor._hooks.monitor.on_unbounded == mode
+    assert compile_monitor._hooks.monitor.on_violation == mode
     assert not compile_monitor._hooks.monitor.serving
     jit_compile_check.mark_jit_compile_serving()
     assert compile_monitor._hooks.monitor.serving

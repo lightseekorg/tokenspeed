@@ -89,7 +89,6 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_quant_method="none",
-        prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=8,
         components=(dsa, linear),

@@ -43,14 +43,12 @@ class Fp8Config(QuantizationConfig):
     weight_scale_dtype = torch.float32
 
     # Excluded from online quantization: linear-attention (GDN/mamba)
-    # projections, plus wo_a, whose grouped projection plan requires serialized
-    # weights and scales during its one-time backend preprocessing.
+    # projections.
     ONLINE_IGNORED_LAYERS = [
         "re:.*linear_attn.*",
         "re:.*conv1d.*",
         "re:.*in_proj.*",
         "re:.*out_proj.*",
-        "re:.*wo_a.*",
     ]
 
     def __init__(

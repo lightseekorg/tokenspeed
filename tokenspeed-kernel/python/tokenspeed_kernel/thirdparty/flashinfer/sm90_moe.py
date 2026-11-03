@@ -153,9 +153,11 @@ def _source_tree(
         "#endif",
     )
     directory = cache / tag
-    # FlashInfer's inline include-directory storage may be shared across DSOs.
-    # Bind the private JIT compiler to this immutable source tree, so loading
-    # another MoE module cannot redirect cold compilation to its headers.
+    # FlashInfer's inline include-directory storage is one process-wide object
+    # shared across DSOs. Bind the private JIT compiler to this immutable source
+    # tree, so loading another MoE module cannot redirect cold compilation to
+    # its headers, and rename the private storage, so loading this module
+    # cannot redirect the installed module to these patched headers either.
     include_dir = json.dumps(str(directory / "csrc/nv_internal/tensorrt_llm"))
     patched[compiler] = _replace_once(
         patched[compiler],
@@ -163,6 +165,9 @@ def _source_tree(
         "for (auto const& dir : std::vector<std::filesystem::path>{"
         + include_dir
         + "}) {",
+    )
+    patched[compiler] = re.sub(
+        r"\b(get|set)JitIncludeDirs\b", rf"\1JitIncludeDirs_{tag}", patched[compiler]
     )
     directory.mkdir(parents=True, exist_ok=True)
     with FileLock(str(directory / "source.lock")):
@@ -217,6 +222,7 @@ def _private_spec(
     flags.append(f"-DFLASHINFER_SM90_MOE_MAX_STAGES_FC2={max_num_stages_fc2}")
     if optimized:
         flags.append("-DFLASHINFER_SM90_GROUPED_MOE_OPTIMIZATIONS=1")
+        flags.append("-DFLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT=1")
     mode = "optimized" if optimized else "expected_m"
     return replace(
         spec,

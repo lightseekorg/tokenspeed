@@ -1,5 +1,18 @@
 # QSA kernels
 
+QSA scores compressed index keys, selects logical blocks, expands them to
+full-cache slots, and attends to those slots. The block selector takes an
+explicit `auto`, `stream`, or `logits` path. Backend selection and overrides
+preserve the requested path.
+
+## PrimTS plan preparation
+
+The FlashInfer PrimTS adapter caches cluster occupancy by CUDA device, context,
+and cluster size. New eager layouts retain their own workspace plans and route
+offsets while sharing the hardware capacity query. This keeps CuTe's
+occupancy-query kernel compilation in startup and preserves the serving JIT
+checks when batch geometry changes.
+
 ## TMA gather sparse attention
 
 `thirdparty/cute_dsl/qsa_tma_gather.py` provides `TmaGatherSparseAttention`, an explicit,
@@ -138,3 +151,70 @@ Provider agreement and model quality are separate checks: the BF16 probability
 rounding can change logits after later layers even when individual attention
 outputs meet their mathematical tolerance. Default selection does not imply
 bitwise equivalence with FA2 or a model-level quality acceptance result.
+
+## Metadata and recent writes
+
+Padded MTP rows with negative logical positions retain them for masking,
+but contribute zero complete blocks to scoring and top-k selection.
+
+Compressed-key RoPE is read only at compression write boundaries. Non-boundary
+draft rows may have valid raw-key tags before their group-start header is staged.
+
+Each recent-cache page owns a separate raw-key ring. A later token suppresses
+an earlier writer only when both address the same physical page and ring slot.
+Prefill must leave the last raw keys and group-start positions in every page
+it computes, including pages before the final window, so an interior state
+checkpoint has valid recent-cache data when the scheduler publishes it.
+
+Startup metadata preparation covers integer alignment classes for compressed
+page-table row strides. Recent-cache writes cover these classes for row count
+and the exclusive request-id bound. The ordinary unlimited prefill call also
+prepares request-limited variants: pure target verification skips the writer
+when there are no extends. Changed table widths and mixed-prefill request
+counts can then reuse startup binaries.
+
+## Materialized Triton scoring
+
+The `logits` path materializes FP32 block scores before top-k selection.
+Query-group count, table capacity, tensor strides, and per-row frontiers are
+runtime inputs. Request count is represented by page-table rows and the
+per-query request indices. The group count opts out of scalar specialization;
+other integer inputs retain Triton's finite alignment classes for optimization.
+
+`BLOCK_N`, `BLOCK_H`, and `BLOCK_D` set static tile dimensions. Query grouping
+also sets `arange` and `reshape` dimensions and remains compile-time; a
+bounded flag selects whether the query-group loop is needed. Model dimensions,
+tensor formats, PDL, and launch tuning stay fixed for a warmed configuration.
+
+During `kernel_warmup`, scoring compiles and loads every power-of-two group
+allowed by the model geometry and both loop variants, without launching the
+unused variants. Four index heads of width 128 on NVIDIA have six groups,
+1 through 32, and two loop variants. Warmup also covers row-stride and capacity
+classes: one, divisible by 16, and other integers. With 64-block pages, capacity
+and logits strides stay divisible by 16; the three page-table stride classes
+give at most 36 binaries for one fixed tensor-format/PDL configuration.
+Later query-count, request-count, and table-width changes reuse these binaries
+while refreshing the launch grid. Grouping and occupancy policies are the same
+during prefill, decode, and CUDA graphs.
+
+## Rubin FP8 decode head tile
+
+The direct-slot CuTe path uses a 16-column tile for twelve query heads per KV
+head with FP8 caches on SM107, once `query_rows * kv_heads >= SM_count`. Each
+query retains its independent selected-slot list. Covering all twelve heads in
+one tile avoids the second gather/conversion stream of the eight-column tactic.
+Both tactics compute sixteen padded head columns in total; useful QK/PV work
+is unchanged.
+
+`_select_head_tile` owns the device/grid policy. Query packing and the grouped
+BF16 private-prefix fallback use a separate fixed-geometry helper, so launch
+policy cannot change their padding.
+
+This selects static geometry inside the existing decode provider. Split4, one
+query per CTA, cache layout, writers, prefix/offload ownership and descales keep
+their contracts. Smaller grids and other architectures keep the prior tactic.
+Startup warmup enumerates both tiles before graph capture, and rows remain
+dynamic within each configuration. Tests cover Hq/Hkv of 24/2 and 12/1, target
+and draft query widths, both sides of the 212-SM grid threshold, padding,
+refreshed cache values, PDL on/off, large KV
+offsets and execution without further compilation after warmup.

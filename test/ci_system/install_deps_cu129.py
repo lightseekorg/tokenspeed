@@ -77,7 +77,6 @@ def validate_environment(workspace: Path, cuda_home: Path) -> None:
             "Activate a Python venv before running the Hopper/cu129 installer"
         )
     for relative in (
-        "requirements/nvidia-cu129-constraints.txt",
         "tokenspeed-kernel/python/setup.py",
         "tokenspeed-scheduler/pyproject.toml",
         "python/pyproject.toml",
@@ -150,6 +149,36 @@ def main() -> None:
     workspace = workspace.resolve()
     cuda_home = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")).resolve()
     validate_environment(workspace, cuda_home)
+    with tempfile.TemporaryDirectory(prefix="tokenspeed-cu129-constraints-") as tmp:
+        constraints = Path(tmp) / "constraints.txt"
+        # Kernel versions come from the existing CUDA requirements. Torch 2.14
+        # uses the cu126 runtime with host nvcc 12.9. A "<0" bound blocks a
+        # CUDA 13 package, since no version satisfies it.
+        constraints.write_text(
+            "\n".join(
+                [
+                    "torch==2.14.0+cu126",
+                    "torchvision==0.29.0+cu126",
+                    "cuda-toolkit==12.6.3",
+                    "cuda-python==12.9.7",
+                    "cuda-bindings==12.9.7",
+                    "tokenspeed-mooncake==0.3.13.post20261027",
+                    "nvidia-cutlass-dsl-libs-cu13<0",
+                    "nvidia-cublas<0",
+                    "nvidia-cuda-runtime<0",
+                    "nvidia-cuda-nvrtc<0",
+                    "nvidia-cudnn-cu13<0",
+                    "nvidia-nccl-cu13<0",
+                    "nvidia-nvshmem-cu13<0",
+                    "tokenspeed-cutedsl-kda<0",
+                ]
+            )
+            + "\n"
+        )
+        install(workspace, cuda_home, constraints)
+
+
+def install(workspace: Path, cuda_home: Path, constraints: Path) -> None:
     os.environ.update(
         CUDA_HOME=str(cuda_home),
         FLASHINFER_NVCC=str(cuda_home / "bin" / "nvcc"),
@@ -157,7 +186,7 @@ def main() -> None:
         TOKENSPEED_KERNEL_CUDA_VARIANT="cu129",
         FLASHINFER_CUDA_ARCH_LIST="9.0a",
         MAX_JOBS=os.environ.get("BUILD_AND_DOWNLOAD_PARALLEL", "16"),
-        PIP_CONSTRAINT=str(workspace / "requirements" / "nvidia-cu129-constraints.txt"),
+        PIP_CONSTRAINT=str(constraints),
         PIP_CONFIG_FILE=os.devnull,
         PIP_INDEX_URL=PYPI,
     )

@@ -37,6 +37,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             .block_granularity = group.block_granularity,
             .shard_count = group.shard_count,
+            .checkpoint_granularity = group.checkpoint_granularity,
         });
     }
     return specs;

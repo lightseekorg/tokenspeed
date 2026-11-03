@@ -428,7 +428,6 @@ def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
         device="cuda",
         attention_backend="trtllm",
         drafter_attention_backend="trtllm",
-        prefix_granularity=128,
         max_num_seqs=16,
         data_parallel_size=None,
         skip_softmax_threshold=0.0,
@@ -509,6 +508,8 @@ class _CaptureCausalLM:
         self.model = _CaptureModel(num_layers)
         self.capture_aux_hidden_states = False
 
+    supports_aux_capture = True
+    require_aux_capture = BaseCausalLM.require_aux_capture
     set_dflash_layers_to_capture = BaseCausalLM.set_dflash_layers_to_capture
 
 
@@ -556,6 +557,8 @@ class _TapCausalLM:
         self.model = model
         self.capture_aux_hidden_states = False
 
+    supports_aux_capture = True
+    require_aux_capture = BaseCausalLM.require_aux_capture
     set_dflash_layers_to_capture = BaseCausalLM.set_dflash_layers_to_capture
 
 

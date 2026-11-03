@@ -925,6 +925,9 @@ if platform.is_cdna5:
         launch_gluon_mm_mxfp8_ue8m0_gfx1250 as _mm_mxfp8_ue8m0_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.mm import (
+        launch_gluon_mm_fp8_blockscale_largem_gfx1250 as _mm_fp8_blockscale_largem_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.mm import (
         launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250 as _mm_mxfp8_ue8m0_largem_gfx1250_impl,
     )
 
@@ -1086,6 +1089,62 @@ if platform.is_cdna5:
             out=out,
         )
 
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_fp8_blockscale_largem_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    a=tensor_format(
+                        "mxfp8",
+                        _FP8_DTYPE,
+                        scale=_FP8_BLOCK_SCALE,
+                    ),
+                    b=tensor_format(
+                        "mxfp8",
+                        _FP8_DTYPE,
+                        scale=_FP8_BLOCK_SCALE,
+                    ),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "m_min": frozenset({65}),
+            "n_align": frozenset({128}),
+            "k_align": frozenset({512}),
+            **_GFX1250_MXFP8_COMMON_TRAITS,
+        },
+    )
+    def gluon_mm_fp8_blockscale_largem_gfx1250(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _mm_fp8_blockscale_largem_gfx1250_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+        )
+
 else:
 
     def gluon_mm_mxfp8_ue8m0_gfx1250(*args, **kwargs):
@@ -1096,6 +1155,9 @@ else:
 
     def gluon_mm_fp8_blockscale_gfx1250(*args, **kwargs):
         raise RuntimeError("gluon_mm_fp8_blockscale_gfx1250 requires CDNA5")
+
+    def gluon_mm_fp8_blockscale_largem_gfx1250(*args, **kwargs):
+        raise RuntimeError("gluon_mm_fp8_blockscale_largem_gfx1250 requires CDNA5")
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1457,6 +1519,7 @@ __all__ = [
     "gluon_mm_fp8_blockscale_gfx950",
     "gluon_mm_mxfp8_decode_gfx950",
     "gluon_mm_fp8_blockscale_gfx1250",
+    "gluon_mm_fp8_blockscale_largem_gfx1250",
     "gluon_mm_mxfp8_ue8m0_gfx1250",
     "gluon_mm_mxfp8_ue8m0_largem_gfx1250",
     "gluon_dsv4_linear_fp32_gfx1250",

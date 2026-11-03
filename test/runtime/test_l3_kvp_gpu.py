@@ -130,7 +130,11 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
     config = json.loads(os.environ["MOONCAKE_GPU_TEST_CONFIG"])
     assert config["global_segment_size"] == 0 and config["protocol"] == "rdma"
     ownership = BlockOwnerTranslation.for_host_pool(
-        layout, contract, num_host_lcm_blocks=4, rank=rank
+        layout,
+        contract,
+        num_host_lcm_blocks=4,
+        rank=rank,
+        host_group_packing=executor.host_storage.group_packing,
     )
     l3 = host_storage_executor(
         executor.host_storage,

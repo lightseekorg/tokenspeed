@@ -20,7 +20,11 @@
 
 """Exercise chunked prefill and decode through the runtime configuration bridge."""
 
+from test.ci_system.ci_register import register_cuda_ci
+
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -60,6 +64,7 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
         storage_config=None,

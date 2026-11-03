@@ -41,15 +41,30 @@ from tokenspeed.runtime.models.deepseek_v3 import (  # noqa: E402
     DeepseekV3DecoderLayer,
     DeepseekV3Model,
 )
+from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41ForCausalLM  # noqa: E402
 from tokenspeed.runtime.models.glm5 import GlmMoeDsaDecoderLayer  # noqa: E402
+from tokenspeed.runtime.models.gpt_oss import GptOssForCausalLM  # noqa: E402
+from tokenspeed.runtime.models.llama import LlamaForCausalLM  # noqa: E402
 from tokenspeed.runtime.models.longcat_flash import (  # noqa: E402
     _RuntimeLongcatDecoderLayer,
     _RuntimeLongcatModel,
 )
+from tokenspeed.runtime.models.muse_spark import (  # noqa: E402
+    MuseSparkForConditionalGeneration,
+)
+from tokenspeed.runtime.models.nemotron_h import NemotronHForCausalLM  # noqa: E402
+from tokenspeed.runtime.models.qwen3 import Qwen3ForCausalLM  # noqa: E402
 from tokenspeed.runtime.models.qwen3_5 import (  # noqa: E402
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5ForCausalLM,
     Qwen3_5LinearDecoderLayer,
+)
+from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM  # noqa: E402
+from tokenspeed.runtime.models.qwen3_omni import (  # noqa: E402
+    Qwen3OmniMoeForConditionalGeneration,
+)
+from tokenspeed.runtime.models.qwen4_exp import (  # noqa: E402
+    Qwen4ExpForConditionalGeneration,
 )
 
 TP = 2
@@ -294,3 +309,47 @@ def test_idle_layer_appends_one_empty_gathered_tap(layer_cls):
 
     assert len(comm.gathered) == 1 and comm.gathered[0] is empty
     assert len(aux) == 1 and aux[0].shape == (0, 8)
+
+
+def _bare(model_cls):
+    """A real causal LM without its weights; the capture setters touch only ``model``."""
+    lm = object.__new__(model_cls)
+    nn.Module.__init__(lm)
+    lm.model = nn.Module()
+    return lm
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [
+        Qwen3ForCausalLM,
+        Qwen3MoeForCausalLM,
+        Qwen3OmniMoeForConditionalGeneration,
+        DeepseekV41ForCausalLM,
+        MuseSparkForConditionalGeneration,
+        Qwen4ExpForConditionalGeneration,
+    ],
+)
+def test_capture_is_refused_where_forward_returns_no_taps(model_cls):
+    lm = _bare(model_cls)
+
+    with pytest.raises(NotImplementedError, match="does not return aux hidden"):
+        lm.set_eagle3_layers_to_capture([1, 5])
+    with pytest.raises(NotImplementedError, match="does not return aux hidden"):
+        lm.set_dflash_layers_to_capture([1, 5])
+    assert "layers_to_capture" not in vars(lm.model)
+
+
+@pytest.mark.parametrize(
+    "model_cls", [LlamaForCausalLM, GptOssForCausalLM, NemotronHForCausalLM]
+)
+def test_capture_is_accepted_where_forward_returns_taps(model_cls):
+    lm = _bare(model_cls)
+
+    lm.set_eagle3_layers_to_capture([1, 5])
+
+    assert lm.model.layers_to_capture == [2, 6]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

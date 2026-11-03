@@ -98,17 +98,15 @@ def _serve_fake_engine():
     "model",
     ["deepseek-ai/DeepSeek-V4.1-Flash", "DeepSeek_V4_1_Flash", "DeepSeekV41-Flash"],
 )
-def test_v41_never_selects_v4(model):
+def test_v41_selects_v41_parsers(model):
     from tokenspeed.cli import serve_smg as serve
 
     assert serve._is_deepseek_v41_model(model)
-    assert not serve._is_deepseek_v4_model(model)
     engine, gateway = serve._args_with_default_model_parsers(
         ["--model", model], ["--model", model]
     )
     assert serve._get_from_args(engine, "--reasoning-parser", None) == "deepseek_v41"
     assert serve._get_from_args(gateway, "--tool-call-parser", None) == "deepseek_v41"
-    assert "deepseek_v4" not in gateway
 
 
 @pytest.mark.parametrize(
@@ -120,7 +118,6 @@ def test_v41_detects_renamed_local_snapshot(tmp_path, config):
 
     (tmp_path / "config.json").write_text(json.dumps(config))
     assert serve._is_deepseek_v41_model(str(tmp_path))
-    assert not serve._is_deepseek_v4_model(str(tmp_path))
 
 
 def test_v41_preserves_explicit_tool_parser():

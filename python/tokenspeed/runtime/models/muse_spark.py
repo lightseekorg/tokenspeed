@@ -114,13 +114,11 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
-    pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
     MultimodalForwardContext,
-    MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.common import make_layers
@@ -2511,13 +2509,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 ),
             )
         return specs
-
-    def pad_input_ids(
-        self,
-        input_ids: list[int],
-        mm_inputs: MultimodalInputs,
-    ) -> list[int]:
-        return pad_input_tokens(input_ids=input_ids, mm_inputs=mm_inputs)
 
     @torch.no_grad()
     def multimodal_input_embeds(

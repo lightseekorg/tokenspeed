@@ -17,7 +17,7 @@ from lib.gemm.rocm.intrinsics import (
 from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.tensor_ops import first, group_gather, load_words, wave_inclusive_sum
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
 
 
 class MegaMoEBlockPhase(IntEnum):

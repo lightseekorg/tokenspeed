@@ -379,8 +379,6 @@ class RTRunner:
             str(port),
             "--gpu-memory-utilization",
             "0.65",
-            "--prefix-granularity",
-            "64",
             "--max-cudagraph-capture-size",
             "4",
             "--disable-kvstore",

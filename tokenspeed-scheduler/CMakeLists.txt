@@ -134,8 +134,10 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_token_level_hits.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_cache_operations.cpp
+        tests/cpp/test_pending_prefix_store.cpp
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_capacity_model.cpp
+        tests/cpp/test_shadow_occupancy.cpp
         tests/cpp/test_closed_loop_random.cpp
     )
 
@@ -182,6 +184,21 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     )
 
     target_include_directories(tokenspeed_scheduler_block_pool_benchmark
+        PRIVATE
+            csrc
+            tests/cpp
+    )
+
+    add_executable(tokenspeed_scheduler_group_allocator_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_group_allocator.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_group_allocator_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+    )
+
+    target_include_directories(tokenspeed_scheduler_group_allocator_benchmark
         PRIVATE
             csrc
             tests/cpp

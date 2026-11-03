@@ -1,13 +1,13 @@
 """Production activation operations from moe/rocm/ops/activation.cuh."""
 
-import triton.experimental.gluon as g
 from lib.gemm.rocm.intrinsics import (
     amdgcn_exp2f,
     amdgcn_pk_add_f32,
     amdgcn_pk_mul_f32,
     amdgcn_rcpf,
 )
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 class SiluDotOp:

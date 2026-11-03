@@ -62,6 +62,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        input_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -131,7 +133,7 @@ class MoELayer(torch.nn.Module):
             self.swiglu_arg = SwigluArg(alpha=activation_alpha, limit=swiglu_limit)
         # Per-model knobs the MoE backend reads in process_weights_after_loading.
         # ``swiglu_beta``: gpt-oss uses silu(α·gate)·(up + 1) and sets 1.0;
-        # standard SwiGLU (e.g. deepseek-v4) leaves it None.
+        # standard SwiGLU (e.g. DeepSeek V4.1) leaves it None.
         # ``w13_input_layout``: "interleaved" for HF gpt-oss-style row layout
         # ([w1_0, w3_0, w1_1, w3_1, ...]); "concatenated" (default) for the
         # shared MoE checkpoint loader's [w1_all | w3_all] block layout.
@@ -342,9 +344,12 @@ class MoELayer(torch.nn.Module):
                 )
             internal_activation_dtype = "mxfp4"
 
-        input_dtype = torch.get_default_dtype()
-        if input_dtype not in {torch.float16, torch.bfloat16}:
-            input_dtype = torch.float16
+        if input_dtype is None:
+            input_dtype = torch.get_default_dtype()
+            if input_dtype not in {torch.float16, torch.bfloat16}:
+                input_dtype = torch.float16
+        elif input_dtype not in {torch.float16, torch.bfloat16}:
+            raise ValueError("MoE input dtype must be FP16 or BF16")
         # The activation dtype the plan is signed for; callers that feed the
         # layer synthetic inputs (kernel tuning) must match it.
         self.input_dtype = input_dtype
@@ -613,7 +618,9 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
-        kernel_moe_process_weights(self.plan, module)
+        kernel_moe_process_weights(
+            self.plan, module, communication_initializer=initialize_communication
+        )
         self._weights_processed = True
 
     @property
@@ -688,6 +695,7 @@ class MoELayer(torch.nn.Module):
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
         routing_prepared: object | None = None,
         deferred_out: torch.Tensor | None = None,
+        valid_token_mask: torch.Tensor | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -716,6 +724,8 @@ class MoELayer(torch.nn.Module):
                 Only kernels advertising prepared routing accept it.
             deferred_out: Optional caller-owned route destination for
                 ``do_finalize=False``; requires ``supports_deferred_out``.
+            valid_token_mask: Optional live-row mask for a kernel that declares
+                ``valid_token_mask`` support. It is never silently discarded.
 
         Returns:
             Finalized ``[tokens, hidden]`` hidden states, or with
@@ -767,6 +777,7 @@ class MoELayer(torch.nn.Module):
                 x_quantized=x_quantized,
                 routing_prepared=routing_prepared,
                 deferred_out=deferred_out,
+                valid_token_mask=valid_token_mask,
             )
             output_scale = topk_output.output_scale
             if isinstance(output_scale, torch.Tensor):
@@ -794,6 +805,7 @@ class MoELayer(torch.nn.Module):
             x_quantized=x_quantized,
             routing_prepared=routing_prepared,
             deferred_out=deferred_out,
+            valid_token_mask=valid_token_mask,
         )
         if not do_finalize and output[1] is None:
             # Some precomputed-route kernels (Triton MXFP4) return no route

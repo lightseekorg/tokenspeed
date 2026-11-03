@@ -317,6 +317,123 @@ if platform.is_amd:
 
 
 # ===-----------------------------------------------------------------------===#
+# Routing: sqrt-softplus top-k (AMD gfx1250)
+# ===-----------------------------------------------------------------------===#
+
+
+if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.router_gemv import (
+        launch_gluon_router_sqrt_softplus_topk_gemv_gfx1250,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.sqrt_softplus_topk import (
+        launch_gluon_sqrt_softplus_topk_gfx1250 as _topk_gfx1250_impl,
+    )
+
+    @register_kernel(
+        "moe",
+        "topk",
+        name="gluon_sqrt_softplus_topk_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            format_signature(router_logits=dense_tensor_format(dtype))
+            for dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ),
+        # Measured to beat the Triton top-k at every batch from 1 to 16384 rows,
+        # so unlike gfx950 it is not limited to decode batches.
+        traits={
+            "experts": frozenset({256, 384}),
+            "top_k": frozenset({6}),
+            "renormalize": frozenset({False, True}),
+            "routing_kind": frozenset({"plain", "bias", "hash"}),
+            "score_function": frozenset({"sqrt_softplus"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_sqrt_softplus_topk_gfx1250(
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        hash_indices_table: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        need_scores: bool,
+        routed_scaling_factor: float,
+        weights_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        weights, ids, scores = _topk_gfx1250_impl(
+            router_logits,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            need_scores,
+            routed_scaling_factor,
+        )
+        return weights.to(weights_dtype), ids, scores
+
+    @register_kernel(
+        "moe",
+        "router_topk",
+        name="gluon_router_sqrt_softplus_topk_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    gate_weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            # Measured to beat the FP32 router GEMM plus top-k up to 256 rows;
+            # the GEMV's serial row tiles lose badly beyond that.
+            "tokens": frozenset(range(1, 257)),
+            "experts": frozenset({256, 384}),
+            "hidden_alignment": frozenset({512}),
+            "top_k": frozenset({6}),
+            "routing_kind": frozenset({"plain", "bias", "hash"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_router_sqrt_softplus_topk_gfx1250(
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        hash_indices_table: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        routed_scaling_factor: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Split-K GEMV partials; the top-k kernel sums them in order.
+        partials = launch_gluon_router_sqrt_softplus_topk_gemv_gfx1250(
+            hidden_states, gate_weight
+        )
+        weights, ids, _ = _topk_gfx1250_impl(
+            partials,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            False,
+            routed_scaling_factor,
+        )
+        return weights, ids
+
+
+# ===-----------------------------------------------------------------------===#
 # Routing: sigmoid-bias top-k (AMD gfx950, gfx1250)
 # ===-----------------------------------------------------------------------===#
 

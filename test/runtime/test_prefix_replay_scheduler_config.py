@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 pytest.importorskip("tokenspeed_scheduler")
 
@@ -29,6 +32,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
         storage_config=None,
@@ -147,6 +151,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         prefill_compute_budget=None,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
         storage_config=(
@@ -174,7 +179,7 @@ def test_private_context_rejects_kvstore_even_without_prefix_caching() -> None:
         _resolve_replay(enable_prefix_caching=False, enable_kvstore=True)
 
 
-def test_make_config_preserves_prefill_compute_calibration():
+def test_make_config_preserves_prefill_compute_calibration() -> None:
     config = make_config(
         num_device_pages=32,
         max_scheduled_tokens=64,
@@ -189,8 +194,11 @@ def test_make_config_preserves_prefill_compute_calibration():
         storage_config=None,
         host_write_policy="write_through",
         prefill_compute_budget=[2.5, 40, 0.01, 5000],
+        host_group_packing=(),
+        max_kv_page_num=32,
     )
     compute = config.prefill_compute
     assert compute.budget_ns == 2_500_000
     assert compute.cost(100, 200) == pytest.approx(5000 + 40 * 100 + 0.01 * 100 * 250.5)
     assert _make_config().prefill_compute is None
+    assert config.max_kv_page_num == 32

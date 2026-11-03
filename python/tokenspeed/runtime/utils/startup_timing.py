@@ -63,7 +63,8 @@ def startup_phase(name: str, *, rank: int | None = None, role: str | None = None
 
     Durations are inclusive host wall time, not device execution time. Wall
     timestamps permit approximate cross-process alignment on synchronized
-    hosts. Triton deltas count observed compilations, not cache lookups.
+    hosts. JIT deltas count observed Triton and CuTe DSL compilations, not
+    cache lookups.
     """
     if not envs.TOKENSPEED_STARTUP_TIMING.get():
         yield
@@ -107,12 +108,12 @@ def startup_phase(name: str, *, rank: int | None = None, role: str | None = None
                 "duration_s": elapsed,
                 "status": status,
                 "error_type": error_type,
-                "triton_compiles": (
+                "jit_compiles": (
                     after.startup_compiles - before.startup_compiles
                     if before is not None and after is not None
                     else None
                 ),
-                "triton_compile_s": (
+                "jit_compile_s": (
                     after.startup_seconds - before.startup_seconds
                     if before is not None and after is not None
                     else None

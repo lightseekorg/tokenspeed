@@ -19,6 +19,8 @@
 # SOFTWARE.
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -29,31 +31,40 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
+_HAS_TRTLLM_KERNEL = (
+    platform.is_nvidia and importlib.util.find_spec("trtllm_kernel") is not None
+)
 __all__ = []
 
-if platform.is_nvidia:
+
+def _per_token_group_quant_8bit(
+    x: torch.Tensor, group_size: int, use_ue8m0: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _HAS_TRTLLM_KERNEL:
+        raise RuntimeError(
+            "TRT-LLM FP8 quantization requires a compatible trtllm_kernel package"
+        )
+    if group_size != 128:
+        raise ValueError(
+            "trtllm fp8_quantize_1x128 only supports group_size=128, "
+            f"got {group_size}"
+        )
+    q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+    if scale.ndim == 1:
+        # The flat-buffer ABI uses 4-row alignment and trailing padding.
+        rows, columns = x.shape
+        padded_rows = (rows + 3) // 4 * 4
+        groups = columns // group_size
+        scale = scale[: groups * padded_rows].view(groups, padded_rows)[:, :rows]
+    return q, scale
+
+
+if _HAS_TRTLLM_KERNEL:
     # DeepEP must initialize before TRT-LLM's static CUDA runtime.
     import deep_ep  # noqa: F401
     import trtllm_kernel  # noqa: F401
 
     _FP8_DTYPE = torch.float8_e4m3fn
-
-    def _per_token_group_quant_8bit(
-        x: torch.Tensor, group_size: int, use_ue8m0: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if group_size != 128:
-            raise ValueError(
-                "trtllm fp8_quantize_1x128 only supports group_size=128, "
-                f"got {group_size}"
-            )
-        q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
-        if scale.ndim == 1:
-            # The flat-buffer ABI uses 4-row alignment and trailing padding.
-            rows, columns = x.shape
-            padded_rows = (rows + 3) // 4 * 4
-            groups = columns // group_size
-            scale = scale[: groups * padded_rows].view(groups, padded_rows)[:, :rows]
-        return q, scale
 
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor

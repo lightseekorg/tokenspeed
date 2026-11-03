@@ -30,11 +30,6 @@ FLASH_MLA_PAGE_SIZE = 64
 # (block-split FP8 payload + FP32 scales).
 DSA_SPARSE_PAGE_SIZE = 64
 
-# DeepSeek V4 kernels consume compressed-KV pages spanning this many raw
-# tokens (256 / compress_ratio rows per page). The V4 cache spec and the
-# model's default prefix granularity both derive from it.
-DEEPSEEK_V4_PAGE_SIZE = 256
-
 # V4.1 FlatKV has 64-row global pages: raw spans are 128 (ratio 2) and
 # 64 (ratio 1). SWA remains a separate 64-token page address domain.
 DEEPSEEK_V41_SWA_PAGE_SIZE = 64

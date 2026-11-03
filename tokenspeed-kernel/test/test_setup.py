@@ -121,10 +121,8 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "tokenspeed-triton",
         "tokenspeed-kernel-amd",
         "tokenspeed-iris",
-        "triton",
         "torch",
     } <= requirements.keys()
-    assert str(requirements["triton"].specifier) == "==3.8.0"
     assert {
         specifier.operator
         for specifier in requirements["tokenspeed-kernel-amd"].specifier

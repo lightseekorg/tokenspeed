@@ -158,7 +158,6 @@ def _backend_config(device: str, *, spec_tokens: int = 1):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=64,
         context_len=4096,
         max_bs=8,
         is_draft=False,
