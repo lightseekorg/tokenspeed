@@ -256,10 +256,12 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                 "Host block bucket is outside the group's shard count");
         ++need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
     }
+    // Host rows land in their source's bucket: no dense blocks, no free-bucket pairs.
     const std::vector<std::int64_t> no_dense_need(groups_.size(), 0);
+    const std::vector<std::int64_t> no_pair_need(groups_.size(), 0);
     ShadowOccupancy shadow{*host_pool_, groups_};
     // Nothing is evicted while free capacity fits every segment.
-    if (shadow.Fits(need_by_bucket, no_dense_need)) {
+    if (shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
         return HostPlacementPlan{.num_placed = segments.size()};
     }
     // These snapshots and indexes live for one plan only. Allocate their
@@ -615,7 +617,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     // page by page would otherwise be walked once per page).
     std::pmr::unordered_set<const BoundaryTree::Node*> walked_by_taken_victims{&scratch};
     bool added_kv_duplicates = false;
-    while (!shadow.Fits(need_by_bucket, no_dense_need)) {
+    while (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
         // Descendants taken in this plan can bring an aged checkpoint within
         // the leaf distance, where it ranks by its own use.
         while (!candidates.empty() && candidates.top().aged_distance != 0 &&
@@ -637,7 +639,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                     victim.reason = &HostEvictionStats::duplicate_kv;
                     victims.push_back(std::move(victim));
                 }
-                return !shadow.Fits(need_by_bucket, no_dense_need);
+                return !shadow.Fits(need_by_bucket, no_dense_need, no_pair_need);
             });
             added_kv_duplicates = true;
             continue;
@@ -803,7 +805,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
     }
 
     // Whole segments go, the last first, while the rest cannot fit.
-    while (!shadow.Fits(need_by_bucket, no_dense_need)) {
+    while (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
         _assert(num_placed_segments > 0, "a batch without rows always fits");
         --num_placed_segments;
         const HostSegmentRows& dropped = segments[num_placed_segments];
@@ -823,7 +825,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         for (const auto& [group_id, location] : victim.members) {
             shadow.Restore(group_id, location);
         }
-        if (!shadow.Fits(need_by_bucket, no_dense_need)) {
+        if (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
             for (const auto& [group_id, location] : victim.members) {
                 shadow.Remove(group_id, location);
             }

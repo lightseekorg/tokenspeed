@@ -47,12 +47,13 @@ TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {
     shadow.Remove(0, held->Location());
 
     const std::vector<std::int64_t> dense{0, 0};
+    const std::vector<std::int64_t> pairs{0, 0};
     const std::vector<std::vector<std::int64_t>> mixed{{2}, {1}};
     const std::vector<std::vector<std::int64_t>> history_only{{8}, {0}};
     const std::vector<std::vector<std::int64_t>> state_only{{0}, {1}};
-    EXPECT_FALSE(shadow.Fits(mixed, dense));
-    EXPECT_TRUE(shadow.Fits(history_only, dense));
-    EXPECT_TRUE(shadow.Fits(state_only, dense));
+    EXPECT_FALSE(shadow.Fits(mixed, dense, pairs));
+    EXPECT_TRUE(shadow.Fits(history_only, dense, pairs));
+    EXPECT_TRUE(shadow.Fits(state_only, dense, pairs));
     EXPECT_EQ(host.NumEmptyLcmBlocks(), 0);  // The plan has not mutated storage.
 }
 
