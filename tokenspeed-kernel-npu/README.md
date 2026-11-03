@@ -195,3 +195,11 @@ have zero output and natural-log LSE `-inf`. Cumulative Q/KV endpoints determine
 those rows, including mixed batches and history loops where only one request
 has keys. Nonempty rows keep their original output and LSE. Repeated prefix
 merges therefore preserve a zero-history request's current causal result.
+
+### Sampling dispatcher
+
+The Ascend sampler calls `torch.ops.custom` for filtering, categorical sampling,
+greedy/speculative verification and scratch allocation. Install the matching
+`flash_ops` package; the adapter uses its registered operators directly.
+Scratch tensors remain caller-owned across NPU Graph replay. Caller-supplied
+coins and the existing sampling arithmetic are preserved.
