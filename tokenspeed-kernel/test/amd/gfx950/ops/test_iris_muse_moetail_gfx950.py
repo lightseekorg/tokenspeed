@@ -39,10 +39,13 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (  # no
 )
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
+    ERROR_ABORT,
     ERROR_RECORD,
     ERROR_WORDS,
     Launch,
 )
+
+_ABORT = gl.constexpr(ERROR_ABORT)
 
 _SITE = gl.constexpr(91)
 _RECORD = gl.constexpr(ERROR_RECORD)
@@ -76,7 +79,10 @@ def _reduce_kernel(
     RELEASE: gl.constexpr,
 ):
     zero = gl.program_id(0) * 0
-    launch = Launch(zero, zero, zero, zero, zero, error_ptr, deadline_ticks)
+    launch = Launch(
+        zero, zero, zero, zero.to(gl.int64), zero, zero, zero, error_ptr,
+        error_ptr + _ABORT, deadline_ticks, error_ptr,
+    )  # fmt: skip
     stages = iris_muse_moetail_row_stages(epochs, row, LOCAL_WIDTH)
     values = iris_muse_moetail_reduce(
         region, stages, row, launch, _record_expiry, _SITE, WORLD_SIZE, LOCAL_WIDTH,
