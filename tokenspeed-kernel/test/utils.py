@@ -234,8 +234,8 @@ def vmcnt_zero_before_barrier(
     On gfx9 ``s_barrier`` does not wait for any counter, and a one-thread
     release waits (``s_waitcnt vmcnt(0)``) only for its own subgroup's stores
     to reach L2 before ``buffer_wbl2``. So each subgroup's vector stores and
-    atomics before the last barrier need an ``s_waitcnt vmcnt(0)`` before
-    that barrier. Walk every control-flow path of ``kernel`` (branches that
+    atomics need an ``s_waitcnt vmcnt(0)`` and then an ``s_barrier`` before
+    ``target``. Walk every control-flow path of ``kernel`` (branches that
     skip a block for inactive lanes model the subgroups that do not run it; a
     call may store) and return each line matching the ``target`` regex with
     whether that holds on all paths reaching it.
@@ -248,35 +248,37 @@ def vmcnt_zero_before_barrier(
         for index in range(start, end)
         if (match := re.match(r"^(\.LBB\w+):", lines[index]))
     }
-    # State per line: (this subgroup may have stores not yet counted out of
-    # vmcnt, some subgroup may have passed the last barrier with such stores).
-    seen: dict[int, tuple[bool, bool]] = {}
-    work = [(start + 1, False, False)]
+    # State per line: this subgroup may have stores not yet counted out of
+    # vmcnt; it may have stores issued since the last barrier; some subgroup
+    # may have passed the last barrier with stores still counted in vmcnt.
+    seen: dict[int, tuple[bool, bool, bool]] = {}
+    work = [(start + 1, (False, False, False))]
     while work:
-        index, pending, unsafe = work.pop()
+        index, state = work.pop()
         while index < end:
-            old = seen.get(index, (False, False))
-            new = (old[0] or pending, old[1] or unsafe)
-            if index in seen and new == old:
+            old = seen.get(index)
+            new = state if old is None else tuple(a or b for a, b in zip(old, state))
+            if new == old:
                 break
             seen[index] = new
-            pending, unsafe = new
+            pending, unbarriered, unsafe = new
             line = lines[index].split(";")[0]
             if re.search(r"\bs_waitcnt\b.*\bvmcnt\(0\)", line):
                 pending = False
             elif _VECTOR_WRITE.search(line) or "s_swappc" in line:
-                pending = True
+                pending = unbarriered = True
             elif re.search(r"\bs_barrier\b", line):
-                unsafe = pending
+                unsafe, unbarriered = pending, False
+            state = (pending, unbarriered, unsafe)
             if match := re.search(r"\bs_(cbranch_\w+|branch)\s+(\.LBB\w+)", line):
-                work.append((labels[match[2]], pending, unsafe))
+                work.append((labels[match[2]], state))
                 if match[1] == "branch":
                     break
             if re.search(r"\bs_(endpgm|setpc_b64)\b", line):
                 break
             index += 1
     return [
-        (lines[index].strip(), not seen[index][1])
+        (lines[index].strip(), not (seen[index][1] or seen[index][2]))
         for index in sorted(seen)
         if re.search(target, lines[index].split(";")[0])
     ]

@@ -1376,10 +1376,7 @@ def iris_pull_oneshot(
         tile_id += NUM_PROGRAMS
 
     # Do not return while a peer program can still be reading this rank's
-    # input. The next producer reuses the same symmetric buffer. Each
-    # subgroup's peer reads returned before it stored their sum; the barrier
-    # holds the release until every subgroup has stored.
-    gl.barrier()
+    # input. The next producer reuses the same symmetric buffer.
     completion_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,
@@ -1565,12 +1562,12 @@ def iris_pull_twoshot(
         )
         tile_id += NUM_PROGRAMS
 
-    # Every subgroup stored part of the partition. A barrier does not wait for
-    # memory, and the one-thread release below waits only for its own
-    # subgroup's stores before writing back L2. So each subgroup first waits
-    # until its stores reach L2 (s_waitcnt vmcnt(0) on gfx950).
+    # Every subgroup stored part of the partition. The barrier the compiler
+    # inserts before the one-thread release does not wait for memory, and the
+    # release waits only for its own subgroup's stores before writing back L2.
+    # So each subgroup first waits until its stores reach L2 (s_waitcnt
+    # vmcnt(0) on gfx950).
     WAIT_STORES(args=[], constraints="=r,~{memory}")
-    gl.barrier()
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,
@@ -1639,9 +1636,6 @@ def iris_pull_twoshot(
         # entry wait follows each peer workgroup's gather of the same tiles.
         # The staged two-shot keeps this extra rendezvous; producer-direct
         # callers and ProducerAllReduce.reduce_ordinary pass False.
-        # Each subgroup's peer reads returned before it stored their values;
-        # the barrier holds the release until every subgroup has stored.
-        gl.barrier()
         reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
         _iris_sync_rank_epoch(
             ready_flags,
