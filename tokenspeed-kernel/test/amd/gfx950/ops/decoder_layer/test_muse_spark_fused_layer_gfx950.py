@@ -43,10 +43,7 @@ between replay and eager.
 """
 
 import socket
-import sys
 import traceback
-from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 import torch
@@ -62,24 +59,28 @@ if not (
 ):
     pytest.skip("needs 8 gfx950 GPUs", allow_module_level=True)
 
-# make_experts lives with the native MoE tests.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "moe"))
-
-from native_moe_helpers import make_experts  # noqa: E402
+from muse_layer_builder import (  # noqa: E402
+    EPS,
+    HEAD_DIM,
+    INTER,
+    KV_HEADS,
+    KV_WIDTH,
+    POOLED,
+    Q_HEADS,
+    Q_WIDTH,
+    TOPK,
+    TRAITS,
+    WIDTH,
+    build_layer_inputs,
+    fresh_next_prologue,
+)
 from tokenspeed_kernel.numerics.torch.residual import (  # noqa: E402
     torch_post_norm_residual_pre_norm,
 )
 from tokenspeed_kernel.ops.attention.mha import (  # noqa: E402
-    mha_decode_schedule,
     mha_decode_with_kvcache,
 )
-from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
-    HeadKVCache,
-    HeadNorm,
-    RopeStyle,
-    Rotary,
-    gqa_prologue,
-)
+from tokenspeed_kernel.ops.attention.prologue import gqa_prologue  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
     BOX_WORDS,
 )
@@ -106,179 +107,14 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E
     empty_swizzled_cdna4_mxfp4_scale,
 )
 
-# Muse Spark per rank at TP 8 / EP1.
-HIDDEN, POOLED, EXPERTS, TOPK, INTER = 8192, 4096, 256, 8, 512
-Q_HEADS, KV_HEADS, HEAD_DIM = 16, 2, 64
-Q_WIDTH, KV_WIDTH = Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM
-WIDTH, PAGE, WINDOW_LEFT = 8, 64, 2047
 # Cached tokens per request before the verify rows. Full layers read the
 # whole context: one request at ~141k (the served context), and two, whose
 # split schedule then gives workgroups two items.
 CONTEXT = {"sliding": (1500, 2600), "full": (141_000, 141_000)}
-MAX_POSITION = 1 << 18
-EPS, POST_EPS = 1e-5, 1e-8
-TRAITS = dict(verify_width=WIDTH, tp_size=WORLD, ep_size=1, kv_cache_dtype="fp8_e4m3")
 SWIGLU = dict(swiglu_alpha=1.0, swiglu_limit=0.0, swiglu_beta=0.0)
 # 8th vs 9th biased routing score: far above the logit error of a reordered
 # FP32 sum over 8192 products (~2**-20 relative).
 ROUTING_GAP = 1e-3
-
-
-@dataclass(frozen=True)
-class _DecodeCache:
-    """The fields of the runtime's DecodeKVView the launch reads."""
-
-    k_cache: torch.Tensor
-    v_cache: torch.Tensor
-    page_table: torch.Tensor
-    seq_lens: torch.Tensor
-    max_seqlen_k: int
-    split_schedule: torch.Tensor | None
-    window_left: int
-
-
-@dataclass(frozen=True)
-class _PrologueTarget:
-    """The fields of the runtime's GQAPrologueTarget the launch reads."""
-
-    cache: HeadKVCache
-    norm: HeadNorm
-    rotary: Rotary | None
-    query_dtype: torch.dtype
-
-
-def _randn(generator, *shape, scale=1.0, dtype=torch.bfloat16):
-    values = torch.randn(shape, device="cuda", generator=generator) * scale
-    return values.to(dtype)
-
-
-def _norm(generator, width, eps):
-    # Zero-centered gains (offset 1.0), as Muse's norms store them.
-    return _randn(generator, width, scale=0.1), eps, 1.0
-
-
-def _weights(rank):
-    """One layer's weights as ``MuseSparkDecoderLayer.fused_weights`` hands
-    them over: replicated tensors equal on every rank, slices per rank."""
-    shared = torch.Generator(device="cuda").manual_seed(0)
-    local = torch.Generator(device="cuda").manual_seed(100 + rank)
-    gates = [
-        torch.rand(HIDDEN, device="cuda", generator=shared) * 0.2 + low
-        for low in (0.8, 0.1, 0.8, 0.1)
-    ]
-    weights = {
-        "attention": dict(scale=HEAD_DIM**-0.5, window_left=WINDOW_LEFT, gate_eps=EPS),
-        "o_proj": _randn(local, HIDDEN, Q_WIDTH, scale=Q_WIDTH**-0.5),
-        # Muse's post-attention norm has no weight.
-        "post_attention_norm": (None, POST_EPS, 1.0),
-        "post_attention_gate": (gates[0], gates[1]),
-        "pre_feedforward_norm": _norm(shared, HIDDEN, EPS),
-        "router": _randn(shared, HIDDEN, EXPERTS, dtype=torch.float32),
-        "router_multiplier": 0.125,
-        "router_bias": torch.randn(EXPERTS, device="cuda", generator=shared) * 0.05,
-        "routed_scaling_factor": 2.5,
-        "pooler": _randn(shared, POOLED, HIDDEN, scale=HIDDEN**-0.5),
-        "pooler_replicated": True,
-        "pooled_norm": _norm(shared, POOLED, EPS),
-        "experts": make_experts(EXPERTS, "cuda", 1000 + rank)[0],
-        "post_expert_proj": _randn(shared, HIDDEN, POOLED, scale=POOLED**-0.5),
-        "post_expert_replicated": True,
-        "post_expert_norm": _norm(shared, POOLED, POST_EPS),
-        "post_feedforward_norm": _norm(shared, HIDDEN, POST_EPS),
-        "post_feedforward_gate": (gates[2], gates[3]),
-        "next_input_norm": _norm(shared, HIDDEN, EPS),
-        "next_qkv_proj": _randn(
-            local, Q_WIDTH * 2 + KV_WIDTH * 2, HIDDEN, scale=HIDDEN**-0.5
-        ),
-    }
-    return weights
-
-
-def _cos_sin():
-    inv = 10000.0 ** (-torch.arange(0, HEAD_DIM, 2, device="cuda") / HEAD_DIM)
-    angles = torch.arange(MAX_POSITION, device="cuda")[:, None] * inv[None, :]
-    return torch.cat((angles.cos(), angles.sin()), dim=-1).float().contiguous()
-
-
-def _inputs(key):
-    """One verify step of ``key.requests`` requests: the prepared query, the
-    FP8 caches of this layer (holding every key the step reads) and the next,
-    the page table and the write slots. The same on every rank, which reads
-    them as its own heads."""
-    generator = torch.Generator(device="cuda").manual_seed(7 + key.requests)
-    requests = key.requests
-    rows = requests * WIDTH
-    lengths = CONTEXT[key.layer_kind][:requests]
-    per_request = -(-(max(lengths) + WIDTH) // PAGE)
-    total = requests * per_request
-    pages = torch.randperm(total, device="cuda", generator=generator).to(torch.int32)
-    page_table = pages.view(requests, per_request).contiguous()
-    context = torch.tensor(lengths, device="cuda")
-    seq_lens = (context + WIDTH).to(torch.int32)
-    positions = (context[:, None] + torch.arange(WIDTH, device="cuda")).flatten()
-    page_of = page_table.long().gather(1, (positions.view(requests, WIDTH) // PAGE))
-    slots = (page_of * PAGE + positions.view(requests, WIDTH) % PAGE).flatten()
-
-    def cache(scale):
-        values = torch.randn(
-            (total, PAGE, KV_HEADS, HEAD_DIM), device="cuda", generator=generator
-        )
-        return (values * scale).to(torch.float8_e4m3fn)
-
-    q = (_randn(generator, rows, Q_WIDTH, dtype=torch.float32) * 2).to(
-        torch.float8_e4m3fn
-    )
-    gate = _randn(generator, rows, Q_WIDTH)
-    residual = _randn(generator, rows, HIDDEN, dtype=torch.float32)
-    next_k = torch.zeros((total, PAGE, KV_HEADS, HEAD_DIM), device="cuda").to(
-        torch.float8_e4m3fn
-    )
-    norm_generator = torch.Generator(device="cuda").manual_seed(3)
-    head_norm = HeadNorm(
-        _randn(norm_generator, HEAD_DIM, scale=0.1),
-        _randn(norm_generator, HEAD_DIM, scale=0.1),
-        1.0,
-        EPS,
-    )
-    rotary = (
-        None
-        if key.next_kind == "full"
-        else Rotary(_cos_sin(), positions, RopeStyle.GPTJ, None)
-    )
-    k_cache, v_cache = cache(1.0), cache(1.0)
-    window_left = WINDOW_LEFT if key.layer_kind == "sliding" else -1
-    schedule = None
-    if key.layer_kind == "full":
-        # The backend's call: the forward's balanced schedule, in place.
-        schedule = mha_decode_schedule(
-            q=q.view(rows, Q_HEADS, HEAD_DIM), k_cache=k_cache, v_cache=v_cache,
-            cache_seqlens=seq_lens, max_seqlen_q=WIDTH,
-            out=torch.zeros((requests + 1, 2), dtype=torch.int32, device="cuda"),
-        )  # fmt: skip
-        assert schedule is not None
-    return dict(
-        prepared_query=(q, gate),
-        residual=residual,
-        positions=positions,
-        cache=_DecodeCache(
-            k_cache, v_cache, page_table, seq_lens, MAX_POSITION, schedule, window_left
-        ),
-        next_k=next_k,
-        next_v=next_k.clone(),
-        slots=slots,
-        head_norm=head_norm,
-        rotary=rotary,
-    )
-
-
-def _next_prologue(inputs, k_cache, v_cache):
-    flat = (-1, KV_HEADS, HEAD_DIM)
-    return _PrologueTarget(
-        HeadKVCache(k_cache.view(flat), v_cache.view(flat), None, inputs["slots"]),
-        inputs["head_norm"],
-        inputs["rotary"],
-        torch.float8_e4m3fn,
-    )
 
 
 def _run(fused, key, inputs):
@@ -291,15 +127,12 @@ def _run(fused, key, inputs):
             inputs["prepared_query"], residual, next_norm=inputs["next_norm"], **common
         )
         return dict(normed=normed, residual=residual)
-    next_k, next_v = inputs["next_k"].clone(), inputs["next_v"].clone()
+    target = fresh_next_prologue(inputs["next_prologue"])
     (q, gate), residual = fused.forward(
-        inputs["prepared_query"],
-        residual,
-        next_prologue=_next_prologue(inputs, next_k, next_v),
-        **common,
+        inputs["prepared_query"], residual, next_prologue=target, **common
     )
     return dict(q=q.reshape(q.shape[0], -1), gate=gate, residual=residual,
-                next_k=next_k, next_v=next_v)  # fmt: skip
+                next_k=target.cache.k_cache, next_v=target.cache.v_cache)  # fmt: skip
 
 
 def _attention(inputs):
@@ -402,14 +235,13 @@ def _reference(key, weights, inputs):
         torch.bfloat16
     )
     q, k, v, next_gate = qkvg.split((Q_WIDTH, KV_WIDTH, KV_WIDTH, Q_WIDTH), dim=-1)
-    next_k, next_v = inputs["next_k"].clone(), inputs["next_v"].clone()
-    target = _next_prologue(inputs, next_k, next_v)
+    target = fresh_next_prologue(inputs["next_prologue"])
     prepared = gqa_prologue(
         q, k, v, norm=target.norm, rotary=target.rotary, cache=target.cache,
         query_dtype=target.query_dtype, return_kv=False, solution=None, override=None,
     )  # fmt: skip
     return dict(q=prepared.q, gate=next_gate, residual=stream.float(),
-                next_k=next_k, next_v=next_v)  # fmt: skip
+                next_k=target.cache.k_cache, next_v=target.cache.v_cache)  # fmt: skip
 
 
 def _relative_rms(actual, expected):
@@ -493,20 +325,17 @@ def _worker(rank, port, record_dir, errors):
             failure_record_path=f"{record_dir}/rank{rank}.bin",
             device=torch.device("cuda", rank),
         )
-        base = _weights(rank)
         for key in PLAN_KEYS:
-            window_left = WINDOW_LEFT if key.layer_kind == "sliding" else -1
-            weights = dict(
-                base, attention=dict(base["attention"], window_left=window_left)
-            )
+            weights, inputs = build_layer_inputs(
+                key, rank, 0, torch.device("cuda", rank),
+                CONTEXT[key.layer_kind][: key.requests],
+            )  # fmt: skip
             fused = prepare_decoder_layer(
                 recipe="muse_spark", plan_keys=[key], traits=TRAITS,
                 weights=weights, state=state,
             )  # fmt: skip
             assert fused is not None
             assert fused.decline_reasons(key.requests) == [], key
-            inputs = _inputs(key)
-            inputs["next_norm"] = weights["next_input_norm"]
             expected = _reference(key, weights, inputs)
             expected["slots"] = inputs["slots"]
             actual = _run(fused, key, inputs)
