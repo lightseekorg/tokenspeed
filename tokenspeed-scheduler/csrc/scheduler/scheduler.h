@@ -82,6 +82,9 @@ struct HostCacheStats {
     // once, no probe being able to resume from it on the Host (dead entries,
     // never written back).
     std::uint64_t dead_entries_not_written_back{0};
+    // What they dropped the same way because it never reaches Host: a
+    // sliding group's Device-only slid-out pages.
+    std::uint64_t device_only_entries_not_written_back{0};
     CacheCoordinator::DeviceEvictionStats device_evictions;
     // CacheCoordinator::CheckpointResumeGaps, the gaps an admission resumed
     // a State checkpoint after, on either tier.

@@ -56,7 +56,7 @@ public:
         const Candidate* request =
             next_request_ < request_candidates.size() ? &request_candidates[next_request_] : nullptr;
         if (!next_cached_) {
-            next_cached_ = candidates_->Next(request ? request->rank_epoch : std::numeric_limits<std::uint64_t>::max());
+            next_cached_ = candidates_->Next(request ? request->rank : std::numeric_limits<std::uint64_t>::max());
         }
         if (request && (!next_cached_ || CacheEvictionCandidates::Before(*request, *next_cached_))) {
             ++next_request_;
