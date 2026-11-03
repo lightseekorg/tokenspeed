@@ -51,7 +51,9 @@ rows or expert weights on one L2.
 
 A wave keeps at most about ten TDM instructions in flight, so decode streams
 weights in wide K steps: one 3-D load brings a step's gate and up rows, and
-16-bit gather indices cover 16 rows per instruction.
+16-bit gather indices cover 16 rows per instruction. Gate/up tiles shorter
+than 128 rows gather with 32-bit indices instead: their 16-bit gathers
+intermittently fault with a memory aperture violation or load wrong rows.
 """
 
 from __future__ import annotations
@@ -1247,7 +1249,7 @@ def _launch_gate_up(
         EXPERT_PAD=_expert_pad(num_experts, cfg.num_warps),
         TOP_K=top_k,
         HAS_LIMIT=swiglu_limit is not None,
-        INDEX_16=num_tokens <= _MAX_INDEX_16_ROWS,
+        INDEX_16=cfg.block_m >= 128 and num_tokens <= _MAX_INDEX_16_ROWS,
         BLOCK_M=cfg.block_m,
         BLOCK_N=cfg.block_n,
         BLOCK_K=cfg.block_k,
