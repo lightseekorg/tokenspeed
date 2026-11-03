@@ -3015,8 +3015,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
     std::vector<std::uint32_t> groups;
     std::vector<std::int32_t> buckets;
     while (candidate.max_tokens > device_only.num_common_tokens) {
-        // Retain capacity across retries, but release the previous candidate's
-        // warm references before probing or allocating for a shorter boundary.
+        // Release rejected candidates' warm pins before the next probe.
         warm_blocks.clear();
         groups.clear();
         buckets.clear();
