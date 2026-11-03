@@ -1084,6 +1084,7 @@ def _launch_mxfp4_route_tiles(
         sorted_routes,
         descriptors,
         group_count,
+        descriptors.shape[0],
         out,
         INTERMEDIATE=inter_dim,
         OUTPUT=out_dim,
