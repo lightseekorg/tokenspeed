@@ -2058,9 +2058,12 @@ std::int32_t CacheCoordinator::TrimUnprovenStateCheckpoints(std::int32_t limit) 
     if (unproven <= limit) {
         return 0;
     }
-    // The admission planner's order among unproven checkpoints: the least
-    // recently used request's first, the shallowest of them first, so the
-    // deepest checkpoint of a chain stays.
+    // Plain LRU by each checkpoint's own access epoch, the oldest first, then
+    // the shallowest (then the block location, for a fixed order). A request
+    // publishes all of its checkpoints at its own epoch, so the least recently
+    // used request's leave first and the deepest checkpoint of a chain stays.
+    // Unlike the admission planner, the trim does not rank an aged checkpoint
+    // at its retention rank (CheckpointAging).
     std::ranges::sort(evictable, {}, [](const Unproven& entry) {
         return std::tuple{entry.last_access_epoch, entry.logical_block_index, entry.location.lcm_block_id,
                           entry.location.slot_index};
