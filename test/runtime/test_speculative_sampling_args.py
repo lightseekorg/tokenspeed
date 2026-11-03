@@ -87,12 +87,14 @@ def test_refuses_block_drafters(algorithm):
         _args(speculative_algorithm=algorithm)
 
 
-def test_dspark_block_verification_requires_both_opt_in_flags():
-    args = _args(speculative_algorithm="DSPARK", enable_block_rejection=True)
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])
+def test_block_verification_requires_both_opt_in_flags(algorithm):
+    args = _args(speculative_algorithm=algorithm, enable_block_rejection=True)
     assert args.enable_block_rejection and args.enable_speculative_sampling
+    assert args.speculative_eagle_topk == 1
     with pytest.raises(ValueError, match="enable-block-rejection requires"):
         _args(
-            speculative_algorithm="DSPARK",
+            speculative_algorithm=algorithm,
             enable_block_rejection=True,
             enable_speculative_sampling=False,
         )
@@ -101,8 +103,15 @@ def test_dspark_block_verification_requires_both_opt_in_flags():
 @pytest.mark.parametrize(
     "changes",
     [
-        {"speculative_algorithm": "EAGLE3"},
+        {"speculative_algorithm": "MTP"},
         {"speculative_algorithm": "DFLASH"},
+        # Block verification is defined on one chain, not a draft tree.
+        {
+            "speculative_algorithm": "EAGLE3",
+            "speculative_eagle_topk": 2,
+            "speculative_num_steps": 3,
+            "speculative_num_draft_tokens": 8,
+        },
         {"sampling_backend": "flashinfer_full"},
         {"sampling_backend": "greedy"},
         {"disaggregation_mode": "decode"},
@@ -115,9 +124,10 @@ def test_block_verification_refuses_unvalidated_execution_modes(changes):
         _args(**kwargs)
 
 
-def test_block_verification_accepts_synthetic_benchmark_acceptance():
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])
+def test_block_verification_accepts_synthetic_benchmark_acceptance(algorithm):
     args = _args(
-        speculative_algorithm="DSPARK",
+        speculative_algorithm=algorithm,
         enable_block_rejection=True,
         synthetic_acceptance_length=3.36,
     )

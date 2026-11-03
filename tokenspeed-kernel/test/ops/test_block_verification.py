@@ -161,6 +161,42 @@ def test_joint_output_law_monte_carlo():
     np.testing.assert_allclose(counts, (p0[:, None] * p1).ravel(), atol=0.012, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires GPU"
+            ),
+        ),
+    ],
+)
+def test_draft_without_full_vocab_support_keeps_target_law(device):
+    # A hot-token draft head (EAGLE3) records q as zero outside its own
+    # vocabulary, so target mass there is reachable only through the residual.
+    rng = np.random.default_rng(7)
+    p0 = np.array([0.2, 0.3, 0.5])
+    q0 = np.array([0.6, 0.4, 0.0])
+    b = 20000
+    c1 = rng.choice(3, size=b, p=q0)
+    p = np.stack([np.broadcast_to(p0, (b, 3)), np.full((b, 3), 1 / 3)], axis=1)
+    q = np.stack([np.broadcast_to(q0, (b, 3)), np.zeros((b, 3))], axis=1)
+    out, _, _ = run(
+        p,
+        q,
+        np.stack([np.zeros(b), c1], axis=1),
+        rng.random((b, 2)),
+        rng.random(b),
+        device,
+    )
+    first = out.reshape(b, 2)[:, 0].numpy()
+    np.testing.assert_allclose(
+        np.bincount(first, minlength=3) / b, p0, atol=0.012, rtol=0
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("n,v", [(1, 2), (3, 17), (5, 2051), (8, 32001)])
 def test_gpu_matches_cpu(n, v):

@@ -126,6 +126,9 @@ PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
 AUX_CAPTURE_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4")
 #: Drafters that propose one token per draft step (a chain of steps + 1 tokens, or a tree).
 STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
+# Drafters whose topk=1 chain can record sampled proposals for block
+# verification (--enable-block-rejection).
+BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "EAGLE3")
 
 
 def expert_placement_requested(server_args) -> bool:
@@ -600,7 +603,8 @@ class ServerArgs:
     # target distribution; this one trades a sampled proposal for a higher
     # acceptance rate under sampling temperatures.
     enable_speculative_sampling: bool = False
-    # Opt-in DSpark block verification; OFF preserves the existing verifier.
+    # Opt-in block verification for DSpark and EAGLE3 topk=1 chains; OFF
+    # preserves the existing verifier.
     enable_block_rejection: bool = False
     # Recorded draft probabilities above this value mark a slot with no
     # proposal (fresh admission, PD landing): always reject. Sentinel rows
@@ -1567,8 +1571,8 @@ class ServerArgs:
                     f"[1, {self.speculative_num_draft_tokens}] "
                     "(the speculative verify width including the target token)"
                 )
-            # Block rejection keeps stochastic DSpark drafting on the path and
-            # forces only the verify outcome, so it uses the flashinfer verifier.
+            # Block rejection keeps stochastic drafting on the path and forces
+            # only the verify outcome, so it uses the flashinfer verifier.
             if self.sampling_backend != "greedy" and not (
                 self.enable_block_rejection and self.sampling_backend == "flashinfer"
             ):
@@ -1659,7 +1663,8 @@ class ServerArgs:
         if self.enable_block_rejection:
             if (
                 not self.enable_speculative_sampling
-                or self.speculative_algorithm != "DSPARK"
+                or self.speculative_algorithm not in BLOCK_REJECTION_ALGORITHMS
+                or self.speculative_eagle_topk != 1
                 or self.sampling_backend != "flashinfer"
                 or self.dp_sampling
                 or self.mapping.has_attn_dp
@@ -1667,7 +1672,8 @@ class ServerArgs:
                 or self.disaggregation_mode != "null"
             ):
                 raise ValueError(
-                    "--enable-block-rejection requires DSPARK, --enable-speculative-sampling, "
+                    "--enable-block-rejection requires a DSPARK or EAGLE3 chain "
+                    "(--speculative-eagle-topk 1), --enable-speculative-sampling, "
                     "the flashinfer sampling backend, and aggregate TP without attention DP, "
                     "DP sampling, or pipeline parallelism"
                 )
@@ -1677,7 +1683,7 @@ class ServerArgs:
                 # standard draft-probability verify runs for its cost, and the
                 # synthetic length replaces both its outcome and block rejection.
                 logger.warning(
-                    "Block rejection with synthetic acceptance: DSpark drafts are "
+                    "Block rejection with synthetic acceptance: drafts are "
                     "sampled and recorded, but the accepted length is forced and "
                     "the block verifier is not run."
                 )
@@ -3602,8 +3608,9 @@ class ServerArgs:
             "--enable-block-rejection",
             action="store_true",
             default=ServerArgs.enable_block_rejection,
-            help="Opt in to DSpark stochastic drafting and block rejection verification. "
-            "Requires --enable-speculative-sampling and --sampling-backend flashinfer. "
+            help="Opt in to block rejection verification of sampled DSPARK or EAGLE3 "
+            "chain drafts (--speculative-eagle-topk 1). Requires "
+            "--enable-speculative-sampling and --sampling-backend flashinfer. "
             "Supports aggregate TP (including DCP), without DP or PP. "
             "With --synthetic-acceptance-length, drafts stay sampled but the "
             "accepted length is forced (benchmark only); greedy requests remain greedy.",
