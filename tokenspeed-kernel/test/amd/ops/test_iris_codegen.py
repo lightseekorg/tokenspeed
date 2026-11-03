@@ -192,3 +192,70 @@ def test_iris_arch_policy_codegen(arch, tmp_path):
     assert all(re.search(isa["system"], line) for line in atomics), atomics
 
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 codegen")
+@pytest.mark.parametrize("exit_barrier", [False, True])
+def test_iris_pull_twoshot_stores_reach_l2_before_release(exit_barrier):
+    """Every subgroup's partition stores reach L2 before the readiness release.
+
+    All eight subgroups store the reduced partition, and the release run by
+    one thread waits only for its own subgroup's stores. Compile without
+    launching and check that, on every path, each subgroup runs
+    s_waitcnt vmcnt(0) before the barrier preceding the entry and partition
+    releases.
+    """
+    from tokenspeed_kernel._triton import gl, gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+        iris_pull_twoshot,
+    )
+    from utils import vmcnt_zero_before_barrier
+
+    policy = iris_arch_policy(ArchVersion(9, 5))
+    fn = iris_pull_twoshot
+    pointers = ("input_sym_ptr", "scratch_sym_ptr", "output_ptr", "ready_flags")
+    signature = {name: "*bf16" for name in pointers[:3]}
+    signature["ready_flags"] = "*i32"
+    signature.update({f"heap_base_{peer}": "i64" for peer in range(8)})
+    signature.update({"PARTITION_WORDS": "i32", "NUM_PROGRAMS": "i32"})
+    signature["NUM_TILES"] = "i32"
+    constexprs = {
+        "RANK": 3,
+        "WORLD_SIZE": 8,
+        "BLOCK_WORDS": 128,
+        "NUM_WARPS": 8,
+        "WORDS_PER_LANE": 2,
+        "ELEMENT_DTYPE": gl.bfloat16,
+        "ELEMENTS_PER_WORD": 4,
+        "EXIT_BARRIER": exit_barrier,
+        "PEER_PAYLOAD_LOAD_CACHE": policy.peer_payload_load,
+        "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+        "WAIT_STORES": policy.wait_stores,
+        "residual": None,
+        "post": None,
+        "comb": None,
+        "HIDDEN_WORDS": 0,
+        "HC_POST": False,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    source = gluon._runtime.GluonASTSource(
+        fn, signature, constexprs=constexprs, attrs=attrs
+    )
+    kernel = triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 8},
+    )
+    releases = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"], "iris_pull_twoshot", r"\bglobal_atomic_add\b.*sc0 sc1"
+    )
+    # The exit release only reports returned peer reads, which each subgroup
+    # consumed before the barrier; its local output stores need not reach L2.
+    assert len(releases) == 2 + exit_barrier, releases
+    assert all(waited for _, waited in releases[:2]), releases

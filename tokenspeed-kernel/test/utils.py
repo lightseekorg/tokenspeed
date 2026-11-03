@@ -223,6 +223,65 @@ def votes_with_subgroup_mask(cycle: list[str]) -> bool:
     )
 
 
+_VECTOR_WRITE = re.compile(r"^\s*(?:buffer|global|flat|scratch)_(?:store|atomic)")
+
+
+def vmcnt_zero_before_barrier(
+    assembly: str, kernel: str, target: str
+) -> list[tuple[str, bool]]:
+    """Check that other subgroups' stores reached L2 before ``target`` runs.
+
+    On gfx9 ``s_barrier`` does not wait for any counter, and a one-thread
+    release waits (``s_waitcnt vmcnt(0)``) only for its own subgroup's stores
+    to reach L2 before ``buffer_wbl2``. So each subgroup's vector stores and
+    atomics before the last barrier need an ``s_waitcnt vmcnt(0)`` before
+    that barrier. Walk every control-flow path of ``kernel`` (branches that
+    skip a block for inactive lanes model the subgroups that do not run it; a
+    call may store) and return each line matching the ``target`` regex with
+    whether that holds on all paths reaching it.
+    """
+    lines = assembly.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"{kernel}:"))
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith(".Lfunc_end"))
+    labels = {
+        match[1]: index
+        for index in range(start, end)
+        if (match := re.match(r"^(\.LBB\w+):", lines[index]))
+    }
+    # State per line: (this subgroup may have stores not yet counted out of
+    # vmcnt, some subgroup may have passed the last barrier with such stores).
+    seen: dict[int, tuple[bool, bool]] = {}
+    work = [(start + 1, False, False)]
+    while work:
+        index, pending, unsafe = work.pop()
+        while index < end:
+            old = seen.get(index, (False, False))
+            new = (old[0] or pending, old[1] or unsafe)
+            if index in seen and new == old:
+                break
+            seen[index] = new
+            pending, unsafe = new
+            line = lines[index].split(";")[0]
+            if re.search(r"\bs_waitcnt\b.*\bvmcnt\(0\)", line):
+                pending = False
+            elif _VECTOR_WRITE.search(line) or "s_swappc" in line:
+                pending = True
+            elif re.search(r"\bs_barrier\b", line):
+                unsafe = pending
+            if match := re.search(r"\bs_(cbranch_\w+|branch)\s+(\.LBB\w+)", line):
+                work.append((labels[match[2]], pending, unsafe))
+                if match[1] == "branch":
+                    break
+            if re.search(r"\bs_(endpgm|setpc_b64)\b", line):
+                break
+            index += 1
+    return [
+        (lines[index].strip(), not seen[index][1])
+        for index in sorted(seen)
+        if re.search(target, lines[index].split(";")[0])
+    ]
+
+
 def int_specialization_class(value: int) -> str:
     """The class Triton specializes a runtime integer on."""
     return "one" if value == 1 else "div16" if value % 16 == 0 else "other"
