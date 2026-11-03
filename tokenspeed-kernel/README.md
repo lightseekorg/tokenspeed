@@ -170,6 +170,11 @@ TokenSpeed-kernel carefully curates external dependencies and actively
 re-evaluates their inclusion to maintain minimal dependencies and enable
 faster iteration.
 
+CUDA provider discovery tolerates missing optional native packages, including
+FlashMLA and DeepGEMM. Providers expose native implementations when their
+corresponding packages are available. Direct calls to unavailable native
+entry points raise an error.
+
 ### Numerics, benchmarking, profiling
 
 - `python -m tokenspeed_kernel.numerics` — dtype-aware tolerances, standard
