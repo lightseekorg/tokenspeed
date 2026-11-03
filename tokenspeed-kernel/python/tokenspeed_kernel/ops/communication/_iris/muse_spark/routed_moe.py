@@ -98,9 +98,9 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     local = combined.to(gl.bfloat16)
     gl.store(symmetric_input + row_offsets, local, mask=valid)
     # The barrier the compiler inserts before the one-thread release does not
-    # wait for memory, and the release waits only for its own subgroup's
-    # stores before writing back L2. So each subgroup first waits until its
-    # stores reach L2 (s_waitcnt vmcnt(0) on gfx950).
+    # wait for memory, and the releasing thread's buffer_wbl2 and s_waitcnt
+    # vmcnt(0) cover only its own subgroup's stores. So each subgroup first
+    # waits until its stores reach L2 (s_waitcnt vmcnt(0) on gfx950).
     WAIT_STORES(args=[], constraints="=r,~{memory}")
 
     local_heap = _iris_group_heap_base(rank, heaps)

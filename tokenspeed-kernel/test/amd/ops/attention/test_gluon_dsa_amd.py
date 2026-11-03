@@ -1105,8 +1105,9 @@ def test_dsa_persistent_topk_atomics_reach_l2_before_arrival(is_decode) -> None:
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
         options={"num_warps": dsa_topk_backend._PERSISTENT_NUM_WARPS},
     )
-    # Each pass has one arrival and one pass_done atomic on a scalar address;
-    # the later output-slot and reset atomics publish no histogram.
+    # Each pass has one arrival and one pass_done atomic on a scalar address,
+    # and the passes come first in program order; the later output-slot and
+    # reset atomics publish no histogram.
     passes = int(dsa_topk_backend._PERSISTENT_NUM_PASSES)
     atomics = vmcnt_zero_before_barrier(
         kernel.asm["amdgcn"],
