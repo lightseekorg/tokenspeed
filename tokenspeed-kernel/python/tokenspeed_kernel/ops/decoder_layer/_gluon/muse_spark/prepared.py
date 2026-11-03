@@ -97,8 +97,11 @@ _MAX_VGPRS = 256
 # taken for a failure.
 DEADLINE_TICKS = 6_000_000_000
 # Plan fields of the default variant (benchmarks sweep them one at a time).
+# The MoE ring is 16 chunks per wave: the kernel's register maximum (set by
+# other phases) does not move, and the down units keep >= 15 loads in flight
+# per wave instead of draining to 2 at unit ends.
 DEFAULT_PLAN_FIELDS = dict(
-    ring=8,
+    ring=16,
     quad_map=0,
     dn_order=0,
     addr_soffset=0,
