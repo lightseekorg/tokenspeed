@@ -2339,3 +2339,106 @@ def test_stream_topk_key_offset_exceeds_int32(device: str, pages: int) -> None:
     _assert_matches_reference(
         query, keys, table, requests, complete, selected, page_size, 512
     )
+
+
+# One layout per score kernel: prefill, dense and overlap take more than 128
+# rows; split, native and both guarded small-grid scorers (with their merges)
+# take fewer.
+_FAR_OFFSET_LAYOUTS = [
+    pytest.param(136, 32, None, "prefill", 0, id="prefill"),
+    pytest.param(136, 64, None, "dense", 0, id="dense"),
+    pytest.param(136, 128, None, "overlap", 0, id="overlap"),
+    pytest.param(8, 256, 8, "split", 0, id="split"),
+    pytest.param(9, 32, None, "small", 0, id="small"),
+    pytest.param(3, 128, None, "small", 16, id="guarded"),
+    pytest.param(3, 256, None, "small", 8, id="guarded-compact"),
+]
+
+
+def _far_offset_topk(
+    query: torch.Tensor, keys: torch.Tensor, table: torch.Tensor, width: int | None
+) -> None:
+    requests = torch.zeros(query.shape[0], device=query.device, dtype=torch.int32)
+    complete = torch.full_like(requests, table.shape[1] * 64)
+
+    def invoke() -> torch.Tensor:
+        return cute_dsl_qsa_stream_topk(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=32 << 20,
+            enable_pdl=False,
+        )
+
+    selected = invoke()
+    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    query.normal_()
+    table.copy_(table.flip(1))
+    complete[::2] = 513
+    graph.replay()
+    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+
+
+@pytest.mark.parametrize(
+    ("rows", "pages", "width", "algorithm", "keep"), _FAR_OFFSET_LAYOUTS
+)
+def test_stream_topk_key_offsets_exceed_int32(
+    device: str, rows: int, pages: int, width: int | None, algorithm: str, keep: int
+) -> None:
+    """Keys whose element offsets pass 2**31 are read from the far pool end."""
+    # Local import: test_qsa_cute_dsl_barriers imports this module in a
+    # subprocess that does not have the test directory on sys.path.
+    from utils import move_pages_past_int32
+
+    torch.manual_seed(337)
+    config = stream_topk._configuration(rows, pages * 64, width, 32 << 20)
+    assert (config.algorithm, config.keep) == (algorithm, keep)
+    query = torch.randn(rows, 4, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(pages, 64, 1, 128, device=device, dtype=torch.bfloat16)
+    table = torch.randperm(pages, device=device).to(torch.int32)[None]
+    (pool,), table = move_pages_past_int32((keys,), table)
+    # Every table page starts past 2**31 elements; slot ids still fit int32.
+    assert int(table.min()) * 64 * 128 > 2**31
+    _far_offset_topk(query, pool.view(-1, 1, 128), table, width)
+
+
+@pytest.mark.parametrize("far_stride", ["row", "head"])
+@pytest.mark.parametrize(
+    ("rows", "pages", "width", "algorithm", "keep"), _FAR_OFFSET_LAYOUTS
+)
+def test_stream_topk_query_offsets_exceed_int32(
+    device: str,
+    rows: int,
+    pages: int,
+    width: int | None,
+    algorithm: str,
+    keep: int,
+    far_stride: str,
+) -> None:
+    """Query vectors past 2**31 elements are read from the far storage end."""
+    torch.manual_seed(347)
+    config = stream_topk._configuration(rows, pages * 64, width, 32 << 20)
+    assert (config.algorithm, config.keep) == (algorithm, keep)
+    # Each stride fits its int32 argument; only the last row (or the last
+    # head of every row, for head-major storage) starts past 2**31.
+    if far_stride == "row":
+        stride = (2**31 // (rows - 1) // 128 + 1) * 128
+        strides, size = (stride, 128, 1), (rows - 1) * stride + 512
+    else:
+        stride = (2**31 // 3 // 128 + 1) * 128
+        strides, size = (128, stride, 1), 3 * stride + rows * 128
+    assert (rows - 1) * strides[0] + 3 * strides[1] > 2**31 > max(strides)
+    storage = torch.empty(size, device=device, dtype=torch.bfloat16)
+    query = storage.as_strided((rows, 4, 128), strides)
+    query.normal_()
+    keys = torch.randn(pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
+    table = torch.randperm(pages, device=device).to(torch.int32)[None]
+    _far_offset_topk(query, keys, table, width)

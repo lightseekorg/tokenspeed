@@ -41,6 +41,9 @@ namespace tokenspeed::fsm {
 
 enum class PrefillSource { kLocal, kRemote };
 
+// A scheduling attempt advances this in place and StagedCacheProgress
+// (scheduler/operations/progress.h) undoes the advance when the attempt
+// fails: a field an attempt changes must be restored there.
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.

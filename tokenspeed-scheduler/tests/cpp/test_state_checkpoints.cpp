@@ -102,7 +102,7 @@ protected:
                                               const std::string& id) {
         const auto it = std::ranges::find(batch.request_ids, id);
         ASSERT_TRUE_OR_RETURN(it != batch.request_ids.end(), {});
-        return batch.block_tables.at(group).at(static_cast<std::size_t>(it - batch.request_ids.begin()));
+        return batch.BlockTables().at(group).at(static_cast<std::size_t>(it - batch.request_ids.begin()));
     }
 
     // Plans one round and returns the state0 row of `id`, which must be in
@@ -143,7 +143,7 @@ protected:
         }
         const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
         resume.prefix_tokens = batch->extend_prefix_lens.at(row);
-        resume.state_row = batch->block_tables.at("state0").at(row);
+        resume.state_row = batch->BlockTables().at("state0").at(row);
         for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
             const auto& load = std::get<LoadBackBatch>(operation);
             for (std::size_t i = 0; i < load.op_ids.size(); ++i) {
@@ -741,6 +741,82 @@ TEST_F(StateCheckpointInForwardSuite, ALongPromptWritesItsCheckpointInsideTheFor
     }
 }
 
+class RetainedCheckpointRetrySuite : public StateCheckpointInForwardSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointInForwardSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 20;
+        cfg.host_allocator.total_pages = 20;
+        cfg.max_scheduled_tokens = 8;
+        cfg.prefix_replay_tokens = 1;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+            if (group.attn_kind == AttnKind::kFull) {
+                // Allocate within a prefix page so the next decode can need a
+                // block without completing another prefix hash.
+                group.block_granularity = 1;
+            } else {
+                group.checkpoint_granularity = kP;
+            }
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(RetainedCheckpointRetrySuite, DecodeAdmissionDropsAnOptionalCheckpointHoldWhenCapacityIsTight) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    RequestSpec request = RequestWithTokens("r", MakeTokens(9));
+    request.max_new_tokens = 0;
+    Submit(request);
+
+    const std::vector<Chunk> chunks = RunPrefill("r", 9);
+    ASSERT_EQ(chunks.size(), 2u);
+    EXPECT_EQ(chunks[0].tokens, 8);
+    EXPECT_EQ(chunks[1].prefix_tokens, 8);
+    EXPECT_EQ(chunks[1].tokens, 1);
+    EXPECT_LE(scheduler_->AvailableLcmBlocks(), 3)
+        << "the prompt and its one-token decode reserve leave at most three blocks free";
+    const ExecutionPlan first_decode = PlanOnce();
+    ASSERT_NE(FindForwardBatch(first_decode), nullptr);
+    ASSERT_EQ(FindForwardBatch(first_decode)->request_ids, (std::vector<std::string>{"r"}));
+    SendForwardDone("r", {901});
+
+    const std::uint64_t evicted_before = scheduler_->GetHostCacheStats().device_evictions.admission.blocks;
+    bool retried_after_releasing_checkpoint = false;
+    for (std::int32_t round = 0; round < 12; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(plan);
+        if (decode == nullptr || decode->empty()) {
+            continue;
+        }
+        ASSERT_EQ(decode->request_ids, (std::vector<std::string>{"r"}));
+        if (scheduler_->GetHostCacheStats().device_evictions.admission.blocks > evicted_before) {
+            retried_after_releasing_checkpoint = true;
+            SendForwardDone("r", {902 + round});
+            break;
+        }
+        SendForwardDone("r", {902 + round});
+    }
+    ASSERT_TRUE(retried_after_releasing_checkpoint)
+        << "the optional checkpoint hold must be dropped before a tight decode allocation can reclaim its cache";
+
+    SendFinish("r");
+    PlanOnce();
+    std::vector<std::int32_t> changed = MakeTokens(9);
+    changed[8] = 991;
+    RequestSpec changed_request = RequestWithTokens("changed", changed);
+    changed_request.max_new_tokens = 0;
+    Submit(changed_request);
+    const ExecutionPlan probe = PlanOnce();
+    const ForwardBatch* probe_batch = FindForwardBatch(probe);
+    ASSERT_NE(probe_batch, nullptr);
+    EXPECT_LT(probe_batch->extend_prefix_lens.at(0), 8)
+        << "the evicted optional checkpoint is not retained as a reusable input";
+    SendAbortEvent("changed");
+    PlanOnce();
+}
+
 // A 26-token prompt's boundary 24 is a budget chunk end already: that chunk
 // leaves the state in slot 1 and the next chunk's admission publishes it as
 // a natural checkpoint. No forward carries a third block.
@@ -1094,7 +1170,7 @@ TEST_F(StateCheckpointSuite, FinishRightAfterPrefillPublishesThePrefillsLiveSlot
     const ForwardBatch* batch = FindForwardBatch(prefill);
     ASSERT_NE(batch, nullptr);
     const std::vector<std::int32_t> state_row = StateRow(*batch, "state0", "r");
-    const std::vector<std::int32_t> full_row = batch->block_tables.at("full").at(0);
+    const std::vector<std::int32_t> full_row = batch->BlockTables().at("full").at(0);
     ASSERT_EQ(state_row.size(), 2u);
     ASSERT_EQ(full_row.size(), 2u);  // [0,4) [4,8): seven prompt tokens and the decode slot
     SendForwardDone("r", {101});
@@ -1112,7 +1188,7 @@ TEST_F(StateCheckpointSuite, FinishRightAfterPrefillPublishesThePrefillsLiveSlot
     EXPECT_EQ(StateRow(*hit, "state0", "hit").at(0), state_row.at(1)) << "the prefill's live slot, not its input";
     ASSERT_EQ(plan.pages_to_copy.at("full").size(), 1u);
     EXPECT_EQ(plan.pages_to_copy.at("full").front().first, full_row.at(1)) << "the partial block as written";
-    EXPECT_EQ(hit->block_tables.at("full").at(0).at(0), full_row.at(0));
+    EXPECT_EQ(hit->BlockTables().at("full").at(0).at(0), full_row.at(0));
 }
 
 // A finish lands on the sampled token while, under the overlap schedule, the
@@ -3031,8 +3107,8 @@ TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictim
     std::map<std::string, std::vector<std::int32_t>> s1_table;
     std::map<std::string, std::vector<std::int32_t>> s2_table;
     for (const std::string& group : group_names) {
-        s1_table[group] = handoff.remote_decode->block_tables.at(group).at(0);
-        s2_table[group] = s2_handoff.remote_decode->block_tables.at(group).at(0);
+        s1_table[group] = handoff.remote_decode->BlockTables().at(group).at(0);
+        s2_table[group] = s2_handoff.remote_decode->BlockTables().at(group).at(0);
     }
     ASSERT_EQ(s1_table["full"].size(), 6u);
     ASSERT_EQ(s2_table["full"].size(), 7u);
@@ -3153,9 +3229,9 @@ TEST_F(StateCheckpointPrefillHostSuite, APromptAloneEvictsTheCheckpointOnItsOwnP
     }
     ASSERT_TRUE(handoff.has_value());
     EXPECT_EQ(resumed_at, 8);
-    const Rows checkpoint{{"state0", s1_handoff.remote_decode->block_tables.at("state0").at(0)[1]},
-                          {"state1", s1_handoff.remote_decode->block_tables.at("state1").at(0)[1]},
-                          {"state2", s1_handoff.remote_decode->block_tables.at("state2").at(0)[1]}};
+    const Rows checkpoint{{"state0", s1_handoff.remote_decode->BlockTables().at("state0").at(0)[1]},
+                          {"state1", s1_handoff.remote_decode->BlockTables().at("state1").at(0)[1]},
+                          {"state2", s1_handoff.remote_decode->BlockTables().at("state2").at(0)[1]}};
     EXPECT_EQ(written_back, checkpoint) << "only the checkpoint at 8 leaves";
     SendPdSucceeded("big");
     AckWriteBacks(PlanOnce());
@@ -3212,7 +3288,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
         const ExecutionPlan handoff = PlanOnce();
         ASSERT_TRUE(handoff.remote_decode.has_value());
         for (const std::string& group : group_names) {
-            pinned[id][group] = handoff.remote_decode->block_tables.at(group).at(0);
+            pinned[id][group] = handoff.remote_decode->BlockTables().at(group).at(0);
         }
         AckWriteBacks(handoff);
         const std::vector<std::int32_t> s1_written_back{8, 24, 9, 10, 23, 22, 21, 44, 43};

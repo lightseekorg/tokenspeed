@@ -598,6 +598,8 @@ class ModelExecutor:
                 attn_backend=attn_backend, kv_pool=token_to_kv_pool
             )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
+        # Read once: scanning every page ID of every forward is a diagnostic.
+        self._validate_page_ids: bool = envs.TOKENSPEED_VALIDATE_PAGE_IDS.get()
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_model_runner = draft_model_runner
@@ -2310,12 +2312,14 @@ class ModelExecutor:
             block_tables = {}
             block_tables_cpu = {}
             if bs > 0:
-                # Validate and pack the per-group tables once for this batch.
+                # Check the per-group tables' structure and pack them once for
+                # this batch; the page IDs only under the diagnostic.
                 cache_metadata = CacheBatchMetadata.from_forward_op(
                     forward_op,
                     device=self.device,
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
+                    validate_page_ids=self._validate_page_ids,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
                 block_tables_cpu = dict(

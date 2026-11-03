@@ -41,9 +41,11 @@ also retain exact refinement. Scratch is bounded by the caller's existing
 budget, with the grouped kernel handling zero-budget calls.
 
 Owners, frontiers, row counts and tensor strides remain runtime inputs.
-Every CuTe streaming algorithm widens query-row indices before multiplying
-by the runtime stride, including for strided query views. Key-page addressing
-retains 64-bit offsets for large cache pools.
+Every CuTe streaming algorithm widens query-row and head indices before
+multiplying by runtime strides, including for strided query views. Key-page
+and partial-score row addressing retain 64-bit offsets for large cache pools
+and scratch buffers. Logical slots and TMA coordinates require fewer than
+`2**31` key slots.
 Only static geometry, explicit algorithm parameters and bucketed capacity
 specialize compilation. Graph replay refreshes the same input buffers as
 eager execution; no backend-private request state is introduced.

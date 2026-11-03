@@ -551,9 +551,13 @@ class PackedMerge(SplitSelector):
                     output_id = tidx
                 output[row, tidx] = output_id
         else:
+            # Widen the runtime row offset once; in-row offsets stay int32.
             words = cute.make_tensor(
-                cute.recast_ptr(partials.iterator, dtype=cutlass.Uint32),
-                cute.make_layout((partials.shape[0] * partials.shape[1] * 2,)),
+                cute.recast_ptr(
+                    partials.iterator + cutlass.Int64(row) * partials.shape[1],
+                    dtype=cutlass.Uint32,
+                ),
+                cute.make_layout((partials.shape[1] * 2,)),
             )
             if cutlass.const_expr(self.cache_encoded):
                 values = cute.make_rmem_tensor((self.entries,), cutlass.Uint32)
@@ -561,9 +565,7 @@ class PackedMerge(SplitSelector):
                     index = tidx + item * self.threads
                     encoded = cutlass.Uint32(0)
                     if index < self.splits * self.partial_count:
-                        encoded = cutlass.Uint32(
-                            words[(row * partials.shape[1] + index) * 2 + 1]
-                        )
+                        encoded = cutlass.Uint32(words[index * 2 + 1])
                     values[item] = encoded
                 self._select(
                     values,
@@ -579,11 +581,8 @@ class PackedMerge(SplitSelector):
                 )
             else:
                 values = cute.make_tensor(
-                    words.iterator + row * partials.shape[1] * 2 + tidx * 2 + 1,
-                    cute.make_layout(
-                        (self.entries,),
-                        stride=(self.threads * 2,),
-                    ),
+                    words.iterator + tidx * 2 + 1,
+                    cute.make_layout((self.entries,), stride=(self.threads * 2,)),
                 )
                 self._select_compact(
                     values,
@@ -602,9 +601,7 @@ class PackedMerge(SplitSelector):
                 if cutlass.const_expr(self.partial_count < _TOPK):
                     output[row, tidx] = position
                 else:
-                    output[row, tidx] = cutlass.Int32(
-                        words[(row * partials.shape[1] + position) * 2]
-                    )
+                    output[row, tidx] = cutlass.Int32(words[position * 2])
 
 
 class SplitMerge(SplitSelector):
@@ -1077,14 +1074,14 @@ class Merge32(SplitMerge):
                     output_id = tidx
                 output[row, tidx] = output_id
         else:
+            # Widen the runtime row offset once; in-row offsets stay int32.
+            row_partials = partials.iterator + cutlass.Int64(row) * partials.shape[1]
             if cutlass.const_expr(self.cache_encoded):
                 values = cute.make_rmem_tensor((self.entries,), cutlass.Uint32)
                 if cutlass.const_expr(self.vector_layout):
                     for group in cutlass.range_constexpr(self.entries // 4):
                         source = cute.make_tensor(
-                            partials.iterator
-                            + row * partials.shape[1]
-                            + (tidx + group * self.threads) * 4,
+                            row_partials + (tidx + group * self.threads) * 4,
                             cute.make_layout((4,)),
                         )
                         packet = cute.make_rmem_tensor((4,), cutlass.Uint32)
@@ -1110,7 +1107,7 @@ class Merge32(SplitMerge):
                 )
             else:
                 values = cute.make_tensor(
-                    partials.iterator + row * partials.shape[1] + tidx,
+                    row_partials + tidx,
                     cute.make_layout((self.entries,), stride=(self.threads,)),
                 )
                 self._select_fine(

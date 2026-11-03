@@ -735,7 +735,8 @@ TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
         TierTransferManager transfers(coordinator);
         const std::vector<std::string> hashes{"state2"};
         const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
-        std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0), pool.AcquireBlock(0)}, 0)};
+        std::vector<BlockTable> tables{
+            BlockTable::FromBlocks(/*group_id=*/0, {pool.AcquireBlock(0), pool.AcquireBlock(0)}, 0)};
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
                                     /*publish_state=*/false);
         EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
@@ -776,7 +777,7 @@ TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAnd
     const auto location = destination->Location();
     coordinator.CacheDeviceBlock(destination, key, /*logical_block_index=*/-1, CacheBoundaryKind::kEndpoint,
                                  /*access_epoch=*/1);
-    std::vector<BlockTable> tables{BlockTable::FromBlocks({std::move(destination)}, 0)};
+    std::vector<BlockTable> tables{BlockTable::FromBlocks(/*group_id=*/0, {std::move(destination)}, 0)};
     std::vector<BlockTransfer> pairs;
     pairs.push_back(BlockTransfer{.source = std::move(source), .destination = tables[0].Blocks()[0]});
     const auto load = transfers.StartPrefixLoad(std::move(pairs));

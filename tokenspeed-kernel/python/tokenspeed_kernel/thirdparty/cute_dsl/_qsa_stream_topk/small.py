@@ -273,7 +273,9 @@ class WarpScore(SplitSelector):
                     if tidx < 64:
                         q_head = (tidx // 2) & 3
                         col = (tidx // 8) * 16 + (tidx % 2) * 8
-                        source = query_row + (q_head % 4) * q_stride_head + col
+                        source = (
+                            query_row + cutlass.Int64(q_head % 4) * q_stride_head + col
+                        )
                         address = q_base + tidx * 16
                         destination = cute.make_ptr(
                             cutlass.BFloat16,
@@ -436,7 +438,9 @@ class GuardScore(WarpScore):
                     if tidx < 128:
                         q_head = tidx // 16
                         col = (tidx % 16) * 8
-                        source = query_row + (q_head % 4) * q_stride_head + col
+                        source = (
+                            query_row + cutlass.Int64(q_head % 4) * q_stride_head + col
+                        )
                         head_offset = q_head * 128 + (col % 64) * 2
                         address = q_base + head_offset + (col // 64) * 1024
                         address ^= (address >> 3) & 0x70
@@ -1124,9 +1128,7 @@ class GuardMerge(Merge32):
                     )
                     for group in cutlass.range_constexpr(self.entries // 4):
                         source = cute.make_tensor(
-                            partials.iterator
-                            + row * partials.shape[1]
-                            + (tidx + group * self.threads) * 4,
+                            partial_base + (tidx + group * self.threads) * 4,
                             cute.make_layout((4,)),
                         )
                         packet = cute.make_rmem_tensor((4,), cutlass.Uint32)
@@ -1174,7 +1176,7 @@ class GuardMerge(Merge32):
                         )
                     else:
                         values = cute.make_tensor(
-                            partials.iterator + row * partials.shape[1] + tidx,
+                            partial_base + tidx,
                             cute.make_layout(
                                 (self.entries,),
                                 stride=(self.threads,),

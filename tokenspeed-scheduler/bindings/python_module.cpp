@@ -454,11 +454,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
         .def_ro("spec_candidate_ids", &tokenspeed::ForwardBatch::spec_candidate_ids)
-        .def_prop_ro(
-            "block_tables",
-            [](const tokenspeed::ForwardBatch& op)
-                -> const std::map<std::string, std::vector<std::vector<std::int32_t>>>& { return op.block_tables; },
-            nb::rv_policy::reference_internal)
+        .def_prop_ro("block_tables", &tokenspeed::ForwardBatch::BlockTables)
         .def("block_tables_arrays",
              [](nb::handle self) {
                  // Zero-copy 2-D int32 views; `self` keeps the backing
