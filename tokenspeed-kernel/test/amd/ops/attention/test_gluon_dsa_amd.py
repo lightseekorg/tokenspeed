@@ -1114,7 +1114,7 @@ def test_dsa_persistent_topk_atomics_reach_l2_before_arrival(is_decode) -> None:
         r"\bglobal_atomic_add v\d+, v\d+, (?:v\d+, )?s\[",
     )[: 2 * passes]
     assert len(atomics) == 2 * passes, atomics
-    assert all(waited for _, waited in atomics), atomics
+    assert all(waited for _, waited, _ in atomics), atomics
 
 
 def test_dsa_prefill_topk_gluon_long_row_uses_radix_path() -> None:

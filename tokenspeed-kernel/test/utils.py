@@ -224,21 +224,27 @@ def votes_with_subgroup_mask(cycle: list[str]) -> bool:
 
 
 _VECTOR_WRITE = re.compile(r"^\s*(?:buffer|global|flat|scratch)_(?:store|atomic)")
+_VECTOR_LOAD = re.compile(r"^\s*(?:buffer|global|flat|scratch)_load")
 
 
 def vmcnt_zero_before_barrier(
     assembly: str, kernel: str, target: str
-) -> list[tuple[str, bool]]:
-    """Check that other subgroups' stores reached L2 before ``target`` runs.
+) -> list[tuple[str, bool, bool]]:
+    """Check that other subgroups' memory accesses finished before ``target``.
 
     On gfx9 ``s_barrier`` does not wait for any counter, and a one-thread
     release waits (``s_waitcnt vmcnt(0)``) only for its own subgroup's stores
-    to reach L2 before ``buffer_wbl2``. So each subgroup's vector stores and
-    atomics need an ``s_waitcnt vmcnt(0)`` and then an ``s_barrier`` before
-    ``target``. Walk every control-flow path of ``kernel`` (branches that
-    skip a block for inactive lanes model the subgroups that do not run it; a
-    call may store) and return each line matching the ``target`` regex with
-    whether that holds on all paths reaching it.
+    to reach L2 before ``buffer_wbl2``. Walk every control-flow path of
+    ``kernel`` (branches that skip a block for inactive lanes model the
+    subgroups that do not run it; a call may access memory) and return each
+    line matching the ``target`` regex with two flags, each true when it holds
+    on all paths reaching it:
+
+    - waited: every vector store and atomic is followed by
+      ``s_waitcnt vmcnt(0)`` and then ``s_barrier``, as a payload release
+      needs;
+    - barrier: an ``s_barrier`` follows every vector memory access, as a
+      release reporting completed reads needs.
     """
     lines = assembly.splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith(f"{kernel}:"))
@@ -249,10 +255,10 @@ def vmcnt_zero_before_barrier(
         if (match := re.match(r"^(\.LBB\w+):", lines[index]))
     }
     # State per line: this subgroup may have stores not yet counted out of
-    # vmcnt; it may have stores issued since the last barrier; some subgroup
-    # may have passed the last barrier with stores still counted in vmcnt.
-    seen: dict[int, tuple[bool, bool, bool]] = {}
-    work = [(start + 1, (False, False, False))]
+    # vmcnt; it may have stores, or any access, issued since the last barrier;
+    # some subgroup may have passed the last barrier with stores in vmcnt.
+    seen: dict[int, tuple[bool, ...]] = {}
+    work = [(start + 1, (False,) * 4)]
     while work:
         index, state = work.pop()
         while index < end:
@@ -261,15 +267,17 @@ def vmcnt_zero_before_barrier(
             if new == old:
                 break
             seen[index] = new
-            pending, unbarriered, unsafe = new
+            pending, stored, accessed, unsafe = new
             line = lines[index].split(";")[0]
             if re.search(r"\bs_waitcnt\b.*\bvmcnt\(0\)", line):
                 pending = False
             elif _VECTOR_WRITE.search(line) or "s_swappc" in line:
-                pending = unbarriered = True
+                pending = stored = accessed = True
+            elif _VECTOR_LOAD.search(line):
+                accessed = True
             elif re.search(r"\bs_barrier\b", line):
-                unsafe, unbarriered = pending, False
-            state = (pending, unbarriered, unsafe)
+                unsafe, stored, accessed = pending, False, False
+            state = (pending, stored, accessed, unsafe)
             if match := re.search(r"\bs_(cbranch_\w+|branch)\s+(\.LBB\w+)", line):
                 work.append((labels[match[2]], state))
                 if match[1] == "branch":
@@ -278,7 +286,11 @@ def vmcnt_zero_before_barrier(
                 break
             index += 1
     return [
-        (lines[index].strip(), not (seen[index][1] or seen[index][2]))
+        (
+            lines[index].strip(),
+            not (seen[index][1] or seen[index][3]),
+            not seen[index][2],
+        )
         for index in sorted(seen)
         if re.search(target, lines[index].split(";")[0])
     ]
