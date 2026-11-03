@@ -95,8 +95,12 @@ def _direct_decode(xq, xs, w13, w13_scale, w2, w2_scale, ids):
         **SWIGLU,
     )
     out = torch.empty((rows * TOPK, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    # Per-route output with unit route weights; the route index buffer is
+    # scratch here.
+    ones = torch.ones((rows, TOPK), dtype=torch.float32, device="cuda")
+    routes = torch.empty((rows * TOPK,), dtype=torch.int32, device="cuda")
     invoke_stage2_mxfp4_mfma_decode_gluon(
-        mids, mids_scale, w2, w2_scale, ids, None, out, TOPK, 0, False, None
+        mids, mids_scale, w2, w2_scale, ids, ones, out, TOPK, 0, False, routes
     )
     return out
 

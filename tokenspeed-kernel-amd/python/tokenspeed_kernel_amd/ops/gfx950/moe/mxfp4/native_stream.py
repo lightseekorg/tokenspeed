@@ -1512,6 +1512,7 @@ def gluon_mxfp4_moe_native_stream_gfx950(
     # Entry counters first, then the plan and the first weights (they depend
     # only on the ids), then the entry check.
     entry = enter_issue(epochs, claims)
+    # The scales' row strides are 1, which a launch passes as constants.
     bufs = MoeBuffers(
         xq,
         xs,
@@ -1523,15 +1524,15 @@ def gluon_mxfp4_moe_native_stream_gfx950(
         mids,
         mids_s,
         tags,
-        stride_xslin,
+        gl.to_tensor(stride_xslin),
         stride_xsnb,
         stride_w13,
         stride_s13,
-        stride_s13lin,
+        gl.to_tensor(stride_s13lin),
         stride_s13nb,
         stride_w2,
         stride_s2,
-        stride_s2lin,
+        gl.to_tensor(stride_s2lin),
         stride_s2nb,
     )
     handles = prefetch_moe(

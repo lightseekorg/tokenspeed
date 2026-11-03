@@ -281,3 +281,11 @@ def test_down_loop_sink_stays_in_the_wave(lines):
         int(re.search(r"\.vgpr_count:\s+(\d+)", a).group(1)) for a in (plain, paired)
     ]
     assert vgprs[1] <= vgprs[0] + 8, vgprs
+
+
+def test_compiles_with_unit_scale_strides():
+    """The scales' row strides are 1, which a launch passes as constants
+    (Triton specializes integer arguments equal to 1)."""
+    ones = dict(stride_xslin=1, stride_s13lin=1, stride_s2lin=1)
+    assembly = _compile(dict(_BASE, ROWS=8, RING=16, **ones))
+    assert int(re.search(r"\.vgpr_spill_count:\s+(\d+)", assembly).group(1)) == 0
