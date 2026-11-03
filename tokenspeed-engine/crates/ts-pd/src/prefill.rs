@@ -1929,4 +1929,69 @@ mod tests {
             [STEP_COUNT_MAX - 1, 0]
         );
     }
+
+    /// Register `session` with this rank, reachable at `endpoint:port`.
+    fn registered(state: &mut State, session: &str, endpoint: &str, port: u16) {
+        let layout =
+            Contract::from_wire(crate::layout::contract::tests::wire().as_bytes()).unwrap();
+        state.registrations.insert(
+            session.to_owned(),
+            Registration {
+                endpoint: endpoint.to_owned(),
+                port,
+                session_id: session.to_owned(),
+                decode_tp_size: 1,
+                decode_tp_rank: 0,
+                arena_base: 0x1000,
+                layout: Arc::new(layout),
+                planned: Arc::new(PlannedRegistration {
+                    fragments: Vec::new(),
+                    owner_filters: Default::default(),
+                    is_dummy: false,
+                    expected_decode_ranks: BTreeSet::from([0]),
+                }),
+            },
+        );
+    }
+
+    // `Shared::abort_room` and `Shared::reader_done` need the native
+    // transport, so these drive their state directly.
+    #[test]
+    fn a_failed_rooms_notices_wait_for_its_last_reader() {
+        let mut state = State::default();
+        registered(&mut state, "decode:1", "decode", 7000);
+        // What `abort_room` owes a failed room's non-dummy destinations.
+        let route = state.route_of("decode:1").unwrap();
+        state
+            .owed_failures
+            .entry(4)
+            .or_default()
+            .insert(route.clone());
+        // Two chunks of the room are queued or running: they may still read.
+        state.readers.insert(4, 2);
+        assert!(state.take_owed_failures(4).is_empty());
+        // One reader returns: the other still may read.
+        *state.readers.get_mut(&4).expect("readers are counted") -= 1;
+        assert!(state.take_owed_failures(4).is_empty());
+        // The last reader returns: the notice goes out, and only once.
+        state.readers.remove(&4);
+        assert_eq!(state.take_owed_failures(4), [route]);
+        assert!(state.take_owed_failures(4).is_empty());
+    }
+
+    #[test]
+    fn an_uncertain_rooms_notices_are_withheld() {
+        let mut state = State::default();
+        registered(&mut state, "decode:1", "decode", 7000);
+        let route = state.route_of("decode:1").unwrap();
+        state.owed_failures.entry(5).or_default().insert(route);
+        // A write failed: the DMA may still land, so Decode keeps the pages.
+        state.uncertain.insert(5);
+        assert!(state.take_owed_failures(5).is_empty());
+        assert!(!state.owed_failures.contains_key(&5));
+        // A later reader's return sends nothing either.
+        state.readers.insert(5, 1);
+        state.readers.remove(&5);
+        assert!(state.take_owed_failures(5).is_empty());
+    }
 }

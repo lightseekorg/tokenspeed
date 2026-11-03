@@ -1067,6 +1067,100 @@ mod tests {
         assert!(state.pending.is_empty() && state.landed.is_empty());
     }
 
+    fn failed(room: u64, prefill_rank: i64) -> StatusMessage {
+        StatusMessage::bare(room, TransferPoll::Failed, prefill_rank)
+    }
+
+    /// Track `room` and connect it to Prefill ranks 0, 1 and 2 at `addr`.
+    fn connected_to_three(state: &mut State, room: u64, addr: &str) -> Arc<Vec<Target>> {
+        let route = PrefillRoute {
+            target_tp_ranks: vec![0, 1, 2],
+            dummy_tp_ranks: Vec::new(),
+            expected_prefill_ranks: vec![0, 1, 2],
+            prefill_dp_size: 1,
+        };
+        let targets = Arc::new(vec![Target {
+            host: "prefill".to_owned(),
+            port: 80,
+            is_dummy: false,
+        }]);
+        state.tracked.insert(room);
+        state.rooms.update(room, TransferPoll::Bootstrapping);
+        assert!(state.attach(room, addr, &route, targets.clone()));
+        targets
+    }
+
+    #[test]
+    fn a_reporting_prefill_rank_is_recorded_as_stopped() {
+        let mut state = State::default();
+        connected(&mut state, 1, "prefill:80");
+        // A bootstrapped report proves nothing about the rank's writes.
+        state.apply(StatusMessage::bare(1, TransferPoll::Bootstrapped, 1));
+        assert!(state.stopped.is_empty());
+        state.apply(success(1, 0, 7));
+        assert_eq!(state.stopped[&1], BTreeSet::from([0]));
+        state.apply(success(1, 1, -1));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Success));
+        assert_eq!(state.stopped[&1], BTreeSet::from([0, 1]));
+        // A Failed report counts too, once per rank.
+        connected(&mut state, 2, "prefill:80");
+        state.apply(failed(2, 1));
+        state.apply(failed(2, 1));
+        assert_eq!(state.stopped[&2], BTreeSet::from([1]));
+        // A room the loop forgot records nothing more.
+        state.clear(2, "prefill:80");
+        state.apply(failed(2, 0));
+        assert!(!state.stopped.contains_key(&2));
+    }
+
+    #[test]
+    fn a_drained_room_waits_for_every_prefill_rank_that_may_write() {
+        let mut state = State::default();
+        let targets = connected_to_three(&mut state, 1, "prefill:80");
+        // Its manifest never went out: no Prefill rank may write it.
+        assert!(state.drain(1).is_none());
+        assert!(state.draining.is_empty());
+        state.admissions.insert(1, 3);
+        // Rank 2 reported Failed; ranks 0 and 1 may still write.
+        state.apply(failed(1, 2));
+        assert!(Arc::ptr_eq(&state.drain(1).unwrap(), &targets));
+        assert_eq!(state.draining[&1], BTreeSet::from([0, 1]));
+        // The peer forgets the room while it drains: its reports still count.
+        state.clear(1, "prefill:80");
+        assert!(!state.tracked.contains(&1));
+        state.apply(success(1, 0, 7));
+        assert_eq!(state.draining[&1], BTreeSet::from([1]));
+        assert!(state.draining.contains_key(&1));
+        state.apply(failed(1, 1));
+        assert!(!state.draining.contains_key(&1));
+    }
+
+    #[test]
+    fn a_room_nothing_may_write_is_not_drained() {
+        let mut state = State::default();
+        connected(&mut state, 1, "prefill:80");
+        state.admissions.insert(1, 3);
+        // Both Prefill ranks reported before the receive failed.
+        state.apply(success(1, 0, 7));
+        state.apply(success(1, 1, -1));
+        assert_eq!(state.stopped[&1], BTreeSet::from([0, 1]));
+        assert!(state.drain(1).is_none());
+        assert!(state.draining.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_request_fails_its_room() {
+        let mut state = State::default();
+        connected(&mut state, 1, "prefill:80");
+        state.fail(1, "the request was aborted");
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert_eq!(state.rooms.failure(1), Some("the request was aborted"));
+        // A Prefill rank's later Success does not resurrect it.
+        state.apply(success(1, 0, 7));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert_eq!(state.stopped[&1], BTreeSet::from([0]));
+    }
+
     #[test]
     fn losing_a_node_keeps_another_whose_address_extends_its_own() {
         let mut state = State::default();
