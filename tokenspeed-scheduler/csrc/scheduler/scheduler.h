@@ -374,13 +374,18 @@ private:
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
     // A PD transfer is out against this request's pages, so nothing here may
-    // retract, finish or flush them. Derived from the FSM, never recorded: on
-    // the D role it is the peer's prefill writing the destination pages
-    // (RemotePrefilling); on the P role it is the peer's decode reading them,
-    // which begins with the first scheduled chunk and ends only with the PD
-    // ACK -- every page-holding state before Finishing. A fused engine never
-    // transfers.
+    // retract, finish, flush or free them. Derived from the FSM, never
+    // recorded: on the D role it is the peer's prefill writing the
+    // destination pages (RemotePrefilling); on the P role it is the peer's
+    // decode reading them, which begins with the first scheduled chunk and
+    // ends only with the PD ACK -- every page-holding state before Finishing.
+    // A request that ends while pinned (an abort, a failed transfer) parks
+    // in PdTransferring until the transport reports the transfer stopped. A
+    // fused engine never transfers.
     bool pdTransferInFlight(const Request& request) const;
+    // Ends a request on an abort or a failed transfer, through PdTransferring
+    // while a transfer may still touch its pages.
+    void abortRequest(Request& request);
 
     void handleEvent(const cache::StorageTick& event);
     void handleEvent(const cache::StorageDone& event);
@@ -395,6 +400,7 @@ private:
     void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
+    void handleEvent(const pd::TransferStoppedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);

@@ -61,7 +61,7 @@ protected:
         SendAbortEvent(id);
         if (config_.role == Role::kP) {
             ExecutionEvent event;
-            event.With(pd::FailedEvent{id});
+            event.With(pd::TransferStoppedEvent{id});
             scheduler_->Advance(std::move(event));
             if (scheduler_->PdTransferPinned(id)) {
                 SendForwardDone(id);
@@ -4278,6 +4278,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
     AckWriteBacks(handoff);
     ExecutionEvent failed;
     failed.With(pd::FailedEvent{"h"});
+    failed.With(pd::TransferStoppedEvent{"h"});
     scheduler_->Advance(std::move(failed));
 
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
@@ -4349,6 +4350,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersI
             } else {
                 ExecutionEvent failed;
                 failed.With(pd::FailedEvent{"g"});
+                failed.With(pd::TransferStoppedEvent{"g"});
                 scheduler_->Advance(std::move(failed));
             }
             // Under write-through the finishes' stores land first: each pins
@@ -4432,6 +4434,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         SendPdSucceeded("h");
         ExecutionEvent failed;
         failed.With(pd::FailedEvent{"g"});
+        failed.With(pd::TransferStoppedEvent{"g"});
         scheduler_->Advance(std::move(failed));
         AckWriteBacks(PlanOnce());
 
@@ -4937,7 +4940,11 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
     ExecutionEvent failed;
     failed.With(pd::FailedEvent{"a"});
     scheduler_->Advance(std::move(failed));
-    AbortAndRetire("b");
+    SendAbortEvent("b");
+    EXPECT_EQ(scheduler_->PdTransferSize(), 2u) << "both ended, their transfers still stopping";
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 4) << "the pages wait for the transport";
+    SendTransferStopped("a");
+    SendTransferStopped("b");
     EXPECT_EQ(scheduler_->PdTransferSize(), 0u);
     EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 10) << "each frees its three State parents";
 

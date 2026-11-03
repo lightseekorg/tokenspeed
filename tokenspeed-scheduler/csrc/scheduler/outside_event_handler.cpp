@@ -52,17 +52,30 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    if (request->ResultsInFlight() > 0) {
-        request->RetirePdFailure();
-        return;
+    abortRequest(*request);
+}
+
+void Scheduler::handleEvent(const pd::TransferStoppedEvent& event) {
+    Request* request = findRequest(event.request_id);
+    if (request != nullptr && request->Is<fsm::PdTransferring>()) {
+        // Transport retirement does not fence this engine's queued forwards.
+        if (request->ResultsInFlight() > 0) {
+            request->RetirePdFailure();
+            return;
+        }
+        request->ClearPdAbort();
+        request->Apply(fsm::TransferStoppedEvent{&coordinator_});
     }
-    request->ClearPdAbort();
-    request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     Request* request = findRequest(event.request_id);
     if (request == nullptr || request->IsAnyOf<fsm::Finishing, fsm::Finished>()) {
+        return;
+    }
+    if (request->Is<fsm::PdTransferring>()) {
+        // A success also retires the transfer, but local forwards may remain.
+        handleEvent(pd::TransferStoppedEvent{event.request_id});
         return;
     }
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
@@ -94,6 +107,11 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         }
         return;
     }
+    if (request->Is<fsm::PdTransferring>()) {
+        // A success also retires the transfer, but local forwards may remain.
+        handleEvent(pd::TransferStoppedEvent{event.request_id});
+        return;
+    }
     if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
         return;
     }
@@ -103,6 +121,9 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 
 void Scheduler::handleEvent(const forward::Finish& event) {
     if (Request* request = findRequest(event.request_id)) {
+        if (request->Is<fsm::PdTransferring>()) {
+            return;  // it ended already; only its transfer is still stopping
+        }
         if (pdTransferInFlight(*request)) {
             throw std::logic_error("PD Finish received while transfer pages are pinned");
         }
@@ -114,7 +135,7 @@ void Scheduler::settleFinishedRequests() {
     for (const std::unique_ptr<Request>& request : requests_) {
         if (request->PdFailureRetired() && request->ResultsInFlight() == 0) {
             request->ClearPdAbort();
-            request->Apply(fsm::AbortEvent{&coordinator_});
+            request->Apply(fsm::TransferStoppedEvent{&coordinator_});
             continue;
         }
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
@@ -378,12 +399,16 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
-        if (pdTransferInFlight(*request)) {
-            request->DeferPdAbort();
-            return;
-        }
-        request->ClearPdAbort();
-        request->Apply(fsm::AbortEvent{&coordinator_});
+        abortRequest(*request);
+    }
+}
+
+void Scheduler::abortRequest(Request& request) {
+    if (pdTransferInFlight(request)) {
+        // The transport stops the transfer; the pages wait for it.
+        request.Apply(fsm::StopPdTransferEvent{});
+    } else {
+        request.Apply(fsm::AbortEvent{&coordinator_});
     }
 }
 
