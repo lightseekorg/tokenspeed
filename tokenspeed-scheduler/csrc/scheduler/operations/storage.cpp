@@ -178,7 +178,7 @@ void Scheduler::prepareStorage(Request& request) {
             expireStorage(request);
             return;
         }
-        const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = state->hashes,
+        CacheCoordinator::PromptPrefix prompt{.prefix_hashes = state->hashes,
                                                     .tokens = request.TokenSlice(0, state->max_tokens),
                                                     .max_tokens = state->max_tokens,
                                                     .tail = state->tail,
@@ -204,6 +204,7 @@ void Scheduler::prepareStorage(Request& request) {
         // The finished query retires before the GET starts: CanStart counts
         // its ticket.
         state->lease.reset();
+        prompt.prepared_keys = probe.group_keys;
         state->lease = storage_transfers_->StartRead(prompt, hits);
         if (state->lease) {
             spdlog::debug("[L3] rid={} op_id={} query_op_id={} hit_keys={} prefetch read enqueued", request.Id(),
@@ -259,7 +260,9 @@ void Scheduler::prepareStorage(Request& request) {
     }
     const auto end = std::min<std::int64_t>(max_tokens, static_cast<std::int64_t>(local) + limits.max_prefetch_tokens);
     setBound(static_cast<std::int32_t>(end));
-    auto query = coordinator_.MissingStorageKeys(prompt(), limits.max_keys_per_operation);
+    auto query_prompt = prompt();
+    query_prompt.prepared_keys = probe.group_keys;
+    auto query = coordinator_.MissingStorageKeys(query_prompt, limits.max_keys_per_operation);
     setBound(query.max_tokens);
     auto keys = std::move(query.keys);
     auto key_tokens = std::move(query.key_tokens);
