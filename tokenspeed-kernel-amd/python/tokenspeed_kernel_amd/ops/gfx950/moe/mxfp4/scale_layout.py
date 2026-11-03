@@ -87,6 +87,7 @@ __all__ = [
     "CDNA4_SCALE_K_BLOCK",
     "empty_swizzled_cdna4_mxfp4_scale",
     "is_swizzled_cdna4_mxfp4_scale",
+    "pack_cdna4_mxfp4_scale_lanes",
     "swizzle_cdna4_mxfp4_scale",
 ]
 
@@ -189,3 +190,28 @@ def swizzle_cdna4_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
     scale = scale.transpose(-1, -2)
     assert scale.stride(-2) == 1
     return scale
+
+
+def pack_cdna4_mxfp4_scale_lanes(scale: torch.Tensor) -> torch.Tensor:
+    """Lane-major MXFP4 block scales for the 16x16x128 scaled MFMA.
+
+    In the MFMA's B-scale operand, lane ``l = 16 * q + n`` of a 16-column
+    strip needs the scale of column ``n`` and K quad ``q`` at every 128-K
+    step. This layout stores those bytes contiguously per lane, so a lane
+    reads 16 steps' scales with one dwordx4 (the swizzled layout gives one
+    dword per two steps).
+
+    Input:  scales with the logical ``(..., N, K // 32)`` layout,
+            ``N % 16 == 0`` and ``K % 128 == 0``.
+    Output: contiguous ``(..., N // 16, 64, K // 128)`` uint8 with
+            ``out[..., s, 16 * q + n, t] = scale[..., 16 * s + n, 4 * t + q]``.
+    """
+    *leading, n, k_scale = scale.shape
+    if n % 16 or k_scale % 4:
+        raise ValueError("lane-major scales need N % 16 == 0 and K % 128 == 0")
+    lanes = scale.reshape(*leading, n // 16, 16, k_scale // 4, 4)
+    rank = len(leading)
+    order = [*range(rank), rank, rank + 3, rank + 1, rank + 2]
+    return (
+        lanes.permute(order).reshape(*leading, n // 16, 64, k_scale // 4).contiguous()
+    )
