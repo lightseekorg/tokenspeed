@@ -297,7 +297,11 @@ def _layer_hops_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, re
             gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0])) // 64
         )
         h4_sink(
-            H4SinkArgs(view, launch, 3), y, route, (1024 + c)[None, :], 1024 + 16 * wave
+            H4SinkArgs(view, launch, 3),
+            (y,),
+            route,
+            ((1024 + c)[None, :],),
+            1024 + 16 * wave,
         )
     elif ROLE == "own4":
         own4_complete(view, launch, rows, words.to(gl.pointer_type(gl.bfloat16),
@@ -412,9 +416,11 @@ def test_every_cleared_area_splits_into_whole_sender_shares():
 
 
 @gluon.jit
-def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors, floats, words, copy):  # fmt: skip
+def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in,h6_sums, errors, floats, words, copy, LINES: gl.constexpr):  # fmt: skip
     """h4_sink inside a loop whose trip count differs per wave, as in the
-    MoE down units: a workgroup barrier inside would deadlock."""
+    MoE down units: a workgroup barrier inside would deadlock. ``LINES``:
+    one call per down unit with its 4 strips (the stream's whole-line
+    column map), else one call per strip."""
     view = MuseNativeView(
         heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, red_in, h6_sums
     )
@@ -431,20 +437,38 @@ def _h4_per_wave_kernel(heaps, rank, box, h1, h1_sums, h3, h4_own, routes, h6, r
     lane = gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0]))
     # This wave's index, as a per-wave scalar: wave w runs w + 1 units.
     units = wave_uniform_i32(gl.max(lane // 64, 0)) + 1
+    wave = wave_scalar(lane // 64)
     for unit in range(units):
-        y = gl.load(floats + unit * 2048 + r[:, None] * 128 + c[None, :])
         route = gl.load(words + unit * 16 + r)[:, None]
-        h4_sink(
-            H4SinkArgs(view, launch, 3), y, route, (unit * 128 + c)[None, :],
-            unit * 128 + 16 * wave_scalar(lane // 64),
-        )  # fmt: skip
+        if LINES:
+            # Strip s of wave w's down unit: lane column group k, value j
+            # holds column 64 w + 32 (k // 2) + 8 (k % 2) + 16 (s % 2)
+            # + s // 2 + 2 j.
+            k = c % 16 // 4
+            local = 32 * (k // 2) + 8 * (k % 2) + 2 * (c % 4)
+            first = unit * 512 + 64 * (c // 16)
+            ys = ()
+            for s in gl.static_range(4):
+                ys += (gl.load(floats + (4 * unit + s) * 2048 + r[:, None] * 128 + c[None, :]),)  # fmt: skip
+            cols = ((first + local)[None, :], (first + local + 16)[None, :])
+            cols += (cols[0] + 1, cols[1] + 1)
+            h4_sink(
+                H4SinkArgs(view, launch, 3), ys, route, cols, unit * 512 + 64 * wave
+            )
+        else:
+            y = gl.load(floats + unit * 2048 + r[:, None] * 128 + c[None, :])
+            h4_sink(
+                H4SinkArgs(view, launch, 3), (y,), route, ((unit * 128 + c)[None, :],),
+                unit * 128 + 16 * wave,
+            )  # fmt: skip
 
 
-def test_h4_sink_moves_no_data_between_lanes():
+@pytest.mark.parametrize("lines", [0, 1])
+def test_h4_sink_moves_no_data_between_lanes(lines):
     """The sink runs in per-wave code: no workgroup barrier and no LDS
     traffic, so waves with different trip counts never wait for each other."""
     signature = dict(_VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32")
-    assembly = _compile(_h4_per_wave_kernel, signature, {})
+    assembly = _compile(_h4_per_wave_kernel, signature, {"LINES": lines})
     # The loop that pushes (finding the wave index before it needs one
     # cross-wave reduction, which is the test's, not the sink's).
     loops = [l for l in innermost_loops(assembly) if "sc0 sc1" in l]
@@ -454,17 +478,22 @@ def test_h4_sink_moves_no_data_between_lanes():
         assert not re.search(r"\bds_(write|read|bpermute)", loop)
 
 
-def test_h4_sink_stores_each_lanes_words_once():
-    """A wave's 16 columns have one owner (``col0``), so a strip is one
-    8-byte store per lane: to the own slice or to that owner's mailbox,
-    never one masked store per possible owner."""
+@pytest.mark.parametrize(
+    "lines, stores",
+    [(0, ["buffer_store_dwordx2"] * 2), (1, ["buffer_store_dwordx4"] * 4)],
+)
+def test_h4_sink_stores_each_lanes_words_once(lines, stores):
+    """A wave's columns have one owner (``col0``), so each lane's words go
+    out once, to the own slice or to that owner's mailbox, never as one
+    masked store per possible owner: one 8-byte store per strip, or one
+    16-byte line per strip pair with the down unit's 4 strips."""
     signature = dict(_VIEW, errors="*i32", floats="*fp32", words="*i32", copy="i32")
-    assembly = _compile(_h4_per_wave_kernel, signature, {})
+    assembly = _compile(_h4_per_wave_kernel, signature, {"LINES": lines})
     loops = [l for l in innermost_loops(assembly) if "sc0 sc1" in l]
     assert loops
     for loop in loops:
-        stores = re.findall(r"\b(?:buffer|global)_store_\w+", loop)
-        assert sorted(stores) == ["buffer_store_dwordx2"] * 2
+        found = re.findall(r"\b(?:buffer|global)_store_\w+", loop)
+        assert sorted(found) == stores
 
 
 @gluon.jit
