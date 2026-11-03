@@ -92,6 +92,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent import (
     poll_tags16,
     release_drain,
 )
+from tokenspeed_kernel_amd.ops.gfx950.persistent.arena import UncachedBuffer
 from tokenspeed_kernel_amd.ops.gfx950.persistent.wave import (
     after,
     lds_spin_until,
@@ -1576,8 +1577,9 @@ def gluon_mxfp4_moe_native_stream_gfx950(
 
 class NativeMoeState:
     """Launch state of the standalone stream on one device: epochs, claims and
-    error words (``persistent``), and the mids hand-off for up to ``rows``
-    tokens. Reused across launches; the launch tag keeps them apart."""
+    error words (``persistent``), the mids hand-off for up to ``rows`` tokens
+    and the readiness tags. Reused across launches; the launch tag keeps them
+    apart. Free the tags with ``state.tags.free()``."""
 
     def __init__(self, device, rows: int, top_k: int):
         self.epochs = torch.zeros(ENTRY_WORDS, dtype=torch.int64, device=device)
@@ -1590,7 +1592,10 @@ class NativeMoeState:
         self.mids_scale = torch.zeros(
             routes * INTER // 32 // 4, dtype=torch.int32, device=device
         )
-        self.tags = torch.zeros(TAG_WORDS, dtype=torch.int32, device=device)
+        # Written on one XCD and polled with scalar loads on others (the split
+        # leftover experts), so uncached: scalar polls of cached device memory
+        # only see writes made on the same XCD.
+        self.tags = UncachedBuffer(TAG_WORDS, torch.int32, device)
 
 
 def _int32_words(scale):

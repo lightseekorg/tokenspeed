@@ -25,6 +25,9 @@ random (not constant) E8M0 scales, every plan variant, repeated launches and
 a captured graph (each launch carries a new tag).
 """
 
+import ctypes
+import os
+
 import pytest
 import torch
 from native_moe_helpers import make_experts
@@ -197,7 +200,13 @@ def test_stale_tags_matching_the_launch_tag_are_never_seen(experts):
 
     # Every workgroup's entry counter advances once per launch from 0, so the
     # second launch has epoch 2: tag 3 (launch_tag), tag copy 0.
-    state.tags[:TAG_COPY_WORDS] = 3
+    # The tags are uncached memory: set them with the HIP runtime torch uses.
+    hip = ctypes.CDLL(
+        os.path.join(os.path.dirname(torch.__file__), "lib", "libamdhip64.so")
+    )
+    assert (
+        hip.hipMemsetD32(ctypes.c_void_p(state.tags.data_ptr()), 3, TAG_COPY_WORDS) == 0
+    )
     run(first)
     state.mids.fill_(0xFF)
     state.mids_scale.fill_(-1)
