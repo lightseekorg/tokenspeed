@@ -155,7 +155,7 @@ def test_ple_break_replays_ragged_rows_and_live_state_pages() -> None:
     for _ in range(2):
         forward(dummy)
     torch.cuda.synchronize()
-    capture = BreakableCapture()
+    capture = BreakableCapture(run_segments_while_capturing=False)
     with active_forward(dummy), capture:
         captured = forward(dummy)
     assert capture.num_segments == 3
@@ -265,7 +265,7 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
     for _ in range(2):
         forward(dummy)
     torch.cuda.synchronize()
-    capture = BreakableCapture()
+    capture = BreakableCapture(run_segments_while_capturing=False)
     with active_forward(dummy), capture:
         captured = forward(dummy)
     assert capture.num_segments == 3

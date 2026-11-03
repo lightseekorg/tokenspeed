@@ -453,7 +453,7 @@ class TestGdnStateCheckpointInForward:
 
         spare = torch.tensor([[61, 62]], dtype=torch.int32, device="cuda")
         self._init_metadata(backend, [3], 0, bucket, spare, [0])
-        capture = BreakableCapture()
+        capture = BreakableCapture(run_segments_while_capturing=False)
         with capture:
             layer()
         assert capture.num_segments == 3

@@ -196,6 +196,13 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
     """One-layer Qwen4-Exp MTP head used by TokenSpeed's MTP drafter."""
 
     compute_dsa_topk_first_step = True
+    # Its narrowed extend step keeps the sequence mixers at breakable-graph
+    # break points (the QSA indexer, ``PagedAttention.attend``) and publishes
+    # the accepted prefix through the narrowing handle, and its draft backend
+    # (the cache-group router, no state groups) attends in the mode it is
+    # passed, so the drafter may record its extend round as breakable graphs
+    # (--enable-drafter-prefill-graph).
+    supports_breakable_draft_extend = True
 
     def __init__(
         self,

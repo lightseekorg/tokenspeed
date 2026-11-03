@@ -1267,7 +1267,7 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
         )
 
         monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
-        cap = BreakableCapture()
+        cap = BreakableCapture(run_segments_while_capturing=False)
         with active_forward(ctx):
             cap.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(cap.stream):
@@ -2871,7 +2871,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         for _ in range(2):
             encoder(ctx)
         torch.cuda.synchronize()
-        encoder_capture = BreakableCapture()
+        encoder_capture = BreakableCapture(run_segments_while_capturing=False)
         with encoder_capture:
             encoder_state = encoder(ctx)
         encoder_capture.replay()
@@ -2914,7 +2914,9 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             model.decoder_forward(statics, ctx)
         torch.cuda.synchronize()
         rearm()
-        decoder_capture = BreakableCapture(pool=encoder_capture.pool)
+        decoder_capture = BreakableCapture(
+            pool=encoder_capture.pool, run_segments_while_capturing=False
+        )
         with decoder_capture:
             decoder_hidden, decoder_taps = model.decoder_forward(statics, ctx)
         rearm()
