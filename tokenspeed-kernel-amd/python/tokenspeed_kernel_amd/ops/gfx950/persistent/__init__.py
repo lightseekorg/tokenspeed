@@ -34,6 +34,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     trap,
     vote,
     wait_vmcnt,
+    wave_acquire,
     xcc_id,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
@@ -120,5 +121,6 @@ __all__ = [
     "trap",
     "vote",
     "wait_vmcnt",
+    "wave_acquire",
     "xcc_id",
 ]

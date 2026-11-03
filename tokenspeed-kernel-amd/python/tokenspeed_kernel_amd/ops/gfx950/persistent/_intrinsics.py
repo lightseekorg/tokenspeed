@@ -27,7 +27,7 @@ COMPILER-TODO with the compiler change that would remove it:
 
 - through ``intrinsics.ll`` (the backend sees the instruction): the clock,
   ``HW_REG_XCC_ID``, the trap, the release drain, paced ``vmcnt(N)`` waits and
-  the lane-0 returning atomic of the launch entry;
+  the lane-0 returning atomic of the launch entry, and a per-wave acquire;
 - as inline asm, where no intrinsic exists or the intrinsic is unusable: the
   per-wave vote, scalar loads past the scalar cache (``s.buffer.load`` is
   declared not to read memory, so LLVM would hoist it out of a poll loop),
@@ -95,6 +95,14 @@ def release_drain(_semantic=None):
     It also waits for loads the wave issued earlier (one in-order counter).
     """
     return _call("release_drain", tl.int32, [], (), _semantic)
+
+
+@tl.core.extern
+def wave_acquire(_semantic=None):
+    """An acquire ordering point for this wave alone (no instruction): loads
+    after it stay after it in the IR. Ends a per-wave poll whose result only
+    this wave uses, in place of a workgroup barrier."""
+    return _call("wave_acquire", tl.int32, [], (), _semantic)
 
 
 @tl.core.extern

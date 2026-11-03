@@ -94,6 +94,12 @@ through memory instead of kernel boundaries.
   (`gl.atomic_poll`, no barrier in its loop); its closing workgroup barrier
   orders the loads after it. It checks the deadline and the abort word every
   50 us of polling.
+- `wave.py` holds the per-wave facts Gluon cannot state (inline asm, each in
+  the compiler TODO): per-wave SGPR values, an opaque index that keeps LDS
+  reads in a loop, a value ordered after a load (to publish after the wave's
+  stores retire), and an LDS exchange among the waves of a workgroup without
+  a barrier (its spin has no deadline: only same-workgroup waves that never
+  wait back may be waited for).
 
 ## Attention prologue
 
@@ -2197,6 +2203,45 @@ rounds is one wave max reduction followed by clearing the winning key. The
 selected logits come back exactly from the key bits, so no second gather is
 needed. The ids and weights collect in registers and leave with one buffer
 store each.
+
+### gfx950 native MXFP4 MoE stream
+
+`moe/mxfp4/native_stream.py`: the MoE phase of a persistent decode layer
+(EP1 slice, up to 16 rows), as device functions `prefetch_moe` /
+`run_moe` and a standalone launch for tests.
+
+#### Contract
+
+- Inputs: the routed ids `(rows, top_k)`, the MXFP4 activations and their
+  swizzled scales, and the direct decode's gdot128 weights with swizzled
+  scales (optionally the gate/up scales lane-major from
+  `pack_cdna4_mxfp4_scale_lanes`).
+- Every down unit's fp32 `[16, 128]` result goes to a sink function with
+  its per-token routes and columns; the layer passes its H4 push, the
+  standalone launch stores `out[route, :]` in bf16.
+- Bitwise equal to the direct decode: the same per-column MFMA chain,
+  SwiGLU, 32-value MXFP4 mids and down chain.
+- Plan fields (constexpr): `RING`, `QUAD_MAP`, `DN_ORDER`, `ADDR_SOFFSET`,
+  `TAG_GLC`, `SCALE_LANES`, `TAIL_NUM` / `TAIL_DEN`.
+
+#### Algorithm
+
+- Every token is an A row (MFMA M = 16), so each touched expert's weights
+  are read once. A gate/up strip is (expert, 16 columns, all K); a quad of 4
+  waves runs the 4 strips of one 32-value mids group. A down unit is
+  (expert, 64 output columns) per wave.
+- Each wave keeps `RING` 1 KB weight chunks in flight and refills the slot
+  it consumed `RING` steps ahead, into the next strip or unit past the
+  current one's end, so the ring does not drain between items. Item
+  metadata comes from LDS and readiness from scalar polls: a vector load the
+  wave waits on would wait for every weight load before it.
+- The quad exchanges its SwiGLU values through LDS (no barrier), each wave
+  quantizes 4 rows of the group, stores them per route, and publishes its
+  tag after a later load of its own has been waited for.
+- The plan is closed-form from the ids in every workgroup: whole experts per
+  XCD, the `E % 8` leftovers split by group; the 16 tail-role workgroups of
+  an XCD (slots 0, 16-30) take half a full share of gate/up only, the others
+  the rest, then the down units, earliest-ready expert first.
 
 ### MXFP4 sorted experts
 
