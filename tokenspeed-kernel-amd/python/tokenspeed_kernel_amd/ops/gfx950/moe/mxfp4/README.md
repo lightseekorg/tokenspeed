@@ -37,8 +37,9 @@ run a fixed persistent grid over the device-side group count and have no
 row-dependent compile-time parameters.
 `fused/tuning.py:_ROUTE_TILE_CONFIGS` sets which shapes and rows take this path
 and each GEMM's tile widths, waves, and how many K tiles' loads it keeps in
-flight ahead of the MFMA (`PREFETCH_TILES`). Neither changes the K
-accumulation order, so every schedule, and the direct decode and staged
+flight ahead of the MFMA (`PREFETCH_TILES`); the direct decode stage 1 takes
+its depth per shape from `_DIRECT_STAGE1_PREFETCH_TILES`. Neither changes the
+K accumulation order, so every schedule, and the direct decode and staged
 package paths that serve the other rows, produce bitwise-identical results.
 
 The package prefill also runs as two calls split at the intermediate:
