@@ -503,8 +503,12 @@ every new conversation resumes at. The scheduler sees no conversations, so a
 boundary only this conversation has resumed from so far is demoted even when
 another request published it before, until the next hit there. A boundary no
 in-forward checkpoint was recorded at (a junction or a prompt end alone) is
-never demoted, nor is an entry a request or a transfer holds; a hit, touch or
-republication dates an entry forward again and ends its demotion. No new store
+never demoted. That holds for its State entries, not for the window blocks it
+shares with `C(n-2)`: another checkpoint whose own window reaches into
+`C(n-2)`'s, such as the prompt end of the turn that wrote `C(n-2)` or a
+junction just before it, can still need a demoted block. No entry a request or
+a transfer holds is demoted either; a hit, touch or republication dates an
+entry forward again and ends its demotion. No new store
 or eviction write-back copies a demoted entry to the Host: a finish's store
 skips it, and an eviction under the write-back policy drops it whatever evicted
 it (counted under that cause and in
