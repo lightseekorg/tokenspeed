@@ -661,7 +661,14 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 gate = projection.gate
         return self._project_query(hidden_states, q_a, latent_cache, gate, ctx)
 
-    def _project_query(self, hidden_states, q_a, latent_cache, gate, ctx):
+    def _project_query(
+        self,
+        hidden_states: torch.Tensor,
+        q_a: torch.Tensor,
+        latent_cache: torch.Tensor,
+        gate: torch.Tensor | None,
+        ctx: ForwardContext | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Normalize q_a and kv_a, then project the query (and absorbed query)."""
         kv_a = latent_cache[..., : self.kv_lora_rank]
         if q_a.shape[0] == 0:
@@ -1569,7 +1576,9 @@ class KimiLinearKDA(nn.Module):
             )
         return self._split_qkvfab(output)
 
-    def _split_qkvfab(self, output: torch.Tensor):
+    def _split_qkvfab(
+        self, output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """(q|k|v, g, f_a, beta) views of the merged projection output."""
         proj_local = self.local_num_heads * self.head_dim
         f_a_end = 4 * proj_local + self.head_dim
@@ -1682,7 +1691,13 @@ class KimiLinearKDA(nn.Module):
         core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
         return self._gated_norm(core_out, out_gate)
 
-    def _recurrent_core(self, mixed_qkv, f_a_out, beta, ctx) -> torch.Tensor:
+    def _recurrent_core(
+        self,
+        mixed_qkv: torch.Tensor,
+        f_a_out: torch.Tensor,
+        beta: torch.Tensor,
+        ctx: "ForwardContext",
+    ) -> torch.Tensor:
         """Short conv, gates and the delta-rule recurrence: [T, heads * head_dim]."""
         num_tokens = mixed_qkv.shape[0]
         hn, hd = self.local_num_heads, self.head_dim
@@ -1728,7 +1743,9 @@ class KimiLinearKDA(nn.Module):
 
         return core_out.reshape(num_tokens, hn * hd)
 
-    def _gated_norm(self, core_out, out_gate) -> torch.Tensor:
+    def _gated_norm(
+        self, core_out: torch.Tensor, out_gate: torch.Tensor
+    ) -> torch.Tensor:
         """Gated RMSNorm of the core output, the BF16 o-projection input."""
         return rmsnorm_gated_sigmoid(
             core_out.contiguous(),
@@ -4045,7 +4062,10 @@ class KimiLinearModel(nn.Module):
         )
 
     def _forward_decode_chain(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor, ctx
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, list | None]:
         """Decode through the TP8 mailbox chain; returns the normalized output and
         the captured hidden states, as the ordinary forward does.
