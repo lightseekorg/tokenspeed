@@ -119,6 +119,8 @@ public:
         return parents_needed <= empty_parent_count_;
     }
 
+    std::size_t TouchedParents() const { return remaining_occupied_.size(); }
+
 private:
     const BlockPool& pool_;
     std::span<const CacheGroup> groups_;

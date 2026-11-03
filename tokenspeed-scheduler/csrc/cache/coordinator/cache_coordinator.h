@@ -30,6 +30,7 @@
 #include <span>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -88,6 +89,36 @@ public:
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                      bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                      bool stream_device_cache_to_host, bool write_back_evictions);
+    std::size_t DemoteSession(const std::string& session_id, bool ended);
+    std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
+
+    // A request's session, registered under its access epoch for every
+    // admission, publication and restore that epoch dates
+    // (SessionForAccess). The first admission of a request with a session id
+    // registers it and returns this handle; dropping the handle unregisters
+    // it. Move-only; the coordinator must outlive it.
+    class SessionAccess {
+    public:
+        SessionAccess() noexcept = default;
+        SessionAccess(const SessionAccess&) = delete;
+        SessionAccess& operator=(const SessionAccess&) = delete;
+        SessionAccess(SessionAccess&& other) noexcept;
+        SessionAccess& operator=(SessionAccess&& other) noexcept;
+        ~SessionAccess();
+
+    private:
+        friend class CacheCoordinator;
+
+        SessionAccess(CacheCoordinator& coordinator, std::uint64_t access_epoch, SessionCacheOwner session);
+        void release() noexcept;
+
+        CacheCoordinator* coordinator_{nullptr};
+        std::uint64_t access_epoch_{0};
+    };
+    SessionCacheOwner SessionForAccess(std::uint64_t epoch) const {
+        const auto it = session_access_.find(epoch);
+        return it == session_access_.end() ? nullptr : it->second;
+    }
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
@@ -149,8 +180,9 @@ public:
     std::vector<CacheBlockRef> RetainInputCheckpoint(std::span<const std::string> prefix_hashes,
                                                      std::int32_t boundary_tokens) const;
     // A finishing producer makes its retained input available to the next
-    // turn now. Refresh its recency without recording a prefix-cache hit.
-    void RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks);
+    // turn now. Refresh its recency without recording a prefix-cache hit or
+    // changing the finishing request's session ownership.
+    void RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks, std::uint64_t request_access_epoch);
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
                                           bool count_uncached) const {
         const CacheGroup& group = groups_[static_cast<std::size_t>(i)];
@@ -269,6 +301,10 @@ public:
         // turn ended. The end state the request publishes supersedes it
         // (MarkSupersededStateInput).
         std::optional<ContentHash> resumed_tail_hash;
+        // The first admission of a request with a session id: that session's
+        // registration under access_epoch, for the caller to hold as long as
+        // the request lives. Empty otherwise.
+        SessionAccess session_access;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -321,7 +357,7 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments);
+                                         bool evict_blocks_past_segments, const std::string& session_id);
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;
@@ -571,7 +607,7 @@ public:
         std::size_t group_scans{0};
         // Unpinned entries visited while collecting replacement candidates.
         std::size_t block_candidates{0};
-        // Distinct touched parents checked for whole-parent reclamation.
+        // Distinct parents whose occupancy was simulated during replacement.
         std::size_t parent_candidates{0};
     };
     struct HostAllocationBatch {
@@ -582,22 +618,13 @@ public:
     // content hashes (chain hashes and tail hashes alike) for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
-    std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+    std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
-    // One Host block per (group, bucket) entry, in the bucket of the Device
-    // block it will mirror -- under page-cyclic sharding the owner of a Host
-    // page must be the owner of its Device page, so a copy's two ends select
-    // the same rows on every rank. Free capacity first, then global LRU over
-    // compatible children and fully evictable parents of any group. A parent
-    // is ranked by its newest child; equal epochs prefer one child. A
-    // shortfall leaves an empty reference. Evicting a State checkpoint takes
-    // the other State groups' at its hash along; every block retries free
-    // capacity before it picks a victim, so it places in the room such a
-    // cascade freed before another victim goes. Block by block: it serves
-    // publication and finish stores and L3 prefetches. A retraction image's
-    // Host blocks come from AcquireHostBoundaries, whose per-block plan ranks
-    // victims as this does (change the two together), and the Host blocks of
-    // what an eviction writes back from AcquireHostSegments.
+    // One Host block per (group, bucket), with free capacity assigned first
+    // in input order. The shared eviction plan funds remaining rows globally;
+    // failed rows and unnecessary tentative victims evict nothing. A State
+    // checkpoint takes its unpinned State siblings at the same boundary along.
+    // A shortfall leaves an empty reference, without blocking later rows.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     // One segment of an AcquireHostSegments batch, or one boundary of a
@@ -650,12 +677,9 @@ public:
     // covering the rows in order, the shallowest first -- the Host can take
     // whole from the first on, each row in its Device block's bucket. Nothing
     // is evicted or acquired; AcquireHostBoundaries carries out the same plan.
-    // It plans block by block with AcquireHostBlocks' victim ranking against
-    // a shadow of the Host, which does not know which parent the pool gives
-    // each row, so where several parents have room the victims can
-    // differ from those AcquireHostBlocks would take. The write-back policy
-    // places by segments first and never places fewer boundaries than block
-    // by block (docs/design/scheduler.md §2).
+    // Uses AcquireHostBlocks' planner, accepting whole boundaries instead of
+    // individual rows. The write-back policy first tries its segment plan,
+    // without placing fewer boundaries than the block plan alone would.
     std::size_t NumHostBoundariesThatFit(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries) const;
@@ -911,10 +935,8 @@ private:
     HostAllocationBatch acquireHostPlacement(const HostPlacementPlan& plan, std::span<const std::uint32_t> group_ids,
                                              std::span<const std::int32_t> buckets,
                                              std::span<const HostSegmentRows> segments);
-    // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
-    // carries out; by whole segments first with place_by_segments (the
-    // write-back policy), else block by block alone. Its per-block victim
-    // ranking is AcquireHostBlocks'; change the two together.
+    // Shared block planning with whole-boundary acceptance. The write-back
+    // policy first tries its segment plan when place_by_segments is set.
     HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
@@ -1123,21 +1145,17 @@ private:
     // Some group is prefix-closed, and needs every page below a boundary: a
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
+    SessionCacheOwner sessionTag(const std::string& id);
+    // One entry per live SessionAccess handle, which adds and erases it.
+    std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
+    std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
+    std::size_t session_tags_since_sweep_{0};
     std::uint64_t next_access_epoch_{0};
     // Issued access epochs start at 1. A superseded input is re-registered
     // at this one (MarkSupersededStateInput), below every other cache entry
     // and level with the blocks no entry holds, until an acquisition or a
     // publication touches it again.
     static constexpr std::uint64_t kSupersededAccessEpoch{0};
-    struct HostParentCandidate {
-        std::uint64_t newest_access_epoch{0};
-        std::int32_t evictable_children{0};
-        bool allocated{false};
-    };
-    // Reuse the direct-indexed scratch buffer; reset only the parents touched
-    // by the previous replacement batch, never the whole Host arena per call.
-    std::vector<HostParentCandidate> host_parent_candidates_;
-    std::vector<std::int32_t> host_touched_parents_;
     TailTable tails_;
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.

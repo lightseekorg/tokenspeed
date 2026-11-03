@@ -168,6 +168,7 @@ def _generate_text() -> list[bytes]:
             input_ids_unpadded=[151644, 872, 198],
             validation_error="rejected",
             data_parallel_rank=1,
+            cache_session_id="cache-session",
         )
     )
 

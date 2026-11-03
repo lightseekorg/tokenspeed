@@ -97,7 +97,7 @@ void RetractForTest(Request& request, CacheCoordinator& coordinator, SnapshotSlo
     taken->store_pairs.clear();
     request.Apply(fsm::SnapshotRetractEvent{&coordinator, epoch, request.HasGeneratedOutput(), std::move(taken->image),
                                             std::make_shared<SnapshotSlotIndex>(slots.Allocate()),
-                                            /*pending_store_ops=*/{}});
+                                            /*image_stores=*/{}});
 }
 
 // Collect every real (>0) physical page id across all rows of a group.
@@ -2414,6 +2414,96 @@ TEST_F(L3PrefetchWindowSuite, AGapBelowMinPrefetchTokensStartsNoQuery) {
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
     EXPECT_EQ(batch->request_ids, std::vector<std::string>{"long"});
+}
+
+// The pre-admission state that waits on an L3 operation leases it
+// (StorageLease), and so does the Ready data a finished GET leaves: an abort
+// ends the state and with it the lease, with no storage-specific call.
+class L3LeaseLifetimeSuite : public L3PrefetchWindowSuite {
+protected:
+    void Tick(std::int64_t now_us, bool allow_forward) {
+        ExecutionEvent tick;
+        tick.With(cache::StorageTick{now_us, allow_forward, /*allow_storage=*/true, StoragePressure{0, 0, 0}});
+        scheduler_->Advance(std::move(tick));
+    }
+
+    // The one storage op the plan emits.
+    static StorageOperation OnlyStorageOp(const ExecutionPlan& plan) {
+        const std::vector<CacheOperation> ops = ExtractCacheOpsOfKind<StorageOperation>(plan);
+        EXPECT_EQ(ops.size(), 1u);
+        return ops.empty() ? StorageOperation{} : std::get<StorageOperation>(ops.front());
+    }
+
+    void Retire(std::uint64_t op_id, std::size_t num_keys) {
+        ExecutionEvent done;
+        done.With(cache::StorageDone{op_id, std::vector<std::uint8_t>(num_keys, 1), /*retired=*/true,
+                                     std::vector<std::uint8_t>(num_keys, 0)});
+        scheduler_->Advance(std::move(done));
+    }
+};
+
+TEST_F(L3LeaseLifetimeSuite, AnAbortWhilePrefetchingCancelsTheQuery) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    ASSERT_EQ(scheduler_->GetStorageStats().waiting_requests, 1u);
+
+    SendAbortEvent("r");
+    EXPECT_EQ(scheduler_->GetStorageStats().waiting_requests, 0u);
+    // The runtime holds the query already: it is cancelled, and its ticket
+    // stays until the runtime retires it.
+    EXPECT_EQ(std::get<StorageCancelOperation>(OnlyStorageOp(PlanOnce())).op_id, query.op_id);
+    EXPECT_TRUE(scheduler_->StoragePending());
+    Retire(query.op_id, query.keys.size());
+    EXPECT_FALSE(scheduler_->StoragePending());
+}
+
+TEST_F(L3LeaseLifetimeSuite, AnAbortReleasesTheReadyDataItHolds) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(query.op_id, query.keys.size());
+    const auto get = std::get<StorageGetOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(get.op_id, get.keys.size());
+    // With forwards held back, the request leaves Prefetching holding its
+    // Ready data instead of being admitted on it.
+    Tick(2, /*allow_forward=*/false);
+    PlanOnce();
+    ASSERT_EQ(scheduler_->GetStorageStats().ready_requests, 1u);
+    ASSERT_EQ(scheduler_->StorageHeldBlocks(), get.keys.size());
+    ASSERT_EQ(scheduler_->HostPoolPinnedBlocks(), static_cast<std::int32_t>(get.keys.size()));
+
+    SendAbortEvent("r");
+    EXPECT_EQ(scheduler_->GetStorageStats().ready_requests, 0u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), 0u);
+    EXPECT_FALSE(scheduler_->StoragePending());
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the read's Host entries stay cached, unpinned";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), static_cast<std::int32_t>(get.keys.size()));
+}
+
+// The session a request names is registered at its first admission for as
+// long as the request lives, so everything it publishes carries it: the
+// prompt pages its first decode publishes and the tail its finish publishes.
+class SessionCacheHintSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.disable_l2_cache = true;  // Device entries only
+        return cfg;
+    }
+};
+
+TEST_F(SessionCacheHintSuite, EveryPublicationOfARequestCarriesItsSession) {
+    RequestSpec spec = MakeRequestSpec("r", /*num_pages=*/3);
+    spec.session_id = "s";
+    Submit(spec);
+    PlanOnce();
+    SendForwardDone("r", {42});
+    PlanOnce();  // the first decode publishes the three prompt pages
+    SendForwardDone("r", {43});
+    SendFinish("r");  // the finish publishes the tail [42]
+    PlanOnce();
+    EXPECT_EQ(scheduler_->DemoteSession("s", /*ended=*/false), 4u);
 }
 
 // Two victims whose images share pages carried by one earlier, still

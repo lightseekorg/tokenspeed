@@ -22,7 +22,8 @@
 
 Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
 backends are only selected for node-local groups; groups spanning nodes fall
-back to NCCL. ``AutoBackend.route`` is the one place that decides which
+back to NCCL, except for the gfx1250 Iris all-reduce when the whole world is in
+one fabric domain. ``AutoBackend.route`` is the one place that decides which
 implementation serves a collective; every public method asks it first.
 """
 
@@ -245,6 +246,20 @@ class AutoBackend(CommBackend):
         return len({rank // nprocs_per_node for rank in group}) > 1
 
     @staticmethod
+    def _iris_maps_other_nodes() -> bool:
+        """Whether the Iris heap maps peers on other nodes.
+
+        Only gfx1250 does, and only when the whole world is in one fabric
+        domain, since the heap spans the world; otherwise groups spanning nodes
+        stay on NCCL. The verdict is gathered during distributed initialization.
+        """
+        from tokenspeed_kernel.ops.communication.fabric import (
+            world_in_one_fabric_domain,
+        )
+
+        return current_platform().is_cdna5 and world_in_one_fabric_domain()
+
+    @staticmethod
     def _multicast_reachable(group: Group) -> bool:
         """Whether symmetric-memory multicast can map across ``group``.
 
@@ -370,8 +385,8 @@ class AutoBackend(CommBackend):
             tensors = tensor
             if len(tensors) == 0:
                 raise ValueError("all-reduce requires at least one tensor")
-            use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
-                group
+            use_nccl = self._force_deterministic_rsag() or (
+                self._group_spans_nodes(group) and not self._iris_maps_other_nodes()
             )
             if (
                 not use_nccl
@@ -413,7 +428,7 @@ class AutoBackend(CommBackend):
         # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by pattern, payload
         # bytes and the IPC kernel's strategy) inside _ar_fusion_workspace.
         #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
-        #   2. group spans nodes ................... NCCL
+        #   2. group spans nodes Iris cannot map ... NCCL
         #   3. producer-owned memory or Iris can run Iris
         #   4. otherwise ........................... NCCL
         spans_nodes = self._group_spans_nodes(group)
@@ -424,7 +439,7 @@ class AutoBackend(CommBackend):
         # the workspace is armed and never called.
         if self._trtllm_ar.has_trtllm_ar(group):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
-        if spans_nodes:
+        if spans_nodes and not self._iris_maps_other_nodes():
             return self._nccl.all_reduce(tensor, group, op=op)
         if self._iris.can_reduce_outputs((tensor,), group, op=op):
             # The producer wrote into acquired Iris symmetric memory, so the
@@ -462,7 +477,8 @@ class AutoBackend(CommBackend):
 
         Return None unless AMD uses a node-local tiered route without trtllm.
         """
-        # Same eligibility as the producer-direct all-reduce in _all_reduce_one.
+        # Same eligibility as the producer-direct all-reduce in _all_reduce_one,
+        # which Iris runs only on gfx950, so groups spanning nodes stay on NCCL.
         if (
             not current_platform().is_amd
             or self.route(Collective.ALL_REDUCE, tensor, group) is not Route.TIERED
@@ -483,7 +499,7 @@ class AutoBackend(CommBackend):
             or dtype != torch.bfloat16
             or self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or (self._group_spans_nodes(group) and not self._iris_maps_other_nodes())
             or self._trtllm_ar.has_trtllm_ar(group)
         )
 

@@ -200,7 +200,7 @@ Retracted SnapshotRetractEvent::retract(State&& state, ResumeShape shape) {
         .shape = std::move(shape),
         .retraction_epoch = epoch_,
         .resumes_generation = resumes_generation_,
-        .pending_store_ops = std::move(pending_store_ops_),
+        .image_stores = std::move(image_stores_),
     };
 }
 

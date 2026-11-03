@@ -6,7 +6,7 @@
     "python/pyproject.toml",
     "test/ci/npu/**",
     "test/ci_system/npu/**",
-    ".github/workflows/pr-test-ascendnpu-arm.yml",
+    ".github/workflows/ascend-npu-tests.yml",
     ".github/workflows/run-ci-task-matrix.yml",
     "test/ci_system/*ascend*",
     "test/ci/ut/npu-operators.yaml",
