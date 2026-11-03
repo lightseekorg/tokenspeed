@@ -182,3 +182,17 @@ def prepare_decoder_layer(
     if kernel is None or state is None:
         return None
     return kernel.impl(plan_keys=plan_keys, weights=weights, state=state)
+
+
+def decoder_layer_state_heap_bytes(*, recipe, world_size, max_requests) -> int:
+    """Iris heap bytes :func:`prepare_decoder_layer_state` will allocate for
+    ``recipe``, or 0 when no leaf serves it; reserve them when the group's
+    heap is created."""
+    kernel = _select(recipe, {})
+    if kernel is None:
+        return 0
+    return kernel.impl.heap_bytes(world_size=world_size, max_requests=max_requests)
+
+
+# Backend registration (side-effect import).
+import tokenspeed_kernel.ops.decoder_layer.gluon  # noqa: E402,F401
