@@ -544,12 +544,6 @@ def _wait_records_gpu(record_ptr, first, count, tag, launch):
             iris_fail_stop(launch, _SITE_RECORDS, chunk)
 
 
-@gluon.jit
-def _no_weights(args):
-    """No resident weights (a value, since the issue point sits in a branch)."""
-    return gl.to_tensor(0)
-
-
 # Front weight pacing. Each stream that overlaps a latency-bound chain keeps
 # few enough bytes in flight per CU that the GPU's total stays below ~4.5
 # TB/s (polls stay flat up to ~4.9 TB/s of other traffic and double above
@@ -561,7 +555,7 @@ def _no_weights(args):
 #   the all-gather;
 # - the router after the sender's push (slot 0: after OWN1), four steps per
 #   CU: 128 CUs ~3.3 TB/s, landed ~2.5 us later, before the all-gather.
-# A full layer's o_proj stays unpaced at the issue hook: the sender waits
+# A full layer's o_proj stays unpaced after the items: the sender waits
 # for it, so it takes the whole fabric.
 _O_PROJ_WINDOW = gl.constexpr(1)
 _POOLER_LOADS_SLIDING = gl.constexpr(2)
@@ -571,7 +565,7 @@ _ROUTER_LOADS = gl.constexpr(4)
 
 @gluon.jit
 def _sender_weights(args):
-    """SND's resident weights at a full layer's issue hook (unpaced): the
+    """SND's resident weights at a full layer, after the items (unpaced): the
     o_proj rows of ``sender``."""
     o_proj_ptr, sender = args
     return gemv_a16w16_splitk_weights_gfx950(o_proj_ptr, sender, _Q_WIDTH, 64, 1, 128)
@@ -612,7 +606,7 @@ def _pooler_weights_sliding(pooler_ptr, task):
 
 @gluon.jit
 def _pooler_weights(args):
-    """POOL's resident weights at a full layer's issue hook (paced)."""
+    """POOL's resident weights at a full layer, after the items (paced)."""
     pooler_ptr, task = args
     return gemv_a16w16_splitk_weight_steps_windowed_gfx950(
         pooler_ptr, task, _HIDDEN, _POOL_TILE, _KPARTS, _POOL_TILES,
@@ -635,18 +629,17 @@ def _full_items(
     record_ptr,
     REQUESTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
-    ISSUE: gl.constexpr,
-    issue_args,
 ):
     """A full layer's splits: this workgroup's balanced decode items
     (program indices ``cta`` and ``cta + GRID``). Each partial is written
     through; its record (device scope) waits only for the partial's stores.
-    The role's weights (``ISSUE(issue_args)``) issue after the last item's
-    partial store, so they hold up neither the pages, the stores nor the
-    records.
+    One copy for every role (instruction cache): the last item's record is
+    left to :func:`_full_items_finish`, which the role calls after issuing
+    its weights, so the weights hold up neither the pages, the stores nor
+    the records.
 
     Returns:
-        ``ISSUE``'s weights.
+        Both items' ``(program, live, block_item, token)``, for the finish.
     """
     gl.static_assert(_FULL_PROGRAMS <= 2 * _GRID)
     program, live, block_item, splits = mha_decode_balanced_item_gfx950(
@@ -666,9 +659,10 @@ def _full_items(
         cfg, q_ptr, cache_seqlens_ptr, REQUESTS, schedule_ptr, page_table_ptr,
         k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, launch.cta + _GRID,
     )  # fmt: skip
+    token2 = gl.zeros([64 * cfg.NUM_WARPS], gl.int32, lanes_l)
     if live2:
-        # Two items: the first's record goes out now, the weights after the
-        # second's partial, so neither item's pages queue behind them.
+        # Two items: the first's record goes out now, the second's at the
+        # finish, after the role's weights.
         if live:
             publish_balanced_record_gfx950(
                 program, record_ptr, block_item, launch.tag, token
@@ -679,17 +673,22 @@ def _full_items(
         token2 = store_balanced_partial_gfx950(
             second, acc, l_i, m_i, block_item2, splits2, record_ptr
         )
-        issued = ISSUE(issue_args)
+    return program, live, block_item, token, second, live2, block_item2, token2
+
+
+@gluon.jit
+def _full_items_finish(launch, items, record_ptr):
+    """Publish the record :func:`_full_items` left pending (the last live
+    item's), after the role issued its weights."""
+    program, live, block_item, token, second, live2, block_item2, token2 = items
+    if live2:
         publish_balanced_record_gfx950(
             second, record_ptr, block_item2, launch.tag, token2
         )
-    else:
-        issued = ISSUE(issue_args)
-        if live:
-            publish_balanced_record_gfx950(
-                program, record_ptr, block_item, launch.tag, token
-            )
-    return issued
+    elif live:
+        publish_balanced_record_gfx950(
+            program, record_ptr, block_item, launch.tag, token
+        )
 
 
 @gluon.jit
@@ -1588,6 +1587,18 @@ def gluon_decoder_layer_muse_spark_gfx950(
     xcd = entry.xcd
     slot = entry.slot
     _stamp(stamps_ptr, entry.cta, _STAMP_ENTRY, STAMPS)
+    if not SLIDING:
+        # Full layers: every workgroup runs its attention items first (one
+        # code copy for every role); each role then issues its weights and
+        # publishes the pending record.
+        launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+        _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
+        records = _launch_records(att_records, launch)
+        items = _full_items(
+            launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
+            k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records, REQUESTS,
+            NUM_STAGES,
+        )  # fmt: skip
     if slot < 16:
         # SND -> OWN1 on slot 0 -> RTR.
         sender = xcd * 16 + slot
@@ -1610,14 +1621,8 @@ def gluon_decoder_layer_muse_spark_gfx950(
             # Full layers: o_proj after this workgroup's attention items; the
             # box arrives soon after, and its read queues behind whatever
             # this workgroup has in flight.
-            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
-            _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
-            records = _launch_records(att_records, launch)
-            o_tiles = _full_items(
-                launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
-                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records,
-                REQUESTS, NUM_STAGES, _sender_weights, (o_proj_ptr, sender),
-            )  # fmt: skip
+            o_tiles = _sender_weights((o_proj_ptr, sender))
+            _full_items_finish(launch, items, records)
             _send(launch, view, sender, o_tiles, rows, RANK, PEER_CACHE)
             if slot == 0:
                 own1(
@@ -1659,14 +1664,8 @@ def gluon_decoder_layer_muse_spark_gfx950(
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
         else:
-            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
-            _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
-            records = _launch_records(att_records, launch)
-            p_tiles = _full_items(
-                launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
-                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records,
-                REQUESTS, NUM_STAGES, _pooler_weights, (pooler_ptr, task),
-            )  # fmt: skip
+            p_tiles = _pooler_weights((pooler_ptr, task))
+            _full_items_finish(launch, items, records)
         pool_x = _kpart_state(
             launch, view, xcd, task, rows, residual_ptr, alpha_ptr, beta_ptr,
             post_attn_bf16_ptr, pre_ffn_bf16_ptr, hprime, False, _POOL_TILES,
@@ -1697,10 +1696,10 @@ def gluon_decoder_layer_muse_spark_gfx950(
                 RANK, PEER_CACHE,
             )  # fmt: skip
     else:
-        launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
-        _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
-        records = _launch_records(att_records, launch)
         if SLIDING:
+            launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
+            _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
+            records = _launch_records(att_records, launch)
             if xcd < 2 * REQUESTS:
                 # Split (slot - 24) of block xcd.
                 _attention_split(
@@ -1710,11 +1709,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
                     GATE_EPS, NUM_STAGES, ATT_MERGE,
                 )  # fmt: skip
         else:
-            _full_items(
-                launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
-                k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records,
-                REQUESTS, NUM_STAGES, _no_weights, (),
-            )  # fmt: skip
+            _full_items_finish(launch, items, records)
             # Merge tasks on slots 24.. (no weights in flight), 8 per XCD row.
             merge = (slot - _ATT_FIRST_SLOT) * 8 + xcd
             if merge < REQUESTS * 2 * _FULL_MERGE_TASKS:
