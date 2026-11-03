@@ -222,6 +222,8 @@ impl Drop for ExitNotice {
 pub struct PythonDataPlane {
     /// The Python `HostDataPlane`.
     plane: Py<PyAny>,
+    /// The control thread's `Python::attach` wait, per call site.
+    pub(crate) attach_latency: AttachLatency,
     /// The control thread's dispatch guard, entered while the plane serves.
     guard: Option<Py<PyAny>>,
     ops: Option<mpsc::Sender<Op>>,
@@ -246,6 +248,7 @@ impl PythonDataPlane {
         let shared = Arc::new(Shared::default());
         let mut data_plane = Self {
             plane: Python::attach(|py| plane.clone_ref(py)),
+            attach_latency: AttachLatency::default(),
             guard: Some(guard),
             ops: Some(ops),
             shared: shared.clone(),
@@ -312,14 +315,56 @@ impl PythonDataPlane {
         call: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
     ) -> Result<T, DataPlaneError> {
         self.failed()?;
-        Python::attach(|py| call(self.plane.bind(py)).map_err(|error| describe(py, &error)))
-            .map_err(|failure| self.fail(failure))
+        let started = std::time::Instant::now();
+        let result =
+            Python::attach(|py| call(self.plane.bind(py)).map_err(|error| describe(py, &error)))
+                .map_err(|failure| self.fail(failure));
+        self.attach_latency
+            .record("query", started.elapsed().as_micros() as u64);
+        result
     }
 
     fn fail(&self, failure: String) -> DataPlaneError {
         tracing::error!("the data plane failed:\n{failure}");
         self.shared.fail(failure.clone());
         DataPlaneError(failure)
+    }
+}
+
+/// The control thread's `Python::attach` wait, as a histogram the metrics
+/// exporter reads. Measures only the attach itself (acquiring the
+/// interpreter lock), not the Python call it wraps.
+#[derive(Debug, Default)]
+pub(crate) struct AttachLatency {
+    /// (label, micros) samples; a bounded ring the metrics relay drains.
+    samples: std::sync::Mutex<Vec<(&'static str, u64)>>,
+}
+
+impl AttachLatency {
+    pub(crate) fn record(&self, label: &'static str, micros: u64) {
+        let mut samples = self.samples.lock().expect("attach samples lock");
+        if samples.len() < 1024 {
+            samples.push((label, micros));
+        }
+    }
+
+    /// Take the recorded samples: (label, p50, p99, count) per label.
+    pub(crate) fn take(&self) -> Vec<(&'static str, u64, u64, usize)> {
+        let samples = self.samples.lock().expect("attach samples lock");
+        let mut labels: std::collections::BTreeMap<&str, Vec<u64>> = Default::default();
+        for &(label, micros) in samples.iter() {
+            labels.entry(label).or_default().push(micros);
+        }
+        labels
+            .into_iter()
+            .map(|(label, mut micros)| {
+                micros.sort_unstable();
+                let count = micros.len();
+                let p50 = micros[count * 50 / 100];
+                let p99 = micros[(count - 1).min(count * 99 / 100)];
+                (label, p50, p99, count)
+            })
+            .collect()
     }
 }
 
@@ -394,18 +439,29 @@ impl DataPlane for PythonDataPlane {
 
     fn complete(&mut self, forward: ForwardId) -> Result<ForwardResult, DataPlaneError> {
         let launched = self.shared.take_launched(forward).map_err(DataPlaneError)?;
-        let result = self.query(|plane| complete(plane, &launched))?;
+        let started = std::time::Instant::now();
+        let result = Python::attach(|py| {
+            let plane = self.plane.bind(py);
+            complete(plane, &launched).map_err(|error| describe(py, &error))
+        })
+        .map_err(|failure| self.fail(failure));
+        self.attach_latency
+            .record("complete", started.elapsed().as_micros() as u64);
+        let result = result?;
         // The profiler counts committed forwards, on the thread it traces.
         self.queue(Op::Committed(launched))?;
         Ok(result)
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
+        let started = std::time::Instant::now();
         let polled: Vec<(String, u32)> = self.query(|plane| {
             plane
                 .call_method0("poll_cache_events")
                 .and_then(|events| events.extract())
         })?;
+        self.attach_latency
+            .record("poll_cache_events", started.elapsed().as_micros() as u64);
         polled
             .into_iter()
             .map(|(kind, op_id)| {
@@ -515,6 +571,18 @@ impl DataPlane for PythonDataPlane {
 
 impl Drop for PythonDataPlane {
     fn drop(&mut self) {
+        // The control thread's `Python::attach` wait, per call site, for
+        // whoever reads the log: the p50/p99 tell whether the GIL is a
+        // visible share of a round (p99 > 1 ms) or noise (< 100 µs).
+        for (label, p50, p99, count) in self.attach_latency.take() {
+            tracing::info!(
+                label,
+                p50_us = p50,
+                p99_us = p99,
+                count,
+                "Python::attach wait"
+            );
+        }
         // Closing the queue ends the forward thread once it ran what is
         // queued.
         self.ops.take();
