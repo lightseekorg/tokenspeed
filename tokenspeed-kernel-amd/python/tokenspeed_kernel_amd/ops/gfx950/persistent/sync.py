@@ -79,8 +79,15 @@ _SITE_ABORTED = gl.constexpr(SITE_ABORTED)
 # it on every retry costs ~0.2 us per handoff round trip.
 _CHECK_RETRIES = gl.constexpr(64)
 
-# Join counters: one line per XCD, then one line for the whole grid.
-JOIN_WORDS = (XCDS + 1) * LINE_WORDS
+# A word wait polls in slices of this many ns, then checks the deadline and
+# the abort word.
+_WAIT_SLICE_NS = gl.constexpr(50_000)
+
+# Join counters: one line per XCD, then one line for the whole grid, in two
+# sets that consecutive joins alternate.
+JOIN_SET_WORDS = (XCDS + 1) * LINE_WORDS
+JOIN_WORDS = 2 * JOIN_SET_WORDS
+_JOIN_SET_WORDS = gl.constexpr(JOIN_SET_WORDS)
 # A top-bit toggle join of N members: every member adds 1, the designated one
 # adds 1 + 2**31 - N instead, so the N-th arrival (in any order) flips bit 31
 # and leaves the low bits as they were. Never skipped, so it needs no reset.
@@ -126,27 +133,6 @@ def wait_vector_memory():
 def trap():
     """Raise a queue error (s_trap 2); the runtime then aborts the process."""
     gl.inline_asm("s_trap 2", "~{memory}", [], (), is_pure=False)
-
-
-@gluon.jit
-def wave_any(flags):
-    """Return whether any lane of this wave holds a nonzero int32 flag.
-
-    One v_cmp writes the lane mask to scalar registers, so a loop can branch
-    on it with no cross-lane reduction. The result is uniform per wave, not
-    per workgroup: a loop on it must not contain a workgroup barrier.
-
-    Args:
-        flags: Exactly one int32 per lane.
-    """
-    mask = gl.inline_asm(
-        "v_cmp_ne_u32_e64 $0, 0, $1",
-        "=s,v,~{memory}",
-        [flags],
-        gl.int64,
-        is_pure=False,
-    )
-    return mask != 0
 
 
 @gluon.jit
@@ -248,7 +234,40 @@ def enter_launch(epoch_ptr, claim_ptr, error_ptr, deadline_ticks, label, on_expi
 
 
 @gluon.jit
-def grid_join(join_ptr, launch, on_expiry):
+def wait_word(word_ptr, expected, launch, on_expiry: gl.constexpr, SITE: gl.constexpr):
+    """Wait until the int32 at ``word_ptr`` equals ``expected``.
+
+    One lane polls with relaxed device-scope loads (``gl.atomic_poll``) while
+    the other waves wait at its closing barrier. Every ``_WAIT_SLICE_NS`` the
+    workgroup checks the launch deadline and the abort word, and calls
+    ``on_expiry(launch, site, 0)`` when either stops it. Returns after a
+    workgroup barrier, so ``.cv`` loads after it see what the word's writer
+    stored before writing it.
+    """
+    start = realtime_ticks()
+    seen = gl.atomic_poll(
+        word_ptr, expected, sem="relaxed", scope="gpu", timeout_ns=_WAIT_SLICE_NS
+    )
+    alive = start >= 0
+    while (not seen) & alive:
+        late = realtime_ticks() - start > launch.deadline_ticks
+        abort = gl.load(launch.error_ptr + _ERROR_ABORT, cache_modifier=".cv")
+        alive = not (late | (abort != 0))
+        if alive:
+            seen = gl.atomic_poll(
+                word_ptr,
+                expected,
+                sem="relaxed",
+                scope="gpu",
+                timeout_ns=_WAIT_SLICE_NS,
+            )
+    if not seen:
+        on_expiry(launch, poll_stop_site(launch, SITE), 0)
+    gl.barrier()
+
+
+@gluon.jit
+def grid_join(join_ptr, launch, on_expiry, SET: gl.constexpr):
     """Wait until every workgroup of the grid has reached this join.
 
     A two-level top-bit toggle (``JOIN_WORDS`` int32 words, zeroed once when
@@ -259,34 +278,22 @@ def grid_join(join_ptr, launch, on_expiry):
     its own XCD arrival. A join must never be skipped: a flip that some
     workgroup missed is never undone.
 
+    Consecutive joins of a launch alternate the two line sets (``SET``: the
+    join's index in the launch, modulo 2). A set is used again only after
+    every workgroup passed the join in between, so a waiter sees its grid
+    line at exactly 0 or ``-2**31`` and can wait for that value.
+
     Stores before the join are visible after it to ``.cv`` loads: each wave
     drains its stores before its workgroup arrives.
     """
+    lines = join_ptr + SET * _JOIN_SET_WORDS
     wait_vector_memory()
     gl.barrier()
     add = gl.where(launch.slot == 0, _XCD_TOGGLE_ADD, 1)
-    old = gl.atomic_add(join_ptr + launch.xcd * _LINE, add, sem="relaxed", scope="gpu")
+    old = gl.atomic_add(lines + launch.xcd * _LINE, add, sem="relaxed", scope="gpu")
     before = old < 0
     if ((old + add) < 0) != before:
         top_add = gl.where(launch.xcd == 0, _TOP_TOGGLE_ADD, 1)
-        gl.atomic_add(join_ptr + _XCDS * _LINE, top_add, sem="relaxed", scope="gpu")
-    # Wave 0 polls (one lane per word slot, all on the grid line) and leaves
-    # on a one-instruction vote; the other waves' loads are masked off, so
-    # they skip the loop and wait at the barrier after it. No barrier sits
-    # inside the loop, whose waves leave on different iterations.
-    NUM_WARPS: gl.constexpr = gl.num_warps()
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
-    lanes = gl.arange(0, 64 * NUM_WARPS, layout)
-    poller = lanes < 64
-    top = join_ptr + _XCDS * _LINE + lanes * 0
-    seen = gl.atomic_load(top, mask=poller, sem="relaxed", scope="gpu")
-    start = realtime_ticks()
-    retries = 0
-    alive = start >= 0
-    while wave_any((poller & ((seen < 0) == before)).to(gl.int32)) & alive:
-        retries += 1
-        alive = not poll_expired(launch, start, retries)
-        seen = gl.atomic_load(top, mask=poller, sem="relaxed", scope="gpu")
-    if not alive:
-        on_expiry(launch, poll_stop_site(launch, _SITE_JOIN), 0)
-    gl.barrier()
+        gl.atomic_add(lines + _XCDS * _LINE, top_add, sem="relaxed", scope="gpu")
+    flipped = gl.where(before, 0, -(2**31))
+    wait_word(lines + _XCDS * _LINE, flipped, launch, on_expiry, _SITE_JOIN)

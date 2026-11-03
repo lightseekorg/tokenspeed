@@ -31,6 +31,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
     ERROR_WORDS,
     FIRST_KERNEL_SITE,
     GRID,
+    JOIN_SET_WORDS,
     JOIN_WORDS,
     LINE_WORDS,
     SITE_ABORTED,
@@ -47,7 +48,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent.sync import (
     poll_stop_site,
     trap,
     wait_vector_memory,
-    wave_any,
+    wait_word,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import (
     REALTIME_TICK_NS,
@@ -62,6 +63,7 @@ __all__ = [
     "ERROR_WORDS",
     "FIRST_KERNEL_SITE",
     "GRID",
+    "JOIN_SET_WORDS",
     "JOIN_WORDS",
     "LINE_WORDS",
     "Launch",
@@ -81,6 +83,6 @@ __all__ = [
     "trace_stamp",
     "trap",
     "wait_vector_memory",
-    "wave_any",
+    "wait_word",
     "xcc_id",
 ]

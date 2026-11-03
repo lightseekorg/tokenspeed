@@ -65,8 +65,11 @@ through memory instead of kernel boundaries.
   depends on the kernels before. A claim that finds this launch's tag means
   two workgroups took one role, and `on_expiry` runs before any
   role-dependent store. Epoch and claim words are zeroed together, once.
-- `grid_join(joins, launch, on_expiry)` waits until all workgroups arrive.
-  Stores issued before it are visible after it to `.cv` loads.
+- `grid_join(joins, launch, on_expiry, SET)` waits until all workgroups
+  arrive; `SET` is the join's index in the launch modulo 2. Stores issued
+  before it are visible after it to `.cv` loads.
+- `wait_word(ptr, expected, launch, on_expiry, SITE)` waits until an int32
+  word equals `expected`, then joins the workgroup.
 - Every wait gives up at `deadline_ticks` (10 ns ticks) or when a peer has
   set the abort word, then calls `on_expiry(launch, site, detail)`.
   `fail_stop` records `(site, cta, detail, epoch, label)` in the error words
@@ -83,9 +86,14 @@ through memory instead of kernel boundaries.
   their XCD's line (the designated one adds `1 + 2**31 - 32`), so the 32nd
   arrival flips bit 31; that arrival adds to the grid line the same way.
   Both levels flip once per join from the same start, so a waiter knows the
-  bit to wait for from its own XCD arrival, and no join needs a reset. One
-  wave polls with no barrier in its loop, exiting on a one-instruction lane
-  vote; a barrier after the loop releases the other waves.
+  bit to wait for from its own XCD arrival, and no join needs a reset.
+  Consecutive joins alternate two line sets; a set is reused only after
+  every workgroup passed the join in between, so the grid line holds exactly
+  0 or `-2**31` while anyone waits on it.
+- `wait_word` polls from one lane with relaxed device-scope loads
+  (`gl.atomic_poll`, no barrier in its loop); its closing workgroup barrier
+  orders the loads after it. It checks the deadline and the abort word every
+  50 us of polling.
 
 ## GEMM
 

@@ -223,6 +223,112 @@ def votes_with_subgroup_mask(cycle: list[str]) -> bool:
     )
 
 
+def _innermost_loop_lines(assembly: str) -> dict[str, list[int]]:
+    """Map each innermost loop's header to the indices of its lines."""
+    loops: dict[str, list[int]] = {}
+    current = None
+    for index, line in enumerate(assembly.splitlines()):
+        label = re.match(r"^\.L(BB\w+):(.*)", line)
+        if label:
+            name, comment = label.groups()
+            if "=>This Inner Loop Header" in comment:
+                current = name
+            else:
+                header = re.search(r"in Loop: Header=(BB\w+)", comment)
+                current = header[1] if header else None
+            if current is not None:
+                loops.setdefault(current, [])
+        if current is not None and current in loops:
+            loops[current].append(index)
+    return loops
+
+
+def innermost_loops(assembly: str) -> list[str]:
+    """Return the text of each innermost loop, from LLVM's loop comments.
+
+    A block belongs to the loop whose header it names (``in Loop:
+    Header=BB0_7``); the header itself says ``=>This Inner Loop Header``.
+    Backward branches that LLVM placed out of line are not loops.
+    """
+    lines = assembly.splitlines()
+    return [
+        "\n".join(lines[i] for i in indices)
+        for indices in _innermost_loop_lines(assembly).values()
+    ]
+
+
+def persistent_codegen_problems(assembly: str) -> list[str]:
+    """Return the ordering rules a persistent kernel's assembly breaks.
+
+    - Nothing invalidates or writes back L2.
+    - Only the epoch store precedes the claim exchange, and the claim's
+      compare-and-branch completes before any other store or atomic.
+    - Every join arrival follows a full drain and a workgroup barrier.
+    - Every poll (an innermost loop that reloads with ``sc1`` and runs no
+      MFMA) exits on lane-mask votes or polls from one lane, reads the clock
+      for its deadline, and holds no workgroup barrier or LDS exchange.
+    - A flag poll (``sc1`` without ``sc0``; Lamport polls read their data
+      with ``sc0 sc1``) reaches a workgroup barrier before its next load.
+    """
+    problems = []
+    if "buffer_inv" in assembly or "buffer_wbl2" in assembly:
+        problems.append("L2 invalidate or write-back")
+    lines = [
+        line
+        for line in assembly.splitlines()
+        if not line.lstrip().startswith((";", ".loc"))
+    ]
+    writes = [
+        index
+        for index, line in enumerate(lines)
+        if re.search(r"\b(global|buffer)_(store|atomic)\w*", line)
+    ]
+    swap = next(i for i in writes if "atomic_swap_x2" in lines[i])
+    if sum(1 for i in writes if i < swap) != 1:
+        problems.append("a store or atomic other than the epoch precedes the claim")
+    after = next(i for i in writes if i > swap)
+    between = "\n".join(lines[swap:after])
+    if "s_waitcnt vmcnt(0)" not in between or "s_cbranch" not in between:
+        problems.append(
+            "the claim's compare-and-branch does not precede the next store"
+        )
+    for position, index in enumerate(writes):
+        if "global_atomic_add" in lines[index] and " sc0" in lines[index]:
+            # A returning add is a join arrival: every store before it drains,
+            # then the work-group joins.
+            previous = writes[position - 1] if position else 0
+            before = "\n".join(lines[previous:index])
+            if "s_waitcnt vmcnt(0)" not in before or "s_barrier" not in before:
+                problems.append(f"arrival without drain and barrier: {lines[index]}")
+    raw = assembly.splitlines()
+    for indices in _innermost_loop_lines(assembly).values():
+        loop = "\n".join(raw[i] for i in indices)
+        # A poll rereads with sc1 and computes nothing; a K loop over data
+        # another work-group wrote (".cv" loads) runs MFMAs.
+        if not re.search(r"(global|buffer)_load_\w+ .*sc1\b", loop) or "v_mfma" in loop:
+            continue
+        if not re.search(r"(global|buffer)_load_\w+ .*\bsc0\b", loop):
+            # The barrier after a flag poll is the acquire that orders the
+            # payload loads after it.
+            after = (
+                line
+                for line in raw[indices[-1] + 1 :]
+                if re.search(r"s_barrier|(global|buffer)_load", line)
+            )
+            if "s_barrier" not in next(after, "s_barrier"):
+                problems.append("a load follows a flag poll before a barrier")
+        if re.search(r"s_barrier|\bds_|_dpp", loop):
+            problems.append("workgroup barrier or LDS exchange inside a poll loop")
+        # A retry exits on a lane mask written by a compare (one per polled
+        # array, or the one polling lane's of gl.atomic_poll), never on a
+        # cross-lane reduction.
+        if not re.search(r"v_cmp_\w+_e64 s\[\d+:\d+\]|v_readfirstlane_b32", loop):
+            problems.append("poll loop without a lane-mask exit")
+        if "s_memrealtime" not in loop:
+            problems.append("poll loop without a deadline")
+    return problems
+
+
 def int_specialization_class(value: int) -> str:
     """The class Triton specializes a runtime integer on."""
     return "one" if value == 1 else "div16" if value % 16 == 0 else "other"
