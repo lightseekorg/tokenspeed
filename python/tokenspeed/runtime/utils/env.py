@@ -86,6 +86,12 @@ global_server_args_dict: dict = {
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
     "all2all_backend": ServerArgs.all2all_backend,
     "deepep_mode": ServerArgs.deepep_mode,
+    # Settings that decide whether fused decoder layers may run (side-stream
+    # kernels, expert-load recording, released memory).
+    "enable_kvstore": ServerArgs.enable_kvstore,
+    "kvstore_io_backend": ServerArgs.kvstore_io_backend,
+    "expert_distribution_recorder_mode": ServerArgs.expert_distribution_recorder_mode,
+    "enable_memory_saver": ServerArgs.enable_memory_saver,
 }
 
 
@@ -151,6 +157,10 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "prefill_graph_max_tokens": server_args.prefill_graph_max_tokens,
             "all2all_backend": server_args.all2all_backend,
             "deepep_mode": server_args.deepep_mode,
+            "enable_kvstore": server_args.enable_kvstore,
+            "kvstore_io_backend": server_args.kvstore_io_backend,
+            "expert_distribution_recorder_mode": server_args.expert_distribution_recorder_mode,
+            "enable_memory_saver": server_args.enable_memory_saver,
         }
     )
 
