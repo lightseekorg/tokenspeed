@@ -520,6 +520,30 @@ def test_verify_is_deterministic_across_runs(window_left: int, fp8: bool) -> Non
         assert torch.equal(again.view(torch.int16), first.view(torch.int16))
 
 
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_pipelined_sliding_verify_is_bitwise_single_buffered(
+    fp8: bool, monkeypatch
+) -> None:
+    """Pipelining the sliding split's pages is a schedule, not new math: the
+    rows must equal the single-buffered loop's bit for bit (a difference in
+    the last bit flips greedy tokens downstream)."""
+    inputs = _verify_inputs(
+        [2048 + VERIFY_TOKENS + 37, 300 * PAGE_SIZE + 5, 700],
+        VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        HEAD_DIM,
+        20261104,
+    )
+    if fp8:
+        for name in ("q", "k_cache", "v_cache"):
+            inputs[name] = inputs[name].to(torch.float8_e4m3fn)
+    pipelined = gluon_mha_decode_gfx950(**inputs, window_left=2047)
+    monkeypatch.setattr(decode, "_SLIDING_DECODE_STAGES", 1)
+    single = gluon_mha_decode_gfx950(**inputs, window_left=2047)
+    assert torch.equal(pipelined.view(torch.int16), single.view(torch.int16))
+
+
 def test_short_window_verify_compiles_once_per_request_bucket() -> None:
     """A short window's split count changes with the request count only
     between at most 4 and more requests, so one warm-up on each side covers
