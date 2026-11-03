@@ -52,7 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, tl
+from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.communication._iris.all_gather import (
     iris_rmsnorm_mxfp4_row,
 )
@@ -2102,6 +2102,33 @@ def offline_signature(constexprs: dict) -> dict:
         else:
             signature[name] = _POINTER_TYPES.get(name, "i32")
     return signature
+
+
+def signature_problems(args: tuple, constexprs: dict) -> list[str]:
+    """The tensor arguments of a launch (``args`` in the kernel's order, the
+    constexprs excluded) whose types differ from :func:`offline_signature`'s.
+
+    Returns:
+        One ``"name: launched T, offline U"`` line per mismatch.
+    """
+    names = [
+        n
+        for n in gluon_decoder_layer_muse_spark_gfx950.arg_names
+        if n not in constexprs
+    ]
+    if len(names) != len(args):
+        return [f"{len(args)} arguments for {len(names)} parameters"]
+    expected = offline_signature(constexprs)
+    problems = []
+    for name, arg in zip(names, args):
+        if not hasattr(arg, "data_ptr"):
+            continue
+        launched = triton.runtime.jit.mangle_type(arg)
+        # "*k": a pointer the kernel only reads; the launch type has no "k".
+        offline = expected[name].replace("*k", "*")
+        if launched != offline:
+            problems.append(f"{name}: launched {launched}, offline {offline}")
+    return problems
 
 
 # Integer arguments a launch passes as multiples of 16, which Triton then

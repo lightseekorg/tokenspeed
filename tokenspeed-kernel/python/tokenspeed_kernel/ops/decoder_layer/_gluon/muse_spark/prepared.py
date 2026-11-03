@@ -70,6 +70,7 @@ from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (
     kernel_constexprs,
     offline_attrs,
     offline_signature,
+    signature_problems,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.native_stream import (
     INTER,
@@ -600,7 +601,7 @@ class MuseSparkFusedDecoderLayer:
                 d["fp32"], 64, positions, d["fp8"], d["fp8"], d["i64"], 0, 1.0, 1.0,
                 normed_out,
             )  # fmt: skip
-        compiled = gluon_decoder_layer_muse_spark_gfx950[(GRID,)](
+        args = (
             state.epochs, state.claims, state.iris.errors, state.arena, state.exchange,
             state.xq, state.xs, self.deadline_ticks, 0,
             *state.iris.view_args(),
@@ -620,11 +621,20 @@ class MuseSparkFusedDecoderLayer:
             t.beta2, t.post2_bf16, t.next_pre_bf16,
             *next_args,
             state.stamps,
+        )  # fmt: skip
+        variant = tuple(sorted(constexprs.items()))
+        if variant not in self.checked:
+            # The binary prepare checked was compiled from offline_signature;
+            # a launch whose argument types differ compiles another one.
+            problems = signature_problems(args, constexprs)
+            if problems:
+                raise ValueError(f"fused Muse layer {key}: {'; '.join(problems)}")
+        compiled = gluon_decoder_layer_muse_spark_gfx950[(GRID,)](
+            *args,
             **constexprs,
             num_warps=NUM_WARPS,
             **persistent_compile_options(),
-        )  # fmt: skip
-        variant = tuple(sorted(constexprs.items()))
+        )
         if variant not in self.checked:
             # The first launch of a variant compiled its binary (graph
             # capture's warm-up, before serving): check that one too.

@@ -852,8 +852,11 @@ class MuseNativeIrisState:
     def view_args(self) -> tuple:
         """Kernel arguments that build :class:`MuseNativeView` in order:
         ``heaps`` (a tuple of 8 int64), rank, then box, h1, h1_sums, h3,
-        h4_own, routes, h6, red_in, h6_sums."""
+        h4_own, routes, h6, red_in, h6_sums. The Lamport areas are typed as
+        the kernel reads them (BF16 halves, or 32-bit words)."""
         return (
-            self.heaps, self.peers.rank, self.box, self.h1, self.h1_sums, self.h3,
-            self.h4_own, self.routes, self.h6, self.red_in, self.h6_sums,
+            self.heaps, self.peers.rank, self.box.view(torch.uint32),
+            self.h1.view(torch.bfloat16), self.h1_sums, self.h3.view(torch.bfloat16),
+            self.h4_own.view(torch.uint32), self.routes.view(torch.uint32),
+            self.h6.view(torch.bfloat16), self.red_in, self.h6_sums,
         )  # fmt: skip

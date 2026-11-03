@@ -36,6 +36,7 @@ import re
 from functools import lru_cache
 
 import pytest
+import torch
 
 pytest.importorskip("tokenspeed_kernel_amd")
 layer = pytest.importorskip(
@@ -259,3 +260,44 @@ def test_sender_clears_drain_before_its_push(key):
     ]
     assert clears and pushes
     assert drains_of(texts, clears[-1], pushes[0])
+
+
+_TORCH_TYPES = {
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "fp8e4nv": torch.float8_e4m3fn,
+    "i64": torch.int64,
+    "i32": torch.int32,
+    "u32": torch.uint32,
+    "u8": torch.uint8,
+}
+
+
+def _launch_args(constexprs, **dtypes):
+    """CPU stand-ins for a launch's arguments, typed as the offline
+    signature says unless ``dtypes`` overrides a tensor's dtype."""
+    args = []
+    for name, kind in layer.offline_signature(constexprs).items():
+        if isinstance(kind, tuple):
+            args.append((0,) * len(kind))
+        elif kind.startswith("*"):
+            dtype = dtypes.get(name, _TORCH_TYPES[kind.lstrip("*k")])
+            args.append(torch.empty(1, dtype=dtype))
+        else:
+            args.append(1)
+    return tuple(args)
+
+
+def test_launch_types_are_checked_against_the_offline_signature():
+    # The Iris areas are allocated as int32 words; launched like that, the
+    # kernel compiles another binary than the one prepare checked (and a
+    # BF16 store into them fails to verify).
+    _, _, constexprs, _ = layer.offline_compile_args(layer.PLAN_VARIANTS[0], 3)
+    assert layer.signature_problems(_launch_args(constexprs), constexprs) == []
+    problems = layer.signature_problems(
+        _launch_args(constexprs, h1=torch.int32, box=torch.int32), constexprs
+    )
+    assert problems == [
+        "box: launched *i32, offline *u32",
+        "h1: launched *i32, offline *bf16",
+    ]
