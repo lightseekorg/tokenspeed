@@ -551,6 +551,60 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
     }
 }
 
+// As in HostSegmentPlacementTakesADemotedCheckpointFirst, X older than D,
+// each checkpoint on the Host alone and D's demoted, but both conversations'
+// pages stay on the Device, where a request holds D's: the Host copies of D's
+// pages are held duplicates, X's unheld ones. The held copies leave before
+// D's demoted checkpoint and X's unheld ones after it, all before X's
+// checkpoint: a plan needing one parent takes D's copies alone, one needing
+// two D's checkpoint as well, and one needing three X's copies too.
+TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpointBetweenHeldAndUnheldDuplicates) {
+    for (const std::size_t parents : {1u, 2u, 3u}) {
+        SCOPED_TRACE(testing::Message() << "parents=" << parents);
+        const std::vector<std::string> x = Publish(MakeTokens(16, 100));
+        const std::vector<std::string> d = Publish(MakeTokens(16, 1));
+        for (const std::vector<std::string>* pages : {&x, &d}) {
+            for (const std::string& page : *pages) {
+                CacheBlockRef block = host_.AcquireBlock(kFull);
+                coordinator_.CacheHostBlock(block, Key(page, kFull), std::nullopt);
+            }
+            CacheBlockRef block = host_.AcquireBlock(kState);
+            coordinator_.CacheHostBlock(block, Key(pages->back(), kState), std::nullopt);
+            // The checkpoint alone leaves the Device; the pages stay.
+            ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(
+                coordinator_, kState,
+                *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, kState, Key(pages->back(), kState))));
+        }
+        ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(d)), 1) << "the Host's checkpoint";
+        std::vector<CacheBlockRef> request;
+        for (const std::string& page : d) {
+            request.push_back(coordinator_.GroupPrefixIndex(kFull).Find(device_, Key(page, kFull)));
+            ASSERT_TRUE(static_cast<bool>(request.back()));
+        }
+        HoldFreeCapacity(host_);
+        const std::vector<std::uint32_t> groups(parents, kState);
+        const std::vector<std::int32_t> buckets(parents, 0);
+        const std::array<CacheCoordinator::HostSegmentRows, 1> segments{
+            CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = parents}};
+        CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostSegments(groups, buckets, segments);
+        ASSERT_EQ(batch.stats.allocated, parents);
+        for (const std::string& page : d) {
+            EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(page, kFull))) << "a held duplicate, first";
+        }
+        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(d.back(), kState)), parents < 2)
+            << "the demoted checkpoint, after the held duplicates";
+        for (const std::string& page : x) {
+            EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(page, kFull)), parents < 3)
+                << "an unheld duplicate, after the demoted checkpoint";
+        }
+        EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(x.back(), kState))) << "Host-only cache, last";
+        batch.blocks.clear();
+        request.clear();
+        held_.clear();
+        ASSERT_TRUE(coordinator_.ClearCache());
+    }
+}
+
 // A session's demotion (DemoteSessions) dates the session's entries back to
 // the demoted epoch without marking them demoted, so with demotion on they
 // keep the rules they have with it off: a finish queues them for the Host, an
