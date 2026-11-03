@@ -67,20 +67,34 @@ def _ordered_key32(x):
     return tl.where(x != x, 0xFFFFFFFF, key)
 
 
-@triton.jit(do_not_specialize=["n_cols", "chunk_cols", "logit_scale", "vocab_start"])
+@triton.jit(
+    do_not_specialize=[
+        "n_cols",
+        "chunk_cols",
+        "logit_scale",
+        "softcap",
+        "vocab_start",
+        "stride_mask",
+    ]
+)
 def _vocab_shard_topk_kernel(
     logits_ptr,
     out_ptr,
+    mask_ptr,
     stride_l,
     stride_o,
+    stride_mask,
     n_cols,
     chunk_cols,
     logit_scale,
+    softcap,
     vocab_start,
     K: tl.constexpr,
     K_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
     SCALE: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    MASK: tl.constexpr,
 ):
     # Program (row, chunk) writes the chunk's best K pairs at pair block
     # ``chunk`` of the row.
@@ -93,6 +107,19 @@ def _vocab_shard_topk_kernel(
     if SCALE:
         # Rounded to the logits' dtype, as an in-place multiply would.
         x = (x.to(tl.float32) * logit_scale).to(logits_ptr.dtype.element_ty)
+    if SOFTCAP:
+        # The logits processor's softcap step for step, rounded to the logits'
+        # dtype as it stores them.
+        capped = x.to(tl.float32) / softcap
+        capped = 2 * tl.sigmoid(2 * capped) - 1
+        x = (capped * softcap).to(logits_ptr.dtype.element_ty)
+    if MASK:
+        # Token bitmask in the xgrammar layout: bit c % 32 of word c // 32 of
+        # the row is set when global token c is allowed.
+        token = vocab_start + first + local
+        word = tl.load(mask_ptr + row * stride_mask + token // 32, mask=valid, other=0)
+        allowed = ((word >> (token % 32)) & 1) != 0
+        x = tl.where(allowed, x, float("-inf"))
     # Value key above, reversed column below: the largest selection keys are
     # the largest values, lowest column first among equal ones.
     key = (_ordered_key16(x) << 15) | (BLOCK - 1 - local)
@@ -125,6 +152,9 @@ def triton_vocab_shard_topk(
     logit_scale: float | None,
     vocab_start: int,
     out: torch.Tensor,
+    *,
+    softcap: float | None,
+    vocab_mask: torch.Tensor | None,
 ) -> None:
     """Write each row's ``k`` best shard logits and their global ids.
 
@@ -138,6 +168,13 @@ def triton_vocab_shard_topk(
         out: ``[M, 2 * k]`` fp32, unit column stride: the values, then the
             global ids as exact fp32 integers, in descending value order
             (lowest column first among equal values).
+        softcap: Final logit softcapping ``c`` in ``c * tanh(x / c)``, applied
+            after the scale and rounded to the logits' dtype before the
+            selection, or None.
+        vocab_mask: Contiguous int32 ``[M, ceil(V / 32)]`` token bitmask over
+            the whole vocabulary (bit ``t % 32`` of word ``t // 32`` set when
+            token ``t`` is allowed); disallowed logits become ``-inf`` before
+            the selection. None for no mask.
     """
     rows, n_cols = logits.shape
     if not vocab_shard_topk_supports(logits.dtype, n_cols, k):
@@ -148,6 +185,18 @@ def triton_vocab_shard_topk(
         raise ValueError("vocab shard top-k takes unit column strides, fp32 out")
     if tuple(out.shape) != (rows, 2 * k):
         raise ValueError(f"out must be [{rows}, {2 * k}], got {tuple(out.shape)}")
+    if vocab_mask is not None and (
+        vocab_mask.dtype != torch.int32
+        or vocab_mask.ndim != 2
+        or vocab_mask.shape[0] < rows
+        or vocab_mask.shape[1] * 32 < vocab_start + n_cols
+        or vocab_mask.stride(1) != 1
+    ):
+        raise ValueError(
+            f"vocab_mask must be an int32 [>= {rows}, >= "
+            f"{triton.cdiv(vocab_start + n_cols, 32)}] bitmask with unit column "
+            f"stride, got {vocab_mask.dtype} {tuple(vocab_mask.shape)}"
+        )
     if rows == 0:
         return
     # The shard width is fixed per server, so the chunking compiles once.
@@ -160,16 +209,21 @@ def triton_vocab_shard_topk(
     _vocab_shard_topk_kernel[(rows, chunks)](
         logits,
         picks,
+        vocab_mask,
         logits.stride(0),
         picks.stride(0),
+        0 if vocab_mask is None else vocab_mask.stride(0),
         n_cols,
         chunk_cols,
         1.0 if logit_scale is None else float(logit_scale),
+        1.0 if softcap is None else float(softcap),
         int(vocab_start),
         K=k,
         K_PAD=triton.next_power_of_2(k),
         BLOCK=triton.next_power_of_2(chunk_cols),
         SCALE=logit_scale is not None,
+        SOFTCAP=softcap is not None,
+        MASK=vocab_mask is not None,
         num_warps=4,
     )
     if chunks > 1:
@@ -257,8 +311,8 @@ def triton_vocab_topk_merge(
         softcap: Final logit softcapping ``c`` in ``c * tanh(x / c)`` applied
             to the kept values, or None. Monotone, so it never changes which
             candidates survive.
-        ids_out: Contiguous ``[M, k]`` int64 global ids, descending value
-            order, lowest rank-major slot first among equal values.
+        ids_out: Contiguous ``[M, k]`` int64 or int32 global ids, descending
+            value order, lowest rank-major slot first among equal values.
         values_out: Contiguous ``[M, k]`` fp32 values, in the same order.
     """
     ranks, rows, width = pairs.shape
@@ -266,16 +320,16 @@ def triton_vocab_topk_merge(
         raise ValueError(f"pairs must be [R, M, {2 * k}] with unit column stride")
     if not vocab_topk_merge_supports(ranks, k):
         raise ValueError(f"vocab top-k merge does not take {ranks} ranks x {k}")
-    for name, tensor, dtype in (
-        ("ids_out", ids_out, torch.int64),
-        ("values_out", values_out, torch.float32),
+    for name, tensor, dtypes in (
+        ("ids_out", ids_out, (torch.int64, torch.int32)),
+        ("values_out", values_out, (torch.float32,)),
     ):
         if (
             tuple(tensor.shape) != (rows, k)
-            or tensor.dtype != dtype
+            or tensor.dtype not in dtypes
             or not tensor.is_contiguous()
         ):
-            raise ValueError(f"{name} must be a contiguous [{rows}, {k}] {dtype}")
+            raise ValueError(f"{name} must be a contiguous [{rows}, {k}] {dtypes}")
     if rows == 0:
         return
     _launch_merge(pairs, k, softcap, ids_out, values_out)

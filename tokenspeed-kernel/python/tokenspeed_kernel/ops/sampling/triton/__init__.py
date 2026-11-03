@@ -59,8 +59,10 @@ from .penalties import accumulate_counts_inplace, apply_penalties_logit_bias_inp
 from .probability import min_p_renorm_prob
 from .topk_topp import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
+    gumbel_sample_top_k_top_p_from_candidates,
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
+    verify_rows_top_k_top_p_from_candidates,
     verify_rows_top_k_top_p_from_pools,
 )
 from .topp import gumbel_sample_top_p_parallel_from_pools
@@ -75,6 +77,7 @@ __all__ = [
     "gumbel_sample_min_p_from_pools_parallel",
     "gumbel_sample_from_pools_generic",
     "gumbel_sample_top_p_parallel_from_pools",
+    "gumbel_sample_top_k_top_p_from_candidates",
     "gumbel_sample_top_k_top_p_from_pools",
     "gumbel_sample_top_k_top_p_qrita_from_pools",
     "TOP_K_DISABLED",
@@ -91,6 +94,7 @@ __all__ = [
     "verify_chain_target_sampled",
     "verify_rows_no_filter_from_pools",
     "verify_rows_no_filter_scratch_shape",
+    "verify_rows_top_k_top_p_from_candidates",
     "verify_rows_top_k_top_p_from_pools",
     "draft_tree_expand",
     "draft_tree_finalize",
