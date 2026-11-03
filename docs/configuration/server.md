@@ -88,17 +88,18 @@ switch an envelope folds is also available individually under `auto`.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--numerics {auto,rl-bitwise}` | `auto` uses each option's default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
+| `--numerics {auto,rl-bitwise}` | `auto` uses each option's default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order selection`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
 | `--disable-autotune` | Disable startup FlashInfer tactic profiling. Matching caches still load; CuTe warmup continues except under pipeline parallelism. PrimTS skips extra group enumeration. |
 | `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
 | `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
-| `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` RoPE inverse frequencies (position frequencies, both divisions and the YaRN linear ramp mask) before the table is moved to the model device once; the trainer builds it on the host. Folded to `cpu` by `rl-bitwise`. |
+| `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` linear ramp mask. Defaults to `cuda`, independently of the frequency device. Folded to `cpu` by `rl-bitwise`. |
+| `--yarn-frequency-device {cuda,cpu}` | Device that computes YaRN powers, divisions and interpolation. Defaults to `cuda`, independently of the ramp device. Folded to `cuda` by `rl-bitwise`, overriding an explicit `cpu`; paired with its CPU ramp. |
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
 | `--layer-boundary-norm {fused,unfused}` | `unfused` materializes `hidden + residual` in bf16 before the norm that opens each physical layer and before the final norm, instead of the fused add+norm kernel; also vetoes all-reduce+norm fusion. Folded to `unfused` by `rl-bitwise`. |
 | `--router-topk {fused,torch}` | Correction-bias MoE routing: the fused CUDA kernel, or fp32 `torch.softmax` + `torch.topk(probs + bias)` with PyTorch tie order and `-1` zero-expert ids. Folded to `torch` by `rl-bitwise`. |
 | `--logprob-order {torch,megatron}` | Order of the selected-token log-softmax: `torch.log_softmax`, or Megatron's vocab-parallel cross-entropy order over fixed 32768-wide vocab blocks; output and prompt (input) logprobs share it. Changes logprobs only. Folded to `megatron` by `rl-bitwise`. |
-| `--dsa-slot-order {selection,sorted}` | The order a token's selected KV rows are reduced in by the sparse (DSA) attention: as the top-k leaf emitted them (`selection`), or in ascending position order (`sorted`: one reduction order per selected set, invariant across batch compositions, runs and engines -- not ascending slot order, which follows the page placement). The top-k leaf emits the order and the core keeps it, so both must declare the `slot_order` trait (registered batch-invariant leaves); a silent kernel is refused under `sorted`. Folded to `sorted` by `rl-bitwise`. |
+| `--dsa-slot-order {selection,sorted}` | The order a token's selected KV rows are reduced in by the sparse (DSA) attention: as the top-k leaf emitted them (`selection`), or in ascending position order (`sorted`: one reduction order per selected set, invariant across batch compositions, runs and engines -- not ascending slot order, which follows the page placement). The top-k leaf emits the order and the core keeps it, so both must declare the `slot_order` trait (registered batch-invariant leaves); a silent kernel is refused under `sorted`. Defaults to `selection`; `rl-bitwise` fixes it to `selection`, overriding an explicit `sorted`. Both top-k and attention leaves must still be batch-invariant under `rl-bitwise`. |
 | `--moe-combine-order {rank,slot}` | How a token's routed-expert contributions meet across the MoE TP-EP group. `rank`: the MoE kernel returns this rank's partial and the host sums the partials, adding LongCat's identity zero-expert residual once around the reduction. `slot`: the MoE kernel folds the token's top-k slots in fp32 slot order across the EP group itself, residual included, as the trainer's grouped MLP does, and the host reduces nothing; needs MoE TP 1 and a kernel declaring `combine_order` with `slot` (a registered batch-invariant leaf), and vetoes all-reduce+norm fusion. Folded to `slot` by `rl-bitwise`. |
 
 ## API surface
@@ -868,6 +869,7 @@ which keeps it when recreating a session after a memory resume.
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
+| `--enable-async-logging` | Write Rust host and default Python root logs on background threads. Defaults to off; `--no-enable-async-logging` explicitly selects synchronous output. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
@@ -884,6 +886,25 @@ cost can be read alongside its batch size), device page usage, the generation
 throughput accumulated since the previous line, `avg_accept_len` /
 `accept_rate` under speculative decoding, and `#queue-req`. Every field is a
 host-side scheduler counter. The line adds no GPU synchronization.
+
+Logging is synchronous by default. With `--enable-async-logging`, the Rust
+host's `tracing` output and the default Python root logger each use a queue
+of at most 8,192 records. A background thread owns writes and flushes, so
+an occasional slow write to a distributed file system or collector does
+not hold the thread emitting the log. When a queue fills, new records are
+dropped without writing a synchronous overflow warning. This removes output
+stalls from the serving thread; it does not increase the sink's throughput.
+
+The host explicitly drains Python logs on both normal and error returns,
+before notifying the launcher of a failure; it does not rely on Python
+interpreter finalization. Python cleanup waits up to five seconds, and the
+Rust appender also performs a bounded, best-effort drain on exit. A sink
+that remains blocked through shutdown can lose pending records.
+
+Colorful Python loggers retain their direct handlers. Custom handlers remain
+under `TOKENSPEED_LOGGING_CONFIG_PATH` control: combining that variable with
+`--enable-async-logging` is rejected. Configure asynchronous handlers in the
+custom file, or use the default configuration with this flag.
 
 `#queue-req` counts requests admitted to the scheduler but not yet running.
 On a PD engine that includes requests still bootstrapping with the peer —

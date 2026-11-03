@@ -21,7 +21,7 @@
 """Which kernel ``layernorm.qk_rmsnorm_ssmax`` runs, decided on the host.
 
 CPU only, nothing launches: ranked selection runs the fused Triton kernel exactly
-where its host guard admits the call (Beam's TP1 and TP8 head pairs on NVIDIA SM100
+where its host guard admits the call (Beam's TP1 and TP8 head pairs on NVIDIA SM90
 to SM103), the torch kernel everywhere else (other TP sizes and platforms), and a
 by-name call outside the guard raises instead of falling back. The kernels' byte
 equality is ``test/nvidia/ops/layernorm/test_beam_norms_cuda.py``.
@@ -74,12 +74,12 @@ def _on_cuda(arguments: tuple) -> tuple:
 
 @pytest.fixture
 def platforms(b200_platform, b300_platform, h100_platform, mi350_platform):
-    """(platform, in the fused kernels' range NVIDIA SM100 to SM103)."""
+    """(platform, in the fused kernels' range NVIDIA SM90 to SM103)."""
     sm107 = dataclasses.replace(b200_platform, arch_version=ArchVersion(10, 7))
     return (
         (b200_platform, True),
         (b300_platform, True),
-        (h100_platform, False),
+        (h100_platform, True),
         (sm107, False),
         (mi350_platform, False),
     )

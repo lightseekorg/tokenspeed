@@ -61,7 +61,8 @@ fn post_init(params: &mut SamplingParams) {
         }
         _ => None,
     };
-    if params.temperature < SAMPLING_EPS {
+    // A near-zero temperature means greedy; `verify` rejects a negative one.
+    if (0.0..SAMPLING_EPS).contains(&params.temperature) {
         params.temperature = 1.0;
         params.top_k = 1;
     }
