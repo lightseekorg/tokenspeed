@@ -827,6 +827,57 @@ class HostDataPlane:
             ),
         )
 
+    def try_complete(self, dispatched: _Dispatched) -> tuple | None:
+        """A forward's results when its D2H copy already landed, else None.
+
+        The forward thread calls this between forwards, while it holds the
+        interpreter lock anyway: the control thread's ``complete`` then reads
+        the extracted lists from a channel instead of acquiring the lock
+        itself. This is the same extraction ``complete`` performs — sync
+        (skipped: the copy event already fired) and tolist — run ahead of
+        time on the thread that was going to hold the lock regardless.
+        """
+        results = dispatched.results
+        if not results.copy_event.query():
+            return None
+        return self._extract(results)
+
+    def _extract(self, results: ModelExecutionResult) -> tuple:
+        """The tolist extraction ``complete`` and ``try_complete`` share."""
+        results.sync()
+        compiles = compile_stats() if self._report_compiles else None
+        return (
+            results.output_tokens.tolist(),
+            results.output_lengths.tolist(),
+            (
+                results.output_logprobs.tolist()
+                if results.output_logprobs is not None
+                else None
+            ),
+            (
+                results.output_nan_flags.tolist()
+                if results.output_nan_flags is not None
+                else None
+            ),
+            (
+                [list(row) for row in results.next_input_ids.tolist()]
+                if results.next_input_ids is not None
+                else None
+            ),
+            (
+                (compiles.serving_compiles, compiles.serving_seconds)
+                if compiles is not None
+                else None
+            ),
+            resolve_grammar_completion(results),
+            _logprob_lists(results),
+            (
+                results.output_token_cumulative_probs.tolist()
+                if results.output_token_cumulative_probs is not None
+                else None
+            ),
+        )
+
     def note_committed(self, dispatched: _Dispatched) -> None:
         """A committed forward counts toward a profile's steps. The forward
         thread runs this, after the commit's ``complete``: the profiler

@@ -165,6 +165,9 @@ struct State {
     failure: Option<String>,
     /// Launched forwards, until their commit takes them.
     launched: HashMap<ForwardId, Py<PyAny>>,
+    /// Forward results the forward thread extracted into Rust types;
+    /// the control thread reads them without the interpreter lock.
+    extracted: HashMap<ForwardId, ForwardResult>,
 }
 
 impl Shared {
@@ -183,6 +186,35 @@ impl Shared {
     fn fail(&self, failure: String) {
         self.state().failure.get_or_insert(failure);
         self.changed.notify_all();
+    }
+
+    /// A result the forward thread pre-extracted; the control thread's
+    /// fast path.
+    fn pre_extracted(&self, forward: ForwardId) -> Option<ForwardResult> {
+        self.state().extracted.remove(&forward)
+    }
+
+    /// Record a result the forward thread extracted, for the control
+    /// thread's next `complete`.
+    fn insert_extracted(&self, forward: ForwardId, result: ForwardResult) {
+        self.state().extracted.insert(forward, result);
+    }
+
+    /// Take the oldest launched forward for the forward thread's
+    /// opportunistic extraction; `restore_launched` puts it back when its
+    /// copy has not landed yet. The oldest is the one most likely to have
+    /// its D2H copy done — a just-launched forward's copy is still in
+    /// flight.
+    fn take_launched_for_extract(&self) -> Option<(ForwardId, Py<PyAny>)> {
+        let mut state = self.state();
+        let forward = state.launched.keys().min().copied()?;
+        let launched = state.launched.remove(&forward)?;
+        Some((forward, launched))
+    }
+
+    /// Put a launched forward back after an unsuccessful extraction.
+    fn restore_launched(&self, forward: ForwardId, launched: Py<PyAny>) {
+        self.state().launched.insert(forward, launched);
     }
 
     fn launch(&self, forward: ForwardId, launched: Py<PyAny>) {
@@ -393,6 +425,13 @@ impl DataPlane for PythonDataPlane {
     }
 
     fn complete(&mut self, forward: ForwardId) -> Result<ForwardResult, DataPlaneError> {
+        // The forward thread may have extracted this result between
+        // forwards, while it held the interpreter lock anyway: reading it
+        // needs no lock at all. Only a result whose D2H copy had not landed
+        // falls through to the querying path below.
+        if let Some(result) = self.shared.pre_extracted(forward) {
+            return Ok(result);
+        }
         let launched = self.shared.take_launched(forward).map_err(DataPlaneError)?;
         let result = self.query(|plane| complete(plane, &launched))?;
         // The profiler counts committed forwards, on the thread it traces.
@@ -718,6 +757,16 @@ fn run(
                     return Err("a plan without a batch ran a forward".to_owned());
                 }
             }
+            // While this thread holds the interpreter lock anyway, extract
+            // any forward whose D2H copy already landed: the control thread
+            // then reads the result without acquiring the lock itself.
+            if let Some((prior, prior_launched)) = shared.take_launched_for_extract() {
+                match try_complete(plane, &prior_launched).map_err(python) {
+                    Ok(Some(result)) => shared.insert_extracted(prior, result),
+                    Ok(None) => shared.restore_launched(prior, prior_launched),
+                    Err(_) => shared.restore_launched(prior, prior_launched),
+                }
+            }
         }
         Op::Committed(launched) => {
             plane
@@ -903,6 +952,42 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         input_top_logprobs,
         output_top_logprobs,
     })
+}
+
+/// A forward's results when its D2H copy already landed, extracted on the
+/// forward thread while it holds the interpreter lock anyway; `None` when
+/// the copy is still in flight.
+fn try_complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<Option<ForwardResult>> {
+    let extracted = plane.call_method1("try_complete", (launched,))?;
+    if extracted.is_none() {
+        return Ok(None);
+    }
+    let (
+        output_tokens,
+        output_lengths,
+        output_logprobs,
+        nan_flags,
+        next_input_ids,
+        serving_compiles,
+        grammar_terminated_at,
+        logprobs,
+        output_token_cumulative_probs,
+    ): Completed = extracted.extract()?;
+    let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
+        logprobs.unwrap_or_default();
+    Ok(Some(ForwardResult {
+        output_tokens,
+        output_lengths,
+        output_logprobs,
+        output_token_cumulative_probs,
+        nan_flags,
+        next_input_ids,
+        serving_compiles,
+        grammar_terminated_at,
+        input_token_logprobs,
+        input_top_logprobs,
+        output_top_logprobs,
+    }))
 }
 
 #[cfg(test)]
