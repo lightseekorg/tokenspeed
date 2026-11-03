@@ -604,7 +604,7 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }
 
-TEST(FullAttnManagerLcmTest, ADedupedSlotExportsTheCanonicalBlocksPageId) {
+TEST(FullAttnManagerLcmTest, APublishedDuplicateKeepsExportingItsOwnPageId) {
     BlockPool pool(2, {2});
     FullAttnManager mgr(4, 2, 0);
     BlockTable first;
@@ -619,8 +619,9 @@ TEST(FullAttnManagerLcmTest, ADedupedSlotExportsTheCanonicalBlocksPageId) {
 
     mgr.CacheFullBlocks(pool, duplicate, std::vector<CacheKey>{key});
 
-    EXPECT_EQ(duplicate.Blocks()[0], first.Blocks()[0]) << "publishing swapped in the canonical block";
-    EXPECT_EQ(mgr.BlockTablePageIds(duplicate), (std::vector<std::int32_t>{canonical, before[1]}));
+    EXPECT_NE(duplicate.Blocks()[0], first.Blocks()[0]) << "publishing keeps the duplicate's own block";
+    EXPECT_EQ(mgr.BlockTablePageIds(duplicate), before) << "the rows a forward or transfer exported stay valid";
+    EXPECT_EQ(mgr.BlockTablePageIds(first)[0], canonical);
 }
 
 TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {

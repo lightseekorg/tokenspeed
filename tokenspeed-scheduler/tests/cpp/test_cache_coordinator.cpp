@@ -14764,13 +14764,11 @@ TEST(RetractionImageSplitTest, OneFullHostBucketDecidesTheSplitBeforeAnyEviction
 
 // KV parallelism over two shards, two Full blocks per parent. Another request
 // publishes the image's one page first, from a block in bucket 0; the
-// victim's own block for that page lies in bucket 1, and its publication
-// re-points the slot to the indexed block. The probe, made before that
-// publication on PublishedDataSlotsAfter, reads the slot on the indexed block
-// as well: the row goes to bucket 0, where the Host's one parent has a free
-// block, not to bucket 1, which a pinned entry fills. The probe's split and
-// the one made after the publication agree.
-TEST(RetractionImageSplitTest, TheProbeCountsARowInTheBucketOfTheBlockItsPublicationDedupesOnto) {
+// victim's own block for that page lies in bucket 1 and stays its private
+// duplicate through its publication. The probe, made before that publication
+// on PublishedDataSlotsAfter, leaves the duplicate to the snapshot pool as
+// well, and the probe's split and the one made after the publication agree.
+TEST(RetractionImageSplitTest, TheProbeLeavesAPrivateDuplicateToTheSnapshotPool) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
@@ -14808,17 +14806,17 @@ TEST(RetractionImageSplitTest, TheProbeCountsARowInTheBucketOfTheBlockItsPublica
             },
         .num_computed_tokens = 2,
     };
+    const CacheBlockRef own = victim[0].Blocks()[0];
     const std::vector<std::vector<ImageSlot>> probed =
         coordinator.PublishedDataSlotsAfter(victim, /*num_tokens=*/2, progress);
-    ASSERT_EQ(probed[0].size(), 1u);
-    EXPECT_EQ(probed[0][0].block, publisher[0].Blocks()[0]) << "the block the publication leaves the slot on";
+    EXPECT_TRUE(probed[0].empty()) << "the publication registers nothing of the victim's";
     const TierTransferManager::RetractionImageSplit probe =
         transfers.SplitRetractionImage(victim, /*num_tokens=*/2, probed);
-    EXPECT_EQ(probe.buckets, (std::vector<std::int32_t>{0}));
-    EXPECT_EQ(probe.num_host_boundaries, 1u);
+    EXPECT_TRUE(probe.slots.empty());
+    EXPECT_EQ(probe.num_host_boundaries, 0u);
 
     coordinator.CacheCompletedBlocks(victim, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
-    ASSERT_EQ(victim[0].Blocks()[0], publisher[0].Blocks()[0]);
+    ASSERT_EQ(victim[0].Blocks()[0], own);
     const TierTransferManager::RetractionImageSplit retraction =
         transfers.SplitRetractionImage(victim, /*num_tokens=*/2, coordinator.PublishedDataSlots(victim, 2));
     EXPECT_EQ(retraction.buckets, probe.buckets);

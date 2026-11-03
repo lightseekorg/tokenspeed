@@ -615,7 +615,7 @@ protected:
         // The state0..state2 rows.
         std::vector<std::vector<std::int32_t>> state_rows;
         std::vector<std::int32_t> zeroed_state0;
-        // The full group's row.
+        // The full group's row, the pages the forward and its PD transfer address.
         std::vector<std::int32_t> full_row;
     };
 
@@ -4048,8 +4048,17 @@ TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictim
     }
     ASSERT_EQ(s1_table["full"].size(), 6u);
     ASSERT_EQ(s2_table["full"].size(), 7u);
-    EXPECT_TRUE(std::equal(s1_table["full"].begin(), s1_table["full"].begin() + 5, s2_table["full"].begin()))
-        << "s2 resumes on s1's five pages";
+    // s1 publishes no State checkpoint before its finish, so s2 recomputes
+    // s1's five pages from the start. They stay s2's private duplicates
+    // through its publications, so its hand-off reads the very blocks its
+    // chunks wrote and exported.
+    ASSERT_EQ(s2_chunks[0].prefix_tokens, 0);
+    ASSERT_GE(s2_chunks[2].full_row.size(), 5u);
+    for (std::size_t page = 0; page < 5; ++page) {
+        EXPECT_NE(s2_table["full"][page], s1_table["full"][page]) << "page " << page << " is s2's own";
+    }
+    EXPECT_TRUE(std::equal(s2_chunks[2].full_row.begin(), s2_chunks[2].full_row.begin() + 5, s2_table["full"].begin()))
+        << "publication leaves s2 on the blocks its chunks exported";
 
     // By plan: the requests that run, and the rows written back as (group,
     // Device page).
@@ -4313,7 +4322,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, WriteBackPlansMatchOnMirroredSchedu
     };
     const std::vector<WriteBackBatch> first = run();
     const std::vector<WriteBackBatch> second = run();
-    ASSERT_EQ(first.size(), 3u);
+    ASSERT_EQ(first.size(), 2u);
     ASSERT_EQ(second.size(), first.size());
     for (std::size_t i = 0; i < first.size(); ++i) {
         EXPECT_EQ(second[i].op_ids, first[i].op_ids);
