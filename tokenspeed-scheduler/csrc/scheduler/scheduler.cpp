@@ -259,18 +259,19 @@ void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std
     }
     _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages = request.FullPrefixPages(false);
-    _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
+    const std::vector<std::span<const std::int32_t>> token_pages =
+        request.PrefixPages(first_page, static_cast<std::int32_t>(prefix_hashes.size()));
     const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
 
     for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
+        const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
         CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[i - 1]};
         KvBlockStoredEvent event{
             .block_hashes = {block_hashes[i]},
             .parent_block_hash = parent_hash,
-            .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
+            .token_ids = std::vector<std::int32_t>(tokens.begin(), tokens.end()),
             .block_size = config_.prefix_granularity,
         };
         const auto [it, inserted] = kv_event_boundaries_.try_emplace(

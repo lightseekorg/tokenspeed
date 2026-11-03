@@ -88,14 +88,13 @@ void fillBlockTables(Operation& operation, Request& request, const CacheCoordina
     }
 }
 
-void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
-                                 const std::vector<std::span<const std::int32_t>>& prefix_pages,
+void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes, const Request& request,
                                  std::int32_t filled_prefix_pages) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size());
     _assert(filled_prefix_pages > first_new_prefix_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = prefix_hashes.empty() ? std::string{} : prefix_hashes.back();
     std::vector<std::string> new_hashes =
-        AdvancePrefixHashes(prefix_pages, first_new_prefix_page, previous_hash, filled_prefix_pages);
+        ComputePrefixHashes(request.PrefixPages(first_new_prefix_page, filled_prefix_pages), previous_hash);
     prefix_hashes.insert(prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                          std::make_move_iterator(new_hashes.end()));
 }
@@ -171,7 +170,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
-        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
+        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request, filled_prefix_pages);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     std::optional<TailPublication> tail;
