@@ -275,6 +275,7 @@ def triton_causal_conv1d_prefill(
     solution="triton",
     signatures=format_signatures("x", "dense", _CONV_DTYPES),
     priority=Priority.PORTABLE,
+    traits={"varlen": frozenset({True, False})},
 )
 def triton_causal_conv1d_update(
     x: torch.Tensor,
@@ -293,6 +294,7 @@ def triton_causal_conv1d_update(
     parent_indices: torch.Tensor | None,
     out: torch.Tensor | None = None,
     replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -325,6 +327,8 @@ def triton_causal_conv1d_update(
     returns: the output, (batch, dim) or (batch, dim, seqlen)
     """
     enable_pdl = pdl_enabled()
+    if query_start_loc is not None and replay_payload is not None:
+        raise ValueError("fused convolution replay requires request-major gates")
     if parent_indices is not None:
         tree_tables_ok = (
             conv_state_indices is not None
@@ -377,6 +381,25 @@ def triton_causal_conv1d_update(
         # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
+    if query_start_loc is not None:
+        if (
+            not unsqueeze
+            or output_state_indices is None
+            or conv_state_indices is None
+            or parent_indices is not None
+            or cache_seqlens is not None
+            or num_accepted_tokens is not None
+            or intermediate_conv_window is not None
+            or query_start_loc.shape != (conv_state_indices.numel() + 1,)
+            or not query_start_loc.is_contiguous()
+            or query_start_loc.dtype not in (torch.int32, torch.int64)
+            or query_start_loc.device != x.device
+            or output_state_indices.shape[0] != conv_state_indices.numel()
+        ):
+            raise ValueError(
+                "packed convolution requires device offsets and per-token state destinations"
+            )
+        batch, seqlen = output_state_indices.shape
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
@@ -411,6 +434,9 @@ def triton_causal_conv1d_update(
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
 
     stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    if query_start_loc is not None:
+        stride_x_seq, stride_x_token = 0, x.stride(0)
+        stride_o_seq, stride_o_token = 0, out.stride(0)
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
@@ -490,6 +516,7 @@ def triton_causal_conv1d_update(
         payload,
         replay_a,
         replay_b,
+        query_start_loc,
         # Matrix dimensions
         batch,
         dim,
@@ -535,6 +562,7 @@ def triton_causal_conv1d_update(
         GATE_HEADS=gate_heads,
         GATE_BLOCK=triton.next_power_of_2(max(gate_heads, 1)),
         NP2_SEQLEN=triton.next_power_of_2(seqlen),
+        HAS_QUERY_OFFSETS=query_start_loc is not None,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

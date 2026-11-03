@@ -226,6 +226,7 @@ class QSAIndexer(nn.Module):
         stage_verify_buffers: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
         ),
+        stage_verify_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         raw, compressed, position_cache = self._fields(pool)
         position_values = self._position_values(rope_positions)
@@ -270,6 +271,7 @@ class QSAIndexer(nn.Module):
             ),
             num_query_heads=self.index_n_heads if query is not None else None,
             stage_verify_buffers=stage_verify_buffers,
+            stage_verify_rows=stage_verify_rows,
             stage_draft=stage_draft,
         )
         if stage_draft:
@@ -445,7 +447,7 @@ class QSAIndexer(nn.Module):
         verify_scratch = None
         if is_target_verify:
             verify_tokens = verify_bs * backend.spec_num_tokens
-            if verify_tokens > token_k.shape[0]:
+            if ctx.verify_queries is None and verify_tokens > token_k.shape[0]:
                 raise RuntimeError("QSA verify rows exceed the current input")
             verify_scratch = backend.verify_staging_buffers(self.layer_id, verify_bs)
         q = self._write_and_compress(
@@ -464,6 +466,9 @@ class QSAIndexer(nn.Module):
             # region is dead; K compression and draft staging still proceed.
             query=None if shared_topk is not None else raw_q,
             stage_verify_buffers=verify_scratch,
+            stage_verify_rows=(
+                None if ctx.verify_queries is None else ctx.verify_queries.packed_rows
+            ),
         )
         if shared_topk is not None:
             return shared_topk[: hidden_states.shape[0]]

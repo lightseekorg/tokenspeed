@@ -36,6 +36,7 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
     CacheGroupConfig,
     CacheTransferPolicy,
     CapacityModel,
+    ConfidenceBudgetPlanner,
     ExecutionEvent,
     ExecutionPlan,
     RequestSpec,
@@ -88,6 +89,7 @@ __all__ = [
     "CacheGroupConfig",
     "CacheTransferPolicy",
     "CapacityModel",
+    "ConfidenceBudgetPlanner",
     # Execution plan & operations
     "ExecutionPlan",
     "SchedulerAbort",

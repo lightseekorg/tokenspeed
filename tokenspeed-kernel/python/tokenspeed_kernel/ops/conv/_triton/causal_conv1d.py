@@ -427,6 +427,7 @@ def _causal_conv1d_update_kernel(
     replay_ptr,  # (batch * seqlen, replay width)
     replay_a_ptr,  # (batch * seqlen, gate heads)
     replay_b_ptr,  # (batch * seqlen, gate heads)
+    query_start_loc,
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
@@ -473,6 +474,7 @@ def _causal_conv1d_update_kernel(
     GATE_HEADS: tl.constexpr,
     GATE_BLOCK: tl.constexpr,
     NP2_SEQLEN: tl.constexpr,
+    HAS_QUERY_OFFSETS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     # ruff: noqa: E501
@@ -483,6 +485,13 @@ def _causal_conv1d_update_kernel(
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
+    start = 0
+    length = seqlen
+    if HAS_QUERY_OFFSETS:
+        start = tl.load(query_start_loc + idx_seq).to(tl.int64)
+        length = tl.load(query_start_loc + idx_seq + 1).to(tl.int64) - start
+        if length == 0:
+            return
 
     if HAS_REPLAY_PAYLOAD:
         # Channel block 0 copies the gates: payload row = [REPLAY_FIRST_CHANNEL on | a | b].
@@ -568,7 +577,12 @@ def _causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    x_base = (
+        x_ptr
+        + (idx_seq * stride_x_seq)
+        + (idx_feats * stride_x_dim)
+        + start * stride_x_token
+    )
 
     if not SAVE_INTERMEDIATE and not HAS_OUTPUT_STATE_INDICES:
         # STEP 2: update conv_state in place.  Speculative verify uses
@@ -653,109 +667,119 @@ def _causal_conv1d_update_kernel(
     x_tokens = ()
     for idx_token in tl.static_range(seqlen):
         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-        x_tokens = x_tokens + (tl.load(x_ptrs_1d, mask=mask_x_1d),)
-
-    # STEP 5: compute each token
-    for idx_token in tl.static_range(seqlen):
-        acc = acc_preload
-
-        matrix_w = w_col0
-        matrix_x = col0
-        for j in tl.static_range(KERNEL_WIDTH):
-            if KERNEL_WIDTH == 2:
-                if j == 1:  # KERNEL_WIDTH-1:
-                    matrix_w = w_col1
-                    matrix_x = x_tokens[idx_token]
-            elif KERNEL_WIDTH == 3:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = x_tokens[idx_token]
-            elif KERNEL_WIDTH == 4:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    matrix_x = x_tokens[idx_token]
-
-            acc += matrix_x * matrix_w  # [BLOCK_N]
-
-        if KERNEL_WIDTH == 2:
-            col0 = matrix_x
-        elif KERNEL_WIDTH == 3:
-            col0 = col1
-            col1 = matrix_x
-        elif KERNEL_WIDTH == 4:
-            col0 = col1
-            col1 = col2
-            col2 = matrix_x
-
-        if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
-        mask_1d = (idx_token < seqlen) & (
-            idx_feats < dim
-        )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (idx_seq) * stride_o_seq
-            + idx_token * stride_o_token
-            + (idx_feats * stride_o_dim)
+        x_tokens = x_tokens + (
+            tl.load(x_ptrs_1d, mask=mask_x_1d & (idx_token < length), other=0.0),
         )
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
-        if HAS_REPLAY_PAYLOAD:
-            # The same rounded output, at the token's payload row.
-            replay_ptrs = (
-                replay_ptr
-                + (idx_seq * seqlen + idx_token).to(tl.int64) * stride_replay_row
-                + (idx_feats - REPLAY_FIRST_CHANNEL)
-            )
-            tl.store(
-                replay_ptrs, acc, mask=mask_1d & (idx_feats >= REPLAY_FIRST_CHANNEL)
+    # Unroll the fixed verify window; device offsets guard its live prefix.
+    for idx_token in tl.static_range(seqlen):
+        if idx_token < length:
+            acc = acc_preload
+
+            matrix_w = w_col0
+            matrix_x = col0
+            for j in tl.static_range(KERNEL_WIDTH):
+                if KERNEL_WIDTH == 2:
+                    if j == 1:  # KERNEL_WIDTH-1:
+                        matrix_w = w_col1
+                        matrix_x = x_tokens[idx_token]
+                elif KERNEL_WIDTH == 3:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = x_tokens[idx_token]
+                elif KERNEL_WIDTH == 4:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = col2
+                    elif j == 3:
+                        matrix_w = w_col3
+                        matrix_x = x_tokens[idx_token]
+
+                acc += matrix_x * matrix_w  # [BLOCK_N]
+
+            if KERNEL_WIDTH == 2:
+                col0 = matrix_x
+            elif KERNEL_WIDTH == 3:
+                col0 = col1
+                col1 = matrix_x
+            elif KERNEL_WIDTH == 4:
+                col0 = col1
+                col1 = col2
+                col2 = matrix_x
+
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            mask_1d = (idx_token < seqlen) & (
+                idx_feats < dim
+            )  # token-index  # feature-index
+            o_ptrs = (
+                o_ptr
+                + (idx_seq) * stride_o_seq
+                + start * stride_o_token
+                + idx_token * stride_o_token
+                + (idx_feats * stride_o_dim)
             )
 
-        if SAVE_INTERMEDIATE:
-            # Save the window state after consuming this token
-            # Layout: [batch_position, step, dim, win(K-1)]
-            # Use idx_seq (batch position) instead of conv_state_batch_coord
-            # (pool index) so the intermediate cache can be sized to
-            # max_batch_size rather than the full mamba pool.
-            base_ptr = (
-                intermediate_conv_window_ptr
-                + idx_seq * stride_inter_seq
-                + idx_token * stride_inter_step
-                + idx_feats * stride_inter_dim
-            )
-            if KERNEL_WIDTH >= 2:
-                tl.store(base_ptr + 0 * stride_inter_win, col0, mask=mask_w)
-            if KERNEL_WIDTH >= 3:
-                tl.store(base_ptr + 1 * stride_inter_win, col1, mask=mask_w)
-            if KERNEL_WIDTH >= 4:
-                tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
-        if HAS_OUTPUT_STATE_INDICES:
-            output_state_idx = tl.load(
-                output_state_indices_ptr
-                + idx_seq * stride_output_state_indices_seq
-                + idx_token * stride_output_state_indices_step
-            ).to(tl.int64)
-            if output_state_idx >= 0:
-                output_base = (
-                    conv_state_ptr
-                    + output_state_idx * stride_conv_state_seq
-                    + idx_feats * stride_conv_state_dim
+            tl.store(o_ptrs, acc, mask=mask_1d)
+            if HAS_REPLAY_PAYLOAD:
+                # The same rounded output, at the token's payload row.
+                replay_ptrs = (
+                    replay_ptr
+                    + (idx_seq * seqlen + idx_token).to(tl.int64) * stride_replay_row
+                    + (idx_feats - REPLAY_FIRST_CHANNEL)
+                )
+                tl.store(
+                    replay_ptrs, acc, mask=mask_1d & (idx_feats >= REPLAY_FIRST_CHANNEL)
+                )
+
+            if SAVE_INTERMEDIATE:
+                # Save the window state after consuming this token
+                # Layout: [batch_position, step, dim, win(K-1)]
+                # Use idx_seq (batch position) instead of conv_state_batch_coord
+                # (pool index) so the intermediate cache can be sized to
+                # max_batch_size rather than the full mamba pool.
+                base_ptr = (
+                    intermediate_conv_window_ptr
+                    + idx_seq * stride_inter_seq
+                    + idx_token * stride_inter_step
+                    + idx_feats * stride_inter_dim
                 )
                 if KERNEL_WIDTH >= 2:
-                    tl.store(output_base + 0 * stride_conv_state_tok, col0, mask=mask_w)
+                    tl.store(base_ptr + 0 * stride_inter_win, col0, mask=mask_w)
                 if KERNEL_WIDTH >= 3:
-                    tl.store(output_base + 1 * stride_conv_state_tok, col1, mask=mask_w)
+                    tl.store(base_ptr + 1 * stride_inter_win, col1, mask=mask_w)
                 if KERNEL_WIDTH >= 4:
-                    tl.store(output_base + 2 * stride_conv_state_tok, col2, mask=mask_w)
+                    tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
+            if HAS_OUTPUT_STATE_INDICES:
+                output_state_idx = tl.load(
+                    output_state_indices_ptr
+                    + idx_seq * stride_output_state_indices_seq
+                    + idx_token * stride_output_state_indices_step
+                ).to(tl.int64)
+                if output_state_idx >= 0:
+                    output_base = (
+                        conv_state_ptr
+                        + output_state_idx * stride_conv_state_seq
+                        + idx_feats * stride_conv_state_dim
+                    )
+                    if KERNEL_WIDTH >= 2:
+                        tl.store(
+                            output_base + 0 * stride_conv_state_tok, col0, mask=mask_w
+                        )
+                    if KERNEL_WIDTH >= 3:
+                        tl.store(
+                            output_base + 1 * stride_conv_state_tok, col1, mask=mask_w
+                        )
+                    if KERNEL_WIDTH >= 4:
+                        tl.store(
+                            output_base + 2 * stride_conv_state_tok, col2, mask=mask_w
+                        )
 
 
 @triton.jit()

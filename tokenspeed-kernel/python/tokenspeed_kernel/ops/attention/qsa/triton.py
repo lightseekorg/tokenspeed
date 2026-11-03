@@ -44,10 +44,13 @@ _SCORE_MAX_WAVES = 3
 LOG2E = math.log2(math.e)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["batch", "total_tokens", "stride_qsa_pt_b", "stride_recent_pt_b"]
+)
 def _qwen4_exp_qsa_prepare_metadata_kernel(
     seq_lens,
     query_lengths,
+    query_start_loc,
     qsa_page_table,
     recent_page_table,
     positions,
@@ -56,6 +59,8 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
     recent_locs,
     complete_blocks,
     draft_logical_positions,
+    batch,
+    total_tokens,
     uniform_len,
     qsa_page_size,
     recent_page_size,
@@ -66,6 +71,7 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
     stride_dlp_r,
     stride_dlp_s,
     HAS_UNIFORM: tl.constexpr,
+    HAS_OFFSETS: tl.constexpr,
     RESET_DRAFT_TAGS: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     RESET_BLOCK: tl.constexpr,
@@ -81,9 +87,24 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
         start = request.to(tl.int64) * uniform_len
     else:
         length = tl.load(query_lengths + request * stride_len_b).to(tl.int64)
-        start = tl.zeros((), dtype=tl.int64)
-        for other in range(0, request):
-            start += tl.load(query_lengths + other * stride_len_b).to(tl.int64)
+        if HAS_OFFSETS:
+            start = tl.load(query_start_loc + request).to(tl.int64)
+        else:
+            start = tl.zeros((), dtype=tl.int64)
+            for other in range(0, request):
+                start += tl.load(query_lengths + other * stride_len_b).to(tl.int64)
+
+    # A static query bucket may have fewer live rows. Its filler has no
+    # position or cache slot and must never inherit a previous replay's tags.
+    if HAS_OFFSETS and request == batch - 1:
+        for offset in range(start + length, total_tokens, BLOCK):
+            rows = offset + tl.arange(0, BLOCK)
+            tail = rows < total_tokens
+            tl.store(positions + rows, -1, mask=tail)
+            tl.store(requests + rows, 0, mask=tail)
+            tl.store(qsa_locs + rows, 0, mask=tail)
+            tl.store(recent_locs + rows, 0, mask=tail)
+            tl.store(complete_blocks + rows, 0, mask=tail)
 
     if RESET_DRAFT_TAGS:
         reset_offsets = tl.arange(0, RESET_BLOCK)
@@ -160,6 +181,7 @@ def qwen4_exp_qsa_prepare_metadata(
     *,
     enable_pdl: bool,
     draft_logical_positions: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -185,6 +207,8 @@ def qwen4_exp_qsa_prepare_metadata(
         compress_ratio: Raw tokens represented by one compressed key.
         enable_pdl: Enable NVIDIA programmatic dependent launch.
         draft_logical_positions: Optional request-local draft tags to reset.
+        query_start_loc: Optional contiguous device prefix offsets. When
+            supplied, unused bucket rows receive invalid positions and slots.
 
     Returns:
         Logical positions, request ids, compressed-cache locations,
@@ -227,13 +251,24 @@ def qwen4_exp_qsa_prepare_metadata(
         draft_arg = draft_logical_positions
         stride_dlp_r = draft_logical_positions.stride(0)
         stride_dlp_s = draft_logical_positions.stride(1)
+    if query_start_loc is not None and (
+        query_start_loc.shape != (batch + 1,)
+        or not query_start_loc.is_contiguous()
+        or isinstance(query_lengths, int)
+    ):
+        raise ValueError(
+            "QSA device offsets require per-request lengths and B + 1 entries"
+        )
     kernel_launcher(_qwen4_exp_qsa_prepare_metadata_kernel, (batch,))(
         seq_lens,
         lengths_arg,
+        query_start_loc,
         qsa_page_table,
         recent_page_table,
         *outputs,
         draft_arg,
+        batch,
+        total_tokens,
         uniform_len,
         qsa_page_size,
         recent_page_size,
@@ -244,6 +279,7 @@ def qwen4_exp_qsa_prepare_metadata(
         stride_dlp_r,
         stride_dlp_s,
         HAS_UNIFORM=has_uniform,
+        HAS_OFFSETS=query_start_loc is not None,
         RESET_DRAFT_TAGS=draft_logical_positions is not None,
         COMPRESS_RATIO=compress_ratio,
         RESET_BLOCK=triton.next_power_of_2(compress_ratio),
@@ -254,7 +290,7 @@ def qwen4_exp_qsa_prepare_metadata(
     return outputs
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stage_verify_start"])
 def _qwen4_exp_qsa_compress_and_store_kernel(
     token_k,
     query,
@@ -278,6 +314,7 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     staged_positions,
     staged_logical,
     staged_recent,
+    stage_verify_rows,
     head_dim,
     rotary_dim,
     norm_epsilon,
@@ -323,6 +360,7 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     HAS_WRITE_MASK: tl.constexpr,
     HAS_DRAFT: tl.constexpr,
     STAGE_VERIFY: tl.constexpr,
+    HAS_STAGE_ROWS: tl.constexpr,
     STAGE_DRAFT: tl.constexpr,
     HAS_SECTIONS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
@@ -676,8 +714,12 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
             other=0,
         )
         if STAGE_VERIFY:
-            if row >= stage_verify_start:
-                staged_row = row - stage_verify_start
+            staged_row = (
+                tl.load(stage_verify_rows + row)
+                if HAS_STAGE_ROWS
+                else row - stage_verify_start
+            )
+            if staged_row >= 0:
                 tl.store(
                     staged_k + staged_row * head_dim + dim_offsets,
                     staged_values.to(staged_k.dtype.element_ty),
@@ -744,6 +786,7 @@ def qwen4_exp_qsa_compress_and_store(
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
     ),
     stage_draft: bool,
+    stage_verify_rows: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Pool, normalize, rotate, and scatter compressed QSA keys in one kernel.
 
@@ -798,6 +841,8 @@ def qwen4_exp_qsa_compress_and_store(
         stage_draft: Store each row into the supplied request-local draft
             scratch after compression has consumed its previous contents.
             Pass False explicitly when draft staging is not needed.
+        stage_verify_rows: Optional original window row per compact query;
+            negative rows do not stage state. Requires verify staging buffers.
 
     Returns:
         Normalized and rotated query rows when ``query`` is provided;
@@ -873,7 +918,7 @@ def qwen4_exp_qsa_compress_and_store(
             staged_rows,
             staged_rows,
         )
-        if staged_rows > rows:
+        if stage_verify_rows is None and staged_rows > rows:
             raise ValueError("QSA verify staging has more rows than its sources")
         for staged, expected_numel in zip(
             stage_verify_buffers, expected_numels, strict=True
@@ -901,6 +946,15 @@ def qwen4_exp_qsa_compress_and_store(
         staged_recent = recent_locs
     if write_mask is None:
         write_mask = recent_locs
+    if stage_verify_rows is not None and (
+        stage_verify_buffers is None
+        or stage_verify_rows.shape != (rows,)
+        or stage_verify_rows.dtype not in (torch.int32, torch.int64)
+        or not stage_verify_rows.is_contiguous()
+    ):
+        raise ValueError(
+            "QSA compact staging needs one integer destination row per query"
+        )
     # ``token_k`` is usually a strided view of the QK projection output; the
     # kernel reads it through its strides directly, and index tensors are
     # cast in-kernel, so no host-side copy/cast kernel is launched.
@@ -928,6 +982,7 @@ def qwen4_exp_qsa_compress_and_store(
         staged_positions,
         staged_logical,
         staged_recent,
+        stage_verify_rows,
         head_dim,
         rotary_dim,
         float(norm_epsilon),
@@ -973,6 +1028,7 @@ def qwen4_exp_qsa_compress_and_store(
         HAS_WRITE_MASK=write_mask is not recent_locs,
         HAS_DRAFT=has_draft,
         STAGE_VERIFY=stage_verify_buffers is not None,
+        HAS_STAGE_ROWS=stage_verify_rows is not None,
         STAGE_DRAFT=stage_draft,
         HAS_SECTIONS=sections is not None,
         INTERLEAVED=interleaved,

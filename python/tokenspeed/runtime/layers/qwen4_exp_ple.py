@@ -336,7 +336,7 @@ class _PleExecutionPlan(NamedTuple):
     plausible embeddings for the wrong tokens rather than an error.
     """
 
-    lengths: list[int]
+    lengths: list[int] | None
     num_real_tokens: int
     flat_ids: torch.Tensor
     index: tuple
@@ -669,7 +669,7 @@ class Qwen4ExpPLELayer(nn.Module):
         self,
         values: torch.Tensor,
         initial: torch.Tensor,
-        lengths: list[int],
+        lengths: list[int] | None,
         index: tuple | None = None,
         need_intermediate: bool = True,
         *,
@@ -912,8 +912,28 @@ class Qwen4ExpPLELayer(nn.Module):
         metadata = self._metadata(backend)
         # A padded-bucket replay hands us bucket rows whose tail is filler, so
         # the lengths decide how many rows are real before anything reads them.
-        lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
-        num_real_tokens = sum(lengths)
+        verify_queries = ctx.verify_queries
+        if verify_queries is None:
+            lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
+            num_real_tokens = sum(lengths)
+            index, uniform_length = self._prefetch_indices(lengths, input_ids.device)
+        else:
+            if not input_ids.is_cuda:
+                raise ValueError(
+                    "confidence PLE execution requires device query metadata"
+                )
+            lengths = None
+            num_real_tokens = verify_queries.query_capacity
+            index = (
+                verify_queries.request_indices,
+                verify_queries.columns,
+                verify_queries.query_lengths,
+                verify_queries.query_offsets[:-1],
+                verify_queries.width,
+                num_real_tokens,
+                ctx.bs,
+            )
+            uniform_length = 0
         (input_ids,) = slice_to_real_tokens(num_real_tokens, input_ids)
         input_pages = metadata.input_blocks[: ctx.bs]
         output_pages = metadata.output_blocks[: ctx.bs]
@@ -937,7 +957,6 @@ class Qwen4ExpPLELayer(nn.Module):
                 context_field, input_pages, self.ple_embedding.eos_token_id
             )
             initial_conv = self._read_pages(conv_field, input_pages)
-        index, uniform_length = self._prefetch_indices(lengths, input_ids.device)
         flat_ids = input_ids.flatten()
         verify = metadata.verify_width is not None
         context_scratch = conv_scratch = None

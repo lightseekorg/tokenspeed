@@ -581,6 +581,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             "layer_id": self.layer_id,
             "seq_len": seq_len,
             "z": z,
+            "verify_queries": ctx.verify_queries,
         }
 
         core_attn_out = ctx.attn_backend.forward(

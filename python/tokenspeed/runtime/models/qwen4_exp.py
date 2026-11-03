@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
+from dataclasses import replace
 
 import torch
 from torch import nn
@@ -63,6 +64,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5ForCausalLM,
@@ -76,10 +78,38 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.moe.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def dspark_hc_features(hidden: torch.Tensor, *, hc_count: int, hidden_size: int):
+    """Collapse materialized HC branches using the draft's training arithmetic."""
+    if hidden.shape[-1] == hidden_size:
+        return hidden
+    if hidden.shape[-1] != hc_count * hidden_size:
+        raise ValueError("DSpark capture has incompatible HC width")
+    return (
+        hidden.unflatten(-1, (hc_count, hidden_size)).float().mean(-2).to(hidden.dtype)
+    )
+
+
+def _configure_dspark_capture(model, layer_ids: list[int]) -> None:
+    if not layer_ids or layer_ids != sorted(set(layer_ids)):
+        raise ValueError(
+            "DSpark capture layers must be nonempty and strictly increasing"
+        )
+    if layer_ids[0] < 0 or layer_ids[-1] >= len(model.layers):
+        raise ValueError("DSpark capture layer is outside the target")
+    model.layers_to_capture = set(layer_ids)
+    model.dspark_capture_enabled = True
+    model._dflash_capture_idx_map = {
+        layer: index for index, layer in enumerate(layer_ids)
+    }
 
 
 def _qwen4_exp_uses_sigmoid_output_gate(config: Qwen4ExpTextConfig) -> bool:
@@ -530,6 +560,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
+        self.dspark_capture_enabled = False
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
@@ -556,17 +587,72 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
+        query_layout = ctx.verify_queries
+        placement = None
+        if query_layout is not None:
+            # Keep the selected rows through every layer. Only the external
+            # verify/sampling and draft-capture interfaces use the full window.
+            input_ids = query_layout.pack(input_ids, token_dim=0)
+            positions = query_layout.pack(positions, token_dim=positions.ndim - 1)
+            if input_embeds is not None:
+                input_embeds = query_layout.pack(input_embeds, token_dim=0)
+            if input_deepstack_embeds is not None:
+                input_deepstack_embeds = query_layout.pack(
+                    input_deepstack_embeds, token_dim=0
+                )
+            ctx = replace(
+                ctx,
+                input_num_tokens=query_layout.query_capacity,
+                collective_num_tokens=query_layout.query_capacity,
+                global_num_tokens=(
+                    None
+                    if ctx.global_num_tokens is None
+                    else [query_layout.query_capacity] * len(ctx.global_num_tokens)
+                ),
+                collective_global_num_tokens=(
+                    None
+                    if ctx.collective_global_num_tokens is None
+                    else [query_layout.query_capacity]
+                    * len(ctx.collective_global_num_tokens)
+                ),
+            )
+            placement = get_global_expert_location_metadata()
+            if placement is not None:
+                placement.load_rows.mark_selected(query_layout.packed_valid)
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
         if self.layers and self.layers[0].ple is not None:
             self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
+        aux_hidden_states = [] if self.dspark_capture_enabled else None
         for layer_id, layer in enumerate(self.layers):
             if layer_id + 1 < len(self.layers):
                 next_ple = self.layers[layer_id + 1].ple
                 if next_ple is not None:
                     self._start_ple_prefetch(next_ple, input_ids, ctx)
+            if self.dspark_capture_enabled and layer_id in self.layers_to_capture:
+                # The preceding layer defers its residual combine. Materialize
+                # it once so the tap is the complete layer input, as in training.
+                if residual is not None:
+                    hidden_states = layer.attn_hyper_connection.combine(
+                        hidden_states, residual
+                    )
+                    residual = None
+                tap = dspark_hc_features(
+                    hidden_states,
+                    hc_count=int(self.config.hc_count),
+                    hidden_size=self.hidden_size,
+                )
+                tap = layer.comm_manager.pre_attn_comm(tap, ctx)
+                aux_hidden_states.append(tap)
+                if ctx.target_capture_sink is not None:
+                    notify_target_capture(
+                        ctx.target_capture_sink,
+                        self._dflash_capture_idx_map,
+                        layer_id,
+                        aux_hidden_states,
+                    )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -607,7 +693,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states, residuals = self.hyper_connection_mixer.mix(
             hidden_states, normalized=normalized
         )
-        return hidden_states, [residuals[0]]
+        if query_layout is not None:
+            if placement is not None:
+                placement.load_rows.clear()
+        return hidden_states, (
+            aux_hidden_states if aux_hidden_states is not None else [residuals[0]]
+        )
 
 
 def _normalize_checkpoint_name(name: str) -> str:
@@ -793,6 +884,9 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
 
     model_cls = Qwen4ExpModel
 
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        _configure_dspark_capture(self.model, layer_ids)
+
     def __init__(
         self,
         config,
@@ -826,6 +920,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     model_cls = Qwen4ExpModel
     # Its backbone returns its own HC-width state, not the taps ``layers_to_capture`` names.
     supports_aux_capture = False
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        _configure_dspark_capture(self.model, layer_ids)
 
     def __init__(
         self,

@@ -280,7 +280,7 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     def _checkpoint_capture_field(self, name: str):
         """A capture field from ``dflash_config``, else the top-level config."""
         nested = getattr(self.config, "dflash_config", {}) or {}
-        return nested.get(name) or getattr(self.config, name, None)
+        return nested[name] if name in nested else getattr(self.config, name, None)
 
     @property
     def target_layer_ids(self) -> tuple[int, ...]:

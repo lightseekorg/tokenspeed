@@ -57,6 +57,7 @@ if _AVAILABLE:
         priority=Priority.SPECIALIZED + 2,
         traits={
             "head_dim": frozenset({128}),
+            "varlen": frozenset({False}),
             "value_head_dim": frozenset({128}),
             "verify_tokens": frozenset(range(1, 17)),
             "output_only": frozenset({True}),

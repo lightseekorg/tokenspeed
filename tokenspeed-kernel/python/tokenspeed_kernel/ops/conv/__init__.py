@@ -532,17 +532,28 @@ def causal_conv1d_update(
     parent_indices: torch.Tensor | None,
     out: torch.Tensor | None = None,
     replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    query_start_loc: torch.Tensor | None = None,
 ):
-    """Select a decode/tree convolution leaf for the supplied state indices."""
+    """Select a decode/tree convolution leaf for the supplied state indices.
+
+    With device ``query_start_loc`` offsets, ``x`` is packed ``[rows, dim]``
+    and ``output_state_indices`` retains the maximum ``[batch, width]``
+    verify layout. Only each request's prefix is read and staged.
+    """
+    traits = {
+        "width": weight.shape[1],
+        "tree": parent_indices is not None,
+        "state_layout": _state_layout(conv_state, weight),
+    }
+    extra = {}
+    if query_start_loc is not None:
+        traits["varlen"] = True
+        extra["query_start_loc"] = query_start_loc
     kernel = select_kernel(
         "conv",
         "causal_conv1d_update",
         format_signature(x=dense_tensor_format(x.dtype)),
-        traits={
-            "width": weight.shape[1],
-            "tree": parent_indices is not None,
-            "state_layout": _state_layout(conv_state, weight),
-        },
+        traits=traits,
     )
     return kernel(
         x=x,
@@ -560,4 +571,5 @@ def causal_conv1d_update(
         parent_indices=parent_indices,
         out=out,
         replay_payload=replay_payload,
+        **extra,
     )

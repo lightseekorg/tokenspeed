@@ -25,6 +25,7 @@ import itertools
 from collections.abc import Mapping, Sequence
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.ops.metadata import apply_stop_conditions
 
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
@@ -98,6 +99,8 @@ class RuntimeStates:
         # The drafter's recorded proposal distributions
         # (--enable-speculative-sampling), see init_draft_probs.
         self.draft_probs: torch.Tensor | None = None
+        self.draft_confidence: torch.Tensor | None = None
+        self.previous_draft_confidence: torch.Tensor | None = None
         self.draft_probs_sentinel: float = 0.0
         # Draft trees (init_draft_trees): next round's parents next to its tokens.
         self.chain_parents: torch.Tensor | None = None
@@ -125,6 +128,36 @@ class RuntimeStates:
         # (masked_state_tables) and it keeps no tokens, so the finish
         # publishes the state and KV of the request's last kept token.
         self.stopped = torch.zeros(req_pool_size + 1, dtype=torch.bool, device=device)
+
+    def init_draft_confidence(self, num_drafts: int) -> None:
+        """Reserve slot-owned confidence beside the next round's candidates."""
+        if num_drafts < 1:
+            raise ValueError("confidence needs at least one draft position")
+        shape = (self.future_input_map.shape[0], num_drafts)
+        self.draft_confidence = torch.zeros(
+            shape, dtype=torch.float32, device=self.device
+        )
+        self.previous_draft_confidence = torch.zeros_like(self.draft_confidence)
+
+    def publish_draft_confidence(
+        self,
+        slots: torch.Tensor,
+        rates: torch.Tensor,
+        *,
+        group: dist.ProcessGroup | None,
+    ) -> None:
+        """Publish one authoritative score generation beside the candidates.
+
+        Replicated ranks use rank zero's scores: small floating-point differences
+        must not give them different prefix lengths or accepted frontiers.
+        The device collective is capturable and stays on the candidate stream.
+        """
+        if self.draft_confidence is None or self.previous_draft_confidence is None:
+            raise RuntimeError("confidence storage has not been initialized")
+        if group is not None:
+            dist.broadcast(rates, src=0, group=group)
+        self.previous_draft_confidence[slots] = self.draft_confidence[slots]
+        self.draft_confidence[slots] = rates
 
     def init_draft_probs(
         self, *, spec_num_tokens: int, reject_threshold: float
@@ -390,6 +423,10 @@ class RuntimeStates:
         ]
         if self.draft_probs is not None:
             rows.append(self.draft_probs[slot])
+        if self.draft_confidence is not None:
+            rows.extend(
+                (self.draft_confidence[slot], self.previous_draft_confidence[slot])
+            )
         if self.future_parent_map is not None:
             rows.append(self.future_parent_map[slot])
         if self.future_draft_q is not None:
@@ -434,6 +471,11 @@ class RuntimeStates:
         # the rows, so a (re)admitted request verifies its first chain against
         # the sentinel and never a previous occupant's distributions.
         self.reset_draft_probs(extend_request_pool_indices)
+        if self.draft_confidence is not None:
+            self.draft_confidence.index_fill_(0, extend_request_pool_indices, 0)
+            self.previous_draft_confidence.index_fill_(
+                0, extend_request_pool_indices, 0
+            )
         if self.ngram_accepted_tokens is not None:
             assert self.ngram_needs_seed is not None
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)

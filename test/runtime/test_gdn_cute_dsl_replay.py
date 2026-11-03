@@ -386,7 +386,8 @@ def test_verify_falls_back_for_unsupported_or_state_writing_calls(
     assert case.backend._verify_reads_committed_recurrent_state == (
         not replay and selected == "triton_gdn_decode_mtp"
     )
-    assert output.isfinite().all()
+    # The fallback leaves padded requests' outputs undefined.
+    assert output[:, :tokens].isfinite().all()
     if replay:
         assert torch.equal(case.state, before)
 

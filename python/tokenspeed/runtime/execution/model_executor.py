@@ -706,6 +706,29 @@ class ModelExecutor:
             # seed from the verifier's pool buffers: one owner of per-request
             # sampling state.
             self.drafter.bind_sampling_backend(self.sampling_backend)
+            if (
+                draft_model_runner is not None
+                and draft_model_runner.server_args.speculative_verify_policy
+                == "confidence"
+                and self.drafter.verify_policy != "confidence"
+            ):
+                raise ValueError(
+                    "This DSpark drafter does not implement confidence verification"
+                )
+            if self.drafter.verify_policy == "confidence":
+                from tokenspeed.runtime.models.qwen4_exp import (
+                    Qwen4ExpForCausalLM,
+                    Qwen4ExpForConditionalGeneration,
+                )
+
+                if not current_platform().is_nvidia or not isinstance(
+                    self.model_runner.model,
+                    (Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration),
+                ):
+                    raise ValueError(
+                        "confidence verification currently supports NVIDIA Qwen4Exp DSpark"
+                    )
+                self.attn_backend.validate_compact_verify()
             MultimodalRuntime.wire_drafter(
                 self.input_buffers, self.model_runner.model_config
             )
@@ -965,6 +988,7 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            target_model=self.model_runner.model,
             decode_graph_supported=self._graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
@@ -1545,6 +1569,13 @@ class ModelExecutor:
                 )
             ),
         )
+        if ctx.verify_queries is not None:
+            accept_lengths.copy_(
+                torch.minimum(
+                    accept_lengths,
+                    ctx.verify_queries.query_lengths[: accept_lengths.shape[0]],
+                )
+            )
         ib = self.input_buffers
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
@@ -1754,6 +1785,18 @@ class ModelExecutor:
             stream=self.device_module.current_stream(),
         )
         ctx.dspark_context_producer = self.dspark_context_producer
+        if ctx.verify_queries is not None:
+            slots = self.input_buffers.state_write_req_pool_indices_buf[
+                : ctx.verify_queries.batch_size
+            ]
+            states = self.runtime_states
+            active = (slots > 0) & (slots < states.future_input_map.shape[0] - 1)
+            active &= ~states.stopped[slots]
+            ctx.verify_queries.refresh(
+                states.draft_confidence[slots],
+                states.spec_candidates_ready[slots],
+                active,
+            )
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
@@ -2562,6 +2605,9 @@ class ModelExecutor:
                     f"forward_step ext={num_extends} dec={bs - num_extends}",
                     color="blue",
                 ):
+                    self.forward_step.prepare_confidence_feedback(
+                        forward_op.request_ids
+                    )
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0
                     if timing_enabled:
