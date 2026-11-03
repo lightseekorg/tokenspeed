@@ -1492,42 +1492,53 @@ TEST_F(DropDeadCheckpointsSuite, NeitherReachesHost) {
 // cache is cleared, `second` -- the seed's first 20 tokens and three new ones
 // -- resumes at the checkpoint 20 from Host, and its Device copy is the
 // request's private slot 0. Its first decode publishes no prompt end and
-// keeps writing its own partial page.
+// keeps writing its own partial page. A finish on its prefill token instead
+// asks whether the checkpoint is still cached, Host answers, and that prompt
+// end stays out of the cache as well: a longer prompt resumes at 20, not 23.
 TEST_F(DropDeadCheckpointsSuite, ACheckpointOnlyHostHoldsCoversThePromptEnd) {
-    ResetWith(/*in_forward=*/true, /*host_cache=*/true);
-    const std::vector<std::int32_t> tokens = MakeTokens(22);
-    Submit(RequestWithTokens("seed", tokens));
-    RunPrefill("seed", 22);
-    Decode("seed", 1);
-    SendFinish("seed");
-    AckWriteBacks(PlanOnce());
-    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    for (const bool decodes : {true, false}) {
+        SCOPED_TRACE(decodes);
+        ResetWith(/*in_forward=*/true, /*host_cache=*/true);
+        const std::vector<std::int32_t> tokens = MakeTokens(22);
+        Submit(RequestWithTokens("seed", tokens));
+        RunPrefill("seed", 22);
+        Decode("seed", 1);
+        SendFinish("seed");
+        AckWriteBacks(PlanOnce());
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
 
-    std::vector<std::int32_t> second(tokens.begin(), tokens.begin() + 20);
-    second.insert(second.end(), {700, 701, 702});
-    Submit(RequestWithTokens("second", second));
-    const ExecutionPlan prefill = PlanOnce();
-    const ForwardBatch* batch = FindForwardBatch(prefill);
-    ASSERT_NE(batch, nullptr);
-    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{20});
-    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{3});
-    bool loads = false;
-    for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(prefill)) {
-        for (const std::uint32_t id : std::get<LoadBackBatch>(operation).op_ids) {
-            SendLoadBackDone(id);
-            loads = true;
+        std::vector<std::int32_t> second(tokens.begin(), tokens.begin() + 20);
+        second.insert(second.end(), {700, 701, 702});
+        Submit(RequestWithTokens("second", second));
+        const ExecutionPlan prefill = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(prefill);
+        ASSERT_NE(batch, nullptr);
+        EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{20});
+        EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{3});
+        bool loads = false;
+        for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(prefill)) {
+            for (const std::uint32_t id : std::get<LoadBackBatch>(operation).op_ids) {
+                SendLoadBackDone(id);
+                loads = true;
+            }
+        }
+        EXPECT_TRUE(loads) << "a Host hit";
+        AckWriteBacks(prefill);
+        SendForwardDone("second", {900});
+
+        const std::size_t tails = scheduler_->TailEntries();
+        if (decodes) {
+            const ExecutionPlan first = Decode("second", 1);
+            EXPECT_TRUE(first.pages_to_copy.at("full").empty()) << "the partial page stays the owner's";
+            EXPECT_EQ(scheduler_->TailEntries(), tails);
+        }
+        SendFinish("second");
+        AckWriteBacks(PlanOnce());
+        if (!decodes) {
+            EXPECT_EQ(scheduler_->TailEntries(), tails) << "the finish at the prompt end publishes no tail";
+            EXPECT_EQ(Probe("longer", Extended(second, {600})).prefix_tokens, 20);
         }
     }
-    EXPECT_TRUE(loads) << "a Host hit";
-    AckWriteBacks(prefill);
-    SendForwardDone("second", {900});
-
-    const std::size_t tails = scheduler_->TailEntries();
-    const ExecutionPlan first = Decode("second", 1);
-    EXPECT_TRUE(first.pages_to_copy.at("full").empty()) << "the partial page stays the owner's";
-    EXPECT_EQ(scheduler_->TailEntries(), tails);
-    SendFinish("second");
-    AckWriteBacks(PlanOnce());
 }
 
 // Dead checkpoints on a model with a sliding-window group (W = 4) beside the
