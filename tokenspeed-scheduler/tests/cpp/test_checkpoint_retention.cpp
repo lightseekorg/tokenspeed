@@ -96,7 +96,7 @@ void Record(CheckpointTree& tree, const Checkpoint& point, CheckpointTree::Resid
     RecordFor(tree, point, residency, ++last_epoch);
 }
 
-TEST(CheckpointTree, DistanceCountsCheckpointsToTheNearestLeaf) {
+TEST(CheckpointTree, DistanceCountsRequestsToTheNearestLeaf) {
     CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)}, d{Sequence(16)};
     for (const Checkpoint* point : {&a, &b, &c, &d}) Record(tree, *point, kOnDevice);
@@ -226,33 +226,28 @@ TEST(CheckpointTree, LeafDistanceRanksNearbyCheckpointsAsLeaves) {
     EXPECT_TRUE(tree.StaysAged(a.Hash(), CacheTier::kDevice, d_taken));
 }
 
-// One turn publishes an in-forward checkpoint, its prompt end and its end
-// state; the next turn extends the end state.
+// One turn publishes an in-forward checkpoint (on the Host only, below the
+// Device copies of the rest), its prompt end and its end state; the next turn
+// extends the end state.
 TEST(CheckpointTree, OneRequestsCheckpointsAreNoStepApart) {
     CheckpointTree tree{kPage, /*leaf_distance=*/0};
     const Checkpoint in_forward{Sequence(8)}, prompt_end{Sequence(10)}, end_state{Sequence(14)};
-    for (const Checkpoint* point : {&in_forward, &prompt_end, &end_state}) RecordFor(tree, *point, kOnDevice, 1);
+    RecordFor(tree, in_forward, kOnHost, 1);
+    RecordFor(tree, prompt_end, kOnDevice, 1);
+    RecordFor(tree, end_state, kOnDevice, 1);
+    EXPECT_EQ(tree.AgedDistance(in_forward.Hash(), CacheTier::kHost), 0);
     for (const Checkpoint* point : {&in_forward, &prompt_end, &end_state}) {
         EXPECT_EQ(tree.Distance(point->Hash()), 0);
-        EXPECT_EQ(tree.AgedDistance(point->Hash(), CacheTier::kDevice), 0);
     }
+    EXPECT_EQ(tree.AgedDistance(prompt_end.Hash(), CacheTier::kDevice), 0);
     const Checkpoint next_prompt_end{Sequence(18)}, next_end_state{Sequence(22)};
     RecordFor(tree, next_prompt_end, kOnDevice, 2);
     RecordFor(tree, next_end_state, kOnDevice, 2);
-    for (const Checkpoint* point : {&in_forward, &prompt_end, &end_state}) {
+    EXPECT_EQ(tree.AgedDistance(in_forward.Hash(), CacheTier::kHost), 1);
+    for (const Checkpoint* point : {&prompt_end, &end_state}) {
         EXPECT_EQ(tree.AgedDistance(point->Hash(), CacheTier::kDevice), 1);
     }
     EXPECT_EQ(tree.Distance(next_prompt_end.Hash()), 0);
-}
-
-// An aligned in-forward checkpoint on the Host, below the same request's
-// prompt end on the Device, keeps its rank on the Host.
-TEST(CheckpointTree, AHostCheckpointBelowItsOwnRequestsDeviceCheckpointKeepsItsRank) {
-    CheckpointTree tree{kPage, /*leaf_distance=*/0};
-    const Checkpoint in_forward{Sequence(8)}, prompt_end{Sequence(16)};
-    RecordFor(tree, in_forward, kOnHost, 1);
-    RecordFor(tree, prompt_end, kOnDevice, 1);
-    EXPECT_EQ(tree.AgedDistance(in_forward.Hash(), CacheTier::kHost), 0);
 }
 
 // A checkpoint compares its request with the nearest present checkpoint
@@ -460,21 +455,15 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
     }
 }
 
-TEST(CheckpointRetention, LeafDistanceKeepsTheCheckpointBeforeTheNewest) {
-    for (const std::int32_t leaf_distance : {0, 1}) {
-        SCOPED_TRACE(leaf_distance);
-        BlockPool device(16, {1, 1});
-        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
-                                     /*checkpoint_retention_requests=*/1000, leaf_distance);
-        const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
-        for (const Checkpoint* point : {&other, &a, &b, &c}) Publish(cache, *point);
-        const std::vector<bool> kept = AdmitIntoFullDevice(cache, device, {&other, &a, &b, &c});
-        if (leaf_distance == 0) {
-            EXPECT_EQ(kept, (std::vector<bool>{true, false, false, true}));
-        } else {
-            EXPECT_EQ(kept, (std::vector<bool>{false, false, true, true})) << "B ranks as a leaf: LRU takes other";
-        }
-    }
+// DeviceEvictsNonLeafCheckpointsBeforeOlderSessions with K = 1: B ranks as a
+// leaf, so LRU takes the other session instead.
+TEST(CheckpointRetention, LeafDistanceKeepsThePreviousTurnsCheckpoint) {
+    BlockPool device(16, {1, 1});
+    auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, nullptr, nullptr, false, false,
+                                 /*checkpoint_retention_requests=*/1000, /*checkpoint_retention_leaf_distance=*/1);
+    const Checkpoint other{{90, 91, 92, 93}}, a{Sequence(4)}, b{Sequence(8)}, c{Sequence(12)};
+    for (const Checkpoint* point : {&other, &a, &b, &c}) Publish(cache, *point);
+    EXPECT_EQ(AdmitIntoFullDevice(cache, device, {&other, &a, &b, &c}), (std::vector<bool>{false, false, true, true}));
 }
 
 TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
