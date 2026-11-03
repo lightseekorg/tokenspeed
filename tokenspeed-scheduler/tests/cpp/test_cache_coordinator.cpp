@@ -6692,6 +6692,114 @@ TEST_F(ShardedTailCopyPackingSixTest, OwnerCopyInIsCountedInTheBucketOfTheBlockI
     coordinator_.Free(owner);
 }
 
+class PreservedSourceTailCopyTest : public ShardedTailCopyPackingSixTest, public ::testing::WithParamInterface<bool> {};
+
+TEST_P(PreservedSourceTailCopyTest, DuplicatePrivateSourceDoesNotConsumeCopyCapacity) {
+    std::vector<BlockTable> owner(2);
+    CacheBlockLocation canonical;
+    ASSERT_NO_FATAL_FAILURE(PublishCanonicalInBucketOne(owner, /*own_bucket_full=*/GetParam(), canonical));
+    const CacheBlockLocation source = owner[0].Blocks()[0]->Location();
+    ASSERT_EQ(pool_.FreeSlotsByBucket(0)[1], 0);
+    ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 0);
+    ASSERT_FALSE(coordinator_.GroupPrefixIndex(1).Contains(pool_, Key(tail_hash_, 1)));
+
+    RequestProgress progress = TailAtThree(/*owner_continues=*/true, /*publish_state=*/true);
+    progress.completed_pages->preserve_source_blocks = true;
+    const auto admitted = AdmitForTest(coordinator_, owner, GroupDemand{.extent = DenseGrowth{1}}, progress);
+    ASSERT_TRUE(admitted);
+    EXPECT_TRUE(admitted->pages_to_copy[0].empty());
+    EXPECT_EQ(owner[0].Blocks()[0]->Location(), source);
+    EXPECT_EQ(CachedTailBlock(), canonical);
+    EXPECT_TRUE(coordinator_.GroupPrefixIndex(1).Contains(pool_, Key(tail_hash_, 1)))
+        << "the duplicate private source needs no copy, so the state checkpoint can be published";
+
+    coordinator_.Free(owner);
+    residents_.clear();
+    coordinator_.ClearCache();
+    EXPECT_EQ(pool_.NumEmptyLcmBlocks(), 3);
+}
+
+INSTANTIATE_TEST_SUITE_P(BucketPressure, PreservedSourceTailCopyTest, ::testing::Bool());
+
+TEST_F(ShardedTailCopyPackingFourTest, PreservedNewSourceStillNeedsCopyCapacity) {
+    std::vector<BlockTable> owner(2);
+    ASSERT_TRUE(AdmitForTest(coordinator_, owner, 3));
+    const CacheBlockLocation source = owner[0].Blocks()[0]->Location();
+    auto resident = Resident(0);
+    ASSERT_EQ(pool_.FreeSlotsByBucket(0)[0], 0);
+    ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 0);
+
+    RequestProgress progress = TailAtThree(/*owner_continues=*/true, /*publish_state=*/true);
+    progress.completed_pages->preserve_source_blocks = true;
+    const auto admitted = AdmitForTest(coordinator_, owner, GroupDemand{.extent = DenseGrowth{1}}, progress);
+    ASSERT_TRUE(admitted);
+    EXPECT_TRUE(admitted->pages_to_copy[0].empty());
+    EXPECT_EQ(owner[0].Blocks()[0]->Location(), source);
+    EXPECT_FALSE(CachedTailBlock().has_value()) << "a newly published source would need a real copy in bucket 0";
+    EXPECT_FALSE(coordinator_.GroupPrefixIndex(1).Contains(pool_, Key(tail_hash_, 1)));
+    coordinator_.Free(owner);
+}
+
+TEST_F(ShardedTailCopyPackingFourTest, PreservedDuplicateInSameBucketPublishesCheckpoint) {
+    std::vector<BlockTable> other(2);
+    ASSERT_TRUE(AdmitForTest(coordinator_, other, coordinator_.ProbePrefix({}), GroupDemand{.extent = DenseGrowth{3}},
+                             RequestProgress{}, StateStep{StateStep::Kind::kKeep}));
+    auto resident = Resident(1);
+    std::vector<BlockTable> owner(2);
+    ASSERT_TRUE(AdmitForTest(coordinator_, owner, 3));
+    const CacheBlockLocation source = owner[0].Blocks()[0]->Location();
+    const CacheBlockLocation canonical = other[0].Blocks()[0]->Location();
+    ASSERT_EQ(BucketOf(other[0].Blocks()[0]), BucketOf(owner[0].Blocks()[0]));
+    ASSERT_NE(source, canonical);
+    coordinator_.CacheCompletedBlocks(other, TailAtThree(/*owner_continues=*/false, /*publish_state=*/false),
+                                      CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+    coordinator_.Free(other);
+    auto full = FillBucket(1);
+    ASSERT_EQ(pool_.NumFreeSlots(0), 0);
+    ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 0);
+
+    RequestProgress progress = TailAtThree(/*owner_continues=*/true, /*publish_state=*/true);
+    progress.completed_pages->preserve_source_blocks = true;
+    const auto admitted = AdmitForTest(coordinator_, owner, GroupDemand{.extent = DenseGrowth{1}}, progress);
+    ASSERT_TRUE(admitted);
+    EXPECT_TRUE(admitted->pages_to_copy[0].empty());
+    EXPECT_EQ(owner[0].Blocks()[0]->Location(), source);
+    EXPECT_EQ(CachedTailBlock(), canonical);
+    EXPECT_TRUE(coordinator_.GroupPrefixIndex(1).Contains(pool_, Key(tail_hash_, 1)));
+    coordinator_.Free(owner);
+}
+
+TEST_F(ShardedTailCopyPackingFourTest, PreservedDuplicateProtectsTailUntilPublication) {
+    auto resident = Resident(0);
+    std::vector<BlockTable> owner(2);
+    ASSERT_TRUE(AdmitForTest(coordinator_, owner, coordinator_.ProbePrefix({}), GroupDemand{.extent = DenseGrowth{3}},
+                             RequestProgress{}, StateStep{StateStep::Kind::kKeep}));
+    const CacheBlockLocation source = owner[0].Blocks()[0]->Location();
+    std::vector<BlockTable> other(2);
+    ASSERT_TRUE(AdmitForTest(coordinator_, other, 3));
+    ASSERT_NE(BucketOf(other[0].Blocks()[0]), BucketOf(owner[0].Blocks()[0]));
+    coordinator_.CacheCompletedBlocks(other, TailAtThree(/*owner_continues=*/false, /*publish_state=*/true),
+                                      CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+    coordinator_.Free(other);
+    ASSERT_EQ(pool_.FreeSlotsByBucket(0)[0], 0);
+    ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 1);
+
+    // Skipping the duplicate's copy is valid only while its canonical tail
+    // survives. Evicting its checkpoint before publication also removes the
+    // canonical KV, making the owner's page shared and requiring a real copy.
+    RequestProgress progress = TailAtThree(/*owner_continues=*/true, /*publish_state=*/false);
+    progress.completed_pages->preserve_source_blocks = true;
+    const auto admitted =
+        AdmitForTest(coordinator_, owner, coordinator_.ProbePrefix({}), GroupDemand{.extent = DenseGrowth{1}}, progress,
+                     StateStep{StateStep::Kind::kRotate});
+    ASSERT_TRUE(admitted);
+    EXPECT_TRUE(admitted->pages_to_copy[0].empty());
+    EXPECT_EQ(owner[0].Blocks()[0]->Location(), source);
+    EXPECT_EQ(owner[1].NumBlocks(), 2);
+    EXPECT_FALSE(CachedTailBlock().has_value()) << "only the fallback without publication may evict the canonical tail";
+    coordinator_.Free(owner);
+}
+
 TEST_F(ShardedTailCopyPackingSixTest, OwnerCopyInKeepsTheBlockItDedupesOnto) {
     std::vector<BlockTable> owner(2);
     CacheBlockLocation canonical;

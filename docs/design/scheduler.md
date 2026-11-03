@@ -1019,6 +1019,12 @@ prompt whose KV is mid-transfer would strand the decode side.
 While P holds a request, prefix publication uses a copy of its block table.
 Deduplication may redirect that copy to canonical cache blocks, but the real
 request keeps the physical source blocks named by queued layerwise transfers.
+Capacity planning follows the real table: a duplicate source that stays private
+needs no tail copy-in. A source newly published into the index, or already
+canonical itself, still needs a copy in its own bucket before further writes.
+When omitting a duplicate's copy, admission protects the canonical tail and its
+checkpoints until publication; evicting them would make the source shared and
+introduce an unbudgeted copy. This protection also applies within one bucket.
 A client abort waits for the transfer terminal event; a failed transfer also
 waits for outstanding local forward results before freeing its tables. Failed
 requests waiting for those results receive no further forward work. Successful

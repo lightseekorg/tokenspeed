@@ -491,7 +491,7 @@ private:
                 blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand) +
                                     tailBlocksNeeded(i, shape_need_[i]) + zeroStateBlocksNeeded(i);
                 if (collectOwnerCopyBuckets(i, shape_need_[i])) {
-                    owner_copy_changes_bucket_ = true;
+                    owner_tail_needs_protection_ = true;
                 }
                 if (!prefix_.host.per_group.empty()) {
                     collectHostHitBuckets(i, shape_need_[i]);
@@ -565,8 +565,9 @@ private:
     // slots whose retention has not expired (Admit reclaims the expired ones
     // first), each the canonical block when another request published the
     // tail first (the publication swaps it into the table), else the owner's
-    // own. Returns whether a copy reads a canonical block in another bucket
-    // than the owner's own block (protectDedupedTail).
+    // own. A preserved private source with a different canonical block is
+    // not published into the index, so it needs no copy. Returns whether the
+    // canonical tail must survive until publication (protectDedupedTail).
     bool collectOwnerCopyBuckets(std::size_t i, std::vector<std::int64_t>& need) const {
         if (completed_ == nullptr || !completed_->owner_continues || !completed_->tail ||
             !geometry_[i].HasTokenSpan() || groups_[i].Spec().replayable) {
@@ -576,7 +577,7 @@ private:
         const BlockTable& table = *demands_[i].table;
         const std::int32_t computed = *num_computed_tokens_;
         const TailSlots slots = tailSlots(geometry_[i], prefix_granularity_, computed);
-        bool copy_changes_bucket = false;
+        bool protect_tail = false;
         for (std::int32_t slot = std::max(slots.first, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), computed));
              slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
@@ -587,13 +588,21 @@ private:
                 groups_[i].Index().Find(pool_, CacheKey{.group_id = groups_[i].Id(),
                                                         .content_hash = completed_->tail->hash,
                                                         .page_offset = slot - slots.first});
+            if (completed_->preserve_source_blocks && canonical && canonical != block) {
+                // Publication redirects only the copied table. The real page
+                // stays private and Admit's Contains check skips its copy-in.
+                // Keep the canonical tail: evicting it would publish the real
+                // page instead and introduce a copy this plan did not count.
+                protect_tail = true;
+                continue;
+            }
             const std::int32_t bucket = allocator.BucketOf(canonical ? canonical->Location() : block->Location());
             ++need[static_cast<std::size_t>(bucket)];
             if (bucket != allocator.BucketOf(block->Location())) {
-                copy_changes_bucket = true;
+                protect_tail = true;
             }
         }
-        return copy_changes_bucket;
+        return protect_tail;
     }
 
     // Whether the probe matched a checkpoint for State group i on either
@@ -772,10 +781,12 @@ private:
     // whole tail (CacheCoordinator::evictCachedBlock), and the publication
     // would then keep the owner's own block and copy that one, in its own
     // bucket rather than the canonical block's. A canonical block in the
-    // owner's own bucket needs no protection: either copy lands in the bucket
-    // the plan charged.
+    // owner's own bucket needs no protection when publication redirects the
+    // real table: either copy lands in the bucket the plan charged. With a
+    // preserved private source, deduplication removes the copy altogether;
+    // protect that canonical tail even when both pages are in the same bucket.
     void protectDedupedTail() {
-        if (!owner_copy_changes_bucket_) {
+        if (!owner_tail_needs_protection_) {
             return;
         }
         const TailPublication& tail = *completed_->tail;
@@ -861,9 +872,9 @@ private:
     // blocks wanted in any bucket.
     std::vector<std::vector<std::int64_t>> shape_need_;
     std::vector<std::int64_t> blocks_needed_;
-    // Whether an owner's copy-in reads a canonical block in another bucket
-    // than its own (collectOwnerCopyBuckets, protectDedupedTail).
-    bool owner_copy_changes_bucket_{false};
+    // Whether evicting the canonical tail would change the copy count or
+    // source bucket (collectOwnerCopyBuckets, protectDedupedTail).
+    bool owner_tail_needs_protection_{false};
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations_{&scratch_};
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> request_reclaim_locations_{&scratch_};
