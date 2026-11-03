@@ -48,7 +48,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (  # no
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (  # noqa: E402
     iris_column_routes_combine,
     iris_column_routes_complete,
-    iris_column_routes_push,
+    iris_column_routes_push_words,
     iris_column_routes_wait,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent import (  # noqa: E402
@@ -91,7 +91,10 @@ def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.const
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
     words = lane[:, None] * 4 + word[None, :]
     partial = gl.load(routes.to(gl.pointer_type(gl.uint32), bitcast=True) + words)
-    iris_column_routes_push(partial, row, 1, copy, regions, RANK, 8, 32, _STAGE, ".wt")
+    iris_column_routes_push_words(
+        partial, row, words, (RANK + 1) % 8, copy, words >= 0, regions, RANK, 8,
+        32, _STAGE, ".wt"
+    )  # fmt: skip
     iris_column_routes_complete(
         partial, copy, norm_weight, region, regions, row, RANK, 8, 32,
         _STAGE, 0.0, ".wt", False, None, None, 0,
