@@ -53,8 +53,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (  #
 )
 
 _WORLD = 8
-_MAX_ROWS = 256
-_STAGE = gl.constexpr(_MAX_ROWS * ((2 * _WORLD - 1) * 2048 + _WORLD * _WORLD * 8))
+_STAGE = gl.constexpr(32 * ((2 * _WORLD - 1) * 2048 + _WORLD * _WORLD * 8))
 
 
 def _compile(fn, signature, constexprs, num_warps=8):
@@ -89,9 +88,9 @@ def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.const
     word = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
     words = lane[:, None] * 4 + word[None, :]
     partial = gl.load(routes.to(gl.pointer_type(gl.uint32), bitcast=True) + words)
-    iris_column_routes_push(partial, row, 1, copy, regions, RANK, 8, 256, _STAGE, ".wt")
+    iris_column_routes_push(partial, row, 1, copy, regions, RANK, 8, 32, _STAGE, ".wt")
     iris_column_routes_complete(
-        partial, copy, norm_weight, region, regions, row, RANK, 8, 256,
+        partial, copy, norm_weight, region, regions, row, RANK, 8, 32,
         _STAGE, 0.0, ".wt", False,
     )  # fmt: skip
 
@@ -100,7 +99,7 @@ def _own4_kernel(routes, norm_weight, region, regions, row, copy, RANK: gl.const
 def _fin_kernel(route_weights, norm_weight, region, out, token, owner, copy):
     """FIN for (token, owner): wait + routed norm + weighted sum."""
     loaded, squares = iris_column_routes_wait(
-        region, copy, token, owner, 8, 256, _STAGE, False
+        region, copy, token, owner, 8, 32, _STAGE, False
     )
     combined = iris_column_routes_combine(
         loaded, squares, route_weights, norm_weight, token, owner, 1e-6, 0.0
@@ -160,7 +159,7 @@ def _xn_kernel(local_input, weight, packed, scales, region, regions, row, copy,R
     )
     words = iris_lamport_allgather_wait(
         region, local_words, row * 256, stages, RANK, 8, 512, 4096, STAGE_WORDS, 8192,
-        False,
+        False, True,
     )  # fmt: skip
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 16], [1, 64], [gl.num_warps(), 1], [1, 0]

@@ -559,11 +559,14 @@ def iris_lamport_allgather_wait(
     stage_words: gl.constexpr,
     peer_words: gl.constexpr,
     CLEAR: gl.constexpr,
+    POLL_OWN: gl.constexpr,
 ):
     """Wait for every peer's shard of one row; returns the row's uint32 BF16
     pairs [total_width // 1024, 64, 8] (lane L holds columns 1024k + 16L +
-    [0, 16)), this rank's own from ``local_words``. With CLEAR, restores the
-    consumed packs; a two-copy caller clears its areas at entry instead."""
+    [0, 16)). This rank's own shard comes from ``local_words``, or with
+    POLL_OWN from its own mailbox slot (a producer on another workgroup
+    pushed it there). With CLEAR, restores the consumed packs; a two-copy
+    caller clears its areas at entry instead."""
     # With several waves every wave polls the same words (replicated
     # layouts), so a wave's clear could race another's poll.
     gl.static_assert(not CLEAR or gl.num_warps() == 1)
@@ -579,14 +582,20 @@ def iris_lamport_allgather_wait(
     owner = column // local_width
     within = column % local_width
     shard_words = (within // 2)[:, :, None] + word[None, None, :]
-    remote = owner != rank
+    if POLL_OWN:
+        remote = owner >= 0
+    else:
+        remote = owner != rank
     mailbox_offsets = (
         (_iris_tile_stage(stages, within // 512) * stage_words).to(gl.int32)
         + owner * peer_words
         + row_words
     )[:, :, None] + shard_words
-    # Every lane's address lies in this row's shard; only own columns use it.
-    own = _iris_sanitize_lamport_bf16x2(gl.load(local_words + shard_words))
+    if POLL_OWN:
+        own = shard_words.to(gl.uint32)
+    else:
+        # Every lane's address lies in this row's shard; only own columns use it.
+        own = _iris_sanitize_lamport_bf16x2(gl.load(local_words + shard_words))
     mailbox = tl.cast(region, gl.pointer_type(gl.uint32))
     # Issue all reads before checking any; arrived packs stay unchanged until
     # this rank clears them, so retries reread them all. Payload high halves are
@@ -738,7 +747,7 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     )  # fmt: skip
     words = iris_lamport_allgather_wait(
         region, local_words, row_words, stages, rank, WORLD_SIZE, local_width,
-        total_width, stage_words, peer_words, True,
+        total_width, stage_words, peer_words, True, False,
     )  # fmt: skip
     iris_rmsnorm_mxfp4_row(
         words, row, norm_weights, packed_output, scale_output, total_width, eps,
