@@ -21,7 +21,7 @@
 
 """Fuse attention reduction with Muse's residual update and MoE input norms."""
 
-from tokenspeed_kernel._triton import gl, gluon
+from tokenspeed_kernel._triton import gl, gluon, tl
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_group_heap_base,
     _iris_rendezvous,
@@ -1205,7 +1205,10 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
-    page_table_ptr,
+    # Const, as in the standalone split: LLVM follows a volatile page-index
+    # load from non-const memory with vmcnt(0), which would drain the K/V
+    # page copies the split keeps in flight.
+    page_table_ptr: tl.const,
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_lse_ptr,

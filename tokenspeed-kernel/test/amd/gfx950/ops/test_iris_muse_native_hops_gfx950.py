@@ -43,7 +43,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (  # noqa: E402
     _iris_lamport_push,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (  # noqa: E402
-    iris_muse_moetail_push,
+    iris_muse_moetail_send,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (  # noqa: E402
     iris_column_routes_combine,
@@ -201,8 +201,8 @@ def _h6_kernel(values_ptr, regions, copy, RANK: gl.constexpr):
     rows = gl.arange(0, 8, layout=gl.SliceLayout(1, layout))
     cols = gl.arange(0, 16, layout=gl.SliceLayout(0, layout))
     values = gl.load(values_ptr + rows[:, None] * 16 + cols[None, :])
-    iris_muse_moetail_push(
-        values, copy.to(gl.uint32), 32, 5, regions, 8, _iris_lamport_push, RANK, 8,
+    iris_muse_moetail_send(
+        values, 32, 5, copy.to(gl.uint32), regions, 8, _iris_lamport_push, RANK, 8,
         1024, 32768, 8, 16, gl.num_warps(), ".wt", ".wt",
     )  # fmt: skip
 

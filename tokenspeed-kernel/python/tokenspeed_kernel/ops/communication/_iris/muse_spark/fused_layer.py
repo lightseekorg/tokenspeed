@@ -53,7 +53,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     muse_attntail_rs_push,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
-    iris_muse_moetail_push,
+    iris_muse_moetail_send,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_column_routes_combine,
@@ -574,8 +574,8 @@ def h6_sink(
 ):
     """UNP's post-expert columns [first_output, + OUTPUTS) of every row to
     slot RANK of every rank's H6 copy, its own included (moetail's push)."""
-    iris_muse_moetail_push(
-        values, launch.copy.to(gl.uint32), first_output, launch.cta,
+    iris_muse_moetail_send(
+        values, first_output, launch.cta, launch.copy.to(gl.uint32),
         _peer_addresses(view.h6, view.heaps, RANK), rows, _iris_lamport_push, RANK,
         _WORLD, HIDDEN_LOCAL, _H6_SLOT, BLOCK_M, OUTPUTS, gl.num_warps(), PEER_CACHE,
         ".wt",

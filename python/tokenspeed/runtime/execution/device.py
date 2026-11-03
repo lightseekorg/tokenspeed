@@ -1224,7 +1224,7 @@ def probe_arena_floor(
     A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
     ``max_decoder_rows_per_request``, None for other models) fabricates one
     request per that many rows of a bucket no wider than the token ladder's,
-    and never more than ``max_num_seqs``.
+    and never more than ``request_state_seqs``.
     """
     from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
     from tokenspeed.runtime.execution.model_executor import (

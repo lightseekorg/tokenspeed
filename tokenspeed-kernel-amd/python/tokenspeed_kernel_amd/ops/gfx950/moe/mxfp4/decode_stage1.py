@@ -406,6 +406,8 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
     sorted_routes,
     descriptors,
     group_count,
+    plan_routes,
+    plan_descriptors,
     out,
     out_scale,
     rows,
@@ -434,9 +436,12 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
     With ``ROUTES_FROM_IDS`` the program groups the routes of at most
     ``BLOCK_M`` tokens by expert itself: ``sorted_routes`` is the top-k IDs
     ``[rows, TOPK]``, program 0 writes the route map (each route, or -1 for
-    another rank's) to ``descriptors`` and ``group_count`` is unused.
-    Otherwise ``sorted_routes``, ``descriptors`` and ``group_count`` are the
-    route-descriptor kernels' outputs.
+    another rank's) to ``descriptors``, and the grouping is written out for
+    stage 2 in the route-descriptor kernels' format: ``plan_routes``
+    (``BLOCK_M`` routes per group), ``plan_descriptors`` (start, count,
+    expert per group) and the group count in ``group_count``. Otherwise
+    ``sorted_routes``, ``descriptors`` and ``group_count`` are the
+    route-descriptor kernels' outputs and the plan arguments are unused.
     """
     gl.static_assert(HIDDEN % BLOCK_K == 0, "route tiles require complete K tiles")
     gl.static_assert(
@@ -476,6 +481,7 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
                 gl.where(route_expert >= 0, route, -1),
                 mask=route < rows * TOPK,
             )
+            gl.store(group_count, groups)
     else:
         groups = gl.load(group_count)
     for job in range(gl.program_id(0), groups * (TWO_I // BLOCK_N), gl.num_programs(0)):
@@ -485,6 +491,13 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
             expert, count, members = _group_routes(
                 route_expert, counts, group_index, group, BLOCK_M
             )
+            if n == 0:
+                # Stage 2 reads this grouping instead of rebuilding it.
+                member = gl.arange(0, BLOCK_M, layout=members.type.layout)
+                gl.store(plan_routes + group * BLOCK_M + member, members)
+                gl.store(plan_descriptors + group * 3, group * BLOCK_M)
+                gl.store(plan_descriptors + group * 3 + 1, count)
+                gl.store(plan_descriptors + group * 3 + 2, expert)
             routes = gl.convert_layout(members, gl.SliceLayout(1, la))[:, None]
             scale_routes = gl.convert_layout(members, gl.SliceLayout(1, lsa))[:, None]
         else:

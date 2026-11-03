@@ -47,6 +47,7 @@ def _selector(lm_head, tp_size: int, top_k: int, max_rows: int, vocab_size: int)
     """A planned selector, with the radix probe left out."""
     selector = VocabParallelTopK.__new__(VocabParallelTopK)
     selector.lm_head = lm_head
+    selector.fp8_weight = None
     selector.tp_size = tp_size
     # Two ranks: no backend prepares a column gather for it, so the pairs
     # take the resident all_gather_single the tests stand in for.
@@ -140,6 +141,7 @@ def test_a_padded_or_offset_shard_declines_the_shard_local_topk() -> None:
         softcapping=None,
         skip_all_gather=False,
         dp_sampling_enabled=False,
+        fp8_weight=None,
     ).enabled
 
     for broken in (
@@ -160,6 +162,7 @@ def test_a_padded_or_offset_shard_declines_the_shard_local_topk() -> None:
             softcapping=None,
             skip_all_gather=False,
             dp_sampling_enabled=False,
+            fp8_weight=None,
         ).enabled
 
 
@@ -196,6 +199,31 @@ def test_shard_logits_matmuls_an_unquantized_head() -> None:
     torch.testing.assert_close(
         _selector(head, 2, 4, 4, 40)._shard_logits(hidden_states),
         hidden_states @ weight.T,
+    )
+
+
+@_needs_gpu
+def test_an_fp8_head_copy_projects_through_its_dequantized_rows() -> None:
+    """A draft's weight-only FP8 copy of the head replaces the head's GEMM."""
+    from tokenspeed.runtime.layers.dense.fp8_weight_only import (
+        quantize_fp8_weight_rows,
+    )
+
+    torch.manual_seed(14)
+    rows, hidden, shard = 7, 256, 300
+    weight = torch.randn(shard, hidden, device="cuda", dtype=torch.bfloat16)
+    q, scale = quantize_fp8_weight_rows(weight)
+    selector = _selector(
+        SimpleNamespace(weight=weight, quant_method=None), 2, 4, 8, 2 * shard
+    )
+    selector.fp8_weight = (q, scale)
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    dequantized = q.double() * scale.double()[:, None]
+    torch.testing.assert_close(
+        selector._shard_logits(hidden_states),
+        (hidden_states.double() @ dequantized.T).bfloat16(),
+        rtol=2**-7,
+        atol=1e-3,
     )
 
 
