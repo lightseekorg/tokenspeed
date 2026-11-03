@@ -40,6 +40,7 @@
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/boundary_tree.h"
+#include "cache/prefix/checkpoint_tree.h"
 #include "cache/prefix/tail_table.h"
 #include "utils.h"
 
@@ -64,6 +65,9 @@ inline std::int32_t FirstTailBlockNeeded(const CacheGroupSpec& spec, std::int32_
 struct CoordinatorMatch {
     std::int32_t num_common_tokens{0};
     std::vector<PrefixMatch> per_group;
+    // The access epoch the resumed State checkpoint had before this match, 0
+    // when this tier resumes none.
+    std::uint64_t resumed_checkpoint_last_use{0};
 };
 
 // Multi-group fan-out over the per-attention groups, one shared BlockPool. Holds no per-request
@@ -82,13 +86,19 @@ public:
     // (the Host write-back policy; it needs a Host pool and excludes
     // streaming). The snapshot pool holds retracted requests' private KV
     // images (Snapshot / Restore); nullptr means the engine never retracts.
-    // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host
-    // and write_back_evictions have no defaults: a shorter call would convert
-    // a pool pointer to bool and silently disable a tier instead of failing
-    // to compile.
+    // checkpoint_retention_requests and checkpoint_retention_leaf_distance are
+    // SchedulerConfig's: a State checkpoint more than the leaf distance from a
+    // leaf ranks, under pressure, as if last used that many new requests ago
+    // (0 requests ranks every entry by its own use).
+    // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host,
+    // write_back_evictions and checkpoint_retention_requests have no defaults:
+    // a shorter call would convert a pool pointer to bool and silently disable
+    // a tier instead of failing to compile. A leaf distance of 0 ranks only
+    // the newest checkpoint on a branch as a leaf.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                      bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
-                     bool stream_device_cache_to_host, bool write_back_evictions);
+                     bool stream_device_cache_to_host, bool write_back_evictions,
+                     std::int64_t checkpoint_retention_requests, std::int32_t checkpoint_retention_leaf_distance = 0);
     std::size_t DemoteSession(const std::string& session_id, bool ended);
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
 
@@ -846,6 +856,15 @@ public:
     // State checkpoints first.
     std::vector<NodeEntry> NodeEntries(const BlockPool& pool, const BoundaryTree::Node& node) const;
 
+    // How an eviction plan on `tier` ranks State checkpoints that are not
+    // leaves (cache-concepts.md, checkpoint retention).
+    CheckpointAging CheckpointAgingFor(CacheTier tier) const;
+    const CheckpointTree& Checkpoints() const { return checkpoints_; }
+    // New requests admitted between a resumed checkpoint's last use and the
+    // resume: index 0 counts none, index b >= 1 counts [2^(b-1), 2^b), and
+    // the last index counts gaps as long as the admissions kept, or longer.
+    const std::vector<std::uint64_t>& CheckpointResumeGaps() const { return checkpoint_resume_gaps_; }
+
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped.
     std::size_t NumTailEntries() const { return tails_.Size(); }
@@ -1103,6 +1122,11 @@ private:
     // it), and a node no prefix-closed group holds on either tier and no store
     // is bringing (a gap).
     void syncTreeNode(const ContentHash& hash);
+    // The checkpoint tree follows the State entries each tier holds.
+    void recordCheckpoints(const CompletedPages& completed, std::uint64_t access_epoch);
+    void syncCheckpoint(const ContentHash& hash);
+    void recordAdmission(std::uint64_t access_epoch);
+    void recordResumeGap(std::uint64_t last_used_epoch);
     // Refresh the closed-group coverage and duplicate membership after a
     // publication, restore, or link gives an existing hash its parent.
     void syncKvCoverage(BoundaryTree::Node& node);
@@ -1160,6 +1184,15 @@ private:
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.
     BoundaryTree boundary_tree_;
+    CheckpointTree checkpoints_;
+    std::int64_t checkpoint_retention_requests_{0};
+    // The access epochs of the latest new-request admissions, oldest first
+    // from num_admissions_ (a ring); it covers the retention window and the
+    // resume gaps.
+    std::vector<std::uint64_t> admission_epochs_;
+    static constexpr std::size_t kResumeGapAdmissions{std::size_t{1} << 16};
+    std::uint64_t num_admissions_{0};
+    std::vector<std::uint64_t> checkpoint_resume_gaps_;
     mutable std::uint64_t host_duplicate_scan_generation_{0};
     // Hashes of possibly dead tree nodes, in the order they were queued, for
     // CollectDeadEntries (write_back_evictions only). A node may be gone or
@@ -1195,5 +1228,7 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
-                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions);
+                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
+                                 std::int64_t checkpoint_retention_requests,
+                                 std::int32_t checkpoint_retention_leaf_distance = 0);
 }  // namespace tokenspeed

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -131,7 +132,9 @@ std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStore
 
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                                    bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
-                                   bool stream_device_cache_to_host, bool write_back_evictions)
+                                   bool stream_device_cache_to_host, bool write_back_evictions,
+                                   std::int64_t checkpoint_retention_requests,
+                                   std::int32_t checkpoint_retention_leaf_distance)
     : groups_{std::move(groups)},
       pool_{pool},
       host_pool_{host_pool},
@@ -139,8 +142,17 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
       stream_device_cache_to_host_{stream_device_cache_to_host && host_pool != nullptr},
       write_back_evictions_{write_back_evictions},
       enable_l3_storage_{enable_l3_storage && host_pool != nullptr},
-      prefix_granularity_{prefix_granularity} {
+      prefix_granularity_{prefix_granularity},
+      checkpoints_{prefix_granularity, checkpoint_retention_leaf_distance},
+      checkpoint_retention_requests_{checkpoint_retention_requests} {
     _assert(prefix_granularity_ > 0, "coordinator needs positive prefix_granularity");
+    _assert(checkpoint_retention_requests_ >= 0 && checkpoint_retention_requests_ <= kMaxCheckpointRetentionRequests,
+            "checkpoint retention requests out of range");
+    // Enough admissions to place the retention window and to tell the resume
+    // gaps a choice of it reads.
+    admission_epochs_.resize(
+        std::max<std::size_t>(static_cast<std::size_t>(checkpoint_retention_requests_), kResumeGapAdmissions));
+    checkpoint_resume_gaps_.resize(static_cast<std::size_t>(std::bit_width(admission_epochs_.size() - 1)) + 2);
     _assert(!write_back_evictions_ || host_pool_ != nullptr, "writing evictions back needs a Host pool");
     _assert(!(stream_device_cache_to_host_ && write_back_evictions_),
             "the Host tier is fed by publication or by eviction, not both");
@@ -300,6 +312,7 @@ bool CacheCoordinator::ClearCache() {
     // holds a node: the scheduler refuses a clear while a store is in flight.
     tails_.Clear();
     boundary_tree_.Clear();
+    checkpoints_.Clear();
     return true;
 }
 
@@ -514,6 +527,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
     CoordinatorMatch out;
     out.num_common_tokens = probe.num_common_tokens;
     out.per_group.resize(groups_.size());
+    bool seen_state_group = false;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         // A State group's hits count from page 0 (PrefixProbe::Tier).
         const std::int32_t floor_pages = GroupIsState(i) ? 0 : floor_tokens / geometry_[i].BlockGranularity();
@@ -541,9 +555,14 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                                            std::make_move_iterator(tail_match.blocks.end()));
         }
         if (GroupIsState(i)) {
+            const bool first_state_group = !seen_state_group;
+            seen_state_group = true;
             for (const CacheBlockRef& block : out.per_group[i].blocks) {
                 if (const std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool, block)) {
                     if (BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash)) {
+                        if (first_state_group) {
+                            out.resumed_checkpoint_last_use = node->latest_state_access_epoch;
+                        }
                         node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
                     }
                 }
@@ -1250,6 +1269,12 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
         out.host = acquireTierWithKeys<CacheTier::kHost>(*probe.group_keys, device_full_tokens, std::move(probe.host),
                                                          access_epoch);
     }
+    if (const std::uint64_t last_use = out.device.resumed_checkpoint_last_use != 0
+                                           ? out.device.resumed_checkpoint_last_use
+                                           : out.host.resumed_checkpoint_last_use;
+        last_use != 0) {
+        recordResumeGap(last_use);
+    }
     if (probe.state_at_prompt_end) {
         out.state_at_prompt_end.resize(groups_.size());
         for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -1443,6 +1468,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
     // A model without a prefix-closed group may register nothing under the
     // deepest boundary linked (a chunk end of State groups alone).
     syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+    recordCheckpoints(completed, access_epoch);
     recordPublishedTail(completed);
 }
 
@@ -1567,7 +1593,7 @@ public:
     HostEvictionPlanner(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
                         const BlockPool& pool)
         : coordinator_{coordinator}, groups_{groups}, pool_{pool}, plan_{pool, groups}, no_dense_need_(groups.size()) {
-        plan_.StartCandidates(&taken_, nullptr);
+        plan_.StartCandidates(&taken_, nullptr, coordinator.CheckpointAgingFor(CacheTier::kHost));
     }
 
     bool Fits(std::span<const std::vector<std::int64_t>> needed) const { return plan_.Fits(needed, no_dense_need_); }
@@ -1946,6 +1972,7 @@ void CacheCoordinator::syncKvCoverage(BoundaryTree::Node& node) {
 }
 
 void CacheCoordinator::syncTreeNode(const ContentHash& hash) {
+    syncCheckpoint(hash);
     // Every registration starts a node, and the last entry to leave takes it
     // and its tail hint along: a hash without a node has nothing left.
     BoundaryTree::Node* node = boundary_tree_.Find(hash);
@@ -2287,6 +2314,85 @@ void CacheCoordinator::MarkSupersededStateInput(const ContentHash& resumed_tail_
                                                            /*newly_cached=*/nullptr, SessionForAccess(access_epoch));
                            }
                        });
+}
+
+void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::uint64_t access_epoch) {
+    if (num_state_groups_ == 0 || completed.tokens.empty()) {
+        return;
+    }
+    // The in-forward checkpoint first: it lies on the path to the point's.
+    if (completed.state_checkpoint_pages > 0) {
+        const auto pages = static_cast<std::size_t>(completed.state_checkpoint_pages);
+        if (checkpoints_.Observe(completed.tokens.first(pages * static_cast<std::size_t>(prefix_granularity_)),
+                                 completed.prefix_hashes.first(pages), std::nullopt, access_epoch)) {
+            syncCheckpoint(completed.prefix_hashes[pages - 1]);
+        }
+    }
+    if (completed.publish_state &&
+        checkpoints_.Observe(completed.tokens, completed.prefix_hashes, completed.tail, access_epoch)) {
+        syncCheckpoint(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+    }
+}
+
+void CacheCoordinator::syncCheckpoint(const ContentHash& hash) {
+    if (checkpoints_.Size() == 0 || !checkpoints_.Contains(hash)) {
+        return;
+    }
+    CheckpointTree::Residency residency{.complete = {true, host_pool_ != nullptr}};
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (!GroupIsState(i)) {
+            continue;
+        }
+        const CacheKey key{.group_id = groups_[i].Id(), .content_hash = hash};
+        const bool on_device = groups_[i].Index().Contains(pool_, key);
+        const bool on_host = host_pool_ != nullptr && groups_[i].Index().Contains(*host_pool_, key);
+        residency.complete[BoundaryTree::kDevice] = residency.complete[BoundaryTree::kDevice] && on_device;
+        residency.complete[BoundaryTree::kHost] = residency.complete[BoundaryTree::kHost] && on_host;
+        residency.held = residency.held || on_device || on_host;
+    }
+    if (const BoundaryTree::Node* node = boundary_tree_.Find(hash);
+        node != nullptr && node->pending_host_checkpoint_stores > 0) {
+        residency.pending_host_store = true;
+        residency.held = true;
+    }
+    checkpoints_.Update(hash, residency);
+}
+
+CheckpointAging CacheCoordinator::CheckpointAgingFor(CacheTier tier) const {
+    if (checkpoint_retention_requests_ == 0 || checkpoints_.Size() == 0) {
+        return CheckpointAging{.tier = tier};
+    }
+    const auto window = static_cast<std::uint64_t>(checkpoint_retention_requests_);
+    // Before that many admissions every entry is recent; epoch 0 stays first.
+    const std::uint64_t cutoff_epoch =
+        num_admissions_ < window ? 1 : admission_epochs_[(num_admissions_ - window) % admission_epochs_.size()];
+    return CheckpointAging{.tree = &checkpoints_, .tier = tier, .cutoff_epoch = cutoff_epoch};
+}
+
+void CacheCoordinator::recordAdmission(std::uint64_t access_epoch) {
+    admission_epochs_[num_admissions_ % admission_epochs_.size()] = access_epoch;
+    ++num_admissions_;
+}
+
+void CacheCoordinator::recordResumeGap(std::uint64_t last_used_epoch) {
+    const std::uint64_t kept = std::min<std::uint64_t>(num_admissions_, admission_epochs_.size());
+    const std::uint64_t oldest = num_admissions_ - kept;
+    // The kept admissions' epochs increase from the oldest: find the first
+    // one after the checkpoint's last use.
+    std::uint64_t low = 0;
+    std::uint64_t high = kept;
+    while (low < high) {
+        const std::uint64_t mid = low + (high - low) / 2;
+        if (admission_epochs_[(oldest + mid) % admission_epochs_.size()] > last_used_epoch) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    const std::uint64_t gap = kept - low;
+    const bool counted = (low > 0 || oldest == 0) && gap < admission_epochs_.size();
+    ++checkpoint_resume_gaps_[counted ? static_cast<std::size_t>(std::bit_width(gap))
+                                      : checkpoint_resume_gaps_.size() - 1];
 }
 
 void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
@@ -2799,6 +2905,7 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
         boundary_tree_.SetCheckpoint(node, CacheTier::kHost, true);
         node.latest_state_access_epoch =
             std::max({node.latest_state_access_epoch, metadata.last_access_epoch, metadata.max_access_epoch});
+        syncCheckpoint(key.content_hash);
     }
 }
 
@@ -2834,6 +2941,7 @@ void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey
     if (GroupIsState(key.group_id)) {
         boundary_tree_.SetCheckpoint(node, CacheTier::kDevice, true);
         node.latest_state_access_epoch = std::max(node.latest_state_access_epoch, access_epoch);
+        syncCheckpoint(key.content_hash);
     }
     if (!cache_mutation_sink_) {
         return;
@@ -2873,8 +2981,9 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
 
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
-                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host,
-                                 bool write_back_evictions) {
+                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
+                                 std::int64_t checkpoint_retention_requests,
+                                 std::int32_t checkpoint_retention_leaf_distance) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     _assert(specs.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
@@ -2894,9 +3003,16 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
         groups.emplace_back(spec, std::move(allocator), MakePrefixMatcher(spec));
     }
-    return CacheCoordinator{std::move(groups),           prefix_granularity,  pool,
-                            enable_l3_storage,           host_pool,           snapshot_pool,
-                            stream_device_cache_to_host, write_back_evictions};
+    return CacheCoordinator{std::move(groups),
+                            prefix_granularity,
+                            pool,
+                            enable_l3_storage,
+                            host_pool,
+                            snapshot_pool,
+                            stream_device_cache_to_host,
+                            write_back_evictions,
+                            checkpoint_retention_requests,
+                            checkpoint_retention_leaf_distance};
 }
 
 CacheBlockRef CacheCoordinator::AcquireHostCachedBlock(const CacheKey& key) {
