@@ -201,7 +201,10 @@ class MuseSparkDecoderLayerState:
         self.mids_scale = torch.zeros(
             routes * INTER // 32 // 4, dtype=torch.int32, device=device
         )
-        self.moe_tags = torch.zeros(TAG_WORDS, dtype=torch.int32, device=device)
+        # The MoE's readiness tags: written on one XCD, polled with scalar
+        # loads on any other, so uncached (scalar polls of cached device
+        # memory are only good for words written on the same XCD).
+        self.moe_tags = UncachedBuffer(TAG_WORDS, torch.int32, device)
         self.s_rows = torch.zeros(
             (MAX_ROWS, POOLED), dtype=torch.bfloat16, device=device
         )
