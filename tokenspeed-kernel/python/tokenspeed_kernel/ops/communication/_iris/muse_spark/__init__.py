@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
+    iris_fused_lamport_allgather_rmsnorm_mxfp4_topk,
     iris_pack_moe_inputs,
     iris_pull_allgather_moe_inputs,
 )
@@ -1811,6 +1812,107 @@ class MuseIrisState:
             and total_width % 1024 == 0
             and rows * local_width <= self.reduction.lamport_max_numel
         )
+
+    def can_all_gather_rmsnorm_mxfp4_quant_topk(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+    ) -> bool:
+        """Check the Lamport gather-and-quantize that also routes its rows.
+
+        The rows' FP32 logits must be contiguous ``[rows, bias.shape[0]]``.
+        """
+        experts = bias.shape[0] if bias.ndim == 1 else -1
+        return (
+            self.can_all_gather_rmsnorm_mxfp4_quant(local, weight)
+            and self._lamport_gathers_rmsnorm_mxfp4(local)
+            # The gfx950 top-k body takes power-of-two expert and top-k counts.
+            and triton.next_power_of_2(experts) == experts <= 1024
+            and triton.next_power_of_2(topk) == topk <= min(16, experts)
+            and bias.dtype == torch.float32
+            and bias.is_contiguous()
+            and bias.device == local.device
+        )
+
+    def all_gather_rmsnorm_mxfp4_quant_topk(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        routed_scaling_factor: float,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Gather and quantize the expert inputs, and route the rows, in one launch.
+
+        Returns the MXFP4 rows and scales of :meth:`all_gather_rmsnorm_mxfp4_quant`
+        and the FP32 weights and int32 ids of the gfx950 biased-sigmoid top-k
+        (normalized, then scaled by ``routed_scaling_factor``).
+        """
+        if not self.can_all_gather_rmsnorm_mxfp4_quant_topk(
+            local, weight, bias, topk
+        ) or (
+            logits.shape != (local.shape[0], bias.shape[0])
+            or logits.dtype != torch.float32
+            or not logits.is_contiguous()
+            or logits.device != local.device
+        ):
+            raise RuntimeError("unsupported Iris gather, MXFP4 and top-k fusion")
+        if local.data_ptr() % 4:
+            # Rank-local fallback could split ranks across protocols.
+            raise ValueError(
+                "iris_fused_lamport_allgather_rmsnorm_mxfp4_topk reads BF16 pairs "
+                f"as 32-bit words; local starts at byte {local.data_ptr() % 4} of a word"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+            empty_swizzled_cdna4_mxfp4_scale,
+        )
+
+        rows, local_width = local.shape
+        total_width = local_width * self.world_size
+        packed = torch.empty(
+            (rows, total_width // 2), dtype=torch.uint8, device=local.device
+        )
+        scales = empty_swizzled_cdna4_mxfp4_scale(
+            rows, total_width // 32, device=local.device
+        )
+        topk_ids = torch.empty((rows, topk), dtype=torch.int32, device=local.device)
+        topk_weights = torch.empty(
+            (rows, topk), dtype=torch.float32, device=local.device
+        )
+        iris_fused_lamport_allgather_rmsnorm_mxfp4_topk[(2 * rows,)](
+            local,
+            weight,
+            packed,
+            scales,
+            self.reduction.lamport_region,
+            self.reduction.lamport_epochs,
+            self.reduction.lamport_peer_addresses[: self.world_size],
+            scales.stride(0),
+            scales.stride(1),
+            logits,
+            bias,
+            topk_ids,
+            topk_weights,
+            rows,
+            rank=self.all_reduce.rank_in_group,
+            local_width=local_width,
+            total_width=total_width,
+            eps=eps,
+            weight_offset=weight_offset,
+            max_elements=self.reduction.lamport_max_numel,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            WAIT_STORES=self._arch.wait_stores,
+            EXPERTS=logits.shape[1],
+            TOPK=topk,
+            ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
+            num_warps=1,
+        )
+        return (packed, scales), topk_weights, topk_ids
 
     def all_gather_rmsnorm_mxfp4_quant(
         self,

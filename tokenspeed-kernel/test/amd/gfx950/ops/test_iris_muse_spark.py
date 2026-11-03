@@ -1502,6 +1502,78 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
     assert bool((region == -(2**31)).all())
 
 
+def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.moe import moe_topk
+    from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
+
+    state = _muse_state(rank, device, 8192, True)
+    width, local_width, experts, topk, scale = 4096, 4096 // world_size, 256, 8, 2.5
+    weight = (torch.randn(width, device=device) * 0.1).bfloat16()
+    bias = torch.randn(experts, device=device) * 0.01
+    for rows in (2, 8, 16):
+        local = torch.empty((rows, local_width), dtype=torch.bfloat16, device=device)
+        logits = torch.empty((rows, experts), dtype=torch.float32, device=device)
+        generator = torch.Generator(device=device)
+
+        def update(phase):
+            # Every rank draws the same rows and logits.
+            generator.manual_seed(1000 * rows + phase)
+            full = torch.randn((rows, width), generator=generator, device=device)
+            full = full.bfloat16()
+            local.copy_(full[:, rank * local_width : (rank + 1) * local_width])
+            logits.copy_(
+                torch.randn((rows, experts), generator=generator, device=device)
+            )
+            return full
+
+        update(0)
+        state.all_gather_rmsnorm_mxfp4_quant_topk(
+            local, weight, 1e-6, 1.0, logits, bias, topk, scale
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            (packed, scales), weights, ids = state.all_gather_rmsnorm_mxfp4_quant_topk(
+                local, weight, 1e-6, 1.0, logits, bias, topk, scale
+            )
+        for phase in range(3):
+            expected = update(phase)
+            if rank == phase % world_size:
+                torch.cuda._sleep(20000)
+            graph.replay()
+            reference = rmsnorm_mxfp4_quant(expected, weight, 1e-6, 1.0)
+            torch.testing.assert_close(packed, reference[0], atol=0, rtol=0)
+            torch.testing.assert_close(
+                _logical_cdna4_scales(scales, rows, width // 32),
+                _logical_cdna4_scales(reference[1], rows, width // 32),
+                atol=0,
+                rtol=0,
+            )
+            reference_weights, reference_ids = moe_topk(
+                router_logits=logits,
+                top_k=topk,
+                score_function="sigmoid",
+                selection_method="topk",
+                renormalize=True,
+                routed_scaling_factor=scale,
+                correction_bias=bias,
+                hash_indices_table=None,
+                input_ids=None,
+                logical_to_physical_map=None,
+                topk_indices_dtype=torch.int32,
+                topk_weights_dtype=torch.float32,
+                override=None,
+                solution=None,
+            )
+            assert torch.equal(ids, reference_ids)
+            assert torch.equal(weights, reference_weights)
+    torch.cuda.synchronize()
+    dist.barrier()
+    region = state.reduction.lamport_region.view(torch.int32)
+    assert bool((region == -(2**31)).all())
+
+
 def _muse_routed_lamport_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,
@@ -3092,8 +3164,9 @@ def _muse_tp_owned_forward_worker(
             full = torch.randn(rows, 8192, device=device)
             local = torch.zeros(local_rows, 8192, device=device)
             local[:valid].copy_(full[first : first + valid])
-            expected, _ = moe(full, full.float(), rows, rows, None, project=True)
-            expected = expected[first : first + valid].clone()
+            expected_rows, _ = moe(full, full.float(), rows, rows, None, project=True)
+            expected_rows = expected_rows.clone()
+            expected = expected_rows[first : first + valid]
             actual, _ = moe(local, local.float(), rows, rows, rows, project=True)
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
@@ -3102,6 +3175,19 @@ def _muse_tp_owned_forward_worker(
             torch.testing.assert_close(
                 actual[valid:], torch.zeros_like(actual[valid:]), atol=0, rtol=0
             )
+            if quantized and rows == 192:
+                # Decode batches route and quantize in two launches; each row
+                # matches the same row of the batch above, too large for them.
+                for small in (8, 16):
+                    rows_in = full[:small].contiguous()
+                    router_in = rows_in.float()
+                    assert (
+                        moe._route_and_quantize_inputs(rows_in, router_in) is not None
+                    )
+                    decode, _ = moe(rows_in, router_in, small, small, None, True)
+                    torch.testing.assert_close(
+                        decode, expected_rows[:small], atol=2**-7, rtol=2**-7
+                    )
         dist.barrier()
 
 
@@ -3584,6 +3670,11 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
         pytest.param(
             _muse_lamport_gather_mxfp4_worker, "nccl", id="lamport_gather_mxfp4"
+        ),
+        pytest.param(
+            _muse_lamport_gather_mxfp4_topk_worker,
+            "nccl",
+            id="lamport_gather_mxfp4_topk",
         ),
         pytest.param(
             _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"
