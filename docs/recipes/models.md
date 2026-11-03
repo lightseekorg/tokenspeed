@@ -1057,11 +1057,12 @@ ts serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
 Use `fixed` to compare full-width DSpark on the same checkpoint. Confidence
 is experimental and keeps selected rows compact through attention, GDN, PLE
 and MLP. State rollback capacity and the external sampling layout retain the
-maximum window. Confidence captures the target body by total query capacity
-and the drafter separately by request capacity; the LM head and verification
-run outside these graphs. With the greedy sampler they consume compact query
-rows directly; other samplers retain maximum-window scores. Target graphs are
-shared across request counts.
+maximum window. Confidence captures target execution, LM head, verification
+and stop processing by total query capacity; draft context writes, native drafting
+and state commit are captured separately by request capacity. With the greedy
+sampler the head and verifier consume compact query rows directly; other samplers
+retain maximum-window scores. Target graphs are shared across request counts.
+Metadata refresh and host scheduling remain outside the graphs.
 Single-GPU and TP2/EP2 smoke runs cover graph and eager execution.
 Full-budget and adaptive output parity against fixed verification have not
 passed acceptance; distributed performance and multimodal validation remain

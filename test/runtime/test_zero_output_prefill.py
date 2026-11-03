@@ -536,7 +536,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
 
     forward = load_symbol(
         RUNTIME + "execution/model_executor.py",
-        "_forward_step",
+        "_forward_draft",
         owner="ModelExecutor",
         ForwardLogprobs=ForwardLogprobs,
     )
@@ -582,7 +582,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
     ctx = SimpleNamespace(
         bs=4, num_extends=2, output_layout=ForwardOutputLayout(2, 1, 2, 3)
     )
-    forward(executor, 4, ctx, None)
+    forward(executor, ctx, Output(torch.zeros(7, 64)), tokens, lengths)
     assert future_inputs.tolist() == [
         [77, 77, 77],
         [31, 32, 33],
@@ -791,6 +791,9 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     observed = []
     accepted_lengths = []
     runner = SimpleNamespace(
+        confidence_feedback=None,
+        segmented_decode=None,
+        commit_forward=lambda ctx, result: accepted_lengths.append(result[1].clone()),
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
         _pad_graph_req_pool_indices=lambda indices, bs: torch.nn.functional.pad(

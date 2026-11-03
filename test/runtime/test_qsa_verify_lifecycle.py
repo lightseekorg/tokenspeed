@@ -60,6 +60,7 @@ def _runner(
     wrapper = object.__new__(ForwardStepRunner)
     wrapper.confidence_feedback = None
     wrapper.segmented_decode = None
+    wrapper.update_runtime_state = None
     wrapper.config = SimpleNamespace(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
     )

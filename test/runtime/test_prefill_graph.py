@@ -1388,6 +1388,8 @@ class TestPrefillRoleGraphsTest:
 
         return self.forward_step.ForwardStepRunner(
             forward_func=lambda *args, **kwargs: None,
+            decode_stages=None,
+            update_runtime_state=None,
             attn_backend=Backend(),
             token_to_kv_pool=_fake_pool(cache_group_page_counts={}),
             input_buffers=object(),
@@ -1436,6 +1438,8 @@ class TestPrefillRoleGraphsTest:
         )
         runner = self.forward_step.ForwardStepRunner(
             forward_func=lambda *args, **kwargs: None,
+            decode_stages=None,
+            update_runtime_state=None,
             attn_backend=Backend(),
             token_to_kv_pool=_fake_pool(specs=specs, cache_group_page_counts={}),
             input_buffers=object(),

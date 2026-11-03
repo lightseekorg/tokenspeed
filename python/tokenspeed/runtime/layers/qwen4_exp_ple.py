@@ -913,8 +913,9 @@ class Qwen4ExpPLELayer(nn.Module):
         # A padded-bucket replay hands us bucket rows whose tail is filler, so
         # the lengths decide how many rows are real before anything reads them.
         verify_queries = ctx.verify_queries
+        bs = ctx.bs if verify_queries is None else verify_queries.batch_size
         if verify_queries is None:
-            lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
+            lengths = self._lengths(metadata, input_ids.shape[0], bs)
             num_real_tokens = sum(lengths)
             index, uniform_length = self._prefetch_indices(lengths, input_ids.device)
         else:
@@ -931,12 +932,12 @@ class Qwen4ExpPLELayer(nn.Module):
                 verify_queries.query_offsets[:-1],
                 verify_queries.width,
                 num_real_tokens,
-                ctx.bs,
+                bs,
             )
             uniform_length = 0
         (input_ids,) = slice_to_real_tokens(num_real_tokens, input_ids)
-        input_pages = metadata.input_blocks[: ctx.bs]
-        output_pages = metadata.output_blocks[: ctx.bs]
+        input_pages = metadata.input_blocks[:bs]
+        output_pages = metadata.output_blocks[:bs]
         pool = ctx.token_to_kv_pool
         load_tracker = getattr(pool, "layerwise_load_tracker", None)
         if load_tracker is not None:
@@ -963,7 +964,7 @@ class Qwen4ExpPLELayer(nn.Module):
         scratch_stride = 0
         if verify:
             context_scratch, conv_scratch = backend.ple_verify_scratch(
-                self.context_field_id, self.layer_id, ctx.bs
+                self.context_field_id, self.layer_id, bs
             )
             scratch_stride = metadata.verify_width + 1
         return _PleExecutionPlan(

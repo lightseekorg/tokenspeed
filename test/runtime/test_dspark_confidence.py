@@ -187,6 +187,8 @@ def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
     weights = torch.randn(channels, 4, device="cuda", dtype=raw.dtype) * 0.1
     A_log, dt_bias = (torch.randn(heads, device="cuda") * 0.1 for _ in range(2))
 
+    actual_bs = 2
+
     def forward(index):
         layout = layouts[index]
         return backends[index].forward_decode(
@@ -196,7 +198,7 @@ def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
             layer=None,
             out_cache_loc=None,
             token_to_kv_pool=pools[index],
-            bs=batch,
+            bs=actual_bs,
             mixed_qkv=layout.pack(raw, token_dim=0),
             conv_weights=weights,
             bias=None,
@@ -219,12 +221,52 @@ def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
         forward(0)
         forward(1)
     graph = None
+    commit_graph = None
     if cuda_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             actual = forward(1)
+        backend = backends[1]
+
+        def prepare_commit():
+            backend.init_forward_metadata_capture_cuda_graph(
+                batch,
+                torch.arange(batch, dtype=torch.int32, device="cuda"),
+                torch.full((batch,), 4 + width, dtype=torch.int32, device="cuda"),
+                ForwardMode.DECODE,
+            )
+            backend.prepare_state_commit_capture()
+
+        for _ in range(2):
+            prepare_commit()
+            backend.commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+        prepare_commit()
+        commit_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(commit_graph):
+            backend.commit_verified_state(layouts[1].query_lengths, accepted_path=None)
     for step in range(2):
-        layouts[1].refresh(rates.roll(step, 0), ready, active)
+        actual_bs = 2 - step
+        active.copy_(torch.arange(batch, device="cuda") < actual_bs)
+        for layout in layouts:
+            layout.refresh(rates.roll(step, 0), ready, active)
+        for backend in backends:
+            # Fresh delivered storage on each round must not replace the
+            # table addresses recorded by the commit graph.
+            backend.refresh_decode_metadata(
+                batch,
+                actual_bs,
+                torch.arange(batch, dtype=torch.int32, device="cuda"),
+                torch.full((batch,), 4 + width, dtype=torch.int32, device="cuda"),
+                forward_mode=ForwardMode.DECODE,
+                for_graph_replay=cuda_graph,
+                block_tables={
+                    "linear_attention": torch.tensor(
+                        [[1 + step, 5 + step], [2 - step, 6 - step]],
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                },
+            )
         expected = forward(0).reshape(-1, heads, dim)
         if graph is None:
             actual = forward(1)
@@ -237,8 +279,13 @@ def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
             atol=0,
             rtol=0,
         )
-        for backend in backends:
-            backend.commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+        backends[0].commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+        if commit_graph is None:
+            backends[1].commit_verified_state(
+                layouts[1].query_lengths, accepted_path=None
+            )
+        else:
+            commit_graph.replay()
         for component in ("conv_state", "recurrent_state"):
             torch.testing.assert_close(
                 pools[0].get_component(0, component),

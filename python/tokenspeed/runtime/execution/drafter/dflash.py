@@ -57,7 +57,6 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 )
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.confidence_graph import ConfidenceDecodeGraphs
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
@@ -145,7 +144,6 @@ class DFlash(BaseDrafter):
             raise ValueError("DFLASH requires --speculative-draft-model-path.")
 
         self.device = torch.device(draft_model_runner.device)
-        self.decode_graphs: ConfidenceDecodeGraphs | None = None
         self.model = draft_model_runner.model
         # Bound by wire_target.
         self.target_model: torch.nn.Module | None = None
@@ -1158,16 +1156,6 @@ class DFlash(BaseDrafter):
         kv_sync_event: torch.cuda.Event = None,
         prepared: bool = False,
     ) -> torch.Tensor:
-        if self.decode_graphs is not None and self.decode_graphs.active:
-            if not prepared:
-                torch.add(
-                    self.draft_seq_lens_buf[: current_tokens.shape[0], None],
-                    self.block_offsets,
-                    out=self.block_positions_buf[: current_tokens.shape[0]],
-                )
-            if kv_sync_event is not None:
-                torch.cuda.current_stream().wait_event(kv_sync_event)
-            return self.decode_graphs.run_draft(current_tokens)
         return self._draft_native_forward(current_tokens, kv_sync_event, prepared)
 
     def _draft_native_forward(
