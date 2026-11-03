@@ -5639,6 +5639,89 @@ TEST_F(FrequentStateCheckpointPrefillRoleSuite, ChunkEndsPublishCheckpointsAndTh
     AckWriteBacks(PlanOnce());
 }
 
+// The P role prepays no later chunk, so on a full Device a chunk's admission
+// fails until another prompt leaves. The attempt of a chunk ending on a
+// frequent checkpoint advances the request's cache progress in place, and the
+// failed admission undoes that (StagedCacheProgress): the retry still finds
+// the pages through the checkpoint unpublished, and publishes them with the
+// checkpoint.
+class FrequentStateCheckpointPrefillRolePressureSuite : public FrequentStateCheckpointPrefillRoleSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointPrefillRoleSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        // 15 usable pages: an 8-token prompt waiting for its hand-off's ACK
+        // holds 6, the first chunk of an 18-token prompt takes 8, and its
+        // second chunk needs two KV pages more.
+        cfg.device_allocator.total_pages = 16;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(FrequentStateCheckpointPrefillRolePressureSuite, AFailedChunkAdmissionLeavesItsCheckpointToTheRetry) {
+    ResetFrequent(true, /*cap=*/8);
+    const std::vector<std::int32_t> tokens = MakeTokens(18);
+    const std::span<const std::int32_t> all(tokens);
+    const std::uint64_t page0_hash = HashKvBlock(all.subspan(0, 4), std::nullopt);
+    const std::uint64_t page1_hash = HashKvBlock(all.subspan(4, 4), page0_hash);
+
+    Submit(RequestWithTokens("holder", MakeTokens(8, 1000)));
+    SendBootstrapped("holder");
+    const ExecutionPlan holder_prefill = PlanOnce();
+    ASSERT_NE(FindForwardBatch(holder_prefill), nullptr);
+    AckWriteBacks(holder_prefill);
+    SendForwardDone("holder", {900});
+    const ExecutionPlan holder_handoff = PlanOnce();
+    ASSERT_TRUE(holder_handoff.remote_decode.has_value());
+    AckWriteBacks(holder_handoff);
+    Drain();
+
+    Submit(RequestWithTokens("seed", tokens));
+    SendBootstrapped("seed");
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* first_batch = FindForwardBatch(first);
+    ASSERT_TRUE(first_batch != nullptr && first_batch->request_ids == std::vector<std::string>{"seed"});
+    ASSERT_EQ(first_batch->input_lengths.at(0), 8);
+    const std::int32_t live_at_8 = StateRow(*first_batch, "state0", "seed").at(1);
+    AckWriteBacks(first);
+    SendForwardDone("seed");
+    // [8, 16) would publish the pages through 8 and the checkpoint at 8, but
+    // the one free page cannot hold its KV.
+    for (int round = 0; round < 2; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        EXPECT_TRUE(batch == nullptr || batch->request_ids.empty()) << "round " << round;
+        AckWriteBacks(plan);
+    }
+    EXPECT_TRUE(Drain().stored.empty()) << "a failed admission publishes nothing";
+
+    SendPdSucceeded("holder");
+    Drain();  // the holder's prompt end, published at its ACK
+    const ExecutionPlan retry = PlanOnce();
+    const ForwardBatch* retry_batch = FindForwardBatch(retry);
+    ASSERT_TRUE(retry_batch != nullptr && retry_batch->request_ids == std::vector<std::string>{"seed"});
+    EXPECT_EQ(retry_batch->extend_prefix_lens.at(0), 8);
+    AckWriteBacks(retry);
+    SendForwardDone("seed");
+    EXPECT_EQ(Drain().stored, std::vector<std::uint64_t>{page1_hash})
+        << "the retry publishes the pages through 8, and the checkpoint at 8 makes the boundary whole";
+
+    const std::vector<Chunk> rest = RunPrefill("seed", 18);
+    ASSERT_EQ(rest.size(), 1u);
+    const ExecutionPlan seed_handoff = PlanOnce();
+    ASSERT_TRUE(seed_handoff.remote_decode.has_value());
+    AckWriteBacks(seed_handoff);
+    SendPdSucceeded("seed");
+    AckWriteBacks(PlanOnce());
+    const Resume resume = Probe("diverges13", Diverging(tokens, 13));
+    EXPECT_EQ(resume.prefix_tokens, 8);
+    EXPECT_EQ(resume.state_row.at(0), live_at_8) << "the live slot the chunk [0, 8) wrote";
+}
+
 // Unproven checkpoints stay on the Device: a chunk end that publishes one
 // streams its KV pages but not its state, and the publisher's finish stores
 // its prompt-end and frontier states but none of them. A hit promotes the
