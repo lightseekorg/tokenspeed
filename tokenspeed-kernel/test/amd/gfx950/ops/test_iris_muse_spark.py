@@ -355,6 +355,7 @@ def _muse_state(rank, device, max_rows, enable_lamport):
         owned_route_max_rows=0,
         intermediate_gather_max_rows=0,
         all_reduce=None,
+        reserved_heap_bytes=0,
         device=device,
     )
 
@@ -2684,6 +2685,7 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
         all_reduce=None,
+        reserved_heap_bytes=0,
         device=device,
     )
     if world_size != 8:
@@ -2880,6 +2882,7 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
         all_reduce=None,
+        reserved_heap_bytes=0,
         device=device,
     )
     if world_size != 8:
@@ -3062,6 +3065,7 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
         owned_route_max_rows=2049,
         intermediate_gather_max_rows=capacity,
         all_reduce=None,
+        reserved_heap_bytes=0,
         device=device,
     )
     assert not state.can_gather_expert_intermediate(191)

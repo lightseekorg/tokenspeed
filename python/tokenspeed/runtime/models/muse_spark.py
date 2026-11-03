@@ -2107,12 +2107,17 @@ class MuseSparkDecoderLayer(nn.Module):
             "post_attention_norm": norm(self.post_attention_layernorm),
             "post_attention_gate": post_attention,
             "pre_feedforward_norm": norm(self.pre_feedforward_layernorm),
+            # [hidden, experts] FP32; the logits are scaled by the multiplier
+            # before the sigmoid.
             "router": mlp.gate.weight,
+            "router_multiplier": mlp.gate.multiplier,
             "router_bias": mlp.gate.e_score_correction_bias,
             "pooler": mlp.pre_expert_proj.weight,
+            "pooler_replicated": mlp.pre_expert_proj.replicated,
             "pooled_norm": norm(mlp.pre_expert_norm),
             "experts": mlp.experts,
             "post_expert_proj": mlp.post_expert_proj.weight,
+            "post_expert_replicated": mlp.post_expert_proj.replicated,
             "post_expert_norm": norm(mlp.post_expert_norm),
             "post_feedforward_norm": norm(self.post_feedforward_layernorm),
             "post_feedforward_gate": post_feedforward,
@@ -2540,6 +2545,36 @@ class MuseSparkModel(BaseTransformerModel):
             and (mapping.moe.tp_size == 1 or rows <= iris.owned_route_max_rows)
         )
 
+    def _fused_layer_indices(self) -> list[int]:
+        """The layers that may run fused: the contiguous MXFP4-expert layers,
+        with a regular layer before and after them; empty if there are none."""
+        indices = [
+            i for i, layer in enumerate(self.layers) if layer.mlp.quantized_experts
+        ]
+        if (
+            not indices
+            or indices[0] == 0
+            or indices[-1] + 1 >= len(self.layers)
+            or indices != list(range(indices[0], indices[-1] + 1))
+        ):
+            return []
+        return indices
+
+    def fused_layer_heap_bytes(self, world_size: int) -> int:
+        """Symmetric heap bytes the fused layers' state takes (0 when no
+        fused layer can run); the Iris heap must be created with them."""
+        from tokenspeed_kernel.ops.decoder_layer import (
+            decoder_layer_state_heap_bytes,
+        )
+
+        if not self._fused_layer_indices():
+            return 0
+        return decoder_layer_state_heap_bytes(
+            recipe="muse_spark",
+            world_size=world_size,
+            max_requests=max(_FUSED_REQUESTS),
+        )
+
     def prepare_fused_layers(self, rank_in_group: int) -> None:
         """Prepare the fused decoder layers and agree, across the attention
         group, on the decode shapes they serve; log the startup report.
@@ -2553,17 +2588,8 @@ class MuseSparkModel(BaseTransformerModel):
             prepare_decoder_layer_state,
         )
 
-        if self.fused_state is not None:
-            return
-        indices = [
-            i for i, layer in enumerate(self.layers) if layer.mlp.quantized_experts
-        ]
-        if (
-            not indices
-            or indices[0] == 0
-            or indices[-1] + 1 >= len(self.layers)
-            or indices != list(range(indices[0], indices[-1] + 1))
-        ):
+        indices = self._fused_layer_indices()
+        if self.fused_state is not None or not indices:
             return
         args = global_server_args_dict
         width = (
@@ -3079,6 +3105,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 owned_route_max_rows=owned_route_max_rows,
                 intermediate_gather_max_rows=intermediate_gather_max_rows,
                 all_reduce=backend.iris.state(group, torch.bfloat16),
+                reserved_heap_bytes=self.model.fused_layer_heap_bytes(len(group)),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )
             backend.iris.install(group, state.all_reduce)

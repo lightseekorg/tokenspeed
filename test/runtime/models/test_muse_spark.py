@@ -301,6 +301,7 @@ class _AddLayer(torch.nn.Module):
     def __init__(self, value: float) -> None:
         super().__init__()
         self.value = value
+        self.fused = None
         self.input_layernorm = f"norm{value}"
         self.comm_manager = SimpleNamespace(
             gather_residual=lambda rows, ctx: rows,
@@ -325,6 +326,7 @@ class _AddLayer(torch.nn.Module):
 def test_forward_threads_attention_input_rows_between_layers() -> None:
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.fused_shapes = frozenset()
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
@@ -348,6 +350,76 @@ def test_forward_threads_attention_input_rows_between_layers() -> None:
     ]
 
 
+class _FusedAddLayer(_AddLayer):
+    """A layer whose fused launch adds its value to the residual and hands the
+    next fused layer a query of the rows it saw; the last one hands the
+    regular layer after it normed rows (here the residual times 10)."""
+
+    def __init__(self, value: float) -> None:
+        super().__init__(value)
+        self.fused = object()
+
+    def prepare_fused_query(self, positions, attention_input, ctx):
+        return ("query", attention_input)
+
+    def forward_fused(self, positions, prepared_query, hidden_states, ctx, next_layer):
+        self.received_query = prepared_query
+        residual = hidden_states + self.value
+        if next_layer.fused is None:
+            return residual, None, residual * 10.0
+        return residual, ("query", residual), None
+
+
+def _fused_model(served: frozenset):
+    """Layer 0 and 3 regular, 1 and 2 fused, serving ``served`` shapes."""
+    model = _stub(MuseSparkForConditionalGeneration.model_cls)
+    model.layers = torch.nn.ModuleList(
+        [_AddLayer(1.0), _FusedAddLayer(2.0), _FusedAddLayer(3.0), _AddLayer(4.0)]
+    )
+    model.fused_shapes = served
+    model._embed_hidden = lambda input_ids, input_embeds: input_embeds
+    model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
+    model.norm = lambda value, out_dtype: -value.to(out_dtype)
+    model.layers_to_capture = []
+    # Decode metadata: what the fused layers read (an extend forward has none).
+    view = object()
+    for layer in model.layers:
+        layer.self_attn = SimpleNamespace(
+            attn=SimpleNamespace(decode_kv_view=lambda ctx: view)
+        )
+    return model
+
+
+def test_fused_layers_run_only_on_served_decode_shapes() -> None:
+    # Two requests of one token each: rows 2, shape (2, 1).
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    ctx = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False), bs=2)
+
+    model = _fused_model(frozenset({(2, 1)}))
+    out, _ = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+    after_regular = hidden + 1.0
+    # The first fused layer prepares its query from the regular boundary rows;
+    # the next one gets the query the previous launch prepared.
+    assert model.layers[1].received_query[1] is not None
+    torch.testing.assert_close(model.layers[1].received_query[1], after_regular * 1.0)
+    torch.testing.assert_close(model.layers[2].received_query[1], after_regular + 2.0)
+    # The last fused launch hands the regular layer its attention input rows.
+    residual = after_regular + 2.0 + 3.0
+    torch.testing.assert_close(model.layers[3].received_attention_input, residual * 10)
+    torch.testing.assert_close(out, -(residual + 4.0).to(torch.bfloat16))
+
+    # The same rows as one request of two tokens are another shape: regular.
+    one_request = SimpleNamespace(forward_mode=ctx.forward_mode, bs=1)
+    model = _fused_model(frozenset({(2, 1)}))
+    out, _ = model.forward(
+        torch.tensor([0, 1]), torch.tensor([0, 1]), one_request, hidden
+    )
+    assert not hasattr(model.layers[1], "received_query")
+    torch.testing.assert_close(
+        out, -(hidden + 1.0 + 2.0 + 3.0 + 4.0).to(torch.bfloat16)
+    )
+
+
 class _CaptureSink:
     def __init__(self) -> None:
         self.captures: list[tuple[int, torch.Tensor]] = []
@@ -360,6 +432,7 @@ def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.fused_shapes = frozenset()
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
@@ -1673,6 +1746,7 @@ def _gathered_mxfp4_workspace_worker(
             owned_route_max_rows=0,
             intermediate_gather_max_rows=0,
             all_reduce=None,
+            reserved_heap_bytes=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=256 * 4096,
