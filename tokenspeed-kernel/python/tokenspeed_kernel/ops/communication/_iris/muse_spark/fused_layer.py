@@ -68,6 +68,7 @@ if current_platform().is_cdna4:
         ERROR_CALLER,
         ERROR_WORDS,
         FIRST_KERNEL_SITE,
+        SITE_ABORTED,
         fail_stop,
         poll_check,
         poll_pairs,
@@ -77,6 +78,7 @@ if current_platform().is_cdna4:
     )
 else:  # host-side sizes only
     ERROR_ABORT, ERROR_CALLER, ERROR_WORDS, FIRST_KERNEL_SITE = 32, 64, 128, 16
+    SITE_ABORTED = 3
 
 WORLD_SIZE = 8
 # Failure sites of the hop waits (fail_stop records them).
@@ -95,6 +97,7 @@ _SITE_FIN = gl.constexpr(SITE_FIN)
 _SITE_RED = gl.constexpr(SITE_RED)
 _SITE_H6_SUMS = gl.constexpr(SITE_H6_SUMS)
 _ERROR_ABORT = gl.constexpr(ERROR_ABORT)
+_SITE_ABORTED = gl.constexpr(SITE_ABORTED)
 _ERROR_CALLER = gl.constexpr(ERROR_CALLER)
 # Rows every area is sized for, whatever a launch's rows (8 or 16 today), so
 # an area's rows never shrink between launches (stale rows of a wider launch
@@ -683,25 +686,39 @@ def iris_fail_stop(launch, site, detail):
     """The fused layer's ``on_expiry``: stop every rank's waits, then record
     the failure and trap (fail_stop); never returns.
 
-    Callable from any subset of waves. Each calling wave stores the abort
-    marker ``(rank + 1) << 16 | site`` (the origin, for every rank's record)
-    into every rank's abort word, system scope; the addresses come from the
-    error words' caller lines that MuseNativeIrisState fills.
+    Callable from any subset of waves. A rank that failed on its own stores
+    the abort marker ``(rank + 1) << 16 | site`` into every rank's abort word
+    that is still zero (system-scope compare-and-swap, so the first origin
+    stays), and records its own site and detail. A rank stopped by a peer's
+    marker records ``SITE_ABORTED`` with the marker as the detail and leaves
+    the abort words alone, so every rank's record names the origin. The
+    peers' addresses come from the error words' caller lines that
+    MuseNativeIrisState fills.
     """
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     lane = gl.arange(0, 64 * gl.num_warps(), layout) % 64
+    seen = gl.load(launch.error_ptr + _ERROR_ABORT + lane * 0, cache_modifier=".cv")
+    origin = seen == 0
     table = launch.error_ptr.to(gl.pointer_type(gl.int64), bitcast=True)
-    peer = gl.load(table + _ERROR_CALLER // 2 + lane, mask=lane < 8, other=0)
+    peer = gl.load(table + _ERROR_CALLER // 2 + lane, mask=origin & (lane < 8), other=0)
     rank = gl.load(launch.error_ptr + _ERROR_CALLER + 16 + lane * 0)
     marker = ((rank + 1) << 16) | site
-    gl.atomic_store(
-        (peer + 4 * _ERROR_ABORT).to(gl.pointer_type(gl.int32)),
+    # Lanes with no peer (and every lane of a stopped rank) swap on this
+    # rank's own abort word instead: a no-op once it is set.
+    own = (launch.error_ptr + _ERROR_ABORT).to(gl.int64, bitcast=True)
+    target = gl.where(origin & (lane < 8), peer + 4 * _ERROR_ABORT, own)
+    gl.atomic_cas(
+        target.to(gl.pointer_type(gl.int32)),
+        gl.zeros_like(marker),
         marker,
-        mask=lane < 8,
         sem="relaxed",
         scope="sys",
     )
-    fail_stop(launch, site, detail)
+    # No cross-lane reduction here: the calling waves may be a subset.
+    if vote((seen != 0).to(gl.int32)):
+        fail_stop(launch, _SITE_ABORTED, seen)
+    else:
+        fail_stop(launch, site, detail)
 
 
 class MuseNativeIrisState:

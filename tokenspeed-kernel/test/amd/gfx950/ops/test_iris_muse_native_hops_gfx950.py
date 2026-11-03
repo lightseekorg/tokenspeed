@@ -238,7 +238,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  
     xn_wait,
 )
 from tokenspeed_kernel_amd._scheduling import wave_uniform_i32  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.persistent import Launch  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.persistent import Launch, vote  # noqa: E402
 
 _VIEW = {
     "heaps": ("i64",) * 8, "rank": "i32", "box": "*i32", "h1": "*bf16", "h1_sums": "*i64",
@@ -403,3 +403,32 @@ def test_h4_sink_moves_no_data_between_lanes():
     for loop in loops:
         assert "s_barrier" not in loop
         assert not re.search(r"\bds_(write|read|bpermute)", loop)
+
+
+@gluon.jit
+def _fail_stop_kernel(errors, flags, copy):
+    """iris_fail_stop called from the waves whose flag is set (a per-wave
+    poll's expiry), not from the whole workgroup."""
+    zero = gl.program_id(0) * 0
+    launch = Launch(
+        gl.program_id(0), zero, zero, copy.to(gl.int64) + 2, zero + 7, copy, zero,
+        errors, errors + 32, zero.to(gl.int64) + 1000, errors,
+    )  # fmt: skip
+    lane = gl.arange(0, 512, gl.BlockedLayout([1], [64], [8], [0]))
+    if vote(gl.load(flags + lane)):
+        iris_fail_stop(launch, 40, 7)
+
+
+def test_iris_fail_stop_runs_from_any_subset_of_waves():
+    """No workgroup barrier or LDS exchange on the failure path (the other
+    waves may never get there); the peers' abort words are swapped at system
+    scope before the trap."""
+    assembly = _compile(
+        _fail_stop_kernel, {"errors": "*i32", "flags": "*i32", "copy": "i32"}, {}
+    )
+    assert "s_barrier" not in assembly
+    assert not re.search(r"\bds_(write|read|bpermute)", assembly)
+    lines = instruction_lines(assembly)
+    trap = next(i for i, l in enumerate(lines) if l.startswith("s_trap"))
+    # On atomics, sc1 is the system scope (sc0 only asks for the old value).
+    assert any(re.match(r"global_atomic_cmpswap\w* .*\bsc1$", l) for l in lines[:trap])
