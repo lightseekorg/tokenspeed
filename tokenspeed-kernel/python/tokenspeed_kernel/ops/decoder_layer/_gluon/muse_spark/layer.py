@@ -87,6 +87,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
     xn_wait,
 )
 from tokenspeed_kernel.ops.decoder_layer import PlanKey
+from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import plan_variants
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import InputStrides
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionConfig,
@@ -201,8 +202,6 @@ QKV_TASK_ROWS = QKV_WIDTH // QKV_GROUPS
 HEAD_TASKS = Q_HEADS + KV_HEADS + Q_HEADS
 # Post-expert senders (UNP) per rank: 16 hidden columns each.
 UNP_COLUMNS = 16
-# Tail-role slots per XCD: OWN4 -> FIN -> HEAD (or BND2).
-TAIL_SLOTS = (0, 24, 25, 26, 27, 28, 29, 30)
 
 # Tagged K-part partials (router, pooler, QKV) keep 16 token slots per part
 # whatever the launch's rows: every slot is rewritten with the launch's tag
@@ -1766,12 +1765,7 @@ def gluon_decoder_layer_muse_spark_gfx950(
 # ---------------------------------------------------------------------------
 
 # Every plan variant (``PlanKey``) the leaf compiles.
-PLAN_VARIANTS = tuple(
-    PlanKey(requests, layer_kind, next_kind)
-    for requests in (1, 2)
-    for layer_kind in ("sliding", "full")
-    for next_kind in ("sliding", "full", "regular")
-)
+PLAN_VARIANTS = plan_variants()
 
 _NEXT_KINDS = {"sliding": 0, "full": 1, "regular": 2}
 
