@@ -253,6 +253,34 @@ GEMM's, with its program ids offset by `P`. Neither half waits on the other.
 The split-K router reads 32 KB of activations per program, where a GEMV
 program reads all of them, so both weight streams finish together.
 
+### gfx950 K-split BF16 decode GEMV task bodies
+
+`gemm/fp16/gemv_splitk.py` holds the K-split GEMV as device functions that a
+persistent kernel calls with explicit task ids, plus a standalone launcher
+(`launch_gluon_gemv_a16w16_splitk_gfx950`) for tests and benchmarks.
+
+#### Contract
+
+- `x` `[M, K]` BF16 with `1 <= M <= 16`, `weight` `[N, K]` contiguous BF16,
+  `N` a multiple of 16 * 16 and `K` of 16 * 8 * 32. Task `t` owns weight rows
+  of group `t % GROUPS` and K slice `t // GROUPS` (16 x 16 tasks).
+- `gemv_a16w16_splitk_weights_gfx950` issues a task's weight loads;
+  `gemv_a16w16_splitk_finish_gfx950` multiplies and stores one 64-bit word
+  per (part, token, row): FP32 value bits low, the caller's `tag` high, one
+  store. Tags must change between uses of the partial buffer.
+- `gemv_a16w16_splitk_sum_gfx950` waits for the tagged words at the caller's
+  offsets (one vote per wave per retry, no barrier) and sums them in part
+  order, stopping at a `Launch` deadline through the caller's `on_expiry`.
+- Results are deterministic but not bit-equal to a full-K GEMV.
+
+#### Algorithm
+
+Weights and the task's x slice load straight into the 16x16x32 MFMA operand
+layouts, so nothing passes through LDS before the MFMAs. A task reads only
+its K slice of x, which keeps the GEMV flat in N at 8-16 rows where a full-K
+GEMV rereads all of x per program. The eight waves' accumulators meet in LDS
+behind one barrier.
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
