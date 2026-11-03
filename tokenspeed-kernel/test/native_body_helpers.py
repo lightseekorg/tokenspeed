@@ -34,10 +34,18 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
     AttentionProgram,
     mha_decode_sliding_split_gfx950,
 )
+from tokenspeed_kernel_amd.ops.gfx950.attention.prologue.gqa import (
+    gqa_prologue_key_gfx950,
+    gqa_prologue_query_gfx950,
+    gqa_prologue_rope_gfx950,
+    gqa_prologue_rows_layout,
+    gqa_prologue_value_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv_splitk import (
     gemv_a16w16_splitk_finish_x_gfx950,
     gemv_a16w16_splitk_hi_lo_sums_gfx950,
     gemv_a16w16_splitk_publish_gfx950,
+    gemv_a16w16_splitk_sum_gfx950,
     gemv_a16w16_splitk_wave_sums_gfx950,
     gemv_a16w16_splitk_weights_gfx950,
     gemv_a16w16_splitk_weights_paced_gfx950,
@@ -429,3 +437,114 @@ def qkv_task_kernel(
     gemv_a16w16_splitk_finish_x_gfx950(
         tiles, x.to(gl.bfloat16), part_ptr, tag, task, M, N, ROWS, 16, ".wt"
     )
+
+
+@gluon.jit
+def _head_rows(
+    part_ptr, tag, column0, launch, M, N: gl.constexpr, HEAD_DIM: gl.constexpr
+):
+    """One head's 16 x HEAD_DIM rows from the QKV tasks' 16 K-part partials,
+    summed in part order and rounded once to BF16 (as FP32), in the
+    prologue's rows layout."""
+    rows_l: gl.constexpr = gqa_prologue_rows_layout(gl.num_warps())
+    flat_l: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    index = gl.arange(0, 16 * HEAD_DIM, flat_l)
+    token = index // HEAD_DIM
+    sums = gemv_a16w16_splitk_sum_gfx950(
+        part_ptr,
+        tag,
+        token * N + column0 + index % HEAD_DIM,
+        token < M,
+        M,
+        N,
+        16,
+        launch,
+        fail_stop,
+        _RECORD_SITE,
+    )
+    rows = gl.reshape(sums.to(gl.bfloat16).to(gl.float32), [16, HEAD_DIM])
+    return gl.convert_layout(rows, rows_l)
+
+
+@gluon.jit
+def head_task_kernel(
+    part_ptr,
+    q_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    slots_ptr,
+    error_ptr,
+    tag,
+    deadline_ticks,
+    M,
+    NUM_Q_HEADS: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+):
+    """The native layer's HEAD tasks: program h < NUM_Q_HEADS + NUM_KV_HEADS
+    sums its head's QKV partials (the K-split task's tagged words) and runs
+    the GQA prologue on them in registers (FP8 query, FP8 cache)."""
+    N: gl.constexpr = (
+        NUM_Q_HEADS + 2 * NUM_KV_HEADS
+    ) * HEAD_DIM + NUM_Q_HEADS * HEAD_DIM
+    head = gl.program_id(0)
+    launch = test_launch(error_ptr, tag, deadline_ticks)
+    rows_l: gl.constexpr = gqa_prologue_rows_layout(gl.num_warps())
+    tokens = gl.arange(0, 16, gl.SliceLayout(1, rows_l)).to(gl.int64)
+    row_mask = tokens < M
+    # Operands first: they do not wait on the partials.
+    cos, sin = gqa_prologue_rope_gfx950(
+        cos_sin_ptr, HEAD_DIM, positions_ptr, tokens, row_mask, HEAD_DIM // 2
+    )
+    slot = gl.load(slots_ptr + tokens, mask=row_mask, other=0).to(gl.int64)
+    if head < NUM_Q_HEADS:
+        rows = _head_rows(part_ptr, tag, head * HEAD_DIM, launch, M, N, HEAD_DIM)
+        gqa_prologue_query_gfx950(
+            rows,
+            q_out_ptr + tokens * (NUM_Q_HEADS * HEAD_DIM) + head * HEAD_DIM,
+            q_weight_ptr,
+            cos,
+            sin,
+            row_mask,
+            True,
+            1e-6,
+            0.0,
+        )
+    else:
+        kv = head - NUM_Q_HEADS
+        k_rows = _head_rows(
+            part_ptr, tag, (NUM_Q_HEADS + kv) * HEAD_DIM, launch, M, N, HEAD_DIM
+        )
+        gqa_prologue_key_gfx950(
+            k_rows,
+            k_cache_ptr + (slot * NUM_KV_HEADS + kv) * HEAD_DIM,
+            k_weight_ptr,
+            cos,
+            sin,
+            row_mask,
+            1.0,
+            True,
+            1e-6,
+            0.0,
+            False,
+        )
+        v_rows = _head_rows(
+            part_ptr,
+            tag,
+            (NUM_Q_HEADS + NUM_KV_HEADS + kv) * HEAD_DIM,
+            launch,
+            M,
+            N,
+            HEAD_DIM,
+        )
+        gqa_prologue_value_gfx950(
+            v_rows,
+            v_cache_ptr + (slot * NUM_KV_HEADS + kv) * HEAD_DIM,
+            row_mask,
+            1.0,
+            False,
+        )

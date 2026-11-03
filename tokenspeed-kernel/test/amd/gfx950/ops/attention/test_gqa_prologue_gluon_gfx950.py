@@ -160,3 +160,59 @@ def test_gluon_declines_what_it_does_not_implement(change):
     traits.update(change)
     with pytest.raises((NoKernelFoundError, ValueError)):
         _select("gqa_prologue", BF16, tuple(traits.items()), "gluon", None)
+
+
+@pytest.mark.parametrize("rows", [8, 16])
+def test_head_tasks_on_summed_partials_write_the_triton_bytes(rows):
+    """The fused layer's HEAD tasks sum the QKV task's 16 K-part partials in
+    part order, round once to BF16 and run the prologue in registers: the
+    bytes equal the Triton prologue's on those BF16 rows."""
+    from native_body_helpers import head_task_kernel
+    from tokenspeed_kernel_amd.ops.gfx950.persistent import (
+        ERROR_WORDS,
+        persistent_compile_options,
+    )
+
+    hq, hkv, dim, total, tag = 16, 2, 64, 64, 11
+    n = (hq + 2 * hkv) * dim + hq * dim  # q | k | v | gate
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    partials = torch.randn(16, rows, n, device="cuda", generator=g)
+    words = (torch.full_like(partials, 0).to(torch.int64) + tag) << 32
+    words |= partials.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    summed = partials[0].clone()
+    for part in range(1, 16):
+        summed += partials[part]
+    qkvg = summed.to(BF16)
+    norm = head_norm(dim, 0.0, seed=20)
+    rotary = _rotary(True, rows, dim, seed=21)
+    out_slots = slots(rows, total, seed=22)
+
+    def cache():
+        return tuple(
+            torch.full((total, hkv, dim), 0x7F, dtype=torch.uint8, device="cuda").view(
+                torch.float8_e4m3fn
+            )
+            for _ in range(2)
+        )
+
+    k_ref, v_ref = cache()
+    expected = gqa_prologue(
+        qkvg[:, : hq * dim], qkvg[:, hq * dim : (hq + hkv) * dim],
+        qkvg[:, (hq + hkv) * dim : (hq + 2 * hkv) * dim], norm=norm, rotary=rotary,
+        cache=HeadKVCache(k_ref, v_ref, None, out_slots),
+        query_dtype=torch.float8_e4m3fn, return_kv=False, solution="triton",
+        override=None,
+    )  # fmt: skip
+    k_cache, v_cache = cache()
+    query = torch.empty(rows, hq * dim, dtype=torch.float8_e4m3fn, device="cuda")
+    errors = torch.zeros(ERROR_WORDS, dtype=torch.int32, device="cuda")
+    head_task_kernel[(hq + hkv,)](
+        words.reshape(-1), query, norm.q_weight, norm.k_weight,
+        rotary.cos_sin_cache, rotary.positions, k_cache, v_cache, out_slots,
+        errors, tag, 2_000_000_000, rows, NUM_Q_HEADS=hq, NUM_KV_HEADS=hkv,
+        HEAD_DIM=dim, num_warps=8, **persistent_compile_options(),
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    assert int(errors.abs().sum()) == 0
+    assert bytes_equal(query, expected.q)
+    assert bytes_equal(k_cache, k_ref) and bytes_equal(v_cache, v_ref)

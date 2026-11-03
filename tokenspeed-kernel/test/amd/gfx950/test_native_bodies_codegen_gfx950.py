@@ -38,6 +38,7 @@ pytest.importorskip("tokenspeed_kernel_amd")
 from asm_checks import instruction_lines  # noqa: E402
 from native_body_helpers import (  # noqa: E402
     compile_gfx950,
+    head_task_kernel,
     kpart_pooler_kernel,
     kpart_router_kernel,
     qkv_task_kernel,
@@ -284,3 +285,41 @@ def test_qkv_task_paces_its_weights_and_fits(window: int):
     else:
         # Before each tile past the window: wait until (window - 1) tiles remain.
         assert waits == [f"s_waitcnt vmcnt({2 * (window - 1)})"] * (9 - window), waits
+
+
+def test_head_task_prologue_runs_on_summed_partials():
+    """A HEAD task sums its head's 16 K-part partials (tag-polled 64-bit
+    words) and runs the GQA prologue on the rows in registers: no store and
+    reload of the rows, no scratch."""
+    assembly = compile_gfx950(
+        head_task_kernel,
+        {
+            "part_ptr": "*i64",
+            "q_out_ptr": "*fp8e4nv",
+            "q_weight_ptr": "*bf16",
+            "k_weight_ptr": "*bf16",
+            "cos_sin_ptr": "*fp32",
+            "positions_ptr": "*i64",
+            "k_cache_ptr": "*fp8e4nv",
+            "v_cache_ptr": "*fp8e4nv",
+            "slots_ptr": "*i64",
+            "error_ptr": "*i32",
+            "tag": "i32",
+            "deadline_ticks": "i64",
+            "M": "i32",
+        },
+        dict(NUM_Q_HEADS=16, NUM_KV_HEADS=2, HEAD_DIM=64),
+        num_warps=8,
+        **persistent_compile_options(),
+    ).asm["amdgcn"]
+    assert _metadata(assembly, "private_segment_fixed_size") == 0
+    code = instruction_lines(assembly)
+    # The rows never go through memory: the only multi-dword stores would be
+    # rows of the summed head; the prologue writes FP8 bytes.
+    assert not [
+        line
+        for line in code
+        if line.startswith(("global_store_dwordx", "buffer_store_dwordx"))
+    ]
+    polls = [line for line in code if line.startswith("buffer_load_dwordx2")]
+    assert polls and all(line.endswith("sc0 sc1") for line in polls), polls[:4]
