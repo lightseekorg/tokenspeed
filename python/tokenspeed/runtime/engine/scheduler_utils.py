@@ -127,6 +127,8 @@ def make_config(
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
     max_kv_page_num: int = 0,
+    checkpoint_retention_requests: int | None = None,
+    checkpoint_retention_leaf_distance: int | None = None,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -182,6 +184,16 @@ def make_config(
             ``ceil((cached prefix + current chunk) / prefix_granularity)``
             across requests. 0 leaves the budget unbounded. Derived from
             ``--chunk-prefill-kv-size``.
+        checkpoint_retention_requests: ``--checkpoint-retention-requests``:
+            under cache pressure a hybrid model's State checkpoint that a later
+            request's checkpoint extends ranks as if last used this many new
+            requests ago (0 ranks every cache entry by its own use). None keeps the
+            scheduler's default, 16 times ``max_batch_size``, which is
+            ``--max-num-seqs`` per attention-DP rank.
+        checkpoint_retention_leaf_distance:
+            ``--checkpoint-retention-leaf-distance``: checkpoints within this
+            many later requests of the newest on their branch rank as it does. None keeps the
+            scheduler's default, 0.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -229,6 +241,12 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if checkpoint_retention_requests is not None:
+        # Set only when given, as above: an older scheduler wheel keeps its
+        # plain LRU by default and refuses an explicit value.
+        cfg.checkpoint_retention_requests = checkpoint_retention_requests
+    if checkpoint_retention_leaf_distance is not None:
+        cfg.checkpoint_retention_leaf_distance = checkpoint_retention_leaf_distance
     cfg.disable_l2_cache = disable_l2_cache
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 

@@ -369,6 +369,7 @@ impl HostConfig {
             limits: IngressLimits {
                 vocab_size: config.getattr("vocab_size")?.extract()?,
                 eos_token_ids: config.getattr("eos_token_ids")?.extract()?,
+                top_k_exclusive_max: config.getattr("top_k_exclusive_max")?.extract()?,
                 max_model_len: config.getattr("max_model_len")?.extract()?,
                 max_req_input_len: config.getattr("max_req_input_len")?.extract()?,
                 enable_output_logprobs: config

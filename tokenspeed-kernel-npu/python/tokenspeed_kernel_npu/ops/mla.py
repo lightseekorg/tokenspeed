@@ -26,6 +26,7 @@ import math
 
 import torch
 import torch_npu
+from tokenspeed_kernel_npu.ops._mla_varlen import set_empty_attention_rows
 from tokenspeed_kernel_npu.ops.mla_packed import (
     packed_mla_decode_op,
     packed_mla_prefill_op,
@@ -140,9 +141,13 @@ def mla_prefill(
         sparse_mode=3 if is_causal else 0,
         softmax_lse_flag=return_lse,
     )
+    lse = _lse(lse, q.shape[0], q.shape[1]) if return_lse else lse
+    set_empty_attention_rows(
+        output, lse if return_lse else None, cu_seqlens_q, cu_seqlens_kv
+    )
     return _result(
         output,
-        _lse(lse, q.shape[0], q.shape[1]) if return_lse else lse,
+        lse,
         return_lse=return_lse,
         out=out,
     )

@@ -47,6 +47,12 @@ enum class CacheBoundaryKind { kChunk, kEndpoint };
 // The tiers a prefix cache entry lives on: Device L1 and Host L2.
 enum class CacheTier { kDevice, kHost };
 
+// The most new-request admissions an aged State checkpoint may rank behind
+// (SchedulerConfig::checkpoint_retention_requests).
+inline constexpr std::int64_t kMaxCheckpointRetentionRequests{std::int64_t{1} << 20};
+// Checkpoint distances from here on rank alike (CheckpointTree).
+inline constexpr std::int32_t kMaxCheckpointDistance{5};
+
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -199,6 +205,8 @@ struct TailPublication {
 // range, a tail, or a state checkpoint. The request owns the storage behind
 // the spans.
 struct CompletedPages {
+    // The completed tokens, which order checkpoints inside a page.
+    std::span<const std::int32_t> tokens{};
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
     // The partial page at this publication point, absent when the point is

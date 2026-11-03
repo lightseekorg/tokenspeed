@@ -58,7 +58,8 @@ CacheCoordinator MakeTwoGroup(BlockPool& pool) {
     };
     return MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                            /*snapshot_pool=*/nullptr,
-                           /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+                           /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                           /*checkpoint_retention_requests=*/0);
 }
 
 TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
@@ -96,10 +97,10 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     // r1: 8 tokens -> 4 pages/group; freed blocks keep their hashes (prefix-hittable).
     std::vector<std::string> hashes8(4);
     for (std::size_t i = 0; i < hashes8.size(); ++i) {
@@ -310,10 +311,10 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                        /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // 8 tokens -> 4 full pages; pages 0-1 registered at prefill time.
@@ -510,6 +511,27 @@ TEST(SchedulerConfigValidateTest, HostPackingIsExplicitAndMayDifferFromDevicePac
     EXPECT_THROW(config.Validate(), std::invalid_argument);
     config.host_group_packing = {6};
     EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, CheckpointRetentionStaysInRange) {
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int64_t requests : {std::int64_t{0}, kMaxCheckpointRetentionRequests}) {
+        config.checkpoint_retention_requests = requests;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+    }
+    for (const std::int64_t requests : {std::int64_t{-1}, kMaxCheckpointRetentionRequests + 1}) {
+        config.checkpoint_retention_requests = requests;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+    }
+    config.checkpoint_retention_requests.reset();
+    for (const std::int32_t leaf_distance : {0, kMaxCheckpointDistance - 1}) {
+        config.checkpoint_retention_leaf_distance = leaf_distance;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+    }
+    for (const std::int32_t leaf_distance : {-1, kMaxCheckpointDistance}) {
+        config.checkpoint_retention_leaf_distance = leaf_distance;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+    }
 }
 
 TEST(SchedulerConfigValidateTest, RejectsNonPositiveGlobalP) {
@@ -970,7 +992,7 @@ TEST(BlockTablePageIdsExport, ChildSlotsWithinOneParentHaveDistinctKernelPageIds
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -1050,7 +1072,7 @@ TEST(BlockTablePageIdsExport, ResolvesEachGroupsPackingRecipe) {
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
                         /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false);
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 

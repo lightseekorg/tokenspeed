@@ -1066,6 +1066,31 @@ Its responsibilities:
   model regenerates from re-fed tokens, not a function of the prefix alone.
   Retention (`ExpiredBlocksAt`/`ReclaimExpired`) still slides their
   request-private pages out.
+* **Checkpoint retention.** A request resumes from the newest checkpoint on
+  its path, so a State checkpoint a later request's checkpoint extends
+  serves only a retry or a new fork. `CheckpointTree` orders the checkpoints
+  every State group holds on either tier by token prefix, including
+  checkpoints inside a page, and keeps each one's distance to the nearest
+  leaf below it. Distance counts the later requests whose checkpoints lie
+  on the way, capped at 5: the checkpoints one request publishes (its
+  in-forward checkpoint, prompt end and end state) are no step apart, so
+  they rank level until a later turn extends them. A checkpoint more than
+  K = `SchedulerConfig::checkpoint_retention_leaf_distance` (default 0; 1
+  also keeps the previous turn's checkpoints) from that leaf is aged. With N =
+  `SchedulerConfig::checkpoint_retention_requests` (default 16 ×
+  `--max-num-seqs` per attention-DP rank, the scheduler's `max_batch_size`; 0
+  is plain LRU), an aged checkpoint used within the last N
+  new-request admissions ranks as if last used at the oldest of them, the
+  larger distance first: it leaves before every entry used since, while
+  entries unused for longer, such as an abandoned session, leave first. N
+  counts admissions, not epochs, because Host publication advances the access
+  epoch too. A junction, with checkpoints on two or more branches below it,
+  has been resumed from more than once (a shared prompt) and keeps its own
+  rank, as does a checkpoint the plan's own victims bring within K of a leaf.
+  Ranks change no checkpoint's
+  validity and reserve no capacity. `CheckpointResumeGaps` counts the
+  admissions between a resumed checkpoint's last use and its resume, from
+  which N is chosen.
 * **Two tiers (Device/Host).** What feeds the Host tier from ordinary
   Device prefix entries is an explicit cache policy,
   `SchedulerConfig::host_write_policy`: `Validate` requires it with a Host
@@ -1079,7 +1104,8 @@ Its responsibilities:
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
   alongside Host-side acquire/contains/pin queries. Host L2 uses free
   capacity first, then the same `CacheEvictionPlan` as Device admission:
-  access epoch first, then boundary tier and logical position, followed by
+  access epoch first (an aged checkpoint at its retention rank, above),
+  then boundary tier and logical position, followed by
   group and physical location. Equal-age prefix pages leave from the suffix;
   unproven chunk boundaries leave before established boundaries and prefix
   pages. The plan tries victims against shadow occupancy until the accepted
@@ -1188,7 +1214,8 @@ Its responsibilities:
   including when the Device KV is no longer held by a request. Held Device
   copies go first, then unheld copies; within each class newer Device copies
   go first to reduce repeated write-back. Host-only State retains its own LRU
-  order once the usable duplicate capacity is exhausted.
+  order, with the retention rank, once the usable duplicate capacity is
+  exhausted.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
   The boundary tree maintains the nodes with settled closed-group duplicates
@@ -1428,8 +1455,8 @@ request reclaim. The groups' unread epochs are merged by access time before
 inspecting block owners: a newer epoch, even if every entry is pinned, is not
 scanned to select an older candidate from another group. Complete equal epochs
 still participate in every policy tie-break. Selection compares the next candidate from each group with
-the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
+the next request-reclaimable candidate using one policy: LRU access epoch (a
+aged State checkpoint at its retention rank), then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Each candidate expands into a
 *victim set* that is selected, restored and evicted whole. Finally, walk the
 selected sets in reverse and restore every set that is not strictly required,
@@ -1453,7 +1480,9 @@ L2: the segment plan (`AcquireHostSegments`) and the boundary plan
 capacity, selection until demand fits, and reverse minimization between
 Device admission and both Host block-placement entry points. Its
 `CacheEvictionCandidates` cursor reads only the access epochs needed, with
-the same boundary-tier/position ordering on both tiers. The caller defines
+the same boundary-tier/position ordering on both tiers; the aged
+checkpoints at the retention cutoff come from `CheckpointTree`, one distance
+at a time. The caller defines
 which blocks leave together: Device segments and request releases, or Host
 State cascades. Host segment write-back retains its copy-aware ordering and
 cross-tier checkpoint dependencies; its fallback boundary placement uses the
@@ -2156,15 +2185,23 @@ including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
 Side-stream allocations retain their own workspace owner through execution,
 separate from scratch that main-stream operations can overwrite.
-Ascend native Prefill keeps receive, send, packed history, and commit slots in
-disjoint views of a backend-owned `WorkspacePool`, allocated on first Prefill
-use and reused thereafter. Cache binding carries only the bounded configuration;
-cache capacity planning does not reserve this runtime allocation. Without
-native pool options, the backend retains its ordinary collective path and
-creates no native transport.
-Native Prefill requires an explicit `chunk_prefill_kv_size`: its page limit is
-the scheduler's rounded batch budget, and exceeding it raises before transport.
-The null page and alignment are physical overhead, not additional batch capacity.
+Ascend DSA/MLA Prefill gathers only the batch's referenced cache pages into
+compact temporary buffers. History and current rows have separate readiness;
+DSA packs KV and Indexer-K together in each phase. Persistent cache planes stay
+separate. The batch page table defines receive addresses and owner writeback.
+`chunk_prefill_kv_size` is only the scheduler's admission budget: omitting it
+never selects a different Prefill implementation.
+
+A model may submit history gathering at the first preceding KDA layer. The
+attention entry ensures the same batch/layer history exists before consumption.
+An active gather owns its tensors through the final queued read; another batch
+or layer cannot reuse those tensors. Gather, copies, commit, and consumers use
+one fixed execution stream. Synchronous HCCL submissions join their internal
+stream onto it; allocator stream tracking protects temporary storage through
+queued consumers. Finish releases references, and shutdown drains execution
+before destroying the communicator. Only one layer's receive buffers are live;
+allocation follows actual referenced pages and current rows, not cache capacity.
+The null page and receive alignment are physical overhead.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 

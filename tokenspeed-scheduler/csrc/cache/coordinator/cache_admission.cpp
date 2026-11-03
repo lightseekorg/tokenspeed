@@ -705,7 +705,8 @@ private:
     }
 
     void collectCandidates() {
-        eviction_plan_.StartCandidates(&protected_locations_, &request_reclaim_locations_);
+        eviction_plan_.StartCandidates(&protected_locations_, &request_reclaim_locations_,
+                                       coordinator_.CheckpointAgingFor(CacheTier::kDevice));
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::vector<CacheBlockLocation> hits = groups_[i].Index().MatchedLocations(
                 pool_, (*prefix_.group_keys)[i], /*begin_blocks=*/0, prefix_.device.per_group[i]);
@@ -1051,6 +1052,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const std::int32_t kv_tokens = std::max(plan.prefix.device.kv_tokens, plan.prefix.host.kv_tokens);
     const bool state_prefix_cached = plan.prefix.state_at_prompt_end.has_value();
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
+    if (!request_access_epoch.has_value()) {
+        recordAdmission(access_epoch);
+    }
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,
@@ -1180,6 +1184,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         // A model without a prefix-closed group may register nothing under
         // the deepest boundary linked (a chunk end of State groups alone).
         syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+        recordCheckpoints(completed, access_epoch);
         recordPublishedTail(completed);
     }
     for (const auto& [group_id, location, reason, segment] : prospective_victims) {

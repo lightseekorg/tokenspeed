@@ -180,6 +180,15 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     if (max_batch_size < 0) {
         throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
     }
+    if (checkpoint_retention_requests &&
+        (*checkpoint_retention_requests < 0 || *checkpoint_retention_requests > kMaxCheckpointRetentionRequests)) {
+        throw std::invalid_argument("Scheduler: checkpoint_retention_requests must be in [0, " +
+                                    std::to_string(kMaxCheckpointRetentionRequests) + "]");
+    }
+    if (checkpoint_retention_leaf_distance < 0 || checkpoint_retention_leaf_distance >= kMaxCheckpointDistance) {
+        throw std::invalid_argument("Scheduler: checkpoint_retention_leaf_distance must be in [0, " +
+                                    std::to_string(kMaxCheckpointDistance - 1) + "]");
+    }
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
     }
