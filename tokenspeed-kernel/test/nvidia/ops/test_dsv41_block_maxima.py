@@ -29,6 +29,9 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     block_maxima,
     clean_logits,
     clean_logits_for_selection,
+    finish_selection,
+    prepare_native_block_scores,
+    prepare_scores,
 )
 from utils import assert_no_triton_compile
 
@@ -236,8 +239,18 @@ def test_clean_logits_bf16_prefixes(cleaner):
     table[:, 2] = -1
     table[:, 4] = pages
 
-    actual = cleaner(values, lengths, table, pages, width, 64)
+    alignment = 16 if cleaner is clean_logits_for_selection else 1
+    if cleaner is clean_logits_for_selection:
+        actual = cleaner(values, lengths, table, pages, width, 64, alignment)
+    else:
+        actual = cleaner(values, lengths, table, pages, width, 64)
     assert actual.dtype == values.dtype
+    expected_width = (
+        (width + alignment - 1) // alignment * alignment
+        if cleaner is clean_logits_for_selection
+        else width
+    )
+    assert actual.shape == (4, expected_width)
 
     expected = values.float().clone()
     for row, length in enumerate(lengths.cpu().tolist()):
@@ -265,6 +278,13 @@ def test_clean_logits_bf16_prefixes(cleaner):
             atol=0,
             rtol=0,
             equal_nan=True,
+        )
+    if cleaner is clean_logits_for_selection:
+        torch.testing.assert_close(
+            actual[3, width:].float(),
+            torch.full_like(actual[3, width:], -float("inf"), dtype=torch.float32),
+            atol=0,
+            rtol=0,
         )
 
 
@@ -364,3 +384,95 @@ def test_clean_block_capacity_does_not_recompile():
     with assert_no_triton_compile(_clean_block_maxima_kernel):
         for rows, width in ((1, 2048), (17, 2049), (3, 16385), (6, 1048640)):
             run(rows, width)
+
+
+@pytest.mark.parametrize("width", [35, 32769])
+def test_native_block_scores_are_aligned_and_pin_newest(width):
+    block_size, alignment = 8, 16
+    logits = torch.randn((4, width), device="cuda")
+    lengths = torch.tensor([0, 9, 17, width], dtype=torch.int32, device="cuda")
+    logits[1, :8] = float("nan")
+    logits[2, 0] = float("nan")
+    logits[1, 8] = 0
+    logits[3, width - 1] = float("inf")
+    logits[3, 24:32] = -1000
+
+    actual, ends = prepare_native_block_scores(logits, lengths, block_size, alignment)
+    columns = torch.arange(width, device="cuda")[None, :]
+    reference = torch_dsv41_block_maxima(
+        logits.masked_fill(columns >= lengths[:, None], -torch.inf), lengths
+    )
+    expected = torch.full_like(actual, -torch.inf)
+    expected[:, : reference.shape[1]] = reference
+    expected_ends = (lengths.clamp(0, width) + block_size - 1) // block_size
+    assert actual.shape == (4, ((width + 7) // 8 + 15) // 16 * 16)
+    torch.testing.assert_close(ends, expected_ends, rtol=0, atol=0)
+    for row, end in enumerate(ends.tolist()):
+        initialized = min(
+            actual.shape[1], (end + alignment - 1) // alignment * alignment
+        )
+        torch.testing.assert_close(
+            actual[row, :initialized],
+            expected[row, :initialized],
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+
+def test_native_block_scores_graph_replay_refreshes_partial_rows():
+    block_size, alignment = 8, 16
+    logits = torch.randn((3, 35), device="cuda")
+    lengths = torch.tensor([0, 9, 17], dtype=torch.int32, device="cuda")
+    columns = torch.arange(logits.shape[1], device="cuda")[None, :]
+    logits.masked_fill_(columns >= lengths[:, None], float("nan"))
+    prepare_native_block_scores(logits, lengths, block_size, alignment)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = prepare_native_block_scores(logits, lengths, block_size, alignment)
+
+    for visible in ([35, 0, 1], [8, 17, 33], [0, 9, 35]):
+        lengths.copy_(torch.tensor(visible, dtype=torch.int32, device="cuda"))
+        logits.normal_()
+        logits.masked_fill_(columns >= lengths[:, None], float("nan"))
+        for output in actual:
+            output.fill_(123456)
+        graph.replay()
+
+        expected, expected_ends = prepare_scores(
+            logits, lengths, block_size, alignment, True
+        )
+        torch.testing.assert_close(actual[1], expected_ends, rtol=0, atol=0)
+        for row, end in enumerate(actual[1].tolist()):
+            initialized = min(
+                actual[0].shape[1],
+                (end + alignment - 1) // alignment * alignment,
+            )
+            torch.testing.assert_close(
+                actual[0][row, :initialized],
+                expected[row, :initialized],
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+            )
+
+
+def test_native_block_scores_width_changes_do_not_recompile():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import _reduce_blocks
+
+    def run(width):
+        values = torch.randn((3, width), dtype=torch.float32, device="cuda")
+        ends = torch.tensor([0, 9, width], dtype=torch.int32, device="cuda")
+        actual, counts = prepare_native_block_scores(values, ends, 8, 16)
+        expected, expected_counts = prepare_scores(values, ends, 8, 16, True)
+        torch.testing.assert_close(counts, expected_counts, rtol=0, atol=0)
+        for row, count in enumerate(counts.tolist()):
+            initialized = (count + 15) // 16 * 16
+            torch.testing.assert_close(
+                actual[row, :initialized], expected[row, :initialized], rtol=0, atol=0
+            )
+
+    run(35)
+    with assert_no_triton_compile(_reduce_blocks):
+        for width in (1025, 32769, 65537):
+            run(width)

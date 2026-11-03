@@ -1687,7 +1687,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     source_table,
                     tile_table,
                     visible,
-                    dsv41.new_index_metadata(tile_table, visible),
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        scoring_requests[start:stop].to(torch.int32).contiguous(),
+                    ),
                 )
             else:
                 geometry = self._selection_geometry(
@@ -2569,7 +2573,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 source_table,
                 tile_table,
                 visible,
-                dsv41.new_index_metadata(tile_table, visible) if cacheable else None,
+                (
+                    dsv41.new_index_metadata(
+                        tile_table,
+                        visible,
+                        requests[start:stop].to(torch.int32).contiguous(),
+                    )
+                    if cacheable
+                    else None
+                ),
             )
             if cacheable:
                 self._index_geometry[key] = geometry
