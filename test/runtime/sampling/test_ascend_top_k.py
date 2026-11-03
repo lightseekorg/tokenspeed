@@ -104,3 +104,56 @@ def test_finite_top_k_cap_and_disabled_survive_graph_replay(top_p):
     prepare(requested[::-1], 1)
     graph.replay()
     check(captured, expected[::-1])
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_sampling_with_nan_detection_is_graph_safe(verify):
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.ascend_full import (
+        AscendFullSamplingBackend,
+    )
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    vocab = 8192
+    backend = AscendFullSamplingBackend(
+        SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=False,
+            sampling_stream="batch",
+            logprob_order="torch",
+            max_bs=1,
+            max_req_pool_size=1,
+            vocab_size=vocab,
+            device="npu",
+            enable_nan_detection=True,
+            enable_output_logprobs=True,
+            enable_tp_sync=False,
+        )
+    )
+    backend.prepare_step(
+        ["graph-safe"],
+        [1],
+        [SamplingParams(temperature=1, top_k=4097, seed=73)],
+        num_tokens_per_req=1,
+    )
+    info = SamplingBatchInfo(req_pool_indices=torch.tensor([1], device="npu"))
+    output = LogitsProcessorOutput(
+        next_token_logits=torch.linspace(-2, 2, vocab, device="npu").reshape(1, -1)
+    )
+    candidates = torch.zeros((1, 1), dtype=torch.int32, device="npu")
+
+    def run():
+        if verify:
+            return backend.verify(output, info, candidates, tree=None)
+        return backend.sample(output, info)
+
+    run()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        tokens, lengths = run()
+    graph.replay()
+    assert vocab - 4096 <= tokens.cpu().item() < vocab
+    assert lengths.cpu().tolist() == [1]
+    assert torch.isfinite(output.next_token_logprobs.cpu()).all()

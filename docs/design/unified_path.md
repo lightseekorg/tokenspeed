@@ -967,6 +967,10 @@ finite values and caps them at 4096 when populating its per-request scalar
 pool, before the int32 write. The normalized disabled sentinel (`top_k=-1`)
 keeps whole-vocabulary sampling. The captured graph reads that same pool
 for single-step sampling and chain verification.
+Ascend sampling consumes the logits already audited and sanitized by the
+executor's `NanGuard`; it does not repeat a host-side NaN truth test inside
+the captured graph. Per-request numerical error flags keep their existing
+executor and output-processor path.
 
 Synthetic acceptance length shares executor scheduling, logit processing,
 persistent output buffers and downstream state updates with ordinary

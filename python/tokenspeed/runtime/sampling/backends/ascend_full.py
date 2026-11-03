@@ -44,7 +44,7 @@ from tokenspeed.runtime.sampling.backends.full_base import FullSamplingBackendBa
 from tokenspeed.runtime.sampling.dp_sampling_config import slice_dp_vocab_mask
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _TOP_K_DISABLED
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -168,9 +168,9 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        ).float()
+        # The executor's NanGuard audits and sanitizes these logits before
+        # sampling. A second host-side tensor truth test cannot be captured.
+        logits = logits_output.next_token_logits.float()
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
                 logits=logits, vocab_mask=sampling_info.vocab_mask
@@ -290,9 +290,7 @@ class AscendFullSamplingBackend(FullSamplingBackendBase):
             accept_length_local = self._accept_length_buf[:local_bs]
 
         accept_index_local.fill_(-1)
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        ).float()
+        logits = logits_output.next_token_logits.float()
         expected_rows = local_bs * num_tokens_per_req
         if logits.shape[0] != expected_rows:
             raise RuntimeError(
