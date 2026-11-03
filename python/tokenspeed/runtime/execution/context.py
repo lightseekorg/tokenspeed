@@ -34,7 +34,6 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.confidence_graph import ConfidenceDecodeGraphs
     from tokenspeed.runtime.execution.dspark_context import (
         DSparkContextProducer,
     )
@@ -158,8 +157,6 @@ class ForwardContext:
     verify_queries: VerifyQueryLayout | None = None
     # The sampler's score rows; None retains maximum-window logits.
     logits_queries: VerifyQueryLayout | None = None
-    # Decode stage execution; target shapes depend on Q, draft shapes on B.
-    decode_graphs: ConfidenceDecodeGraphs | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None

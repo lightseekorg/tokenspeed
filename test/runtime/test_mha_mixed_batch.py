@@ -395,7 +395,6 @@ def _block_runtime():
     drafter.attn_backend = routers[1]
     drafter.token_to_kv_pool = None  # No model/cache-storage operation is reached.
     drafter.round_block_tables = None
-    drafter.decode_graphs = None
     drafter.embed_tokens = _stop_before_weights
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.attn_backend, runner.draft_attn_backend = routers

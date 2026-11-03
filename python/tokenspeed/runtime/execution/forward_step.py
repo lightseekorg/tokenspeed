@@ -32,7 +32,10 @@ import torch.distributed as dist
 import tqdm
 from tokenspeed_kernel.workspace import capture_session
 
-from tokenspeed.runtime.execution.confidence_graph import ConfidenceDecodeGraphs
+from tokenspeed.runtime.execution.confidence_graph import (
+    ConfidenceDecodeGraphs,
+    DecodeStages,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
@@ -78,7 +81,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.models.base import BaseCausalLM
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -276,8 +278,10 @@ class ForwardStepRunner:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
-        target_model: BaseCausalLM | None = None,
         decode_graph_supported: bool = True,
+        *,
+        decode_stages: DecodeStages | None,
+        update_runtime_state: Callable | None,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -290,6 +294,8 @@ class ForwardStepRunner:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.decode_stages = decode_stages
+        self.update_runtime_state = update_runtime_state
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
@@ -433,10 +439,11 @@ class ForwardStepRunner:
         self.stream = self.device_module.Stream()
         self.segmented_decode: ConfidenceDecodeGraphs | None = None
         if self.confidence_feedback is not None:
-            if target_model is None:
-                raise ValueError("confidence graphs require the target model")
-            self.segmented_decode = ConfidenceDecodeGraphs(self, target_model)
-            self.drafter.decode_graphs = self.segmented_decode
+            if decode_stages is None:
+                raise ValueError(
+                    "confidence graphs require the forward's decode stages"
+                )
+            self.segmented_decode = ConfidenceDecodeGraphs(self, decode_stages)
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -1249,8 +1256,8 @@ class ForwardStepRunner:
             if self.global_rank == 0 and self.confidence_feedback.can_record():
                 confidence_start = self.device_module.Event(enable_timing=True)
                 confidence_start.record()
-            # Only the drafter stage pads to a request bucket. The model exit,
-            # verifier and outer state updates retain the real request count.
+            # Stage graphs handle their padding. The outer forward retains the
+            # real request count for feedback and output delivery.
             if self.segmented_decode is not None:
                 padded_bs = bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
@@ -1343,27 +1350,10 @@ class ForwardStepRunner:
             self.segmented_decode.bind_round(
                 ctx,
                 actual_bs=bs,
-                request_capacity=padded_bs,
                 block_tables=block_tables,
                 use_graph=use_graph,
             )
-            try:
-                result = self._forward_func(
-                    bs=padded_bs, ctx=ctx, sampling_info=sampling_info
-                )
-                result = (
-                    result[0][: bs * self.max_tokens_per_req],
-                    result[1][:bs],
-                    (
-                        None
-                        if result[2] is None
-                        else result[2][: bs * self.max_tokens_per_req]
-                    ),
-                    result[3],
-                )
-            finally:
-                self.segmented_decode.active = False
-                ctx.decode_graphs = None
+            result = self.segmented_decode.run_round(ctx, sampling_info)
         elif use_graph:
             # Runtime prepare() is called by ModelExecutor with per-request rids
             # BEFORE self.forward_step — we don't refill here to avoid clobbering
@@ -1414,16 +1404,8 @@ class ForwardStepRunner:
             ctx.bs = bs
             ctx.output_layout = live_output_layout
 
-        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
-            self.attn_backend.commit_state_after_acceptance(
-                result[1],
-                num_extends=ctx.num_extends,
-                accepted_path=(
-                    self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
-                    if self.config.spec_draft_tree and ctx.num_extends == 0
-                    else None
-                ),
-            )
+        if not (self.segmented_decode is not None and ctx.verify_queries is not None):
+            self.commit_forward(ctx, result)
 
         if confidence_start is not None:
             slots = self.input_buffers.req_pool_indices_buf[:bs]
@@ -1437,3 +1419,21 @@ class ForwardStepRunner:
 
         self.last_graph_bs = padded_bs if use_graph else None
         return result
+
+    def commit_forward(self, ctx: ForwardContext, result: tuple) -> None:
+        """Commit accepted state and advance the frontier once, after drafting."""
+        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
+            self.attn_backend.commit_state_after_acceptance(
+                result[1],
+                num_extends=ctx.num_extends,
+                accepted_path=(
+                    self.sampling_backend.accepted_path(
+                        ctx.bs, self.config.spec_num_tokens
+                    )
+                    if self.config.spec_draft_tree and ctx.num_extends == 0
+                    else None
+                ),
+            )
+
+        if self.update_runtime_state is not None:
+            self.update_runtime_state(ctx, result)

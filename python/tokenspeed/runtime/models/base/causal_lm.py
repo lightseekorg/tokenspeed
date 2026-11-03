@@ -385,14 +385,9 @@ class BaseCausalLM(nn.Module):
 
         model_kwargs = self.prepare_model_kwargs(ctx, input_ids, kwargs)
 
-        if ctx.decode_graphs is None:
-            hidden_states, aux_hidden_states = self.model(
-                input_ids, positions, ctx, **model_kwargs
-            )
-        else:
-            hidden_states, aux_hidden_states = ctx.decode_graphs.run_target(
-                input_ids, positions, ctx, model_kwargs
-            )
+        hidden_states, aux_hidden_states = self.model(
+            input_ids, positions, ctx, **model_kwargs
+        )
         if not self.mapping.is_last_pp_rank:
             # Mid-pipeline stage: the executor sends this boundary state to
             # the next stage; there are no logits here.

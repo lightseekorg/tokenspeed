@@ -117,6 +117,184 @@ def test_hc_capture_uses_fp32_mean_and_preserves_branch_order():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "state_dtype,width", [(torch.bfloat16, 8), (torch.float32, 13)]
+)
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
+    state_dtype, width, replay, cuda_graph
+):
+    from test.runtime.test_gdn_state_paging import _ContractPool, _mamba_config_pair
+
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.state.gdn import GdnAttnBackend
+
+    torch.manual_seed(53)
+    batch, heads, dim = 3, 8, 128
+    channels = 3 * heads * dim
+    conv = torch.randn(8, channels, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    state = torch.randn(8, heads, dim, dim, device="cuda", dtype=state_dtype) * 0.02
+    conv[0].zero_()
+    state[0].zero_()
+    backends, pools = [], []
+    for _ in range(2):
+        pool = _ContractPool({0: ("linear_attention", conv.clone(), state.clone())})
+        backend = GdnAttnBackend(
+            *_mamba_config_pair(
+                torch,
+                heads=heads,
+                head_dim=dim,
+                spec_tokens=width,
+                max_bs=batch,
+                device="cuda",
+                replay_ssm=replay,
+            )
+        )
+        backend.set_kv_pool(pool)
+        backend.init_cuda_graph_state(batch)
+        backend.refresh_decode_metadata(
+            batch,
+            2,
+            torch.arange(batch, dtype=torch.int32, device="cuda"),
+            torch.full((batch,), 4 + width, dtype=torch.int32, device="cuda"),
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=cuda_graph,
+            block_tables={
+                "linear_attention": torch.tensor(
+                    [[1, 5], [2, 6], [0, 0]], dtype=torch.int32, device="cuda"
+                )
+            },
+        )
+        backends.append(backend)
+        pools.append(pool)
+    layouts = (
+        VerifyQueryLayout(batch, batch * width, width, "cuda"),
+        VerifyQueryLayout(batch, width, width, "cuda"),
+    )
+    rates = torch.full((batch, width - 1), 0.1, device="cuda")
+    rates[0].fill_(0.99)
+    ready = torch.ones(batch, dtype=torch.bool, device="cuda")
+    active = torch.tensor([True, True, False], device="cuda")
+    for layout in layouts:
+        layout.refresh(rates, ready, active)
+    raw = torch.randn(batch * width, channels, device="cuda", dtype=torch.bfloat16)
+    a, b = (
+        torch.randn(batch * width, heads, device="cuda", dtype=torch.bfloat16)
+        for _ in range(2)
+    )
+    weights = torch.randn(channels, 4, device="cuda", dtype=raw.dtype) * 0.1
+    A_log, dt_bias = (torch.randn(heads, device="cuda") * 0.1 for _ in range(2))
+
+    actual_bs = 2
+
+    def forward(index):
+        layout = layouts[index]
+        return backends[index].forward_decode(
+            None,
+            None,
+            None,
+            layer=None,
+            out_cache_loc=None,
+            token_to_kv_pool=pools[index],
+            bs=actual_bs,
+            mixed_qkv=layout.pack(raw, token_dim=0),
+            conv_weights=weights,
+            bias=None,
+            activation="silu",
+            key_dim=heads * dim,
+            value_dim=heads * dim,
+            attention_tp_size=1,
+            head_k_dim=dim,
+            head_v_dim=dim,
+            a=layout.pack(a, token_dim=0),
+            b=layout.pack(b, token_dim=0),
+            A_log=A_log,
+            dt_bias=dt_bias,
+            layer_id=0,
+            seq_len=layout.query_capacity,
+            verify_queries=layout,
+        )
+
+    for _ in range(2):
+        forward(0)
+        forward(1)
+    graph = None
+    commit_graph = None
+    if cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = forward(1)
+        backend = backends[1]
+
+        def prepare_commit():
+            backend.init_forward_metadata_capture_cuda_graph(
+                batch,
+                torch.arange(batch, dtype=torch.int32, device="cuda"),
+                torch.full((batch,), 4 + width, dtype=torch.int32, device="cuda"),
+                ForwardMode.DECODE,
+            )
+            backend.prepare_state_commit_capture()
+
+        for _ in range(2):
+            prepare_commit()
+            backend.commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+        prepare_commit()
+        commit_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(commit_graph):
+            backend.commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+    for step in range(2):
+        actual_bs = 2 - step
+        active.copy_(torch.arange(batch, device="cuda") < actual_bs)
+        for layout in layouts:
+            layout.refresh(rates.roll(step, 0), ready, active)
+        for backend in backends:
+            # Fresh delivered storage on each round must not replace the
+            # table addresses recorded by the commit graph.
+            backend.refresh_decode_metadata(
+                batch,
+                actual_bs,
+                torch.arange(batch, dtype=torch.int32, device="cuda"),
+                torch.full((batch,), 4 + width, dtype=torch.int32, device="cuda"),
+                forward_mode=ForwardMode.DECODE,
+                for_graph_replay=cuda_graph,
+                block_tables={
+                    "linear_attention": torch.tensor(
+                        [[1 + step, 5 + step], [2 - step, 6 - step]],
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                },
+            )
+        expected = forward(0).reshape(-1, heads, dim)
+        if graph is None:
+            actual = forward(1)
+        else:
+            graph.replay()
+        selected = layouts[1].packed_rows[layouts[1].packed_valid]
+        torch.testing.assert_close(
+            actual.reshape(-1, heads, dim)[: selected.numel()],
+            expected.index_select(0, selected),
+            atol=0,
+            rtol=0,
+        )
+        backends[0].commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+        if commit_graph is None:
+            backends[1].commit_verified_state(
+                layouts[1].query_lengths, accepted_path=None
+            )
+        else:
+            commit_graph.replay()
+        for component in ("conv_state", "recurrent_state"):
+            torch.testing.assert_close(
+                pools[0].get_component(0, component),
+                pools[1].get_component(0, component),
+                atol=0,
+                rtol=0,
+            )
+
+
 def test_compact_attention_retains_window_start_and_isolates_filler():
     layout = VerifyQueryLayout(3, 6, 4, "cpu")
     rates = torch.full((3, 3), 0.5)

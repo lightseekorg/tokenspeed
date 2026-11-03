@@ -133,6 +133,15 @@ class CachePoolBinding:
         for backend in self.child_backends():
             backend.validate_compact_verify()
 
+    def prepare_state_commit_capture(self) -> None:
+        """Bind null-page commit inputs after idle metadata, before capture.
+
+        Stateful leaves arm the same commit that a live refresh would arm.
+        Its page tables must have stable storage refreshed on every round.
+        """
+        for backend in self.child_backends():
+            backend.prepare_state_commit_capture()
+
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         """Raise if this node or any child cannot rebind to ``cache_pool``."""
         for backend in self.child_backends():

@@ -31,8 +31,10 @@ import pytest
 import torch
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.graph_ptr_guard import snapshot_graph_metadata
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
@@ -85,11 +87,26 @@ def test_qsa_dense_falls_through_to_mha(monkeypatch, forward_name):
     dense = Mock(return_value=object())
     monkeypatch.setattr(MHAAttnBackend, forward_name, dense)
     args = tuple(object() for _ in range(6))
-    output = getattr(backend, forward_name)(
-        *args, bs=1, topk_indices=None, ctx=object()
-    )
+    ctx = object()
+    output = getattr(backend, forward_name)(*args, bs=1, topk_indices=None, ctx=ctx)
     assert output is dense.return_value
-    dense.assert_called_once_with(*args, 1)
+    dense.assert_called_once_with(
+        *args, 1, **({"ctx": ctx} if forward_name == "forward_decode" else {})
+    )
+
+
+def _forward_context(backend, bs, num_extends, mode, tokens):
+    return ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=num_extends,
+        input_num_tokens=tokens,
+        forward_mode=mode,
+        output_layout=ForwardOutputLayout(
+            num_extends, num_extends, bs - num_extends, 4
+        ),
+    )
 
 
 def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
@@ -363,7 +380,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
         gid: torch.tensor([[1], [2]], dtype=torch.int32, device="cuda")
         for gid in pool.paged_group_ids
     }
-    ctx = SimpleNamespace(bs=2, forward_mode=ForwardMode.DECODE, attn_backend=backend)
+    ctx = _forward_context(backend, 2, 0, ForwardMode.DECODE, 8)
 
     def refresh(actual_bs: int) -> None:
         backend.sparse_topk.qsa_metadata = object()
@@ -617,7 +634,7 @@ def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
         lambda *args, **kwargs: (torch.zeros(total_rows, dtype=torch.int32),) * 5,
     )
     layout = qsa_forward_layout(
-        SimpleNamespace(bs=bs, forward_mode=ForwardMode.MIXED, attn_backend=root),
+        _forward_context(root, bs, len(queries), ForwardMode.MIXED, total_rows),
         total_rows,
         compressed_token_page_size=256,
         recent_page_size=64,
@@ -702,9 +719,7 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
         return logical, requests, slots, slots, slots
 
     monkeypatch.setattr(metadata_module, "qwen4_exp_qsa_prepare_metadata", prepare)
-    ctx = SimpleNamespace(
-        attn_backend=root, bs=2, num_extends=1, forward_mode=ForwardMode.MIXED
-    )
+    ctx = _forward_context(root, 2, 1, ForwardMode.MIXED, 7)
     kwargs = dict(
         compressed_token_page_size=256,
         recent_page_size=64,
