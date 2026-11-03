@@ -164,27 +164,6 @@ entry:
   ret i32 0
 }
 
-; A returning device-scope atomic add by lane 0 of the calling wave (relaxed);
-; the other lanes do nothing and get undef. The address is an integer so that
-; Triton's extern dispatch can key on it. The undef incoming value lets the
-; result keep the atomic's own register, so the backend waits for it only
-; where it is used (vmcnt(k) counting only later operations), not at the
-; branch join. Callers pass a lane-indexed address (lane 0 -> the word): a
-; uniform address goes through the backend's atomic optimizer, which reads
-; the result back right after the atomic.
-define i64 @__tokenspeed_persistent_lane0_add_i64(i64 %addr, i64 %v, i32 %lane) alwaysinline {
-entry:
-  %p = inttoptr i64 %addr to ptr addrspace(1)
-  %is0 = icmp eq i32 %lane, 0
-  br i1 %is0, label %do, label %join
-do:
-  %old = atomicrmw add ptr addrspace(1) %p, i64 %v syncscope("agent") monotonic, align 8
-  br label %join
-join:
-  %r = phi i64 [ %old, %do ], [ undef, %entry ]
-  ret i64 %r
-}
-
 ; Acquire for one wave: an IR ordering point (loads after it cannot move
 ; above it), with no instruction on gfx950. It replaces the workgroup
 ; barrier after a per-wave poll whose result only this wave uses.

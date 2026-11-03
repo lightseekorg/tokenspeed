@@ -108,18 +108,64 @@ _ENTRY_SIGNATURE = {
 }
 
 
-def test_entry_waits_only_for_its_counters():
-    """The counters go out before the role's loads, and the claim compare
-    waits vmcnt(LOADS): the loads stay in flight through the entry."""
+def test_entry_never_waits_for_the_roles_loads():
+    """The role's first loads go out with nothing vector outstanding, and
+    the entry's counters are scalar atomics waited for with lgkmcnt: the
+    loads stay in flight until the role uses them."""
     assembly = _compile(_entry_kernel, _ENTRY_SIGNATURE, {"LOADS": _LOADS})
     assert persistent_codegen_problems(assembly, entry=True) == []
     lines = instruction_lines(assembly)
-    counters = [i for i, l in enumerate(lines) if l.startswith("global_atomic_add_x2")]
     first_load = next(i for i, l in enumerate(lines) if l.startswith("buffer_load"))
-    assert len(counters) == 2 and counters[1] < first_load
-    assert not any("vmcnt" in l for l in lines[counters[0] : first_load])
-    check = next(i for i, l in enumerate(lines) if l.startswith("v_cmp_ne_u64"))
-    assert f"s_waitcnt vmcnt({_LOADS})" in lines[first_load:check]
+    assert not any("vmcnt" in l for l in lines[:first_load])
+    counters = [i for i, l in enumerate(lines) if l.startswith("s_atomic_add_x2")]
+    assert len(counters) == 2 and counters[0] > first_load
+    # Nothing waits for the loads before the counters' compare.
+    check = next(
+        i for i in range(counters[1], len(lines)) if lines[i].startswith("s_cmp")
+    )
+    assert not any("vmcnt" in l for l in lines[first_load:check])
+
+
+@gluon.jit
+def _raw_weights(w_ptr):
+    """Four dwordx4 loads per lane, held in registers (not yet used)."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [64, 1], [gl.num_warps(), 1], [1, 0]
+    )
+    rows = gl.arange(0, 64 * gl.num_warps(), gl.SliceLayout(1, layout))
+    cols = gl.arange(0, 4, gl.SliceLayout(0, layout))
+    offs = rows[:, None] * 4 + cols[None, :]
+    loads = ()
+    for i in gl.static_range(4):
+        loads += (gl.amd.cdna4.buffer_load(w_ptr + i * 65536, offs, cache=".cg"),)
+    return loads, offs
+
+
+@gluon.jit(do_not_specialize=["deadline_ticks"])
+def _roles_kernel(epochs, claims, errors, arena, w_ptr, kv_ptr, out, deadline_ticks):
+    """A composed layer's shape: role branches by slot, each issuing its own
+    weights (or attention pages) before the entry check, used after it."""
+    entry = enter_issue(epochs, claims)
+    if entry.slot < 16:
+        loads, offs = _raw_weights(w_ptr)
+    elif entry.slot < 24:
+        loads, offs = _raw_weights(w_ptr + 8 * 65536)
+    else:
+        loads, offs = _raw_weights(kv_ptr)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    total = loads[0] + loads[1] + loads[2] + loads[3]
+    gl.amd.cdna4.buffer_store(total + launch.tag.to(gl.float32), out, offs)
+
+
+def test_composed_role_loads_issue_with_nothing_outstanding():
+    """In every role branch the first load follows no vmcnt wait: the entry
+    leaves nothing vector in flight for a register reuse to wait on."""
+    signature = dict(_ENTRY_SIGNATURE, kv_ptr="*fp32")
+    assembly = _compile(_roles_kernel, signature)
+    assert persistent_codegen_problems(assembly, entry=True) == []
+    lines = instruction_lines(assembly)
+    last_load = max(i for i, l in enumerate(lines) if l.startswith("buffer_load"))
+    assert not any("vmcnt" in l for l in lines[:last_load])
 
 
 @gluon.jit(do_not_specialize=["tag"])

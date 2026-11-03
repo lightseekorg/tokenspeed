@@ -26,12 +26,13 @@ one named helper per instruction pattern, each documented with the compiler
 change that would remove it:
 
 - through ``intrinsics.ll`` (the backend sees the instruction): the clock,
-  ``HW_REG_XCC_ID``, the trap, the release drain, paced ``vmcnt(N)`` waits and
-  the lane-0 returning atomic of the launch entry, and a per-wave acquire;
+  ``HW_REG_XCC_ID``, the trap, the release drain, paced ``vmcnt(N)`` waits
+  and a per-wave acquire;
 - as inline asm, where no intrinsic exists or the intrinsic is unusable: the
-  per-wave vote, scalar loads past the scalar cache (``s.buffer.load`` is
-  declared not to read memory, so LLVM would hoist it out of a poll loop),
-  ``s_dcache_inv`` and the 64-bit claim compare pinned below the role's loads.
+  per-wave vote, the wave index, scalar returning atomics (the launch
+  entry's counters), scalar loads past the scalar cache (``s.buffer.load`` is
+  declared not to read memory, so LLVM would hoist it out of a poll loop)
+  and ``s_dcache_inv``.
 
 Kernels calling the intrinsics launch with :func:`persistent_compile_options`.
 """
@@ -115,18 +116,6 @@ def wait_vmcnt(n, _semantic=None):
     return _call(f"vmcnt_{n}", tl.int32, [], (), _semantic)
 
 
-@tl.core.extern
-def lane0_add_i64(address, value, lane, _semantic=None):
-    """Lane 0 adds ``value`` to the int64 at ``address`` (an int64 holding a
-    global address), device scope, relaxed, returning the old value; other
-    lanes get an undefined value. The wait for the result is placed at its
-    first use. Pass a lane-indexed address (see ``intrinsics.ll``)."""
-    return _call(
-        "lane0_add_i64", tl.int64, [address, value, lane],
-        (tl.int64, tl.int64, tl.int32), _semantic,
-    )  # fmt: skip
-
-
 @gluon.jit
 def vote(flags):
     """Whether any lane of this wave holds a nonzero int32 flag, as a per-wave
@@ -141,26 +130,33 @@ def vote(flags):
 
 
 @gluon.jit
-def lane_mask_differs_i64(a, b):
-    """The lane mask of ``a != b`` (int64 per lane) as a per-wave scalar.
-
-    A side-effecting asm: the compiler cannot move it above vector loads
-    issued before it, so its wait for ``a`` and ``b`` counts only the
-    operations issued after them (a plain compare was hoisted above the
-    loads and forced ``vmcnt(0)``)."""
+def wave_index():
+    """This wave's index in the workgroup, as a per-wave scalar (SGPR)."""
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    lane = gl.arange(0, 64 * gl.num_warps(), layout)
     return gl.inline_asm(
-        "v_cmp_ne_u64_e64 $0, $1, $2", "=s,v,v,~{memory}", [a, b], gl.int64,
-        is_pure=False,
-    )  # fmt: skip
+        "v_readfirstlane_b32 $0, $1", "=s,v", [lane // 64], gl.int32, is_pure=True
+    )
 
 
 @gluon.jit
-def lane_mask(flags):
-    """The lane mask of ``flags != 0`` (int32 per lane) as a per-wave scalar."""
+def scalar_add2_i64(first_ptr, second_ptr):
+    """Add 1 to the int64 at each address with returning scalar atomics
+    (``s_atomic_add_x2 … glc``) and return both old values, per wave.
+
+    Scalar atomics count in ``lgkmcnt``, so the wait for them never waits
+    for the wave's vector loads. Each atomic is its own clause (the ISA
+    requires it), hence the ``s_nop`` between them. Inline asm: LLVM never
+    selects scalar atomics."""
     return gl.inline_asm(
-        "v_cmp_ne_u32_e64 $0, 0, $1", "=s,v,~{memory}", [flags], gl.int64,
+        "s_mov_b64 $0, 1\n\ts_mov_b64 $1, 1\n\t"
+        "s_atomic_add_x2 $0, $2, 0x0 glc\n\ts_nop 0\n\t"
+        "s_atomic_add_x2 $1, $3, 0x0 glc\n\ts_waitcnt lgkmcnt(0)",
+        "=&s,=&s,s,s,~{memory}",
+        [first_ptr, second_ptr],
+        (gl.int64, gl.int64),
         is_pure=False,
-    )  # fmt: skip
+    )
 
 
 @gluon.jit

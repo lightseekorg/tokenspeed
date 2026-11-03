@@ -164,16 +164,13 @@ def test_joins_order_writes_across_launches_and_graph_replays():
     assert torch.equal(
         seen.cpu(), torch.full((GRID,), rounds * launches, dtype=torch.int32)
     )
-    # Each program id advanced its own epoch once per launch.
-    assert torch.equal(
-        state.epochs.view(GRID, LINE_WORDS // 2)[:, 0].cpu(),
-        torch.full((GRID,), launches, dtype=torch.int64),
-    )
-    # Each role was claimed once per launch.
-    assert torch.equal(
-        state.claims.view(GRID, LINE_WORDS // 2)[:, 0].cpu(),
-        torch.full((GRID,), launches, dtype=torch.int64),
-    )
+    # Each wave of each program id advanced its own epoch once per launch,
+    # and each wave of each role claimed it once per launch.
+    for counters in (state.epochs, state.claims):
+        assert torch.equal(
+            counters.view(GRID, LINE_WORDS // 2)[:, :8].cpu(),
+            torch.full((GRID, 8), launches, dtype=torch.int64),
+        )
     rows = placement[1 : launches + 1].cpu()
     pid = torch.arange(GRID, dtype=torch.int32)
     xcd, cta = rows & 0xFF, rows >> 8
@@ -222,8 +219,9 @@ def test_launches_cross_the_32_bit_epoch_boundary():
     no claim trips across 2**32."""
     state = _State()
     start = 2**32 - 3
-    state.epochs.view(GRID, LINE_WORDS // 2)[:, 0] = start
-    state.claims.view(GRID, LINE_WORDS // 2)[:, 0] = start
+    # Every wave's counters (one int64 per wave in each line).
+    state.epochs.view(GRID, LINE_WORDS // 2)[:, :8] = start
+    state.claims.view(GRID, LINE_WORDS // 2)[:, :8] = start
     values = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     seen = torch.zeros(GRID, dtype=torch.int32, device="cuda")
     placement = torch.zeros((8, GRID), dtype=torch.int32, device="cuda")
