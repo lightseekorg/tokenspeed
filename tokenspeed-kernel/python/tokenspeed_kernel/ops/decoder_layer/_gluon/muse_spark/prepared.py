@@ -92,7 +92,7 @@ _CU_LDS_BYTES = 160 * 1024
 _MAX_VGPRS = 256
 # Clock ticks (10 ns) a wait may last before the launch fail-stops: 2 s.
 _DEADLINE_TICKS = 200_000_000
-# Plan fields of the default variant (NATIVE-DESIGN §12 sweeps them).
+# Plan fields of the default variant (benchmarks sweep them one at a time).
 DEFAULT_PLAN_FIELDS = dict(
     ring=8,
     quad_map=0,
@@ -344,7 +344,7 @@ class MuseSparkFusedDecoderLayer:
         """A layer with explicit plan fields (``DEFAULT_PLAN_FIELDS``' keys),
         clock stamps into ``state.stamps``, and the wait deadline in 10 ns
         clock ticks (a test stops a withheld launch sooner than the serving
-        deadline), for NATIVE-DESIGN §12's runs."""
+        deadline), for the plan-field benchmark runs."""
         layer = cls.__new__(cls)
         layer._setup(plan_keys, weights, state, plan_fields, stamps, deadline_ticks)
         return layer
@@ -374,7 +374,7 @@ class MuseSparkFusedDecoderLayer:
         self.declines: dict[int, list[str]] = {}
         self.tensors, self.model, problems = self._read_weights(weights, state.rank)
         # The lane-major gate/up scales cost a 32 MiB copy per layer: off
-        # until NATIVE-DESIGN §12 shows the win.
+        # until a benchmark shows the win is worth the memory.
         self.moe = native_moe_weights(weights["experts"], scale_lanes=False)
         for key in self.plan_keys:
             reasons = problems + self._compile(key)

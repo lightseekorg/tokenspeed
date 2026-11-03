@@ -22,8 +22,8 @@
 """Escape hatches of persistent gfx950 kernels: LLVM intrinsics and inline asm.
 
 Everything Gluon cannot express for persistent synchronization lives here,
-one named helper per instruction pattern, each listed in the workspace's
-COMPILER-TODO with the compiler change that would remove it:
+one named helper per instruction pattern, each documented with the compiler
+change that would remove it:
 
 - through ``intrinsics.ll`` (the backend sees the instruction): the clock,
   ``HW_REG_XCC_ID``, the trap, the release drain, paced ``vmcnt(N)`` waits and

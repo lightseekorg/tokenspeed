@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """The fused Muse Spark layer's launch state under the conditions serving
-creates, on 8 gfx950 ranks (NATIVE-DESIGN §12 job 1).
+creates, on 8 gfx950 ranks.
 
 One state serves every launch of a group: launches alternate request counts
 and the two copies of every Lamport area, epochs grow without bound, and a

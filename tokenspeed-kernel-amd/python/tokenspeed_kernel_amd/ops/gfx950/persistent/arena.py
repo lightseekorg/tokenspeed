@@ -25,7 +25,7 @@ Each XCD has its own L2, which does not snoop the others: a line one XCD
 cached during a previous launch can still be read there after another XCD
 wrote the word. Loads from uncached memory (``hipDeviceMallocUncached``) skip
 every cache, so a word another XCD stored is seen without cache bits on the
-load, and scalar ``glc`` polls see it too [measured, research-sync MB-S].
+load, and scalar ``glc`` polls see it too (measured on MI355X).
 Keep only words read soon after another XCD writes them here (flags, routed
 ids, small activation rows): every access goes to memory.
 """
