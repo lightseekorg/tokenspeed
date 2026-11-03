@@ -663,7 +663,9 @@ def _load_chunk(
 
 @gluon.jit
 def _load_scale_dword(desc, base, pair, p: gl.constexpr, live):
-    """The E8M0 dword of step pair ``p`` (bytes ``base + p * pair``)."""
+    """The E8M0 dword of step pair ``p`` (bytes ``base + p * pair``).
+    Cached normally: the two strips of a 32-column block read the same
+    lines."""
     mask = None if live is None else (base == base) & live
     return gl.amd.cdna3.buffer.load(desc, (base + p * pair) // 4, mask=mask)
 
@@ -704,9 +706,12 @@ def _lanes_base(expert, column, N_PHYS: gl.constexpr, K_STEPS: gl.constexpr):
 @gluon.jit
 def _load_lanes(desc, base, half: gl.constexpr, live):
     """Steps 16 half .. 16 half + 15 of a strip's lane-major scales: one
-    dwordx4 per lane."""
+    dwordx4 per lane, nontemporal like the weights (each byte is read once)."""
+    policy: gl.constexpr = gl.amd.cdna3.CachePolicy(nontemporal=True)
     mask = None if live is None else (base == base) & live
-    return gl.amd.cdna3.buffer.load(desc, base + half * 4, mask=mask)
+    return gl.amd.cdna3.buffer.load(
+        desc, base + half * 4, mask=mask, cache_policy=policy
+    )
 
 
 @gluon.jit
