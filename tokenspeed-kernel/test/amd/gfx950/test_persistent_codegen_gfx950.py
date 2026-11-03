@@ -224,21 +224,31 @@ def test_pair_poll_reads_value_and_tag_in_one_load(scope):
 
 
 @gluon.jit(do_not_specialize=["tag", "deadline_ticks"])
-def _tags16_kernel(epochs, claims, errors, arena, tags, w_ptr, out, tag,deadline_ticks, GLC: gl.constexpr):  # fmt: skip
+def _tags16_kernel(epochs, claims, errors, arena, tags, w_ptr, out, tag,deadline_ticks, GLC: gl.constexpr, BARRIER: gl.constexpr):  # fmt: skip
     entry = enter_issue(epochs, claims)
     total, offs = _weights(w_ptr, 2)
     launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
-    if not poll_tags16(tags, tag, launch, GLC):
+    if not poll_tags16(tags, tag, launch, GLC, BARRIER):
         fail_stop(launch, 16, 0)
+    # What the tags guard, read after the poll.
+    total += gl.amd.cdna4.buffer_load(w_ptr + 524288, offs, cache=".cg")
     gl.amd.cdna4.buffer_store(total, out, offs)
 
 
 @pytest.mark.parametrize("glc", [True, False])
-def test_poll_tags16_is_scalar_only(glc):
+@pytest.mark.parametrize("barrier", [True, False])
+def test_poll_tags16_is_scalar_only(glc, barrier):
     signature = dict(_ENTRY_SIGNATURE, tags="*i32", tag="i32")
-    assembly = _compile(_tags16_kernel, signature, {"GLC": glc})
-    assert persistent_codegen_problems(assembly, entry=True) == []
+    assembly = _compile(_tags16_kernel, signature, {"GLC": glc, "BARRIER": barrier})
+    if barrier:
+        assert persistent_codegen_problems(assembly, entry=True) == []
     assert scalar_poll_vector_waits(assembly) == []
+    # The guarded load stays after the poll loop, barrier or not.
+    lines = instruction_lines(assembly)
+    poll = max(i for i, l in enumerate(lines) if l.startswith("s_load_dwordx16"))
+    guarded = [i for i, l in enumerate(lines) if "buffer_load" in l and "s[" in l]
+    assert max(guarded) > poll
+    assert ("s_barrier" in "\n".join(lines[poll:])) == barrier
     assert re.search(
         r"s_load_dwordx16 s\[64:79\], s\[\d+:\d+\], 0x0" + (" glc" if glc else "$"),
         assembly,
@@ -307,3 +317,29 @@ def test_fail_stop_mirrors_the_record_before_the_trap():
     ]
     assert host, "the record is not written through"
     assert "s_waitcnt vmcnt(0)" in before[host[-1] :]
+
+
+@gluon.jit(do_not_specialize=["deadline_ticks"])
+def _tag_poll_kernel(epochs, claims, errors, arena, word, deadline_ticks):
+    entry = enter_issue(epochs, claims)
+    launch = enter_check(entry, errors, arena, deadline_ticks, 0, fail_stop)
+    if not poll_until(word, launch.tag, launch, "smem"):
+        fail_stop(launch, 16, 0)
+
+
+def test_launch_tag_is_a_scalar():
+    """The epoch comes out of a cross-wave reduction in a VGPR; read back to
+    a scalar, a scalar poll on the tag stays a uniform loop (no exec masks,
+    no lane reads per retry)."""
+    signature = {k: v for k, v in _ENTRY_SIGNATURE.items() if k not in ("w_ptr", "out")}
+    signature["word"] = "*i32"
+    assembly = _compile(_tag_poll_kernel, signature)
+    from asm_checks import innermost_loops
+
+    polls = [l for l in innermost_loops(assembly) if "s_load_dword" in l and "glc" in l]
+    assert polls
+    for loop in polls:
+        # The retry compares two scalars; a VGPR tag needs a lane read or a
+        # vector compare on every retry.
+        assert re.search(r"s_cmp_(eq|lg)_u32 s\d+, s\d+", loop), loop
+        assert "v_readfirstlane" not in loop

@@ -48,6 +48,7 @@ wave; the caller runs ``on_expiry(launch, site, detail)`` otherwise, which
 must not return (:func:`fail_stop` is the local handler).
 """
 
+from tokenspeed_kernel_amd._scheduling import wave_uniform_i32
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     lane0_add_i64,
@@ -59,6 +60,7 @@ from tokenspeed_kernel_amd.ops.gfx950.persistent._intrinsics import (
     scalar_tags16_differ,
     trap,
     vote,
+    wave_acquire,
     xcc_id,
 )
 from tokenspeed_kernel_amd.ops.gfx950.persistent.timing import realtime_ticks
@@ -279,8 +281,13 @@ def enter_check(entry, error_ptr, arena_ptr, deadline_ticks, label, on_expiry):
             gl.to_tensor(label), error_ptr, abort_ptr, deadline_ticks, arena_ptr,
         )  # fmt: skip
         on_expiry(unknown, _SITE_CLAIM, entry.slot)
-    # The epoch reaches every wave through LDS and one barrier.
+    # The epoch reaches every wave through LDS and one barrier. A value out
+    # of a cross-wave reduction stays in a VGPR; readfirstlane makes it a
+    # scalar, so loops and compares on the tag stay uniform branches.
     epoch = gl.max(gl.where(first, entry.epoch_old + 1, 0), 0)
+    low = wave_uniform_i32((epoch & 0xFFFFFFFF).to(gl.int32))
+    high = wave_uniform_i32((epoch >> 32).to(gl.int32))
+    epoch = (high.to(gl.int64) << 32) | (low.to(gl.int64) & 0xFFFFFFFF)
     tag = launch_tag(epoch, 32).to(gl.int32)
     launch = Launch(
         entry.cta, entry.xcd, entry.slot, epoch, tag, (epoch & 1).to(gl.int32),
@@ -498,14 +505,16 @@ def poll_pairs(pair_ptrs, valid, launch, SCOPE: gl.constexpr):
 
 
 @gluon.jit
-def poll_tags16(word_ptr, tag, launch, GLC: gl.constexpr):
+def poll_tags16(word_ptr, tag, launch, GLC: gl.constexpr, BARRIER: gl.constexpr):
     """Wait until all 16 int32 tags at ``word_ptr`` (64 B aligned) equal
     ``tag``, with scalar loads only (never behind the wave's vector loads).
 
     ``GLC`` (no default): ``True`` reads past the scalar cache (same-XCD
     words, or uncached memory, measured); ``False`` reads through it after
-    ``s_dcache_inv`` (unmeasured). Returns whether the tags were seen, per
-    wave; after one workgroup barrier.
+    ``s_dcache_inv`` (unmeasured). ``BARRIER``: end with a workgroup barrier
+    (other waves use what the tags guard), or only with a per-wave acquire
+    (this wave alone polls and reads, as in per-wave work loops). Returns
+    whether the tags were seen, per wave.
     """
     start = gl.to_tensor(0).to(gl.int64)
     retries = 0
@@ -516,7 +525,10 @@ def poll_tags16(word_ptr, tag, launch, GLC: gl.constexpr):
         differ = scalar_tags16_differ(word_ptr, tag, GLC)
         if retries % _CHECK_RETRIES == 0:
             stop, start = _expired(launch, start, retries, True)
-    gl.barrier()
+    if BARRIER:
+        gl.barrier()
+    else:
+        wave_acquire()
     return not stop
 
 

@@ -113,7 +113,7 @@ def wait_records_tags16(record_ptr, first, count: gl.constexpr, tag, launch):
     launch's ``fail_stop``."""
     gl.static_assert(count % 16 == 0)
     for line in gl.static_range(count // 16):
-        if not poll_tags16(record_ptr + first + 16 * line, tag, launch, True):
+        if not poll_tags16(record_ptr + first + 16 * line, tag, launch, True, True):
             fail_stop(launch, _RECORD_SITE, line)
 
 
