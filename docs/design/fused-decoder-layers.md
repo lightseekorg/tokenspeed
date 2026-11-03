@@ -92,6 +92,31 @@ every fused node.
 * The epochs are 64 bits and never wrap; tags, copy parity and stage indices
   derive from them.
 
+### Hand-offs inside a launch
+
+Workgroups hand data to each other through memory; the kernel's module
+docstring lists each hand-off. Every one follows these rules:
+
+* A producer's payload stores complete before the flag or tag that publishes
+  them: each storing wave waits for its own stores, and a workgroup barrier
+  precedes a flag that covers several waves' stores. Single 64-bit stores
+  that carry the value and its tag together need no flag.
+* A consumer on another XCD reads the payload so that no cached copy of an
+  earlier launch can answer: loads that bypass the XCD's cache (`.cv`), or
+  memory allocated uncached (`UncachedBuffer`). Flags in uncached memory can
+  be polled with scalar loads, which do not wait behind the wave's vector
+  loads.
+* Tags derive from the epoch and repeat after 2**32 - 1 launches, about a week
+  of serving. Every slot a launch polls is rewritten (or zeroed) in every
+  launch, or lives in two copies by epoch parity with the other copy zeroed
+  each launch, so no slot keeps a tag old enough to repeat.
+* A wave's vector memory operations complete in issue order. A vector poll or
+  read issued behind the workgroup's own weight loads waits for them, so a
+  role polls only after its weights have landed, or the plan states why they
+  land first (`plan.py` checks every such wait).
+* Per-wave loops (the MoE stream, per-wave polls) hold no workgroup barrier
+  and no cross-wave layout change: their trip counts differ by wave.
+
 ### Caches and request state
 
 * A fused layer writes the K/V rows of the layer it prepares at the slots and
