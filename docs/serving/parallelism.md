@@ -948,6 +948,12 @@ Before benchmarking:
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
 
+`--moe-weight-sharing-copy-ctas C` fetches remote weights with a copy kernel on
+`C` CTAs instead of copy engines. With every worker pulling at once, copy-engine
+reads stay near 420 GB/s per GB300 and leave the forward waiting on weights;
+the kernel reaches the fabric limit but shares SMs with compute, so use a few
+dozen CTAs (32 for K3 NVFP4 on GB300) rather than one per SM.
+
 The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
 `--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.

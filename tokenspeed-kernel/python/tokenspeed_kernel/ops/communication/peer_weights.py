@@ -119,6 +119,7 @@ def create_peer_weight_store(
     model_identity: str,
     pool_page_bytes: int,
     copy_implementation: str,
+    copy_kernel_ctas: int | None,
     solution: str,
 ) -> PeerWeightStore:
     """Create immutable peer storage before loading processed expert weights.
@@ -129,7 +130,10 @@ def create_peer_weight_store(
         device: Local device for source and staging allocations.
         model_identity: Shared checkpoint/quantization identity for validation.
         pool_page_bytes: Physical staging-page size, fixed for the store lifetime.
-        copy_implementation: Explicit transfer implementation; currently ``simple``.
+        copy_implementation: Explicit transfer implementation: ``simple`` issues
+            copy-engine copies; ``kernel`` copies with SMs, which keeps
+            fetches fast while every rank pulls at once.
+        copy_kernel_ctas: CTAs of the ``kernel`` copy; None for ``simple``.
         solution: Registered storage implementation, currently ``cuda``.
 
     Returns:
@@ -157,4 +161,5 @@ def create_peer_weight_store(
         model_identity=model_identity,
         pool_page_bytes=pool_page_bytes,
         copy_implementation=copy_implementation,
+        copy_kernel_ctas=copy_kernel_ctas,
     )

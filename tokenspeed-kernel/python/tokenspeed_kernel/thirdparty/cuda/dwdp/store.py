@@ -25,12 +25,19 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication._triton.peer_fetch import (
+    FetchPlan,
+    build_fetch_plan,
+    launch_peer_fetch,
+)
 from tokenspeed_kernel.ops.communication.peer_weights import (
     ExpertPartition,
     ExpertWeightShard,
 )
 from tokenspeed_kernel.thirdparty.cuda.dwdp import vmm
 from tokenspeed_kernel.thirdparty.cuda.dwdp.layout import WeightLayout
+
+_FETCH_TILE_BYTES = 2 << 20
 
 
 @dataclass
@@ -71,10 +78,17 @@ class CudaPeerWeightStore:
         model_identity: str,
         pool_page_bytes: int,
         copy_implementation: str,
+        copy_kernel_ctas: int | None,
     ) -> None:
-        if copy_implementation != "simple":
+        if copy_implementation not in ("simple", "kernel"):
             raise ValueError(
                 f"Unsupported peer copy implementation: {copy_implementation}"
+            )
+        if (copy_implementation == "kernel") != (
+            copy_kernel_ctas is not None and copy_kernel_ctas > 0
+        ):
+            raise ValueError(
+                "copy_kernel_ctas must be positive exactly for the kernel copy"
             )
         if dist.get_backend(group) != "gloo":
             raise ValueError("Weight setup requires a CPU gloo group")
@@ -103,6 +117,12 @@ class CudaPeerWeightStore:
         self._layers: dict[int, _Layer] = {}
         self._views: dict[int, dict[str, torch.Tensor]] = {}
         self._plans: dict[int, list[tuple[int, int, int]]] = {}
+        self._copy_kernel_ctas = copy_kernel_ctas
+        self._fetch_plans: dict[int, FetchPlan] = {}
+        # Tile offsets are relative to this tensor's address; fetches run in
+        # order on one copy stream, so they share one tile counter.
+        self._fetch_base = torch.empty(2, dtype=torch.int64, device=device)
+        self._fetch_counter = torch.zeros(1, dtype=torch.int32, device=device)
         self._mappings: list[tuple[int, int]] = []
         self._reservations: list[tuple[int, int]] = []
         self._handles: list[int] = []
@@ -390,6 +410,13 @@ class CudaPeerWeightStore:
                 )
             self._views[layer.index] = views
             self._plans[layer.index] = plan
+            if self._copy_kernel_ctas is not None:
+                self._fetch_plans[layer.index] = build_fetch_plan(
+                    plan,
+                    base=self._fetch_base.data_ptr(),
+                    tile_bytes=_FETCH_TILE_BYTES,
+                    device=self.device,
+                )
         stream.synchronize()
         self._finalized = True
 
@@ -417,8 +444,20 @@ class CudaPeerWeightStore:
                 "Cannot overwrite a weight slot before releasing its reader"
             )
         self._stream.wait_event(slot.released)
-        for destination, source, size in self._plans[layer]:
-            vmm.copy(destination, source, size, self._stream)
+        if self._copy_kernel_ctas is None:
+            for destination, source, size in self._plans[layer]:
+                vmm.copy(destination, source, size, self._stream)
+        else:
+            fetch = self._fetch_plans[layer]
+            for destination, source, size in fetch.leftovers:
+                vmm.copy(destination, source, size, self._stream)
+            with torch.cuda.stream(self._stream):
+                launch_peer_fetch(
+                    fetch,
+                    base=self._fetch_base,
+                    counter=self._fetch_counter,
+                    ctas=self._copy_kernel_ctas,
+                )
         slot.ready.record(self._stream)
         slot.layer = layer
 

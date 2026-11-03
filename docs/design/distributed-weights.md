@@ -54,6 +54,13 @@ Host run-ahead is allowed. Only startup and collective teardown coordinate with
 other weight owners, over a dedicated named process group; ordinary prefetch,
 acquire and release do not.
 
+A prefetch is either copy-engine copies or one SM copy kernel on the store's
+copy stream; both follow the same slot events. The kernel's tile table is built
+at finalize, interleaves peers so every owner is read at once, and lets CTAs
+claim tiles so late-starting CTAs do not delay completion. Its CTA count trades
+fetch bandwidth against SMs taken from concurrent compute: persistent kernels
+sized to every SM stall while copy CTAs occupy SMs.
+
 The event loop receives only `DeviceSpecs.requires_forward_coordination`,
 derived from execution groups. It continues using the same scheduler and
 submission path. When execution is fully local, it does not gather per-round

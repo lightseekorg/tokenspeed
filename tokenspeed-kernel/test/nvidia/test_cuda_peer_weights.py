@@ -49,14 +49,20 @@ def peers():
     dist.destroy_process_group()
 
 
-def _store(partition, device):
+# Copy engines, and the SM copy kernel with a few CTAs.
+COPIES = [("simple", None), ("kernel", 8)]
+
+
+def _store(partition, device, copy):
+    implementation, ctas = copy
     return create_peer_weight_store(
         partition=partition,
         group=dist.group.WORLD,
         device=device,
         model_identity="peer-weights-test",
         pool_page_bytes=16 * 1024**2,
-        copy_implementation="simple",
+        copy_implementation=implementation,
+        copy_kernel_ctas=ctas,
         solution="cuda",
     )
 
@@ -67,10 +73,11 @@ def _values(first, count, width, layer, dtype, device):
     return ((ids * 17 + columns + layer * 13) % 113).to(dtype)
 
 
+@pytest.mark.parametrize("copy", COPIES)
 @pytest.mark.parametrize("layers", [2, 3])
-def test_composite_weights_and_queued_forward_lifetime(peers, layers):
+def test_composite_weights_and_queued_forward_lifetime(peers, layers, copy):
     partition, device = peers
-    store = _store(partition, device)
+    store = _store(partition, device, copy)
     fields = (
         ("weight", 1048585, torch.uint8),
         ("scale", 524291, torch.float32),
@@ -190,9 +197,10 @@ def test_composite_weights_and_queued_forward_lifetime(peers, layers):
         store.acquire(0)
 
 
-def test_reader_must_be_released_before_slot_reuse(peers):
+@pytest.mark.parametrize("copy", COPIES)
+def test_reader_must_be_released_before_slot_reuse(peers, copy):
     partition, device = peers
-    store = _store(partition, device)
+    store = _store(partition, device, copy)
     try:
         for layer in range(3):
             store.publish_layer(
@@ -223,9 +231,10 @@ def test_reader_must_be_released_before_slot_reuse(peers):
         store.close()
 
 
-def test_full_model_mapping_count(peers):
+@pytest.mark.parametrize("copy", COPIES)
+def test_full_model_mapping_count(peers, copy):
     partition, device = peers
-    store = _store(partition, device)
+    store = _store(partition, device, copy)
     try:
         for layer in range(92):
             store.publish_layer(
@@ -269,10 +278,11 @@ def test_full_model_mapping_count(peers):
         store.close()
 
 
+@pytest.mark.parametrize("copy", COPIES)
 @pytest.mark.parametrize("switch_stream", [False, True])
-def test_slot_reuse_waits_for_readers_across_streams(peers, switch_stream):
+def test_slot_reuse_waits_for_readers_across_streams(peers, switch_stream, copy):
     partition, device = peers
-    store = _store(partition, device)
+    store = _store(partition, device, copy)
     width = 1048585
     try:
         for layer in range(3):
@@ -324,3 +334,12 @@ def test_slot_reuse_waits_for_readers_across_streams(peers, switch_stream):
         )
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    "copy", [("simple", 8), ("kernel", None), ("kernel", 0), ("fast", None)]
+)
+def test_copy_configuration_is_explicit(peers, copy):
+    partition, device = peers
+    with pytest.raises(ValueError):
+        _store(partition, device, copy)

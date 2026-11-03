@@ -728,6 +728,7 @@ class ServerArgs:
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     moe_weight_sharing_size: int | None = None
+    moe_weight_sharing_copy_ctas: int | None = None
     mapping: Mapping | None = None
     emulate_rank_zero: bool = False
 
@@ -1163,6 +1164,13 @@ class ServerArgs:
             gpu_id_step=self.gpu_id_step,
         )
 
+        if self.moe_weight_sharing_copy_ctas is not None and (
+            self.moe_weight_sharing_size is None
+            or self.moe_weight_sharing_copy_ctas < 1
+        ):
+            raise ValueError(
+                "--moe-weight-sharing-copy-ctas needs a positive value and --moe-weight-sharing-size"
+            )
         if self.moe_weight_sharing_size is not None:
             if self.load_format not in ("auto", "safetensors"):
                 raise ValueError(
@@ -3918,6 +3926,14 @@ class ServerArgs:
             help="Share immutable expert weights across this many workers while executing "
             "each batch locally (DWDP). Omission keeps resident weights. Requires "
             "prefill, TP1/EP1 compute, and disabled model CUDA graphs.",
+        )
+        parser.add_argument(
+            "--moe-weight-sharing-copy-ctas",
+            type=int,
+            default=ServerArgs.moe_weight_sharing_copy_ctas,
+            help="Fetch peer expert weights with a copy kernel on this many CTAs instead "
+            "of copy engines, which slow down while every worker pulls at once. "
+            "Omission keeps copy-engine transfers. Requires --moe-weight-sharing-size.",
         )
         parser.add_argument(
             "--moe-tp-size",

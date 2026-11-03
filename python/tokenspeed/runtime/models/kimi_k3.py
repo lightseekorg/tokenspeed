@@ -3611,7 +3611,14 @@ class KimiLinearModel(nn.Module):
                 device=torch.device("cuda", torch.cuda.current_device()),
                 model_identity=f"{global_server_args_dict['model']}@{global_server_args_dict['revision']}",
                 pool_page_bytes=16 * 1024**2,
-                copy_implementation="simple",
+                copy_implementation=(
+                    "simple"
+                    if global_server_args_dict["moe_weight_sharing_copy_ctas"] is None
+                    else "kernel"
+                ),
+                copy_kernel_ctas=global_server_args_dict[
+                    "moe_weight_sharing_copy_ctas"
+                ],
                 solution="cuda",
             )
             self.peer_weights = MoEPeerWeights(partition=partition, store=store)

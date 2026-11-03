@@ -141,6 +141,7 @@ def test_owned_loading_and_full_expert_compute():
         model_identity="runtime-moe-test",
         pool_page_bytes=16 * 1024**2,
         copy_implementation="simple",
+        copy_kernel_ctas=None,
         solution="cuda",
     )
     manager = MoEPeerWeights(partition=partition, store=store)

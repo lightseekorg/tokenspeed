@@ -83,6 +83,7 @@ global_server_args_dict: dict = {
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
     "all2all_backend": ServerArgs.all2all_backend,
     "deepep_mode": ServerArgs.deepep_mode,
+    "moe_weight_sharing_copy_ctas": ServerArgs.moe_weight_sharing_copy_ctas,
 }
 
 
@@ -105,6 +106,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "kv_cache_dtype": server_args.kv_cache_dtype,
             "enable_nan_detection": server_args.enable_nan_detection,
             "mapping": server_args.mapping,
+            "moe_weight_sharing_copy_ctas": server_args.moe_weight_sharing_copy_ctas,
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
             "batch_invariant_collectives": server_args.batch_invariant_collectives,
             "numerics": server_args.numerics,
