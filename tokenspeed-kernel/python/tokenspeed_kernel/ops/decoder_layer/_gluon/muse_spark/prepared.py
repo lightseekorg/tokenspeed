@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import gluon, triton
+from tokenspeed_kernel.ops.attention.prologue.types import RopeStyle
 from tokenspeed_kernel.ops.communication._iris import (
     HEAP_HEADROOM_BYTES,
     MIN_HEAP_BYTES,
@@ -45,8 +46,10 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (
 )
 from tokenspeed_kernel.ops.decoder_layer import PlanKey
 from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.layer import (
+    ATT_BLOCK_M,
     DIVISIBLE_ARGS,
     EXCHANGE_WORDS,
+    FULL_PROGRAMS,
     HIDDEN,
     KV_HEADS,
     NUM_WARPS,
@@ -156,19 +159,18 @@ class MuseSparkDecoderLayerState:
         self.exchange = UncachedBuffer(EXCHANGE_WORDS, torch.int32, device)
         self.xq = UncachedBuffer(MAX_ROWS * XQ_ROW_BYTES, torch.uint8, device)
         self.xs = UncachedBuffer(XS_MBLOCK_STRIDE, torch.uint8, device)
-        # Attention: per (request, KV head) block, 8 splits x 8 waves of
-        # int32 records; partials [tokens, heads, splits, head dim].
+        # Attention partials and per-wave int32 records, sized for the
+        # larger of the two layouts: a sliding layer's [tokens, heads, 8
+        # splits, head dim] and a full layer's balanced items [items,
+        # BLOCK_M rows, head dim].
+        partial_rows = max(rows * Q_HEADS * SLIDING_SPLITS, FULL_PROGRAMS * ATT_BLOCK_M)
         self.att_records = torch.zeros(
-            max_requests * KV_HEADS * SLIDING_SPLITS * NUM_WARPS,
+            max(max_requests * KV_HEADS * SLIDING_SPLITS, FULL_PROGRAMS) * NUM_WARPS,
             dtype=torch.int32,
             device=device,
         )
-        self.mid_o = torch.empty(
-            (rows, Q_HEADS, SLIDING_SPLITS, 64), dtype=torch.float32, device=device
-        )
-        self.mid_lse = torch.empty(
-            (rows, Q_HEADS, SLIDING_SPLITS), dtype=torch.float32, device=device
-        )
+        self.mid_o = torch.empty((partial_rows, 64), dtype=torch.float32, device=device)
+        self.mid_lse = torch.empty(partial_rows, dtype=torch.float32, device=device)
         # Tagged K-part partials (tag high): router, pooler, QKV.
         self.logits_parts = torch.zeros(
             (8, rows, 256), dtype=torch.int64, device=device
@@ -204,9 +206,11 @@ class MuseSparkDecoderLayerState:
         return MuseNativeIrisState.heap_bytes()
 
 
-def _bf16_with_offset(weight: torch.Tensor, offset: float) -> torch.Tensor:
+def _bf16_with_offset(weight: torch.Tensor | None, offset: float, width: int, device):
     """``bf16(fp32(weight) + offset)``: the norm multiplier the regular
-    kernels form, rounded as they round it."""
+    kernels form, rounded as they round it; ones for a weightless norm."""
+    if weight is None:
+        return torch.ones(width, dtype=torch.bfloat16, device=device)
     return (weight.float() + offset).to(torch.bfloat16).contiguous()
 
 
@@ -346,6 +350,7 @@ class MuseSparkFusedDecoderLayer:
         if not weights["post_expert_replicated"]:
             problems.append("post_expert_proj is not replicated on this rank")
         attention = weights["attention"]
+        device = weights["o_proj"].device
         post_attn_w, post_attn_eps, post_attn_offset = norm("post_attention_norm")
         pre_ffn_w, pre_ffn_eps, pre_ffn_offset = norm("pre_feedforward_norm")
         pooled_w, pooled_eps, pooled_offset = norm("pooled_norm")
@@ -368,11 +373,15 @@ class MuseSparkFusedDecoderLayer:
             o_proj=_require("o_proj", weights["o_proj"], (HIDDEN, Q_WIDTH), torch.bfloat16),
             alpha=_require("alpha", alpha, (HIDDEN,), torch.float32),
             beta=_require("beta", beta, (HIDDEN,), torch.float32),
-            post_attn_norm=_require(
-                "post_attention_norm", post_attn_w, (HIDDEN,), torch.bfloat16
+            # A weightless post-attention norm (Muse) passes the multiplier
+            # vector of ones and no weight to OWN1.
+            post_attn_norm=(
+                weights["o_proj"]
+                if post_attn_w is None
+                else _require("post_attention_norm", post_attn_w, (HIDDEN,), torch.bfloat16)
             ),
-            post_attn_bf16=_bf16_with_offset(post_attn_w, post_attn_offset),
-            pre_ffn_bf16=_bf16_with_offset(pre_ffn_w, pre_ffn_offset),
+            post_attn_bf16=_bf16_with_offset(post_attn_w, post_attn_offset, HIDDEN, device),
+            pre_ffn_bf16=_bf16_with_offset(pre_ffn_w, pre_ffn_offset, HIDDEN, device),
             router_hi=router_hi,
             router_lo=router_lo,
             router_multiplier=float(weights["router_multiplier"]),
@@ -386,8 +395,8 @@ class MuseSparkFusedDecoderLayer:
             ),
             alpha2=_require("ffn alpha", alpha2, (HIDDEN,), torch.float32),
             beta2=_require("ffn beta", beta2, (HIDDEN,), torch.float32),
-            post2_bf16=_bf16_with_offset(post2_w, post2_offset),
-            next_pre_bf16=_bf16_with_offset(next_w, next_offset),
+            post2_bf16=_bf16_with_offset(post2_w, post2_offset, HIDDEN, device),
+            next_pre_bf16=_bf16_with_offset(next_w, next_offset, HIDDEN, device),
             next_qkv=next_qkv,
         )  # fmt: skip
         model = dict(
@@ -396,6 +405,7 @@ class MuseSparkFusedDecoderLayer:
             gate_eps=float(attention["gate_eps"]),
             post_attn_eps=post_attn_eps,
             post_attn_offset=post_attn_offset,
+            post_attn_has_weight=post_attn_w is not None,
             pre_ffn_eps=pre_ffn_eps,
             pooled_eps=pooled_eps,
             pooled_offset=pooled_offset,
@@ -429,8 +439,6 @@ class MuseSparkFusedDecoderLayer:
     def _compile(self, key: PlanKey) -> list[str]:
         """Compile ``key`` offline now and check its residency; the reasons
         this rank cannot serve it, or none."""
-        if key.layer_kind == "full":
-            return [f"{key}: full-attention layers are not composed yet"]
         properties = torch.cuda.get_device_properties(self.state.device)
         if properties.multi_processor_count != GRID:
             return [
@@ -464,6 +472,19 @@ class MuseSparkFusedDecoderLayer:
     def _launch(self, key, q, gate, residual, positions, cache, prologue, normed_out):
         state, t, moe = self.state, self.tensors, self.moe
         rows = q.shape[0]
+        if key.layer_kind == "full" and cache.split_schedule is None:
+            raise ValueError("a full layer's decode view carries no split schedule")
+        if (
+            prologue is not None
+            and prologue.rotary is not None
+            and (
+                prologue.rotary.style != RopeStyle.GPTJ
+                or prologue.rotary.mrope is not None
+            )
+        ):
+            raise ValueError(
+                "the fused prologue rotates interleaved (GPT-J) pairs only, without mrope"
+            )
         scales = None if prologue is None else prologue.cache.scales
         constexprs = self._constexprs(
             key,
@@ -506,7 +527,9 @@ class MuseSparkFusedDecoderLayer:
             state.xq, state.xs, _DEADLINE_TICKS, 0,
             *state.iris.view_args(),
             q, gate, gate.stride(0), cache.k_cache, cache.v_cache, cache.page_table,
-            cache.seq_lens, state.mid_o, state.mid_lse, state.att_records,
+            cache.seq_lens,
+            cache.page_table if key.layer_kind == "sliding" else cache.split_schedule,
+            state.mid_o, state.mid_lse, state.att_records,
             t.o_proj, residual, t.alpha, t.beta, t.post_attn_norm, t.post_attn_bf16,
             t.pre_ffn_bf16, t.router_hi, t.router_lo, t.router_multiplier,
             t.router_bias, state.logits_parts, t.pooler, state.pooled_parts,
@@ -541,7 +564,8 @@ class MuseSparkFusedDecoderLayer:
             raise ValueError("this layer's next layer is fused: use forward")
         weight, eps, offset = next_norm
         if float(eps) != self.model["pre2_eps"] or not torch.equal(
-            _bf16_with_offset(weight, float(offset)), self.tensors.next_pre_bf16
+            _bf16_with_offset(weight, float(offset), HIDDEN, q.device),
+            self.tensors.next_pre_bf16,
         ):
             raise ValueError("next_norm differs from the prepared next input norm")
         normed = torch.empty(
