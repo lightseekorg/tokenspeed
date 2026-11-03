@@ -105,7 +105,7 @@ def _epoch(state) -> int:
 
 
 def _layer(state, weights, deadline_seconds: float):
-    return MuseSparkFusedDecoderLayer.for_benchmark(
+    return MuseSparkFusedDecoderLayer(
         plan_keys=[ONE, TWO], weights=weights, state=state,
         plan_fields=DEFAULT_PLAN_FIELDS, stamps=False,
         deadline_ticks=int(deadline_seconds * TICKS_PER_SECOND),
