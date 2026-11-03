@@ -498,9 +498,11 @@ impl TransferPeer for FakePeer {
             let room = wire.rooms.entry(*room).or_default();
             match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
                 TransferPoll::Failed => {
-                    // The peer engine sees the failure only on the wire.
+                    // The peer engine sees the failure only on the wire. Its
+                    // transfer stops at once.
                     room.fails = true;
                     events.push(PdEvent::Failed(rid.clone()));
+                    events.push(PdEvent::Stopped(rid.clone()));
                     false
                 }
                 TransferPoll::Bootstrapped if !*bootstrapped => {

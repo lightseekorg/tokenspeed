@@ -45,7 +45,9 @@ use ts_collective::{Group, Mesh, Reduce};
 
 use crate::{
     batch::{BatchRows, Staged},
-    control::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer},
+    control::{
+        stalled_drains, BootstrapInfo, Draining, PdError, PdEvent, RemotePrefill, TransferPeer,
+    },
     http,
     layout::{
         contract::Contract,
@@ -688,6 +690,7 @@ struct Receiver {
     addr: String,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
+    draining: Option<Draining>,
 }
 
 /// A Decode rank's PD transfer peer.
@@ -702,6 +705,7 @@ pub struct DecodePeer {
     order: Vec<String>,
     receivers: HashMap<String, Receiver>,
     timeout_logged: bool,
+    drain_logged_at: Option<Instant>,
 }
 
 impl DecodePeer {
@@ -795,6 +799,7 @@ impl DecodePeer {
                 order: Vec::new(),
                 receivers: HashMap::new(),
                 timeout_logged: false,
+                drain_logged_at: None,
             },
             outbox,
         ))
@@ -860,6 +865,7 @@ impl TransferPeer for DecodePeer {
                     addr: addr.clone(),
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
+                    draining: None,
                 },
             )
             .is_none()
@@ -969,16 +975,27 @@ impl TransferPeer for DecodePeer {
             if receiver.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 receiver.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
-            } else if poll == TransferPoll::Failed && retired != 0 {
-                let reason = self
-                    .shared
-                    .state()
-                    .rooms
-                    .failure(receiver.room)
-                    .map(str::to_owned);
-                tracing::warn!(rid, room = receiver.room, reason, "KV transfer failed");
-                events.push(PdEvent::Failed(rid.clone()));
-                ended.push(rid.clone());
+            } else if poll == TransferPoll::Failed {
+                if receiver.local != TransferPoll::Failed {
+                    receiver.local = TransferPoll::Failed;
+                    receiver.draining = Some(Draining {
+                        rid: rid.clone(),
+                        room: receiver.room,
+                        since: now,
+                    });
+                    let reason = self
+                        .shared
+                        .state()
+                        .rooms
+                        .failure(receiver.room)
+                        .map(str::to_owned);
+                    tracing::warn!(rid, room = receiver.room, reason, "KV transfer failed");
+                    events.push(PdEvent::Failed(rid.clone()));
+                }
+                if retired != 0 {
+                    events.push(PdEvent::Stopped(rid.clone()));
+                    ended.push(rid.clone());
+                }
             } else if receiver.local == TransferPoll::Bootstrapped && poll == TransferPoll::Success
             {
                 receiver.local = TransferPoll::Success;
@@ -1006,6 +1023,19 @@ impl TransferPeer for DecodePeer {
         }
         for rid in ended {
             self.forget(&rid);
+        }
+        let stalled = stalled_drains(
+            self.order
+                .iter()
+                .filter_map(|rid| self.receivers[rid].draining.as_ref()),
+            &mut self.drain_logged_at,
+            now,
+        );
+        if !stalled.is_empty() {
+            tracing::warn!(
+                ?stalled,
+                "PD destination pages are waiting for cancellation acknowledgments"
+            );
         }
         Ok(events)
     }
