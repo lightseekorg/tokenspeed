@@ -160,6 +160,40 @@ def iris_muse_moetail_send(
     valid = (rows < M)[:, None] & (outputs >= 0)[None, :]
     # OUTPUTS divides the 512-element tile, so a row's outputs share one stage.
     stage = gl.load(epochs + elements // 512, mask=valid, other=0).to(gl.uint32) % 3
+    iris_muse_moetail_push(
+        values, stage, first_output, program, regions, M, sink, RANK, WORLD_SIZE,
+        LOCAL_WIDTH, MAX_ELEMENTS, BLOCK_M, OUTPUTS, NUM_WARPS, PEER_STORE_CACHE,
+        OWN_STORE_CACHE,
+    )  # fmt: skip
+
+
+@gluon.jit
+def iris_muse_moetail_push(
+    values,
+    stage,
+    first_output,
+    program,
+    regions,
+    M,
+    sink: gl.constexpr,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    LOCAL_WIDTH: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    OUTPUTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    PEER_STORE_CACHE: gl.constexpr,
+    OWN_STORE_CACHE: gl.constexpr,
+):
+    """iris_muse_moetail_send with the mailbox copy given: ``stage`` (uint32,
+    scalar or per element of the [BLOCK_M, OUTPUTS] send layout) selects it,
+    WORLD_SIZE * MAX_ELEMENTS elements each."""
+    layout: gl.constexpr = _send_layout(OUTPUTS, NUM_WARPS)
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
+    outputs = first_output + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(0, layout))
+    elements = rows[:, None] * LOCAL_WIDTH + outputs[None, :]
+    valid = (rows < M)[:, None] & (outputs >= 0)[None, :]
     # Many lanes may hold each value; the store lowering masks the duplicates,
     # so one lane writes each 8-byte packet.
     values = _iris_sanitize_lamport_bf16(gl.convert_layout(values, layout))
