@@ -2066,6 +2066,42 @@ mod tests {
             [STEP_COUNT_MAX - 1, 0]
         );
     }
+
+    #[test]
+    fn cancellation_ack_waits_for_the_last_pending_chunk() {
+        let mut state = State::default();
+        let key = (4, "cache".to_owned());
+        let route = ("decode".to_owned(), 7000);
+        state.cancel_room(4, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), route.clone());
+        state.pending_chunks.insert(4, 2);
+        assert!(state.take_cancellation_replies().is_empty());
+        *state.pending_chunks.get_mut(&4).unwrap() -= 1;
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&4);
+        assert_eq!(state.take_cancellation_replies(), [(key, route)]);
+        assert!(state.take_cancellation_replies().is_empty());
+    }
+
+    #[test]
+    fn uncertain_writes_never_acknowledge_cancellation() {
+        let mut state = State::default();
+        let key = (5, "cache".to_owned());
+        state.cancel_room(5, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), ("decode".to_owned(), 7000));
+        state.uncertain.insert(5);
+        state.pending_chunks.insert(5, 1);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&5);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.clear(5);
+        assert!(state.take_cancellation_replies().is_empty());
+        assert!(state.cancellation_replies.contains_key(&key));
+    }
 }
 
 #[cfg(test)]

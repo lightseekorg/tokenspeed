@@ -1129,6 +1129,41 @@ mod tests {
     }
 
     #[test]
+    fn failure_and_lost_routes_do_not_replace_cancellation_acknowledgments() {
+        let mut state = State {
+            cache_id: "cache".to_owned(),
+            ..State::default()
+        };
+        connected(&mut state, 1, "prefill:80");
+        state.targets.insert(
+            1,
+            Arc::new(
+                (0..2)
+                    .map(|rank| Target {
+                        host: "prefill".to_owned(),
+                        port: 80,
+                        rank,
+                        is_dummy: false,
+                    })
+                    .collect(),
+            ),
+        );
+        state.admissions.insert(1, 3);
+        state.apply(StatusMessage::bare(1, TransferPoll::Failed, 0));
+        state.cancellations.insert(1, Cancellation::default());
+        assert!(!state.cancellation_retired(1));
+        state.acknowledge_cancellation(1, "cache", 0);
+        assert!(!state.cancellation_retired(1));
+        state.lose_node("prefill:80");
+        assert!(!state.cancellation_retired(1));
+        state.apply(success(1, 1, 7));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert!(!state.cancellation_retired(1));
+        state.acknowledge_cancellation(1, "cache", 1);
+        assert!(state.cancellation_retired(1));
+    }
+
+    #[test]
     fn cancellation_needs_every_target_including_dummy_and_the_current_cache() {
         let mut state = State {
             cache_id: "current".to_owned(),
