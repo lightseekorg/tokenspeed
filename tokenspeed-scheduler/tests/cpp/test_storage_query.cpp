@@ -142,6 +142,70 @@ TEST_P(StorageQueryHighestTest, RestoresTheHighestCheckpointWithinTheActualKeyBu
 
 INSTANTIATE_TEST_SUITE_P(KeyBudgets, StorageQueryHighestTest, ::testing::Values(40u, 256u));
 
+TEST(StorageQueryTest, PreparedQueryKeysRespectShorterBoundAndKeyBudget) {
+    QueryCache cache(4, FullAndStates(4, 1, 2), 64);
+    QueryPrompt tokens(14, 4);
+    const auto full = tokens.Prefix(14, true);
+    const auto keys = cache.coordinator.ProbePromptPrefix(full).group_keys;
+    for (const int bound : {4, 7, 8, 11, 14}) {
+        auto prompt = tokens.Prefix(bound, true);
+        for (std::size_t budget = 0; budget <= 20; ++budget) {
+            const auto fresh = cache.coordinator.MissingStorageKeys(prompt, budget);
+            prompt.prepared_keys = keys;
+            const auto reused = cache.coordinator.MissingStorageKeys(prompt, budget);
+            EXPECT_EQ(reused.max_tokens, fresh.max_tokens);
+            EXPECT_EQ(reused.keys, fresh.keys);
+            prompt.prepared_keys.reset();
+        }
+    }
+}
+
+TEST(StorageQueryTest, PreparedReservationMatchesFreshKeysAcrossBudgets) {
+    QueryCache cache(4, FullAndStates(4, 4, 2), 64);
+    QueryPrompt tokens(14, 4);
+    const auto plain = tokens.Prefix(14, true);
+    auto prepared = plain;
+    prepared.prepared_keys = cache.coordinator.ProbePromptPrefix(plain).group_keys;
+    const auto query = cache.coordinator.MissingStorageKeys(plain, 100);
+    for (std::size_t budget = 0; budget <= 8; ++budget) {
+        auto fresh = cache.coordinator.ReserveStoragePrefix(plain, query.keys, budget);
+        auto reused = cache.coordinator.ReserveStoragePrefix(prepared, query.keys, budget);
+        EXPECT_EQ(reused.keys, fresh.keys);
+        EXPECT_EQ(reused.blocks.size(), fresh.blocks.size());
+        EXPECT_EQ(reused.tail_prior, fresh.tail_prior);
+        ASSERT_EQ(reused.tail.has_value(), fresh.tail.has_value());
+        if (fresh.tail) {
+            EXPECT_EQ(reused.tail->tail_tokens, fresh.tail->tail_tokens);
+            EXPECT_EQ(reused.tail->hash, fresh.tail->hash);
+        }
+    }
+}
+
+TEST(StorageQueryTest, PreparedReservationObservesCacheChanges) {
+    QueryCache cache(4, FullAndStates(4, 4, 1), 64);
+    QueryPrompt tokens(8, 4);
+    auto prompt = tokens.Prefix(8, false);
+    const CacheKey first{.group_id = 0, .content_hash = tokens.hashes[0]};
+    const std::vector<CacheKey> remote{
+        first,
+        {.group_id = 0, .content_hash = tokens.hashes[1]},
+        {.group_id = 1, .content_hash = tokens.hashes[1]},
+    };
+    cache.Warm(std::span{&first, 1});
+    prompt.prepared_keys = cache.coordinator.ProbePromptPrefix(prompt).group_keys;
+    ASSERT_TRUE(cache.coordinator.ClearCache());
+    {
+        auto reservation = cache.coordinator.ReserveStoragePrefix(prompt, remote, 3);
+        EXPECT_EQ(reservation.keys, remote);
+    }
+    cache.Warm(std::span{&first, 1});
+    {
+        auto reservation = cache.coordinator.ReserveStoragePrefix(prompt, remote, 3);
+        EXPECT_EQ(reservation.keys.size(), 2u);
+        EXPECT_FALSE(Has(reservation.keys, first));
+    }
+}
+
 TEST(StorageQueryTest, MissingHighestStateFallsBackToTheNextCompleteCheckpoint) {
     QueryCache cache(4, FullAndStates(4, 4, 1), 64);
     QueryPrompt prompt(11, 4);
