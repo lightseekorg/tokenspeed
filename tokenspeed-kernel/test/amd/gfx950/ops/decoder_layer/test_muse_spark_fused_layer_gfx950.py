@@ -122,6 +122,7 @@ class _DecodeCache:
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     max_seqlen_k: int
+    split_schedule: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -234,7 +235,10 @@ def _inputs(key):
         prepared_query=(q, gate),
         residual=residual,
         positions=positions,
-        cache=_DecodeCache(cache(1.0), cache(1.0), page_table, seq_lens, MAX_POSITION),
+        # Sliding layers: no split schedule.
+        cache=_DecodeCache(
+            cache(1.0), cache(1.0), page_table, seq_lens, MAX_POSITION, None
+        ),
         next_k=next_k,
         next_v=next_k.clone(),
         slots=slots,
