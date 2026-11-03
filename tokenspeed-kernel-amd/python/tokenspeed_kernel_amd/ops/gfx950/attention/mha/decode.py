@@ -1997,10 +1997,13 @@ def _locate_balanced(
 
 
 @gluon.jit
-def _store_balanced(program, acc, l_i, m_i, block_item, splits):
+def _store_balanced(
+    program, acc, l_i, m_i, block_item, splits, PARTIAL_CACHE: gl.constexpr
+):
     """Store the partial of a balanced work item. A row block's items hold
     BLOCK_M x splits partials, row major, from block_item on, so the reduce
-    reads each row's partials from one contiguous range."""
+    reads each row's partials from one contiguous range. ``PARTIAL_CACHE`` is
+    the stores' cache modifier ("" for none)."""
     cfg = program.cfg
     offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
@@ -2023,8 +2026,11 @@ def _store_balanced(program, acc, l_i, m_i, block_item, splits):
         program.mid_o_ptr,
         rows[:, None] * cfg.HEAD_DIM + offs_d[None, :],
         mask=valid[:, None],
+        cache=PARTIAL_CACHE,
     )
-    cdna4.buffer_store(part_lse, program.mid_lse_ptr, rows, mask=valid)
+    cdna4.buffer_store(
+        part_lse, program.mid_lse_ptr, rows, mask=valid, cache=PARTIAL_CACHE
+    )
 
 
 @gluon.jit
@@ -2106,6 +2112,91 @@ def _stream_balanced(
     return m_i, l_i, acc
 
 
+@gluon.jit
+def mha_decode_balanced_item_gfx950(
+    cfg: gl.constexpr,
+    q_ptr,
+    cache_seqlens_ptr,
+    num_requests,
+    schedule_ptr,
+    page_table_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    program_index,
+):
+    """Locate work item ``program_index`` of a balanced schedule.
+
+    ``program_index`` runs over the grid of ``gluon_mha_decode_balanced_gfx950``
+    (at least every item); a persistent kernel runs several per workgroup,
+    keeping each index's XCD (index mod 8) on the workgroup's.
+
+    Returns:
+        ``(program, live, block_item, splits)``: the split's
+        ``AttentionProgram``, whether the index holds an item, the first item
+        of its row block (where the block's partials and records start) and
+        the request's split count.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
+    row_blocks: gl.constexpr = cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS
+    split_pages = gl.load(schedule_ptr)
+    num_slots = gl.load(schedule_ptr + 1)
+    num_items = num_slots * row_blocks
+    # Work-groups are dispatched round robin over the XCDs (8, as every
+    # gfx950 kernel here assumes). _remap_xcd gives each XCD a contiguous run
+    # of the items, so the row blocks of a slot, which read the same pages,
+    # share one XCD's L2 and address translations.
+    item = gl.where(
+        program_index < num_items,
+        _remap_xcd(program_index, num_items, 8),
+        num_items,
+    )
+    slot = item // row_blocks
+    head_block = item - slot * row_blocks
+    request, seq_len, first_slot, splits = _find_slot(
+        schedule_ptr, cache_seqlens_ptr, num_requests, slot, layout
+    )
+    split_id = slot - first_slot
+    program = _locate_balanced(
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+        request,
+        seq_len,
+        head_block,
+        split_id,
+        splits,
+        split_pages,
+    )
+    # The row block's partials follow its first item, at its share of the
+    # request's slots times row blocks.
+    return (
+        program,
+        item < num_items,
+        first_slot * row_blocks + head_block * splits,
+        splits,
+    )
+
+
+@gluon.jit
+def mha_decode_balanced_split_gfx950(
+    program, k_cache_ptr, v_cache_ptr, NUM_STAGES: gl.constexpr
+):
+    """Stream one balanced split (``mha_decode_balanced_item_gfx950``'s
+    program); returns its ``(m_i, l_i, acc)`` softmax state."""
+    q = program.load_q()
+    m_i, l_i, acc, sink_log2 = program.init_state(program.q_ptr, False)
+    return _stream_balanced(
+        program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+    )
+
+
 @gluon.jit(do_not_specialize=("num_requests",))
 def gluon_mha_decode_balanced_gfx950(
     # The compiler (LLVM AMDGPU kernel-argument preloading) preloads the
@@ -2157,55 +2248,24 @@ def gluon_mha_decode_balanced_gfx950(
         k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
-    row_blocks: gl.constexpr = NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS
-    split_pages = gl.load(schedule_ptr)
-    num_slots = gl.load(schedule_ptr + 1)
-    num_items = num_slots * row_blocks
-    # Work-groups are dispatched round robin over the XCDs (8, as every
-    # gfx950 kernel here assumes). _remap_xcd gives each XCD a contiguous run
-    # of the items, so the row blocks of a slot, which read the same pages,
-    # share one XCD's L2 and address translations.
-    pid = gl.program_id(0)
-    item = gl.where(pid < num_items, _remap_xcd(pid, num_items, 8), num_items)
-    slot = item // row_blocks
-    head_block = item - slot * row_blocks
-    request, seq_len, first_slot, splits = _find_slot(
-        schedule_ptr, cache_seqlens_ptr, num_requests, slot, layout
-    )
-    split_id = slot - first_slot
-    program = _locate_balanced(
+    program, live, block_item, splits = mha_decode_balanced_item_gfx950(
         cfg,
         q_ptr,
+        cache_seqlens_ptr,
+        num_requests,
+        schedule_ptr,
+        page_table_ptr,
         k_cache_ptr,
         v_cache_ptr,
-        page_table_ptr,
-        cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
-        request,
-        seq_len,
-        head_block,
-        split_id,
-        splits,
-        split_pages,
+        gl.program_id(0),
     )
-    if item < num_items:
-        q = program.load_q()
-        m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
-        m_i, l_i, acc = _stream_balanced(
-            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+    if live:
+        m_i, l_i, acc = mha_decode_balanced_split_gfx950(
+            program, k_cache_ptr, v_cache_ptr, NUM_STAGES
         )
-        # The row block's partials follow its first item, at its share of
-        # the request's slots times row blocks.
-        _store_balanced(
-            program,
-            acc,
-            l_i,
-            m_i,
-            first_slot * row_blocks + head_block * splits,
-            splits,
-        )
+        _store_balanced(program, acc, l_i, m_i, block_item, splits, "")
 
 
 @gluon.jit
