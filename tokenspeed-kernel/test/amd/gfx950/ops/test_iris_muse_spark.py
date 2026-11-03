@@ -1871,6 +1871,145 @@ def _muse_moetail_worker(rank, world_size, device):
     assert all(torch.equal(e, reduction.lamport_epochs) for e in epochs)
 
 
+def _muse_sliding_attention_tail_worker(rank, world_size, device):
+    """The fused sliding attention tail matches today's four kernels.
+
+    Today: sliding split attention, the gated per-head norm, the o_proj GEMV
+    into the producer buffer and the attention boundary. The tail differs only
+    in reduction orders (GEMV, per-head and per-chunk sums, the norm-sum
+    expansion), so it agrees within rounding while ranks agree bit for bit.
+    Row counts alternate 8 -> 16 -> 8 -> 16 eagerly and under graph replay
+    with fresh inputs, one rank lags, and both post-norm forms run; afterwards
+    the next launch's mailboxes are empty.
+    """
+    from tokenspeed_kernel.ops.gemm import mv
+    from tokenspeed_kernel.ops.layernorm.fused_norm import (
+        weightless_rmsnorm_gated_sigmoid,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        launch_gluon_mha_decode_gfx950,
+    )
+
+    state = _muse_state(rank, device, 16, True)
+    if world_size != 8:
+        assert state.attntail_region is None
+        return
+    generator = torch.Generator(device=device).manual_seed(4100 + rank)
+    shared = torch.Generator(device=device).manual_seed(4200)
+    # 4104 cached tokens per request: a 2048-key window over 33 pages of 64.
+    context, window, page = 4104, 2047, 64
+    pages = context // page + 1
+    k_cache = (
+        torch.randn(2 * pages + 8, page, 2, 64, device=device, generator=generator) / 2
+    ).to(torch.float8_e4m3fn)
+    v_cache = torch.randn_like(k_cache, dtype=torch.float32).to(torch.float8_e4m3fn)
+    page_table = (
+        torch.randperm(2 * pages + 8, device=device, generator=generator)[: 2 * pages]
+        .view(2, pages)
+        .to(torch.int32)
+    )
+    seqlens = torch.full((2,), context, dtype=torch.int32, device=device)
+    weight = torch.randn(8192, 1024, device=device, generator=generator).bfloat16() / 32
+    pre = (torch.randn(8192, device=device, generator=shared) * 0.1).bfloat16()
+    post = (torch.randn(8192, device=device, generator=shared) * 0.1).bfloat16()
+    beta = torch.sigmoid(torch.randn(8192, device=device, generator=shared))
+    alpha = torch.sqrt(1 - beta.square())
+    q = torch.empty(16, 16, 64, dtype=torch.float8_e4m3fn, device=device)
+    qkvg = torch.empty(16, 2304, dtype=torch.bfloat16, device=device)
+    stream = torch.empty(16, 8192, device=device)
+
+    def update(phase):
+        g = torch.Generator(device=device).manual_seed(4300 + 8 * phase + rank)
+        q.copy_((torch.randn(16, 16, 64, device=device, generator=g) / 3).to(q.dtype))
+        qkvg.copy_(torch.randn(16, 2304, device=device, generator=g).bfloat16())
+        # The residual is replicated across ranks.
+        h = torch.Generator(device=device).manual_seed(4400 + phase)
+        stream.copy_(torch.randn(16, 8192, device=device, generator=h))
+
+    def tail(rows, post_weight, lag):
+        if lag:
+            torch.cuda._sleep(20000)
+        return state.sliding_attention_boundary(
+            q[:rows],
+            k_cache,
+            v_cache,
+            page_table[: rows // 8],
+            seqlens[: rows // 8],
+            context,
+            window,
+            0.125,
+            qkvg[:rows, 1280:],
+            weight,
+            stream[:rows],
+            post_weight,
+            alpha,
+            beta,
+            pre,
+            1e-6,
+            1e-6,
+            1.0,
+            1e-6,
+            1.0,
+        )
+
+    def today(rows, post_weight):
+        attended = launch_gluon_mha_decode_gfx950(
+            q[:rows],
+            k_cache,
+            v_cache,
+            page_table[: rows // 8],
+            seqlens[: rows // 8],
+            context,
+            max_seqlen_q=8,
+            window_left=window,
+            softmax_scale=0.125,
+        )
+        normed = weightless_rmsnorm_gated_sigmoid(
+            attended.view(rows, 1024), qkvg[:rows, 1280:], 16, 64, 1e-6, False
+        )
+        branch = state.all_reduce.producer.acquire(((rows, 8192),))[0]
+        mv(normed, weight, out=branch)
+        return state.all_reduce_symmetric_boundary(
+            branch, stream[:rows], post_weight, alpha, beta, pre, 1e-6, 1.0, 1e-6, 1.0
+        )
+
+    def check(rows, got, post_weight):
+        expected = today(rows, post_weight)
+        for a, b in zip(got, expected, strict=True):
+            a, b = a.float(), b.float()
+            # Measured relative RMS 5e-5 to 1e-4 (reduction order only).
+            assert (a - b).pow(2).mean().sqrt() < 1e-3 * b.pow(2).mean().sqrt()
+            copies = [torch.empty_like(a) for _ in range(world_size)]
+            dist.all_gather(copies, a)
+            assert all(torch.equal(c, copies[0]) for c in copies)
+
+    order = (8, 16, 8, 16)
+    for phase in range(2):
+        update(phase)
+        for step, rows in enumerate(order):
+            post_weight = post if step % 2 else None
+            check(rows, tail(rows, post_weight, rank == step), post_weight)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = [tail(rows, None, False) for rows in order]
+    for phase in range(2, 4):
+        update(phase)
+        graph.replay()
+        for rows, got in zip(order, outputs):
+            check(rows, got, None)
+    torch.cuda.synchronize()
+    dist.barrier()
+    # The next launch's stage is empty everywhere (cleared at an entry two
+    # launches back and unused since), and every attention-box word is re-armed.
+    epochs = state.attntail_epochs
+    assert bool((epochs == epochs[0]).all())
+    stage = int(epochs[0]) % 3
+    assert bool((state.attntail_region[stage].view(torch.int32) == -(2**31)).all())
+    assert bool((state.attention_box == -2147450880).all())
+
+
 def _muse_decode_step_lamport_worker(rank, world_size, device):
     """Interleave every Lamport user of one decode layer under graph replay.
 
@@ -3637,6 +3776,9 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
             _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"
         ),
         pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
+        pytest.param(
+            _muse_sliding_attention_tail_worker, "nccl", id="sliding_attention_tail"
+        ),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
