@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.fused_decoder_layer import (
     current_deployment,
     deployment_decline_reasons,
 )
+from tokenspeed.runtime.models.base.layer_stack import DecoderLayerStack
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.failure_records import rank_record_path
 
@@ -59,7 +60,7 @@ FUSED_REQUESTS = (1, 2)
 RECIPE = "muse_spark"
 
 
-class MuseSparkLayerStack:
+class MuseSparkLayerStack(DecoderLayerStack):
     """Muse Spark's decoder layers for one forward.
 
     Fused layers cover the contiguous layers with MXFP4 experts; the layers
@@ -216,7 +217,7 @@ class MuseSparkLayerStack:
             return range(0)
         return self.fused_indices
 
-    def run(
+    def run(  # type: ignore[override]
         self,
         model: MuseSparkModel,
         positions: torch.Tensor,
@@ -227,7 +228,8 @@ class MuseSparkLayerStack:
         aux_hidden_states: list[torch.Tensor],
         taps_live: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the model's layers on one step.
+        """Run the model's layers on one step, with the boundary values Muse
+        Spark's layers pass (its forward overrides the default arguments).
 
         Args:
             model: The model whose layers run.
