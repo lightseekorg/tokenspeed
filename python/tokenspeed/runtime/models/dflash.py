@@ -31,16 +31,15 @@ from torch import nn
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
     hf_sliding_window_to_window_left,
@@ -185,49 +184,6 @@ class DFlashAttention(nn.Module):
         )
 
 
-class DFlashMLP(nn.Module):
-    def __init__(
-        self,
-        config,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        hidden_size = int(config.hidden_size)
-        intermediate_size = int(config.intermediate_size)
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=mapping.dense.tp_rank,
-            tp_size=mapping.dense.tp_size,
-            tp_group=mapping.dense.tp_group,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-            reduce_results=False,
-            tp_rank=mapping.dense.tp_rank,
-            tp_size=mapping.dense.tp_size,
-            tp_group=mapping.dense.tp_group,
-        )
-        if getattr(config, "hidden_act", "silu") != "silu":
-            raise ValueError("DFlash only supports silu activation.")
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
-
 class DFlashDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -250,9 +206,15 @@ class DFlashDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.mlp = DFlashMLP(
-            config=config,
-            mapping=mapping,
+        self.mlp = GatedMLP.tensor_parallel(
+            hidden_size=hidden_size,
+            intermediate_size=int(config.intermediate_size),
+            activation=gated_activation(getattr(config, "hidden_act", "silu")),
+            tp_rank=mapping.dense.tp_rank,
+            tp_size=mapping.dense.tp_size,
+            tp_group=mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
