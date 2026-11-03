@@ -122,7 +122,15 @@ def _pin(values):
 
 
 @gluon.jit
-def _rows_x_step(x_ptr, rows, x_columns, M, K: gl.constexpr, start: gl.constexpr):
+def _rows_x_step(
+    x_ptr,
+    rows,
+    x_columns,
+    M,
+    K: gl.constexpr,
+    start: gl.constexpr,
+    X_CACHE: gl.constexpr,
+):
     """Load one K step of every activation row; rows past M read zero."""
     # No ``other``: a masked lane's buffer load gets an out-of-range offset
     # and reads zero (CDNA4 ISA 9.1.5.1), while ``other`` would add a
@@ -131,6 +139,7 @@ def _rows_x_step(x_ptr, rows, x_columns, M, K: gl.constexpr, start: gl.constexpr
         x_ptr,
         (rows[:, None] * K + start + x_columns[None, :]).to(gl.int32),
         mask=(rows < M)[:, None],
+        cache=X_CACHE,
     )
 
 
@@ -146,8 +155,12 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     WAVES_PER_OUTPUT: gl.constexpr,
     OUTPUTS_PER_WAVE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    X_CACHE: gl.constexpr,
 ):
     """Return ``[BLOCK_M, OUTPUTS]`` sums of outputs ``first ..`` for every row.
+
+    ``X_CACHE`` is the activation loads' cache modifier: "" when an earlier
+    launch wrote x, ".cv" when another workgroup of this launch did.
 
     Each (row, output) keeps the single-row kernel's reduction for
     ``(BLOCK_K, WAVES_PER_OUTPUT)``: per-lane FP32 chunks accumulated in K order,
@@ -179,7 +192,7 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     X_AHEAD: gl.constexpr = 1
     xs = ()
     for step in gl.static_range(min(X_AHEAD, STEPS)):
-        xs += (_rows_x_step(x_ptr, rows, x_columns, M, K, step * BLOCK_K),)
+        xs += (_rows_x_step(x_ptr, rows, x_columns, M, K, step * BLOCK_K, X_CACHE),)
     weights = ()
     for step in gl.static_range(STEPS):
         weights += (
@@ -195,7 +208,9 @@ def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
     for step in gl.static_range(STEPS):
         if step + X_AHEAD < STEPS:
             xs += (
-                _rows_x_step(x_ptr, rows, x_columns, M, K, (step + X_AHEAD) * BLOCK_K),
+                _rows_x_step(
+                    x_ptr, rows, x_columns, M, K, (step + X_AHEAD) * BLOCK_K, X_CACHE
+                ),
             )
         weight = weights[step].to(gl.float32)
         x = xs[step].to(gl.float32)
@@ -245,6 +260,7 @@ def gluon_rowcta_bf16_gemv_rows_gfx950(
         WAVES_PER_OUTPUT,
         OUTPUTS_PER_WAVE,
         NUM_WARPS,
+        "",
     )
     layout: gl.constexpr = sums.type.layout
     rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
