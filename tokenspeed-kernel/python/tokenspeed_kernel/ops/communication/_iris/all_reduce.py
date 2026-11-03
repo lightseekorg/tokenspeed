@@ -271,6 +271,7 @@ def _launch_pull_twoshot(
         EXIT_BARRIER=exit_barrier,
         PEER_PAYLOAD_LOAD_CACHE=arch.peer_payload_load,
         PEER_SIGNAL_STORE_CACHE=arch.peer_signal_store,
+        WAIT_STORES=arch.wait_stores,
         **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
@@ -1428,6 +1429,7 @@ def iris_pull_twoshot(
     EXIT_BARRIER: gl.constexpr,
     PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
     residual=None,
     post=None,
     comb=None,
@@ -1560,6 +1562,12 @@ def iris_pull_twoshot(
         )
         tile_id += NUM_PROGRAMS
 
+    # Every subgroup stored part of the partition. A barrier does not wait for
+    # memory, and the one-thread release below waits only for its own
+    # subgroup's stores before writing back L2. So each subgroup first waits
+    # until its stores reach L2 (s_waitcnt vmcnt(0) on gfx950).
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    gl.barrier()
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,
@@ -1628,6 +1636,9 @@ def iris_pull_twoshot(
         # entry wait follows each peer workgroup's gather of the same tiles.
         # The staged two-shot keeps this extra rendezvous; producer-direct
         # callers and ProducerAllReduce.reduce_ordinary pass False.
+        # Each subgroup's peer reads returned before it stored their values;
+        # the barrier holds the release until every subgroup has stored.
+        gl.barrier()
         reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
         _iris_sync_rank_epoch(
             ready_flags,

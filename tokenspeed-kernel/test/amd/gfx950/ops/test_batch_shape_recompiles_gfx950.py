@@ -598,6 +598,7 @@ def test_iris_allreduce_sizes():
             NUM_TILES=tiles,
             NUM_WARPS=8,
             EXIT_BARRIER=True,
+            WAIT_STORES=policy.wait_stores,
             num_warps=8,
             grid=(1,),
             **common,
