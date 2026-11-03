@@ -48,11 +48,18 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
     make_layer_group_ids,
     specs_for_layers,
 )
+from test.runtime.scheduler_driver import (  # noqa: E402
+    advance_scheduler,
+    make_extend_result_event,
+    make_finish_event,
+)
 
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
     rank_process_title,
+    request_state_slots,
+    scheduler_batch_slots,
     scheduler_config_from_args,
 )
 from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
@@ -632,3 +639,79 @@ def test_a_rank_is_titled_by_its_parallel_ranks(mapping, title):
     # The attention TP rank always shows; another dimension only when it
     # has more than one rank.
     assert rank_process_title(mapping) == title
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+def test_a_speculative_cap_below_attention_tp_starts_and_is_honored(cap):
+    # The draft decode warmup decodes one request per attention-TP peer, so
+    # the decode state is sized for 8 while the scheduler still runs `cap`.
+    args = ServerArgs(
+        model="x",
+        dtype="bfloat16",
+        world_size=8,
+        attn_tp_size=8,
+        ep_size=8,
+        max_num_seqs=cap,
+        speculative_algorithm="MTP",
+    )
+    assert (args.max_num_seqs, args.request_state_seqs) == (cap, 8)
+    assert (scheduler_batch_slots(args), request_state_slots(args)) == (cap, 8)
+
+    page, prompts, decodes = 2, 4, 3
+    scheduler = ts.Scheduler(
+        make_config(
+            num_device_pages=64,
+            max_scheduled_tokens=64,
+            max_batch_size=scheduler_batch_slots(args),
+            prefix_granularity=page,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            role="fused",
+            num_snapshot_pages=1,
+            host_group_packing=(),
+            max_retracted_requests=0,
+            host_write_policy="write_through",
+            prefill_decode_interval=args.prefill_decode_interval,
+            storage_config=None,
+            cache_groups=[
+                ts.CacheGroupConfig(
+                    group_id="history",
+                    block_granularity=page,
+                    total_pages=64,
+                    attn_kind=ts.AttnKind.Full,
+                )
+            ],
+        )
+    )
+    specs = []
+    for i in range(prompts):
+        spec = ts.RequestSpec()
+        spec.request_id = f"r{i}"
+        spec.tokens = [100 * i + t for t in range(4)]
+        spec.max_new_tokens = 16
+        specs.append(spec)
+    scheduler.submit_requests(specs)
+    left = {spec.request_id: decodes for spec in specs}
+    most_running = 0
+    for _ in range(200):
+        if not left:
+            break
+        plan = scheduler.next_execution_plan()
+        forwards = [op for op in plan.forward if op.request_ids]
+        if not forwards:
+            continue
+        (op,) = forwards
+        ids = list(op.request_ids)
+        most_running = max(most_running, len(ids))
+        advance_scheduler(scheduler, [make_extend_result_event(r, [7]) for r in ids])
+        finished = []
+        for rid in ids:
+            left[rid] -= 1
+            if left[rid] == 0:
+                finished.append(rid)
+                del left[rid]
+        if finished:
+            advance_scheduler(scheduler, [make_finish_event(r) for r in finished])
+    assert not left
+    assert most_running == cap
