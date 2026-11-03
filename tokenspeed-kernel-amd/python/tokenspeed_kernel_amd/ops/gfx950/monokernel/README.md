@@ -9,7 +9,8 @@ Read these documents with this one:
 - [`docs/design/monokernel.md`](../../../../../../docs/design/monokernel.md):
   the invariants.
 - [`tokenspeed_kernel/ops/monokernel/README.md`](../../../../../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md):
-  the steps to add a model, the tests and the performance workflow.
+  the ops, how a model's runtime seam calls them, the steps to add a model
+  and the tests.
 - `tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_monokernel_example_gfx950.py`:
   the smallest complete monokernel, of two stages. Copy its shape for a new
   model.
@@ -30,6 +31,46 @@ Read these documents with this one:
 | Model directory | Model |
 |---|---|
 | [`qwen4_exp/`](qwen4_exp/README.md) | Qwen3.8-Flash-Next: Gated DeltaNet and QSA attention layers. |
+
+## Adding a model's kernels
+
+These are the gfx950 steps of "Adding a model" in the kernel boundary's
+README. The [Qwen3.8-Flash-Next kernels](qwen4_exp/README.md) are the full
+example. Their README gives the stages, the placement and the rows and verify
+design. Their module docstrings give each stage's math and task split.
+
+1. **Write one stage module per block** in `<model>/`. A module has:
+   - Its mailbox `REGIONS`, as `(name, pairs per row)`.
+   - Its `@aggregate` operand bundles, with a `row(r)` view for per-row
+     operands.
+   - `stages(bases, rows, ...)`, which declares each stage's tasks and the
+     regions it reads and writes. The layer gives the placement.
+   - One `@gluon.jit` function per stage, `(mailbox, task, bundles...,
+     region names, STAGE)`.
+
+   Put model dimensions that several modules use in `dims.py`. A handoff
+   costs about 0.7 us when the GPU is idle, and 2 to 3 us while weights
+   stream.
+2. **Compose the layer** in `<model>/layer.py`:
+   - A `functools.cache` plan function per layer kind, which concatenates
+     the modules' `stages()` with all stage bases in that one function.
+   - The `@gluon.jit` kernel, which builds the bundles from tuple arguments
+     and runs each stage's tasks in plan order.
+   - `launch_<kernel name>`, which checks shapes, strides and row counts.
+3. **Pack the weights** in `<model>/weights.py`. Where the regular path's
+   weights have the GEMV's tile order, read them in place. The MFMA dense
+   layout and the N16 MoE banks have that order. Copy only the scales. Give
+   each host dataclass a `kernel_args()` that returns its bundle's fields in
+   order.
+4. **Document the model** in `<model>/README.md`, with the sections of
+   `qwen4_exp/README.md`: the kernels and their contract, the stage table,
+   the placement, rows and verify, the weights and the tests. Add the
+   directory to the model table above.
+
+To test one stage, run a slice of the real plan,
+`layer_plan(...).only(("b1", "b3"))`. The regions that the slice reads before
+it writes become `external`. Fill them with `monokernel_testing.fill` and
+read the outputs with `payloads`.
 
 ## Launch contract
 
@@ -287,6 +328,34 @@ Read the kernel's AMDGCN from the Triton cache. Look for these items:
 - The expected count of `v_mfma_scale_f32_16x16x128_f8f6f4`.
 - The weight loads before the first poll of the stage.
 - No `v_readfirstlane` loops around buffer loads (a base for each lane).
+
+## Performance workflow
+
+Placement (each stage's `base`) is the main tuning knob. Make each decision
+from a measurement:
+
+1. Record the timeline (see [Trace](#trace)). Find the critical path.
+2. Change the placement:
+   - Put a stage that streams weights on CTAs that are idle while other
+     stages produce its inputs, so that its loads overlap the wait.
+   - CTAs without a task in the first two stages sleep for a short time
+     first (`schedule.head_sleep`). Without this, their weight streams
+     compete with the critical path.
+   - Issue a task's loads that need no mailbox input at the beginning of
+     the first task that its CTA runs (see "Issue early on shared CTAs" in
+     [Writing a stage](#writing-a-stage)).
+   - Give a long serial task its own CTA.
+   - For a selection over many items, poll the inputs once into LDS, then
+     run chunk tasks plus one final task. Do not poll again for each pass.
+3. Time layer kernels cold, with several copies of the weights in
+   rotation. Warm replays hit the Infinity Cache and hide 2 to 4 us.
+4. Compare the old and new kernels in interleaved runs in one process, also
+   for refactors (see the last item of [Gluon notes](#gluon-notes)).
+5. Time the server with CUDA-graph events over several fresh servers, run
+   alternately. End-to-end TPOT changes by 10 to 25 us between server
+   instances.
+6. Read the ISA (see the [ISA checklist](#isa-checklist)) and use
+   `rocprofv3 --kernel-trace` for the gaps between launches.
 
 ## Tests
 
