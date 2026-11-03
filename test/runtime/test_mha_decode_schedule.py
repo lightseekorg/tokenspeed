@@ -53,7 +53,9 @@ def gfx950():
 class _Cache:
     """KV storage only; the backend and the kernels stay real."""
 
-    def __init__(self, kv_heads: list[int], generator: torch.Generator):
+    def __init__(
+        self, kv_heads: list[int], dtype: torch.dtype, generator: torch.Generator
+    ):
         pages = MAX_BS * CONTEXT // PAGE_SIZE
         self.buffers = [
             tuple(
@@ -63,7 +65,7 @@ class _Cache:
                     HEAD_DIM,
                     generator=generator,
                     device="cuda",
-                ).bfloat16()
+                ).to(dtype)
                 for _ in range(2)
             )
             for heads in kv_heads
@@ -77,7 +79,14 @@ class _Cache:
 
 
 class _Step:
-    def __init__(self, *, width: int, q_heads: int = 16, is_draft: bool = False):
+    def __init__(
+        self,
+        *,
+        width: int,
+        q_heads: int = 16,
+        is_draft: bool = False,
+        kv_cache_dtype: torch.dtype = torch.bfloat16,
+    ):
         from tokenspeed.runtime.layers.attention.backends.paged.mha import (
             MHAAttnBackend,
         )
@@ -95,7 +104,7 @@ class _Step:
         config = AttnConfig(
             device="cuda",
             dtype=torch.bfloat16,
-            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype=kv_cache_dtype,
             kv_cache_quant_method="none",
             context_len=CONTEXT,
             max_bs=MAX_BS,
@@ -126,7 +135,8 @@ class _Step:
             for layer_id, (window, kv_heads) in enumerate(layouts)
         ]
         generator = torch.Generator(device="cuda").manual_seed(7)
-        self.cache = _Cache([heads for _, heads in layouts], generator)
+        self.cache = _Cache([heads for _, heads in layouts], kv_cache_dtype, generator)
+        self.kv_cache_dtype = kv_cache_dtype
         pages = CONTEXT // PAGE_SIZE
         self.page_table = (
             torch.randperm(MAX_BS * pages, generator=generator, device="cuda")
@@ -168,7 +178,7 @@ class _Step:
 
         key, value = self.cache.buffers[0]
         return mha_decode_schedule(
-            q=self.q[: len(lengths) * self.width],
+            q=self.q[: len(lengths) * self.width].to(self.kv_cache_dtype),
             k_cache=key.view(-1, PAGE_SIZE, KV_HEADS, HEAD_DIM),
             v_cache=value.view(-1, PAGE_SIZE, KV_HEADS, HEAD_DIM),
             cache_seqlens=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
@@ -297,3 +307,26 @@ def test_captured_verify_computes_each_steps_schedule_in_the_graph(schedule_call
             step.fresh_schedule(lengths),
         )
     assert len(schedule_calls) == captured
+
+
+def test_full_layer_views_carry_the_forwards_schedule(schedule_calls):
+    """A fused layer runs a full layer's verify attention itself: its view of
+    the FP8 cache carries the forward's schedule, computed when the first
+    view is taken and reused by the next full layer's decode call. A sliding
+    view carries none; a layer of another shape, or a draft's, has no view."""
+    fp8 = torch.float8_e4m3fn
+    step = _Step(width=8, kv_cache_dtype=fp8)
+    step.refresh(UNEVEN)
+    sliding = step.backend.decode_kv_view(step.layers[1], step.cache)
+    assert sliding is not None and sliding.split_schedule is None
+    assert schedule_calls == []
+    full = step.backend.decode_kv_view(step.layers[0], step.cache)
+    assert full.split_schedule is step.backend.decode_schedule_buf
+    assert torch.equal(full.split_schedule[:5], step.fresh_schedule(UNEVEN))
+    step.forward(2, 4)
+    assert schedule_calls == [4]
+    assert step.backend.decode_kv_view(step.layers[3], step.cache) is None
+
+    draft = _Step(width=8, is_draft=True, kv_cache_dtype=fp8)
+    draft.refresh(UNEVEN)
+    assert draft.backend.decode_kv_view(draft.layers[0], draft.cache) is None
