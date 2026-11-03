@@ -1713,8 +1713,8 @@ def gluon_decoder_layer_muse_spark_gfx950(
         xs_ptr,
         w13, s13, s13_lanes, w2, s2, mids, mids_s, moe_tags, gl.to_tensor(1),
         gl.to_tensor(_XS_MBLOCK_STRIDE), stride_w13,
-        stride_s13, stride_s13lin, stride_s13nb, stride_w2, stride_s2,
-        stride_s2lin, stride_s2nb,
+        stride_s13, gl.to_tensor(stride_s13lin), stride_s13nb, stride_w2, stride_s2,
+        gl.to_tensor(stride_s2lin), stride_s2nb,
     )  # fmt: skip
     handles = prefetch_moe(
         launch, exchange + _EX_IDS, bufs, ROWS, _TOPK, N_PHYS1, RING, QUAD_MAP,
@@ -2066,11 +2066,9 @@ DIVISIBLE_ARGS = frozenset(
         "cos_sin_stride",
         "stride_w13",
         "stride_s13",
-        "stride_s13lin",
         "stride_s13nb",
         "stride_w2",
         "stride_s2",
-        "stride_s2lin",
         "stride_s2nb",
     }
 )
