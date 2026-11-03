@@ -15,11 +15,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Static DSpark drafter.
-
-This is the minimal static configuration: greedy sampling, vanilla Markov head,
-fixed verify window (verify-all). No confidence head / SPS-STS / ragged verify.
-"""
+"""DSpark block proposal with checkpoint-trained acceptance confidence."""
 
 from __future__ import annotations
 
@@ -38,6 +34,15 @@ class DSpark(DFlash):
     sample_from_anchor = True
     spec_algorithm = "DSPARK"
 
+    def prepare_target_forward(self, ctx) -> None:
+        if ctx.verify_queries is not None:
+            # Target graphs are shared across request counts. Project the
+            # request-shaped draft context after their compact taps return.
+            self._incremental_kv_write_done = False
+            ctx.target_capture_sink = None
+            return
+        super().prepare_target_forward(ctx)
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.markov_head = getattr(self.model, "markov_head", None)
@@ -46,6 +51,34 @@ class DSpark(DFlash):
                 "DSPARK requires the draft model to define a markov_head "
                 "(use a DSparkDraftModel checkpoint with markov_rank > 0)."
             )
+        self.confidence_head = self.model.confidence_head
+        self.verify_policy = (
+            self.draft_model_runner.server_args.speculative_verify_policy
+        )
+        if self.verify_policy == "confidence" and (
+            self.confidence_head is None or not self.model.confidence_weights_loaded
+        ):
+            raise ValueError(
+                "confidence verification requires a loaded DSpark confidence head"
+            )
+        self.confidence_rates: torch.Tensor | None = None
+        self.confidence_group = None
+        if self.verify_policy == "confidence":
+            mapping = self.draft_model_runner.server_args.mapping
+            if mapping.world_size > 1:
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager,
+                )
+
+                self.confidence_group = process_group_manager.get_device_process_group(
+                    mapping.world_group
+                )
+            self.confidence_rates = torch.empty(
+                (self.input_buffers.max_bs, self.spec_num_tokens - 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.runtime_states.init_draft_confidence(self.spec_num_tokens - 1)
 
     @nvtx_range("dspark_sample_block", color="purple")
     def _sample_block(
@@ -59,6 +92,18 @@ class DSpark(DFlash):
         # Only the bias follows the previous token; the projection does not.
         block_logits = self._block_base_logits(draft_hidden)
         for k in range(1, self.spec_num_tokens):
+            if self.confidence_rates is not None:
+                previous = next_tokens[:, k - 1].clamp(
+                    0, self.markov_head.vocab_size - 1
+                )
+                latent = (
+                    self.markov_head.get_prev_latent(previous)
+                    if self.confidence_head.with_markov
+                    else None
+                )
+                self.confidence_rates[: next_tokens.shape[0], k - 1].copy_(
+                    self.confidence_head(draft_hidden[:, k - 1], latent)
+                )
             # The Markov head embeds the previous token, so it must be in range
             # before this step, not after the loop: the anchor comes from the
             # target's last output (garbage during warmup) and each proposal
@@ -79,6 +124,13 @@ class DSpark(DFlash):
                     base_logits=block_logits[k - 1],
                 )
         next_tokens.clamp_(min=0)
+        if self.confidence_rates is not None:
+            bs = next_tokens.shape[0]
+            self.runtime_states.publish_draft_confidence(
+                self.input_buffers.state_write_req_pool_indices_buf[:bs],
+                self.confidence_rates[:bs],
+                group=self.confidence_group,
+            )
         return next_tokens
 
     def _block_base_logits(self, draft_hidden: torch.Tensor):

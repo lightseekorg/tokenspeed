@@ -131,6 +131,7 @@ def _runtime_states(*, draft_probs: bool, trees: bool, history: bool) -> Runtime
         output_length=SPEC_TOKENS,
         device="cpu",
     )
+    states.init_draft_confidence(SPEC_TOKENS - 1)
     if draft_probs:
         states.init_draft_probs(spec_num_tokens=SPEC_TOKENS, reject_threshold=2.0)
     if trees:

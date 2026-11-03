@@ -333,9 +333,11 @@ class PagedAttention(nn.Module):
     def _write_target(
         self, q: torch.Tensor, ctx: ForwardContext
     ) -> HeadKVCache | LatentKVCache:
-        slots = ctx.attn_backend.padded_write_locations(
-            self, ctx.forward_mode, q.shape[0]
-        )
+        layout = ctx.verify_queries
+        rows = q.shape[0] if layout is None else layout.batch_size * layout.width
+        slots = ctx.attn_backend.padded_write_locations(self, ctx.forward_mode, rows)
+        if layout is not None:
+            slots = layout.pack(slots, token_dim=0)
         return self._local_target(slots, ctx)
 
     def _local_target(

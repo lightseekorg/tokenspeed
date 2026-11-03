@@ -1179,3 +1179,14 @@ lands in the same change as the pin, never a release apart.
   remainder (4). Only the empty-round retraction (2), in a round that builds
   nothing and waits for no finished request, retracts or aborts an exempt
   request.
+
+
+## Confidence verification budgets
+
+`ConfidenceBudgetPlanner` is a host-only cost model for DSpark verify rounds.
+Its inputs are completed older confidence scores and a measured full-round
+latency per `(request capacity, query capacity)` graph. It maximizes expected
+committed tokens per time and chooses the smaller bucket on ties. It does not
+change admission, block ownership or the maximum reserved decode window.
+The forward runner applies the selected budget to the latest device scores;
+the event loop holds no confidence tensors and issues no new GPU work.

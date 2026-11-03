@@ -2159,3 +2159,95 @@ cache groups. Its eager and captured decode share metadata refresh and DCP
 partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
+
+## DSpark confidence verification
+
+Qwen4-Exp targets can use a separate DSpark checkpoint whose capture contract
+is the FP32 mean of the four HC branches at the requested layer inputs. The
+draft configures these taps before cache construction through
+`TargetCaptureConfigurator`; the target materializes a deferred residual
+before capturing it. The drafter loads its own Markov and scalar confidence
+heads and shares the target embedding and LM head.
+
+The experimental `--speculative-verify-policy confidence` selects a per-round
+query budget.
+The C++ `ConfidenceBudgetPlanner` scores `(request capacity, query capacity)`
+budgets by expected committed tokens per round. These are cost-model keys,
+not graph keys: the target body is captured by query capacity Q, and the native
+drafter is captured independently by request capacity B. The query ladder is
+the deduplicated union of the configured request capacities times 1..width.
+For request capacities `[1, 2, 4, 8, 16]` and width 8, this is 24 target graphs
+plus 5 draft graphs, rather than 40 complete-round graphs.
+Startup composes the independently timed target and draft stages. Completed
+whole-round feedback replaces those estimates online and includes the eager
+LM head, sampling and context projection.
+The complete forward is warmed at startup even though only its two model
+stages are captured, so the eager exit and state updates are also compiled.
+Rank zero selects the bucket and agrees it over a named host group managed by
+the existing process-group manager. Its forward-thread broadcasts cannot share
+the event loop's request-broadcast sequence.
+Online feedback is bounded and asynchronous: only completed CUDA events are
+read, and the budget uses an older confidence generation. The latest device
+confidence allocates contiguous prefixes inside that budget. Ties use request
+then position order. A fresh request verifies only its anchor.
+The drafter broadcasts rank zero's scores on the device group before publishing
+them. Local floating-point differences must not change per-request prefixes
+across ranks: different acceptance lengths would split their scheduler state.
+
+`VerifyQueryLayout` owns persistent prefix lengths, offsets, request/column
+indices and bidirectional row maps. A target graph's request capacity is
+`min(max_capture_bs, Q)`, determined by Q alone; inactive requests have zero
+query lengths and null state destinations. The actual request count remains
+on the outer forward. Qwen4-Exp packs model inputs once and keeps the static
+query bucket through HC, attention, GDN, PLE and MLP. The body returns compact
+hidden states and taps. The common model exit expands just the actual requests'
+maximum windows before the LM head and verification run outside the graph.
+The sampling interface remains request-major; this does not yet make the
+LM-head projection compact. Both eager and graph forwards use the same device
+row selection and expansion.
+
+Draft context projection consumes those returned taps outside the target graph;
+request-shaped incremental projection must not be captured inside a Q-only
+target graph. The native draft stage retains its existing input preparation,
+waits for the context write, and pads to its own B bucket before replay. It
+includes the draft forward, sampling and confidence publication. The outer
+verifier, stop processing and frontier updates keep the actual request extent.
+Target metadata is refreshed to the Q graph's request capacity before replay
+and to the outer request extent afterward through the ordinary decode refresh.
+Neither stage changes the cache ownership or accepted-prefix commit protocol.
+Expert load counters map that same device-validity mask through the ordinary
+TP partition and MoE group order, so filler rows never affect placement feedback.
+
+The attention prologue gathers write slots in the selected order. QSA derives
+logical positions from the original window start and stages each key at its
+original request/column, while sparse attention consumes per-query physical
+slots. Dense MHA and TRT-LLM decode use one causal cache length per compact row.
+Unsupported paged leaves reject compact verification before capture.
+
+GDN convolution and recurrence read device offsets, skip empty requests and
+compute only selected prefixes. State destinations retain maximum verify
+width. ReplaySSM writes raw k/v/a/b into that same request-major layout so the
+existing accepted-prefix commit reconstructs the selected state. PLE reuses the
+device request/column map for hashing, lookup and dilated convolution; negative
+columns denote filler and never write context or convolution checkpoints.
+Cache allocation, rollback capacity and commit protocols remain maximum-width.
+
+Acceptance is limited to the selected prefix before stop conditions, frontier
+updates, draft anchoring or state commit. Cache admission still reserves the
+maximum verify window. Both confidence generations live with candidates in
+`RuntimeStates`, are reset on slot admission and are imaged by
+`SlotStateExporter` on retraction. Host feedback is an expendable cost-model
+cache and never reconstructs device request state.
+
+The policy currently requires NVIDIA, a Qwen4-Exp target, a separate DSpark
+checkpoint with complete confidence weights, and one attention-DP/pipeline
+rank. PD, trees and draft-prob rejection sampling are rejected at startup.
+Mixed and prefill rounds retain full-width execution and produce confidence
+for the next decode. Unspecified legacy launch policies resolve explicitly to
+`fixed` at argument normalization. Single-GPU and TP2/EP2 smoke runs cover
+adaptive graphs, reuse of Q=8 as request counts change, and compact eager
+verification with graph metadata identity checks enabled. Full-budget
+and adaptive output parity acceptance, distributed performance and multimodal
+validation remain outstanding. The compact GDN layout currently selects the
+portable verify kernel; serving with automatic kernel selection does not
+establish batch-invariant target numerics.

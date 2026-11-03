@@ -691,12 +691,15 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     )
     layer.bind_cache_group(FULL_ATTENTION)
     pool = SimpleNamespace()
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         attn_backend=backend,
         token_to_kv_pool=pool,
         bs=2,
         forward_mode=mode,
         draft_narrowing=object() if query_width < kv_width else None,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 2, 1),
     )
     queries = torch.zeros((2 * query_width, 16))
     topk = torch.zeros((2 * query_width, 4), dtype=torch.int32)
@@ -855,13 +858,15 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     indexer._select = lambda *args, **kwargs: (
         selections.append((args, kwargs)) or QSASelection(rows, blocks, 4)
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         bs=2,
         num_extends=2,
         forward_mode=ForwardMode.EXTEND,
         draft_narrowing=None,
         attn_backend=backend,
         token_to_kv_pool=pool,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 2, 1),
     )
 
     actual = indexer(torch.zeros((2, 4)), torch.tensor([7, 8]), ctx)
@@ -1031,10 +1036,14 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
         seq_lens=[8, 12],
         query_lengths=[4, 4],
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         bs=2,
         forward_mode=ForwardMode.EXTEND,
         attn_backend=backend,
+        token_to_kv_pool=None,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 2, 1),
     )
     outputs = (
         torch.tensor([4, 5, 6, 7, 8, 9, 10, 11]),
@@ -1673,7 +1682,16 @@ def test_qwen4_exp_ple_idle_dp_participates_in_lookup(offload, prefetch) -> None
     layer.ple_embedding.lookup = SimpleNamespace(
         make_layout=lambda *args: None, start=start, finish=finish
     )
-    ctx = SimpleNamespace(forward_mode=ForwardMode.IDLE, global_num_tokens=[0, 2])
+    ctx = ForwardContext(
+        forward_mode=ForwardMode.IDLE,
+        global_num_tokens=[0, 2],
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=0,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 0, 1),
+    )
     ids = torch.empty(0, dtype=torch.int32)
     hidden = torch.empty((0, 2))
     if prefetch:
@@ -1702,11 +1720,15 @@ def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
         arena=SimpleNamespace(field=fields.__getitem__),
         layerwise_load_tracker=SimpleNamespace(wait_for_layer=waited_layers.append),
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         bs=1,
         forward_mode=ForwardMode.DECODE,
         token_to_kv_pool=pool,
         global_num_tokens=None,
+        attn_backend=None,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
     hidden_states = torch.tensor([[1.0, 2.0]])
 
@@ -1742,11 +1764,15 @@ def test_qwen4_exp_qsa_sparse_attention_reads_the_cache(
     k_cache = torch.empty((32, 1, 8), dtype=cache_dtype)
     v_cache = torch.empty_like(k_cache)
     pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (k_cache, v_cache))
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         attn_backend=_qsa_router(kernel_page_size=64, max_bs=1, spec=1),
         bs=1,
         forward_mode=ForwardMode.DECODE,
         draft_narrowing=None,
+        token_to_kv_pool=None,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
     layer = SimpleNamespace(layer_id=3, tp_q_head_num=1, head_dim=8, scaling=0.5)
     calls = []
@@ -1980,11 +2006,15 @@ def test_qwen4_exp_ple_handles_a_ragged_padded_batch() -> None:
     layer._metadata = lambda ctx: metadata
     layer._ple_backend = lambda ctx: SimpleNamespace()
     pool = SimpleNamespace(arena=SimpleNamespace(field=fields.__getitem__))
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         bs=2,
         forward_mode=ForwardMode.EXTEND,
         token_to_kv_pool=pool,
         global_num_tokens=None,
+        attn_backend=None,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 2, 1),
     )
     # Eight rows for five real tokens: the tail is the padded bucket's filler.
     input_ids = torch.tensor([10, 11, 12, 20, 21, 1, 1, 1], dtype=torch.int64)

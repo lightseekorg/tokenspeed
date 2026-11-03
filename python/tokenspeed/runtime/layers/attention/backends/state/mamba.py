@@ -1379,7 +1379,7 @@ class MambaAttnBackend(AttentionBackend):
         # the multi-token kernel path in forward_extend. `q` is None for
         # hybrid linear-attn layers; the token count comes from mixed_qkv.
         q_len_per_req = kwargs["mixed_qkv"].shape[0] // bs if bs > 0 else 1
-        if q_len_per_req > 1:
+        if q_len_per_req > 1 or kwargs.get("verify_queries") is not None:
             return self.forward_extend(
                 q,
                 k,
@@ -1659,19 +1659,22 @@ class MambaAttnBackend(AttentionBackend):
         D = kwargs.get("D")
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
+        verify_queries = kwargs.get("verify_queries")
 
         # `q` is None for hybrid linear-attn layers; the token count comes
         # from seq_len carried in kwargs.
         q_len_per_req = seq_len // bs if bs > 0 else 1
         is_target_verify = (
-            forward_mode.is_decode_or_idle() and not self.is_draft and q_len_per_req > 1
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and (q_len_per_req > 1 or verify_queries is not None)
         )
 
         query_start_loc = self.forward_metadata.query_start_loc
 
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
-            batch_size = seq_len // draft_token_num
+            batch_size = bs
             output_indices = self.forward_metadata.mamba_output_indices
             state_in_blocks, _, conv_comp, ssm_comp = self._layer_state(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
@@ -1712,9 +1715,11 @@ class MambaAttnBackend(AttentionBackend):
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            mixed_qkv_reshaped = (
+                mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2)
+                if verify_queries is None
+                else mixed_qkv
+            )
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -1724,9 +1729,16 @@ class MambaAttnBackend(AttentionBackend):
                 conv_state_indices=conv_read,
                 output_state_indices=conv_out,
                 parent_indices=self._tree_parents(batch_size),
+                query_start_loc=(
+                    None if verify_queries is None else verify_queries.query_offsets
+                ),
             )
             # needn't contiguous here.
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv = (
+                mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+                if verify_queries is None
+                else mixed_qkv_processed
+            )
         else:
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
                 self._layer_state(layer_id)
@@ -1790,6 +1802,9 @@ class MambaAttnBackend(AttentionBackend):
 
         # GDN's chunked tree verify (no node states) fills the replay payload as it reads k/v/a/b.
         scan_replay = None
+        if replay_inputs is not None and verify_queries is not None:
+            scan_replay = replay.payload[layer_slot, : batch_size * draft_token_num]
+            replay_inputs = None
         if (
             replay_inputs is not None
             and self._verify_scan_writes_replay
@@ -1801,7 +1816,11 @@ class MambaAttnBackend(AttentionBackend):
         # replay is enabled, the split kernel also saves the persistent inputs
         # needed to reconstruct accepted state later.
         if (
-            (self._verify_packed_qkv_views or scan_replay is not None)
+            (
+                self._verify_packed_qkv_views
+                or scan_replay is not None
+                or verify_queries is not None
+            )
             and replay_inputs is None
             and mixed_qkv.stride(-1) == 1
             and is_target_verify
@@ -1856,6 +1875,11 @@ class MambaAttnBackend(AttentionBackend):
                 seq_len=seq_len,
                 lower_bound=gate_lower_bound,
                 replay_payload=scan_replay,
+                **(
+                    {}
+                    if verify_queries is None
+                    else {"query_start_loc": verify_queries.query_offsets}
+                ),
             )
         else:
             metadata = self.forward_metadata
@@ -1983,6 +2007,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         lower_bound: float | None,
         replay_payload: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-position recurrent scan of a target-verify round.
 
@@ -2026,11 +2051,14 @@ class MambaAttnBackend(AttentionBackend):
         num_value_heads = value.shape[2]
         head_v_dim = value.shape[3]
         # Request-major varlen layout: [B, T, H, D] is a plain view, no movement.
-        query_b = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
-        key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
-        value_b = value.view(batch_size, draft_token_num, num_value_heads, head_v_dim)
-        a_b = a.view(batch_size, draft_token_num, -1)
-        b_b = b.view(batch_size, draft_token_num, -1)
+        scan_batch, scan_width = (
+            (batch_size, draft_token_num) if query_start_loc is None else (1, seq_len)
+        )
+        query_b = query.view(scan_batch, scan_width, num_heads, head_k_dim)
+        key_b = key.view(scan_batch, scan_width, num_heads, head_k_dim)
+        value_b = value.view(scan_batch, scan_width, num_value_heads, head_v_dim)
+        a_b = a.view(scan_batch, scan_width, -1)
+        b_b = b.view(scan_batch, scan_width, -1)
 
         intermediate_states = None
         output_state = None
@@ -2081,7 +2109,9 @@ class MambaAttnBackend(AttentionBackend):
             ),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
-            solution=mtp_solution,
+            solution=mtp_solution if query_start_loc is None else None,
+            query_start_loc=query_start_loc,
+            max_seqlen_q=None if query_start_loc is None else draft_token_num,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     def _prefill_scan(

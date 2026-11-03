@@ -42,7 +42,9 @@ from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
     RopeStyle,
 )
 
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers import paged_attention  # noqa: E402
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm, RMSNorm  # noqa: E402
 from tokenspeed.runtime.layers.rotary_embedding import (  # noqa: E402
@@ -100,7 +102,7 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
         4, 64, 1.0, num_kv_heads=2, layer_id=0, rotary_emb=None, qk_norm=qk_norm
     )
     cache = torch.zeros(8, 2, 64, dtype=torch.bfloat16)
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         forward_mode=mode,
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda layer, m, rows: handed.update(rows=rows)
@@ -110,6 +112,10 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: HeadKVCache(cache, cache, None, s)
         ),
+        bs=1,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
     kv = torch.zeros(rows, 2 * 64, dtype=torch.bfloat16)
     layer.prologue(
@@ -203,12 +209,16 @@ def test_the_write_lands_on_this_ranks_shard_under_kvp(monkeypatch):
     placement = CachePlacement(
         block_granularity=4, virtual_block_count=8, group=(0, 1), rank=1
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         forward_mode=ForwardMode.EXTEND,
         attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
+        bs=1,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
     q = torch.zeros(4, 4, 576, dtype=torch.bfloat16)
     layer.latent_prologue(
@@ -261,12 +271,16 @@ def test_a_query_shard_gathers_the_rotated_latent_before_the_masked_store(
     placement = CachePlacement(
         block_granularity=4, virtual_block_count=8, group=(0, 1), rank=1
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         forward_mode=ForwardMode.EXTEND,
         attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
+        bs=1,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
     plan = QueryShardPlan.from_forward(
         total_tokens=5, input_lengths=[5], size=2, rank=0
@@ -333,12 +347,16 @@ def test_an_empty_shard_still_joins_the_gather_and_stores_its_pages(monkeypatch)
     layer = paged_attention.PagedAttention(
         4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=None, qk_norm=None
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         forward_mode=ForwardMode.EXTEND,
         attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
+        bs=1,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
     # Two rows over four ranks: ranks 2 and 3 hold nothing.
     plan = QueryShardPlan.from_forward(
@@ -511,11 +529,14 @@ def test_msa_publishes_a_layer_after_every_field_it_writes(sparse):
     layer = paged_attention.PagedAttention(
         4, 64, 1.0, num_kv_heads=2, layer_id=0, rotary_emb=None, qk_norm=None
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
         forward_mode=ForwardMode.EXTEND,
         attn_backend=backend,
         token_to_kv_pool=None,
         bs=1,
+        num_extends=0,
+        input_num_tokens=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
     layer.forward(torch.zeros(4, 4 * 64), None, None, None, ctx)
     assert order == (["attention", "record"] if sparse else ["record", "attention"])

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Static DSpark draft model.
+"""DSpark block draft model with Markov and acceptance-confidence heads.
 
 The backbone, target-hidden projection, KV injection and block forward are
 all inherited unchanged from ``DFlashDraftModel``; the only addition is a
@@ -26,13 +26,13 @@ per-position Markov head that turns the parallel mask-forward proposal into a
 semi-autoregressive one by adding a bigram-style bias to the base logits
 before sampling.
 
-This module implements the minimal static configuration: the ``vanilla``
-Markov head only (no confidence head, no gated/rnn heads, no
-confidence-scheduled ragged verify).
+The confidence head predicts conditional acceptance at each block position;
+its sigmoid outputs, rather than its logits, are multiplied into prefix scores.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -43,6 +43,33 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 
 SUPPORTED_MARKOV_HEAD_TYPES = ("vanilla",)
+
+
+class AcceptRatePredictor(nn.Module):
+    """Checkpoint-compatible scalar predictor over hidden and Markov features."""
+
+    def __init__(self, hidden_size: int, markov_rank: int, *, with_markov: bool):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.with_markov = with_markov
+        self.proj = nn.Linear(hidden_size + (markov_rank if with_markov else 0), 1)
+
+    def forward(
+        self, hidden_states: torch.Tensor, previous_latent: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.with_markov:
+            if previous_latent is None:
+                raise ValueError(
+                    "Markov-conditioned confidence requires previous latent"
+                )
+            hidden_states = torch.cat(
+                (hidden_states, previous_latent.to(hidden_states.dtype)), dim=-1
+            )
+        elif previous_latent is not None:
+            raise ValueError(
+                "Unconditioned confidence does not consume Markov features"
+            )
+        return self.proj(hidden_states).squeeze(-1).float().sigmoid()
 
 
 class VanillaMarkov(nn.Module):
@@ -126,6 +153,56 @@ class DSparkDraftModel(DFlashDraftModel):
         self.markov_head = VanillaMarkov(
             vocab_size=int(vocab_size), markov_rank=markov_rank
         )
+        self.confidence_head: AcceptRatePredictor | None = None
+        self.confidence_weights_loaded = False
+        if bool(self._checkpoint_capture_field("enable_confidence_head")):
+            with_markov = self._checkpoint_capture_field("confidence_head_with_markov")
+            if with_markov is None:
+                raise ValueError("confidence_head_with_markov must be explicit")
+            self.confidence_head = AcceptRatePredictor(
+                int(config.hidden_size), markov_rank, with_markov=bool(with_markov)
+            )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        loaded_confidence: set[str] = set()
+
+        def tracked_weights():
+            for name, weight in weights:
+                normalized = name.removeprefix("model.")
+                if normalized.startswith("confidence_head."):
+                    if self.confidence_head is None:
+                        raise ValueError(
+                            "Checkpoint has confidence weights but head is disabled"
+                        )
+                    loaded_confidence.add(normalized)
+                yield name, weight
+
+        super().load_weights(tracked_weights())
+        if self.confidence_head is not None:
+            required = {"confidence_head.proj.weight", "confidence_head.proj.bias"}
+            missing = required - loaded_confidence
+            if missing:
+                raise ValueError(
+                    f"Missing DSpark confidence weights: {sorted(missing)}"
+                )
+            self.confidence_weights_loaded = True
+
+    def configure_target(self, target_model, target_config) -> None:
+        from tokenspeed.runtime.models.qwen4_exp import (
+            Qwen4ExpForCausalLM,
+            Qwen4ExpForConditionalGeneration,
+        )
+
+        if isinstance(
+            target_model, (Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration)
+        ):
+            if self.aux_hidden_stream != "prefix":
+                raise ValueError(
+                    "Qwen4Exp DSpark requires its trained HC-mean input stream"
+                )
+            target_model.set_dspark_layers_to_capture(list(self.target_layer_ids))
+        else:
+            super().configure_target(target_model, target_config)
 
 
 EntryClass = [DSparkDraftModel]

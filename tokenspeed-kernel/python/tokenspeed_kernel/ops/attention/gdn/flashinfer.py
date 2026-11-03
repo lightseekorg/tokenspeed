@@ -349,6 +349,7 @@ if is_decode_available():
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "varlen": frozenset({False}),
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False}),

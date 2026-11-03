@@ -58,6 +58,8 @@ def _runner(
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
+    wrapper.confidence_feedback = None
+    wrapper.segmented_decode = None
     wrapper.config = SimpleNamespace(spec_algo="MTP", max_req_pool_size=8, spec_topk=1)
     wrapper.device = "cpu"
     full_backend = object.__new__(AttentionBackend)

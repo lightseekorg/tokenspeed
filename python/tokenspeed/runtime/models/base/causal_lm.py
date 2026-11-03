@@ -320,12 +320,14 @@ class BaseCausalLM(nn.Module):
 
         model_kwargs = self.prepare_model_kwargs(ctx, input_ids, kwargs)
 
-        hidden_states, aux_hidden_states = self.model(
-            input_ids,
-            positions,
-            ctx,
-            **model_kwargs,
-        )
+        if ctx.decode_graphs is None:
+            hidden_states, aux_hidden_states = self.model(
+                input_ids, positions, ctx, **model_kwargs
+            )
+        else:
+            hidden_states, aux_hidden_states = ctx.decode_graphs.run_target(
+                input_ids, positions, ctx, model_kwargs
+            )
         if not self.mapping.is_last_pp_rank:
             # Mid-pipeline stage: the executor sends this boundary state to
             # the next stage; there are no logits here.
@@ -348,6 +350,17 @@ class BaseCausalLM(nn.Module):
         order on a shard) for the LM head; a full-hidden capture for the
         drafter stays the rows as given, which is the drafter's extend input.
         """
+        if ctx.verify_queries is not None:
+            # The target graph returns Q rows. The request-shaped LM head and
+            # verifier run outside it, with the same layout as eager decode.
+            hidden_states = ctx.verify_queries.expand(
+                hidden_states, token_dim=0, request_count=ctx.bs
+            )
+            if aux_hidden_states is not None:
+                aux_hidden_states = [
+                    ctx.verify_queries.expand(h, token_dim=0, request_count=ctx.bs)
+                    for h in aux_hidden_states
+                ]
         return self.logits_processor(
             input_ids,
             hidden_states,

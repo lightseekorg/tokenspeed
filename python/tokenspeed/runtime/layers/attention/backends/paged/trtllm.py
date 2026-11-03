@@ -101,6 +101,7 @@ class TRTLLMMHAMetadata:
 class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
+    supports_compact_verify = True
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
     # Both kernel call sites forward layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
@@ -143,7 +144,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             ).multi_processor_count
             self._kv_counter_buffer = torch.zeros(
                 get_trtllm_gen_multi_ctas_kv_counter_bytes(
-                    config.max_bs * self.block_decode_expansion,
+                    config.max_bs
+                    * max(self.block_decode_expansion, self.spec_num_tokens),
                     self.tp_q_head_num,
                     self._sm_count,
                 ),
@@ -446,6 +448,19 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 self.forward_prefill_metadata
                 if q_len_per_req > 1
                 else self.forward_decode_metadata
+            )
+
+        ctx = kwargs.get("ctx")
+        verify = None if ctx is None else ctx.verify_queries
+        if verify is not None:
+            base = self.forward_prefill_metadata
+            pages, lengths = verify.causal_metadata(
+                base.cache_seqlens_int32, base.page_table
+            )
+            metadata = TRTLLMMHAMetadata(
+                cache_seqlens_int32=lengths,
+                max_seq_len_q=1,
+                page_table=pages,
             )
 
         tree = self._tree_verify_rows(

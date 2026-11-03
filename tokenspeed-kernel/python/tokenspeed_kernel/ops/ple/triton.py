@@ -101,6 +101,7 @@ def _ngram_ids_kernel(
     head = lanes % H
     owner = head == 0
     mask = rows < total
+    row_mask = mask
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
     if uniform_length > 0:
@@ -121,6 +122,7 @@ def _ngram_ids_kernel(
         req = tl.load(req_ptr + rows, mask=mask, other=0).to(tl.int64)
         col = tl.load(col_ptr + rows, mask=mask, other=0).to(tl.int64)
         start = tl.load(starts_ptr + req, mask=mask, other=0).to(tl.int64)
+        mask &= col >= 0
 
     tail_row = rows.to(tl.int64)
     if SCATTER_TAIL:
@@ -166,7 +168,11 @@ def _ngram_ids_kernel(
         remainder = _exact_remainder(mixed, size, tl.load(reciprocals_ptr + head))
     else:
         remainder = mixed % size
-    tl.store(out_ptr + rows * H + head, remainder + offset, mask=mask)
+    tl.store(
+        out_ptr + rows * H + head,
+        tl.where(mask, remainder + offset, offset),
+        mask=row_mask,
+    )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -593,30 +599,34 @@ def _ple_conv_state_kernel(
         # Successors may set up, but must wait before reading any output.
         tl.extra.cuda.gdc_launch_dependents()
     if tl.program_id(0) < TOTAL:
-        _ple_dilated_conv_kernel(
-            values_ptr,
-            initial_ptr,
-            weights,
-            req_ptr,
-            col_ptr,
-            starts_ptr,
-            out_ptr,
-            windows_ptr,
-            gated_ptr,
-            residual_ptr,
-            windows_block_rows,
-            gated_row_stride,
-            residual_row_stride,
-            C,
-            D,
-            K,
-            STATE,
-            WRITE_WINDOWS,
-            SCATTER_WINDOWS,
-            ADD_GATED,
-            ADD_RESIDUAL,
-            BLOCK_C,
-        )
+        column = tl.load(col_ptr + tl.program_id(0))
+        if column < 0:
+            tl.store(out_ptr + tl.program_id(0).to(tl.int64) * C + ch, 0, mask=ch < C)
+        else:
+            _ple_dilated_conv_kernel(
+                values_ptr,
+                initial_ptr,
+                weights,
+                req_ptr,
+                col_ptr,
+                starts_ptr,
+                out_ptr,
+                windows_ptr,
+                gated_ptr,
+                residual_ptr,
+                windows_block_rows,
+                gated_row_stride,
+                residual_row_stride,
+                C,
+                D,
+                K,
+                STATE,
+                WRITE_WINDOWS,
+                SCATTER_WINDOWS,
+                ADD_GATED,
+                ADD_RESIDUAL,
+                BLOCK_C,
+            )
     if WRITE_FINAL or SCATTER_WINDOWS:
         if tl.program_id(0) < BATCH:
             _ple_conv_final_kernel(

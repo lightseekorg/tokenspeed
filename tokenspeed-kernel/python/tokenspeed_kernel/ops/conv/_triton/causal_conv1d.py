@@ -424,6 +424,7 @@ def _causal_conv1d_update_kernel(
     intermediate_conv_window_ptr,
     output_state_indices_ptr,
     o_ptr,  # (batch, dim, seqlen)
+    query_start_loc,
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
@@ -462,6 +463,7 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
+    HAS_QUERY_OFFSETS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     # ruff: noqa: E501
@@ -472,6 +474,13 @@ def _causal_conv1d_update_kernel(
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
+    start = 0
+    length = seqlen
+    if HAS_QUERY_OFFSETS:
+        start = tl.load(query_start_loc + idx_seq).to(tl.int64)
+        length = tl.load(query_start_loc + idx_seq + 1).to(tl.int64) - start
+        if length == 0:
+            return
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -527,7 +536,12 @@ def _causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    x_base = (
+        x_ptr
+        + (idx_seq * stride_x_seq)
+        + (idx_feats * stride_x_dim)
+        + start * stride_x_token
+    )
 
     if not SAVE_INTERMEDIATE and not HAS_OUTPUT_STATE_INDICES:
         # STEP 2: update conv_state in place.  Speculative verify uses
@@ -610,7 +624,7 @@ def _causal_conv1d_update_kernel(
     mask_x_1d = idx_feats < dim
 
     # STEP 5: compute each token
-    for idx_token in tl.static_range(seqlen):
+    for idx_token in range(length):
         acc = acc_preload
 
         matrix_w = w_col0
@@ -661,6 +675,7 @@ def _causal_conv1d_update_kernel(
         o_ptrs = (
             o_ptr
             + (idx_seq) * stride_o_seq
+            + start * stride_o_token
             + idx_token * stride_o_token
             + (idx_feats * stride_o_dim)
         )

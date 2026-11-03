@@ -100,14 +100,18 @@ class QSAAttnBackend(MHAAttnBackend):
             q, topk_indices = slice_to_real_tokens(num_real, q, topk_indices)
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        max_seqlen_q = decode_query_lengths(
-            ctx,
-            q.shape[0],
-            force_uniform=ctx.draft_narrowing is not None,
+        # Selected physical slots already carry causality per query. A compact
+        # verify uses independent query rows, without a host copy of offsets.
+        max_seqlen_q = (
+            1
+            if ctx.verify_queries is not None
+            else decode_query_lengths(
+                ctx, q.shape[0], force_uniform=ctx.draft_narrowing is not None
+            )
         )
         sparse_metadata = None
         selection = ctx.attn_backend.sparse_topk.qsa_selection
-        if selection is not None:
+        if selection is not None and ctx.verify_queries is None:
             if not isinstance(selection, QSASelection):
                 raise RuntimeError("invalid QSA logical selection memo")
             rows = q.shape[0]
@@ -171,7 +175,7 @@ class QSAAttnBackend(MHAAttnBackend):
     ):
         if topk_indices is None:
             return super().forward_decode(
-                q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
+                q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, ctx=ctx, **kwargs
             )
         return self._sparse_attention(q, layer, token_to_kv_pool, topk_indices, ctx)
 

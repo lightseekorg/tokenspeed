@@ -34,9 +34,11 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.confidence_graph import ConfidenceDecodeGraphs
     from tokenspeed.runtime.execution.dspark_context import (
         DSparkContextProducer,
     )
+    from tokenspeed.runtime.execution.verify_layout import VerifyQueryLayout
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -153,6 +155,9 @@ class ForwardContext:
     input_num_tokens: int
     forward_mode: ForwardMode | None
     output_layout: ForwardOutputLayout
+    verify_queries: VerifyQueryLayout | None = None
+    # Decode stage execution; target shapes depend on Q, draft shapes on B.
+    decode_graphs: ConfidenceDecodeGraphs | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None

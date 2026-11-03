@@ -104,6 +104,13 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
     supports_mla_dcp: bool = False
+    supports_compact_verify: bool = False
+
+    def validate_compact_verify(self) -> None:
+        if not self.supports_compact_verify:
+            raise ValueError(
+                f"{type(self).__name__} does not support compact verify queries"
+            )
 
     @classmethod
     def resolve_kernel_page_size(

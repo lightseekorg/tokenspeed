@@ -128,6 +128,11 @@ class CachePoolBinding:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
 
+    def validate_compact_verify(self) -> None:
+        """Validate every cache consumer before capturing packed verify rows."""
+        for backend in self.child_backends():
+            backend.validate_compact_verify()
+
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         """Raise if this node or any child cannot rebind to ``cache_pool``."""
         for backend in self.child_backends():
