@@ -506,19 +506,22 @@ def _no_weights(args):
 
 @gluon.jit
 def _sender_weights(args):
-    """SND + RTR's resident weights: o_proj rows of sender, the router's
-    hi / lo tiles of its K-part task."""
-    o_proj_ptr, sender, router_hi_ptr, router_lo_ptr, task = args
-    o_tiles = gemv_a16w16_splitk_weights_gfx950(
-        o_proj_ptr, sender, _Q_WIDTH, 64, 1, 128
-    )
+    """SND's resident weights: the o_proj rows of ``sender``."""
+    o_proj_ptr, sender = args
+    return gemv_a16w16_splitk_weights_gfx950(o_proj_ptr, sender, _Q_WIDTH, 64, 1, 128)
+
+
+@gluon.jit
+def _router_weights(router_hi_ptr, router_lo_ptr, task):
+    """RTR's resident weights: the router's hi / lo tiles of its K-part
+    task."""
     hi = gemv_a16w16_splitk_weight_steps_gfx950(
         router_hi_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS, 1
     )
     lo = gemv_a16w16_splitk_weight_steps_gfx950(
         router_lo_ptr, task, _HIDDEN, 16, _KPARTS, _ROUTER_GROUPS, 1
     )
-    return o_tiles, hi, lo
+    return hi, lo
 
 
 @gluon.jit
@@ -1486,29 +1489,43 @@ def gluon_decoder_layer_muse_spark_gfx950(
         # SND -> OWN1 on slot 0 -> RTR.
         sender = xcd * 16 + slot
         task = xcd * _ROUTER_GROUPS + slot
-        weights = (o_proj_ptr, sender, router_hi_ptr, router_lo_ptr, task)
         if SLIDING:
-            # The weights go out before the entry check (no attention here).
-            o_tiles, hi, lo = _sender_weights(weights)
+            # The weights go out before the entry check (no attention here)
+            # and land long before the box: o_proj and the router's tiles.
+            o_tiles = _sender_weights((o_proj_ptr, sender))
+            hi, lo = _router_weights(router_hi_ptr, router_lo_ptr, task)
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
+            _send(launch, view, sender, o_tiles, rows, RANK, PEER_CACHE)
+            if slot == 0:
+                own1(
+                    view, launch, xcd, rows, residual_ptr, post_attn_norm_ptr,
+                    alpha_ptr, beta_ptr, iris_fail_stop, RANK, POST_ATTN_OFFSET,
+                    POST_ATTN_HAS_WEIGHT, PEER_CACHE,
+                )  # fmt: skip
         else:
+            # Full layers: o_proj after this workgroup's attention items; the
+            # box arrives soon after, and its read queues behind whatever
+            # this workgroup has in flight, so the router's tiles wait for
+            # the push and OWN1 (they are needed only after the all-gather).
             launch = enter_check(entry, errors, arena, deadline_ticks, label, fail_stop)
             _stamp(stamps_ptr, launch.cta, _STAMP_CHECKED, STAMPS)
             records = _launch_records(att_records, launch)
-            o_tiles, hi, lo = _full_items(
+            o_tiles = _full_items(
                 launch, cfg, q_ptr, cache_seqlens_ptr, schedule_ptr, page_table_ptr,
                 k_cache_ptr, v_cache_ptr, mid_o_ptr, mid_lse_ptr, records,
-                REQUESTS, NUM_STAGES, _sender_weights, weights,
+                REQUESTS, NUM_STAGES, _sender_weights, (o_proj_ptr, sender),
             )  # fmt: skip
-        _send(launch, view, sender, o_tiles, rows, RANK, PEER_CACHE)
-        if slot == 0:
-            own1(
-                view, launch, xcd, rows, residual_ptr, post_attn_norm_ptr, alpha_ptr,
-                beta_ptr, iris_fail_stop, RANK, POST_ATTN_OFFSET, POST_ATTN_HAS_WEIGHT,
-                PEER_CACHE,
-            )  # fmt: skip
+            _send(launch, view, sender, o_tiles, rows, RANK, PEER_CACHE)
+            if slot == 0:
+                own1(
+                    view, launch, xcd, rows, residual_ptr, post_attn_norm_ptr,
+                    alpha_ptr, beta_ptr, iris_fail_stop, RANK, POST_ATTN_OFFSET,
+                    POST_ATTN_HAS_WEIGHT, PEER_CACHE,
+                )  # fmt: skip
+            # After OWN1's reduce-scatter wait, which they would hold up.
+            hi, lo = _router_weights(router_hi_ptr, router_lo_ptr, task)
         router_x = _kpart_state(
             launch, view, xcd, task, rows, residual_ptr, alpha_ptr, beta_ptr,
             post_attn_bf16_ptr, pre_ffn_bf16_ptr, hprime, slot == 1, _ROUTER_GROUPS,
