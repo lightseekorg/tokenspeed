@@ -66,7 +66,8 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
     """Each wave's record (one ``buffer_store_dword`` of the tag) comes after a
     ``s_waitcnt vmcnt(0)`` that follows the wave's last partial store, with no
     store between them, and the merger reads the partials ``sc0 nt`` without
-    any L2 writeback or invalidate."""
+    any L2 writeback or invalidate, issuing the splits' partial loads back to
+    back with no full drain among them."""
     kernel = compile_gfx950(
         split_records_kernel,
         {
@@ -108,7 +109,23 @@ def test_split_record_follows_the_wave_drain_of_its_partial():
         if code[i].startswith("s_waitcnt") and "vmcnt(0)" in code[i]
     ]
     assert drains, code[stores[-1] : record + 1]
-    partial_loads = [line for line in code[poll:] if line.startswith("buffer_load")]
+    loads = [
+        i for i, line in enumerate(code) if i > poll and line.startswith("buffer_load")
+    ]
+    partial_loads = [code[i] for i in loads]
     assert partial_loads and all(
         line.endswith("sc0 nt") for line in partial_loads
     ), partial_loads
+    # The splits' partials stream back to back: the fold waits for them one
+    # at a time (counted waits) and never drains the loads still in flight.
+    assert not [
+        line
+        for line in code[loads[0] : loads[-1]]
+        if line.startswith("s_waitcnt") and "vmcnt(0)" in line
+    ]
+    first_wait = next(
+        i for i in range(loads[0], len(code)) if code[i].startswith("s_waitcnt vmcnt")
+    )
+    assert (
+        sum(1 for i in loads if i < first_wait) >= 16
+    ), "every split's partial load is issued before the first wait"

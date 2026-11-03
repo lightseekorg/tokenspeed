@@ -831,56 +831,71 @@ class AttentionProgram:
         # waves share, and the L2's non-coherently cached lines (CDNA4
         # ISA 9.1.10.2, Table 52), and the barrier that
         # broadcasts the old count orders their loads after it.
-        for split in range(0, cfg.NUM_KV_SPLITS):
-            base = (
-                (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
-                * cfg.NUM_KV_SPLITS
-                + split
-            ) * cfg.HEAD_DIM + offs_d[None, :]
-            if PARTIAL_CACHE == "":
+        if PARTIAL_CACHE == "":
+            for split in range(0, cfg.NUM_KV_SPLITS):
+                base = (
+                    (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
+                    * cfg.NUM_KV_SPLITS
+                    + split
+                ) * cfg.HEAD_DIM + offs_d[None, :]
                 part_o = gl.load(
                     self.mid_o_ptr + base,
                     mask=valid[:, None],
                     other=0.0,
                 ).to(gl.float32)
-            else:
-                part_o = cdna4.buffer_load(
-                    self.mid_o_ptr,
-                    base,
-                    mask=valid[:, None],
-                    other=0.0,
-                    cache=PARTIAL_CACHE,
-                ).to(gl.float32)
-            lse_offset = (
-                tokens * cfg.NUM_Q_HEADS + q_heads
-            ) * cfg.NUM_KV_SPLITS + split
-            if PARTIAL_CACHE == "":
+                lse_offset = (
+                    tokens * cfg.NUM_Q_HEADS + q_heads
+                ) * cfg.NUM_KV_SPLITS + split
                 part_lse = gl.load(
                     self.mid_lse_ptr + lse_offset,
                     mask=valid,
                     other=-float("inf"),
                 ).to(gl.float32)
-            else:
-                part_lse = cdna4.buffer_load(
-                    self.mid_lse_ptr,
-                    lse_offset,
-                    mask=valid,
-                    other=-float("inf"),
-                    cache=PARTIAL_CACHE,
-                ).to(gl.float32)
-            next_m = maximum(final_m, part_lse)
-            if cfg.MAX_SEQLEN_Q > 1:
-                # A later query position's first splits can all precede
-                # its window, leaving -inf - -inf.
-                next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
-                alpha = gl.exp2(final_m - next_m_safe)
-                beta = gl.exp2(part_lse - next_m_safe)
-            else:
-                alpha = gl.exp2(final_m - next_m)
-                beta = gl.exp2(part_lse - next_m)
-            final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
-            final_l = final_l * alpha + beta
-            final_m = next_m
+                final_m, final_l, final_acc = _merge_split_step(
+                    cfg, final_m, final_l, final_acc, part_o, part_lse
+                )
+        else:
+            # Every split's partial in flight at once, then the fold in split
+            # order: a per-split load-then-fold loop would wait one memory
+            # round trip per split.
+            parts_o = ()
+            parts_lse = ()
+            for split in gl.static_range(cfg.NUM_KV_SPLITS):
+                base = (
+                    (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
+                    * cfg.NUM_KV_SPLITS
+                    + split
+                ) * cfg.HEAD_DIM + offs_d[None, :]
+                parts_o += (
+                    cdna4.buffer_load(
+                        self.mid_o_ptr,
+                        base,
+                        mask=valid[:, None],
+                        other=0.0,
+                        cache=PARTIAL_CACHE,
+                    ),
+                )
+                lse_offset = (
+                    tokens * cfg.NUM_Q_HEADS + q_heads
+                ) * cfg.NUM_KV_SPLITS + split
+                parts_lse += (
+                    cdna4.buffer_load(
+                        self.mid_lse_ptr,
+                        lse_offset,
+                        mask=valid,
+                        other=-float("inf"),
+                        cache=PARTIAL_CACHE,
+                    ),
+                )
+            for split in gl.static_range(cfg.NUM_KV_SPLITS):
+                final_m, final_l, final_acc = _merge_split_step(
+                    cfg,
+                    final_m,
+                    final_l,
+                    final_acc,
+                    parts_o[split].to(gl.float32),
+                    parts_lse[split].to(gl.float32),
+                )
         if has_sink:
             sink_log2 = (
                 gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
@@ -892,6 +907,25 @@ class AttentionProgram:
             final_acc *= alpha[:, None]
             final_l = final_l * alpha + beta
         return final_acc / final_l[:, None]
+
+
+@gluon.jit
+def _merge_split_step(cfg, final_m, final_l, final_acc, part_o, part_lse):
+    """Fold one split's partial (rows ``part_o``, log2-sum-exp ``part_lse``)
+    into the running merge; ``merge_splits`` folds the splits in split order."""
+    next_m = maximum(final_m, part_lse)
+    if cfg.MAX_SEQLEN_Q > 1:
+        # A later query position's first splits can all precede
+        # its window, leaving -inf - -inf.
+        next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
+        alpha = gl.exp2(final_m - next_m_safe)
+        beta = gl.exp2(part_lse - next_m_safe)
+    else:
+        alpha = gl.exp2(final_m - next_m)
+        beta = gl.exp2(part_lse - next_m)
+    final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
+    final_l = final_l * alpha + beta
+    return next_m, final_l, final_acc
 
 
 # ===-----------------------------------------------------------------------===#
