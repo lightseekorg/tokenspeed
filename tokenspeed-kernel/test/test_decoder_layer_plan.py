@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark import plan_variants
 from tokenspeed_kernel.ops.decoder_layer._gluon.muse_spark.plan import muse_plan
 from tokenspeed_kernel.ops.decoder_layer._gluon.plan import (
     Clear,
+    Load,
     PlanError,
     Publish,
     Region,
@@ -119,6 +120,22 @@ def test_a_vector_poll_behind_its_own_loads_is_rejected():
 
     with pytest.raises(PlanError, match="poll-behind-own-loads"):
         check_plan(_edit(muse_plan(_KEY), (3, 5), drop_flag))
+
+
+def test_router_weights_at_entry_would_queue_the_owner_poll():
+    """OWN1 polls the reduce-scatter words with no loads in flight: the
+    router's tiles go out after it. Issued at entry (before the push), they
+    would sit in front of that poll."""
+
+    def router_at_entry(steps):
+        router = next(x for x in steps if isinstance(x, Load) and x.role == "RTR")
+        steps = [x for x in steps if x is not router]
+        return [steps[0], router] + steps[1:]
+
+    plan = muse_plan(_KEY)
+    assert check_plan(plan) > 0
+    with pytest.raises(PlanError, match="OWN1 on \\(3, 0\\) polls .*poll-behind"):
+        check_plan(_edit(plan, (3, 0), router_at_entry))
 
 
 def test_a_wait_cycle_is_rejected():
