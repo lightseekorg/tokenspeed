@@ -46,7 +46,7 @@ use ts_collective::{Group, Mesh, Reduce};
 
 use crate::{
     batch::{BatchRows, Staged},
-    control::{BootstrapInfo, PdError, PdEvent, TransferPeer},
+    control::{stalled_drains, BootstrapInfo, Draining, PdError, PdEvent, TransferPeer},
     http,
     layout::{
         contract::Contract,
@@ -233,9 +233,39 @@ struct State {
     layerwise_rooms: HashSet<u64>,
     /// Layerwise rooms' bootstrap payloads, from their remote decode.
     prefill_metadata: HashMap<u64, (i64, Option<Vec<i32>>)>,
+    /// Chunks queued or running, by room: they may still read its source
+    /// pages. Kept apart from the room's other state, which a failure
+    /// forgets while a chunk still runs.
+    readers: HashMap<u64, usize>,
+    /// The Decode ranks a failed room still owes its failure, told once no
+    /// chunk of the room reads any more: a Decode rank frees the room's
+    /// pages on every Prefill rank's report.
+    owed_failures: HashMap<u64, BTreeSet<(String, u16)>>,
+    /// Rooms a write failed in. The native transfer does not say whether
+    /// its DMA stopped, so their Decode ranks are never told they may free
+    /// the pages. Never cleared with the room: a later Cancel or failure of
+    /// it must still be withheld. One entry per failed write.
+    uncertain: HashSet<u64>,
 }
 
 impl State {
+    /// The failure notices `room` owes, once no chunk of it reads.
+    fn take_owed_failures(&mut self, room: u64) -> Vec<(String, u16)> {
+        if self.readers.contains_key(&room) {
+            return Vec::new();
+        }
+        let owed = self.owed_failures.remove(&room).unwrap_or_default();
+        if self.uncertain.contains(&room) && !owed.is_empty() {
+            tracing::error!(
+                room,
+                "withholding a failed room's notices: a write may still land, so its Decode \
+                 ranks keep the pages"
+            );
+            return Vec::new();
+        }
+        owed.into_iter().collect()
+    }
+
     fn route_of(&self, session_id: &str) -> Option<(String, u16)> {
         self.registrations
             .get(session_id)
@@ -361,9 +391,9 @@ impl Shared {
     }
 
     /// Fail a room and tell every destination that pre-allocated for it
-    /// (`abort_room`).
+    /// (`abort_room`), once no chunk of the room still reads.
     fn abort_room(&self, room: u64, reason: &str) {
-        let routes: Vec<_> = {
+        let routes = {
             let mut state = self.state();
             // Once per room: a room's later chunks fail here again.
             let counted = state.rooms.get(room) == Some(TransferPoll::Failed)
@@ -375,7 +405,7 @@ impl Shared {
             state.rooms.update(room, TransferPoll::Failed);
             state.touch(room);
             let destinations = state.destinations.remove(&room).unwrap_or_default();
-            destinations
+            let routes: Vec<_> = destinations
                 .iter()
                 .filter(|destination| !destination.is_dummy())
                 .filter_map(|destination| {
@@ -389,16 +419,66 @@ impl Shared {
                     }
                     route
                 })
-                .collect()
+                .collect();
+            state.owed_failures.entry(room).or_default().extend(routes);
+            state.take_owed_failures(room)
         };
         for route in routes {
             self.notify_failed(route, room);
         }
     }
 
+    /// A chunk of `room` stopped reading its source pages: the last one sends
+    /// the failure notices the room owes.
+    fn reader_done(&self, room: u64) {
+        let routes = {
+            let mut state = self.state();
+            let readers = state
+                .readers
+                .get_mut(&room)
+                .expect("a queued chunk is counted");
+            *readers -= 1;
+            if *readers > 0 {
+                return;
+            }
+            state.readers.remove(&room);
+            state.take_owed_failures(room)
+        };
+        for route in routes {
+            self.notify_failed(route, room);
+        }
+    }
+
+    /// A Decode rank stopped receiving a room: fail it here too, and tell
+    /// that rank once this rank's writes to it stopped.
+    fn handle_cancel(&self, frames: &[Bytes]) {
+        let (room, session_id) = match wire::cancel_route(frames) {
+            Ok(route) => route,
+            Err(error) => {
+                tracing::error!(%error, "rejecting a malformed CachePD cancellation");
+                return;
+            }
+        };
+        let route = self.state().route_of(&session_id);
+        match route {
+            // Owed even when its pre-allocation never arrived here.
+            Some(route) => {
+                self.state()
+                    .owed_failures
+                    .entry(room)
+                    .or_default()
+                    .insert(route);
+            }
+            None => tracing::error!(room, "cannot answer a cancellation: unregistered session"),
+        }
+        self.abort_room(room, "Decode stopped receiving the room");
+    }
+
     fn handle(&self, frames: &[Bytes]) {
         if wire::is_registration(frames) {
             self.handle_registration(frames);
+        } else if wire::is_cancel(frames) {
+            self.handle_cancel(frames);
         } else {
             self.handle_preallocation(frames);
         }
@@ -671,9 +751,15 @@ impl Shared {
             .collect()
     }
 
-    fn write_copies(&self, registration: &Registration, copies: &[Copy]) -> Result<(), String> {
+    fn write_copies(
+        &self,
+        room: u64,
+        registration: &Registration,
+        copies: &[Copy],
+    ) -> Result<(), String> {
         let started = Instant::now();
         if let Err(error) = self.transport.write(&registration.session_id, copies) {
+            self.state().uncertain.insert(room);
             self.mark_session_failed(&registration.session_id);
             return Err(format!(
                 "Mooncake transfer failed for {}:{}: {error}",
@@ -802,7 +888,7 @@ impl Shared {
                     .get(interval)
                     .ok_or("a layerwise plan has fewer intervals than the chunk")?;
                 if !copies.is_empty() {
-                    self.write_copies(registration, copies)?;
+                    self.write_copies(room, registration, copies)?;
                 }
             }
         }
@@ -873,7 +959,7 @@ impl Shared {
             prepared.push((registration, copies));
         }
         for (registration, copies) in &prepared {
-            self.write_copies(registration, copies)?;
+            self.write_copies(room, registration, copies)?;
         }
         let registrations: Vec<Registration> = prepared
             .into_iter()
@@ -885,20 +971,22 @@ impl Shared {
 
     fn run_worker(&self, queue: &mpsc::Receiver<Chunk>) {
         while let Ok(chunk) = queue.recv() {
-            if let Err(reason) = self.transfer(&chunk) {
-                if self.state().ended(chunk.room()) {
-                    // Another thread failed or dropped the room after it was
-                    // queued: failing it again would replace its reason.
-                    tracing::debug!(
-                        room = chunk.room(),
-                        reason,
-                        "dropping an ended room's transfer"
-                    );
-                    continue;
+            let room = chunk.room();
+            // A room that ended while the chunk waited is written no more.
+            if !self.state().ended(room) {
+                if let Err(reason) = self.transfer(&chunk) {
+                    if self.state().ended(room) {
+                        // Another thread failed or dropped the room after it
+                        // was queued: failing it again would replace its
+                        // reason.
+                        tracing::debug!(room, reason, "dropping an ended room's transfer");
+                    } else {
+                        tracing::error!(room, reason, "CachePD transfer failed");
+                        self.abort_room(room, &format!("CachePD transfer failed: {reason}"));
+                    }
                 }
-                tracing::error!(room = chunk.room(), reason, "CachePD transfer failed");
-                self.abort_room(chunk.room(), &format!("CachePD transfer failed: {reason}"));
             }
+            self.reader_done(room);
         }
     }
 }
@@ -926,7 +1014,17 @@ impl PrefillOutbox {
     /// refused while a tracked request's KV may still go out. A room no
     /// request here claimed sends nothing, so it does not hold the release.
     pub fn release_registration(&self) -> Result<(), String> {
-        let mut sending: Vec<u64> = self.shared.state().tracked.iter().copied().collect();
+        let mut sending: Vec<u64> = {
+            let state = self.shared.state();
+            state
+                .tracked
+                .iter()
+                .chain(state.readers.keys())
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
         if !sending.is_empty() {
             sending.sort_unstable();
             return Err(format!(
@@ -1111,7 +1209,7 @@ impl PrefillOutbox {
     fn enqueue(&self, rid: &str, chunk: Chunk) {
         let room = chunk.room();
         let shard = {
-            let state = self.shared.state();
+            let mut state = self.shared.state();
             if state.ended(room) {
                 tracing::debug!(rid, room, "the room already failed or ended");
                 return;
@@ -1124,10 +1222,14 @@ impl PrefillOutbox {
                 .iter()
                 .filter_map(|destination| wire::session_port(&destination.session_id))
                 .sum();
+            *state.readers.entry(room).or_default() += 1;
             (ports % self.queues.len() as u64) as usize
         };
         if self.queues[shard].send(chunk).is_err() {
             tracing::error!(rid, room, "the PD transfer workers stopped");
+            self.shared.reader_done(room);
+            self.shared
+                .abort_room(room, "the PD transfer workers stopped");
         }
     }
 
@@ -1250,6 +1352,10 @@ pub struct PrefillPeer {
     /// registers the same requests in the same order).
     order: Vec<String>,
     senders: HashMap<String, Sender>,
+    /// Requests whose transfer failed, with their rooms, until no chunk of
+    /// the room reads on any member ([`PdEvent::Stopped`]); in failure order.
+    draining: Vec<Draining>,
+    drain_logged_at: Option<Instant>,
     stall_logged_at: Option<Instant>,
     timeout_logged: bool,
 }
@@ -1336,6 +1442,8 @@ impl PrefillPeer {
                 bootstrap_timeout: config.bootstrap_timeout,
                 order: Vec::new(),
                 senders: HashMap::new(),
+                draining: Vec::new(),
+                drain_logged_at: None,
                 stall_logged_at: None,
                 timeout_logged: false,
             },
@@ -1389,11 +1497,26 @@ impl PrefillPeer {
         }
     }
 
-    fn forget(&mut self, rid: &str) {
+    fn forget(&mut self, rid: &str, failed: bool) {
         let Some(sender) = self.senders.remove(rid) else {
             return;
         };
         self.order.retain(|tracked| tracked != rid);
+        if failed {
+            // Whichever member failed it, every member stops its own reads
+            // and tells its Decode ranks once they stopped.
+            let failed_here =
+                self.shared.state().rooms.get(sender.room) == Some(TransferPoll::Failed);
+            if !failed_here {
+                self.shared
+                    .abort_room(sender.room, "the transfer failed on another rank");
+            }
+            self.draining.push(Draining {
+                rid: rid.to_owned(),
+                room: sender.room,
+                since: Instant::now(),
+            });
+        }
         let mut state = self.shared.state();
         state.clear(sender.room);
         state.rooms_by_rid.remove(rid);
@@ -1439,11 +1562,11 @@ impl TransferPeer for PrefillPeer {
     }
 
     fn poll(&mut self, mesh: &mut Mesh, replica: &Group) -> Result<Vec<PdEvent>, PdError> {
-        if self.order.is_empty() {
+        if self.order.is_empty() && self.draining.is_empty() {
             return Ok(Vec::new());
         }
         let now = Instant::now();
-        let mut polls = Vec::with_capacity(self.order.len());
+        let mut polls = Vec::with_capacity(self.order.len() + self.draining.len());
         {
             let mut state = self.shared.state();
             for rid in &self.order {
@@ -1487,17 +1610,39 @@ impl TransferPeer for PrefillPeer {
                 };
                 polls.push(poll as i64);
             }
+            // Then each draining room: 1 once no chunk of it reads here.
+            polls.extend(
+                self.draining
+                    .iter()
+                    .map(|drain| i64::from(!state.readers.contains_key(&drain.room))),
+            );
         }
         let agreed = if replica.size() > 1 {
             mesh.all_reduce(replica, &polls, Reduce::Min)?
         } else {
             polls
         };
-        self.log_stalls(&agreed);
+        let (agreed, stopped) = agreed.split_at(self.order.len());
+        self.log_stalls(agreed);
 
         let mut events = Vec::new();
+        let mut stopped = stopped.iter();
+        self.draining.retain(|drain| {
+            let done = *stopped.next().expect("one code per draining room") != 0;
+            if done {
+                events.push(PdEvent::Stopped(drain.rid.clone()));
+            }
+            !done
+        });
+        let stalled = stalled_drains(&self.draining, &mut self.drain_logged_at, now);
+        if !stalled.is_empty() {
+            tracing::warn!(
+                ?stalled,
+                "transfers still stopping: their pages stay pinned"
+            );
+        }
         let mut ended = Vec::new();
-        for (rid, &poll) in self.order.iter().zip(&agreed) {
+        for (rid, &poll) in self.order.iter().zip(agreed) {
             let sender = self.senders.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
@@ -1512,21 +1657,28 @@ impl TransferPeer for PrefillPeer {
                     .map(str::to_owned);
                 tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
                 events.push(PdEvent::Failed(rid.clone()));
-                ended.push(rid.clone());
+                ended.push((rid.clone(), true));
             } else if sender.local == TransferPoll::Bootstrapped && poll == TransferPoll::Success {
                 sender.local = TransferPoll::Success;
                 events.push(PdEvent::Succeeded(rid.clone()));
-                ended.push(rid.clone());
+                ended.push((rid.clone(), false));
             }
         }
-        for rid in ended {
-            self.forget(&rid);
+        for (rid, failed) in ended {
+            self.forget(&rid, failed);
         }
         Ok(events)
     }
 
+    fn cancel(&mut self, rid: &str) {
+        if let Some(sender) = self.senders.get(rid) {
+            self.shared
+                .abort_room(sender.room, "the request was aborted");
+        }
+    }
+
     fn has_in_flight(&self) -> bool {
-        !self.order.is_empty()
+        !self.order.is_empty() || !self.draining.is_empty()
     }
 
     fn abort_room(&mut self, rid: &str, room: u64) {

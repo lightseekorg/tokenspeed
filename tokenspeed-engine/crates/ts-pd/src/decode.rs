@@ -43,7 +43,9 @@ use ts_collective::{Group, Mesh, Reduce};
 
 use crate::{
     batch::{BatchRows, Staged},
-    control::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer},
+    control::{
+        stalled_drains, BootstrapInfo, Draining, PdError, PdEvent, RemotePrefill, TransferPeer,
+    },
     http,
     layout::{
         contract::Contract,
@@ -123,6 +125,13 @@ struct State {
     targets: HashMap<u64, Arc<Vec<Target>>>,
     admissions: HashMap<u64, i32>,
     waiting_since: HashMap<u64, Instant>,
+    /// The Prefill ranks that reported a tracked room done or failed: they
+    /// write it no more.
+    stopped: HashMap<u64, BTreeSet<i64>>,
+    /// Rooms whose receive failed after their manifest went out, and the
+    /// Prefill ranks that may still write them: the pages stay until each
+    /// reports it stopped.
+    draining: HashMap<u64, BTreeSet<i64>>,
     /// Bootstrap address -> the rooms reading from it.
     addr_rooms: HashMap<String, HashSet<u64>>,
     /// Bootstrap address -> its route; the addresses the heartbeat watches.
@@ -143,8 +152,24 @@ impl State {
     /// Apply one Prefill rank's report.
     fn apply(&mut self, message: StatusMessage) {
         let room = message.room;
+        let stops = matches!(message.status, TransferPoll::Success | TransferPoll::Failed);
+        if let Some(writers) = self.draining.get_mut(&room) {
+            if stops {
+                writers.remove(&message.prefill_rank);
+                if writers.is_empty() {
+                    self.draining.remove(&room);
+                }
+            }
+            return;
+        }
         if !self.tracked.contains(&room) {
             return;
+        }
+        if stops {
+            self.stopped
+                .entry(room)
+                .or_default()
+                .insert(message.prefill_rank);
         }
         match message.status {
             TransferPoll::Success => {
@@ -278,8 +303,31 @@ impl State {
         affected
     }
 
+    /// A failed receive is forgotten: the Prefill ranks its manifest went
+    /// to that have not stopped may still write its pages. Starts draining
+    /// them and returns the targets to cancel, or `None` when none may.
+    fn drain(&mut self, room: u64) -> Option<Arc<Vec<Target>>> {
+        if !self.admissions.contains_key(&room) {
+            return None;
+        }
+        let targets = self.targets.get(&room)?.clone();
+        let stopped = self.stopped.get(&room).cloned().unwrap_or_default();
+        let writers: BTreeSet<i64> = self
+            .expected
+            .get(&room)?
+            .difference(&stopped)
+            .copied()
+            .collect();
+        if writers.is_empty() {
+            return None;
+        }
+        self.draining.insert(room, writers);
+        Some(targets)
+    }
+
     fn clear(&mut self, room: u64, addr: &str) {
         self.rooms.remove(room);
+        self.stopped.remove(&room);
         self.tracked.remove(&room);
         self.expected.remove(&room);
         self.responses.remove(&room);
@@ -472,7 +520,15 @@ impl DecodeOutbox {
     /// A sleep releases the cache: deregister it from the transfer engine,
     /// refused while a tracked request's KV may still land.
     pub fn release_registration(&self) -> Result<(), String> {
-        let mut receiving: Vec<u64> = self.shared.state().tracked.iter().copied().collect();
+        let mut receiving: Vec<u64> = {
+            let state = self.shared.state();
+            state
+                .tracked
+                .iter()
+                .chain(state.draining.keys())
+                .copied()
+                .collect()
+        };
         if !receiving.is_empty() {
             receiving.sort_unstable();
             return Err(format!(
@@ -542,10 +598,10 @@ impl DecodeOutbox {
     fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
         let targets = {
             let mut state = self.shared.state();
-            if !state.tracked.contains(&room) {
-                // The loop ended the request (its transfer failed) after it
-                // planned this admission: its pages go back, so no Prefill
-                // rank may write them.
+            if !state.tracked.contains(&room) || state.rooms.get(room) == Some(TransferPoll::Failed)
+            {
+                // The request ended or failed after the loop planned this
+                // admission: no Prefill rank may learn of its pages.
                 tracing::debug!(rid, room, "not pre-allocating an ended request");
                 return;
             }
@@ -597,6 +653,11 @@ pub struct DecodePeer {
     /// registers the same requests in the same order).
     order: Vec<String>,
     receivers: HashMap<String, Receiver>,
+    /// Requests whose receive failed, with their rooms, until no Prefill
+    /// rank writes the room for any member ([`PdEvent::Stopped`]); in
+    /// failure order.
+    draining: Vec<Draining>,
+    drain_logged_at: Option<Instant>,
     timeout_logged: bool,
 }
 
@@ -680,6 +741,8 @@ impl DecodePeer {
                 waiting_timeout: config.waiting_timeout,
                 order: Vec::new(),
                 receivers: HashMap::new(),
+                draining: Vec::new(),
+                drain_logged_at: None,
                 timeout_logged: false,
             },
             outbox,
@@ -696,14 +759,39 @@ impl DecodePeer {
         self.shared.transport.session_id()
     }
 
-    fn forget(&mut self, rid: &str) {
+    fn forget(&mut self, rid: &str, failed: bool) {
         let Some(receiver) = self.receivers.remove(rid) else {
             return;
         };
         self.order.retain(|tracked| tracked != rid);
-        let mut state = self.shared.state();
-        state.clear(receiver.room, &receiver.addr);
-        state.rooms_by_rid.remove(rid);
+        let cancel = {
+            let mut state = self.shared.state();
+            let cancel = if failed {
+                state.drain(receiver.room)
+            } else {
+                None
+            };
+            state.clear(receiver.room, &receiver.addr);
+            state.rooms_by_rid.remove(rid);
+            cancel
+        };
+        if let Some(targets) = cancel {
+            let session_id = self.shared.transport.session_id();
+            for target in targets.iter() {
+                self.shared.transport.sockets.send(
+                    &target.host,
+                    target.port,
+                    wire::cancel_frames(receiver.room, &session_id),
+                );
+            }
+        }
+        if failed {
+            self.draining.push(Draining {
+                rid: rid.to_owned(),
+                room: receiver.room,
+                since: Instant::now(),
+            });
+        }
     }
 }
 
@@ -753,11 +841,11 @@ impl TransferPeer for DecodePeer {
     }
 
     fn poll(&mut self, mesh: &mut Mesh, replica: &Group) -> Result<Vec<PdEvent>, PdError> {
-        if self.order.is_empty() {
+        if self.order.is_empty() && self.draining.is_empty() {
             return Ok(Vec::new());
         }
         let now = Instant::now();
-        let mut polls = Vec::with_capacity(self.order.len());
+        let mut polls = Vec::with_capacity(self.order.len() + self.draining.len());
         {
             let mut state = self.shared.state();
             for rid in &self.order {
@@ -812,16 +900,38 @@ impl TransferPeer for DecodePeer {
                 };
                 polls.push(poll as i64);
             }
+            // Then each draining room: 1 once no Prefill rank writes it.
+            polls.extend(
+                self.draining
+                    .iter()
+                    .map(|drain| i64::from(!state.draining.contains_key(&drain.room))),
+            );
         }
         let agreed = if replica.size() > 1 {
             mesh.all_reduce(replica, &polls, Reduce::Min)?
         } else {
             polls
         };
+        let (agreed, stopped) = agreed.split_at(self.order.len());
 
         let mut events = Vec::new();
+        let mut stopped = stopped.iter();
+        self.draining.retain(|drain| {
+            let done = *stopped.next().expect("one code per draining room") != 0;
+            if done {
+                events.push(PdEvent::Stopped(drain.rid.clone()));
+            }
+            !done
+        });
+        let stalled = stalled_drains(&self.draining, &mut self.drain_logged_at, now);
+        if !stalled.is_empty() {
+            tracing::warn!(
+                ?stalled,
+                "transfers still stopping: their pages stay pinned"
+            );
+        }
         let mut ended = Vec::new();
-        for (rid, &poll) in self.order.iter().zip(&agreed) {
+        for (rid, &poll) in self.order.iter().zip(agreed) {
             let receiver = self.receivers.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
             if receiver.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
@@ -836,7 +946,7 @@ impl TransferPeer for DecodePeer {
                     .map(str::to_owned);
                 tracing::warn!(rid, room = receiver.room, reason, "KV transfer failed");
                 events.push(PdEvent::Failed(rid.clone()));
-                ended.push(rid.clone());
+                ended.push((rid.clone(), true));
             } else if receiver.local == TransferPoll::Bootstrapped && poll == TransferPoll::Success
             {
                 receiver.local = TransferPoll::Success;
@@ -859,19 +969,27 @@ impl TransferPeer for DecodePeer {
                     spec_candidate_ids: landed.spec_candidate_ids,
                     request_pool_index,
                 }));
-                ended.push(rid.clone());
+                ended.push((rid.clone(), false));
             }
         }
-        for rid in ended {
-            self.forget(&rid);
+        for (rid, failed) in ended {
+            self.forget(&rid, failed);
         }
         Ok(events)
+    }
+
+    fn cancel(&mut self, rid: &str) {
+        if let Some(receiver) = self.receivers.get(rid) {
+            self.shared
+                .state()
+                .fail(receiver.room, "the request was aborted");
+        }
     }
 
     fn record_usage(&mut self, _rid: &str, _cached_tokens: i64, _bootstrap_logprob: Option<f64>) {}
 
     fn has_in_flight(&self) -> bool {
-        !self.order.is_empty()
+        !self.order.is_empty() || !self.draining.is_empty()
     }
 
     /// The decode node has no encoder to wait on.

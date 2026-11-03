@@ -418,6 +418,19 @@ struct FakePeer {
 }
 
 impl TransferPeer for FakePeer {
+    /// The wire carries the cancellation as a broken transfer.
+    fn cancel(&mut self, rid: &str) {
+        if let Some((_, room, _)) = self.tracked.iter().find(|(id, _, _)| id == rid) {
+            self.wire
+                .lock()
+                .unwrap()
+                .rooms
+                .entry(*room)
+                .or_default()
+                .fails = true;
+        }
+    }
+
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
         if self.role == Role::Decode {
             self.wire
@@ -493,9 +506,11 @@ impl TransferPeer for FakePeer {
             let room = wire.rooms.entry(*room).or_default();
             match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
                 TransferPoll::Failed => {
-                    // The peer engine sees the failure only on the wire.
+                    // The peer engine sees the failure only on the wire. Its
+                    // transfer stops at once.
                     room.fails = true;
                     events.push(PdEvent::Failed(rid.clone()));
+                    events.push(PdEvent::Stopped(rid.clone()));
                     false
                 }
                 TransferPoll::Bootstrapped if !*bootstrapped => {

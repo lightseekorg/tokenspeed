@@ -124,6 +124,35 @@ pub fn preallocation_route(frames: &[Bytes]) -> Result<(u64, String), WireError>
     Ok((room, session_id))
 }
 
+/// A Decode rank stopped receiving a room: every Prefill rank fails it and
+/// reports `Failed` once its writes to the room stopped.
+pub fn cancel_frames(room: u64, session_id: &str) -> Vec<Bytes> {
+    vec![Bytes::from_static(CANCEL), ascii(room), ascii(session_id)]
+}
+
+const CANCEL: &[u8] = b"Cancel";
+
+/// Whether `frames` are a [`cancel_frames`] message.
+pub fn is_cancel(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|header| header.as_ref() == CANCEL)
+}
+
+/// A cancellation's room and Decode session.
+pub fn cancel_route(frames: &[Bytes]) -> Result<(u64, String), WireError> {
+    if frames.len() != 3 || !is_cancel(frames) {
+        return Err(error("CachePD cancellation requires exactly 3 frames"));
+    }
+    let room = parse_uint(&frames[1], MAX_ROOM)
+        .ok_or_else(|| error("CachePD room must be canonical unsigned ASCII"))?;
+    let session_id = text(&frames[2], "CachePD session")?;
+    if session_id.is_empty() || session_id.len() > 512 {
+        return Err(error("CachePD cancellation requires a Decode session"));
+    }
+    Ok((room, session_id))
+}
+
 /// A Prefill rank's report on one room.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusMessage {
