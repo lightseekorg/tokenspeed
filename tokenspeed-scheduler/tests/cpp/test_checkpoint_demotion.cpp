@@ -1093,7 +1093,9 @@ TEST_F(CheckpointDemotionSuite, ATurnResumingOneTurnBackDemotesNothing) {
 
 // A shared prefix's junction checkpoint is no in-forward checkpoint, so no
 // turn that resumed from it demotes it, while each user's own chain demotes
-// its first turn's checkpoint.
+// its first turn's checkpoint. User 3's second turn finds the junction two
+// turns back with only user 3 resumed there, so the exact counts check it:
+// user 4's hit at 12 would end a demotion before the final probe.
 TEST_F(CheckpointDemotionSuite, ASharedJunctionIsNeverDemoted) {
     Rebuild(/*demote=*/true, /*device_pages=*/257, /*host_pages=*/129);
     const std::vector<std::int32_t> shared = MakeTokens(12);
@@ -1101,16 +1103,18 @@ TEST_F(CheckpointDemotionSuite, ASharedJunctionIsNeverDemoted) {
     ASSERT_EQ(Turn("u2", Extend(shared, 2000, 10)), 0);  // KV to 12: the first chunk ends at the junction 12
     std::uint64_t demoted = 0;
     for (const std::int32_t user : {3, 4, 5}) {
+        SCOPED_TRACE(user);
         const std::vector<std::int32_t> first = Extend(shared, 1000 * user, 10);
         ASSERT_EQ(Turn("u" + std::to_string(user), first), 12);
         const std::vector<std::int32_t> second = Extend(First(first, 21), 100 * user, 8);
         ASSERT_EQ(Turn("u" + std::to_string(user) + "b", second), 20);
+        EXPECT_EQ(scheduler_->DemotedCheckpointEntries(), demoted) << "the junction two turns back stays";
         ASSERT_EQ(Turn("u" + std::to_string(user) + "c", Extend(First(second, 28), 50 * user, 5)), 28);
-        EXPECT_GT(scheduler_->DemotedCheckpointEntries(), demoted) << "the user's own C(20)";
+        EXPECT_EQ(scheduler_->DemotedCheckpointEntries() - demoted, 2u) << "the user's own C(20) on both tiers";
         demoted = scheduler_->DemotedCheckpointEntries();
     }
     ASSERT_TRUE(scheduler_->ClearL1Cache());
-    EXPECT_EQ(ProbeResume("u9", Extend(shared, 9000, 10)), 12) << "the junction at 12 stayed undemoted";
+    EXPECT_EQ(ProbeResume("u9", Extend(shared, 9000, 10)), 12) << "the junction at 12 still serves a new user";
 }
 
 // A 21-token system prompt S: a cold request S + 1 writes its in-forward
