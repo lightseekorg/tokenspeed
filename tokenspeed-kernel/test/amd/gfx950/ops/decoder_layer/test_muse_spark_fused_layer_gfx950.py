@@ -24,7 +24,8 @@ gfx950 ranks.
 Each rank prepares the ``muse_spark`` leaf over random weights in the
 production layouts (EP1 expert slices from ``make_experts``) and runs one
 launch per plan key. The reference composes the regular path's steps on the
-same inputs: core attention over the FP8 cache, the gated o-norm, the
+same inputs: today's decode kernel over the FP8 cache (with the forward's
+split schedule on full layers, ~141k context), the gated o-norm, the
 o_proj all-reduce, the attention boundary, the FP32 router with sigmoid
 top-8, the pooler with its norm and MXFP4 quantization, today's direct-decode
 MoE kernels per rank and their route sum, the routed norm, the post-expert
@@ -36,8 +37,9 @@ The fused sums run in a different order (deterministic, not bitwise), and the
 pooled rows feed an MXFP4 quantization, where an order difference can move a
 value across a rounding boundary. So outputs are compared by relative RMS
 error (one BF16 rounding per reordered step, with headroom for those rare
-MXFP4 steps), and bitwise only where both sides compute alike: across ranks,
-across repeated launches, and between replay and eager.
+MXFP4 steps), and bitwise only where both sides compute alike: a full
+layer's gated attention rows, across ranks, across repeated launches, and
+between replay and eager.
 """
 
 import socket
@@ -64,11 +66,12 @@ if not (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "moe"))
 
 from native_moe_helpers import make_experts  # noqa: E402
-from tokenspeed_kernel.numerics.torch.layernorm import (  # noqa: E402
-    torch_weightless_rmsnorm_gated_sigmoid,
-)
 from tokenspeed_kernel.numerics.torch.residual import (  # noqa: E402
     torch_post_norm_residual_pre_norm,
+)
+from tokenspeed_kernel.ops.attention.mha import (  # noqa: E402
+    mha_decode_schedule,
+    mha_decode_with_kvcache,
 )
 from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
     HeadKVCache,
@@ -77,10 +80,16 @@ from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
     Rotary,
     gqa_prologue,
 )
+from tokenspeed_kernel.ops.communication._iris.muse_spark.fused_layer import (  # noqa: E402
+    BOX_WORDS,
+)
 from tokenspeed_kernel.ops.decoder_layer import (  # noqa: E402
     PlanKey,
     prepare_decoder_layer,
     prepare_decoder_layer_state,
+)
+from tokenspeed_kernel.ops.layernorm.fused_norm import (  # noqa: E402
+    weightless_rmsnorm_gated_sigmoid,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (  # noqa: E402
     invoke_stage1_mxfp4_mfma_decode_gluon,
@@ -102,9 +111,11 @@ HIDDEN, POOLED, EXPERTS, TOPK, INTER = 8192, 4096, 256, 8, 512
 Q_HEADS, KV_HEADS, HEAD_DIM = 16, 2, 64
 Q_WIDTH, KV_WIDTH = Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM
 WIDTH, PAGE, WINDOW_LEFT = 8, 64, 2047
-CONTEXT = (1500, 2600)  # cached tokens per request before the verify rows
-PAGES = 128
-MAX_POSITION = 4096
+# Cached tokens per request before the verify rows. Full layers read the
+# whole context: one request at ~141k (the served context), and two, whose
+# split schedule then gives workgroups two items.
+CONTEXT = {"sliding": (1500, 2600), "full": (141_000, 141_000)}
+MAX_POSITION = 1 << 18
 EPS, POST_EPS = 1e-5, 1e-8
 TRAITS = dict(verify_width=WIDTH, tp_size=WORLD, ep_size=1, kv_cache_dtype="fp8_e4m3")
 SWIGLU = dict(swiglu_alpha=1.0, swiglu_limit=0.0, swiglu_beta=0.0)
@@ -123,6 +134,7 @@ class _DecodeCache:
     seq_lens: torch.Tensor
     max_seqlen_k: int
     split_schedule: torch.Tensor | None
+    window_left: int
 
 
 @dataclass(frozen=True)
@@ -196,10 +208,12 @@ def _inputs(key):
     generator = torch.Generator(device="cuda").manual_seed(7 + key.requests)
     requests = key.requests
     rows = requests * WIDTH
-    pages = torch.randperm(PAGES, device="cuda", generator=generator).to(torch.int32)
-    per_request = PAGES // 2
-    page_table = pages.view(2, per_request)[:requests].contiguous()
-    context = torch.tensor(CONTEXT[:requests], device="cuda")
+    lengths = CONTEXT[key.layer_kind][:requests]
+    per_request = -(-(max(lengths) + WIDTH) // PAGE)
+    total = requests * per_request
+    pages = torch.randperm(total, device="cuda", generator=generator).to(torch.int32)
+    page_table = pages.view(requests, per_request).contiguous()
+    context = torch.tensor(lengths, device="cuda")
     seq_lens = (context + WIDTH).to(torch.int32)
     positions = (context[:, None] + torch.arange(WIDTH, device="cuda")).flatten()
     page_of = page_table.long().gather(1, (positions.view(requests, WIDTH) // PAGE))
@@ -207,7 +221,7 @@ def _inputs(key):
 
     def cache(scale):
         values = torch.randn(
-            (PAGES, PAGE, KV_HEADS, HEAD_DIM), device="cuda", generator=generator
+            (total, PAGE, KV_HEADS, HEAD_DIM), device="cuda", generator=generator
         )
         return (values * scale).to(torch.float8_e4m3fn)
 
@@ -216,7 +230,7 @@ def _inputs(key):
     )
     gate = _randn(generator, rows, Q_WIDTH)
     residual = _randn(generator, rows, HIDDEN, dtype=torch.float32)
-    next_k = torch.zeros((PAGES, PAGE, KV_HEADS, HEAD_DIM), device="cuda").to(
+    next_k = torch.zeros((total, PAGE, KV_HEADS, HEAD_DIM), device="cuda").to(
         torch.float8_e4m3fn
     )
     norm_generator = torch.Generator(device="cuda").manual_seed(3)
@@ -231,13 +245,23 @@ def _inputs(key):
         if key.next_kind == "full"
         else Rotary(_cos_sin(), positions, RopeStyle.GPTJ, None)
     )
+    k_cache, v_cache = cache(1.0), cache(1.0)
+    window_left = WINDOW_LEFT if key.layer_kind == "sliding" else -1
+    schedule = None
+    if key.layer_kind == "full":
+        # The backend's call: the forward's balanced schedule, in place.
+        schedule = mha_decode_schedule(
+            q=q.view(rows, Q_HEADS, HEAD_DIM), k_cache=k_cache, v_cache=v_cache,
+            cache_seqlens=seq_lens, max_seqlen_q=WIDTH,
+            out=torch.zeros((requests + 1, 2), dtype=torch.int32, device="cuda"),
+        )  # fmt: skip
+        assert schedule is not None
     return dict(
         prepared_query=(q, gate),
         residual=residual,
         positions=positions,
-        # Sliding layers: no split schedule.
         cache=_DecodeCache(
-            cache(1.0), cache(1.0), page_table, seq_lens, MAX_POSITION, None
+            k_cache, v_cache, page_table, seq_lens, MAX_POSITION, schedule, window_left
         ),
         next_k=next_k,
         next_v=next_k.clone(),
@@ -279,30 +303,20 @@ def _run(fused, key, inputs):
 
 
 def _attention(inputs):
-    """Core attention of the step's rows over the FP8 cache, in FP32: causal
-    within the verify rows, a sliding window of WINDOW_LEFT earlier keys."""
+    """Today's decode of the step's rows over the FP8 cache (the registered
+    kernel the MHA backend calls, with the forward's split schedule on full
+    layers): [rows, Q_WIDTH] BF16."""
     q, _ = inputs["prepared_query"]
     cache = inputs["cache"]
     rows = q.shape[0]
-    group = Q_HEADS // KV_HEADS
-    out = torch.empty((rows, Q_HEADS, HEAD_DIM), device="cuda")
-    q = q.float().view(rows, Q_HEADS, HEAD_DIM)
-    for request, length in enumerate(cache.seq_lens.tolist()):
-        pages = cache.page_table[request].long()
-        keys = torch.arange(length, device="cuda")
-        slots = pages[keys // PAGE] * PAGE + keys % PAGE
-        k = cache.k_cache.view(-1, KV_HEADS, HEAD_DIM)[slots].float()
-        v = cache.v_cache.view(-1, KV_HEADS, HEAD_DIM)[slots].float()
-        for token in range(WIDTH):
-            row = request * WIDTH + token
-            position = length - WIDTH + token
-            visible = (keys <= position) & (keys >= position - WINDOW_LEFT)
-            for head in range(Q_HEADS):
-                kv = head // group
-                scores = (k[:, kv] @ q[row, head]) * HEAD_DIM**-0.5
-                scores = scores.masked_fill(~visible, float("-inf"))
-                out[row, head] = scores.softmax(0) @ v[:, kv]
-    return out.view(rows, Q_WIDTH).to(torch.bfloat16)
+    out = mha_decode_with_kvcache(
+        q=q.view(rows, Q_HEADS, HEAD_DIM), k_cache=cache.k_cache,
+        v_cache=cache.v_cache, page_table=cache.page_table,
+        cache_seqlens=cache.seq_lens, max_seqlen_k=cache.max_seqlen_k,
+        max_seqlen_q=WIDTH, window_left=cache.window_left,
+        schedule=cache.split_schedule,
+    )  # fmt: skip
+    return out.reshape(rows, Q_WIDTH)
 
 
 def _direct_decode(xq, xs, experts, ids):
@@ -337,7 +351,7 @@ def _reference(key, weights, inputs):
     """The regular layer's steps on the same inputs (collectives over the
     world group)."""
     q, gate = inputs["prepared_query"]
-    gated = torch_weightless_rmsnorm_gated_sigmoid(
+    gated = weightless_rmsnorm_gated_sigmoid(
         _attention(inputs), gate, Q_HEADS, HEAD_DIM, EPS, False
     )
     attention = gated.float() @ weights["o_proj"].float().t()
@@ -434,10 +448,35 @@ def _compare(key, actual, expected):
 
 
 PLAN_KEYS = [
-    PlanKey(requests, "sliding", next_kind)
+    PlanKey(requests, kind, next_kind)
+    for kind in ("sliding", "full")
     for requests in (1, 2)
     for next_kind in ("sliding", "full", "regular")
 ]
+
+
+def _check_attention_box(state, inputs):
+    """The launch's attention box holds the gated-normed attention rows; for
+    a full layer, the split-schedule attention followed by the gated norm
+    must equal today's decode kernel and gated-norm kernel bit for bit (the
+    box stores -0.0 as +0.0: its empty word is the -0.0 pair)."""
+    q, gate = inputs["prepared_query"]
+    rows = q.shape[0]
+    expected = weightless_rmsnorm_gated_sigmoid(
+        _attention(inputs), gate, Q_HEADS, HEAD_DIM, EPS, False
+    )
+    # This launch's copy of the box (epoch & 1), as BF16 rows.
+    epoch = int(state.epochs[0])
+    box = state.iris.box.view(2, BOX_WORDS)[epoch & 1]
+    actual = box.view(torch.bfloat16).view(-1, Q_WIDTH)[:rows]
+
+    def positive_zero(values):
+        return torch.where(values == 0, torch.zeros_like(values), values)
+
+    assert torch.equal(
+        positive_zero(actual).view(torch.int16),
+        positive_zero(expected).view(torch.int16),
+    )
 
 
 def _worker(rank, port, record_dir, errors):
@@ -454,8 +493,12 @@ def _worker(rank, port, record_dir, errors):
             failure_record_path=f"{record_dir}/rank{rank}.bin",
             device=torch.device("cuda", rank),
         )
-        weights = _weights(rank)
+        base = _weights(rank)
         for key in PLAN_KEYS:
+            window_left = WINDOW_LEFT if key.layer_kind == "sliding" else -1
+            weights = dict(
+                base, attention=dict(base["attention"], window_left=window_left)
+            )
             fused = prepare_decoder_layer(
                 recipe="muse_spark", plan_keys=[key], traits=TRAITS,
                 weights=weights, state=state,
@@ -467,6 +510,8 @@ def _worker(rank, port, record_dir, errors):
             expected = _reference(key, weights, inputs)
             expected["slots"] = inputs["slots"]
             actual = _run(fused, key, inputs)
+            if key.layer_kind == "full":
+                _check_attention_box(state, inputs)
             _compare(key, actual, expected)
 
             # Deterministic: the same launch again, at the next epoch and
