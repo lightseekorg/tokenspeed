@@ -2181,7 +2181,7 @@ def offline_compile_args(key: PlanKey, rank: int):
     fn = gluon_decoder_layer_muse_spark_gfx950
     constexprs = kernel_constexprs(
         key, MUSE_SPARK_CONSTANTS, rank=rank, peer_cache=".wt", ring=16, quad_map=0,
-        dn_order=0, dn_lines=0, addr_soffset=0, tag_poll=1, scale_lanes=0, tail_num=1, tail_den=2,
+        dn_order=0, dn_lines=0, addr_soffset=0, tag_poll=2, scale_lanes=0, tail_num=1, tail_den=2,
         n_phys1=1024, n_phys2=4096, num_stages=2, kv_scaled=False,
         next_rotary=key.next_kind == "sliding", qkv_window=2, att_merge="designated",
         entry="vector", stamps=False,

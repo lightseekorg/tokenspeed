@@ -109,7 +109,9 @@ DEFAULT_PLAN_FIELDS = dict(
     addr_soffset=0,
     # MoE readiness polls: scalar loads past the scalar cache (1), or
     # uncached vector loads (2), which wait behind the wave's weight loads.
-    tag_poll=1,
+    # 2 until the scalar form's fault on gfx950 is understood: a scalar load
+    # at a per-wave address followed by an exec-masked store faults there.
+    tag_poll=2,
     tail_num=1,
     tail_den=2,
     num_stages=2,
