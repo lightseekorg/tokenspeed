@@ -144,20 +144,16 @@ plan also skips epochs whose entries are all known to be pinned. Temporary
 lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
 
-Host duplicate reclamation checks pending stores on a candidate's ancestor
-chain once per scan and reuses that answer for other candidates sharing it.
-The memo and traversal buffers belong to the scan: the next scan rechecks
-store completions and new tree links. This changes traversal cost without
-changing candidate eligibility or eviction order.
+Host duplicate reclamation needs a complete Device prefix with no pending
+store at or above the candidate. A page is complete on the Device when its tree
+node counts every prefix-closed block of it there, so the scan checks a
+candidate's ancestor chain once and reuses the answer for other candidates
+sharing it; the memo belongs to the scan, and the next scan rechecks.
 Before opening the ordered duplicate scan, placement walks from the tree's
 roots and prunes whole subtrees covered by a pending store or an incomplete
 Device prefix. It stops at the first possible duplicate. When none is reachable,
-placement skips the ordered scan. Roots share the ordinary sibling links and
-need constant-time maintenance on insertion, linking and removal; publishing or
-settling a page adds no ancestor-count updates. A reachable duplicate still
-needs the ordinary ownership and checkpoint-window checks before reclamation.
-Collection also keeps each candidate's Device ownership and access epoch for
-ranking in the same call, avoiding a second set of key and tree lookups.
+placement skips the ordered scan. A reachable duplicate still needs the
+ordinary ownership and checkpoint-window checks before reclamation.
 Closed-group indexes maintain a non-owning Device access order for keys
 present in both Device and Host pools. Publishing or evicting either copy
 updates membership; a Device access updates the order. Host duplicate selection
@@ -781,14 +777,14 @@ Perception rules per directory:
   argument (`nullptr` when storage is unset) so Host-only matching cannot be
   selected by omitting it. A matcher only *reads* the group's index; it never
   touches allocation or physical placement.
-* **`TailTable`** (`tail_table.h`) — the coordinator's index of published
+* **`TailTable`** (`tail_table.h`) — the boundary tree's index of published
   tails: under the chain hash of the last full page (the *prior*), the
   `(T mod P, hash@T)` pairs published so far in least-recently-used order
   — a publication or a hit moves a tail to the back — capped at
   `kMaxTailsPerPrior` (8) with a counter of the drops
   (`Scheduler.tail_cap_evictions`). The probe enumerates it to find the
-  candidate boundaries inside a page; eviction of a tail's block removes its
-  entry.
+  candidate boundaries inside a page; a tail's entry leaves with the tail's
+  tree node.
 * **`BoundaryTree`** (`boundary_tree.h`) — the coordinator's tree of the
   boundaries it indexes, shared by both tiers: one node per content
   hash either tier holds, linked to the chain hash of the page before it (a
@@ -802,8 +798,15 @@ Perception rules per directory:
   write-back is bringing it to the Host, or a child hangs under it, and goes
   with its tail hint once none of these holds. An entry registered with no
   node yet (an L3 GET, a store whose Device entry left before its ACK, a
-  restore's republication) starts one without a parent. It is kept in step
-  with the indexes: no match reads it, evicting by segments selects along it
+  restore's republication) starts one without a parent. Its holders keep it
+  in step with the indexes: every entry of either tier, every eviction
+  write-back on its way to the Host (`PendingHostStore`) and every
+  publication in progress holds the node of its hash (`BoundaryTree::Hold`),
+  the node counts them and derives its presence and checkpoint marks from the
+  counts, and the last holder to leave takes the node away, with its tail
+  hint, and queues the node the removal stops at for the dead-entry
+  collection. Each change of a State checkpoint's residency reaches
+  `CheckpointTree` the same way. No match reads it, evicting by segments selects along it
   (`AdmissionPlanner`, and the Host's segment plan, `AcquireHostSegments`),
   the collection of dead prefix entries finds them through it, and its walks
   follow parent pointers and insertion-ordered lists, never the map, so
@@ -1202,8 +1205,9 @@ Its responsibilities:
   by the request itself. Releasing an input does not invalidate its checkpoint
   for other requests; a deeper checkpoint cannot restore an earlier boundary.
   Unpublished slots are dropped, and so is a block no probe could resume from on the Host
-  (`DeadEntriesNotWrittenBack`). A record holds its tree node, tail hint and
-  Host presence until its segment settles, and a block the Host holds already
+  (`DeadEntriesNotWrittenBack`). A record's `PendingHostStore` holds its
+  tree node, tail hint and Host presence until its segment settles, or until
+  a segment dropped unsettled goes, and a block the Host holds already
   rides as that entry, never copied again. The invariants: eviction keeps the
   Device's coverage closed from the root (a restore can open it, below) and a
   segment is never split; the plan that evicts drains its segments right
@@ -1248,9 +1252,10 @@ Its responsibilities:
   exhausted.
   No group has a reserved capacity; every freed parent returns to the shared
   pool and can serve either State or history demand.
-  The boundary tree maintains the nodes with settled closed-group duplicates
-  as entries arrive and leave. It also propagates complete Device-prefix
-  coverage when a page changes, including gaps opened or filled by restores.
+  The boundary tree counts each node's closed-group duplicates as entries
+  arrive and leave; whether a page completes the Device prefix is read off
+  the counts along its ancestors when a scan needs it, including gaps opened
+  or filled by restores.
   Placement follows the indexes' Device access order, merging one epoch
   across closed groups and sorting equal-epoch boundary/location ties.
   It checks duplicate membership, prefix coverage and the bounded sliding

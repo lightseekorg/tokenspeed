@@ -607,6 +607,8 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             if (collect) {
                 coordinator.CollectDeadEntries();
             }
+            const std::vector<std::string> mismatches = CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator);
+            ASSERT_TRUE(mismatches.empty()) << "round " << round << ": " << mismatches.front();
             const auto on_device = [&](const std::string& hash) {
                 return coordinator.GroupPrefixIndex(0).Contains(device, KeyFor(hash, 0));
             };

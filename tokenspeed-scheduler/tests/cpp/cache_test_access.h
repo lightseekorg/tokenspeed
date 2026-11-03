@@ -20,11 +20,13 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -83,6 +85,83 @@ struct CacheCoordinatorTestAccess {
 
     static auto NodeEntries(const CacheCoordinator& coordinator, const BlockPool& pool, const ContentHash& hash) {
         return coordinator.NodeEntries(pool, *coordinator.boundary_tree_.Find(hash));
+    }
+
+    // Where the boundary tree disagrees with the indexes, recounted from
+    // scratch: every indexed hash has a node whose entry, State, prefix-closed
+    // and pair counts match its entries on both tiers, and a node without
+    // entries stays only for a child or a write-back on its way to the Host.
+    // Empty when they agree. Call it between coordinator operations.
+    static std::vector<std::string> BoundaryTreeMismatches(const CacheCoordinator& coordinator) {
+        struct Counts {
+            std::array<std::int32_t, 2> entries{};
+            std::array<std::int32_t, 2> state{};
+            std::array<std::int32_t, 2> closed{};
+            std::int32_t pairs{0};
+        };
+        std::unordered_map<ContentHash, Counts> expected;
+        const std::array<const BlockPool*, 2> pools{&coordinator.pool_, coordinator.host_pool_};
+        for (std::size_t i = 0; i < coordinator.groups_.size(); ++i) {
+            const PrefixCacheIndex& index = coordinator.groups_[i].Index();
+            const bool state = coordinator.GroupIsState(i);
+            const bool closed = coordinator.groups_[i].Matcher().IsPrefixClosed();
+            for (std::size_t tier = 0; tier < pools.size(); ++tier) {
+                if (pools[tier] == nullptr) {
+                    continue;
+                }
+                index.ForEachEntry(
+                    *pools[tier], [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot&) {
+                        Counts& counts = expected[key.content_hash];
+                        ++counts.entries[tier];
+                        counts.state[tier] += state ? 1 : 0;
+                        counts.closed[tier] += closed ? 1 : 0;
+                        if (tier == BoundaryTree::kDevice && closed && pools[BoundaryTree::kHost] != nullptr &&
+                            index.Contains(*pools[BoundaryTree::kHost], key)) {
+                            ++counts.pairs;
+                        }
+                    });
+            }
+        }
+        std::vector<std::string> mismatches;
+        const BoundaryTree& tree = coordinator.boundary_tree_;
+        for (const auto& [hash, counts] : expected) {
+            const BoundaryTree::Node* node = tree.Find(hash);
+            if (node == nullptr) {
+                mismatches.push_back("no node for the indexed hash " + hash);
+                continue;
+            }
+            for (const std::size_t tier : {BoundaryTree::kDevice, BoundaryTree::kHost}) {
+                if (node->Entries(tier) != counts.entries[tier] || node->StateEntries(tier) != counts.state[tier] ||
+                    node->ClosedEntries(tier) != counts.closed[tier]) {
+                    mismatches.push_back("entry counts of " + hash + " on tier " + std::to_string(tier));
+                }
+            }
+            if (node->ClosedPairs() != counts.pairs) {
+                mismatches.push_back("pair count of " + hash);
+            }
+        }
+        // Every node, by the tree's own links: one without entries hangs on
+        // for a child or a store; and none is out of reach.
+        std::size_t reached = 0;
+        std::vector<const BoundaryTree::Node*> pending;
+        for (const BoundaryTree::Node* root = tree.FirstRoot(); root != nullptr; root = root->next_sibling) {
+            pending.push_back(root);
+        }
+        while (!pending.empty()) {
+            const BoundaryTree::Node* node = pending.back();
+            pending.pop_back();
+            ++reached;
+            if (!expected.contains(*node->hash) && node->first_child == nullptr && node->PendingHostStores() == 0) {
+                mismatches.push_back("nothing holds the node " + *node->hash);
+            }
+            for (const BoundaryTree::Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+                pending.push_back(child);
+            }
+        }
+        if (reached != tree.Size()) {
+            mismatches.push_back("nodes out of reach of the roots");
+        }
+        return mismatches;
     }
 };
 

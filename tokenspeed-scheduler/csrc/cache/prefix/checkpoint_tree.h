@@ -57,6 +57,8 @@ public:
         bool pending_host_store{false};
         // Some State entry or pending store still holds it.
         bool held{false};
+
+        bool operator==(const Residency&) const = default;
     };
 
     CheckpointTree(std::int32_t prefix_granularity, std::int32_t leaf_distance)
